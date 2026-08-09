@@ -7,6 +7,10 @@ of **Ascensus** (M9, the DSPy optimization harness; `docs/architecture/system-de
 (pytest 9.1.1, CPython 3.14.7, installed via `uv`) or a file reference.
 Anything that could not be checked is marked **UNVERIFIED**.
 
+**Current-main note (2026-08-09):** the scaffold-era six-test baseline in this
+document is historical. Current main collects 108 tests and the full run reports
+108 passed; the source ruff gate is clean.
+
 ## 1. Purpose
 
 The harness measures four things for every Cambium module, and stores them so
@@ -44,11 +48,14 @@ scenario runner (`[project.optional-dependencies].test`).
 uv run --python 3.14.7 pytest -q
 ```
 
-Verified in this worktree: `6 passed in 0.08s` (first run) and `6 passed in
-0.03s` (warm). Note: this works because pytest is already installed in the
-venv. In a fresh checkout, pytest is declared under the `test` extra, so the
-documented form is `uv run --python 3.14.7 --extra test pytest -q` (matches
-`README.md`).
+The current-main verification is `uv run --python 3.14.7 --extra test pytest
+--collect-only -q` → `108 tests collected`; the full command reports 108 passed.
+In a fresh checkout, pytest is declared
+under the `test` extra, so the documented form is
+`uv run --python 3.14.7 --extra test pytest -q` (matches `README.md`).
+
+The earlier six-test output is retained only as the historical scaffold
+baseline for this design.
 
 ### Proposed: bench harness
 
@@ -120,7 +127,7 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
     "canaries": 2
   },
   "tests": {
-    "count": 6,
+    "count": 108,                 // current-main collection; nodeids abbreviated
     "wall_seconds": {
       "p50": 0.004, "p90": 0.011, "max": 0.02
     },
@@ -147,19 +154,16 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
   baselines. The drift check compares **only against the last baseline with
   the same `dataset_version`**; when `dataset_version` changes, the harness
   records a new anchor instead of failing.
-  - **v2 (current scaffold): `dataset_version` is `null`.** The example module
-    ships a flat single-file dataset (`example_pairs.jsonl`) and its loader
-    (`ExampleDatasetLoader`, `src/cambium/modules/example/dataset.py`) exposes
-    no version — it validates `input`/`expected`/`canary` per record and
-    returns `Example`s. With no version to read, the harness cannot pin the
-    baseline to a dataset revision; the drift anchor is effectively the git
-    sha. This is honest but weak, which is why migration to the three-split
-    format is a goal.
-  - **v2.1 target: `dataset_version` populated from `datasets/meta.json`**
-    (`src/cambium/modules/<name>/datasets/meta.json` per `dataset-format.md`
-    §5), read through the load contract's `Dataset.dataset_version`
-    (`dataset-format.md` §9). The schema field is already there and nullable,
-    so v2 baselines migrate forward without a `schema_version` bump.
+   - **Current main: `dataset_version` is populated from `datasets/meta.json`.**
+     The example module ships the three split files plus `meta.json`; its
+     `ExampleDatasetLoader` (`src/cambium/modules/example/dataset.py`) exposes
+     `load_all()` and validates `input`/`expected`/`canary` per record. The
+     legacy `example_pairs.jsonl` remains a loader fallback for the flat v2
+     format.
+   - **Future module target:** new modules populate `dataset_version` from
+     `datasets/meta.json` (`src/cambium/modules/<name>/datasets/meta.json` per
+     `dataset-format.md` §5), read through the load contract's
+     `Dataset.dataset_version` (`dataset-format.md` §9).
 - `git_sha` makes the recorded number attributable to a concrete tree.
 
 ## 4. What to run when
@@ -321,12 +325,11 @@ def canary_coverage(examples, taxonomy) -> dict:
 
 `taxonomy_coverage < 1` is **reported, not failed** in gate mode — a module may
 legitimately need only some trap kinds. What is always failed: `total == 0`
-(no canaries at all defeats the anti-reward-hacking layer). The current
-example dataset is a flat single-split file (`example_pairs.jsonl`, 9 records,
-2 canaries, `decompose` 4-true/5-false); the three-split format
-(train/eval/canaries.jsonl) and per-record `data.canary.kind` fields from
-`dataset-format.md` are the target shape the harness computes against once
-datasets migrate.
+(no canaries at all defeats the anti-reward-hacking layer). The current example
+dataset uses the three split files (`train.jsonl`, `eval.jsonl`, and
+`canaries.jsonl`) plus `meta.json`: 260 records total, with 200 train, 50 eval,
+and 10 canaries. The legacy `example_pairs.jsonl` remains available as the
+loader's flat-format fallback.
 
 ### Drift comparison
 

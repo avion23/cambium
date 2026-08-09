@@ -3,7 +3,13 @@
 **Version:** 1.0.0
 **Date:** 2026-08-09
 **Branch:** `wt-fb2` (`/tmp/opencode/cambium-fb2`)
-**Status:** Assessment of the second external critique against the current state (architecture v2.0.0 + design-deltas D1–D7 + merged research). New residue is captured as **D8a–D8g** in the same format as `docs/research/design-deltas.md`. This document supplements `docs/architecture.md` and `design-deltas.md` and supersedes them wherever a delta is marked **adopt**.
+**Status:** Assessment of the second external critique against the current state (architecture v2.0.0 + design-deltas D1–D7 + merged research). New residue is captured as **D8a–D8g** in the same format as `docs/research/design-deltas.md`. This document supplements `docs/architecture/architecture.md` and `design-deltas.md` and supersedes them wherever a delta is marked **adopt**.
+
+**Current-main note (2026-08-09):** the branch and count details below are the
+historical assessment snapshot. Current main is at `6109a6a`, with 80 tracked
+files, 33 research documents, and 108 collected tests. The canonical paths are
+`docs/architecture/architecture.md`, `docs/architecture/module-template/`,
+and `docs/architecture/reviews/`.
 
 **Sources incorporated:** (1) the second external critique of the v2 architecture — 14 claims reproduced in §1; (2) current state, read from the branches listed in §0.3.
 
@@ -19,7 +25,7 @@
 
 ### 0.2 "As of" note
 
-- `docs/architecture.md` v2.0.0 — **as of commit `17ef25f` on branch `wt-arch`**. The D1–D7 deltas (`design-deltas.md` v1.0.0, branch `wt-deltas2`) are authoritative amendments to that document and are treated as current state here.
+- `docs/architecture/architecture.md` v2.0.0 — **as of commit `17ef25f` on branch `wt-arch`**. The D1–D7 deltas (`design-deltas.md` v1.0.0, branch `wt-deltas2`) are authoritative amendments to that document and are treated as current state here.
 - Decision record: `implementation-plan.md` Decisions 8 (no local LLM cache), 9 (task tree), 10 (no sandboxing in the harness) — directive-sourced, adopted.
 - Merged research: `main` tip `3621fd9` at the time of writing.
 
@@ -27,11 +33,11 @@
 
 | Path | Where it lives now | Read from |
 |---|---|---|
-| `docs/architecture.md`, `agents.md`, `docs/module-template/*` | `wt-arch` @ `17ef25f` | `wt-arch` |
+| `docs/architecture/architecture.md`, `agents.md`, `docs/architecture/module-template/*` | `wt-arch` @ `17ef25f` | `wt-arch` |
 | `docs/research/design-deltas.md` (D1–D7) | `wt-deltas2` @ `905fc1b` | `wt-deltas2` |
 | `docs/research/example-datasets-v1.md`, `custos-asyncio-design.md`, `threat-model.md`, `sandbox-options.md`, `ipc-protocol-draft.md` | `main` | `main` (read-only) |
 | `docs/research/cascade-design.md`, `sqlite-wal-durability.md`, `repo-structure-plan.md` | `wt-cascade` @ `73093e7`, `wt-sqlite` @ `7f6ac8d`, `wt-hygiene` @ `660f930` | branches (read-only) |
-| `docs/reviews/review-distributed-systems.md`, `review-llm-design.md`, `review-implementation.md` | `main` | `main` |
+| `docs/architecture/reviews/review-distributed-systems.md`, `review-llm-design.md`, `review-implementation.md` | `main` | `main` |
 | `src/cambium/**` (scaffold) | `wt-fb2` (= main @ `96da568`) | `wt-fb2`; tests re-run here |
 | `implementation-plan.md` | `main` / `wt-fb2` | `wt-fb2` |
 
@@ -367,7 +373,7 @@ cambium/
 2. **D8a CLI is a spec, not code.** The `python -m cambium.modules.<name>` wrapper does not exist yet anywhere; the scaffold test run (`uv run --python 3.14.7 --extra test pytest tests/scenarios/test_example_module.py -q` → **6 passed**, worktree `/tmp/opencode/cambium-fb2`, exit 0) exercises `decide()`/`metric()` only, not a CLI.
 3. **D8f rate-limit defaults.** Token-bucket `rpm` values are UNVERIFIED — no provider rate-limit data was measured in this worktree (`cascade-design.md` §2.3's breaker defaults are likewise un-calibrated). `docs/research/provider-landscape.md` may inform the defaults at implementation time.
 4. **D8e container claims.** No Docker/Firecracker container was run in this worktree; the claim that "the worker runs unchanged in a container" rests on the stdio IPC contract (`§5.1`) and the `wt-slice` stdio proof, not on a container execution.
-5. **D8g conversation-store layout.** Whether `conversations.db` is separate from `events.db` is an open question (Q8g.1); the SQLite WAL durability claims are validated by `docs/research/sqlite-wal-durability.md` (a different, unmerged-at-wt-fb2-base branch, read read-only).
+5. **D8g conversation-store layout.** Whether `conversations.db` is separate from `events.db` is an open question (Q8g.1); the SQLite WAL durability claims are validated by `docs/research/sqlite-wal-durability.md` (a branch-local document at the wt-fb2 baseline, read read-only).
 6. **`should_decompose` "regex = toy".** The critique's characterization is accepted as the design's deliberate v2 state (rule engine, DSPy seam at v2.1) — it is **not** a defect claim that needs fixing, so no verification was run beyond the scaffold tests above.
 7. **Claim-1 counts.** The "30 tracked files / 66 post-merge" numbers are computed from `git ls-tree` unions in this worktree at commit time; re-run repo-structure-plan §5 step 1's `git ls-files | wc -l` on the real merged `main` and trust that number.
 
