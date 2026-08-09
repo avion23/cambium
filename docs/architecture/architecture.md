@@ -456,9 +456,9 @@ Invariants:
 
 ```sql
 CREATE TABLE events (
-    seq          INTEGER PRIMARY KEY AUTOINCREMENT,  -- monotonic, gap-free
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,  -- monotonic, gap-free (by construction, §6.5)
     monotonic_ms INTEGER NOT NULL,
-    wall_ts      REAL    NOT NULL,
+    ts           TEXT,                              -- ISO-8601 TEXT (canonical for v2; see note below)
     kind         TEXT    NOT NULL,
     task_id      TEXT,
     request_id   TEXT,
@@ -475,7 +475,9 @@ CREATE TABLE snapshots (
 );
 ```
 
-`seq` is gap-free within a session; gaps signal data loss on replay.
+`seq` is gap-free within a session **by construction**: the writer reserves `seq` at enqueue and commits in reservation order (single writer, FIFO queue — §6.2), so a gap cannot occur. Loss is bounded by the fsync-cadence crash window, not by gap detection (§6.5).
+
+**Envelope reconciliation (`ts`, `event_id`).** The envelope timestamp is stored as **ISO-8601 TEXT** (`ts TEXT`); the events draft's float-epoch `ts` semantics (`docs/research/event-schema-draft.md` §2) are superseded for v2 — the code's TEXT form is canonical. The draft's ULID `event_id` correlation key (§2, D2) is **deferred to v2.1** and is absent from the v2 store DDL; **`seq` is the durable identity for v2**.
 
 **Tree linkage is payload-first (D2).** `parent_task_id` is a payload key on `submitted` (critical) and `task_decomposed` (non-critical) — **no new column** is added to the `events` table (a new required column would be a breaking envelope change under the events draft's migration policy, `docs/research/event-schema-draft.md` §7.2). Tree reconstruction joins those records on `payload.parent_task_id`; an index over the payload field is a v2.1 optimization if query volume demands it. `task_decomposed.payload.subtasks[]` carries the decomposed child list and `cycle_detected` (I2.2).
 
@@ -517,7 +519,9 @@ Notes:
 - Critical events trigger `_fsync_now` synchronously inside the writer's dequeue loop before the next event is read; non-critical events are buffered until the next timer-driven `_fsync_now` (every `fsync_interval_s`).
 - The timer-driven `_fsync_now` runs even when no critical events arrive, so the worst-case non-critical loss on crash is bounded by `fsync_interval_s`.
 
-**Recovery on supervisor restart.** Open the DB (SQLite replays the WAL automatically), read `events` since the last `snapshots` row, and re-publish to fresh subscribers. Non-critical events missing from the tail are detected by a gap in `seq` (gap-free invariant); the writer emits a `recovery_gap` event documenting the lost range.
+**Recovery on supervisor restart.** Open the DB (SQLite replays the WAL automatically), read `events` since the last `snapshots` row, and re-publish to fresh subscribers. `seq` gaps cannot occur — `seq` is reserved at enqueue and the sole writer commits in reservation order (§6.2), so the gap-free invariant holds by construction and there is **no gap detection** to run. Loss is bounded by the fsync-cadence crash window: at most `fsync_interval_s` of the most recent non-critical events (§6.2 inv. 5), absorbed by the supervisor's own restart logic (re-read from the last snapshot, re-publish to fresh subscribers). The `recovery_gap` event kind is **superseded (unreachable by construction)** and is kept in the kind vocabulary only as a reserved marker for tooling compatibility; the writer never emits it.
+
+**Phantom-read caveat (normative for callers).** A non-critical append returns a reserved `seq` whose row may not be durable yet: `events_after(seq)` may not observe it, and a supervisor crash inside `fsync_interval_s` can lose it. Callers must tolerate both — by polling `events_after`/re-publishing on restart and by treating a missing tail as loss within the crash window, never as corruption.
 
 **What this means for callers.** A caller that needs proof a thing happened must wait for the matching **critical** event (e.g., a `result` event for task completion, a `merge_committed` event for a merge). A caller that observes only heartbeats or tool events cannot prove liveness across a supervisor crash — by design, since these are high-volume advisory signals.
 
