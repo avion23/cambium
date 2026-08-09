@@ -74,6 +74,15 @@ async def _read_line(reader: asyncio.StreamReader, limit: int) -> bytes | None:
     can never consume bytes past the first newline. Raises ``MessageTooLong``
     (after resyncing past the oversized line) when more than ``limit`` content
     bytes accumulate without a newline.
+
+    Perf tradeoff: byte-at-a-time reads cost one coroutine step per byte for
+    already-buffered data (no syscall amplification — the pipe transport
+    fills the reader's buffer in bulk), keeping the per-call ``limit`` exact
+    and the newline boundary precise. An alternative is ``readuntil`` /
+    ``StreamReader.readline`` on a reader constructed with a matching limit,
+    but that couples the cap to the reader's constructor and needs explicit
+    ``LimitOverrunError`` resync. Keep byte-accurate reads unless profiling
+    shows them on a hot path.
     """
     buf = bytearray()
     while True:

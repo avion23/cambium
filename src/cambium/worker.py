@@ -4,14 +4,29 @@ Speaks the Nuntius JSON-Lines wire protocol over stdio
 (docs/architecture.md §5, docs/research/ipc-protocol-draft.md). One worker
 executes one task and then exits:
 
-    init                       ->  ready (echoes the init request_id and the
-                                   generation fencing token)
-    run_task                   ->  heartbeat(s) every ~1s while working
+    init                        ->  ready (echoes the init request_id and the
+                                    generation fencing token)
+    run_task                    ->  heartbeat(s) every ~1s while working
                                 ->  result_envelope (echoes the run_task
                                     request_id) -> exit_message (connection
                                     level; carries NO request_id)
-    steer / cancel             ->  cooperatively abort the current task with
-                                   status "cancelled"
+    check_health                ->  ok (echoes the request_id, generation)
+    steer                       ->  {"action": "cancel"} aborts the current
+                                    task (status cancelled); anything else is
+                                    logged and ignored (v2.1 hook)
+    cancel                      ->  ok (ack) then abort the current task with
+                                    status "cancelled"
+    shutdown                    ->  ok (ack), abort the current task, then
+                                    exit_message (reason "shutdown") + exit 0
+
+Defensive timeouts (worker self-protection if the supervisor dies):
+    - init deadline: no init message within ``INIT_TIMEOUT_S`` (default 30 s,
+      env ``CAMBIUM_INIT_TIMEOUT_S``) -> ``fatal_error`` + exit 1.
+    - idle deadline: no message from the supervisor within ``IDLE_TIMEOUT_S``
+      (default 300 s, env ``CAMBIUM_IDLE_TIMEOUT_S``) after ``ready`` -> the
+      worker aborts any current task and exits gracefully (``exit_message``
+      reason "idle", exit 0). No ``result_envelope`` is emitted for the
+      aborted task — the supervisor is presumed gone.
 
 Task spec (the ``run_task`` body) is compatible with
 ``scripts/fake_worker.py``'s task spec:
@@ -29,7 +44,8 @@ Task spec (the ``run_task`` body) is compatible with
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
-process exit code is 0 only when the task status is "succeeded".
+process exit code is 0 when the task status is "succeeded" or when the exit
+is a graceful supervisor- or worker-initiated close (shutdown, idle).
 """
 
 from __future__ import annotations
@@ -49,6 +65,8 @@ from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_mess
 
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
+INIT_TIMEOUT_S = 30.0
+IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
@@ -58,6 +76,16 @@ logger = logging.getLogger(__name__)
 
 def _monotonic_ms() -> int:
     return time.monotonic_ns() // 1_000_000
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
@@ -70,6 +98,16 @@ def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def cap_diff(diff: str) -> tuple[str, bool]:
+    """Cap ``diff`` to ``MAX_DIFF_BYTES`` UTF-8 bytes, never splitting a
+    codepoint; returns ``(diff, truncated)``."""
+    raw = diff.encode("utf-8")
+    if len(raw) <= MAX_DIFF_BYTES:
+        return diff, False
+    truncated = raw[:MAX_DIFF_BYTES].decode("utf-8", errors="ignore")
+    return truncated + "\n... [diff truncated]", True
+
+
 def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
     """Execute one task: throwaway worktree, one-file edit, commit.
 
@@ -80,7 +118,8 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         commits         list[str] of SHAs produced
         files_changed   list[str] of paths changed
         diff            ``git diff <base_commit>..HEAD`` in the worktree,
-                        capped at ``MAX_DIFF_BYTES``
+                        capped at ``MAX_DIFF_BYTES`` UTF-8 bytes
+        diff_truncated  bool; true when the diff was capped
         summary         worker-authored, <= ``MAX_SUMMARY_CHARS``
 
     Cooperative cancellation via ``stop``: the worker checks it between git
@@ -92,6 +131,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         "commits": [],
         "files_changed": [],
         "diff": "",
+        "diff_truncated": False,
         "summary": "",
     }
     try:
@@ -160,12 +200,14 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
             return outcome
         _rc, sha, _err = git("rev-parse", "HEAD", cwd=worktree)
         _rc, diff, _err = git("diff", f"{base_commit}..HEAD", cwd=worktree)
+        diff, diff_truncated = cap_diff(diff)
         outcome.update(
             status="succeeded",
             failure_reason=None,
             commits=[sha],
             files_changed=[target_file],
-            diff=diff[:MAX_DIFF_BYTES],
+            diff=diff,
+            diff_truncated=diff_truncated,
             summary=f"appended marker to {target_file}"[:MAX_SUMMARY_CHARS],
         )
         return outcome
@@ -192,6 +234,10 @@ async def _heartbeat_loop(
             "monotonic_ms": _monotonic_ms(),
         })
         turn += 1
+        if stop.is_set():
+            # Observed the stop flag right after this send: exit at the safe
+            # point (between iterations) instead of starting another send.
+            break
         await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
 
@@ -211,11 +257,20 @@ async def _run_task(
         outcome = await asyncio.to_thread(do_work, run, stop)
     finally:
         stop.set()
-        hb.cancel()
+        # Heartbeat stop: the write is enqueued synchronously and atomically,
+        # but cancel() between the write and its drain could leave the next
+        # (result) message written against a mid-drain heartbeat. Never cancel
+        # mid-send: set the stop flag and let the loop observe it at its safe
+        # point (after the in-flight send completes, before the next one).
+        # A hard cancel is only a fallback if the loop fails to drain promptly.
         try:
-            await hb
-        except asyncio.CancelledError:
-            pass
+            await asyncio.wait_for(hb, timeout=HEARTBEAT_INTERVAL_S + 1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
     outcome["request_id"] = run_rid
     outcome["task_id"] = task_id
     outcome["generation"] = generation
@@ -224,7 +279,12 @@ async def _run_task(
     return outcome
 
 
-async def _emit_result(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
+def _exit_reason(status: str) -> str:
+    return {"succeeded": "done", "failed": "failed", "cancelled": "cancelled"}.get(
+        status, "failed")
+
+
+async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
     status = outcome["status"]
     envelope = {
         "type": "result_envelope",
@@ -236,19 +296,38 @@ async def _emit_result(writer: asyncio.StreamWriter, outcome: dict[str, Any]) ->
         "commits": outcome.get("commits", []),
         "files_changed": outcome.get("files_changed", []),
         "diff": outcome.get("diff", ""),
+        "diff_truncated": bool(outcome.get("diff_truncated", False)),
         "summary": (outcome.get("summary") or "")[:MAX_SUMMARY_CHARS],
         "failure_reason": outcome.get("failure_reason"),
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),
     }
     await send(writer, envelope)
-    reason = {"succeeded": "done", "failed": "failed", "cancelled": "cancelled"}.get(
-        status, "failed")
+
+
+async def _emit_result(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
+    """Emit result_envelope + the authoritative exit_message (normal completion)."""
+    await _emit_result_envelope(writer, outcome)
     await send(writer, {
         "type": "exit_message",
         "task_id": outcome["task_id"],
         "generation": outcome["generation"],
-        "reason": reason,
+        "reason": _exit_reason(outcome["status"]),
+        "monotonic_ms": _monotonic_ms(),
+    })
+
+
+async def _send_ok(
+    writer: asyncio.StreamWriter,
+    msg: dict[str, Any],
+    task_id: str,
+    generation: int,
+) -> None:
+    await send(writer, {
+        "type": "ok",
+        "request_id": msg.get("request_id") if isinstance(msg, dict) else None,
+        "task_id": task_id,
+        "generation": generation,
         "monotonic_ms": _monotonic_ms(),
     })
 
@@ -276,8 +355,13 @@ async def _fatal(writer: asyncio.StreamWriter, msg: Any, message: str) -> int:
 
 async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int:
     """The worker wire loop. Returns the process exit code."""
+    init_timeout = _env_float("CAMBIUM_INIT_TIMEOUT_S", INIT_TIMEOUT_S)
+    idle_timeout = _env_float("CAMBIUM_IDLE_TIMEOUT_S", IDLE_TIMEOUT_S)
+
     try:
-        first = await read_message(reader)
+        first = await asyncio.wait_for(read_message(reader), timeout=init_timeout)
+    except asyncio.TimeoutError:
+        return await _fatal(writer, {}, "init timeout: no init message within deadline")
     except MessageTooLong:
         return await _fatal(writer, {}, "wire line exceeded the length cap")
     if first is None:
@@ -302,7 +386,8 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
     stop = threading.Event()
 
     while True:
-        read_task = asyncio.create_task(read_message(reader))
+        read_task = asyncio.create_task(
+            asyncio.wait_for(read_message(reader), timeout=idle_timeout))
         pending = {read_task}
         if current is not None:
             pending.add(current)
@@ -325,6 +410,26 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
 
         try:
             msg = read_task.result()
+        except asyncio.TimeoutError:
+            # No message from the supervisor within the idle deadline: the
+            # supervisor is presumed gone. Abort any current task and exit
+            # gracefully (documented in the module docstring).
+            stop.set()
+            if current is not None:
+                task = current
+                current = None
+                try:
+                    await task
+                except BaseException:
+                    pass
+            await send(writer, {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": generation,
+                "reason": "idle",
+                "monotonic_ms": _monotonic_ms(),
+            })
+            return 0
         except MessageTooLong:
             return await _fatal(writer, {}, "wire line exceeded the length cap")
         except Exception as exc:
@@ -350,9 +455,13 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             stop = threading.Event()
             current = asyncio.create_task(
                 _run_task(writer, msg, task_id, generation, stop))
+        elif mtype == "check_health":
+            await _send_ok(writer, msg, task_id, generation)
         elif mtype == "steer":
             payload = msg.get("payload") or {}
-            if "cancel" in json.dumps(payload):
+            # Structured parse: only an exact {"action": "cancel"} aborts.
+            # Free text containing the word "cancel" must NOT abort.
+            if isinstance(payload, dict) and payload.get("action") == "cancel":
                 logger.info("steer: cancel requested")
                 stop.set()
             else:
@@ -360,7 +469,27 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                             json.dumps(payload)[:200])
         elif mtype == "cancel":
             logger.info("cancel: aborting current task")
+            await _send_ok(writer, msg, task_id, generation)
             stop.set()
+        elif mtype == "shutdown":
+            await _send_ok(writer, msg, task_id, generation)
+            if current is not None:
+                stop.set()
+                task = current
+                current = None
+                try:
+                    outcome = await task
+                    await _emit_result_envelope(writer, outcome)
+                except BaseException:
+                    pass
+            await send(writer, {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": generation,
+                "reason": "shutdown",
+                "monotonic_ms": _monotonic_ms(),
+            })
+            return 0
         else:
             return await _fatal(writer, msg, f"unknown message type {mtype!r}")
 
