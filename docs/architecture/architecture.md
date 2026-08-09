@@ -187,6 +187,8 @@ class Result:
 
 **Result envelopes flow up the Task Tree** (D2): a child node's terminal envelope is a **message** to the parent, not merely a terminal report. The upward envelope carries **exactly**: `parent_task_id`, `unified_diff` (with `diff_truncated` set on overflow), `summary`, `metric_score`, `metric_breakdown`, `commits`, `files_changed`, and terminal `status` — **never the child's scratchpad, chain-of-thought, or trajectory** (normative information-hiding rule, D8b/I2.7). The `Result` dataclass above adds session/root-level fields (`exit_code`, `event_log_ref`, `session_id`, `started_at`, `ended_at`, `failure_reason`) that are populated when the session result is finalized (§16.1); they are **not** part of the upward child envelope. `Nuntius`/`Custos` validate upward messages against this envelope schema and reject unknown top-level fields, so the rule is structural, not a prompt convention.
 
+The `unified_diff` field is capped at 64 KiB and is included by default (the evaluator tier consumes it for merge-conflict context and result review; consuming design: `docs/research/architectus-design.md`). A per-task config flag `include_diff: false` omits the field for higher orchestrator tiers where the merge-conflict context is not needed (token savings); the diff remains available on demand when `merge_failed` resolution requires it (§7.8).
+
 ### 3.5 `Instance` — proto-AGI leaf handle (control plane)
 
 ```python
