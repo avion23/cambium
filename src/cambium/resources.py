@@ -1,0 +1,211 @@
+"""Supervisor-owned controls for CPU-heavy gates and task resource budgets.
+
+``CompileGate`` limits only commands whose token prefix is in
+:data:`HEAVY_PATTERNS`.  The heuristic is deliberately lexical: a pattern is
+split into command tokens and must match the beginning of the command exactly.
+It does not inspect shell syntax, expand aliases, resolve executable paths, or
+classify a command by its arguments.  For example, ``["cargo", "build"]`` is
+heavy, while ``["python", "-m", "pytest"]`` is not because it does not start
+with the ``pytest`` token prefix.
+
+The gate is an instance-owned dependency.  A supervisor constructs one gate
+for its session and passes it to the code that runs gates; this module keeps no
+mutable process-wide state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import time
+from typing import Final
+
+# These are command-token prefixes, not regular expressions.  Keep the public
+# values as strings so the policy is easy to audit and change as a unit.
+HEAVY_PATTERNS: Final[tuple[str, ...]] = (
+    "make",
+    "cargo",
+    "npm install",
+    "yarn",
+    "pip install",
+    "pytest",
+    "cmake",
+    "ninja",
+    "gcc",
+    "clang",
+    "go build",
+    "rustc",
+    "mvn",
+    "gradle",
+)
+
+DEFAULT_ACQUIRE_TIMEOUT_S: Final[float] = 60.0
+
+
+def _matches_prefix(command: list[str], pattern: str) -> bool:
+    """Return whether ``command`` starts with the exact tokens in ``pattern``."""
+    pattern_tokens = pattern.split()
+    return len(command) >= len(pattern_tokens) and command[: len(pattern_tokens)] == pattern_tokens
+
+
+class CompileGate:
+    """Bound concurrent CPU-heavy gate commands for one supervisor session.
+
+    Non-heavy commands bypass the semaphore.  A successful heavy acquisition
+    must be paired with ``release`` by the caller.  ``timeout_s`` is optional
+    to keep timeout tests and supervisor configuration short; its production
+    default is 60 seconds.
+
+    The instance is intended to be used by one asyncio supervisor loop.  Its
+    counters are loop-affine and therefore need no shared-state lock.
+    """
+
+    __slots__ = (
+        "_max_concurrent",
+        "_timeout_s",
+        "_semaphore",
+        "_current",
+        "_heavy",
+        "_waits",
+        "_timeouts",
+        "_held",
+    )
+
+    def __init__(
+        self,
+        max_concurrent: int | None = None,
+        *,
+        timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
+    ) -> None:
+        if max_concurrent is None:
+            max_concurrent = os.cpu_count() or 1
+        if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int):
+            raise TypeError("max_concurrent must be an integer or None")
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be at least 1")
+        if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool):
+            raise TypeError("timeout_s must be a number")
+        if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and greater than zero")
+
+        self._max_concurrent = max_concurrent
+        self._timeout_s = float(timeout_s)
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._current = 0
+        self._heavy = 0
+        self._waits = 0
+        self._timeouts = 0
+        self._held: dict[tuple[str, ...], int] = {}
+
+    def is_heavy(self, command: list[str]) -> bool:
+        """Return whether ``command`` has a configured heavy token prefix."""
+        return any(_matches_prefix(command, pattern) for pattern in HEAVY_PATTERNS)
+
+    async def acquire(self, command: list[str]) -> bool:
+        """Acquire a heavy-command permit, or return ``False`` on timeout.
+
+        Non-heavy commands return immediately and do not affect semaphore
+        state or statistics.
+        """
+        if not self.is_heavy(command):
+            return True
+
+        if self._semaphore.locked():
+            self._waits += 1
+        try:
+            acquired = await asyncio.wait_for(self._semaphore.acquire(), self._timeout_s)
+        except TimeoutError:
+            self._timeouts += 1
+            return False
+        if not acquired:
+            return False
+        self._current += 1
+        self._heavy += 1
+        key = tuple(command)
+        self._held[key] = self._held.get(key, 0) + 1
+        return True
+
+    def release(self, command: list[str]) -> None:
+        """Release a permit previously acquired for a heavy command."""
+        if not self.is_heavy(command):
+            return
+        key = tuple(command)
+        held = self._held.get(key, 0)
+        if held == 0:
+            return
+        if held == 1:
+            del self._held[key]
+        else:
+            self._held[key] = held - 1
+        self._current -= 1
+        self._semaphore.release()
+
+    def stats(self) -> dict[str, int]:
+        """Return current use, total successful heavy acquisitions, and waits."""
+        return {
+            "current": self._current,
+            "heavy": self._heavy,
+            "max": self._max_concurrent,
+            "waits": self._waits,
+            "timeouts": self._timeouts,
+        }
+
+
+class ResourceBudget:
+    """Small supervisor-owned budget for one session or task.
+
+    ``consume_heavy_op`` reserves one heavy operation.  It returns ``False``
+    when either the wall-time budget or the heavy-operation allowance is
+    exhausted.  The budget clock starts when this object is constructed and
+    is intended to be owned by one supervisor event-loop task.
+    """
+
+    __slots__ = ("_max_wall_s", "_max_heavy_ops", "_started_at", "_heavy_ops")
+
+    def __init__(self, max_wall_s: float, max_heavy_ops: int) -> None:
+        if not isinstance(max_wall_s, (int, float)) or isinstance(max_wall_s, bool):
+            raise TypeError("max_wall_s must be a number")
+        if not math.isfinite(float(max_wall_s)) or max_wall_s < 0:
+            raise ValueError("max_wall_s must be finite and non-negative")
+        if isinstance(max_heavy_ops, bool) or not isinstance(max_heavy_ops, int):
+            raise TypeError("max_heavy_ops must be an integer")
+        if max_heavy_ops < 0:
+            raise ValueError("max_heavy_ops must be non-negative")
+
+        self._max_wall_s = float(max_wall_s)
+        self._max_heavy_ops = max_heavy_ops
+        self._started_at = time.monotonic()
+        self._heavy_ops = 0
+
+    @property
+    def max_wall_s(self) -> float:
+        """Configured wall-time limit in seconds."""
+        return self._max_wall_s
+
+    @property
+    def max_heavy_ops(self) -> int:
+        """Configured heavy-operation limit."""
+        return self._max_heavy_ops
+
+    @property
+    def heavy_ops(self) -> int:
+        """Number of heavy operations reserved so far."""
+        return self._heavy_ops
+
+    @property
+    def wall_remaining_s(self) -> float:
+        """Remaining wall-time budget, clamped at zero."""
+        elapsed = time.monotonic() - self._started_at
+        return max(0.0, self._max_wall_s - elapsed)
+
+    def can_start_heavy(self) -> bool:
+        """Return whether another heavy operation may be reserved."""
+        return self.wall_remaining_s > 0 and self._heavy_ops < self._max_heavy_ops
+
+    def consume_heavy_op(self) -> bool:
+        """Reserve one heavy operation if both budget bounds remain."""
+        if not self.can_start_heavy():
+            return False
+        self._heavy_ops += 1
+        return True
