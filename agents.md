@@ -40,9 +40,11 @@ Trace from entry points, not from filenames. Concrete starting points:
 
 - **Public API surface:** `src/cambium/__init__.py` — `Cambium`, `Session`, `Result`, `Instance`, `Event`, `Config`.
 - **IPC protocol:** `src/cambium/nuntius/` — message types and framing. Schema is normative in `docs/architecture/architecture.md` §5.2.
-- **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in §7.
+- **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in `docs/architecture/architecture.md` §7.
 - **Worker entry:** `src/cambium/opifex/__main__.py` — read-init → ready → loop → result/exit.
 - **Decision modules:** `src/cambium/modules/<name>/` — each module is self-contained (rule engine primary + DSPy seam in `decide.py`).
+
+`nuntius`, `custos`, and `opifex` are **planned** directories — they do not exist in `src/cambium/` yet (only `supervisor.py`, `orchestrator.py`, `events.py`, and `modules/` are present). Read the architecture sections above for their intended shape; see the §2 note for what a missing path means.
 
 When a `grep`/`rg` search fails to find what you expect, follow the execution path: read the import graph, the route registration, the message dispatcher. Don't conclude "doesn't exist" from a single miss.
 
@@ -53,6 +55,7 @@ When a `grep`/`rg` search fails to find what you expect, follow the execution pa
 - Every non-trivial change happens in an **isolated git worktree** off the relevant branch. The orchestrator (root agent) owns the integration worktree; child agents work in disjoint worktrees.
 - Work in **disjoint file scopes** when running in parallel. Same-file concurrent edits require isolated worktrees and explicit merge sequencing.
 - Commit **frequently** in your worktree. Small, well-described commits are easier to review and revert than large ones.
+- **Worktree discipline guard:** before *any* commit, `git rev-parse --show-toplevel` must equal your worktree's path — verify with `git worktree list`. Never commit to `main`; the python314 incident did exactly that and its changes had to be untangled by hand.
 - **No destructive git.** No `push --force`, no `rebase` of shared branches, no `reset --hard` of other agents' work. Amend only your own unpushed commit if asked.
 - Clean up your own worktree when finished. The supervisor's `Surculus.prune()` is for runtime worktrees, not for your development worktrees.
 
@@ -82,6 +85,13 @@ Standard checks (run from repo root unless noted):
   python -c "import cambium"
   ```
 
+**Test hygiene** (on top of the checks above):
+
+- Scenario/integration tests are the primary module tests (`tests/scenarios/test_<module>.py`); no TDD ceremony — write a test when it earns its place.
+- Supervision tests use **fake workers**, not real ones.
+- **No network in tests.** Anything that dials a provider is a manual or gated run.
+- Harness code is **stdlib + git only**. `dspy` is an optional extra, lazy-imported, never a hard dependency.
+
 Mark your report with one of:
 - **VERIFIED** — command run, exit status 0, output cited.
 - **UNVERIFIED** — claim made, check not run (state why: no interpreter, no fake LLM, out of scope, etc.).
@@ -97,6 +107,8 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Separate facts from inferences.** "The supervisor emits `worker_exit` on EOF" is a fact (cite the line). "The supervisor is therefore robust to zombie grandchildren" is an inference (justify it or test it).
 - **A defect fix is done only with before/after verification.** "Unverified" if not run; "workaround" if the cause still exists.
 - **Three-failure rule.** If three attempts at a fix fail, stop and report all three with evidence. Do not keep guessing. Each attempt must test a distinct hypothesis.
+- **Empty reports are failures.** Every task ends with a substantial report: files changed, exact commands with their outputs, and the commit hash. Silent completion — and returning early without the deliverable — are failures, not results.
+- **Snapshots are point-in-time.** A dump of a live system (DB, log, session state) needs an explicit as-of timestamp and the command that produced it; never present it as stable truth.
 - **Use existing vocabulary.** Cambium, Custos, Opifex, Diffundo, worktree, generation, request_id, etc. Do not invent synonyms or new jargon. Module names match `docs/architecture/architecture.md` §4.
 - **No new doc/report/summary files unless asked.** Say it in chat. `agents.md`, `docs/architecture/architecture.md`, and `docs/architecture/module-template/*` are the normative documents; do not proliferate.
 
@@ -109,30 +121,95 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Flat over nested.** Early returns, guard clauses, exhaustive match/switch. Business logic in pure functions; state and I/O at the edges.
 - **Concrete over abstract.** Inline unless a boundary is independently meaningful.
 - **Real enums for domain alternatives.** `WorkerState`, `ResultStatus`, `EventKind` are enums, not strings or booleans.
-- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`SandboxKind.Bwrap` vs `SandboxKind.SandboxExec` vs `SandboxKind.Noop`, not `is_linux=True`).
+- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`WorkerState.Running` vs `WorkerState.Crashed`, not `is_running=True`).
 - **No `print()` in worker code or library code.** Use `logging`. The worker's stdout is reserved for the protocol.
 - **No shell=True with user input.** Use list-form `subprocess.run`. `git_op` and `grep_code` enforce this.
 - **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture/architecture.md` §12.
-- **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See §6.2.
+- **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See `docs/architecture/architecture.md` §6.2.
+- **Module shape** (per `docs/architecture/module-template/*`): modules are pure JSON-in/JSON-out functions with strict JSON schemas, each with a CLI entry — `python -m cambium.modules.<name>` reads JSON from stdin, writes JSON to stdout. Modules depend on `Protocol`s (ports/adapters), never concrete providers; dependency injection happens at the root.
+- **Engine swap is a strategy pattern.** The rule engine is the primary `decide` implementation today; a DSPy program implementing the same interface can replace it behind the seam without touching callers (v2.1 — `docs/research/dspy-python-314.md`; see `docs/architecture/module-template/architecture.md` §5.1/§5.3).
+- **Durable state layout.** Event log and conversation store live in SQLite (WAL mode); low-level IPC is JSON-Lines. All session state sits under the dotted `.cambium/` dir — `docs/architecture/architecture.md` §16.2 is canonical on that naming.
+
+### Coding principles (translated constitution)
+
+> The Rust/HFT coding-preference constitution, translated for Cambium's Python 3.14 stack.
+> Detail and citations per principle: `docs/research/coding-constitution.md` (a)–(l).
+> Bullets marked **new** become normative on merge; the rest restate or sharpen existing
+> §7 / `docs/architecture/architecture.md` §19 norms.
+> Overlaps with existing §7 bullets are merged — ONE bullet each, the fuller existing bullet
+> wins: "Module shape" absorbs the patch's "Small, JSON-schema-shaped interfaces"; "Engine
+> swap is a strategy pattern" (with the "Flat over nested" tail) absorbs the patch's
+> "Business logic = pure functions on flat structs" — those two patch bullets are one-line
+> pointers below. The "Prefer Protocols" bullet shares the Protocols point with "Module shape"
+> but keeps its new no-deep-hierarchy/no-dynamic-machinery norm.
+
+- **Measure before optimizing.** *New.* Time goes where measurement says it goes: worker cold
+  start is dominated by interpreter startup + `import dspy` (~1–3 s, `docs/architecture/reviews/
+  review-implementation.md` §M2), so allocation micro-opts are noise until that floor is
+  addressed. Profile first; do not churn hot paths on speculation. See (a).
+- **Flat records over deep object graphs.** Data lives in frozen `slots=True` dataclasses and
+  lists — `events.py`, `base.py.Example`, `decide.py.TaskInput` are the precedent. Events are
+  flat payloads, not pointer graphs. See (b).
+- **No shared mutable state across threads.** Cambium's architecture is the enforcement:
+  single-writer event-log thread with a bounded queue (`docs/architecture/architecture.md` §6.2;
+  `docs/research/custos-asyncio-design.md` §2.4), bounded drop-on-full logging queues
+  (`docs/research/logging-design.md` §2.9), workers as separate processes over stdio pipes
+  (§5.1). Add nothing that shares mutable state across threads. See (c).
+- **asyncio loop-affine state.** Mutable handles are mutated by exactly one loop task per
+  transition, with no `await` between check and set (`docs/research/custos-asyncio-design.md`
+  §3.1). Anything crossing into a thread is an immutable, already-redacted value. See (e).
+- **Business logic = pure functions on flat structs; state and I/O at the edges.** Covered by the existing §7 "Engine swap is a strategy pattern" bullet (`Module.decide()` is the seam) and the "Flat over nested" tail; see `docs/research/coding-constitution.md` (d).
+- **Enums over booleans/ints for domain alternatives.** `WorkerState`, `ResultStatus`,
+  `EventKind`, `SandboxKind` are enums, not strings; booleans are predicates and API
+  compatibility only (existing §7 bullets). New domain alternatives are enum members — the
+  v2.1 `Decision` migration for `should_decompose` is documented in `docs/research/
+  coding-constitution.md` (i); do not change the reviewed v2 contract now.
+- **Prefer Protocols and plain functions over deep class hierarchies.** `base.py`
+  `Output`/`Metric` are the precedent. No dynamic machinery where a plain function suffices.
+  Composition over inheritance; a module is a small interface + a pure core. See (f), (g).
+- **Small, JSON-schema-shaped interfaces; modules deletable without breaking siblings.** Interface shape = the existing §7 "Module shape" bullet; new here: pinned siblings (`docs/architecture/architecture.md` §17.2) keep a module removable without breaking siblings — §10 "done" is the deletion checklist; see `docs/research/coding-constitution.md` (g).
+- **Flat control flow.** Early returns, guard clauses, exhaustive `match` over enums (existing
+  §7 "Flat over nested"). See (h).
+- **No globals, no hidden state, no singletons.** Existing §7 "No hidden global state";
+  `docs/architecture/architecture.md` §19 item 6, §16.2 invariant 5. New nuance: `functools.cache` and
+  class-level mutable defaults are static state — use them only at explicitly-owned boundaries
+  (the `Diffundo` cache is owned). See (k).
+- **Battle-tested libraries over custom infra.** Stdlib + git + uv + pytest; dspy is an
+  optional extra. No hand-rolled logging, IPC framing, or persistence (`pyproject.toml`;
+  `docs/architecture/architecture.md` §1 non-goal 5). See (j).
+- **Delete over add.** *New.* Prefer deleting, composing, or using an existing library over
+  adding new code. A smaller interface is easier to reason about and delete later. See (l).
 
 ---
 
-## 8. Where to look for what
+## 8. Design norms
+
+- **Task tree, not flat lists.** Decomposition produces a tree (DAG): nodes are sub-LLM sessions. A node's only contract is its `Result` envelope — a unified diff, summary, and metrics. A parent **never reads a child's scratchpad or reasoning**; steering goes downward by `session_id`, results flow upward as envelopes (design-deltas D2/D3).
+- **Determinism split.** The LLM plans — it emits JSON arrays of sub-tasks. Deterministic supervisor code manages spawning, queues, and merges. The LLM never manages parallelism.
+- **Let it crash.** Worker crashes are normal; the supervisor restarts from the last durable checkpoint. Do **not** write defensive spaghetti in workers: no `try/except` around LLM-output parsing — crash, and let the supervisor handle it.
+- **Prompt structure for provider caching.** Static prefix (system prompt, `AGENTS.md`, guidelines) at the top; dynamic content (conversation history, repo state) at the bottom. Never put timestamps or request IDs at the top. There is **no local LLM cache** — provider-side caching only (supersedes `architecture.md` §8.1 cache design per design-deltas D1 — arch amendment pending); prompt structure exists to make provider caches hit, not as a correctness mechanism.
+- **No sandboxing in the harness.** Containment = git worktree isolation + permission allowlists + approval gates (design-deltas D7). Workers are stdio processes — local today, a disposable container at deployment, and that is out of harness scope.
+- **Canary gate.** Any metric or refinement change that degrades the canary score is **rejected** — the canary suite is the gate, not a suggestion (`docs/architecture/module-template/dataset-format.md` §6; design-deltas D5).
+
+---
+
+## 9. Where to look for what
 
 | If you need to... | Read this |
 |---|---|
 | Understand the system end-to-end | `docs/architecture/architecture.md` §0–§7 |
+| Understand an adopted design decision (delta over architecture v2) | `docs/research/design-deltas.md` (D1–D7) |
 | Add or change a decision module | `docs/architecture/module-template/architecture.md`, then `docs/architecture/module-template/example-spec.md` |
 | Add or change a dataset | `docs/architecture/module-template/dataset-format.md` |
 | Add a new protocol message | `docs/architecture/architecture.md` §5.2, then `src/cambium/nuntius/` |
 | Debug a worker crash / restart loop | `docs/architecture/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
-| Debug a merge failure | `docs/architecture/architecture.md` §4 (Unio), §7.7 |
+| Debug a merge failure | `docs/architecture/architecture.md` §4 (Unio), §7.8 |
 | Understand an old design choice | `docs/architecture/system-design.md` (v0.1) + the three `docs/architecture/reviews/` |
-| Find what to copy for a new sandbox backend | `src/cambium/septum/` + §4 (Septum) in architecture.md |
+| Find what to copy for a sandbox backend (out of v2 scope) | `src/cambium/septum/` + §4 (Septum) in architecture.md; removal rationale in design-deltas D7 |
 
 ---
 
-## 9. What "done" means for a module
+## 10. What "done" means for a module
 
 A module is **done** when **all** of the following hold:
 
@@ -148,7 +225,7 @@ If any of these is missing, the module is **not done** — it is "in progress." 
 
 ---
 
-## 10. Asking for help
+## 11. Asking for help
 
 Ask the orchestrator (root agent) when:
 - Two equal-priority requirements conflict and evidence cannot decide.
