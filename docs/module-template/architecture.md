@@ -1,6 +1,6 @@
 # Module Architecture — Template
 
-**Status:** Normative template. Every DSPy module in Cambium (`ShouldDecompose`, `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`, `Opifex` ReAct, future modules) ships a `src/cambium/modules/<name>/architecture.md` filled out against this template.
+**Status:** Normative template. Every decision module in Cambium (`should_decompose`, `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`, `Opifex` ReAct, future modules) ships a `src/cambium/modules/<name>/architecture.md` filled out against this template. Each module subclasses `cambium.modules.base.Module`; the `should_decompose` reference at `src/cambium/modules/example/` is the canonical instance.
 
 > Copy this file to `src/cambium/modules/<name>/architecture.md` and fill in every section. Empty sections are not acceptable; write "N/A — <reason>" if a section genuinely does not apply.
 
@@ -23,7 +23,7 @@
 
 One paragraph. State the decision the module makes or the transformation it performs. State the **failure mode of the system if this module did not exist**.
 
-Example (`ShouldDecompose`): "Decides whether a task spec should be decomposed into parallel subtasks or dispatched as a single atomic unit. Without this module, every task — including trivially atomic ones — pays the cost of decomposition + parallel dispatch + serial merge, and the orchestrator over-decomposes coherent tasks into inconsistent fragments."
+Example (`should_decompose`): "Decides whether a task spec should be decomposed into parallel subtasks or dispatched as a single atomic unit. Without this module, every task — including trivially atomic ones — pays the cost of decomposition + parallel dispatch + serial merge, and the orchestrator over-decomposes coherent tasks into inconsistent fragments."
 
 ---
 
@@ -83,40 +83,61 @@ Modules in the **Deterministic Layer** of Cambium must not own LLM-derived state
 
 ### 5.1 Signature
 
-The DSPy signature, as a string and as a Python class. Reference: DSPy docs for `dspy.Signature`, `dspy.ChainOfThought`, `dspy.ReAct`, `dspy.Predict`.
+### 5.1 Implementation strategy — rule engine primary, DSPy seam
+
+Every v2 module subclasses `cambium.modules.base.Module` and implements two methods: `async decide(input) -> Output` and `metric(example: Example) -> float`. The **primary** implementation may be a rule engine (as in the `should_decompose` reference at `src/cambium/modules/example/`), a pure function, or any deterministic procedure — DSPy is **not** required for v2. The `decide` method **is the DSPy seam**: a future DSPy program implementing the same interface can replace the primary behind it without touching callers, the dataset, the loader, or the metric.
 
 ```python
-class ShouldDecomposeSignature(dspy.Signature):
-    """Classify whether a task spec should be decomposed."""
-    spec: str = dspy.InputField(desc="The task specification.")
-    repo_context: str = dspy.InputField(desc="Repository context summary, ≤2k chars.")
-    should_decompose: bool = dspy.OutputField(desc="True if decomposition is worth the cost.")
-    rationale: str = dspy.OutputField(desc="One-sentence justification.")
-    confidence: float = dspy.OutputField(desc="Calibrated probability in [0, 1].")
+# src/cambium/modules/base.py  (scaffold, authoritative)
+class Module(ABC):
+    name: str
+    @abstractmethod
+    async def decide(self, input: Any) -> Output: ...
+    @abstractmethod
+    def metric(self, example: Example) -> float: ...
 ```
 
-### 5.2 Module class
+### 5.2 DSPy signature (only when the module has a DSPy seam)
+
+If a future DSPy program will replace the rule engine, document its signature here. Reference: DSPy docs for `dspy.Signature`, `dspy.ChainOfThought`, `dspy.ReAct`, `dspy.Predict`. This subsection may be marked "N/A — no DSPy seam in v2" if the module is permanently rule-based.
 
 ```python
-class <Module>(dspy.Module):
-    def __init__(self):
-        self.classifier = dspy.ChainOfThought(ShouldDecomposeSignature)
+class <Module>Signature(dspy.Signature):
+    """<one-sentence purpose>."""
+    task: str = dspy.InputField()
+    context: str = dspy.InputField()
+    decompose: bool = dspy.OutputField(desc="True if decomposition is worth the cost.")
+    reason: str = dspy.OutputField(desc="One-sentence justification.")
+```
 
-    def forward(self, *, spec: str, repo_context: str = "") -> <Module>Output:
-        pred = self.classifier(spec=spec, repo_context=repo_context)
-        # Post-processing / validation / type coercion here.
+### 5.3 DSPy replacement (v2.1+, opt-in)
+
+```python
+class <Module>DSPy(<Module>Module):
+    """DSPy-backed replacement; same Module interface."""
+
+    def __init__(self, diffundo: Diffundo):
+        # Idiomatic DSPy configuration (NOT dspy.settings.context mutation):
+        dspy.configure(lm=CambiumLM(diffundo, tier="fast", temperature=0.0))
+        self._clf = dspy.ChainOfThought(<Module>Signature)
+
+    async def decide(self, input: <Module>Input) -> <Module>Output:
+        pred = self._clf(task=input.task, context=input.context)
+        # Attribute access on dspy.Prediction (pred.dict() does NOT exist):
         return <Module>Output(
-            decision=pred.should_decompose,
-            confidence=float(pred.confidence),
-            rationale=pred.rationale.strip(),
+            decompose=bool(pred.decompose),
+            reason=str(pred.reason),
         )
+
+    def metric(self, example: Example) -> float:
+        return <module>_metric(example)   # unchanged from rule-engine version
 ```
 
-### 5.3 LLM access
+### 5.4 LLM access
 
-All LLM calls route through `Diffundo` (see `docs/architecture.md` §9). The module receives a `Diffundo`-backed `CambiumLM` from its caller; it never constructs `dspy.LM` directly.
+All LLM calls route through `Diffundo` (see `docs/architecture.md` §9). The DSPy replacement receives a `Diffundo`-backed `CambiumLM` from its caller; it never constructs `dspy.LM` directly and never mutates `dspy.settings.context` — it calls `dspy.configure(lm=...)` per `architecture.md` §9.3.
 
-### 5.4 Determinism
+### 5.5 Determinism
 
 State the temperature, top-p, and seed policy. Default: `temperature=0.0` for classifier/evaluator modules; `temperature=0.2` for generative ones. Document any module where determinism is required and how it is enforced.
 
@@ -216,7 +237,7 @@ How this module is tested against **stub** siblings (frozen references) rather t
 Concrete, answerable questions that this module cannot resolve in isolation. Each one should be tagged with who can answer it (orchestrator, sibling-module owner, infrastructure).
 
 Example:
-- Q: Does `ShouldDecompose` see the worker tier mix before deciding? Currently no. (Owner: `Architectus` author.)
+- Q: Does `should_decompose` see the worker tier mix before deciding? Currently no. (Owner: `Architectus` author.)
 
 ---
 

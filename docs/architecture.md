@@ -150,7 +150,9 @@ class Session:
         """Block until the task completes, fails permanently, or is cancelled."""
 
     async def events(self) -> AsyncIterator[Event]:
-        """Stream every Event. Durability: every event is fsync-d before yielded."""
+        """Stream every Event. Durability: see §6.5 — critical events are
+        fsync-d before yielded; non-critical events may be lost within the
+        configured fsync interval (default 1 s) on supervisor crash."""
 
     async def cancel(self, reason: str = "user") -> None: ...
 ```
@@ -217,7 +219,7 @@ class Event:
     payload: dict           # type-specific; redacted of secrets (§9)
 ```
 
-The `Event` stream is the **machine interface**. The TUI renders it; the host system can also subscribe. Every `Event` has been fsync-d to the durable log before it is yielded to subscribers.
+The `Event` stream is the **machine interface**. The TUI renders it; the host system can also subscribe. Durability is tiered (critical vs non-critical events) — see §6.5 for the precise contract; in short, critical events (`result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`) are fsync-d before they are yielded to any subscriber, while non-critical events may be lost within the configured fsync interval (default 1 s) on supervisor crash.
 
 ---
 
@@ -232,7 +234,7 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 | M3 | Surculus | Deterministic | `git worktree` lifecycle: create, recover, prune, list. | None (state lives in git). |
 | M4 | Custos | Deterministic | Supervisor: lifecycle, watchdog, restart, event log writer. | WorkerHandle table; event log handle; restart counters. |
 | M5 | Opifex | Worker | DSPy ReAct loop; tools; checkpoint; heartbeat. | Per-worker: trajectory, turn counter, generation token. |
-| M6 | Architectus | Orchestrator | DSPy modules: `ShouldDecompose`, `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. | DSPy program versions (read-only at runtime). |
+| M6 | Architectus | Orchestrator | Decision modules: `should_decompose` (v2 rule engine; DSPy seam per `docs/module-template/example-spec.md`), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. All subclass `cambium.modules.base.Module` (`decide()` + `metric()`). | Program versions (read-only at runtime). |
 | M7 | Unio | Deterministic | Merge sequencer: serialized, throwaway worktree, test gate. | None (operates on a temp worktree). |
 | M8 | Septum | Deterministic | Sandbox wrapper: `bwrap` (Linux), `sandbox-exec` (macOS), noop. | None. |
 | M9 | Ascensus | Tooling (offline) | Optimization harness: per-module dataset, metric, held-out eval. | Optimized prompt artifacts under `.cambium/optimized/`. |
@@ -384,12 +386,12 @@ The event log is the **durable feedback channel**: it is how the orchestrating L
 asyncio tasks ──► │ supervisor     │  queue.Queue   │ single consumer:       │
                   │ enqueues Event ├───────────────►│ - dequeue               │
                   │ (non-blocking) │   (bounded,    │ - BEGIN; INSERT; COMMIT│
-                  │                │    backpressure│ - fsync WAL every 1s   │
-                  └────────────────┘    or drop+log)│ - publish to in-proc   │
-                          │                            │   subscriber set      │
-                          ▼                            └───────────┬────────────┘
-                  in-memory ring buffer                            │
-                  (last 10 000 events)                            ▼
+                  │                │    backpressure│ - fsync per §6.5:      │
+                  └────────────────┘    or drop+log)│   • critical = now     │
+                          │                            │   • other    ≤ 1 s    │
+                          ▼                            │ - publish to in-proc   │
+                  in-memory ring buffer                │   subscriber set      │
+                  (last 10 000 events)                └───────────┬────────────┘
                                                               asyncio.Queue
                                                                   │
                                                                   ▼
@@ -402,8 +404,8 @@ Invariants:
 1. The supervisor **never** performs disk I/O on the event-loop thread. Every event goes through `queue.Queue.put_nowait()` (non-blocking).
 2. The queue is **bounded** (default 10 000). On overflow, the writer drops the oldest non-critical event, logs a `drop` marker, and increments a counter. Critical events (`result`, `worker_exit`, `task_failed`, `merge_progress`) are **never** dropped — they block the producer for up to 100 ms (acceptable, because these are rare).
 3. The writer thread is the **sole process** that holds the SQLite write connection. There is no concurrency on the write path. The in-memory ring buffer is a `collections.deque(maxlen=10000)` protected by a `threading.Lock`.
-4. **fsync cadence:** the writer calls `PRAGMA wal_checkpoint(PASSIVE)` and `os.fsync(db_fd)` at most once per second, or immediately on critical events. The default fsync cadence is configurable.
-5. **Subscribers** (`Session.events()` consumers) receive events via an `asyncio.Queue` fed from the writer thread through `loop.call_soon_threadsafe`. Subscribers are guaranteed to see events in monotonic order, fsync-d before delivery.
+4. **fsync cadence:** the writer maintains two modes — *batched* and *critical-immediate*. In batched mode it flushes the SQLite WAL to disk at most once per `fsync_interval_s` (default 1.0) via `PRAGMA wal_checkpoint(TRUNCATE)` followed by `os.fsync(wal_fd)` on the WAL file's fd (not the main DB fd — in WAL mode recent commits live in the `-wal` file, so fsyncing the main DB fd alone is a no-op for durability). In critical-immediate mode (entered when a critical event is dequeued), it runs the same checkpoint+fsync before acking the producer. `PRAGMA synchronous=NORMAL` is set (WAL+NORMAL is crash-safe for the last committed transaction; FULL would add an fsync per commit and is unnecessary with our explicit WAL checkpoint). The default cadence is configurable.
+5. **Subscribers** (`Session.events()` consumers) receive events via an `asyncio.Queue` fed from the writer thread through `loop.call_soon_threadsafe`. Subscribers see events in monotonic order. **Critical events** are guaranteed to be fsync-d before they reach a subscriber; **non-critical events** may reach a subscriber before they are fsync-d, so a supervisor crash within `fsync_interval_s` can drop the most recent non-critical events from a subscriber's view (but the in-memory ring buffer and the at-most-1s checkpoint catch-up close the gap on restart — see §6.5).
 6. **Redaction** is applied at enqueue time, before the event ever reaches disk (§9.3).
 
 ### 6.3 Event schema (durable)
@@ -438,6 +440,38 @@ A worker emits `{"type":"checkpoint", "state_ref":"...", "commits_so_far":[...]}
 On restart (§7.4), `Custos` loads the latest checkpoint for the task and re-injects it into the new worker via the `init` message as `resume_from_checkpoint`. Workers that opt out of checkpointing (e.g., read-only tasks) accept a fresh start.
 
 **Checkpoint is not a substitute for the event log.** The event log records *what happened* (for replay, audit, training); checkpoints record *where to resume* (for crash recovery). They are distinct stores.
+
+### 6.5 Durability contract (precise)
+
+The previous sections refer to "durability" in several places. This section states the contract once, exactly, and is normative.
+
+**Event tiers.** Every event has a tier, derived from `kind`:
+
+| Tier | Kinds | Promise |
+|---|---|---|
+| **Critical** | `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`, `task_assigned`, `merge_committed` | Fsync-d to disk **before** the writer returns the ack to the producer and **before** the event is yielded to any `Session.events()` subscriber. Loss window on supervisor crash: zero (last committed transaction may be lost only on simultaneous kernel/page-cache loss, which SQLite WAL + `synchronous=NORMAL` protects against). |
+| **Non-critical** | `heartbeat`, `tool_event`, `log`, `worker_spawned`, `worker_ready` | Appended to the WAL subject to `fsync_interval_s` (default 1 s) checkpoint cadence. Loss window on supervisor crash: at most `fsync_interval_s` of the most recent non-critical events. |
+
+**Mechanism.** The writer thread holds open the main DB fd **and** the WAL fd. The "fsync" operation is:
+
+```python
+def _fsync_now(self) -> None:
+    cur = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    cur.close()
+    os.fsync(self._wal_fd)        # fsync the WAL file (recent commits live here)
+    os.fsync(self._db_fd)         # belt-and-braces; cheap after a TRUNCATE checkpoint
+```
+
+Notes:
+
+- `PRAGMA synchronous=NORMAL` is set on connection open. Under WAL, NORMAL is crash-safe for the most recently committed transaction; FULL would add a per-commit fsync that defeats batching. Our explicit `_fsync_now` is the source of truth for cross-interval durability.
+- We fsync the **WAL fd**, not just the main DB fd. In WAL mode, recent commits are appended to `${db}-wal`; fsyncing only the main DB fd is a no-op for those commits — this was the latent bug in the v2.0 draft's invariant 4 wording.
+- Critical events trigger `_fsync_now` synchronously inside the writer's dequeue loop before the next event is read; non-critical events are buffered until the next timer-driven `_fsync_now` (every `fsync_interval_s`).
+- The timer-driven `_fsync_now` runs even when no critical events arrive, so the worst-case non-critical loss on crash is bounded by `fsync_interval_s`.
+
+**Recovery on supervisor restart.** Open the DB (SQLite replays the WAL automatically), read `events` since the last `snapshots` row, and re-publish to fresh subscribers. Non-critical events missing from the tail are detected by a gap in `seq` (gap-free invariant); the writer emits a `recovery_gap` event documenting the lost range.
+
+**What this means for callers.** A caller that needs proof a thing happened must wait for the matching **critical** event (e.g., a `result` event for task completion, a `merge_committed` event for a merge). A caller that observes only heartbeats or tool events cannot prove liveness across a supervisor crash — by design, since these are high-volume advisory signals.
 
 ---
 
@@ -529,6 +563,8 @@ class RestartPolicy:
 
 ### 7.5 Worktree recovery (resolves DS-C5, IMPL-M9)
 
+> The worktree lifecycle rules below consolidate Codex desktop-app practice (per-task worktree, detached HEAD, snapshot before deletion, ~15-worktree GC cap, `.worktreeinclude` for ignored files like `.env`) as researched in `docs/research/codex.md` ("Worktree lifecycle engineering"). The lock-cleanup sequence addresses the specific failure modes Prime Agent exhibited locally (`docs/research/prime-agent.md` §3.2 — socket/lock-file supervision failures).
+
 Before **every** respawn (not just first-spawn), `Surculus.recover(worktree, base_commit)` runs:
 
 1. Remove every `*.lock` file under `${worktree}/.git` and `${repo}/.git/worktrees/${id}`.
@@ -585,6 +621,55 @@ async def shutdown(self):
 ```
 
 Process groups are used (not bare PIDs), so grandchildren die with the worker. The supervisor's own parent (host system) can additionally `killpg` the supervisor's PID for hard shutdown.
+
+### 7.8 Merge terminal step — atomic update of `refs/heads/main`
+
+The catalog (§4) and §7.1 establish that `Unio` operates in a throwaway worktree under an `asyncio.Lock`. This section normatively closes the loop: **how does `main` actually get updated?** Without an explicit terminal step, the v2.0 draft left the merge sequencer "verifying in a throwaway worktree" with no path to publishing the result.
+
+**Single writer.** `Unio` is the **only** code path in Cambium permitted to mutate `refs/heads/main`. Workers never touch `main`; the orchestrator never touches `main`; only `Unio.publish_merge(...)` does, and it holds the `Unio` lock for the duration.
+
+**Publish sequence (atomic fast-forward):**
+
+```python
+async def publish_merge(self, verified_tip: str) -> str:
+    """Fast-forward refs/heads/main to verified_tip under the Unio lock.
+
+    `verified_tip` is the SHA that the throwaway worktree reached after the
+    test gate passed. This call must not run any test or build; that work is
+    already done. It only publishes.
+    """
+    async with self._lock:                      # the only writer to main
+        # 1. Refuse non-fast-forwards: this is a hard correctness invariant.
+        #    A non-FF means main moved while we were verifying — abort and
+        #    let the orchestrator re-merge against the new main.
+        old_sha = self._read_ref("refs/heads/main")
+        if not await self._is_ancestor(old_sha, verified_tip):
+            raise NonFastForward(old=old_sha, new=verified_tip)
+
+        # 2. Atomic ref update. `git update-ref` takes the ref lock inside
+        #    .git/refs/heads/main.lock, writes the new SHA, renames — atomic
+        #    at the filesystem level. We pass the expected old_sha so a
+        #    concurrent update from outside Cambium (e.g., a human `git push`)
+        #    is detected rather than silently overwritten.
+        await self._git(["update-ref", "refs/heads/main", verified_tip, old_sha],
+                        check=True)
+        # 3. Emit the critical merge_committed event BEFORE returning, so
+        #    subscribers see it only after it is durable (§6.5).
+        await self._events.enqueue_critical(Event(
+            kind="merge_committed",
+            payload={"old": old_sha, "new": verified_tip},
+            ...))
+        return verified_tip
+```
+
+**Crash-safety story.**
+
+- `git update-ref` is the atomic primitive: it takes `.git/refs/heads/main.lock`, writes the new SHA to a tempfile, and renames over the ref file. A crash before the rename leaves `main.lock` (recovered by `Surculus.recover()`, §7.5) and `main` unchanged. A crash after the rename has `main` pointing at the new SHA. There is no torn state.
+- The expected-old-SHA argument (`update-ref <ref> <new> <old>`) makes the publish **fail loudly** if anything — including a human `git push` to `main` while Cambium is running — moved the ref between read and write. The orchestrator treats `NonFastForward` as "main moved; re-merge from the new main."
+- The `merge_committed` event is **critical** (§6.5). It is fsync-d before `publish_merge` returns, so a supervisor crash immediately after `update-ref` is observable on recovery: the event log shows the new main SHA, and `result.json` can be written against it. A crash *between* `update-ref` and the event emit leaves the ref advanced but the event log unaware — on recovery, `Unio.reconcile()` reads `refs/heads/main`, compares to the latest `merge_committed` event, and emits a `merge_reconciled` event to close the gap.
+- No working-tree checkout of `main` is performed by `Unio`. The publish is purely a ref update; the working tree of `main` (if any) is updated by the host system or a separate Cambium command, never automatically. This is the same lesson Codex's CLI applies ("create git checkpoints; do not auto-mutate the working tree") — see `docs/research/codex.md`.
+
+**Lock scope.** The `Unio` lock is held across verify-in-throwaway-worktree **and** publish. This serializes the whole merge pipeline. Throughput impact is documented in DS-M1; the throwaway-worktree + batch-test mode mitigates wall-clock cost without weakening the single-writer invariant.
 
 ---
 
@@ -702,13 +787,15 @@ There is no single number that captures "did the agent write good code." v2 uses
 
 Final score: `score = (tests × w1 + spec_adherence × w2 + diff_quality × w3 + behavioral_checks × w4) × canaries`. Weights are per-task-type in config; defaults above.
 
-**Held-out evaluation set.** `Ascensus` ships with 20+ reference tasks (in `datasets/eval/`) with gold diffs and pre-registered rubrics. The held-out set is **never** used for training; it is the gate for shipping optimized prompts to production.
+**Held-out evaluation set.** `Ascensus` ships with 20+ reference coding tasks (in `src/cambium/modules/<name>/datasets/eval.jsonl`, schema in `docs/module-template/dataset-format.md`) with gold diffs and pre-registered rubrics. The held-out set is **never** used for training; it is the gate for shipping optimized prompts to production.
 
 **Reward-hacking canaries.** Each held-out task ships with 3–5 canary assertions designed to detect the failure modes the metric would otherwise incentivize (deleting failing tests, no-op patches, `# noqa` additions, etc.). A prompt variant that improves the training metric while regressing the canary rate is **rejected** by the optimization harness, even if its score went up.
 
 ---
 
 ## 11. Worker Tool Set (resolves LLM-M2, IMPL-C4, IMPL-C5, IMPL-N4)
+
+> The tool-set design and the per-tool heartbeat model below borrow concrete lessons from `docs/research/codex.md` ("Worktree lifecycle engineering", "Make git checkpoint/rollback implicit") and `docs/research/prime-agent.md` (children die mid-work — checkpoint early and often).
 
 | Tool | Implementation | Notes |
 |---|---|---|
@@ -782,34 +869,40 @@ Applied at enqueue time (before the writer thread sees the event). Belt-and-brac
 - **Correlation:** every record carries `task_id`, `request_id`, `generation`, ` monotonic_ms`. Set via `logging.LoggerAdapter` per task.
 - **Redaction:** a `logging.Filter` applies the same redaction as §12.3.
 - **stderr from workers** is captured by the supervisor and forwarded to the event log as `kind="log"` events with `level` and `module` fields parsed from common prefixes (`WARNING`, `ERROR`, etc.). Unparseable stderr lines are stored verbatim at level `INFO`.
+- **Diagnostics command (`cambium doctor`).** A health check that validates log↔state consistency, reports dropped-event counters from §6.5, verifies worktree↔ref alignment, and flags stale `.lock` files. Modeled on `codex doctor` (see `docs/research/codex.md` "Persistence = append-only log + migrated SQLite, plus a diagnostics command"); Codex's local install shows the exact drift failure mode (rows pointing at missing rollout files) this command exists to surface early.
 
 ---
 
 ## 14. Python Stance
 
-- **`requires-python = ">=3.14,<3.15"`** in `pyproject.toml`. Pinned to 3.14, as required by the task.
-- **Standard CPython build.** Free-threaded (`python3.14t`) is **not** required, **not** the default, and **not** recommended for v2. Rationale:
-  - Workers are separate **processes**, not threads; the GIL is irrelevant to inter-worker parallelism.
+- **`requires-python = ">=3.14,<3.15"`** in `pyproject.toml`. Pinned to 3.14, as required by the task. Verified against a real 3.14.7 install: see `docs/research/python-3.14.md` ("Recommendation for Cambium").
+- **Standard CPython (GIL) build.** Free-threaded (`python3.14t`) is **not** required, **not** the default, and **not** recommended for v2. Rationale (drawn from `docs/research/python-3.14.md`):
+  - Workers are separate **processes**, not threads; the GIL is irrelevant to inter-worker parallelism. Process isolation already delivers multi-core parallelism.
   - The supervisor is single-threaded asyncio.
-  - The only multi-threaded code is `Ascensus` (offline SIMBA fan-out); when needed, it can opt into free-threading via `pyproject.toml` extras.
-  - Free-threading adds 10–40% single-threaded overhead and C-extension risk (DSPy, LiteLLM, torch).
-- **Free-threading is an opt-in extra** for users who want SIMBA parallelism:
+  - The only in-process multi-threaded code is `Ascensus` (offline SIMBA fan-out); `asyncio.to_thread` for LLM/`git` calls is I/O-bound and releases the GIL on blocking I/O regardless.
+  - Free-threading adds ~5–10% single-threaded overhead on 3.14 (per `docs/research/python-3.14.md` §"Cost/benefit in 3.14"; the 10–40% figure measured on 3.13t is outdated), disables the JIT, and adds C-extension risk (DSPy, LiteLLM, tokenizers, torch, numpy FT-safety is **UNVERIFIED** per the same doc).
+  - Free-threading is officially supported in 3.14 (PEP 779) but still optional and not the default; pinning plain 3.14 yields the GIL build for everyone (`docs/research/python-3.14.md` §"GIL / free-threading").
+- **Free-threading is an opt-in extra** for users who want SIMBA thread-level CPU parallelism:
   ```toml
   [project.optional-dependencies]
-  free_threaded = []  # marker only; document that user supplies python3.14t
+  free_threaded = []  # marker only; user supplies python3.14t and the FT-safe wheel set
   ```
+  Pair it with a documented fallback (`ProcessPoolExecutor` or 3.14's `concurrent.futures.InterpreterPoolExecutor`, both available in 3.14 and verified present in `docs/research/python-3.14.md`), as the implementation review's M1 asks. On the GIL build, `InterpreterPoolExecutor` is preferred for in-process parallelism — it gives real multi-core (per-interpreter GIL, PEP 684) without FT risk.
+- **3.14 features the design relies on**, all verified in `docs/research/python-3.14.md`: `asyncio.to_thread`, `asyncio.timeout`, `asyncio.TaskGroup`; PEP 649/749 lazy annotations (lets DSPy/LiteLLM type-heavy code drop `from __future__ import annotations`); `multiprocessing`'s new `forkserver` default and `Process.interrupt()` for clean worker stop; `concurrent.interpreters` for future worker-pool work. **Migration note:** `forkserver` is now the default multiprocessing start method on Linux — any Cambium code that relied on `fork` semantics must be re-validated (per the same doc).
 - **`asyncio.to_thread`** is used for the rare synchronous, CPU-light blocking call inside the supervisor (e.g., `git` invocations). It runs on the default thread pool, which is fine because no shared mutable state is touched inside those calls.
-- **Subprocess-per-worker** design means each worker is a fresh Python interpreter. Cold-start cost is documented (IMPL-M2) and mitigated by `ready_timeout`. A persistent worker pool is **deferred to v2.1** — it requires a different IPC model (multiple init messages per process) and is not needed for v2 correctness.
+- **Subprocess-per-worker** design means each worker is a fresh Python interpreter. Cold-start cost is documented (IMPL-M2) and mitigated by `ready_timeout`. A persistent worker pool (or `InterpreterPoolExecutor`-backed pool) is **deferred to v2.1** — it requires a different IPC model (multiple init messages per process) and is not needed for v2 correctness.
 
 ---
 
 ## 15. TUI Policy
 
-- **The TUI (`Janus`, M10) is a view, not a controller.** It subscribes to `Session.events()` and renders `Event` objects. It does not call `Custos` directly.
-- **Headless-first.** Every feature reachable from the TUI is reachable from the public API. If a feature is TUI-only, that's a bug.
+> The TUI design lessons below are drawn from `docs/research/tui-best-practices.md` (which inspects opencode 0.0.0-dev-202608071959, Codex 0.146.1, and Claude Code locally) and `docs/research/codex.md`. Cited inline.
+
+- **The TUI (`Janus`, M10) is a view, not a controller.** It subscribes to `Session.events()` and renders `Event` objects. It does not call `Custos` directly. This mirrors the `opencode run --format json` and `codex exec` headless surfaces — both ship a JSON event stream that any UI can render (`docs/research/tui-best-practices.md` §1, `docs/research/codex.md` "Headless exec is the harness surface").
+- **Headless-first.** Every feature reachable from the TUI is reachable from the public API. If a feature is TUI-only, that's a bug. opencode and Codex both ship their TUI as a thin layer over the same protocol their headless modes speak; we follow the same rule.
 - **The TUI is optional at runtime.** `pip install cambium` does not require the TUI's dependencies; `pip install cambium[tui]` adds them. The TUI lives in `cambium.tui` behind the extra.
 - **The machine interface is JSON-Lines events.** A host system that wants to render its own UI reads `Session.events()` exactly as the TUI does. There is no second API.
-- **TUI is NOT in scope for v2 P0.** It is P2 and depends only on the Public API.
+- **TUI is NOT in scope for v2 P0.** It is P2 and depends only on the Public API. Build it last, after the headless contract is locked.
 
 ---
 
@@ -876,7 +969,7 @@ The host may rely on the following invariants across v2.x:
 
 ### 17.1 The coupling problem, restated
 
-`Architectus` has four DSPy modules: `ShouldDecompose`, `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. `Opifex` has its own worker ReAct module. v0.1 claimed all five were "independently hill-climbable." They are not: the worker metric depends on the decomposer's output, the decomposer metric depends on the worker's competence, etc. SIMBA on one module with the others held fixed is a moving-target optimization.
+`Architectus` has four decision modules: `should_decompose` (v2 rule engine today, DSPy seam documented in `docs/module-template/example-spec.md` §5.1), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. `Opifex` has its own worker ReAct module. All are `cambium.modules.base.Module` subclasses with `decide()` + `metric()` methods (see the scaffold at `src/cambium/modules/base.py`). v0.1 claimed all five were "independently hill-climbable." They are not: the worker metric depends on the decomposer's output, the decomposer metric depends on the worker's competence, etc. SIMBA on one module with the others held fixed is a moving-target optimization.
 
 ### 17.2 Decoupling via pinned siblings and held-out eval
 
@@ -884,7 +977,7 @@ Each module is optimized against **frozen references** of its siblings, not thei
 
 | Module | Optimization input | Sibling pinning | Held-out metric |
 |---|---|---|---|
-| `ShouldDecompose` | `spec → bool` | None needed (input is just the spec). | Accuracy + F1 + calibration on a frozen 200-spec dataset. |
+| `ShouldDecompose` | `task, context → decompose` | None needed (input is just the spec). | Accuracy on a frozen 50-spec held-out set (train split = 200). |
 | `TaskDecomposer` | `spec → list[SubTask]` | **Stub Worker** that returns canned results per subtask ID. | Subtask-completion rate on a frozen 50-spec dataset with pre-registered gold decompositions. |
 | `TaskRouter` | `subtask, worker_profiles → route` | Stub Worker pool with declared tiers. | Routing accuracy vs gold routing on 100 cases. |
 | `ResultEvaluator` | `spec, diff, test_results → verdict` | None (input is post-hoc). | Verdict accuracy + F1 on 100 hand-labeled (spec, diff, verdict) triples. |
@@ -897,15 +990,17 @@ Each module ships, under `src/cambium/modules/<name>/`:
 ```
 src/cambium/modules/<name>/
 ├── architecture.md           # per-module design (template: docs/module-template/architecture.md)
-├── program.py                # the DSPy Module subclass
-├── metric.py                 # metric function
-├── eval.py                   # eval harness entry point
-├── datasets/
-│   ├── train.jsonl           # versioned (see docs/module-template/dataset-format.md)
-│   ├── eval.jsonl            # frozen held-out
-│   └── canaries.jsonl        # reward-hacking traps
-└── siblings-stub.yaml        # which sibling versions this module was last optimized against
+├── __init__.py               # public exports (module class, input/output, loader, metric)
+├── decide.py                 # primary implementation (rule engine today) + the Module subclass;
+│                             #   this file is also the DSPy seam — a future DSPy program
+│                             #   replaces the engine behind `Module.decide`.
+├── metric.py                 # metric function: (example_with_prediction) -> float in [0,1]
+├── dataset.py                # DatasetLoader subclass (validates JSONL → Example records)
+└── datasets/
+    └── <name>_pairs.jsonl    # v2: single combined dataset; records may carry `canary: true`.
 ```
+
+**v2 extensions (labeled, opt-in):** the scaffold ships a single combined `datasets/<name>_pairs.jsonl` with inline `canary: true` markers (see `src/cambium/modules/example/` for the reference). Splitting into `train.jsonl` / `eval.jsonl` / `canaries.jsonl` per `docs/module-template/dataset-format.md` is the planned v2.1 layout — until then, canaries are inlined in the single file and an `eval.py` harness entry point selects them by the `canary` flag. A `siblings-stub.yaml` is added when this module becomes siblings with another (the `should_decompose` reference has none — it is the first module in the pipeline).
 
 ### 17.4 Optimization loop (in `Ascensus`)
 
@@ -1053,10 +1148,23 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 
 ## 20. References
 
+### Review and prior-design artifacts
 - `docs/system-design.md` — v0.1 draft (superseded).
 - `docs/reviews/review-distributed-systems.md` — DS review (391 lines).
 - `docs/reviews/review-llm-design.md` — LLM review (242 lines).
 - `docs/reviews/review-implementation.md` — implementation review (326 lines).
+
+### Research docs (in main; cited from this document)
+
+The research docs live under `docs/research/` in main. They are not present on this branch (the orchestrator merges them); references here are by stable path so coherence is auditable when the merge lands.
+
+- `docs/research/python-3.14.md` — verified Python 3.14 capabilities. Cited in §14 (free-threading cost ~5–10% on 3.14t, JIT not available on FT builds, `concurrent.interpreters` / `InterpreterPoolExecutor` available, `forkserver` default, PEP 649/749 lazy annotations). Used as the empirical basis for the `requires-python = ">=3.14,<3.15"` GIL-build pin.
+- `docs/research/codex.md` — OpenAI Codex CLI local-install analysis. Cited in §7.5 (worktree lifecycle: per-task worktree, detached HEAD, snapshot-before-delete, ~15-worktree GC, `.worktreeinclude`), §7.8 (no auto-mutation of working tree; publish is ref-update only), §13 (`codex doctor` as the model for `cambium doctor`), §15 (headless exec is the harness surface; `codex exec`/`review`/`mcp-server`).
+- `docs/research/tui-best-practices.md` — opencode / Codex / Claude Code TUI-surface analysis. Cited in §15 (headless-first; JSON event stream as machine interface; TUI as thin consumer).
+- `docs/research/prime-agent.md` — Prime Agent local-install analysis. Cited in §7.5 (socket/lock-file supervision failure modes that motivate Surculus lock-cleanup), §11 (children die mid-work — checkpoint-early lesson).
+- `docs/research/opencode.md`, `docs/research/cloud-code.md`, `docs/research/omp.md`, `docs/research/pi.md`, `docs/research/pydev.md` — additional competitive-analysis context informing §4 module decomposition and §19 success factors. Not cited inline but tracked as background.
+
+### Templates and orientation
 - `docs/module-template/architecture.md` — per-module design template.
 - `docs/module-template/dataset-format.md` — dataset JSONL schema, versioning, splits, canaries.
 - `docs/module-template/example-spec.md` — reference module (`ShouldDecompose`) for first implementation.

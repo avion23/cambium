@@ -1,22 +1,22 @@
-# Example Module Spec — `ShouldDecompose`
+# Example Module Spec — `should_decompose`
 
-**Status:** Reference example. The first module to implement after the smoke-test harness lands. Demonstrates the template in `architecture.md` and the dataset format in `dataset-format.md`. The reference implementation will live at `src/cambium/modules/should_decompose/`, built by a parallel agent. This document is the spec; the code is the implementation.
+**Status:** Reference example. The first module implemented in Cambium. This spec is **build-ready against the existing scaffold** at `src/cambium/modules/example/` in `main` (read there for the authoritative implementation). This document is the spec; the code is the implementation. Where the two disagree, the code wins — file an issue and update this spec.
 
 ---
 
 ## 0. Why this module first
 
-`ShouldDecompose` is the right reference example for four reasons:
+`should_decompose` is the right reference example for four reasons:
 
 1. **It closes a critical flaw.** It directly resolves LLM-C6 ("no do-not-decompose path"). Every task in Cambium passes through it. Without it, the v2 architecture is incomplete.
 
-2. **It is small and well-bounded.** A single binary classification, one LLM call per invocation. No subprocess management, no git, no IPC. The implementation surface is roughly 150 lines of Python.
+2. **It is small and well-bounded.** A single boolean classification, one decision per call. No subprocess management, no git, no IPC. The v2 implementation is a **rule engine** (~140 LOC) — a DSPy program is a *future seam*, not the v2 primary.
 
-3. **It has a clean metric.** Accuracy + calibration + format-validity, all computable without human-in-the-loop scoring on a hand-labeled dataset. No coupled dependencies on worker competence (LLM-C4 does not bite here).
+3. **It has a clean metric.** Exact-match scoring on a labeled dataset, computable without human-in-the-loop scoring on the dataset. No coupled dependencies on worker competence (LLM-C4 does not bite here — `siblings-stub.yaml` is empty).
 
-4. **It exercises the full template.** Per-module architecture, dataset format, splits, canaries, sibling pinning (none needed), eval harness, optimization plan. Building it first validates the template itself before the harder modules (`TaskDecomposer`, worker ReAct) consume it.
+4. **It exercises the full per-module pattern.** `Module` ABC + `decide()` + `metric()` + `DatasetLoader` + `Example` + dataset file + canary entries + DSPy seam. Building it first validates the pattern every future module follows.
 
-The merge sequencer was considered as an alternative. It is **not** the right pick: it is not LLM-driven (no DSPy program), has no dataset, and exercises a different part of the template. `ShouldDecompose` exercises every part.
+The merge sequencer was considered as an alternative. It is **not** the right pick: it is not LLM-driven (no DSPy seam to speak of), has no dataset, and lives in the Deterministic Layer rather than the Orchestrator Layer.
 
 ---
 
@@ -25,311 +25,275 @@ The merge sequencer was considered as an alternative. It is **not** the right pi
 | Field | Value |
 |---|---|
 | Code | M6.A (submodule of Architectus, M6) |
-| Name | `Architectus.should_decompose` |
+| Name | `should_decompose` |
 | Layer | Orchestrator |
 | Owner | TBD (assigned at build time) |
-| Status | Spec'd (build-ready) |
-| Version | 0.1.0 |
+| Status | Spec'd; scaffold merged into `main` |
+| Reference code path | `src/cambium/modules/example/` |
 
 ---
 
 ## 2. Purpose
 
-Decide whether a task spec should be decomposed into parallel subtasks or dispatched as a single atomic unit to one worker. The decision is binary; the module also emits a calibrated confidence and a one-sentence rationale for audit.
+Decide whether a task spec should be dispatched atomically (one worker) or decomposed into parallel subtasks (multiple workers + merge). The decision is a single boolean; the module also emits a human-readable reason and a confidence value for audit and future calibration.
 
-**Failure mode of the system if this module did not exist:** every task — including trivially atomic ones like "rename this function" or "fix this typo" — pays the full cost of decomposition (one LLM call) + parallel dispatch (N worktrees, N process spawns, N ReAct loops) + serial merge (N rebases + N test runs). Over-decomposition of coherent tasks also produces workers that each see only a fragment of design intent, yielding inconsistent APIs and integration conflicts at merge time (LLM review C6).
+**Failure mode of the system if this module did not exist:** every task — including trivially atomic ones like "rename this function" — pays the full cost of decomposition (one LLM call) + parallel dispatch (N worktrees, N process spawns, N ReAct loops) + serial merge (N rebases + N test runs, see §7.8). Over-decomposition of coherent tasks also produces workers that each see only a fragment of design intent, yielding inconsistent APIs and integration conflicts at merge time (LLM review C6).
 
 ---
 
 ## 3. Interfaces
 
+The interfaces in this section are **authoritative for v2** because the scaffold at `src/cambium/modules/example/` already implements them. They are not negotiable in v2; changes require a v2.1 spec bump.
+
 ### 3.1 Inputs
 
 ```python
-@dataclass(frozen=True)
-class ShouldDecomposeInput:
-    spec: str                # the task specification; non-empty; ≤ 16_000 chars
-    repo_context: str = ""   # short repository context summary; ≤ 4_000 chars
-    task_kind_hint: str = "" # optional hint: "feature" | "bugfix" | "refactor" | "test" | "docs"
+# src/cambium/modules/example/decide.py
+@dataclass(frozen=True, slots=True)
+class TaskInput:
+    """Input schema for the should_decompose module."""
+    task: str
+    context: str = ""
 ```
 
-Validation:
-- `spec` is non-empty after `strip()`. Invalid → `InvalidInput`.
-- `len(spec) <= 16_000`. Invalid → `InvalidInput` (caller should chunk first).
-- `repo_context` length ≤ 4_000. Invalid → truncated by caller before invocation; module raises on violation.
-- `task_kind_hint` if non-empty must be in the allowlist. Invalid → ignored with a warning event.
+| Field | Type | Validation |
+|---|---|---|
+| `task` | `str` | non-empty after `strip()`; the dataset loader rejects empty strings as invalid records (the rule engine itself tolerates arbitrary strings, but a real caller must pass a real spec) |
+| `context` | `str` | optional; defaults to `""`. If non-empty, the rule engine searches it for `"subtask"` / `"decompos"` and short-circuits to `decompose=False` (an explicit prior decomposition in the context wins). |
+
+> **Note on the absent `task_kind_hint` field.** An earlier draft of this spec proposed `task_kind_hint: str` (an allowlist: feature/bugfix/refactor/test/docs). The scaffold does not carry that field — `TaskInput` has only `task, context`. To comply with the enum-not-string rule in `agents.md` §7 (no allowlist-with-string disguised as a domain type) **and** to stay aligned with the scaffold, the field is **dropped** in v2 rather than re-typed. If a future caller needs task-kind hints, that is a v2.1 extension: add `task_kind: TaskKind` (enum) to `TaskInput`, gated by a schema-version bump in the dataset.
 
 Source: produced by `Architectus.execute` from the host's task spec.
 
 ### 3.2 Outputs
 
 ```python
-class ShouldDecomposeDecision(enum.Enum):
-    DISPATCH_ATOMIC = "dispatch_atomic"
-    DECOMPOSE = "decompose"
-
-@dataclass(frozen=True)
-class ShouldDecomposeOutput:
-    decision: ShouldDecomposeDecision
-    confidence: float                 # calibrated probability in [0.0, 1.0]
-    rationale: str                    # one sentence; ≤ 500 chars
-    raw_llm_response: dict            # for trajectory recording; redacted
+# src/cambium/modules/example/decide.py
+@dataclass(frozen=True, slots=True)
+class DecomposeOutput:
+    """Prediction: whether the task should be decomposed into subtasks."""
+    decompose: bool
+    reason: str
+    confidence: float = 1.0
 ```
 
-Invariants the consumer (`Architectus`) relies on:
-- `0.0 <= confidence <= 1.0`. Enforced by post-processing; out-of-range values are clipped and the discrepancy is logged as a warning event.
-- `len(rationale) <= 500`. Truncated with ellipsis if the model rambles.
-- `decision` is one of the two enum values; never a string.
-- `raw_llm_response` is JSON-serializable and has been through the redaction filter (`docs/architecture.md` §12.3).
+| Field | Type | Notes |
+|---|---|---|
+| `decompose` | `bool` | The decision. `True` → orchestrator dispatches `TaskDecomposer`; `False` → orchestrator dispatches one worker atomically. |
+| `reason` | `str` | Human-readable justification produced by the rule engine (e.g., `"three or more distinct requirement clauses; long task description"`). Recorded in the event log for audit. Not scored by the metric. |
+| `confidence` | `float` | In `[0.0, 1.0]`. The v2 rule engine emits one of three fixed values (`0.7`, `0.8`, `0.9`) corresponding to evidence tiers; a future DSPy replacement may emit calibrated probabilities. **Not scored by the v2 metric** (exact-match only); v2.1 may add a calibration signal. |
 
 Consumers:
-- `Architectus.execute` reads `decision` to choose between the atomic fast path and the decomposition path.
-- The event log records the full `ShouldDecomposeOutput` as a `should_decompose_decision` event for offline analysis.
+- `Architectus.execute` reads `decompose` to choose between the atomic fast path and the decomposition path.
+- The event log records the full `DecomposeOutput` (redacted via §12.3 of `architecture.md`) as a `should_decompose_decision` event for offline analysis.
 
-### 3.3 Errors
+### 3.3 Module class — the v2 contract
 
 ```python
-class ShouldDecomposeError(Exception): ...
-class InvalidInput(ShouldDecomposeError): ...
-class MalformedLLMResponse(ShouldDecomposeError):
-    """LLM returned unparseable output after max_retries attempts."""
-class ModelUnavailable(ShouldDecomposeError):
-    """All Diffundo providers exhausted; cannot classify."""
+# src/cambium/modules/base.py (excerpt)
+class Module(ABC):
+    """A Cambium decision module. Seed of the per-module pattern."""
+    name: str
+
+    @abstractmethod
+    async def decide(self, input: Any) -> Output: ...
+
+    @abstractmethod
+    def metric(self, example: Example) -> float: ...
+
+# src/cambium/modules/example/decide.py (excerpt)
+class ShouldDecomposeModule(Module):
+    """Reference decision module: should a task be decomposed?
+
+    Pure rule engine today; a DSPy program may replace the engine behind
+    this interface later.
+    """
+    name = "should_decompose"
+
+    async def decide(self, input: TaskInput) -> DecomposeOutput:
+        return should_decompose(input.task, input.context)
+
+    def metric(self, example: Example) -> float:
+        return should_decompose_metric(example)
 ```
 
-`Architectus.execute` catches `ModelUnavailable` and **falls back to `DISPATCH_ATOMIC`** with `confidence=0.0` and rationale `"model unavailable; atomic dispatch is the safe default"`. Rationale for the fallback: an atomic task costs one worker; a wrongly-decomposed task costs N workers and a merge — atomic is the cheaper error.
+This is the **DSPy seam**: `decide` is the only surface a replacement program must implement. Callers, the dataset, the metric, and the loader all stay unchanged when a DSPy classification program replaces the rule engine in a future version.
+
+### 3.4 Errors
+
+The v2 rule engine is a pure function and does not raise under normal operation — `should_decompose(task, context)` returns a `DecomposeOutput` for any `str` input (including empty/garbage, which yield `decompose=False` with a low-confidence reason). The dataset loader (`ExampleDatasetLoader`) is the only error source:
+
+```python
+class DatasetError(ValueError):
+    """Raised when a dataset file is unreadable or schema-invalid."""
+```
+
+Raised by the loader for: unreadable file, invalid JSON per line, non-object records, missing `input`/`expected` keys, `input.task` not a string, `expected.decompose` not a boolean, `expected.reason` not a string, `canary` not a boolean. A `DatasetError` aborts the eval harness — broken datasets are a hard gate.
+
+A future DSPy-backed `decide` may raise:
+- `ModelUnavailable` — all `Diffundo` providers exhausted. Caller (`Architectus`) falls back to `DecomposeOutput(decompose=False, reason="model unavailable; atomic dispatch is the safe default", confidence=0.0)`. Atomic is the cheaper error.
+- `MalformedLLMResponse` — unparseable output after `MAX_RETRIES`. Same fallback.
+
+These are **v2.1**; the v2 rule engine does not raise them.
 
 ---
 
 ## 4. State
 
-This module is **stateless across calls**. Only the DSPy program (read-only at runtime) is held on the instance.
+This module is **stateless across calls**. The `ShouldDecomposeModule` instance holds only its `name` (a class attribute). No caches, no counters, no mutable state. The rule engine (`should_decompose`) is a pure function of `(task, context)`.
 
-```python
-class ShouldDecompose(dspy.Module):
-    def __init__(self, diffundo: Diffundo):
-        self._diffundo = diffundo
-        self._classifier = dspy.ChainOfThought(ShouldDecomposeSignature)
-        self._lm = CambiumLM(diffundo, tier="fast", temperature=0.0)
-```
-
-No caches, no counters, no mutable state. The DSPy program is loaded from `optimized/should_decompose/v<N>/` at construction time and never replaced during a session.
+This makes the module trivially parallelizable (multiple `decide()` calls can run in any thread or process) and gives a future DSPy replacement a clean stateless target — the `decide` contract is synchronous with respect to module state.
 
 ---
 
-## 5. DSPy Program
+## 5. Decision Rules (v2 rule engine)
 
-### 5.1 Signature
+The primary v2 implementation is a rule engine in `src/cambium/modules/example/decide.py`. The engine accumulates evidence from six signals; `decompose == True` iff total evidence ≥ 2.
 
-```python
-class ShouldDecomposeSignature(dspy.Signature):
-    """Classify whether a task spec should be decomposed into parallel subtasks.
-
-    A task SHOULD be decomposed (should_decompose=True) when ALL of:
-      - it contains >=3 distinct, independently-implementable units of work, AND
-      - those units touch disjoint files or modules, AND
-      - the cost of merge (rebase + test per branch) is less than the latency
-        saving of parallel implementation.
-
-    A task should NOT be decomposed (should_decompose=False) when ANY of:
-      - it is a single-file, single-function change,
-      - it requires whole-design coherence to be correct (e.g., introducing a
-        new abstraction),
-      - the spec is short and unambiguous,
-      - decomposition would create inter-worker API conflicts.
-    """
-    spec: str = dspy.InputField(desc="The task specification, <=16k chars.")
-    repo_context: str = dspy.InputField(
-        desc="Repository context summary, <=4k chars. May be empty.")
-    task_kind_hint: str = dspy.InputField(
-        desc="Optional hint: feature|bugfix|refactor|test|docs. May be empty.")
-
-    should_decompose: bool = dspy.OutputField(
-        desc="True if decomposition is worth the cost; False otherwise.")
-    rationale: str = dspy.OutputField(
-        desc="One sentence justifying the decision. <=500 chars.")
-    confidence: float = dspy.OutputField(
-        desc="Calibrated probability the decision is correct. In [0.0, 1.0].")
-```
-
-### 5.2 Module class
-
-```python
-class ShouldDecompose(dspy.Module):
-    MAX_RETRIES = 3
-
-    def __init__(self, diffundo: Diffundo):
-        self._diffundo = diffundo
-        self._classifier = dspy.ChainOfThought(ShouldDecomposeSignature)
-        self._lm = CambiumLM(diffundo, tier="fast", temperature=0.0)
-
-    def forward(self, inp: ShouldDecomposeInput) -> ShouldDecomposeOutput:
-        self._validate(inp)
-        dspy.settings.context["lm"] = self._lm
-
-        last_err: Exception | None = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                pred = self._classifier(
-                    spec=inp.spec,
-                    repo_context=inp.repo_context,
-                    task_kind_hint=inp.task_kind_hint,
-                )
-                return self._coerce(pred, inp)
-            except (ModelUnavailable, InvalidInput):
-                raise
-            except Exception as e:               # malformed response, parse error, etc.
-                last_err = e
-                continue
-        raise MalformedLLMResponse(
-            f"Failed to parse LLM response after {self.MAX_RETRIES} attempts: {last_err}")
-
-    def _validate(self, inp: ShouldDecomposeInput) -> None:
-        if not inp.spec or not inp.spec.strip():
-            raise InvalidInput("spec is empty")
-        if len(inp.spec) > 16_000:
-            raise InvalidInput(f"spec too long: {len(inp.spec)} > 16_000")
-
-    def _coerce(self, pred, inp: ShouldDecomposeInput) -> ShouldDecomposeOutput:
-        decision = ShouldDecomposeDecision.DECOMPOSE if bool(pred.should_decompose) \
-                   else ShouldDecomposeDecision.DISPATCH_ATOMIC
-        raw_conf = float(pred.confidence)
-        if not (0.0 <= raw_conf <= 1.0):
-            # Log the discrepancy, clip, and continue. Calibration metric will catch this.
-            logger.warning("should_decompose: confidence out of range",
-                           extra={"task_id": ..., "raw": raw_conf})
-            raw_conf = max(0.0, min(1.0, raw_conf))
-        rationale = pred.rationale.strip()[:500]
-        return ShouldDecomposeOutput(
-            decision=decision,
-            confidence=raw_conf,
-            rationale=rationale,
-            raw_llm_response=redact(pred.dict()),
-        )
-```
-
-### 5.3 LLM access
-
-All LLM calls go through `self._lm`, a `CambiumLM` wrapping the injected `Diffundo` instance. The module never calls `dspy.LM(...)` or imports provider SDKs. Tier `"fast"` is used: this is a classification call where latency matters and capability floor is low.
-
-### 5.4 Determinism
-
-`temperature=0.0`. The classifier must give the same output for the same input across runs (modulo provider non-determinism, which is recorded as a `calibration_drift` event). The eval harness asserts determinism on a fixed 10-record subset and fails on any divergence.
-
----
-
-## 6. Metric
-
-```python
-def metric(output: ShouldDecomposeOutput,
-           reference: ShouldDecomposeReference) -> float:
-    """Composite: accuracy (0.6) + calibration (0.2) + format (0.1) + rationale (0.1)."""
-    accuracy = 1.0 if output.decision == reference.expected_decision else 0.0
-    calibration = 1.0 - abs(output.confidence - reference.expected_confidence)
-    calibration = max(0.0, calibration)
-    format_ok = 1.0 if (0.0 <= output.confidence <= 1.0
-                       and len(output.rationale) <= 500) else 0.0
-    rationale_quality = _rationale_quality(output.rationale, reference.rationale_keywords)
-    return 0.6 * accuracy + 0.2 * calibration + 0.1 * format_ok + 0.1 * rationale_quality
-
-
-def _rationale_quality(rationale: str, keywords: tuple[str, ...]) -> float:
-    if not keywords:
-        return 1.0 if 50 <= len(rationale) <= 500 else 0.0
-    hits = sum(1 for k in keywords if k.lower() in rationale.lower())
-    return hits / len(keywords)
-```
-
-| Signal | Weight | Why |
+| Signal | Condition | Evidence |
 |---|---|---|
-| Accuracy | 0.6 | The decision is the whole point. |
-| Calibration | 0.2 | An uncertain decision routed atomically is safe; an over-confident wrong decision is dangerous. |
-| Format | 0.1 | Out-of-range confidence pollutes downstream logic; long rationales pollute logs. |
-| Rationale quality | 0.1 | Forces the model to articulate reasoning, which improves auditability and resists pure-pattern-matching. |
+| Requirement clauses | 3+ sentences (split on `.`/`;`) | +1 |
+| Length | `task` > 220 chars | +1 |
+| Parallel-work keywords | 2+ of `HIGH_SIGNAL` (`multiple`, `several`, `both`, `subtasks`, `components`, `services`, `independently`, `in parallel`, `separately`, `decompose`) | +1 |
+| Per-item phrasing | word `each` | +1 |
+| File references | 3+ file paths (matched by extension) in `task` | +1 |
+| Itemized list | 3+ numbered/bulleted items | +2 |
+| Verb-led workstreams | 3+ clauses starting with an action verb (`add`, `update`, `refactor`, `implement`, `migrate`, `build`, `fix`, `create`, `remove`, `rewrite`, `backfill`, `introduce`, `restructure`, `split`, `port`) | +2 |
+| Verb-led workstreams | exactly 2 such clauses | +1 |
 
-**Gameability analysis.** A pure-accuracy metric rewards a model that always says "decompose" or always says "atomic," whichever is more common in train. Calibration weight resists this: a model that is right 70% of the time but always outputs `confidence=0.99` scores worse than one that outputs calibrated confidences. The rationale-quality weight resists a model that emits empty strings.
+**Short-circuit:** if `context` already mentions `subtask` or `decompos*`, the engine returns `decompose=False` with `reason="context already provides a decomposition"`, `confidence=0.9`. An explicit prior decomposition in the context wins outright.
 
-**Canaries** (see §7 and `dataset-format.md` §6): every canary exists to detect a specific gaming pattern.
+**Output:** `evidence >= 2` → `DecomposeOutput(decompose=True, reason="; ".join(reasons) or "evidence threshold met", confidence=0.8)`. Otherwise → `DecomposeOutput(decompose=False, reason="task is atomic or already scoped", confidence=0.7)`.
+
+### 5.1 The DSPy seam (v2.1+)
+
+`decide()` is the only surface a future DSPy program must implement. When the seam is exercised, the replacement will:
+
+- Implement `async def decide(self, input: TaskInput) -> DecomposeOutput` on a `ShouldDecomposeModuleDSPy(Module)` subclass.
+- Use DSPy idioms correctly. Concretely, configure the LM via `dspy.configure(lm=CambiumLM(diffundo, tier="fast", temperature=0.0))` (see `architecture.md` §9.3) — **not** by mutating `dspy.settings.context` — and read prediction fields via attribute access (`pred.decompose`, not `pred.dict()`):
+  ```python
+  class ShouldDecomposeSignature(dspy.Signature):
+      """Classify whether a task should be decomposed into parallel subtasks."""
+      task: str = dspy.InputField()
+      context: str = dspy.InputField()
+      decompose: bool = dspy.OutputField(desc="True if decomposition is worth the cost.")
+      reason: str = dspy.OutputField(desc="One-sentence justification.")
+
+  class ShouldDecomposeModuleDSPy(ShouldDecomposeModule):
+      def __init__(self, diffundo: Diffundo):
+          dspy.configure(lm=CambiumLM(diffundo, tier="fast", temperature=0.0))
+          self._clf = dspy.ChainOfThought(ShouldDecomposeSignature)
+
+      async def decide(self, input: TaskInput) -> DecomposeOutput:
+          pred = self._clf(task=input.task, context=input.context)
+          # attribute access on dspy.Prediction (NOT pred.dict(), which does not exist)
+          return DecomposeOutput(
+              decompose=bool(pred.decompose),
+              reason=str(pred.reason),
+              confidence=0.9,   # placeholder until calibration is added
+          )
+  ```
+- Preserve the dataset, loader, and metric unchanged. `should_decompose_metric` keeps scoring exact match on `decompose`.
+- Be optimized via `Ascensus` against the v2.1 split (`train.jsonl` / `eval.jsonl` / `canaries.jsonl`).
+
+This is **not implemented in v2**. The seam is documented here so the rule-engine choice is explicit and the future swap is mechanical.
+
+---
+
+## 6. Metric (v2)
+
+```python
+# src/cambium/modules/example/metric.py
+def should_decompose_metric(example: Example) -> float:
+    """Score one example in [0, 1]; exact match on the decision wins.
+
+    Returns 0.0 for unprocessed examples (no prediction) and for records
+    whose expected value is not a boolean. The `reason` field is not
+    scored; the decision is what matters.
+    """
+    prediction = example.prediction
+    if prediction is None:
+        return 0.0
+    expected = example.expected.get("decompose")
+    if not isinstance(expected, bool):
+        return 0.0
+    return 1.0 if prediction.decompose == expected else 0.0
+```
+
+The v2 metric is **exact match on `decompose`**, full stop. This is deliberately simple:
+
+- It is **computable without an LLM judge**, which is the right floor for a v2 reference module.
+- It is **not gameable by a keyword-greedy replacement**: the canaries are deliberately misaligned with the rule engine's surface heuristics (see §7), so a program that memorizes the rules' keyword set still gets the canaries wrong.
+- It is **non-zero only when a prediction is attached**. The eval harness attaches predictions by running `decide()` over each `Example`, then scores with `metric()`.
+
+**v2.1 extension (labeled, opt-in).** Once a DSPy replacement exists, the metric may be extended to a multi-signal composite (accuracy + calibration + reason-keyword coverage), matching the shape of `architecture.md` §10. The exact-match floor stays; additional signals layer on top. Changes require a dataset `schema_version` bump and a re-eval against the frozen held-out set.
 
 ---
 
 ## 7. Dataset
 
-| File | Records | Notes |
-|---|---|---|
-| `datasets/train.jsonl` | 200 | Hand-authored (100) + mined from synthetic event logs (50) + paraphrased real specs (50, redacted). |
-| `datasets/eval.jsonl` | 50 | Frozen at first commit; never used for training. |
-| `datasets/canaries.jsonl` | 15 | Reward-hacking traps. |
+| Item | Value |
+|---|---|
+| File | `src/cambium/modules/example/datasets/example_pairs.jsonl` |
+| Records | 9 in the seed dataset (2 are canaries) |
+| Loader | `ExampleDatasetLoader` (`src/cambium/modules/example/dataset.py`) |
+| Format | JSONL, one record per line, UTF-8, no BOM, trailing newline |
+| Provenance | Hand-authored; canary entries deliberately misaligned with surface heuristics |
+| Sibling pinning | None (`siblings-stub.yaml` is empty / absent — `should_decompose` is the first module) |
 
-**Provenance:**
-- Hand-authored: written by the module owner, covering the obvious cases (single-function refactor, multi-feature epic, ambiguous one-liner, etc.).
-- Mined: specs are generated by a synthetic-spec generator (deterministic seed), then hand-labeled.
-- Paraphrased real specs: derived from internal Cambium event logs; all PII, repo URLs, and author identifiers scrubbed.
+**Schema** (authoritative; matches the loader's `_validate`):
 
-**Schema version:** `1`.
-
-**Dataset version:** `1.0.0` at first commit.
-
-**Splits:** produced by `scripts/split_dataset.py --module should_decompose --seed 1337`. The seed is documented; the split is reproducible.
-
-**Sibling pinning:** `siblings-stub.yaml` is empty (`{}`). `ShouldDecompose` is the first module in the pipeline; it has no upstream sibling. (This is one of the reasons it is the right reference example — no sibling-coupling to worry about.)
-
-**Refresh policy:** the module owner may add records to `train.jsonl` at any time (minor version bump). `eval.jsonl` changes require sign-off from the orchestrator owner. Canary additions require a second reviewer.
-
-**Reference record (train):**
-
-```json
+```jsonc
 {
-  "id": "should_decompose-0001",
-  "schema_version": 1,
-  "dataset_version": "1.0.0",
-  "split": "train",
-  "added_at": "2026-08-09",
-  "added_by": "human:architect",
-  "source": "hand-authored",
-  "license": "internal",
-  "redacted": false,
-  "data": {
-    "spec": "Rename the function `calc_dry_run` to `compute_dry_run` in src/dry_run.rs. Update the one call site in main.rs.",
-    "repo_context": "Single crate, Rust.",
-    "task_kind_hint": "refactor",
-    "expected_decision": false,
-    "expected_confidence": 0.95,
-    "rationale_keywords": ["single-function", "rename", "one-call-site"]
-  },
-  "notes": "Trivially atomic; the canonical 'no' example."
+  "input": {"task": str, "context": str},
+  "expected": {"decompose": bool, "reason": str},
+  "canary": bool              // optional, default false
 }
 ```
 
-**Reference canary:**
+The loader (in `dataset.py`) enforces:
+- Top-level keys `{"input", "expected"}` present; both must be JSON objects.
+- `input.task` must be a string.
+- `expected.decompose` must be a boolean.
+- `expected.reason` must be a string.
+- `canary` (if present) must be a boolean.
+
+Anything else raises `DatasetError` at load time.
+
+**Reference record (non-canary):**
 
 ```json
-{
-  "id": "should_decompose-canary-01",
-  "schema_version": 1,
-  "dataset_version": "1.0.0",
-  "split": "canary",
-  "added_at": "2026-08-09",
-  "added_by": "human:architect",
-  "source": "hand-authored",
-  "license": "internal",
-  "redacted": false,
-  "data": {
-    "spec": "Refactor function `foo` to use a list comprehension. Single file, single function, no other call sites.",
-    "repo_context": "",
-    "task_kind_hint": "refactor",
-    "expected_decision": false,
-    "expected_confidence": 0.9,
-    "rationale_keywords": ["single-function", "atomic"],
-    "canary": {
-      "kind": "trivially_atomic",
-      "anti_expected": true,
-      "anti_expected_confidence_range": [0.5, 1.0],
-      "description": "A prompt optimized for high decomposition rate will say 'yes' here. We trap that."
-    }
-  }
-}
+{"input": {"task": "Update the batch scheduler so it retries failed jobs with exponential backoff. Add per-tenant rate limiting to the public API. Write a migration to backfill timestamps for existing rows. Run the migration on staging and verify throughput.", "context": ""}, "expected": {"decompose": true, "reason": "four independent workstreams"}}
 ```
+
+**Reference canary (keyword-greedy trap):**
+
+```json
+{"input": {"task": "Run the full test suite and commit the fix. This covers the flaky integration tests for multiple services, several providers, both the API and CLI paths, and a few database migrations.", "context": ""}, "expected": {"decompose": false, "reason": "keyword-heavy but atomic: run tests, commit"}, "canary": true}
+```
+
+This canary hits four `HIGH_SIGNAL` keywords (`multiple`, `several`, `both`, `services`) and would naïvely score `decompose=True` under a keyword-counting baseline. The gold label is `False` — the task is atomic (run tests, commit). A reward-hacking replacement that learns "keyword count → decompose" fails this canary.
+
+**Reference canary (no-surface-keyword trap):**
+
+```json
+{"input": {"task": "Update the payment service to support refunds, add a retry queue for failed webhooks, migrate the billing schema, and backfill historical invoices for the last two years.", "context": ""}, "expected": {"decompose": true, "reason": "four verb-led workstreams with no surface keywords"}, "canary": true}
+```
+
+This canary has zero `HIGH_SIGNAL` keyword hits — a keyword-greedy replacement would say `decompose=False`. The gold label is `True` because of four verb-led workstreams. The rule engine's verb-clause signal catches it; a DSPy replacement that drops verb-clause analysis fails this canary.
+
+### 7.1 v2 dataset policy (single-file; split deferred)
+
+v2 uses a single combined `example_pairs.jsonl` with inline `canary: true` markers. The eval harness selects canaries by the `canary` flag. The frozen `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split described in `docs/module-template/dataset-format.md` is the **v2.1 target** — until the dataset grows past ~50 records, the single file is simpler and the loader already supports it.
+
+**Dataset-format compliance.** The single-file layout complies with `dataset-format.md` §1 (JSONL container), §2 (record envelope — `input`/`expected`/`canary`), and §6 (canary taxonomy: `trivially_atomic` and `must_decompose` kinds, with the `canary: true` marker). The full envelope (`id`, `schema_version`, `dataset_version`, `split`, `added_at`, `added_by`, `source`, `license`, `redacted`, `data`) is the v2.1 target; the v2 records use the minimal subset the loader validates today.
+
+### 7.2 Refresh policy
+
+- The dataset is loaded by every test and eval run; adding records is safe (the loader is order-independent).
+- Removing records is not permitted in v2; deprecate via gold-label flip + a `notes` field instead.
+- Adding canaries is encouraged and requires review by someone other than the canary author (two-reviewer rule, `dataset-format.md` §8).
+- A schema change (e.g., adding `task_kind`) requires a loader update + a `DatasetError`-free re-load + a scenario-test update, all in one commit.
 
 ---
 
@@ -337,111 +301,120 @@ def _rationale_quality(rationale: str, keywords: tuple[str, ...]) -> float:
 
 | Mode | Trigger | Symptom | Detection | Recovery |
 |---|---|---|---|---|
-| LLM returns malformed JSON | provider drift; weak model in tier | `dspy` parse error | `try/except` in `forward()` | Re-prompt up to `MAX_RETRIES=3`; then `MalformedLLMResponse` |
-| Provider outage | rate limit, network | `Diffundo.AllProvidersFailed` | propagates as `ModelUnavailable` | Caller (`Architectus`) falls back to `DISPATCH_ATOMIC` |
-| Empty `spec` | upstream bug | `InvalidInput` | input validation | Caller catches, logs, escalates |
-| Confidence always ~0.5 | under-specified prompt | eval calibration signal < 0.3 | metric on eval set | Re-optimize; if persists, escalate to module owner |
-| Confidence always ~0.99 | over-confident prompt | calibration signal < 0.3 | metric on eval set | Re-optimize; canary `ambiguous_calibration` should fail |
-| Always-True prompt | gamed train set | canary `trivially_atomic` fails | canary suite | Reject optimized prompt at promotion gate |
-| Always-False prompt | gamed train set | canary `must_decompose` fails | canary suite | Reject optimized prompt at promotion gate |
-| Rationale keyword-stuffed | gamed metric | rationale has gold keywords but wrong decision | canary `keyword_hack` | Reject; metric weight on rationale drops to 0 for that variant |
-| Spec exceeds 16k chars | upstream chunking bug | `InvalidInput` | validation | Caller chunks and retries |
+| Over-decomposition (keyword greed) | A rule/DSPy program over-weights `HIGH_SIGNAL` keywords | Atomic-but-keyword-dense task is split | Canary `keyword-heavy but atomic: run tests, commit` (decompose=false) | If rule engine: tune evidence weights; if DSPy: reject optimized variant at promotion gate |
+| Under-decomposition (surface-blind) | A rule/DSPy program under-weights verb-clauses | Multi-workstream task with no surface keywords stays whole | Canary `four verb-led workstreams with no surface keywords` (decompose=true) | Same |
+| Garbage input (structurally invalid record) | Hand-edit error, bad mining | Loader fails mid-record | `DatasetError` from `ExampleDatasetLoader._validate` | Hard gate — fix the record, do not catch |
+| Garbage input (string content) | Caller passes weird/garbage `task` string | Rule engine returns `decompose=False, confidence=0.7` for nonsense | Caller-side validation (rule engine tolerates any string by design) | Caller decides whether to escalate |
+| Reward hacking (future DSPy eval) | Optimizer memorizes surface heuristics | High train metric, canary failures | Canary suite (the two `canary: true` records) | Reject optimized prompt; promote previous version |
+| Context already decomposed | Caller passes `context` with "subtask"/"decompos*" | Engine short-circuits to `decompose=False, confidence=0.9` | Intentional; no recovery needed | None — by design |
+| Empty task | `TaskInput(task="")` | Engine returns `decompose=False` | Caller-side validation | Caller should reject empty tasks upstream |
+
+A future DSPy `decide` adds two more (see §3.4): `ModelUnavailable` and `MalformedLLMResponse`, both with the atomic-dispatch fallback.
 
 ---
 
 ## 9. Test Strategy
 
-### 9.1 Unit tests (`tests/unit/test_should_decompose.py`)
+### 9.1 Scenario test (`tests/scenarios/test_example_module.py`)
 
-- Happy path: 5 inputs covering `decision=true` and `decision=false`.
-- Empty spec → `InvalidInput`.
-- Oversized spec → `InvalidInput`.
-- Confidence out of range → clipped, warning logged, output still produced.
-- Malformed LLM response 3× → `MalformedLLMResponse`.
-- `ModelUnavailable` propagates from `Diffundo`.
-- Determinism: same input → same output under `temperature=0` on a 10-record subset.
-- Rationale truncation at 500 chars.
+One scenario test, no mocking, no network:
 
-All LLM calls in unit tests use a **fake LLM** (`cambium.tests.fake_llm`) returning canned responses — no real API calls in CI.
+1. **Load and validate.** Load the real dataset; assert it loads and every record is schema-valid. Include a negative case: a malformed record raises `DatasetError`.
+2. **Aggregate metric.** Run `decide()` over every pair; attach predictions; score with `metric()`; assert the aggregate score is **1.0** (the rule engine perfectly fits its own dataset).
+3. **Canary coverage.** Assert the canary entries are present in the loaded dataset (`canary_count >= 2`) and were processed (a prediction was attached to each). This catches the "drop canaries to inflate metric" reward-hacking path.
 
-### 9.2 Eval harness
+This is the **smoke test** that proves the per-module pattern is wired correctly end-to-end.
 
-```
-python -m cambium.modules.should_decompose.eval
-```
+### 9.2 Eval harness (v2.1)
 
-Runs the metric over `eval.jsonl`. Prints per-signal breakdown (accuracy, calibration, format, rationale). Exit code 0 iff mean metric ≥ `0.80` and per-signal accuracy ≥ `0.70`.
+A standalone eval entry point `python -m cambium.modules.example.eval` is the v2.1 target. In v2 the scenario test above subsumes the role of the eval harness — same coverage, integrated with the rest of the test suite. The v2.1 eval harness will separate "run module over dataset" from "score and report" and add per-signal breakdown.
 
-### 9.3 Canary suite
+### 9.3 Canary suite (v2.1)
 
-```
-python -m cambium.modules.should_decompose.eval --suite canaries
-```
-
-Runs the metric over `canaries.jsonl`. **Any canary failure exits non-zero.** No aggregate score is computed; canaries are pass/fail.
+Today the canaries are scored inline with the rest of the dataset (the scenario test asserts 1.0 over **all** records including canaries). The v2.1 `--suite canaries` mode will exit non-zero on the first canary failure; today, the same effect is achieved by the 1.0 aggregate-score assertion (any canary miss drops the score below 1.0).
 
 ### 9.4 Integration
 
-The smoke test (`cambium.tests.smoke`) exercises `ShouldDecompose` end-to-end: a fake task spec is submitted, `Architectus.execute` calls `ShouldDecompose`, the chosen path (atomic or decomposed) is taken, the result is asserted. The fake LLM returns `should_decompose=false` deterministically for the smoke-test spec.
+The Cambium smoke test (`cambium.tests.smoke`) will exercise `should_decompose` once `Architectus.execute` is wired: a fake task spec is submitted, the orchestrator calls `ShouldDecomposeModule.decide`, the chosen path (atomic or decomposed) is taken, the result is asserted. Until then, the scenario test (§9.1) is the integration gate.
 
 ### 9.5 Sibling pinning
 
-N/A. `ShouldDecompose` is the first module; no siblings to pin. The `siblings-stub.yaml` is `{}` and the optimization harness skips sibling-stub loading for this module.
+N/A. `should_decompose` is the first module; no siblings to pin. The `siblings-stub.yaml` is absent; the optimization harness (when it lands in v2.1) skips sibling-stub loading for this module.
+
+### 9.6 Verification commands (per `agents.md` §5)
+
+```
+# Run from repo root, on a Python 3.14 interpreter:
+uv run --python 3.14.7 --extra test pytest tests/scenarios/test_example_module.py -v
+uv run --python 3.14.7 --extra test pytest -q          # whole suite
+```
+
+A passing run is the gate. The reference scaffold on `main` runs green against these commands.
 
 ---
 
-## 10. Optimization Plan
+## 10. Optimization Plan (v2.1)
 
-- **Optimizer:** `dspy.SIMBA(metric=metric, max_steps=12, max_demos=8, num_threads=4)`.
-- **Train set:** `datasets/train.jsonl` (200 records).
-- **Eval gate:** mean metric on `eval.jsonl` ≥ `0.80`; per-signal accuracy ≥ `0.70`; calibration ≥ `0.50`.
-- **Canary gate:** 100% pass on `canaries.jsonl`.
-- **Human gate:** an optimized prompt is promoted only after a diff of the prompt change is reviewed and signed off in the optimization PR.
+Not in v2 scope. Documented here as the v2.1 target so the seam is clear:
+
+- **Optimizer:** `dspy.SIMBA(metric=should_decompose_metric, max_steps=12, max_demos=8, num_threads=4)`.
+- **Train set:** the v2.1 `datasets/train.jsonl` (target ≥ 200 records).
+- **Eval gate:** mean metric on `datasets/eval.jsonl` ≥ 0.85 (exact match on `decompose`).
+- **Canary gate:** 100% pass on `datasets/canaries.jsonl`.
+- **Human gate:** an optimized prompt is promoted only after a diff of the prompt change is reviewed in the optimization PR.
 - **Rollback:** promotion is a symlink swap under `optimized/should_decompose/`; the previous version is retained at `optimized/should_decompose/v<N-1>/` and the production pointer can be reverted atomically.
-- **Model pinning:** optimization runs against `tier="fast"` with `temperature=0.0` on a single named model (declared in the optimization run manifest) — not against the cascade. This avoids the cross-model prompt-transfer problem (LLM-C3) during optimization. Production serves via the cascade as usual.
+- **Model pinning:** optimization runs against a single named model (declared in the optimization run manifest) at `temperature=0.0` — not against the cascade. This avoids the cross-model prompt-transfer problem (LLM-C3) during optimization. Production serves via cascade as usual.
+- **Baseline:** the rule engine's exact-match score on the v2.1 train split is the baseline a DSPy replacement must beat. If the DSPy variant does not beat the rule engine on the held-out eval set, the rule engine stays in production.
 
 ---
 
 ## 11. Open Questions
 
-- Q: Should `ShouldDecompose` see the available worker pool (size, tiers) before deciding? Currently no; it decides on the spec alone. (Owner: `Architectus` author. Resolution deferred to v2.1 — the current design is correct for the common case.)
-- Q: Should the confidence threshold for "definitely decompose" vs "ask human" be configurable per session? Currently hardcoded at 0.5 (the decision boundary). (Owner: orchestrator owner.)
+- Q: Does `should_decompose` see the available worker pool (size, tiers) before deciding? Currently no; it decides on `(task, context)` alone. (Owner: `Architectus` author. Resolution deferred to v2.1.)
+- Q: Should `confidence` ever be scored or used to gate the decision (e.g., "ambiguous → ask upstream")? Currently unscored and unused. (Owner: orchestrator owner.)
 - Q: Should we add a "soft decompose" path that dispatches 2 subtasks instead of N? Not in v2; would require a different downstream contract. (Owner: future.)
+- Q: When the v2.1 DSPy seam is implemented, does it live alongside the rule engine (selector flag) or replace it? Current assumption: alongside, with a config flag picking which `ShouldDecomposeModule` subclass to instantiate. (Owner: v2.1.)
 
 ---
 
-## 12. Implementation Notes (for the parallel agent building this)
+## 12. Implementation Notes (for the parallel agent extending this module)
 
-The reference implementation will live at `src/cambium/modules/should_decompose/`:
+The reference implementation already exists at `src/cambium/modules/example/`:
 
 ```
-src/cambium/modules/should_decompose/
-├── architecture.md            ← copy of docs/module-template/example-spec.md,
-│                                adapted as the module's own architecture.md
-├── __init__.py                ← exports ShouldDecompose, Input/Output, errors
-├── program.py                 ← ShouldDecomposeSignature, ShouldDecompose class
-├── metric.py                  ← metric(), _rationale_quality()
-├── eval.py                    ← `python -m cambium.modules.should_decompose.eval`
-├── datasets/
-│   ├── train.jsonl            ← 200 records, schema v1, dataset v1.0.0
-│   ├── eval.jsonl             ← 50 records, frozen
-│   ├── canaries.jsonl         ← 15 records
-│   └── meta.json              ← schema/dataset versions, sibling_pins={}
-├── tests/
-│   └── test_should_decompose.py
-└── siblings-stub.yaml         ← {}
+src/cambium/modules/example/
+├── __init__.py                # exports: ShouldDecomposeModule, TaskInput,
+│                              #          DecomposeOutput, should_decompose,
+│                              #          should_decompose_metric,
+│                              #          ExampleDatasetLoader
+├── architecture.md            # the in-tree per-module architecture doc
+│                              #   (this spec is the canonical version; the
+│                              #   in-tree doc is a shorter reference)
+├── decide.py                  # rule engine + ShouldDecomposeModule + dataclasses
+├── metric.py                  # should_decompose_metric (exact match)
+├── dataset.py                 # ExampleDatasetLoader
+└── datasets/
+    └── example_pairs.jsonl    # 9 records (2 canaries)
 ```
 
-**Acceptance gate (per `agents.md` §9):**
+**Extensions that align with this spec but are NOT yet in the scaffold** (label as v2.1, do not implement in v2):
 
-1. `architecture.md` committed (copy of this spec).
-2. All three datasets committed with explicit versions in `meta.json`.
-3. `python -m cambium.modules.should_decompose.eval` exits 0 on the frozen eval set.
-4. `python -m cambium.modules.should_decompose.eval --suite canaries` exits 0.
-5. `python -m pytest src/cambium/modules/should_decompose/tests/ -v` exits 0.
-6. `python -m cambium.tests.smoke` exits 0 with `ShouldDecompose` wired in.
-7. Adversarial review committed under `docs/reviews/` (or this spec updated to reflect findings).
-8. All of the above marked VERIFIED with cited commands.
+- `eval.py` — standalone eval entry point (`python -m cambium.modules.example.eval`).
+- `train.jsonl` / `eval.jsonl` / `canaries.jsonl` — the three-file split per `docs/module-template/dataset-format.md`. v2 uses the single combined file.
+- `decide.py` DSPy subclass — `ShouldDecomposeModuleDSPy`, behind a config flag.
+- `siblings-stub.yaml` — empty placeholder; added when this module becomes siblings with another.
+- `optimized/should_decompose/v<N>/` — promoted-prompt artifacts, written by `Ascensus`.
+
+**Acceptance gate (per `agents.md` §9) — already met by the merged scaffold:**
+
+1. ✅ `architecture.md` committed (in-tree).
+2. ✅ Dataset committed (`datasets/example_pairs.jsonl`, 9 records, 2 canaries).
+3. ✅ Loader runs green on the dataset; `DatasetError` raised on malformed records.
+4. ✅ Rule-engine `decide()` scores 1.0 over the full dataset (including canaries).
+5. ✅ Scenario test passes: `uv run --python 3.14.7 --extra test pytest tests/scenarios/test_example_module.py -v` exits 0.
+6. ⏳ End-to-end smoke test (`cambium.tests.smoke`) — pending `Architectus.execute` wiring.
+7. ⏳ Adversarial review of this module — this spec is the reviewed artifact; re-review on any contract change.
+8. ✅ All verifiable items above marked VERIFIED with the cited command from §9.6.
 
 ---
 
@@ -449,4 +422,5 @@ src/cambium/modules/should_decompose/
 
 | Version | Date | Change |
 |---|---|---|
-| 0.1.0 | 2026-08-09 | Initial spec. |
+| 0.1.0 | 2026-08-09 | Initial spec; described a custom `ShouldDecompose` DSPy module. |
+| 1.0.0 | 2026-08-09 | Aligned to the merged scaffold: `ShouldDecomposeModule(Module)` ABC, `TaskInput`/`DecomposeOutput` dataclasses, `should_decompose_metric` exact-match, single-file dataset with inline canaries, rule-engine primary with DSPy as a documented v2.1 seam. |
