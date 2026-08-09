@@ -44,6 +44,27 @@ def test_next_generation_increments_from_missing_and_existing_fence(tmp_path: Pa
     assert read_generation(worktree) == 2
 
 
+def test_concurrent_next_generation_calls_do_not_lose_increments(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    start_generation = 11
+    caller_count = 32
+    write_generation(worktree, start_generation)
+
+    barrier = threading.Barrier(caller_count)
+
+    def advance() -> int:
+        barrier.wait()
+        return next_generation(worktree)
+
+    with ThreadPoolExecutor(max_workers=caller_count) as pool:
+        generations = list(pool.map(lambda _: advance(), range(caller_count)))
+
+    assert sorted(generations) == list(
+        range(start_generation + 1, start_generation + caller_count + 1)
+    )
+    assert read_generation(worktree) == start_generation + caller_count
+
+
 def test_concurrent_writes_are_atomic_and_an_ordered_write_wins(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     fence_path = worktree / FENCE_FILE
