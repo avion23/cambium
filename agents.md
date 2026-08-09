@@ -21,12 +21,12 @@ cambium/
 │   ├── reviews/                   ← adversarial reviews (cited from architecture.md)
 │   └── module-template/           ← per-module template + reference example spec
 ├── src/cambium/                   ← implementation
-│   └── modules/<name>/            ← one subdir per DSPy module
+│   └── modules/<name>/            ← one subdir per decision module
 │       ├── architecture.md        ← per-module design
-│       ├── program.py
+│       ├── decide.py              ← rule engine (primary) + the DSPy seam
 │       ├── metric.py
-│       ├── eval.py
-│       └── datasets/{train,eval,canaries}.jsonl
+│       ├── dataset.py
+│       └── datasets/<name>_pairs.jsonl   ← v2 combined; train/eval/canaries split is v2.1
 └── pyproject.toml
 ```
 
@@ -42,7 +42,7 @@ Trace from entry points, not from filenames. Concrete starting points:
 - **IPC protocol:** `src/cambium/nuntius/` — message types and framing. Schema is normative in `docs/architecture.md` §5.2.
 - **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in §7.
 - **Worker entry:** `src/cambium/opifex/__main__.py` — read-init → ready → loop → result/exit.
-- **DSPy modules:** `src/cambium/modules/<name>/` — each module is self-contained.
+- **Decision modules:** `src/cambium/modules/<name>/` — each module is self-contained (rule engine primary + DSPy seam in `decide.py`).
 
 When a `grep`/`rg` search fails to find what you expect, follow the execution path: read the import graph, the route registration, the message dispatcher. Don't conclude "doesn't exist" from a single miss.
 
@@ -105,7 +105,7 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 ## 7. Coding norms specific to Cambium
 
 - **Stdlib + DSPy + git.** No new frameworks. Structured logging via stdlib `logging`. No `structlog`, no `loguru`, no `aiofiles` (use `asyncio.to_thread` or a writer thread).
-- **No hidden global state.** Configuration flows through `Config` (frozen dataclass). Runtime state lives under `${session_dir}/cambium/`. No module-level mutables, no process-global caches outside explicitly-owned ones (`Diffundo` cache is owned).
+- **No hidden global state.** Configuration flows through `Config` (frozen dataclass). Runtime state lives under `${session_dir}/.cambium/`. No module-level mutables, no process-global caches outside explicitly-owned ones (`Diffundo` cache is owned).
 - **Flat over nested.** Early returns, guard clauses, exhaustive match/switch. Business logic in pure functions; state and I/O at the edges.
 - **Concrete over abstract.** Inline unless a boundary is independently meaningful.
 - **Real enums for domain alternatives.** `WorkerState`, `ResultStatus`, `EventKind` are enums, not strings or booleans.
@@ -122,7 +122,7 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 | If you need to... | Read this |
 |---|---|
 | Understand the system end-to-end | `docs/architecture.md` §0–§7 |
-| Add or change a DSPy module | `docs/module-template/architecture.md`, then `docs/module-template/example-spec.md` |
+| Add or change a decision module | `docs/module-template/architecture.md`, then `docs/module-template/example-spec.md` |
 | Add or change a dataset | `docs/module-template/dataset-format.md` |
 | Add a new protocol message | `docs/architecture.md` §5.2, then `src/cambium/nuntius/` |
 | Debug a worker crash / restart loop | `docs/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
@@ -137,8 +137,8 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 A module is **done** when **all** of the following hold:
 
 1. Its `architecture.md` (per template) is committed.
-2. Its datasets are committed (`train.jsonl`, `eval.jsonl`, `canaries.jsonl`) with explicit version fields.
-3. Its metric and eval harness run green on the frozen held-out set.
+2. Its datasets are committed with explicit schema/version markers. **v2:** a single `<name>_pairs.jsonl` with inline `canary: true` records (see `src/cambium/modules/example/`); **v2.1:** the `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split per `docs/module-template/dataset-format.md`.
+3. Its metric and eval harness run green over the full dataset (including canaries) — in v2, via the scenario test (§9 of `docs/module-template/architecture.md`).
 4. Its unit tests pass.
 5. The end-to-end smoke test passes with the module wired in.
 6. An adversarial review has been committed under `docs/reviews/` (or an existing one updated and re-run).

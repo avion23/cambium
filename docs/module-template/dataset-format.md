@@ -1,6 +1,6 @@
 # Dataset Format — JSONL Schema, Versioning, Splits, Canaries
 
-**Status:** Normative. Every DSPy module's `datasets/{train,eval,canaries}.jsonl` files conform to this format.
+**Status:** Normative. Every decision module's datasets conform to this format. v2 modules ship a single combined `<name>_pairs.jsonl` with inline `canary: true` markers (see `docs/module-template/example-spec.md` §7.1); the `{train,eval,canaries}.jsonl` three-file split described here is the v2.1 target.
 
 ---
 
@@ -58,16 +58,17 @@ Invariants:
 
 ## 3. Module-specific `data` schema
 
-Each module defines its own `data` shape and documents it in `src/cambium/modules/<name>/architecture.md` §7. The shape must be a frozen, typed dataclass in the module's `program.py`:
+Each module defines its own `data` shape and documents it in `src/cambium/modules/<name>/architecture.md` §7. The shape must be a frozen, typed dataclass in the module's primary implementation file (`decide.py` — the rule engine today; a future DSPy program implements the same interface behind it). For the v2 combined dataset the record shape is the scaffold's minimal `{input, expected, canary?}`; the extended envelope below is the v2.1 target:
 
 ```python
 @dataclass(frozen=True)
 class ShouldDecomposeDatum:
-    spec: str
-    repo_context: str
-    expected_decision: bool
-    expected_confidence: float
-    rationale_keywords: tuple[str, ...]   # must appear in a good rationale
+    task: str                    # v2: input.task
+    context: str                 # v2: input.context
+    decompose: bool              # v2: expected.decompose
+    reason: str                  # v2: expected.reason
+    expected_confidence: float   # v2.1 extension
+    rationale_keywords: tuple[str, ...]   # v2.1 extension; must appear in a good rationale
 ```
 
 The JSONL `data` field is the JSON serialization of this dataclass. Loaders use `cattrs` or hand-written `from_dict`/`to_dict`.
@@ -118,7 +119,9 @@ Two orthogonal versions:
   ```python
   def migrate(record: dict, from_v: int, to_v: int) -> dict:
       if from_v == 1 and to_v == 2:
-          record["data"]["expected_decision"] = bool(record["data"].pop("decompose"))
+          # v1 used `expected_decision`; v2 standardizes on `decompose`
+          # (matching the scaffold's expected.decompose field).
+          record["data"]["decompose"] = bool(record["data"].pop("expected_decision"))
           record["schema_version"] = 2
       return record
   ```
@@ -161,10 +164,11 @@ Each canary record carries a `canary` field under `data`:
   "schema_version": 1,
   "split": "canary",
   "data": {
-    "spec": "Refactor function `foo` to use list comprehension. Single file, single function.",
-    "repo_context": "",
-    "expected_decision": false,
-    "expected_confidence": 0.9,
+    "task": "Refactor function `foo` to use list comprehension. Single file, single function.",
+    "context": "",
+    "decompose": false,
+    "reason": "trivially atomic",
+    "expected_confidence": 0.9,        // v2.1 extension
     "canary": {
       "kind": "trivially_atomic",                    // see taxonomy below
       "anti_expected": true,                          // what a hacked prompt would say

@@ -15,7 +15,7 @@
 | Layer | Deterministic \| Orchestrator \| Worker \| View \| Tooling (offline) |
 | Owner | Initials or agent name; transferred on handoff |
 | Status | Draft \| In review \| Build-ready \| Done |
-| Version | semver of this module's `program.py` (e.g., `0.1.0`) |
+| Version | semver of this module's primary implementation file (e.g., `decide.py`, `0.1.0`); a future DSPy replacement is versioned separately |
 
 ---
 
@@ -31,7 +31,7 @@ Example (`should_decompose`): "Decides whether a task spec should be decomposed 
 
 ### 3.1 Inputs
 
-A typed list. Every input is a field on a frozen dataclass or a typed parameter to `forward()`. Untyped `dict` inputs are not permitted.
+A typed list. Every input is a field on a frozen dataclass or a typed parameter to `decide()`. Untyped `dict` inputs are not permitted.
 
 ```python
 @dataclass(frozen=True)
@@ -71,17 +71,15 @@ class ModelUnavailable(<Module>Error): ...   # raised only after Diffundo cascad
 
 | State | Scope (per-call / per-instance / per-process) | Mutation path | Persistence |
 |---|---|---|---|
-| (e.g., cached DSPy program) | per-instance | lazy init in `__init__` | none |
+| (e.g., a cached rule-engine reference or the DSPy program) | per-instance | lazy init in `__init__` | none |
 
-If the module owns **no state** beyond the DSPy program, say so explicitly: "This module is stateless across calls; only the DSPy program (read-only at runtime) is held on the instance."
+If the module owns **no state** beyond its primary implementation (rule engine or DSPy program), say so explicitly: "This module is stateless across calls; only the primary implementation (read-only at runtime) is held on the instance."
 
 Modules in the **Deterministic Layer** of Cambium must not own LLM-derived state. Modules in the **Orchestrator Layer** may own per-session state but must not mutate it from a worker process.
 
 ---
 
 ## 5. DSPy Program
-
-### 5.1 Signature
 
 ### 5.1 Implementation strategy — rule engine primary, DSPy seam
 
@@ -145,21 +143,29 @@ State the temperature, top-p, and seed policy. Default: `temperature=0.0` for cl
 
 ## 6. Metric
 
-A function from `(module_output, reference) -> float in [0, 1]`. Must be **computable without human-in-the-loop scoring** for the automatic optimization path; can use LLM-as-judge as one signal, but the LLM judge must itself be evaluated against a human-graded held-out subset.
+A function from `(example: Example) -> float in [0, 1]` — exactly the signature required by `cambium.modules.base.Module.metric` (§5.1). The `Example` carries `input`, `expected` (a `dict`), and `prediction` (attached by the caller after running `decide()`). Must be **computable without human-in-the-loop scoring** for the automatic optimization path; can use LLM-as-judge as one signal, but the LLM judge must itself be evaluated against a human-graded held-out subset.
 
 ```python
-def metric(output: <Module>Output, reference: <Module>Reference) -> float:
-    """Composite: accuracy (0.7) + calibration (0.2) + format-validity (0.1)."""
-    accuracy = 1.0 if output.decision == reference.expected_decision else 0.0
-    calibration = 1.0 - abs(output.confidence - reference.expected_confidence)
-    format_ok = 1.0 if (0.0 <= output.confidence <= 1.0
-                       and len(output.rationale) <= 500) else 0.0
-    return 0.7 * accuracy + 0.2 * max(0.0, calibration) + 0.1 * format_ok
+def metric(example: Example) -> float:
+    """Score one example (with prediction attached) in [0, 1].
+
+    Exact match on the decision wins. Returns 0.0 for unprocessed examples
+    (no prediction) and for records whose expected value is not a boolean.
+    """
+    prediction = example.prediction
+    if prediction is None:
+        return 0.0
+    expected = example.expected.get("decompose")
+    if not isinstance(expected, bool):
+        return 0.0
+    return 1.0 if prediction.decompose == expected else 0.0
 ```
+
+(Reference: `should_decompose_metric` in `src/cambium/modules/example/metric.py` — the canonical instance of this contract.)
 
 State:
 
-- Each signal's weight and why.
+- Each signal's weight and why (for multi-signal metrics; the exact-match floor above may be layered with calibration / format signals in v2.1).
 - Gameability analysis: what does this metric reward that we do not want?
 - Canaries (see `dataset-format.md`): which dataset entries are designed to detect each gameable failure mode?
 
@@ -169,11 +175,11 @@ State:
 
 Reference: `dataset-format.md` for schema and versioning. In this section, state:
 
-- Dataset path: `src/cambium/modules/<name>/datasets/{train,eval,canaries}.jsonl`
+- Dataset path: **v2** — single combined `src/cambium/modules/<name>/datasets/<name>_pairs.jsonl` (with inline `canary: true` markers); **v2.1 target** — `src/cambium/modules/<name>/datasets/{train,eval,canaries}.jsonl`.
 - Train size, eval size (frozen, held-out), canary count.
 - Provenance: how were the examples collected? Hand-authored? Mined from production? Both?
 - Schema version (`schema_version` field, integer, monotonic).
-- Splits: how train/eval/canary were partitioned (deterministic seed).
+- Splits: how train/eval/canary were partitioned (deterministic seed); for v2, how canary records are marked within the single file.
 - Sibling-pinning manifest: which sibling-module versions this dataset was last validated against (`siblings-stub.yaml`).
 - Refresh policy: who can add examples, who reviews, how often.
 
@@ -185,7 +191,7 @@ A table. For each mode: trigger, symptom, detection, recovery.
 
 | Mode | Trigger | Symptom | Detection | Recovery |
 |---|---|---|---|---|
-| LLM returns malformed JSON | provider drift; weak model | `dspy` parse error | `try/except` in `forward()` | Re-prompt with stricter instruction; if 3× fail, raise `ModelUnavailable` |
+| LLM returns malformed JSON | provider drift; weak model | `dspy` parse error | `try/except` in `decide()` | Re-prompt with stricter instruction; if 3× fail, raise `ModelUnavailable` |
 | Spec is empty | upstream bug | `InvalidInput` | input validation | Caller catches, logs, escalates |
 | Confidence always ~0.5 | under-specified prompt | eval calibration <0.3 | metric | Re-optimize against eval set |
 
@@ -206,15 +212,20 @@ List at least five. If you cannot think of five, the module is under-specified.
 
 ### 9.2 Eval harness
 
-`python -m cambium.modules.<name>.eval` runs the metric over the frozen eval set and prints per-signal breakdown. Exit code 0 if mean metric ≥ module's threshold (state the threshold here; default 0.75).
+**v2:** the scenario/integration test (§9.4, `tests/scenarios/test_<module>.py`) loads the real dataset, runs `decide()` over every pair, attaches predictions, and scores with `metric()` — this subsumes the role of a standalone eval harness in v2.
+
+**v2.1 target:** a standalone `python -m cambium.modules.<name>.eval` runs the metric over the frozen eval set and prints per-signal breakdown. Exit code 0 if mean metric ≥ module's threshold (state the threshold here; default 0.75).
 
 ### 9.3 Canary suite
 
-`python -m cambium.modules.<name>.eval --suite canaries` runs the metric over `canaries.jsonl`. **Any canary failure exits non-zero.** Canary pass rate is the gate for promoting an optimized prompt to production.
+**v2:** canaries are inline `canary: true` records in the single dataset file; the scenario test asserts the aggregate metric over **all** records (including canaries) is at the module's threshold, so any canary miss fails the gate.
+
+**v2.1 target:** `python -m cambium.modules.<name>.eval --suite canaries` runs the metric over `canaries.jsonl`. **Any canary failure exits non-zero.** Canary pass rate is the gate for promoting an optimized prompt to production.
 
 ### 9.4 Integration
 
-Where this module is exercised by the end-to-end smoke test (`cambium.tests.smoke`). If not exercised, justify.
+- **Scenario test (`tests/scenarios/test_<module>.py`, v2):** loads the real dataset, asserts schema validity (plus a negative case that raises `DatasetError`), runs `decide()` over every pair, attaches predictions, and asserts the aggregate metric is at threshold (for the `should_decompose` reference: 1.0 — see `docs/module-template/example-spec.md` §9.1). This is the v2 eval-harness substitute (§9.2).
+- **Smoke test (`cambium.tests.smoke`):** where this module is exercised end-to-end once the orchestrator is wired. If not exercised, justify.
 
 ### 9.5 Sibling pinning
 

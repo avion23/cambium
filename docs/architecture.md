@@ -172,14 +172,14 @@ class Result:
     summary: str                        # worker-authored, ≤2k chars
     metric_score: float                 # 0.0..1.0, multi-signal (§10)
     metric_breakdown: dict[str, float]  # per-signal scores
-    event_log_ref: str                  # "sqlite:<session_dir>/cambium/events.db"
+    event_log_ref: str                  # "sqlite:<session_dir>/.cambium/events.db"
     session_id: str
     started_at: float
     ended_at: float
     failure_reason: str | None          # populated when status != "done"
 ```
 
-`Result` is JSON-serializable and is the **only** contract the upper system consumes from a finished run. It is written atomically to `${session_dir}/cambium/result.json` before `Session.run()` returns.
+`Result` is JSON-serializable and is the **only** contract the upper system consumes from a finished run. It is written atomically to `${session_dir}/.cambium/result.json` before `Session.run()` returns.
 
 ### 3.5 `Instance` — proto-AGI leaf handle (control plane)
 
@@ -201,7 +201,7 @@ class Instance:
         # "workers_alive", "current_phase", etc. Never blocks.
 ```
 
-`Instance` is what a proto-AGI host holds. The host owns `session_dir` lifecycle; Cambium owns everything under `${session_dir}/cambium/`.
+`Instance` is what a proto-AGI host holds. The host owns `session_dir` lifecycle; Cambium owns everything under `${session_dir}/.cambium/`.
 
 ### 3.6 `Event` — typed stream record
 
@@ -374,8 +374,8 @@ The event log is the **durable feedback channel**: it is how the orchestrating L
 
 ### 6.1 Store
 
-- **Primary store:** SQLite in **WAL mode** at `${session_dir}/cambium/events.db`. Stdlib only; atomic commits; crash-safe by construction (resolves DS-C6/M3).
-- **Optional mirror:** JSON-Lines at `${session_dir}/cambium/events.jsonl` for streaming consumers and human inspection. Off by default; enable via config.
+- **Primary store:** SQLite in **WAL mode** at `${session_dir}/.cambium/events.db`. Stdlib only; atomic commits; crash-safe by construction (resolves DS-C6/M3).
+- **Optional mirror:** JSON-Lines at `${session_dir}/.cambium/events.jsonl` for streaming consumers and human inspection. Off by default; enable via config.
 - **Retention:** per-session DB; the host archives or deletes the session dir. Within a session, an `events` table is append-only; a `snapshots` table stores periodic compaction points. Replay = read `events` since the last `snapshot`.
 
 ### 6.2 Writer architecture (resolves DS-C1, DS-M3, IMPL-M7)
@@ -435,7 +435,7 @@ CREATE TABLE snapshots (
 
 ### 6.4 Checkpoint / restart semantics
 
-A worker emits `{"type":"checkpoint", "state_ref":"...", "commits_so_far":[...]}` after every tool call that produces or modifies durable state (file writes, commits). The `state_ref` points to `${session_dir}/cambium/checkpoints/${task_id}/turn-${N}.json`, written atomically (write-temp + `os.rename`).
+A worker emits `{"type":"checkpoint", "state_ref":"...", "commits_so_far":[...]}` after every tool call that produces or modifies durable state (file writes, commits). The `state_ref` points to `${session_dir}/.cambium/checkpoints/${task_id}/turn-${N}.json`, written atomically (write-temp + `os.rename`).
 
 On restart (§7.4), `Custos` loads the latest checkpoint for the task and re-injects it into the new worker via the `init` message as `resume_from_checkpoint`. Workers that opt out of checkpointing (e.g., read-only tasks) accept a fresh start.
 
@@ -576,7 +576,7 @@ Before **every** respawn (not just first-spawn), `Surculus.recover(worktree, bas
 
 After M3-style recovery, the worktree is in a known-good state. The new worker inherits no corruption.
 
-If recovery fails (step 3 returns non-zero), the worktree is **quarantined** to `${session_dir}/cambium/quarantine/${task_id}-${generation}/` and a fresh worktree is created from `base_commit`. The quarantined tree is preserved for forensics and pruned after `${session_dir}` cleanup.
+If recovery fails (step 3 returns non-zero), the worktree is **quarantined** to `${session_dir}/.cambium/quarantine/${task_id}-${generation}/` and a fresh worktree is created from `base_commit`. The quarantined tree is preserved for forensics and pruned after `${session_dir}` cleanup.
 
 `Surculus.prune()` is called on supervisor startup and shutdown to clean stale `git worktree` administrative entries.
 
@@ -864,7 +864,7 @@ Applied at enqueue time (before the writer thread sees the event). Belt-and-brac
 ## 13. Logging (resolves IMPL-M7)
 
 - **stdlib `logging`** with a `JsonFormatter` (no third-party logging lib). One formatter, defined in `cambium.logging`.
-- **Non-blocking:** every logger is wired with a `logging.handlers.QueueHandler` that feeds a single `QueueListener` running on a background thread. The listener writes to a `logging.handlers.RotatingFileHandler` (100 MB × 5 files) at `${session_dir}/cambium/cambium.log`.
+- **Non-blocking:** every logger is wired with a `logging.handlers.QueueHandler` that feeds a single `QueueListener` running on a background thread. The listener writes to a `logging.handlers.RotatingFileHandler` (100 MB × 5 files) at `${session_dir}/.cambium/cambium.log`.
 - **Per-module loggers:** `cambium.nuntius`, `cambium.diffundo`, ..., `cambium.opifex.<task_id>`. Levels configurable per module in config.
 - **Correlation:** every record carries `task_id`, `request_id`, `generation`, ` monotonic_ms`. Set via `logging.LoggerAdapter` per task.
 - **Redaction:** a `logging.Filter` applies the same redaction as §12.3.
@@ -913,16 +913,18 @@ A proto-AGI host treats Cambium the way Cambium treats a worker: as a subprocess
 ### 16.1 Control plane vs data plane
 
 - **Control plane** (lifecycle): `spawn`, `poll`, `wait`, `stop`, `kill`, `query`. Owned by `Instance` (§3.5). Transport: in-process function calls if Cambium is embedded as a library, or process signals/stdin if Cambium runs as a standalone subprocess wrapping `cambium.cli`.
-- **Data plane** (work): the `Result` envelope (§3.4) and the event log. The host reads `Result` from `${session_dir}/cambium/result.json` after `Instance.wait()` returns, or subscribes to `Session.events()` for live observation.
+- **Data plane** (work): the `Result` envelope (§3.4) and the event log. The host reads `Result` from `${session_dir}/.cambium/result.json` after `Instance.wait()` returns, or subscribes to `Session.events()` for live observation.
 
 ### 16.2 Session directory contract
 
-The host owns `${session_dir}/`. Cambium owns **only** `${session_dir}/cambium/`:
+> **Naming note (canonical):** Cambium's per-session state directory is the **dotted** `.cambium/` — a hidden directory, consistent with the worktree-local `.cambium/generation` fencing file (§7.3) and common convention. `${session_dir}/.cambium/` is the canonical path everywhere in this document; the bare `cambium/` form is not used. (Research docs in `wt-logging` use `${SESSION_DIR}/.cambium/`; this document agrees.)
+
+The host owns `${session_dir}/`. Cambium owns **only** `${session_dir}/.cambium/`:
 
 ```
 ${session_dir}/
 ├── host-controlled files         # upper system's state
-└── cambium/                       # Cambium owns everything below
+└── .cambium/                      # Cambium owns everything below
     ├── events.db                  # SQLite WAL
     ├── events.jsonl               # optional mirror
     ├── cambium.log                # rotated logs
@@ -960,7 +962,7 @@ The host may rely on the following invariants across v2.x:
 1. **`result.json` is written atomically** (temp + rename) before `Instance.wait()` returns. The host can poll for its presence to detect completion without `wait()`.
 2. **Exit codes are stable:** `0` done, `1` failed, `2` rejected, `3` timeout, `4` cancelled, `>100` supervisor crash.
 3. **`events.db` is always recoverable.** SQLite WAL is crash-safe by construction; replay = open the DB and read `events` since the last `snapshot`.
-4. **The `${session_dir}/cambium/` layout is stable.** The host can archive it without parsing.
+4. **The `${session_dir}/.cambium/` layout is stable.** The host can archive it without parsing.
 5. **No implicit global state.** Two Cambium instances in two different `session_dir`s do not interfere. No `/tmp/cambium-*` files; no `~/.cambium`; no shared caches.
 
 ---
@@ -1118,7 +1120,7 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 
 5. **Adversarial review gates.** Every module passes an adversarial review before merge; integration reviews re-run on every cross-module contract change. The three v0.1 reviews are the template for what a review looks like. Addressed: `docs/reviews/` are now first-class artifacts; `agents.md` documents the review gate.
 
-6. **No hidden global state.** Config is explicit (`Config` dataclass, frozen). No module-level mutables. All runtime state lives under `${session_dir}/cambium/`. Two Cambium instances in two session dirs do not interfere. Addressed: §16.2 invariant 5.
+6. **No hidden global state.** Config is explicit (`Config` dataclass, frozen). No module-level mutables. All runtime state lives under `${session_dir}/.cambium/`. Two Cambium instances in two session dirs do not interfere. Addressed: §16.2 invariant 5.
 
 7. **Fail-fast on invariant violations.** Generation mismatches, parse errors, lock files, missing providers, missing env vars — all cause explicit failure with a typed event in the log, never silent corruption. The system tells you when it is broken. Addressed: §5, §7.3, §12.
 
