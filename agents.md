@@ -53,6 +53,7 @@ When a `grep`/`rg` search fails to find what you expect, follow the execution pa
 - Every non-trivial change happens in an **isolated git worktree** off the relevant branch. The orchestrator (root agent) owns the integration worktree; child agents work in disjoint worktrees.
 - Work in **disjoint file scopes** when running in parallel. Same-file concurrent edits require isolated worktrees and explicit merge sequencing.
 - Commit **frequently** in your worktree. Small, well-described commits are easier to review and revert than large ones.
+- **Worktree discipline guard:** before *any* commit, `git rev-parse --show-toplevel` must equal your worktree's path — verify with `git worktree list`. Never commit to `main`; the python314 incident did exactly that and its changes had to be untangled by hand.
 - **No destructive git.** No `push --force`, no `rebase` of shared branches, no `reset --hard` of other agents' work. Amend only your own unpushed commit if asked.
 - Clean up your own worktree when finished. The supervisor's `Surculus.prune()` is for runtime worktrees, not for your development worktrees.
 
@@ -82,6 +83,13 @@ Standard checks (run from repo root unless noted):
   python -c "import cambium"
   ```
 
+**Test hygiene** (on top of the checks above):
+
+- Scenario/integration tests are the primary module tests (`tests/scenarios/test_<module>.py`); no TDD ceremony — write a test when it earns its place.
+- Supervision tests use **fake workers**, not real ones.
+- **No network in tests.** Anything that dials a provider is a manual or gated run.
+- Harness code is **stdlib + git only**. `dspy` is an optional extra, lazy-imported, never a hard dependency.
+
 Mark your report with one of:
 - **VERIFIED** — command run, exit status 0, output cited.
 - **UNVERIFIED** — claim made, check not run (state why: no interpreter, no fake LLM, out of scope, etc.).
@@ -97,6 +105,8 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Separate facts from inferences.** "The supervisor emits `worker_exit` on EOF" is a fact (cite the line). "The supervisor is therefore robust to zombie grandchildren" is an inference (justify it or test it).
 - **A defect fix is done only with before/after verification.** "Unverified" if not run; "workaround" if the cause still exists.
 - **Three-failure rule.** If three attempts at a fix fail, stop and report all three with evidence. Do not keep guessing. Each attempt must test a distinct hypothesis.
+- **Empty reports are failures.** Every task ends with a substantial report: files changed, exact commands with their outputs, and the commit hash. Silent completion — and returning early without the deliverable — are failures, not results.
+- **Snapshots are point-in-time.** A dump of a live system (DB, log, session state) needs an explicit as-of timestamp and the command that produced it; never present it as stable truth.
 - **Use existing vocabulary.** Cambium, Custos, Opifex, Diffundo, worktree, generation, request_id, etc. Do not invent synonyms or new jargon. Module names match `docs/architecture.md` §4.
 - **No new doc/report/summary files unless asked.** Say it in chat. `agents.md`, `docs/architecture.md`, and `docs/module-template/*` are the normative documents; do not proliferate.
 
@@ -109,30 +119,45 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Flat over nested.** Early returns, guard clauses, exhaustive match/switch. Business logic in pure functions; state and I/O at the edges.
 - **Concrete over abstract.** Inline unless a boundary is independently meaningful.
 - **Real enums for domain alternatives.** `WorkerState`, `ResultStatus`, `EventKind` are enums, not strings or booleans.
-- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`SandboxKind.Bwrap` vs `SandboxKind.SandboxExec` vs `SandboxKind.Noop`, not `is_linux=True`).
+- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`WorkerState.Running` vs `WorkerState.Stopped`, not `is_running=True`).
 - **No `print()` in worker code or library code.** Use `logging`. The worker's stdout is reserved for the protocol.
 - **No shell=True with user input.** Use list-form `subprocess.run`. `git_op` and `grep_code` enforce this.
 - **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture.md` §12.
 - **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See §6.2.
+- **Module shape** (per `docs/module-template/*`): modules are pure JSON-in/JSON-out functions with strict JSON schemas, each with a CLI entry — `python -m cambium.modules.<name>` reads JSON from stdin, writes JSON to stdout. Modules depend on `Protocol`s (ports/adapters), never concrete providers; dependency injection happens at the root.
+- **Engine swap is a strategy pattern.** The rule engine is the primary `decide` implementation today; a DSPy program implementing the same interface can replace it behind the seam without touching callers (v2.1 — `docs/research/dspy-python-314.md`; see `docs/module-template/architecture.md` §5.1/§5.3).
+- **Durable state layout.** Event log and conversation store live in SQLite (WAL mode); low-level IPC is JSON-Lines. All session state sits under the dotted `.cambium/` dir — `docs/architecture.md` §16.2 is canonical on that naming.
 
 ---
 
-## 8. Where to look for what
+## 8. Design norms
+
+- **Task tree, not flat lists.** Decomposition produces a tree (DAG): nodes are sub-LLM sessions. A node's only contract is its `Result` envelope — a unified diff, summary, and metrics. A parent **never reads a child's scratchpad or reasoning**; steering goes downward by `session_id`, results flow upward as envelopes (design-deltas D2/D3).
+- **Determinism split.** The LLM plans — it emits JSON arrays of sub-tasks. Deterministic supervisor code manages spawning, queues, and merges. The LLM never manages parallelism.
+- **Let it crash.** Worker crashes are normal; the supervisor restarts from the last durable checkpoint. Do **not** write defensive spaghetti in workers: no `try/except` around LLM-output parsing — crash, and let the supervisor handle it.
+- **Prompt structure for provider caching.** Static prefix (system prompt, `AGENTS.md`, guidelines) at the top; dynamic content (conversation history, repo state) at the bottom. Never put timestamps or request IDs at the top. There is **no local LLM cache** — provider-side caching only (design-deltas D1); prompt structure exists to make provider caches hit, not as a correctness mechanism.
+- **No sandboxing in the harness.** Containment = git worktree isolation + permission allowlists + approval gates (design-deltas D7). Workers are stdio processes — local today, a disposable container at deployment, and that is out of harness scope.
+- **Canary gate.** Any metric or refinement change that degrades the canary score is **rejected** — the canary suite is the gate, not a suggestion (`docs/module-template/dataset-format.md` §6; design-deltas D5).
+
+---
+
+## 9. Where to look for what
 
 | If you need to... | Read this |
 |---|---|
 | Understand the system end-to-end | `docs/architecture.md` §0–§7 |
+| Understand a design decision that postdates the architecture | `docs/research/design-deltas.md` (D1–D7) |
 | Add or change a decision module | `docs/module-template/architecture.md`, then `docs/module-template/example-spec.md` |
 | Add or change a dataset | `docs/module-template/dataset-format.md` |
 | Add a new protocol message | `docs/architecture.md` §5.2, then `src/cambium/nuntius/` |
 | Debug a worker crash / restart loop | `docs/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
 | Debug a merge failure | `docs/architecture.md` §4 (Unio), §7.7 |
 | Understand an old design choice | `docs/system-design.md` (v0.1) + the three `docs/reviews/` |
-| Find what to copy for a new sandbox backend | `src/cambium/septum/` + §4 (Septum) in architecture.md |
+| Find what to copy for a sandbox backend (out of v2 scope) | `src/cambium/septum/` + §4 (Septum) in architecture.md; removal rationale in design-deltas D7 |
 
 ---
 
-## 9. What "done" means for a module
+## 10. What "done" means for a module
 
 A module is **done** when **all** of the following hold:
 
@@ -148,7 +173,7 @@ If any of these is missing, the module is **not done** — it is "in progress." 
 
 ---
 
-## 10. Asking for help
+## 11. Asking for help
 
 Ask the orchestrator (root agent) when:
 - Two equal-priority requirements conflict and evidence cannot decide.
