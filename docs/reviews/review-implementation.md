@@ -84,10 +84,10 @@ This is a parse error. The entire `Orchestrator` class — and therefore the ent
 
 Line 1010:
 ```python
-def __ bwrap_command(self, ...):   # ← space in identifier; SyntaxError
+def __ sandbox_command(self, ...):   # ← space in identifier; SyntaxError
 ```
 
-Python identifiers cannot contain spaces. The `Sandbox` class will not parse. Even if fixed to `_bwrap_command`, line 1024 references `sys.executable` without `import sys`, and line 1029 calls `self._bwrap_command` (single underscore) while the definition uses double underscore (name-mangling applies). Three bugs in a 25-line module.
+Python identifiers cannot contain spaces. The `Sandbox` class will not parse. Even if fixed to `_sandbox_command`, line 1024 references `sys.executable` without `import sys`, and line 1029 calls `self._sandbox_command` (single underscore) while the definition uses double underscore (name-mangling applies). Three bugs in a 25-line module.
 
 ### C8. Orchestrator calls `await` on synchronous methods, and references undefined `merge`/`evaluate`/`asyncio`
 
@@ -198,14 +198,14 @@ Multiple workers operate on different worktrees of the same repo. The document c
 
 **Recommendation:** Set `gc.auto=0` in the cambium-managed repo. Add retry-with-backoff on `worktree add` for lock errors. Ensure `remove()` and merge never run concurrently for the same branch. Consider a separate "merge repo" or bare clone for the sequencer.
 
-### M4. bubblewrap is Linux-only; the user's macOS build machine is unsupported
+### M4. Sandbox backend is Linux-only; the user's macOS build machine is unsupported
 
-§M8 (line 998) hardcodes `bwrap`. Bubblewrap exists only on Linux. The user's environment includes a MacBook Pro used for Rust compilation (per the task context). On macOS:
+§M8 (line 998) hardcodes a Linux-only sandbox tool. The user's environment includes a MacBook Pro used for Rust compilation (per the task context). On macOS:
 
-- No `bwrap`. Apple's sandboxing is via `sandbox-exec` (deprecated, undocumented) or Seatbelt profiles.
+- No equivalent tool on macOS. Apple's sandboxing is via `sandbox-exec` (deprecated, undocumented) or Seatbelt profiles.
 - The `Sandbox` class has no platform abstraction, no macOS branch, no `firejail` fallback (firejail is also Linux-only despite being mentioned in the module table).
 
-**Recommendation:** Define a `Sandbox` protocol with platform backends: `BwrapSandbox` (Linux), `SandboxExecSandbox` (macOS, best-effort), and `NoopSandbox` (development). Gate sandboxing behind a config flag. Document that macOS sandboxing is weaker and should not be trusted for untrusted-code scenarios.
+**Recommendation:** Define a `Sandbox` protocol with platform backends: a Linux namespace backend, `SandboxExecSandbox` (macOS, best-effort), and `NoopSandbox` (development). Gate sandboxing behind a config flag. Document that macOS sandboxing is weaker and should not be trusted for untrusted-code scenarios.
 
 ### M5. No error handling when ALL FanOut providers are down
 
@@ -226,7 +226,7 @@ Multiple workers operate on different worktrees of the same repo. The document c
 - The worker init message if the worker needs its own key — but the worker currently bypasses FanOut (C12), so it would need the key in the `dspy.LM(api_key=...)` call.
 - Potentially the event log: `_log_event` serializes arbitrary dicts to JSONL; if a config or error dict contains a key, it's written to disk in plaintext.
 
-There is no mention of: environment variables, `.env` loading, OS keychain, a vault, or redaction. The bwrap sandbox (M8) doesn't `--setenv` keys, so a sandboxed worker can't authenticate at all.
+There is no mention of: environment variables, `.env` loading, OS keychain, a vault, or redaction. The sandbox (M8) doesn't `--setenv` keys, so a sandboxed worker can't authenticate at all.
 
 **Recommendation:** Load keys from environment or a secrets file with `0600` perms. Never log keys — add a redaction filter in `_log_event`. Pass keys to workers via an inherited env or a one-shot FD, not in the JSON init message. Document the threat model (keys at rest, in transit to workers, in logs).
 
@@ -310,7 +310,7 @@ The architectural vision — Erlang-style supervision, Kahn-process IPC, Tempora
 1. **~12 syntax errors and undefined-name bugs (C3, C4, C5, C6, C7, C8, C9, C2, C11) mean that no module in the document can run as written.** M5 (Worker) crashes on `os.getpid()`. M6 (Orchestrator) won't parse. M8 (Sandbox) won't parse. M9 (Optimization) won't parse. M7 (Merge) hits `AttributeError: self.root`. M4 (Supervisor) `shutdown()` is broken. The fact that *none* of these have been caught suggests **zero of this code has been executed, even as a smoke test.**
 2. **The headline concurrency story has a critical race (C1):** concurrent merges mutate the shared repo working tree with no serialization.
 3. **The headline resilience story has a gap (C12, M5):** workers bypass FanOut, so provider failover doesn't actually protect the workers; and when all providers are down, the exception is unhandled and undefined.
-4. **Platform portability is unaddressed (M4):** bubblewrap is Linux-only, but the user's build machine is macOS.
+4. **Platform portability is unaddressed (M4):** the sandbox backend is Linux-only, but the user's build machine is macOS.
 5. **There is no test strategy (M8), no secrets management (M6), no real logging (M7), and no fallback for the experimental Python 3.14 free-threaded build (M1).**
 
 **Recommended path to build-ready:**

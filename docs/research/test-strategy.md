@@ -326,7 +326,7 @@ tests/
 │   ├── test_restart_policy.py   #   should_restart / delay as a pure function
 │   ├── test_redaction.py        #   secrets never reach the log
 │   ├── test_dag_validation.py   #   cycle detection in Architectus (DS-M6)
-│   └── test_septum.py           #   bwrap / sandbox-exec / noop command wrapping
+│   └── test_septum.py           #   namespace / sandbox-exec / noop command wrapping
 ├── scenarios/                   # L5 named scenarios (§7); @pytest.mark.scenario
 │   ├── test_example_module.py   #   S14 (exists today)
 │   ├── test_smoke_happy_path.py #   S01
@@ -401,7 +401,7 @@ Every review finding that demands a test maps to a concrete item. IMPL-M8
 | IMPL-C2..C9, IMPL-N1..N14 — runtime bugs (`self.root`, `os.getpid`, `write_content`, missing returns, broken syntax, `shutdown` `.kill()`) | any module runs at all | S01 (the "single dry run" gate); S15 for C11 |
 | IMPL-M2 — unbounded cold start | readiness gate | S01 (ready handshake; a worker that never readies trips `ready_timeout` → killed, folded into S03) |
 | IMPL-M3 — git worktree concurrency / `gc.auto` | no cross-worker git contention | S08; §4.1; S07 |
-| IMPL-M4 — bubblewrap Linux-only | Septum platform abstraction | §9.1 `unit/test_septum.py` (bwrap/sandbox-exec/noop command wrapping) |
+| IMPL-M4 — sandbox backend Linux-only | Septum platform abstraction | §9.1 `unit/test_septum.py` (namespace/sandbox-exec/noop command wrapping) |
 | IMPL-M5 / DS-M7 — all-provider-down unhandled; kills workers | typed `AllProvidersFailed`, dispatch parked, workers survive | S13; §6.1 item 4 |
 | IMPL-M6 — no secrets management | keys never in logs/protocol | `unit/test_redaction.py`; S01 assertion (no key material in events) |
 | IMPL-M7 — no real logging | non-blocking writer, rotation, flush | S15 (flush on shutdown); §3 items 1–3; S06 |

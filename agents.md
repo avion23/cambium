@@ -109,7 +109,7 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Flat over nested.** Early returns, guard clauses, exhaustive match/switch. Business logic in pure functions; state and I/O at the edges.
 - **Concrete over abstract.** Inline unless a boundary is independently meaningful.
 - **Real enums for domain alternatives.** `WorkerState`, `ResultStatus`, `EventKind` are enums, not strings or booleans.
-- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`SandboxKind.Bwrap` vs `SandboxKind.SandboxExec` vs `SandboxKind.Noop`, not `is_linux=True`).
+- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`WorkerState.Running` vs `WorkerState.Exited`, not `is_running=True`).
 - **No `print()` in worker code or library code.** Use `logging`. The worker's stdout is reserved for the protocol.
 - **No shell=True with user input.** Use list-form `subprocess.run`. `git_op` and `grep_code` enforce this.
 - **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture.md` §12.
@@ -128,7 +128,6 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 | Debug a worker crash / restart loop | `docs/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
 | Debug a merge failure | `docs/architecture.md` §4 (Unio), §7.7 |
 | Understand an old design choice | `docs/system-design.md` (v0.1) + the three `docs/reviews/` |
-| Find what to copy for a new sandbox backend | `src/cambium/septum/` + §4 (Septum) in architecture.md |
 
 ---
 

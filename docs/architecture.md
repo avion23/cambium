@@ -72,7 +72,7 @@ Cambium is a **leaf module** of a larger system: a host process spawns instances
 │  │              worktree recovery; durable event log.              │  │
 │  │  Unio      — merge sequencer (asyncio.Lock + throwaway wt).     │  │
 │  │  Surculus  — worktree manager (lock recovery + prune).          │  │
-│  │  Septum    — sandbox (Linux bwrap / macOS sandbox-exec / noop). │  │
+│  │  Septum    — sandbox (Linux / macOS sandbox-exec / noop).       │  │
 │  │  Nuntius   — IPC protocol (JSON-Lines + request_id framing).    │  │
 │  └──────────────────────────────┬─────────────────────────────────┘  │
 │                                 │ stdin/stdout pipes (one pair/worker) │
@@ -236,7 +236,7 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 | M5 | Opifex | Worker | DSPy ReAct loop; tools; checkpoint; heartbeat. | Per-worker: trajectory, turn counter, generation token. |
 | M6 | Architectus | Orchestrator | Decision modules: `should_decompose` (v2 rule engine; DSPy seam per `docs/module-template/example-spec.md`), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. All subclass `cambium.modules.base.Module` (`decide()` + `metric()`). | Program versions (read-only at runtime). |
 | M7 | Unio | Deterministic | Merge sequencer: serialized, throwaway worktree, test gate. | None (operates on a temp worktree). |
-| M8 | Septum | Deterministic | Sandbox wrapper: `bwrap` (Linux), `sandbox-exec` (macOS), noop. | None. |
+| M8 | Septum | Deterministic | Sandbox wrapper: Linux (kernel namespace), `sandbox-exec` (macOS), noop. | None. |
 | M9 | Ascensus | Tooling (offline) | Optimization harness: per-module dataset, metric, held-out eval. | Optimized prompt artifacts under `.cambium/optimized/`. |
 | M10 | Janus | View | TUI: subscribes to `Session.events()`. Read-only. | None. |
 
@@ -1090,7 +1090,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 | IMPL-M1 | Python 3.14 free-threaded experimental | Standard 3.14; free-threading opt-in. | §14 |
 | IMPL-M2 | Subprocess cold-start unbounded | Documented; `ready_timeout` (default 60 s); persistent pool deferred to v2.1. | §14 |
 | IMPL-M3 | Git worktree concurrency / `gc.auto` | `Surculus` sets `gc.auto=0` on the cambium-managed repo; retries `worktree add` on lock contention; never mutates `main` from worker code. | §7 (Surculus) |
-| IMPL-M4 | bubblewrap Linux-only | `Septum` has `BwrapSandbox` (Linux), `SandboxExecSandbox` (macOS, best-effort), `NoopSandbox` (dev/CI). | §4 (Septum) |
+| IMPL-M4 | Linux-only sandbox backend | `Septum` has a kernel-namespace backend (Linux), `SandboxExecSandbox` (macOS, best-effort), `NoopSandbox` (dev/CI). | §4 (Septum) |
 | IMPL-M5 | `AllProvidersFailed` undefined / unhandled | Defined in `cambium.diffundo.errors`; orchestrator catches it and parks dispatch. | §9.2 |
 | IMPL-M6 | No secrets management | Env-only; redaction filter; never in JSON init; sandbox `--setenv` per-worker key allowlist. | §12 |
 | IMPL-M7 | No real logging | stdlib `logging` + `JsonFormatter`; `QueueHandler` + `QueueListener`; rotation; correlation IDs. | §13 |
@@ -1130,7 +1130,7 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 
 10. **Explicit concurrency guards.** Merge sequencer is locked. FanOut cooldown is locked. Event log is single-writer. Worker subprocesses are in their own process group. Nothing races implicitly. Addressed: §6.2, §7, §8, §9.
 
-11. **Cross-platform from day 1.** The sandbox has Linux, macOS, and noop backends. The design does not assume bubblewrap. macOS is a first-class dev platform. Addressed: §4 (Septum).
+11. **Cross-platform from day 1.** The sandbox has Linux, macOS, and noop backends, abstracted so that no single platform tool is assumed. macOS is a first-class dev platform. Addressed: §4 (Septum).
 
 12. **Secrets handled once, correctly.** Env-only at rest, inherited via subprocess env, never in protocol messages, redacted at the log boundary, sandboxed per-worker via `--setenv`. Documented threat model. Addressed: §12.
 
@@ -1143,7 +1143,7 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 **Failure modes this design does not yet address (honest gaps):**
 - Cold-start latency for subprocess-per-worker (mitigation documented; persistent pool deferred).
 - Cross-model prompt transfer during optimization (documented; mitigation is per-model optimization, deferred to v2.1).
-- Macos sandbox is weaker than Linux bwrap (documented as best-effort).
+- Macos sandbox is weaker than Linux (documented as best-effort).
 - The "doom loop detector" pattern from Claude Code is on the v2.1 list, not in v2.
 
 ---

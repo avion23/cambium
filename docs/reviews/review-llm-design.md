@@ -199,7 +199,7 @@ These are in shipped pseudocode that the document presents as the implementation
 | 1077 | `r.get("status") "done"` — missing `==` operator; syntax error. |
 | 1091 | `... if true_bugs polymorphism` — `polymorphism` is a stray token; syntax error. |
 | 1116 | `f".c flywheel/data/optimized/{node_name}.json"` — space in path; should be `.cambium`. |
-| 1010 | `def __ bwrap_command` — space after `__`, invalid identifier. |
+| 1010 | `def __ sandbox_command` — space after `__`, invalid identifier. |
 | 1024 | `sys.executable` referenced in M8 but `sys` not imported there. |
 | 118 | Duplicate `M7: Merge Sequencer` row (line 117 is correct; 118 has "test test gate" typo). |
 | 1133, 1140 | Broken box-drawing characters (`┌` / `┏` instead of `┐`) in the flywheel diagram. |
@@ -223,7 +223,7 @@ Line 767 runs `git log --oneline HEAD~5..HEAD`. On a fresh worktree with fewer t
 
 ### N6. "Zero external runtime dependencies" claim is inaccurate
 
-Line 17 claims "Zero external runtime dependencies beyond Python stdlib + DSPy + git." The design also depends on LiteLLM (line 112, line 298), `bubblewrap`/`firejail` (M8), and transitively on whatever DSPy pulls in. The claim should be qualified.
+Line 17 claims "Zero external runtime dependencies beyond Python stdlib + DSPy + git." The design also depends on LiteLLM (line 112, line 298), the sandbox tooling (M8), and transitively on whatever DSPy pulls in. The claim should be qualified.
 
 ---
 
