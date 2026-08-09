@@ -19,7 +19,7 @@ Cambium decision module, from spec to merged and optimized.
 | Dataset schema/versioning/canaries | `docs/architecture/module-template/dataset-format.md` | JSONL envelope, splits, versions, canary taxonomy |
 | Reference example spec | `docs/architecture/module-template/example-spec.md` | the `should_decompose` module spec |
 | Reference implementation | `src/cambium/modules/example/**` | `__init__.py`, `decide.py`, `dataset.py`, `metric.py`, `architecture.md`, `datasets/example_pairs.jsonl` |
-| Reference scenario test | `tests/scenarios/test_example_module.py` | the per-module test gate |
+| Reference scenario test | `src/cambium/modules/example/tests/test_example_module.py` | the per-module test gate |
 | Python 3.14 verification | `docs/research/python-3.14.md` | CPython 3.14.7 regular build is the target; GIL present by default |
 
 > **Template caveat.** `agents.md`, `docs/architecture/architecture.md` (v2.0.0), and
@@ -48,7 +48,7 @@ Cambium decision module, from spec to merged and optimized.
 5. Read the reference module end-to-end, in this order:
    `src/cambium/modules/example/architecture.md` → `__init__.py` →
    `decide.py` → `metric.py` → `dataset.py` → `datasets/example_pairs.jsonl` →
-   the scenario test `tests/scenarios/test_example_module.py`. Also read
+   the colocated scenario test `src/cambium/modules/example/tests/test_example_module.py`. Also read
    `src/cambium/modules/base.py` (`Module`, `Example`, `DatasetLoader`, `DatasetError`).
 6. Copy `docs/architecture/module-template/architecture.md` to `src/cambium/modules/<name>/architecture.md`
    and fill in every section. **Empty sections are not acceptable** — write "N/A — <reason>"
@@ -161,8 +161,8 @@ declared threshold) on the full dataset including canaries.
 
 ### Step 5 — Scenario tests (minimum set)
 
-**What:** `tests/scenarios/test_<name>_module.py`, no mocking, no network (reference:
-`tests/scenarios/test_example_module.py`). Minimum test set:
+**What:** `src/cambium/modules/<name>/tests/test_<name>_module.py`, no mocking, no network
+(reference: `src/cambium/modules/example/tests/test_example_module.py`). Minimum test set:
 
 1. **Load and validate** the real dataset; assert schema validity; include a negative case
    (malformed record raises `DatasetError`).
@@ -179,10 +179,10 @@ declared threshold) on the full dataset including canaries.
 **Gate:**
 
 ```
-uv run --python 3.14.7 --extra test pytest tests/scenarios/test_<name>_module.py -v
+uv run --python 3.14.7 --extra test pytest src/cambium/modules/<name>/tests/test_<name>_module.py -v
 ```
 
-Exit 0. (VERIFIED for the reference: `tests/scenarios/test_example_module.py` — 6 passed on
+Exit 0. (VERIFIED for the reference: `src/cambium/modules/example/tests/test_example_module.py` — 6 passed on
 2026-08-09.)
 
 ### Step 6 — Verify on Python 3.14.7 (exact commands)
@@ -190,7 +190,7 @@ Exit 0. (VERIFIED for the reference: `tests/scenarios/test_example_module.py` �
 Run from the repo root, on CPython 3.14.7 (regular GIL build; see `docs/research/python-3.14.md`):
 
 ```
-uv run --python 3.14.7 --extra test pytest tests/scenarios/test_<name>_module.py -v   # per-module gate
+uv run --python 3.14.7 --extra test pytest src/cambium/modules/<name>/tests/test_<name>_module.py -v   # per-module gate
 uv run --python 3.14.7 --extra test pytest -q                                          # whole suite
 uv run --python 3.14.7 python -m compileall src/cambium                                # syntax gate
 uv run --python 3.14.7 python -c "import cambium"                                      # import gate
@@ -257,7 +257,8 @@ module commit on `wt-<name>`.
 
 1. Record the baseline (Step 3.4) in `src/cambium/modules/<name>/architecture.md` §10
    (Optimization Plan): rule-engine mean metric + per-signal breakdown on the frozen held-out
-   set, the eval threshold, and the exact eval command that produced it.
+   set, the eval threshold, and the exact eval command that produced it. Store the committed
+   benchmark artifact at `src/cambium/modules/<name>/tests/baselines/baseline.json`.
 2. In v2 (no `eval.py` yet) the baseline is the scenario-test aggregate — the reference
    records "1.0 exact-match over the full dataset" as its baseline.
 3. A future DSPy variant must beat this baseline on the held-out set, or the rule engine
@@ -357,8 +358,8 @@ VERIFIED/UNVERIFIED/BLOCKED next to it.
 - [ ] Canary suite passes **100%**. *Verify:*
       `uv run --python 3.14.7 python -m cambium.modules.<name>.eval --suite canaries` exit 0
       (v2.1), or the scenario test's canary-coverage assertion (v2).
-- [ ] Scenario tests pass. *Verify:* `uv run --python 3.14.7 --extra test pytest
-      tests/scenarios/test_<name>_module.py -v` exit 0.
+- [ ] Colocated module tests pass. *Verify:* `uv run --python 3.14.7 --extra test pytest
+      src/cambium/modules/<name>/tests/test_<name>_module.py -v` exit 0.
 - [ ] Whole suite passes. *Verify:* `uv run --python 3.14.7 --extra test pytest -q` exit 0.
 - [ ] Syntax + import gates pass. *Verify:*
       `uv run --python 3.14.7 python -m compileall src/cambium` and
