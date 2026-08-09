@@ -74,7 +74,7 @@ Objectively verifiable stats:
 | Cwd | Dates | Topics (from user prompts) |
 |-----|-------|---------------------------|
 | `/home/ubuntu` | 2026-08-07 | Smoke tests: "Reply with exactly: PI OK" (openai-codex/gpt-5.6-sol), "PI KIMI OK" (kimi/k3-256k); `models` listing |
-| `/home/ubuntu` | 2026-08-09 | Five consecutive `status`/`doctor` sessions, all gpt-5.6-sol; assistant repeatedly replied "needs a target" without resolving — a repetitive-response loop |
+| `/home/ubuntu` | 2026-08-09 | Six sessions, all gpt-5.6-sol: 1×`status` + 5×`doctor`; assistant repeatedly replied "needs a target" without resolving — a repetitive-response loop |
 | `/home/ubuntu/bench-harness` | 2026-08-08 | Benchmark-style single commands (`df -h /`, top-RAM/zombie inspection) run across gpt-5.6-sol, gemini-2.5-pro, openrouter/auto, zai/gpt-5.2, nvidia/nemotron-3-ultra-550b, opencode-go/deepseek-v4-flash — a multi-provider eval harness |
 | `/home/ubuntu/polymarket-arbitrage` | 2026-08-01 | Config work: made pi "permissionless" (`defaultProjectTrust: "always"`), fixed `codebase-memory/SKILL.md:3` YAML frontmatter, then reverted over-scoped changes. 1,390,461-byte session |
 
@@ -164,7 +164,7 @@ Usage: pi [options] [@files...] [messages...]
 $ node --version; npm --version
 v22.23.2
 10.9.8
-$ ls ~/.pi/agent
+$ ls ~/.pi/agent   # excerpt, listing trimmed for brevity
 AGENTS.md  agents/  auth.json  auth.json.bak-bench  cache/  extensions/  git/  models-store.json
 models.json  models.json.bak-bench  npm/  REALTIME-SYSTEM-PROMPT.md  sessions/  settings.json  subagents.json
 $ git -C ~/.pi/agent log --oneline
