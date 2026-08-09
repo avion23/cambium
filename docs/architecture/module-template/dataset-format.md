@@ -1,6 +1,6 @@
 # Dataset Format — JSONL Schema, Versioning, Splits, Canaries
 
-**Status:** Normative. Every decision module's datasets conform to this format. v2 modules ship a single combined `<name>_pairs.jsonl` with inline `canary: true` markers (see `docs/module-template/example-spec.md` §7.1); the `{train,eval,canaries}.jsonl` three-file split described here is the v2.1 target.
+**Status:** Normative. Every decision module's datasets conform to this format. v2 modules ship a single combined `<name>_pairs.jsonl` with inline `canary: true` markers (see `docs/architecture/module-template/example-spec.md` §7.1); the `{train,eval,canaries}.jsonl` three-file split described here is the v2.1 target.
 
 ---
 
@@ -154,7 +154,7 @@ A sidecar `meta.json` records the current versions and the frozen-at timestamp:
 
 ## 6. Canaries (reward-hacking traps)
 
-Canaries are records that should **not** pass trivially under a metric-gaming prompt. They are the brakes on the flywheel (`docs/architecture.md` §17.4 step 8).
+Canaries are records that should **not** pass trivially under a metric-gaming prompt. They are the brakes on the flywheel (`docs/architecture/architecture.md` §17.4 step 8).
 
 Each canary record carries a `canary` field under `data`:
 

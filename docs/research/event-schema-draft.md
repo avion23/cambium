@@ -1,8 +1,8 @@
 # Cambium Event-Log Schema — DRAFT
 
 **Status:** DRAFT. Research-stage proposal for the durable event log of the Cambium supervisor/worker lifecycle.
-**Will be reconciled with:** the final architecture (`/tmp/opencode/cambium-arch/docs/architecture.md`, v2.0.0, build-ready) before any schema is frozen in code.
-**Authoritative sources today:** architecture v2.0.0 §3.6 (Event record), §5 (liveness + IPC), §6 (event log + durability contract), §7 (lifecycle); the merged scaffold `src/cambium/events.py`; dataset versioning convention `docs/module-template/dataset-format.md` §5.
+**Will be reconciled with:** the final architecture (`/tmp/opencode/cambium-arch/docs/architecture/architecture.md`, v2.0.0, build-ready) before any schema is frozen in code.
+**Authoritative sources today:** architecture v2.0.0 §3.6 (Event record), §5 (liveness + IPC), §6 (event log + durability contract), §7 (lifecycle); the merged scaffold `src/cambium/events.py`; dataset versioning convention `docs/architecture/module-template/dataset-format.md` §5.
 **Deviations from the architecture are explicitly flagged in §8 (Reconciliation Notes).**
 
 ---
@@ -486,7 +486,7 @@ Heartbeats (layer 3) never fire during normal tool execution because tools emit 
 
 ## 7. Schema versioning and migration policy
 
-Pattern follows the in-repo dataset convention (`docs/module-template/dataset-format.md` §5) adapted to an **append-only** log: the log is never rewritten in place; versioning is a read/replay concern.
+Pattern follows the in-repo dataset convention (`docs/architecture/module-template/dataset-format.md` §5) adapted to an **append-only** log: the log is never rewritten in place; versioning is a read/replay concern.
 
 ### 7.1 Version identity
 

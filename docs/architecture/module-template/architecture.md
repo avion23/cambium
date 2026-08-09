@@ -10,7 +10,7 @@
 
 | Field | Value |
 |---|---|
-| Code | M? (assign from `docs/architecture.md` §4 catalog, or "new" if not listed) |
+| Code | M? (assign from `docs/architecture/architecture.md` §4 catalog, or "new" if not listed) |
 | Name (Latin) | e.g., `Architectus.should_decompose` |
 | Layer | Deterministic \| Orchestrator \| Worker \| View \| Tooling (offline) |
 | Owner | Initials or agent name; transferred on handoff |
@@ -133,7 +133,7 @@ class <Module>DSPy(<Module>Module):
 
 ### 5.4 LLM access
 
-All LLM calls route through `Diffundo` (see `docs/architecture.md` §9). The DSPy replacement receives a `Diffundo`-backed `CambiumLM` from its caller; it never constructs `dspy.LM` directly and never mutates `dspy.settings.context` — it calls `dspy.configure(lm=...)` per `architecture.md` §9.3.
+All LLM calls route through `Diffundo` (see `docs/architecture/architecture.md` §9). The DSPy replacement receives a `Diffundo`-backed `CambiumLM` from its caller; it never constructs `dspy.LM` directly and never mutates `dspy.settings.context` — it calls `dspy.configure(lm=...)` per `architecture.md` §9.3.
 
 ### 5.5 Determinism
 
@@ -224,12 +224,12 @@ List at least five. If you cannot think of five, the module is under-specified.
 
 ### 9.4 Integration
 
-- **Scenario test (`tests/scenarios/test_<module>.py`, v2):** loads the real dataset, asserts schema validity (plus a negative case that raises `DatasetError`), runs `decide()` over every pair, attaches predictions, and asserts the aggregate metric is at threshold (for the `should_decompose` reference: 1.0 — see `docs/module-template/example-spec.md` §9.1). This is the v2 eval-harness substitute (§9.2).
+- **Scenario test (`tests/scenarios/test_<module>.py`, v2):** loads the real dataset, asserts schema validity (plus a negative case that raises `DatasetError`), runs `decide()` over every pair, attaches predictions, and asserts the aggregate metric is at threshold (for the `should_decompose` reference: 1.0 — see `docs/architecture/module-template/example-spec.md` §9.1). This is the v2 eval-harness substitute (§9.2).
 - **Smoke test (`cambium.tests.smoke`):** where this module is exercised end-to-end once the orchestrator is wired. If not exercised, justify.
 
 ### 9.5 Sibling pinning
 
-How this module is tested against **stub** siblings (frozen references) rather than live co-adapted siblings, per `docs/architecture.md` §17.2.
+How this module is tested against **stub** siblings (frozen references) rather than live co-adapted siblings, per `docs/architecture/architecture.md` §17.2.
 
 ---
 

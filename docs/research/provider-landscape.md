@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 **Target:** the locally configured LLM provider landscape on this machine (evidence: config files only).
-**Purpose:** input to Cambium's M2 **Diffundo** (FanOut — multi-provider LLM access with cascade/race/cache; `docs/system-design.md` M2, review `docs/reviews/review-llm-design.md` C2/C3). Task scope: docs only — **no API calls, no keys used, no network calls to LLM providers.**
+**Purpose:** input to Cambium's M2 **Diffundo** (FanOut — multi-provider LLM access with cascade/race/cache; `docs/architecture/system-design.md` M2, review `docs/architecture/reviews/review-llm-design.md` C2/C3). Task scope: docs only — **no API calls, no keys used, no network calls to LLM providers.**
 
 **Redaction rule (stated explicitly):** no API key, token, refresh token, session token, or other secret **value** appears anywhere in this document or in the report. Where a value could be a secret, only the **key name** and its **type** (e.g. `api_key`, `oauth`) and **length** are listed, or the value is replaced by `***[redacted]`. Files whose only content is credentials (`~/.codex/auth.json`, `~/.pi/agent/auth.json`, `~/.prime/agent/auth.json`, `~/.local/share/opencode/auth.json`, `~/.config/opencode/antigravity-accounts.json`) were inspected for **structure only** (key names, types, lengths); their values were never copied and are not reproduced here. The only exception to "values redacted": non-secret scalar settings (numbers, booleans, URLs, model IDs, provider names) are reported as-is because they carry the routing/caching facts Diffundo needs.
 

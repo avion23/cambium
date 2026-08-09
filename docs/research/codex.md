@@ -1,6 +1,6 @@
 # Competitive Analysis: OpenAI Codex CLI
 
-Research date: 2026-08-09. Purpose: inform the Cambium harness design (see `docs/system-design.md`).
+Research date: 2026-08-09. Purpose: inform the Cambium harness design (see `docs/architecture/system-design.md`).
 
 ---
 

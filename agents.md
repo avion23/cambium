@@ -6,7 +6,7 @@
 
 ## 1. What Cambium is, in one paragraph
 
-Cambium is a Python 3.14 multi-agent coding-agent harness. It runs as an embeddable library (headless-first) with an optional TUI. A deterministic supervisor (`Custos`) manages N isolated worker processes (`Opifex`) over JSON-Lines-on-stdio IPC with `request_id` RPC framing. Workers run DSPy ReAct loops in private git worktrees. An LLM-driven orchestrator (`Architectus`) decomposes, routes, and evaluates. A serialized merge sequencer (`Unio`) fuses worker branches back. Read `docs/architecture.md` before changing anything non-trivial.
+Cambium is a Python 3.14 multi-agent coding-agent harness. It runs as an embeddable library (headless-first) with an optional TUI. A deterministic supervisor (`Custos`) manages N isolated worker processes (`Opifex`) over JSON-Lines-on-stdio IPC with `request_id` RPC framing. Workers run DSPy ReAct loops in private git worktrees. An LLM-driven orchestrator (`Architectus`) decomposes, routes, and evaluates. A serialized merge sequencer (`Unio`) fuses worker branches back. Read `docs/architecture/architecture.md` before changing anything non-trivial.
 
 ---
 
@@ -30,7 +30,7 @@ cambium/
 └── pyproject.toml
 ```
 
-If a directory or file referenced here does not exist yet, it is planned (see `docs/architecture.md` §4) but not built. Do not invent it; ask.
+If a directory or file referenced here does not exist yet, it is planned (see `docs/architecture/architecture.md` §4) but not built. Do not invent it; ask.
 
 ---
 
@@ -39,7 +39,7 @@ If a directory or file referenced here does not exist yet, it is planned (see `d
 Trace from entry points, not from filenames. Concrete starting points:
 
 - **Public API surface:** `src/cambium/__init__.py` — `Cambium`, `Session`, `Result`, `Instance`, `Event`, `Config`.
-- **IPC protocol:** `src/cambium/nuntius/` — message types and framing. Schema is normative in `docs/architecture.md` §5.2.
+- **IPC protocol:** `src/cambium/nuntius/` — message types and framing. Schema is normative in `docs/architecture/architecture.md` §5.2.
 - **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in §7.
 - **Worker entry:** `src/cambium/opifex/__main__.py` — read-init → ready → loop → result/exit.
 - **Decision modules:** `src/cambium/modules/<name>/` — each module is self-contained (rule engine primary + DSPy seam in `decide.py`).
@@ -97,8 +97,8 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Separate facts from inferences.** "The supervisor emits `worker_exit` on EOF" is a fact (cite the line). "The supervisor is therefore robust to zombie grandchildren" is an inference (justify it or test it).
 - **A defect fix is done only with before/after verification.** "Unverified" if not run; "workaround" if the cause still exists.
 - **Three-failure rule.** If three attempts at a fix fail, stop and report all three with evidence. Do not keep guessing. Each attempt must test a distinct hypothesis.
-- **Use existing vocabulary.** Cambium, Custos, Opifex, Diffundo, worktree, generation, request_id, etc. Do not invent synonyms or new jargon. Module names match `docs/architecture.md` §4.
-- **No new doc/report/summary files unless asked.** Say it in chat. `agents.md`, `docs/architecture.md`, and `docs/module-template/*` are the normative documents; do not proliferate.
+- **Use existing vocabulary.** Cambium, Custos, Opifex, Diffundo, worktree, generation, request_id, etc. Do not invent synonyms or new jargon. Module names match `docs/architecture/architecture.md` §4.
+- **No new doc/report/summary files unless asked.** Say it in chat. `agents.md`, `docs/architecture/architecture.md`, and `docs/architecture/module-template/*` are the normative documents; do not proliferate.
 
 ---
 
@@ -112,7 +112,7 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`SandboxKind.Bwrap` vs `SandboxKind.SandboxExec` vs `SandboxKind.Noop`, not `is_linux=True`).
 - **No `print()` in worker code or library code.** Use `logging`. The worker's stdout is reserved for the protocol.
 - **No shell=True with user input.** Use list-form `subprocess.run`. `git_op` and `grep_code` enforce this.
-- **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture.md` §12.
+- **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture/architecture.md` §12.
 - **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See §6.2.
 
 ---
@@ -121,13 +121,13 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 
 | If you need to... | Read this |
 |---|---|
-| Understand the system end-to-end | `docs/architecture.md` §0–§7 |
-| Add or change a decision module | `docs/module-template/architecture.md`, then `docs/module-template/example-spec.md` |
-| Add or change a dataset | `docs/module-template/dataset-format.md` |
-| Add a new protocol message | `docs/architecture.md` §5.2, then `src/cambium/nuntius/` |
-| Debug a worker crash / restart loop | `docs/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
-| Debug a merge failure | `docs/architecture.md` §4 (Unio), §7.7 |
-| Understand an old design choice | `docs/system-design.md` (v0.1) + the three `docs/reviews/` |
+| Understand the system end-to-end | `docs/architecture/architecture.md` §0–§7 |
+| Add or change a decision module | `docs/architecture/module-template/architecture.md`, then `docs/architecture/module-template/example-spec.md` |
+| Add or change a dataset | `docs/architecture/module-template/dataset-format.md` |
+| Add a new protocol message | `docs/architecture/architecture.md` §5.2, then `src/cambium/nuntius/` |
+| Debug a worker crash / restart loop | `docs/architecture/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
+| Debug a merge failure | `docs/architecture/architecture.md` §4 (Unio), §7.7 |
+| Understand an old design choice | `docs/architecture/system-design.md` (v0.1) + the three `docs/architecture/reviews/` |
 | Find what to copy for a new sandbox backend | `src/cambium/septum/` + §4 (Septum) in architecture.md |
 
 ---
@@ -137,11 +137,11 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 A module is **done** when **all** of the following hold:
 
 1. Its `architecture.md` (per template) is committed.
-2. Its datasets are committed with explicit schema/version markers. **v2:** a single `<name>_pairs.jsonl` with inline `canary: true` records (see `src/cambium/modules/example/`); **v2.1:** the `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split per `docs/module-template/dataset-format.md`.
-3. Its metric and eval harness run green over the full dataset (including canaries) — in v2, via the scenario test (§9 of `docs/module-template/architecture.md`).
+2. Its datasets are committed with explicit schema/version markers. **v2:** a single `<name>_pairs.jsonl` with inline `canary: true` records (see `src/cambium/modules/example/`); **v2.1:** the `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split per `docs/architecture/module-template/dataset-format.md`.
+3. Its metric and eval harness run green over the full dataset (including canaries) — in v2, via the scenario test (§9 of `docs/architecture/module-template/architecture.md`).
 4. Its unit tests pass.
 5. The end-to-end smoke test passes with the module wired in.
-6. An adversarial review has been committed under `docs/reviews/` (or an existing one updated and re-run).
+6. An adversarial review has been committed under `docs/architecture/reviews/` (or an existing one updated and re-run).
 7. The change has been verified (VERIFIED, not UNVERIFIED) per §5.
 
 If any of these is missing, the module is **not done** — it is "in progress." State which step is missing and why.
@@ -157,7 +157,7 @@ Ask the orchestrator (root agent) when:
 - You need access outside your assigned file scope.
 
 Do **not** ask when:
-- The answer is in `docs/architecture.md` or in this file.
+- The answer is in `docs/architecture/architecture.md` or in this file.
 - A test or grep would answer it.
 - You are hedging out of caution rather than uncertainty.
 

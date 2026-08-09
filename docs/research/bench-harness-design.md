@@ -2,7 +2,7 @@
 
 Research date: 2026-08-09. Purpose: design the measurement layer that turns
 Cambium scenario tests into an objective, repeatable evidence base — the seed
-of **Ascensus** (M9, the DSPy optimization harness; `docs/system-design.md`
+of **Ascensus** (M9, the DSPy optimization harness; `docs/architecture/system-design.md`
 §M9). Every claim below is either a command output verified on this machine
 (pytest 9.1.1, CPython 3.14.7, installed via `uv`) or a file reference.
 Anything that could not be checked is marked **UNVERIFIED**.
@@ -299,7 +299,7 @@ pytest's own report objects only in plugin mode.
 Reuses the example module's loader (`ExampleDatasetLoader` from
 `src/cambium/modules/example/dataset.py`), which validates each record and
 flags `canary`. Coverage is measured against the canary taxonomy in
-`docs/module-template/dataset-format.md` §6:
+`docs/architecture/module-template/dataset-format.md` §6:
 
 - `trivially_atomic`, `must_decompose`, `ambiguous_calibration`,
   `format_only_hack`, `keyword_hack`.

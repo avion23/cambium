@@ -1,7 +1,7 @@
 # py.dev / JetBrains AI — Competitive Analysis
 
 **Date:** 2026-08-09
-**Scope:** Web-only research for Cambium (Python-native multi-agent coding harness; see `docs/system-design.md`).
+**Scope:** Web-only research for Cambium (Python-native multi-agent coding harness; see `docs/architecture/system-design.md`).
 **Status:** All claims sourced from fetched URLs. Anything not verifiable is marked UNVERIFIED.
 
 ---

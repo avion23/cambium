@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 **Target:** locally installed `/home/ubuntu/.local/bin/omp`, investigated from worktree `/tmp/opencode/cambium-omp` (branch `wt-omp`).
-**Purpose:** input to Cambium system design (`docs/system-design.md`).
+**Purpose:** input to Cambium system design (`docs/architecture/system-design.md`).
 **Verification rule:** local claims cite the exact command + observed output; web claims cite the URL; anything not directly observed is marked **UNVERIFIED**.
 
 ---

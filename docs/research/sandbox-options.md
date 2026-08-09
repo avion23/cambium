@@ -7,14 +7,14 @@ machine, or a URL. Anything that could not be checked is marked **UNVERIFIED**.
 
 Scope contract from the source docs:
 
-- `docs/system-design.md` §M8: Septum wraps each worker in `bwrap`
+- `docs/architecture/system-design.md` §M8: Septum wraps each worker in `bwrap`
   (`--die-with-parent`, ro-binds of `/usr /lib /lib64 /bin`, `--bind` of the
   worktree, fresh `/dev /proc`, `--tmpfs /tmp`, `--unshare-net` when
   `allow_network=False`).
-- `docs/reviews/review-implementation.md` IMPL-M4: bwrap is Linux-only; the
+- `docs/architecture/reviews/review-implementation.md` IMPL-M4: bwrap is Linux-only; the
   design must add platform backends (`SandboxExecSandbox` on macOS, noop) and
   a platform abstraction.
-- `cambium-arch/docs/architecture.md` §4: Septum = `BwrapSandbox` (Linux),
+- `cambium-arch/docs/architecture/architecture.md` §4: Septum = `BwrapSandbox` (Linux),
   `SandboxExecSandbox` (macOS, best-effort), `NoopSandbox` (dev/CI). Spawn uses
   `sandbox.wrap([sys.executable, ...])`. The arch doc does **not** specify the
   failure mode when the Linux sandbox cannot start; that policy is proposed

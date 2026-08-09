@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 **Worktree:** `/tmp/opencode/cambium-cascade` (branch `wt-cascade`)
-**Inputs (read-only):** `docs/architecture.md` (v2, at `/tmp/opencode/cambium-arch/docs/architecture.md`), `docs/system-design.md` (v0.1, superseded), `docs/reviews/review-llm-design.md` (LLM-C2, LLM-M6).
+**Inputs (read-only):** `docs/architecture/architecture.md` (v2, at `/tmp/opencode/cambium-arch/docs/architecture/architecture.md`), `docs/architecture/system-design.md` (v0.1, superseded), `docs/architecture/reviews/review-llm-design.md` (LLM-C2, LLM-M6).
 **Status:** design (docs only). Normative extension of architecture §9; defers only where explicitly flagged.
 **Verification rule:** every claim about existing documents cites a section (`[arch §N]`, `[sysd §M2]`, `[rev-llm C2]`). Claims the architecture does not make are marked **design**; claims that depend on data no available source provides are marked **UNVERIFIED**.
 
@@ -388,8 +388,8 @@ The example's fast-tier list is the review's example order `[rev-llm C2]`, which
 
 ## References
 
-- `docs/architecture.md` (v2) — §2 (layering invariants), §3.2–3.6 (Config/Session/Result/Event), §5.2 (init/error message schema), §6 (event log: schema §6.3, durability §6.5), §7.4 (restart policy, provider_patience_s, DS-M7), §8.1 (cache policy), §9 (provider cascade: §9.1 ProviderConfig, §9.2 cascade semantics, §9.3 worker integration), §10 (coding metric), §12 (secrets), §18 (resolution matrix; DS-M4, IMPL-M5).
-- `docs/system-design.md` (v0.1, superseded) — M2 Diffundo (the buggy `_cascade`/`_race`, `FanOutConfig`, cache key `[sysd §M2]`).
-- `docs/reviews/review-llm-design.md` — C1 (cache staleness), C2 (cascade no-op), C3 (transparency), M6 (race discard + hygiene).
-- `docs/reviews/review-distributed-systems.md` — C3 (worst-case cascade latency product).
+- `docs/architecture/architecture.md` (v2) — §2 (layering invariants), §3.2–3.6 (Config/Session/Result/Event), §5.2 (init/error message schema), §6 (event log: schema §6.3, durability §6.5), §7.4 (restart policy, provider_patience_s, DS-M7), §8.1 (cache policy), §9 (provider cascade: §9.1 ProviderConfig, §9.2 cascade semantics, §9.3 worker integration), §10 (coding metric), §12 (secrets), §18 (resolution matrix; DS-M4, IMPL-M5).
+- `docs/architecture/system-design.md` (v0.1, superseded) — M2 Diffundo (the buggy `_cascade`/`_race`, `FanOutConfig`, cache key `[sysd §M2]`).
+- `docs/architecture/reviews/review-llm-design.md` — C1 (cache staleness), C2 (cascade no-op), C3 (transparency), M6 (race discard + hygiene).
+- `docs/architecture/reviews/review-distributed-systems.md` — C3 (worst-case cascade latency product).
 - **Absent:** `docs/research/provider-landscape.md` — verified not in main on 2026-08-09; any per-provider datum derived from it is flagged **UNVERIFIED** throughout.
