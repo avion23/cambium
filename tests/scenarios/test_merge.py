@@ -144,7 +144,7 @@ def test_publish_rejects_stale_expected_old(tmp_path) -> None:
     base = _init_repo(repo)
 
     wt_a = tmp_path / "wt-a"
-    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
     wt_m = tmp_path / "wt-m"
     tip_m = _worker_commit(repo, "wt-m", wt_m, {"m.txt": "m\n"}, base)
 
@@ -169,7 +169,7 @@ def test_publish_works_through_staged_poison(tmp_path) -> None:
     base = _init_repo(repo)
 
     wt_a = tmp_path / "wt-a"
-    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
     wt_b = tmp_path / "wt-b"
     tip_b = _worker_commit(repo, "wt-b", wt_b, {"b.txt": "b\n"}, base)
 
@@ -196,7 +196,7 @@ def test_publish_rejects_quarantine_env(tmp_path, monkeypatch) -> None:
     base = _init_repo(repo)
 
     wt_a = tmp_path / "wt-a"
-    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
 
     seq = MergeSequencer(task_id="quar-1")
     staged_a = seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
@@ -293,7 +293,7 @@ def test_reconcile_reads_current_main(tmp_path) -> None:
     assert seq.reconcile(repo) == base
 
     wt_a = tmp_path / "wt-a"
-    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
     staged_a = seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
     seq.publish_merge(repo, staged_a, base)
     assert seq.reconcile(repo) == staged_a  # the ref-advance/event gap is closable
