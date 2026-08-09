@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = []
 
+[project.scripts]
+cambium = "cambium.cli:main"
+
 [project.entry-points.pytest11]
 "cambium.bench" = "cambium.bench"
 

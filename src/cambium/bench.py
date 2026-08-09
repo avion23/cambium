@@ -20,6 +20,7 @@ Only the Python standard library plus pytest is used.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import datetime as _dt
 import importlib
@@ -490,18 +491,51 @@ def pytest_configure(config: Any) -> None:
     config.pluginmanager.register(BenchPlugin(config, thresholds), "cambium-bench")
 
 
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m cambium.bench",
+        description="Run the Cambium benchmark report or drift gate.",
+    )
+    parser.add_argument("mode", nargs="?", default="report", metavar="{report,gate}")
+    parser.add_argument(
+        "--bench-root",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="baseline root override (default: next to each module)",
+    )
+    parser.add_argument(
+        "--bench-metric-delta",
+        type=float,
+        default=None,
+        help="override the metric mean drop drift threshold",
+    )
+    parser.add_argument(
+        "--bench-wall-ratio",
+        type=float,
+        default=None,
+        help="override the wall p90 ratio drift threshold",
+    )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI form: ``python -m cambium.bench report|gate`` (no durations)."""
-    args = list(sys.argv[1:] if argv is None else argv)
-    mode = args[0] if args else "report"
+    """CLI form: ``python -m cambium.bench report|gate``."""
+    args = _cli_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    mode = args.mode
     if mode not in ("report", "gate"):
         print("usage: python -m cambium.bench report|gate", file=sys.stderr)
         return 2
+    thresholds = dict(DEFAULT_THRESHOLDS)
+    if args.bench_metric_delta is not None:
+        thresholds["metric_mean_delta"] = args.bench_metric_delta
+    if args.bench_wall_ratio is not None:
+        thresholds["wall_p90_ratio"] = args.bench_wall_ratio
     failures = 0
     for pkg_name in discover_modules():
         body = build_module_report(pkg_name)
-        report = _assemble_baseline(body, {})
-        path = _baseline_path(pkg_name, report["module"])
+        report = _assemble_baseline(body, {}, thresholds)
+        path = _baseline_path(pkg_name, report["module"], args.bench_root)
         if mode == "report":
             _write_baseline(report, path)
             print(f"cambium bench: wrote {path}")

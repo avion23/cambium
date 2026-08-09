@@ -150,6 +150,7 @@ async def _run_gate(
     proc = await asyncio.create_subprocess_exec(
         "sh", "-c", command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_strip_sensitive_env(dict(os.environ)),
     )
     try:
         _out, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -167,6 +168,7 @@ async def _merge_branch(scratch_repo: Path, branch: str, log: EventLog, task_id:
     proc = await asyncio.create_subprocess_exec(
         "git", "merge", "--ff-only", branch, cwd=scratch_repo,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=_strip_sensitive_env(dict(os.environ)),
     )
     _out, err = await proc.communicate()
     if proc.returncode != 0:
@@ -176,6 +178,7 @@ async def _merge_branch(scratch_repo: Path, branch: str, log: EventLog, task_id:
     tip = await asyncio.create_subprocess_exec(
         "git", "rev-parse", "HEAD", cwd=scratch_repo,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=_strip_sensitive_env(dict(os.environ)),
     )
     out, _ = await tip.communicate()
     sha = out.decode("utf-8", "replace").strip()
@@ -216,8 +219,8 @@ async def run_session(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=WORKER_STDIN_LIMIT,
-        env={**os.environ, "PYTHONUNBUFFERED": "1",
-             "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": "1"},
+        env=_strip_sensitive_env({**os.environ, "PYTHONUNBUFFERED": "1",
+                                  "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": "1"}),
         start_new_session=True,
     )
 
@@ -1134,7 +1137,7 @@ class _Runtime:
                 stderr=asyncio.subprocess.PIPE,
                 limit=WORKER_STDIN_LIMIT,
                 cwd=str(worktree),
-                env=env,
+                env=_strip_sensitive_env(env),
                 start_new_session=True,
                 pass_fds=(),
                 close_fds=True,
@@ -1411,6 +1414,7 @@ class _Runtime:
         proc = await asyncio.create_subprocess_exec(
             "sh", "-c", gate, cwd=str(worktree),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_strip_sensitive_env(dict(os.environ)),
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
