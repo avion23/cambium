@@ -60,6 +60,8 @@ def _build_parser() -> argparse.ArgumentParser:
     for mode in ("report", "gate"):
         mode_parser = bench_commands.add_parser(mode, help=f"run the bench {mode}")
         mode_parser.add_argument("--bench-root", type=Path, metavar="PATH")
+        mode_parser.add_argument("--bench-metric-delta", type=float, metavar="FLOAT")
+        mode_parser.add_argument("--bench-wall-ratio", type=float, metavar="FLOAT")
 
     commands.add_parser(
         "tasktree",
@@ -114,24 +116,11 @@ def _run_bench(args: argparse.Namespace) -> int:
             return 1
         raise
 
-    mode = args.bench_command
-    bench_root = args.bench_root
-
-    # The current standalone bench function accepts only the mode and uses
-    # DEFAULT_BASELINE_DIR.  Newer shapes may parse --bench-root themselves.
-    # Prefer the explicit option when no standalone default exists; otherwise
-    # scope the existing default to this invocation.
-    previous_root = getattr(bench, "DEFAULT_BASELINE_DIR", None)
-    if bench_root is not None and previous_root is not None:
-        bench.DEFAULT_BASELINE_DIR = bench_root
-        try:
-            return bench.main([mode])
-        finally:
-            bench.DEFAULT_BASELINE_DIR = previous_root
-
-    delegated = [mode]
-    if bench_root is not None:
-        delegated.extend(("--bench-root", str(bench_root)))
+    delegated = [args.bench_command]
+    for option in ("bench_root", "bench_metric_delta", "bench_wall_ratio"):
+        value = getattr(args, option)
+        if value is not None:
+            delegated.extend((f"--{option.replace('_', '-')}", str(value)))
     return bench.main(delegated)
 
 

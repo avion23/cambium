@@ -38,6 +38,18 @@ def test_doctor_exits_zero_on_healthy_repo() -> None:
     assert "0 fail" in result.stdout
 
 
+def test_bench_report_honors_bench_root(tmp_path) -> None:
+    bench_root = tmp_path / "baselines"
+    module_baseline = REPO_ROOT / "src/cambium/modules/example/tests/baselines/baseline.json"
+    before = module_baseline.read_bytes()
+
+    result = _run("bench", "report", "--bench-root", str(bench_root))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (bench_root / "should_decompose" / "baseline.json").is_file()
+    assert module_baseline.read_bytes() == before
+
+
 def test_unknown_subcommand_exits_two() -> None:
     result = _run("not-a-command")
 
