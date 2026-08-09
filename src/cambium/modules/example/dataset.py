@@ -50,6 +50,10 @@ class ExampleDatasetLoader(DatasetLoader):
             raise DatasetError(
                 f"{self.path}:{line_no}: expected.decompose must be a boolean"
             )
+        if not isinstance(record["expected"].get("reason"), str):
+            raise DatasetError(
+                f"{self.path}:{line_no}: expected.reason must be a string"
+            )
         canary = record.get("canary", False)
         if not isinstance(canary, bool):
             raise DatasetError(f"{self.path}:{line_no}: canary must be a boolean")

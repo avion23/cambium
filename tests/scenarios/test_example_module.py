@@ -62,6 +62,26 @@ def test_malformed_record_is_rejected(tmp_path) -> None:
         raise AssertionError("expected DatasetError for a schema-invalid record")
 
 
+def test_missing_expected_reason_is_rejected(tmp_path) -> None:
+    bad = tmp_path / "bad_reason.jsonl"
+    bad.write_text(
+        '{"input": {"task": "Do the thing."}, "expected": {"decompose": false}}\n'
+    )
+    try:
+        ExampleDatasetLoader(bad).load()
+    except DatasetError:
+        pass
+    else:
+        raise AssertionError("expected DatasetError for a missing expected.reason")
+
+
+def test_engine_tolerates_leading_separators() -> None:
+    from cambium.modules.example.decide import should_decompose
+
+    result = should_decompose("; hello world", "")
+    assert result.decompose is False
+
+
 def test_module_scores_perfect_on_its_dataset() -> None:
     scored = _run_all()
     assert len(scored) >= 8

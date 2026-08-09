@@ -63,9 +63,13 @@ decomposition outright (an explicit prior decomposition wins).
   canaries, which are deliberately misaligned with those heuristics.
   Canaries are scored like any other entry; dropping them is a dataset
   integrity failure caught by the scenario test.
-- **Garbage input** — non-string `task`, missing keys, or malformed
-  JSON is rejected by the loader with `DatasetError` before it reaches
-  the engine.
+- **Garbage input** — structurally invalid records (malformed JSON,
+  non-object records, non-string `task`, non-string `expected.reason`,
+  non-boolean `expected.decompose`/`canary`) are rejected by the loader
+  with `DatasetError`. String *content* is not validated: the engine is
+  a pure function that must tolerate arbitrary strings (clause
+  splitting is guarded), and a DSPy replacement inherits the same
+  requirement.
 
 ## Test strategy
 

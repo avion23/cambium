@@ -118,7 +118,10 @@ def should_decompose(task: str, context: str = "") -> DecomposeOutput:
 
     clauses = [c.strip() for c in re.split(r"[,;]\s+", task)]
     action_verbs = [
-        c for c in clauses if c.split()[0].lower().rstrip(".") in ACTION_VERBS
+        clause
+        for clause in clauses
+        if (words := clause.split())
+        and words[0].lower().rstrip(".") in ACTION_VERBS
     ]
     if len(action_verbs) >= 3:
         evidence += 2

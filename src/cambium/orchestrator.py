@@ -56,6 +56,4 @@ class Orchestrator:
             spec = await self._queue.get()
             task_id = spec["task_id"]
             await self._emit(WorkerStarted(task_id=task_id))
-            await self._emit(
-                WorkerFinished(task_id=task_id, status="pending", exit_code=None)
-            )
+            await self._emit(WorkerFinished(task_id=task_id))
