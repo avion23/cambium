@@ -198,7 +198,9 @@ class MergeSequencer:
             raise GitError(Path(cwd), list(args), result)
         return result
 
-    def _run_repo(self, repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def _run_repo(
+        self, repo: Path, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         return self._run(repo, *args, check=check)
 
     def _rev_parse(self, cwd: str | Path, rev: str) -> str:
