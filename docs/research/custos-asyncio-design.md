@@ -198,7 +198,10 @@ Read: `src/cambium/orchestrator.py` (59 lines) and `src/cambium/events.py` (47 l
 
 ## 6. Test scenarios
 
-There is **no test-strategy document in `main`** at this commit (`docs/` contains only `research/`, `reviews/`, `system-design.md`). The harness strategy lives in the un-merged arch worktree: `docs/architecture/module-template/architecture.md` §9 (unit tests, eval harness, canary suite, integration smoke test, sibling pinning) and the scaffold's `tests/scenarios/test_example_module.py` precedent (real fixtures, no mocks). The scenarios below slot into that strategy's §9.4 integration tier and extend the smoke test.
+At the historical commit for this design there was no dedicated test-strategy
+document in `main`. Current main has `docs/research/test-strategy.md` and 108
+collected scenario tests. The scenarios below still slot into that strategy's
+§9.4 integration tier and extend the smoke test.
 
 All scenarios use a **fake worker** (`tests/fixtures/fake_worker.py`): a script that speaks canned NDJSON over stdout at a scripted pace, controllable via env vars — no DSPy, no network, deterministic.
 
@@ -260,6 +263,6 @@ True
 
 - `/home/ubuntu/cambium/docs/architecture/reviews/review-distributed-systems.md` — DS-C1 (§1, §2), DS-M2 (§3), DS-M3 (§2.4).
 - `/home/ubuntu/cambium/docs/architecture/system-design.md` §M4 (lines 397–643) — the reviewed `Supervisor` (this doc replaces its I/O and liveness model).
-- `/tmp/opencode/cambium-arch/docs/architecture/architecture.md` (v2.0.0, arch worktree, pending merge into main) — §5.3 liveness model, §6 event-log writer (§6.2) and durability contract (§6.5), §7.1 state machine, §7.2 spawn, §7.3 fencing, §7.4 restart, §7.5 worktree recovery, §7.7 shutdown, §7.8 Unio publish, §13 logging, §14 Python stance (`asyncio.to_thread`).
-- `/tmp/opencode/cambium-arch/docs/architecture/module-template/architecture.md` §9 — the test-strategy template this doc's §6 extends (not yet in `main`).
+- `docs/architecture/architecture.md` (v2.0.0, now merged in main) — §5.3 liveness model, §6 event-log writer (§6.2) and durability contract (§6.5), §7.1 state machine, §7.2 spawn, §7.3 fencing, §7.4 restart, §7.5 worktree recovery, §7.7 shutdown, §7.8 Unio publish, §13 logging, §14 Python stance (`asyncio.to_thread`).
+- `docs/architecture/module-template/architecture.md` §9 — the test-strategy template this doc's §6 extends (now in `main`).
 - `/tmp/opencode/cambium-csp/src/cambium/orchestrator.py`, `src/cambium/events.py` — the merged skeleton this design must grow into (§5).

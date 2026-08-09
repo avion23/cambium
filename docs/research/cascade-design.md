@@ -6,7 +6,11 @@
 **Status:** design (docs only). Normative extension of architecture §9; defers only where explicitly flagged.
 **Verification rule:** every claim about existing documents cites a section (`[arch §N]`, `[sysd §M2]`, `[rev-llm C2]`). Claims the architecture does not make are marked **design**; claims that depend on data no available source provides are marked **UNVERIFIED**.
 
-**Provenance note:** `docs/research/provider-landscape.md` **does not exist** in main as of 2026-08-09 (verified by glob; the research directory contains `cloud-code.md`, `codex.md`, `omp.md`, `opencode.md`, `pi.md`, `prime-agent.md`, `pydev.md`, `python-3.14.md`, `tui-best-practices.md`). Per-provider pricing, real context windows, and tool-calling support cannot be validated from a landscape doc. All such numbers in this document are **UNVERIFIED design defaults**, not facts.
+**Provenance note:** `docs/research/provider-landscape.md` was absent from
+main when this document was drafted and is now present in current main. This
+design was not re-run against that later document, so per-provider pricing,
+context windows, and tool-calling support remain **UNVERIFIED design defaults**
+here, not facts.
 
 ---
 
@@ -370,13 +374,13 @@ Architecture `ProviderConfig` fields: `name`, `model`, `tier` (`fast|balanced|st
 }
 ```
 
-The example's fast-tier list is the review's example order `[rev-llm C2]`, which architecture §9.2 cites as the interchangeable fast tier `[arch §9.2]`. **No actual model id, context window, or price in this example is verified** (no provider-landscape; model ids in `[arch §9.1]`/`[rev-llm C2]` are illustrative). Provider config is part of `Config` as `providers: tuple[ProviderConfig, ...]`, never serialized to logs `[arch §3.2]`; API keys come from `api_key_env` names resolved from the environment `[arch §9.1], [arch §12]`.
+The example's fast-tier list is the review's example order `[rev-llm C2]`, which architecture §9.2 cites as the interchangeable fast tier `[arch §9.2]`. **No actual model id, context window, or price in this example is verified** (the later provider-landscape document was not used here; model ids in `[arch §9.1]`/`[rev-llm C2]` are illustrative). Provider config is part of `Config` as `providers: tuple[ProviderConfig, ...]`, never serialized to logs `[arch §3.2]`; API keys come from `api_key_env` names resolved from the environment `[arch §9.1], [arch §12]`.
 
 ---
 
 ## 7. Open questions for the orchestrator
 
-1. **Tier taxonomy validation.** Architecture defines `tier: Literal["fast","balanced","strong","reasoning"]` `[arch §9.1]` but only names fast-tier models `[arch §9.2]`. **`provider-landscape.md` does not exist in main** (verified absent, 2026-08-09), so there is no data answering: which providers/models occupy `balanced`/`strong`/`reasoning`; what are their real `context_window`, `supports_tools`, prices; and should tier membership live in config or in a registry. All UNVERIFIED.
+1. **Tier taxonomy validation.** Architecture defines `tier: Literal["fast","balanced","strong","reasoning"]` `[arch §9.1]` but only names fast-tier models `[arch §9.2]`. `provider-landscape.md` is now present in main, but this design was not re-run against it, so which providers/models occupy `balanced`/`strong`/`reasoning`, their real `context_window`, `supports_tools`, prices, and the config-vs-registry choice remain UNVERIFIED.
 2. **Race quality gate cost.** `quality_gate`/`score()` (§1.3) are deterministic by default; an LLM-judge gate on `strong`/`reasoning` costs an extra call (§3.4). Does the orchestrator accept that cost for latency-critical evaluation steps, or is race only ever used with deterministic gates?
 3. **Budget-pressured downgrade vs fail.** On `CostBudgetExceeded` (§3.1), should `Architectus` re-route remaining work to `fast`, or fail the task? The architecture's posture for `AllProvidersFailed` is park-dispatch `[arch §9.2]`; cost exhaustion has no analogous mechanism.
 4. **Event schema extension.** `provider_health_change`, `llm_call`, `all_providers_down` (§3.4, §5.2) extend the `kind` enumeration of `[arch §6.3]` and add `all_providers_down` to the critical tier of `[arch §6.5]`. Needs a schema-version bump and replay-compat decision (`snapshots` compaction `[arch §6.1]`).
@@ -392,4 +396,4 @@ The example's fast-tier list is the review's example order `[rev-llm C2]`, which
 - `docs/architecture/system-design.md` (v0.1, superseded) — M2 Diffundo (the buggy `_cascade`/`_race`, `FanOutConfig`, cache key `[sysd §M2]`).
 - `docs/architecture/reviews/review-llm-design.md` — C1 (cache staleness), C2 (cascade no-op), C3 (transparency), M6 (race discard + hygiene).
 - `docs/architecture/reviews/review-distributed-systems.md` — C3 (worst-case cascade latency product).
-- **Absent:** `docs/research/provider-landscape.md` — verified not in main on 2026-08-09; any per-provider datum derived from it is flagged **UNVERIFIED** throughout.
+- **Not revalidated:** `docs/research/provider-landscape.md` is now in main, but this design did not use it; any per-provider datum in this document remains **UNVERIFIED**.

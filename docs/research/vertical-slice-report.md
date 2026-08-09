@@ -6,6 +6,10 @@ worker before more theory. A real supervisor subprocess-spawns a real worker scr
 JSON-Lines over pipes, runs a real gate, and merges a real git change — all stdlib + git,
 Python 3.14.7 (uv), no LLM, no network, no DSPy, no sandbox.
 
+**Current-main note (2026-08-09):** this is the historical slice report, not the current
+suite report. Main now collects 108 scenario tests and the full suite passes; the
+slice-only test total below is superseded by that current-main count.
+
 **Revision 2 (review CONDITIONAL-PASS must-fixes):** enforced worker-exit / exit_message /
 result_envelope failure conditions, run_task↔result_envelope request_id correlation,
 minimal timeouts (killpg), and path safety. The reviewer's two repro cases now fail
@@ -64,8 +68,10 @@ rc=1, no merge, `main` unchanged, supervisor exit 1.
 
 All run from the worktree root `/tmp/opencode/cambium-slice`.
 
-1. `uv run --python 3.14.7 --extra test pytest -q` → `14 passed in 3.90s`
-   (existing 6 stay green; slice adds 8 scenario tests; the ~2 s is the ready-timeout test).
+1. `uv run --python 3.14.7 --extra test pytest --collect-only -q` → `108 tests collected`.
+   The full command `uv run --python 3.14.7 --extra test pytest -q` → `108 passed`;
+   `uv run --python 3.14.7 --with ruff ruff check src` → `All checks passed`. The
+   slice-only total is historical.
 2. `uv run --python 3.14.7 python -m compileall -q src scripts` → rc=0 (no output).
 3. Manual run:
    `uv run --python 3.14.7 python -m cambium.supervisor --session-dir /tmp/opencode/slice-run`

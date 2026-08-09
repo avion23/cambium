@@ -5,6 +5,11 @@
 **Branch:** `wt-deltas2` (`/tmp/opencode/cambium-deltas2`)
 **Status:** Authoritative design-delta record. Supplements `docs/architecture/architecture.md` (v2.0.0) and supersedes it wherever a delta is marked **adopt**. Each delta states the arch section it amends.
 
+**Current-main note (2026-08-09):** this record preserves branch provenance from
+its drafting snapshot. The architecture and every research file cited below are
+now present in the current main tree; the historical provenance table is not a
+statement that those files are still missing.
+
 **Sources incorporated:** (1) the external re-review of the v2 architecture (in flight at the time of writing — see §0.2); (2) the Prime Agent good parts, researched in `docs/research/prime-agent.md`; (3) explicit orchestrator/user directives dated 2026-08-09.
 
 ---
@@ -14,7 +19,7 @@
 ### 0.1 Verification convention
 
 - **Every citation is a real file/section or a URL.** Files are cited by stable repository-relative path so coherence is auditable when branches merge (`architecture.md` §20 uses the same convention).
-- Files **not merged into `main`** at the time of writing are cited with their branch in parentheses. Their content was read from the named branch (real, verified).
+- Files that were branch-local at the time of writing are cited with their branch in parentheses. Their content was read from the named branch (real, verified); the original branch provenance is retained below.
 - **Every provider-caching claim is backed by a URL** fetched 2026-08-09.
 - Anything that could not be verified is marked **UNVERIFIED**.
 - Claims that come from the orchestrator directive rather than from a file in the corpus are labeled "directive" — they are requirements, not research findings.
@@ -23,11 +28,11 @@
 
 This document is written **as of** the current state of:
 
-- `docs/architecture/architecture.md` v2.0.0 — **as of commit `17ef25f` on branch `wt-arch`** (`docs(architecture): fix review findings — durability contract, spec-scaffold alignment, eval sizes, DSPy idioms, merge terminal step`). A **re-review of the v2 architecture is in flight**; this delta document records the dispositions and adopted residue for that review (D6) and must be reconciled against the re-review text when it lands.
-- `agents.md` and `docs/architecture/module-template/*` — **as of the same `wt-arch` commit**.
+- `docs/architecture/architecture.md` v2.0.0 — recorded at commit `17ef25f` on branch `wt-arch` (`docs(architecture): fix review findings — durability contract, spec-scaffold alignment, eval sizes, DSPy idioms, merge terminal step`). The finalized architecture is now in current main; this document retains the earlier review provenance.
+- `agents.md` and `docs/architecture/module-template/*` — recorded at the same `wt-arch` commit and now present in current main.
 - `docs/architecture/system-design.md` (v0.1, superseded), `docs/architecture/reviews/*` (v0.1 adversarial reviews), and the research subset present in this worktree — **as merged in `main` at the branch point**. `main` has since advanced (research merges for IPC, events, threat-model, sandbox-options, benchmark, etc.); files cited here that are not in this worktree were read from `main` — see §0.3.
 
-### 0.3 Files cited that are not in `main` (branch provenance)
+### 0.3 Historical branch provenance
 
 | Path | Branch | Content |
 |---|---|---|
@@ -36,9 +41,9 @@ This document is written **as of** the current state of:
 | `docs/research/sandbox-options.md` | `main` (merged after this worktree branched; first drafted on `wt-sandbox` @ `242a509`) | Septum sandbox options on this host — retained as evidence by D7 |
 | `docs/research/event-schema-draft.md` | `main` | Event-log schema draft — cited by D2 (payload-first `parent_task_id`) |
 | `docs/research/ipc-protocol-draft.md` | `main` | Nuntius IPC draft — cited by D3 (`steer`, `ready` gating, `PROTO_OUT_OF_ORDER`, `ready_timeout`) |
-| `docs/research/worker-coldstart.md` | `wt-coldstart` @ `108c83d` (still **not** in `main`) | fork-per-task vs persistent-pool benchmark — cited by D3 |
+| `docs/research/worker-coldstart.md` | `wt-coldstart` @ `108c83d` (now merged into current main) | fork-per-task vs persistent-pool benchmark — cited by D3 |
 
-These are the same stable-path references the v2 architecture itself uses for research and drafts that may not be present on every branch (`architecture.md` §20: "references here are by stable path so coherence is auditable when the merge lands").
+These are the same stable-path references the v2 architecture itself uses for research and drafts that were not present on every branch at drafting time (`architecture.md` §20: "references here are by stable path so coherence is auditable when the merge lands").
 
 ### 0.4 Summary
 
@@ -310,9 +315,9 @@ This milestone is currently referenced but not yet built: `agents.md` §5 ("`pyt
 
 ## 2. UNVERIFIED items
 
-- `docs/research/worker-coldstart.md` is cited from branch `wt-coldstart`; it is **not in `main`** as of this writing (verified against the current `main` listing). Its numbers were not re-measured here.
-- `docs/research/sandbox-options.md` and `docs/research/threat-model.md` were on unmerged branches when this document was first drafted; both are now **merged in `main`** (verified). Their claims were verified on this host in their own research; not re-run here.
-- `docs/research/event-schema-draft.md` and `docs/research/ipc-protocol-draft.md` are cited from `main` (read there; not present in this worktree).
+- `docs/research/worker-coldstart.md` was branch-local when this record was drafted; it is now in current main. Its benchmark numbers were not re-measured here.
+- `docs/research/sandbox-options.md` and `docs/research/threat-model.md` were branch-local when this document was first drafted; both are now **merged in `main`** (verified). Their claims were verified on this host in their own research; not re-run here.
+- `docs/research/event-schema-draft.md` and `docs/research/ipc-protocol-draft.md` are present in the current worktree and remain cited as research records.
 - The external critique's full text is not yet committed to any branch (re-review in flight); D6's disposition table is written against the critique items as described in the orchestrator directive.
 - Provider-caching URLs (D1) were fetched 2026-08-09; pricing and model-specific details (OpenAI GPT-5.6 family, Anthropic per-model minimums) may drift after that date. The structural claims (content-addressed, exact-prefix, never-caches-responses) are stable across the cited docs.
 - The Factorio reward-hacking incident (D5) is directive-provided context, not a research-corpus file.

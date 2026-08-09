@@ -1,56 +1,79 @@
 # Implementation Plan (TRANSIENT — delete when implementation is done)
 
-Status date: 2026-08-09. Orchestrator-owned tracker. Each subagent reads this to know what
-everyone else is doing. Worktrees: /tmp/opencode/cambium-<name> (branches wt-<name>).
+Status date: 2026-08-09. Current merged baseline: `main@6109a6a`. This is the
+orchestrator-owned tracker for the 20-agent implementation wave. Worktrees live
+under `/tmp/opencode/cambium-<name>` on `wt-*` branches.
 
-## Phase 0 — Foundation (DONE)
-- git init (main, a0fc528), docs moved: docs/architecture/system-design.md, docs/architecture/reviews/ (3 adversarial reviews).
-- Python: pin CPython 3.14.7 REGULAR build (free-threaded exists but optional; GIL verified present in default build — the "GIL is gone" assumption is FALSE for default 3.14). See docs/research/python-3.14.md.
-- Scaffold: pyproject.toml (requires-python >=3.14), src/cambium (orchestrator skeleton, events, modules/base.py, modules/example/ with dataset + canaries + scenario test). Merged f66bdc6 + review fixes 93db348.
+## Current merged baseline
 
-## Phase 1 — Competitive research (DONE — all 9 docs merged into main)
-| Tool | Doc | Final commit |
-|---|---|---|
-| OpenCode | docs/research/opencode.md | 692fff1 (snapshot refresh per review) |
-| Codex | docs/research/codex.md | ea81dd1 (PASS) |
-| pi | docs/research/pi.md | 68a31c0 (cosmetic fixes) |
-| OMP | docs/research/omp.md | 85eed02 (fork provenance + stats) |
-| Prime Agent | docs/research/prime-agent.md | 2dd1a89 (counts corrected) |
-| py.dev | docs/research/pydev.md | d0bca1e (PASS) |
-| Cloud Code | docs/research/cloud-code.md | 7810fb4 (PASS) |
-| TUI best practices | docs/research/tui-best-practices.md | d937dca (PASS) |
-| Python 3.14 | docs/research/python-3.14.md | 8f5492d (PASS; discipline violation recovered) |
+The following deterministic modules are in `main`:
 
-Key research conclusions (see docs for details):
-- TUI: headless-first. `cambium serve` = JSON-Lines on stdout (matches Nuntius); `cli` = rich; optional `tui` = Textual. OpenCode TUI (opentui+SolidJS) and codex (ratatui) both full-screen; codex's `exec --json` proves headless-first wins.
-- GIL truth: default 3.14.7 has GIL; freethreaded build optional (verified empirically). PEP 649 lazy annotations default; JIT via PYTHON_JIT.
-- Competitors: opencode (provider breadth, sequential subagents), codex (sandbox+approval, worktrees), pi (permissionless-by-default — bad), omp (hash-anchored edits), prime-agent (single-process memory blowups — validates process-per-worker), py.dev/JetBrains (Air does parallel worktree agents), cloud code (worktree format bugs).
+| Capability | Main merge commit |
+|---|---|
+| Foundation: `events.py`, `orchestrator.py`, `modules/base.py`, example module, test scaffold | `f66bdc6` (`merge: build(scaffold)`) |
+| Vertical-slice supervisor and fake worker | `c053d35` (`merge: feat(slice) — vertical slice milestone`) |
+| `doctor.py` diagnostics and ruff tooling | `2822139` (`merge: feat(tooling) — ruff + doctor`) |
+| `merge.py` / `MergeSequencer` | `c7e19b0` (`merge: feat(merge) — unio sequencer`) |
+| `store.py` / `EventStore` | `3d27ba3` (`merge: feat(store) — sqlite wal event store`) |
+| `tasktree.py` / deterministic DAG validation | `06ce0dc` (`merge: feat(tasktree) — dag builder`) |
+| `ipc.py` + `worker.py` / Nuntius framing and Opifex seed | `38e1d43` (`merge: feat(ipc) — nuntius framing + worker runtime`) |
+| Split dataset loader and dataset scenarios | `df8ed81` (`merge: feat(datasets) — split loaders`) |
+| Final architecture/D7 and recovery-gap specification fold | `e8f0d0f`, `d67cd5e` |
+| Ruff-clean test gate | `d7971cc` (`merge: chore(lint) — ruff-clean tests`) |
+| v2.1 architecture review and roadmap | `6109a6a` (`merge: research(v2.1) — architecture review and roadmap`) |
 
-## Phase 2 — Architecture (DONE — fb17089, wt-arch; review in progress)
-GLM-5.2 (GPT-5.6 Sol backend unavailable — sol/reviewer/luna returned empty, kimi misconfigured).
-Deliverables: docs/architecture/architecture.md (1063 LOC, 21 sections, resolution matrix for all 24 CRITICAL flaws),
-agents.md, docs/architecture/module-template/{architecture,dataset-format,example-spec}.md.
-Key decisions: standard CPython 3.14; SQLite WAL event store single-writer-thread; JSON-Lines stdio IPC
-with request_id RPC framing + authoritative exit message (four-layer liveness model); headless-first public
-API (Cambium/Session/Result/Instance/Event); TUI as optional view; Diffundo cache keyed on task+context+model
-+ TTL (not prompt hash); tier-based cascade; multi-signal coding metric + canaries; ShouldDecompose as
-first example module; proto-AGI contract via session-dir + control plane.
-Open questions deferred: cascade tier taxonomy, worker pool v2.1, joint optimization, cross-model prompt
-transfer, macOS sandbox posture, doom-loop detector.
+Current source inventory: `events.py`, `orchestrator.py`, `supervisor.py`,
+`store.py`, `merge.py`, `ipc.py`, `worker.py`, `tasktree.py`, `doctor.py`,
+and `modules/{base,example}`. `diffundo.py`, `bench.py`, and `redact.py` are
+still branch-local implementation artifacts, not modules in `main`.
 
-## Phase 3 — Adversarial review (DONE for research+scaffold; arch review in progress)
-Round 1 (reviewer/sol/luna/kimi): all failed (empty results / config error). Round 2 via GLM:
-- R1 opencode+codex — codex PASS, opencode CONDITIONAL → fixed 692fff1, merged
-- R2 pi+omp — pi PASS (cosmetic fixed), omp CONDITIONAL → fixed 85eed02, merged
-- R3 prime+pydev — pydev PASS, prime-agent CONDITIONAL → fixed 2dd1a89, merged
-- R4 cloud-code+tui — PASS ×2, merged
-- R5 python314+build — doc PASS; scaffold CONDITIONAL → fixed 93db348 (6 tests green), merged
-- R-arch — in progress (glm)
+Verification on current `main`:
 
-## Phase 4 — Merge & cleanup (IN PROGRESS)
-Merged: cloud-code, tui, pydev, opencode, prime-agent, codex, python314, build, pi, omp.
-Remaining: wt-arch (pending review + merge). Then integration verification in main (uv run pytest),
-update this file's final status, final report. Delete this file when implementation is done.
+- `uv run --python 3.14.7 --extra test pytest --collect-only -q` → **108 tests collected**.
+- `uv run --python 3.14.7 --extra test pytest -q` → **108 passed**.
+- `uv run --python 3.14.7 --with ruff ruff check src` → **All checks passed**.
 
-## Decisions (recorded)
-1. Python: >=3.14,<3.15 regular build. 2. Interface: headless library + JSON-Lines; TUI optional. 3. Caching upstream in Diffundo, transparent Nuntius. 4. Per-module DSPy + datasets + metric; decoupled eval harness. 5. Subprocess-per-worker (never in-process). 6. No dspy runtime dep in scaffold (heavy; seam documented). 7. Backend availability: OpenAI-family (sol/reviewer/luna) returns EMPTY results (broken); kimi misconfigured; GLM-5.2 worked then became depleted; ALL work now on general/build (DeepSeek V4 Flash) — proven reliable. 8. NO LOCAL LLM CACHE — provider-side caching only (user directive; resolves LLM-C1 by deletion). 9. Task tree / conversation tree = first-class concept (nodes = sub-LLM sessions). 10. NO SANDBOXING IN THE HARNESS (user directive, 2026-08-09): Septum removed from v2 scope; containment = git worktree isolation + permission allowlists + approval gates; sandbox-options.md retained as evidence (unprivileged user namespaces blocked by AppArmor on this host); threat-model R3 re-rated "accepted — out of scope". Fold into design-deltas (D7) when wt-deltas completes.
+## In-flight: 20-agent wave
+
+The implementation and follow-up wave remains in isolated worktrees. The
+active surfaces are:
+
+- `wt-impl-super`: Custos canonical runtime and store/merge wiring.
+- `wt-impl-diffundo`, `wt-impl-bench`, `wt-redact`: provider routing,
+  benchmark gate, and redaction components.
+- `wt-luna-fence`, `wt-luna-dlq`, `wt-luna-pipe`, `wt-luna-cli`,
+  `wt-luna-conv`: fencing, dead-lettering, protocol/pipeline, CLI, and
+  conversation-store work.
+- `wt-doc-*`, `wt-audit-*`, `wt-modtests`, and `wt-research-treesitter`:
+  audit, documentation, test, and v2.1 research follow-up.
+
+Branch-local green tests are not merged-state evidence. Do not mark an item
+complete until it is on one main SHA and the full suite is rerun.
+
+## Pending milestones
+
+Milestones and dependencies are defined in `docs/research/v2-1-review.md`:
+
+1. **Hardening pass** — protocol deadlines/caps, redaction, environment
+   allowlists, fencing, bounded queues, gate/resource limits, and audit fixes.
+2. **M1 — canonical runtime and audit baseline** — wire one Custos path to
+   `EventStore`, `MergeSequencer`, Nuntius, worker, redactor, and doctor;
+   remove slice and fallback paths; rerun all three audits on one SHA.
+3. **M6 — first real LLM end-to-end task** — after M1–M5, connect Diffundo,
+   one OpenAI-compatible provider, `CambiumLM`, one atomic coding task, a
+   deterministic gate, and Unio publication. Keep it manual and key-gated.
+
+M2–M5 are the hard gates between M1 and M6. M7 persistent workers, M8 DSPy
+refinement, and M9 tree-sitter research follow the first real end-to-end task.
+
+## Recorded decisions
+
+1. Python: `>=3.14,<3.15`, regular GIL build.
+2. Public interface: headless library plus JSON-Lines; TUI is optional.
+3. Provider caching is upstream; no local LLM response cache.
+4. Modules use a DSPy seam, frozen datasets, metrics, and canaries.
+5. Workers are subprocesses, never in-process.
+6. No DSPy runtime dependency enters the deterministic scaffold.
+7. The task tree is a first-class DAG of sub-LLM sessions.
+8. No sandboxing in the harness; containment is worktree isolation, permission
+   allowlists, approval gates, and host-owned controls.
