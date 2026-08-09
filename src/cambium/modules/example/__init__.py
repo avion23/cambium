@@ -21,15 +21,18 @@ decomposer gets them wrong). Eval runs must process every entry,
 canaries included — they are scored like any other entry.
 """
 
-from .dataset import ExampleDatasetLoader
+from .dataset import DatasetBundle, ExampleDatasetLoader, Split
 from .decide import DecomposeOutput, ShouldDecomposeModule, TaskInput, should_decompose
-from .metric import should_decompose_metric
+from .metric import evaluate_split, should_decompose_metric
 
 __all__ = [
+    "DatasetBundle",
     "DecomposeOutput",
     "ExampleDatasetLoader",
     "ShouldDecomposeModule",
+    "Split",
     "TaskInput",
+    "evaluate_split",
     "should_decompose",
     "should_decompose_metric",
 ]

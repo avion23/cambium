@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from cambium.modules.base import Example
+import asyncio
+import statistics
+
+from cambium.modules.base import Example, Module
 
 
 def should_decompose_metric(example: Example) -> float:
@@ -19,3 +22,27 @@ def should_decompose_metric(example: Example) -> float:
     if not isinstance(expected, bool):
         return 0.0
     return 1.0 if prediction.decompose == expected else 0.0
+
+
+def evaluate_split(module: Module, loader, split) -> dict:
+    """Score one dataset split with the module metric.
+
+    Runs the module over every example in the split and returns a
+    ``{"mean", "std", "count"}`` summary for the bench harness baseline
+    (docs/research/bench-harness-design.md §3).
+    """
+    scores: list[float] = []
+
+    async def score() -> None:
+        for example in loader.load_split(split):
+            prediction = await module.decide(example.input)
+            scores.append(module.metric(example.with_prediction(prediction)))
+
+    asyncio.run(score())
+    if not scores:
+        return {"mean": float("nan"), "std": float("nan"), "count": 0}
+    return {
+        "mean": statistics.fmean(scores),
+        "std": statistics.pstdev(scores),
+        "count": len(scores),
+    }
