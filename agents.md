@@ -40,9 +40,11 @@ Trace from entry points, not from filenames. Concrete starting points:
 
 - **Public API surface:** `src/cambium/__init__.py` — `Cambium`, `Session`, `Result`, `Instance`, `Event`, `Config`.
 - **IPC protocol:** `src/cambium/nuntius/` — message types and framing. Schema is normative in `docs/architecture.md` §5.2.
-- **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in §7.
+- **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in `docs/architecture.md` §7.
 - **Worker entry:** `src/cambium/opifex/__main__.py` — read-init → ready → loop → result/exit.
 - **Decision modules:** `src/cambium/modules/<name>/` — each module is self-contained (rule engine primary + DSPy seam in `decide.py`).
+
+`nuntius`, `custos`, and `opifex` are **planned** directories — they do not exist in `src/cambium/` yet (only `supervisor.py`, `orchestrator.py`, `events.py`, and `modules/` are present). Read the architecture sections above for their intended shape; see the §2 note for what a missing path means.
 
 When a `grep`/`rg` search fails to find what you expect, follow the execution path: read the import graph, the route registration, the message dispatcher. Don't conclude "doesn't exist" from a single miss.
 
@@ -119,11 +121,11 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Flat over nested.** Early returns, guard clauses, exhaustive match/switch. Business logic in pure functions; state and I/O at the edges.
 - **Concrete over abstract.** Inline unless a boundary is independently meaningful.
 - **Real enums for domain alternatives.** `WorkerState`, `ResultStatus`, `EventKind` are enums, not strings or booleans.
-- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`WorkerState.Running` vs `WorkerState.Stopped`, not `is_running=True`).
+- **Booleans are for predicates and API compatibility only.** Use enums for domain alternatives (`WorkerState.Running` vs `WorkerState.Crashed`, not `is_running=True`).
 - **No `print()` in worker code or library code.** Use `logging`. The worker's stdout is reserved for the protocol.
 - **No shell=True with user input.** Use list-form `subprocess.run`. `git_op` and `grep_code` enforce this.
 - **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture.md` §12.
-- **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See §6.2.
+- **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See `docs/architecture.md` §6.2.
 - **Module shape** (per `docs/module-template/*`): modules are pure JSON-in/JSON-out functions with strict JSON schemas, each with a CLI entry — `python -m cambium.modules.<name>` reads JSON from stdin, writes JSON to stdout. Modules depend on `Protocol`s (ports/adapters), never concrete providers; dependency injection happens at the root.
 - **Engine swap is a strategy pattern.** The rule engine is the primary `decide` implementation today; a DSPy program implementing the same interface can replace it behind the seam without touching callers (v2.1 — `docs/research/dspy-python-314.md`; see `docs/module-template/architecture.md` §5.1/§5.3).
 - **Durable state layout.** Event log and conversation store live in SQLite (WAL mode); low-level IPC is JSON-Lines. All session state sits under the dotted `.cambium/` dir — `docs/architecture.md` §16.2 is canonical on that naming.
@@ -135,7 +137,7 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Task tree, not flat lists.** Decomposition produces a tree (DAG): nodes are sub-LLM sessions. A node's only contract is its `Result` envelope — a unified diff, summary, and metrics. A parent **never reads a child's scratchpad or reasoning**; steering goes downward by `session_id`, results flow upward as envelopes (design-deltas D2/D3).
 - **Determinism split.** The LLM plans — it emits JSON arrays of sub-tasks. Deterministic supervisor code manages spawning, queues, and merges. The LLM never manages parallelism.
 - **Let it crash.** Worker crashes are normal; the supervisor restarts from the last durable checkpoint. Do **not** write defensive spaghetti in workers: no `try/except` around LLM-output parsing — crash, and let the supervisor handle it.
-- **Prompt structure for provider caching.** Static prefix (system prompt, `AGENTS.md`, guidelines) at the top; dynamic content (conversation history, repo state) at the bottom. Never put timestamps or request IDs at the top. There is **no local LLM cache** — provider-side caching only (design-deltas D1); prompt structure exists to make provider caches hit, not as a correctness mechanism.
+- **Prompt structure for provider caching.** Static prefix (system prompt, `AGENTS.md`, guidelines) at the top; dynamic content (conversation history, repo state) at the bottom. Never put timestamps or request IDs at the top. There is **no local LLM cache** — provider-side caching only (supersedes `architecture.md` §8.1 cache design per design-deltas D1 — arch amendment pending); prompt structure exists to make provider caches hit, not as a correctness mechanism.
 - **No sandboxing in the harness.** Containment = git worktree isolation + permission allowlists + approval gates (design-deltas D7). Workers are stdio processes — local today, a disposable container at deployment, and that is out of harness scope.
 - **Canary gate.** Any metric or refinement change that degrades the canary score is **rejected** — the canary suite is the gate, not a suggestion (`docs/module-template/dataset-format.md` §6; design-deltas D5).
 
@@ -146,12 +148,12 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 | If you need to... | Read this |
 |---|---|
 | Understand the system end-to-end | `docs/architecture.md` §0–§7 |
-| Understand a design decision that postdates the architecture | `docs/research/design-deltas.md` (D1–D7) |
+| Understand an adopted design decision (delta over architecture v2) | `docs/research/design-deltas.md` (D1–D7) |
 | Add or change a decision module | `docs/module-template/architecture.md`, then `docs/module-template/example-spec.md` |
 | Add or change a dataset | `docs/module-template/dataset-format.md` |
 | Add a new protocol message | `docs/architecture.md` §5.2, then `src/cambium/nuntius/` |
 | Debug a worker crash / restart loop | `docs/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
-| Debug a merge failure | `docs/architecture.md` §4 (Unio), §7.7 |
+| Debug a merge failure | `docs/architecture.md` §4 (Unio), §7.8 |
 | Understand an old design choice | `docs/system-design.md` (v0.1) + the three `docs/reviews/` |
 | Find what to copy for a sandbox backend (out of v2 scope) | `src/cambium/septum/` + §4 (Septum) in architecture.md; removal rationale in design-deltas D7 |
 
