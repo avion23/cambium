@@ -13,7 +13,9 @@ import subprocess
 import sys
 import time
 
-from cambium.store import CRITICAL_KINDS, EventStore
+import pytest
+
+from cambium.store import CRITICAL_KINDS, EventStore, StoreError, StoreInitError
 
 
 def _open(path):
@@ -167,3 +169,33 @@ def test_close_drains_pending_appends(tmp_path) -> None:
         assert [e["payload"]["i"] for e in events] == list(range(100))
     finally:
         reopened.close()
+
+
+def test_corrupt_db_init_raises_not_hangs(tmp_path) -> None:
+    path = tmp_path / "events.db"
+    path.write_bytes(b"this is not a sqlite database at all" * 16)
+    start = time.monotonic()
+    with pytest.raises(StoreInitError):
+        EventStore(path, startup_timeout_s=10.0)
+    assert time.monotonic() - start < 5.0
+
+
+def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
+    path = tmp_path / "events.db"
+    store = _open(path)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        start = time.monotonic()
+        with pytest.raises(StoreError):
+            store.append({"kind": "result", "payload": {"ok": True}})
+        elapsed = time.monotonic() - start
+        assert 4.0 <= elapsed < 30.0  # bounded by busy_timeout, not a hang
+    finally:
+        blocker.close()
+    # store is dead: subsequent appends fail immediately, close() does not hang
+    with pytest.raises(StoreError):
+        store.append({"kind": "log", "payload": {}})
+    with pytest.raises(StoreError):
+        store.append({"kind": "result", "payload": {}})
+    store.close()
