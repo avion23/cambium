@@ -95,7 +95,7 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
 {
   "schema_version": 1,                  // format version of THIS file
   "module": "should_decompose",         // module name, must equal Module.name
-  "dataset_version": "1.0.0",           // from datasets/meta.json
+  "dataset_version": null,              // null in v2 (see §3 "Versioning")
   "git_sha": "191543e4c587f4481e060c1fcf0373d6bcd23db6",  // full sha of the run
   "date": "2026-08-09T21:00:00Z",       // ISO 8601 UTC
   "python": "3.14.7",
@@ -147,6 +147,19 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
   baselines. The drift check compares **only against the last baseline with
   the same `dataset_version`**; when `dataset_version` changes, the harness
   records a new anchor instead of failing.
+  - **v2 (current scaffold): `dataset_version` is `null`.** The example module
+    ships a flat single-file dataset (`example_pairs.jsonl`) and its loader
+    (`ExampleDatasetLoader`, `src/cambium/modules/example/dataset.py`) exposes
+    no version — it validates `input`/`expected`/`canary` per record and
+    returns `Example`s. With no version to read, the harness cannot pin the
+    baseline to a dataset revision; the drift anchor is effectively the git
+    sha. This is honest but weak, which is why migration to the three-split
+    format is a goal.
+  - **v2.1 target: `dataset_version` populated from `datasets/meta.json`**
+    (`src/cambium/modules/<name>/datasets/meta.json` per `dataset-format.md`
+    §5), read through the load contract's `Dataset.dataset_version`
+    (`dataset-format.md` §9). The schema field is already there and nullable,
+    so v2 baselines migrate forward without a `schema_version` bump.
 - `git_sha` makes the recorded number attributable to a concrete tree.
 
 ## 4. What to run when
@@ -198,9 +211,10 @@ def pytest_runtest_makereport(item: Item, call: CallInfo[None]) -> TestReport | 
 It fires once per setup/call/teardown phase. `CallInfo` carries `.duration`,
 `.when`, `.start`, `.stop`, `.excinfo` (`_pytest/runner.py:293-330`).
 `TestReport` carries `.nodeid`, `.when`, `.outcome`, `.duration`, `.passed`,
-`.failed`, `.skipped` (fields at `_pytest/reports.py:62-160`, `duration` set
-at `:371`). So the plugin timestamps
-`report.when == "call"` per `report.nodeid`.
+`.failed`, `.skipped` (type annotations at `_pytest/reports.py:62-69`; the
+`passed`/`failed`/`skipped` properties at `:148-160`; instance fields set in
+`__init__`: `nodeid` :338, `outcome` :352, `when` :358, `duration` :371). So
+the plugin timestamps `report.when == "call"` per `report.nodeid`.
 
 Full hook list used (all verified present in `_pytest/hookspec.py`):
 
@@ -361,6 +375,12 @@ The harness is exercised by its own tests in
 - Whether `taxonomy_coverage` should become a hard gate per module after
   datasets migrate to the three-split format — deferred until real modules
   exist beyond the reference example.
-- Exact naming collision check: `cambium.bench` vs pytest's `--bench` flag
-  vs the repo's `bench-harness` dirs in `/home/ubuntu` — the plugin name is
-  namespaced (`cambium-bench`) to stay distinct.
+- Exact naming collision check: `cambium.bench` (the Python module) vs
+  `--bench=gate|report`, a **proposed custom option** registered by the
+  cambium pytest plugin's own `pytest_addoption` (`-p cambium.bench`), vs the
+  repo's `bench-harness` dirs in `/home/ubuntu`. Premise corrected after
+  review: pytest 9.1.1 defines **no builtin `--bench` flag** (verified:
+  `pytest --help` outputs 0 hits for `bench`); the flag only exists once the
+  plugin is loaded, so there is no collision with a pytest core option. The
+  plugin name stays namespaced (`cambium-bench`) to stay distinct from any
+  future third-party plugin.
