@@ -17,15 +17,28 @@ What exists now:
   rule-engine `decide()` with a DSPy seam, an exact-match `metric()`, and
   dataset v1 (the combined `example_pairs.jsonl` plus the seeded
   `train`/`eval`/`canaries` split) with canary records.
+- **Deterministic runtime foundations** — SQLite WAL storage (`store.py`), the
+  atomic merge sequencer (`merge.py`), NDJSON framing (`ipc.py`), the worker
+  runtime (`worker.py`), task-tree validation (`tasktree.py`), and diagnostics
+  (`doctor.py`).
 - **Vertical-slice milestone** — supervisor to worker to gate to merge,
   end-to-end: a real supervisor subprocess-spawns a real worker, runs the
   task's gate, and merges the worker branch with `git merge --ff-only`.
-  14 scenario tests pass (`tests/scenarios/`).
+- **Scenario coverage** — 108 tests are collected from `tests/scenarios/`.
+  Current main reports 108 passed, and the source ruff gate is clean.
+- **Not in this main snapshot** — `diffundo.py`, `bench.py`, and `redact.py`
+  remain in implementation worktrees and are not current modules in
+  `src/cambium/`.
 
-Next, per `docs/architecture/module-template/example-spec.md`: exercise the
-DSPy seam (v2.1) — swap the `should_decompose` rule engine for a DSPy program,
-move the loader onto the `train`/`eval`/`canaries` split, add the standalone
-eval harness, and extend the metric to the multi-signal composite.
+Next:
+
+- **Hardening pass** — clear the current source gate, complete the implementation
+  audit actions, and verify the supervisor, store, IPC, worker, task-tree, and
+  merge paths together.
+- **v2.1** — exercise the DSPy seam and optimization/eval path described in
+  `docs/architecture/module-template/example-spec.md`, then land the remaining
+  provider, benchmark, redaction, and recovery work. The roadmap is in
+  `docs/research/v2-1-review.md`.
 
 ## Quickstart
 
@@ -33,7 +46,7 @@ Requires Python 3.14 (regular build) and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 uv sync --extra test --python 3.14.7
-uv run --python 3.14.7 pytest -q
+uv run --python 3.14.7 --extra test pytest -q
 ```
 
 Vertical-slice demo (no LLM, no network — stdlib + git only):
@@ -54,7 +67,7 @@ protocol and the full manual-run transcript.
   - `system-design.md` — the v0.1 design draft (superseded; kept as the origin record).
   - `module-template/` — the per-module pattern: `architecture.md`, `dataset-format.md`, `example-spec.md`.
   - `reviews/` — the three adversarial reviews that shaped v2.
-- `docs/research/` — 28 evidence docs (historical, never pruned). Key reads:
+- `docs/research/` — 33 evidence docs (historical, never pruned). Key reads:
   `python-3.14.md`, `tui-best-practices.md`, `sqlite-wal-durability.md`,
   `worktree-concurrency.md`, `design-deltas.md`.
 - `agents.md` — orientation for agents landing in this repo. Read first.
@@ -77,10 +90,11 @@ cambium/
 ├── agents.md                  orientation for agents
 ├── docs/
 │   ├── architecture/          architecture.md, system-design.md (v0.1), module-template/, reviews/
-│   └── research/              28 evidence docs
+│   └── research/              33 evidence docs
 ├── scripts/                   dataset tooling + the fake worker
-├── src/cambium/               orchestrator.py, supervisor.py, events.py, modules/
-├── tests/scenarios/           example-module + vertical-slice tests
+├── src/cambium/               events.py, orchestrator.py, supervisor.py, doctor.py,
+│                              ipc.py, merge.py, store.py, tasktree.py, worker.py, modules/
+├── tests/scenarios/           108 example/dataset/runtime scenario tests
 └── pyproject.toml
 ```
 
