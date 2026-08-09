@@ -50,6 +50,28 @@ flagged **UNVERIFIED** with the branch it lives on. This matches the convention 
 | `src/cambium/diffundo.py` | **UNVERIFIED** on `main`; lives on `wt-impl-diffundo@f5ae0d3` | `v2-1-review.md` lines 88-94 |
 | `docs/research/compaction-design.md` | **Does not exist** (verified by listing `docs/research/`) | §3.4 below |
 
+### 0.3 Critique-4 additions (adopted) — amendment record
+
+This document is amended with three adopted additions from **critique-4** (the critique's
+full text is **directive-provided**; no critique-4 file exists in the repo — flagged
+**UNVERIFIED** in §9, matching the provenance note in `design-deltas.md` §2, line 316):
+
+1. **Shared blackboard for cross-cutting tasks** — the conversation store
+   (`conversations.db`, D8g/§6.6) doubles as a shared context area addressed by
+   `node_id = "_shared"`; the orchestrator is the **only writer**, workers pull
+   READ-ONLY and propose facts, and the orchestrator merges proposals at wave
+   boundaries (§3.6; scheduling-loop hooks in §2.2/§2.3; proposal channel `shared_update`
+   in §5.3 D).
+2. **Speculative tool calls (Proposal 2, adopted-lite)** — the worker ReAct loop may
+   batch up to N concurrent `read_file` calls in one model response, executed
+   concurrently with in-order results; falsifiable at M6 against a **≥30%** latency
+   target, the **60%** headline claim left **UNVERIFIED** (§4.4).
+3. **`include_diff` flag** — a per-task config controlling whether the composed parent
+   context includes each child's diff text; the envelope and the evaluator tier keep the
+   diff, which stays available on demand for `merge_failed` resolution (§3.7).
+
+Each addition is anchored at its section and re-flagged in the §9 verification appendix.
+
 ---
 
 ## 1. Role split: Custos = thin watcher; Architectus = DAG owner
@@ -198,6 +220,10 @@ loop(tree, custos, conversation_store):
                 if dead_end:
                     mark_subtree_failed(node, subtree_failed)       # §2.3
             in_flight.pop(node_id)
+        # wave boundary: merge cross-cutting proposals into the shared blackboard
+        # (_shared) before composing the next wave's contexts (§3.6). Orchestrator is
+        # the only writer of _shared; workers only propose via shared_update (§5.3 D).
+        merge_shared_updates(conversation_store._shared)
         # the orchestrating LLM seam (optional; §4) sees (tree_state, events) here
         # and may return replan/resolve actions (§6) before the next wave.
     return aggregate root (or fail)
@@ -224,6 +250,13 @@ loop(tree, custos, conversation_store):
 - **Determinism.** Wave order is deterministic by construction
   (`ready_tasks` sort, `tasktree.py:400-403`); replay uses the event log
   (`task_decomposed`/`submitted` payload-first linkage, design-deltas.md D2 item 4).
+- **Shared-context merge at wave boundaries (critique-4, adopted).** Cross-cutting nodes
+  (`spec.cross_cutting: true`) may **propose** global facts (schema definitions,
+  interface contracts, changed-file index) through the shared blackboard; Architectus is
+  the only writer of `_shared` and merges accepted proposals at each wave boundary,
+  before the next wave's contexts are composed (§3.6). Sibling visibility stays
+  READ-ONLY for workers, and info-hiding for non-cross-cutting tasks is unchanged
+  (I2.7).
 
 ---
 
@@ -325,6 +358,75 @@ pre-verified constants. A dedicated `compaction-design.md` is a follow-on resear
   worker tried to send one. M5 acceptance criterion 3 tests exactly this with a canary
   string (`v2-1-review.md` lines 396-397).
 
+### 3.6 Shared blackboard for cross-cutting tasks (critique-4, adopted)
+
+I2.4's sibling isolation is a liability for **cross-cutting changes** — schema or
+interface changes whose effects span sibling subtrees: each sibling would independently
+re-derive the same global facts and drift. For these tasks the conversation store
+(D8g `conversations.db`, arch §6.6) doubles as a **shared blackboard**: a shared context
+area addressed by the reserved `node_id = "_shared"`.
+
+Mechanics:
+
+1. **Orchestrator-only writes (`_shared`).** Architectus posts global facts — schema
+   definitions, interface contracts, and a changed-file index — to the `_shared` area.
+   Single-writer discipline, mirroring the event-store single-writer-thread rule
+   (arch §6.2, line 425) applied to shared context. Custos never reads `_shared`;
+   workers never write it.
+2. **Opt-in per task.** A task opts in with `spec.cross_cutting: true` (a new per-task
+   config field, carried in the `submitted`/`task_decomposed` payloads,
+   event-schema-draft.md §3.1/§3.10). For such nodes the dynamic tail (§3.2) gains a
+   **`_shared` facts segment** (current schema/interface facts + changed-file index),
+   inserted after the parent summary and before the subtree result envelopes.
+   `_shared` facts are the **last-evicted** segment under the §3.3 token budget — they
+   are the reason the task is cross-cutting.
+3. **Worker proposals are READ-ONLY.** A cross-cutting worker never mutates `_shared`.
+   It may **propose** additions (facts it authored, files it changed) via the dedicated
+   fire-and-forget wire event `shared_update` (§5.3, addition D). A proposal is a
+   request, not a write; the worker cannot overwrite or delete an existing `_shared`
+   key.
+4. **Merge at wave boundaries.** At each wave boundary Architectus validates
+   (schema-shape check), redacts (arch §12.3), and merges accepted proposals into
+   `_shared` before composing the next wave's contexts (§2.2/§2.3). Conflict policy:
+   the same `_shared` key proposed by two workers resolves by **last-arrival wins**, and
+   the resolution is recorded in the event log.
+5. **Isolation is preserved by default.** Non-cross-cutting tasks (`cross_cutting`
+   absent or `false`) compose context exactly as §3.1-§3.5 specify — I2.4 and I2.7 are
+   unchanged. Reading `_shared` does not violate I2.4 ("a node never reads a sibling's
+   raw session"): `_shared` is a designated global, orchestrator-written area, not a
+   sibling's session; a cross-cutting worker still never sees a sibling's raw session.
+
+`_shared` lives in `conversations.db` as a reserved node namespace; §6.6 pruning treats
+it like any node store. **UNVERIFIED on `main`:** the `_shared` namespace convention,
+the `spec.cross_cutting` flag, and the `shared_update` event are new; no merged spec or
+code defines them (§9).
+
+### 3.7 `include_diff` flag (critique-4, adopted)
+
+The upward envelope **always** carries `unified_diff` (capped 64 KiB; I2.7 key set,
+`tasktree.py:50-60`) — that is unchanged and is the **default for the evaluator tier**:
+`ResultEvaluator` needs the diff to score ("judge sees only the spec + diff + test
+output", arch §10, line 889).
+
+A per-task config, `include_diff: false`, applies to **higher orchestrator tiers**
+(decomposition / planning / routing contexts) where merge-conflict context is not
+needed:
+
+- For each child envelope, the composed parent context (§3.2 segment 3) substitutes the
+  diff body with a constant placeholder (`"<diff omitted: include_diff=false>"`) while
+  keeping `diff_truncated` and `files_changed` — saving up to 64 KiB of diff text per
+  child in the parent's window.
+- **The diff is not lost.** The envelope schema is unchanged (`upward_result` still
+  returns the full I2.7 set, `tasktree.py:453-478`); only the *composed context*
+  changes. The diff remains available on demand for the `merge_failed` resolution path
+  (§6 rows 6-8), where Architectus composes the resolver context from the
+  quarantined/conflicting diff (event-schema-draft.md §3.13).
+- Token effect: for a parent with fan-out N, `include_diff: false` replaces up to
+  N×64 KiB of diff text with one constant placeholder. The bound is structural, not a
+  measured constant — flagged **UNVERIFIED** pending the §3.4 calibration.
+- This is a context-composition policy, not an envelope change: I2.7's structural
+  enforcement is untouched.
+
 ---
 
 ## 4. The LLM interaction: Architectus as a module with a fake-LLM port
@@ -390,6 +492,36 @@ responses — keyed by prompt digest and/or a sequence index — so the entire l
 - This is the same discipline as the fake worker for Custos
   (custos-asyncio-design.md §6, lines 201-204; `scripts/fake_worker.py`) applied at the
   orchestration layer.
+
+### 4.4 Speculative tool calls (worker-loop design note — Proposal 2, adopted-lite)
+
+The worker ReAct loop (Opifex; the loop Architectus dispatches to) currently reads files
+one `read_file` per turn. When the model is deciding between N candidate files — e.g.
+"which of these 3 files owns the global state?" — Proposal 2 (adopted-lite) allows a
+**single model response to carry up to N batched `read_file` calls**:
+
+- The worker executes the batch **concurrently** and appends the results to the
+  observation stream **in call order** (deterministic, never reordered). This collapses
+  N sequential tool round-trips into one.
+- **No new protocol message.** The batch is a tool-call array in the model response and
+  a concurrent-execute loop inside the worker; the `tools` allowlist (arch §5.2, line
+  304) and the supervisor↔worker wire are unchanged. Each call in the batch still emits
+  its own `tool_event`/`progress` so the event trail stays per-call
+  (ipc-protocol-draft.md §2.4, lines 291, 299-302), and per-tool heartbeats (arch §7.6)
+  keep the watchdog from firing mid-batch. A failed call is handled per-tool, not as a
+  batch failure.
+- **Falsification (M6).** Acceptance requires a TTFT/latency comparison — sequential vs
+  batched — on a **3-file read** fixture against a real provider (the M6 end-to-end
+  milestone, `v2-1-review.md` lines 401-417). Adopted target: **≥30% latency
+  reduction**. The Proposal-2 headline figure of **60% latency reduction is
+  UNVERIFIED** — no measurement exists on `main`; the ≥30% bar is the adopted
+  falsifiable target. Failure to meet the bar keeps the sequential read path (same
+  falsification posture as v2-1-review.md M9, lines 450-459).
+- Scope: the batch size N is bounded by the number of candidate files named in the
+  model's reasoning, capped by the tool-set bound. This is an Opifex worker-loop note;
+  Architectus's only obligations are keeping `read_file` in the allowlist and recording
+  batch behavior in the event trail. It lands in chunk S4's Opifex-consumption work and
+  is falsified at M6 (§8).
 
 ---
 
@@ -462,6 +594,27 @@ control-plane/event-log** surfaces. Their normative home is therefore:
 - Architectus↔Custos control plane (spawn/kill/restart/gate/merge) is **not wire**: it is
   the Custos Python API specified in custos-asyncio-design.md §5 deltas 7-11 (lines
   190-195), plus the event kinds above.
+
+**D. `shared_update` wire event — the blackboard proposal channel (§3.6, critique-4,
+adopted).** Worker→supervisor fire-and-forget event carrying a cross-cutting node's
+**proposed** additions to `_shared` (facts it authored, files it changed):
+
+```jsonc
+{"type":"shared_update","task_id":"wt-abc-001","generation":3,
+ "payload":{"facts":{"schema.users.v2":"<definition>","api.v1.contract":"<contract>"},
+            "changed_files":["src/schema.rs"]}}
+```
+
+- Enters the worker→supervisor events table (ipc-protocol-draft.md §2.4) and the event
+  catalog (event-schema-draft.md §3) as a new kind, **NC** (proposals are advisory and
+  reconstructible; the durable decision is Architectus's merge). Additive → no `proto`
+  bump (ipc-protocol-draft.md §5).
+- The worker **never writes** `_shared`; it only proposes. Architectus validates shape,
+  redacts (arch §12.3), and merges at wave boundaries (§3.6, §2.3).
+- Not an upward result envelope: I2.7's unknown-top-level-field rejection does not apply
+  to this dedicated proposal channel — the two surfaces stay separate.
+- **UNVERIFIED on `main`:** the event kind and its payload shape are new (draft-
+  proposed); no merged spec defines them (§9).
 
 ---
 
@@ -541,11 +694,11 @@ parallelizable where noted.
 | Chunk | Size | Scope | Depends on | Parallel with |
 |---|---|---|---|---|
 | **S1 — Architectus module skeleton** | S | `OrchestrationInput/Output` dataclasses, `Action` enum, `decide` pure core, D8a CLI, rule-engine default policy (§6 table) | M5 base | S2, S4 |
-| **S2 — Conversation store + context composition** | S | `ConversationStore` (conversations.db, §6.6/D8g: `last_turns`/`cost_by_node`/`context_for`), §3 composition algorithm + token budget + prompt-lint | S1; conversation store component (v2-1-review gap 11, lines 189-191) | S4, S5 |
-| **S3 — Wave scheduler** | M | §2 loop over `tasktree.ready_tasks` with bounded admission, envelope aggregation via `upward_result`, `subtree_failed` handling; fake-Custos harness | S1, S2 | — |
-| **S4 — Steer emission + routing** | S | `steer` wire addition (ipc-protocol-draft §2.2), WorkerHandle routing by `session_id`, Opifex consumption of direction/gate-retry content | M2 (FD-3 protocol + pipe hardening); S3 | S5 |
-| **S5 — Feedback-loop events** | S | `child_result`/`subtree_failed`/`replan` event kinds (event-schema-draft §3), the §6 decision table applied to live events | S3; M4 (gate verdicts) | S4 |
-| **S6 — ResultEvaluator + aggregation** | M | `ResultEvaluator` module (arch §10, §4 M6), envelope aggregation into parent contexts, root finalization | S2, S3 | — |
+| **S2 — Conversation store + context composition** | S | `ConversationStore` (conversations.db, §6.6/D8g: `last_turns`/`cost_by_node`/`context_for`), §3 composition algorithm + token budget + prompt-lint; **shared blackboard `_shared` + `spec.cross_cutting` flag (§3.6); `include_diff` config (§3.7)** | S1; conversation store component (v2-1-review gap 11, lines 189-191) | S4, S5 |
+| **S3 — Wave scheduler** | M | §2 loop over `tasktree.ready_tasks` with bounded admission, envelope aggregation via `upward_result`, `subtree_failed` handling; **`_shared` merge at wave boundaries (§3.6)**; fake-Custos harness | S1, S2 | — |
+| **S4 — Steer emission + routing** | S | `steer` wire addition (ipc-protocol-draft §2.2), WorkerHandle routing by `session_id`, Opifex consumption of direction/gate-retry content; **`shared_update` wire event (§5.3 D); speculative batched `read_file` in the worker loop (§4.4)** | M2 (FD-3 protocol + pipe hardening); S3 | S5 |
+| **S5 — Feedback-loop events** | S | `child_result`/`subtree_failed`/`replan` + `shared_update` event kinds (event-schema-draft §3), the §6 decision table applied to live events | S3; M4 (gate verdicts) | S4 |
+| **S6 — ResultEvaluator + aggregation** | M | `ResultEvaluator` module (arch §10, §4 M6), envelope aggregation into parent contexts, root finalization; **`include_diff: false` diff-substitution at higher orchestrator tiers + diff-on-demand for `merge_failed` resolution (§3.7)** | S2, S3 | — |
 | **S7 — Full-loop integration + scenario suite** | L | §7 scenarios 1-13 end-to-end: real worker + ScriptedLLM + real gate + Unio publish | S3-S6, M1 (canonical Custos), M3 (fencing/redaction), M4 (gate/budgets) | — |
 
 Critical path: **S1 → S2 → S3 → S5 → S7** (context → schedule → feedback). S4 (protocol)
@@ -564,6 +717,14 @@ pre-spawned pool; M5 steering works within one NodeSession's lifetime), DSPy
 **mid-task** parent direction on a live NodeSession; the "multiple init messages per
 process" model that would host multiple tasks per process remains deferred to M7
 (ipc-protocol-draft.md §7 reconciliation row 1, line 525; arch §14, line 999).
+
+Critique-4 landings: the **speculative batched `read_file`** (§4.4) ships in the Opifex
+worker loop inside S4 but is **falsified at M6** — sequential-vs-batched latency on a
+3-file read, **≥30%** target, the 60% claim UNVERIFIED — not at M5. The **blackboard
+(`_shared`) and `include_diff`** are M5 scope (S2/S3/S5/S6) with new config fields
+(`spec.cross_cutting`, `include_diff`) and one new wire event (`shared_update`), all
+flagged UNVERIFIED in §9. The blackboard's wave-boundary merge adds a scheduling-loop
+step (S3) and one catalog kind (S5) but no new milestone.
 
 ---
 
@@ -605,3 +766,9 @@ process" model that would host multiple tasks per process remains deferred to M7
 | Worker-side steer content consumption | — | **UNVERIFIED** — `worker.py:468` is a placeholder hook |
 | arch §5.2 `steer.context` vs worker `steer.payload` | lines 314-316 vs 460-469 | **DIVERGENT** — reconciliation required (§5.2) |
 | `AGENTS.md` guideline file re-read | — | **UNVERIFIED** — cited by name only (D8c) |
+| critique-4 source (blackboard / speculative reads / `include_diff`) | — | **UNVERIFIED** — directive-provided; no critique-4 file in the repo (design-deltas.md §2 line 316 precedent) |
+| `spec.cross_cutting` flag and `_shared` blackboard namespace | — | **UNVERIFIED** — new config + §6.6 extension; no merged spec (provenance: §3.6) |
+| `shared_update` wire event | — | **UNVERIFIED** — new, draft-proposed (§5.3 D) |
+| `include_diff` per-task config + token savings | — | **UNVERIFIED** — structural bound, unmeasured (see §3.4 calibration) |
+| Proposal-2 **60%** batched-read latency-reduction claim | — | **UNVERIFIED** — no measurement on `main`; headline figure only |
+| **≥30%** batched-read latency target (M6 falsification) | — | **UNVERIFIED** — adopted falsifiable bar, unmeasured (v2-1-review.md M6, lines 401-417) |
