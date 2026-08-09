@@ -3,8 +3,8 @@
 Research date: 2026-08-10. Purpose: answer **IMPL-M8** ("No test strategy for the
 harness itself", `docs/architecture/reviews/review-implementation.md`) and the test-relevant
 findings of the distributed-systems and LLM-design reviews. The strategy
-applies to the harness as designed in `docs/architecture/architecture.md` (v2, pending merge
-from the architecture worktree): Custos (supervisor), Opifex (workers), Nuntius
+applies to the harness as designed in `docs/architecture/architecture.md` (v2, now merged
+into main): Custos (supervisor), Opifex (workers), Nuntius
 (IPC), Surculus (worktrees), Unio (merge sequencer), Diffundo (provider
 cascade), and the event log.
 
@@ -24,7 +24,7 @@ Constraints honored from `agents.md` §5 and `docs/architecture/architecture.md`
   the existing scenario test does.
 
 Pytest-feature claims in this document are annotated **VERIFIED** (tested
-against pytest 8.x on CPython 3.14.7, commands shown in §10.1) or **UNVERIFIED**
+against pytest 9.1.1 on CPython 3.14.7, commands shown in §10.1) or **UNVERIFIED**
 (could not be checked here; treat as needing a check during implementation).
 
 ---
@@ -39,7 +39,7 @@ layer.
 
 | Layer | What lives here | Real I/O | Speed | Gate value |
 |---|---|---|---|---|
-| L5 Scenarios | The 15 named scenarios of §7, through the public API / orchestrator | workers, git, sqlite, local HTTP | seconds–minutes | The behavioral contract (this is the smoke test) |
+| L5 Scenarios | The 15 named scenarios in the §7 target catalog, through the public API / orchestrator | workers, git, sqlite, local HTTP | seconds–minutes | The behavioral contract (this is the smoke test) |
 | L4 Integration | Fake-worker liveness (§2), event-log replay (§3), worktree lifecycle (§4), merge concurrency (§5), Diffundo vs fake provider (§6.1) | workers, git, sqlite, localhost HTTP | seconds | Each harness mechanism under its real failure modes |
 | L3 Deterministic replay | Nuntius frame-in/frame-out round trips, event-tier/fsync contract, restart-policy decisions as a pure function, DAG validation, Septum command wrapping, redaction | none (pure + temp files) | milliseconds | The contracts the upper layers rely on |
 | L2 Module datasets | Every DSPy module's dataset loader + metric over the frozen split, canaries (§8) | none | milliseconds | The per-module eval gate |
@@ -375,8 +375,8 @@ against the local install (§10.1).
 | Scenario suite only | `uv run --python 3.14.7 --extra test pytest -q -m scenario` |
 | Integration suite only | `uv run --python 3.14.7 --extra test pytest -q -m integration` |
 | Exclude known-slow | `uv run --python 3.14.7 --extra test pytest -q -m "not slow"` |
-| One named scenario | `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_liveness.py -v` |
-| Deselect one flaky test | `... pytest -q --deselect tests/scenarios/test_liveness.py::test_hang_watchdog` |
+| One named scenario | `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_vertical_slice.py -v` |
+| Deselect one slow test | `... pytest -q --deselect tests/scenarios/test_vertical_slice.py::test_ready_timeout_fails_within_budget` |
 | Find the slowest tests | `... pytest -q --durations=5` |
 | No `.pytest_cache` writes | `... pytest -q -p no:cacheprovider` |
 | Show registered markers | `... pytest --markers` |
@@ -435,7 +435,7 @@ Every review finding that demands a test maps to a concrete item. IMPL-M8
 
 ### 10.1 VERIFIED claims
 
-Tested on CPython 3.14.7 with pytest 8.x (installed via
+Tested on CPython 3.14.7 with pytest 9.1.1 (installed via
 `uv run --python 3.14.7 --extra test`), using a throwaway project at
 `/tmp/opencode/pytest-verify`:
 
@@ -472,9 +472,9 @@ Tested on CPython 3.14.7 with pytest 8.x (installed via
 
 ## 11. Scope note
 
-This document is a **design** for the harness tests. Today only S14 exists
-(`tests/scenarios/test_example_module.py`, the reference module). Every other
-test lands alongside its module (Custos, Nuntius, Surculus, Unio, Diffundo,
-Septum), in the same PR that implements the module, gated by the L1 smoke test
-(S01). A module that ships without its scenario test is not complete
-(`agents.md` §9).
+This document is a **design** for the harness tests. Current main collects 108
+tests under `tests/scenarios/`, covering the reference module, datasets, the
+vertical slice, storage, merge, IPC, task-tree, and doctor paths. The remaining
+catalog scenarios land alongside their modules (Custos, Nuntius, Surculus,
+Unio, Diffundo, Septum), gated by the L1 smoke test (S01). A module that ships
+without its scenario test is not complete (`agents.md` §9).

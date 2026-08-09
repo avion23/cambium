@@ -199,7 +199,7 @@ deliverable report):
   `ExampleDatasetLoader`; running `ShouldDecomposeModule.decide` over all 260
   examples and scoring with `should_decompose_metric` yields **metric == 1.0
   on every example** — the labels are exactly what the rule engine produces.
-- The existing scenario test (`tests/scenarios/test_example_module.py`)
+- The existing colocated scenario test (`src/cambium/modules/example/tests/test_example_module.py`)
   targets the untouched `example_pairs.jsonl` and is unaffected.
 
 ## 7. UNVERIFIED notes

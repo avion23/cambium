@@ -7,6 +7,10 @@ of **Ascensus** (M9, the DSPy optimization harness; `docs/architecture/system-de
 (pytest 9.1.1, CPython 3.14.7, installed via `uv`) or a file reference.
 Anything that could not be checked is marked **UNVERIFIED**.
 
+**Current-main note (2026-08-09):** the scaffold-era six-test baseline in this
+document is historical. Current main collects 108 tests and the full run reports
+108 passed; the source ruff gate is clean.
+
 ## 1. Purpose
 
 The harness measures four things for every Cambium module, and stores them so
@@ -44,11 +48,14 @@ scenario runner (`[project.optional-dependencies].test`).
 uv run --python 3.14.7 pytest -q
 ```
 
-Verified in this worktree: `6 passed in 0.08s` (first run) and `6 passed in
-0.03s` (warm). Note: this works because pytest is already installed in the
-venv. In a fresh checkout, pytest is declared under the `test` extra, so the
-documented form is `uv run --python 3.14.7 --extra test pytest -q` (matches
-`README.md`).
+The current-main verification is `uv run --python 3.14.7 --extra test pytest
+--collect-only -q` → `108 tests collected`; the full command reports 108 passed.
+In a fresh checkout, pytest is declared
+under the `test` extra, so the documented form is
+`uv run --python 3.14.7 --extra test pytest -q` (matches `README.md`).
+
+The earlier six-test output is retained only as the historical scaffold
+baseline for this design.
 
 ### Proposed: bench harness
 
@@ -78,18 +85,19 @@ The drift check exit code matters: **exit 1 on regression** so CI gates on it.
 
 Two choices were weighed:
 
-- `tests/baselines/` — committed, versioned with the repo, reviewable in PRs.
+- `src/cambium/modules/<name>/tests/baselines/` — committed next to each module,
+  versioned with the repo, and reviewable in PRs.
   **Chosen for the committed reference** baselines: they are source of truth
   and must survive machine changes.
 - `.cambium/` — already in `.gitignore`, machine-generated, unbounded growth.
 
 Split: the **committed reference** lives in
-`tests/baselines/<module>/baseline.json` (one file per module, plus
-`tests/baselines/manifest.json`). Run artifacts and ephemeral drift reports
+`src/cambium/modules/<name>/tests/baselines/baseline.json` (one file per module).
+Run artifacts and ephemeral drift reports
 are written to `.cambium/baselines/` (gitignored). The committed file is the
 anchor for the drift gate; the `.cambium/` copies are forensic history.
 
-### JSON schema (`tests/baselines/<module>/baseline.json`)
+### JSON schema (`src/cambium/modules/<name>/tests/baselines/baseline.json`)
 
 ```jsonc
 {
@@ -120,13 +128,13 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
     "canaries": 2
   },
   "tests": {
-    "count": 6,
+    "count": 108,                 // current-main collection; nodeids abbreviated
     "wall_seconds": {
       "p50": 0.004, "p90": 0.011, "max": 0.02
     },
     "by_nodeid": {
-      "tests/scenarios/test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.004,
-      "tests/scenarios/test_example_module.py::test_malformed_record_is_rejected": 0.011
+      "src/cambium/modules/example/tests/test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.004,
+      "src/cambium/modules/example/tests/test_example_module.py::test_malformed_record_is_rejected": 0.011
     }
   },
   "drift_thresholds": {                 // defaults; configurable per module
@@ -147,19 +155,16 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
   baselines. The drift check compares **only against the last baseline with
   the same `dataset_version`**; when `dataset_version` changes, the harness
   records a new anchor instead of failing.
-  - **v2 (current scaffold): `dataset_version` is `null`.** The example module
-    ships a flat single-file dataset (`example_pairs.jsonl`) and its loader
-    (`ExampleDatasetLoader`, `src/cambium/modules/example/dataset.py`) exposes
-    no version — it validates `input`/`expected`/`canary` per record and
-    returns `Example`s. With no version to read, the harness cannot pin the
-    baseline to a dataset revision; the drift anchor is effectively the git
-    sha. This is honest but weak, which is why migration to the three-split
-    format is a goal.
-  - **v2.1 target: `dataset_version` populated from `datasets/meta.json`**
-    (`src/cambium/modules/<name>/datasets/meta.json` per `dataset-format.md`
-    §5), read through the load contract's `Dataset.dataset_version`
-    (`dataset-format.md` §9). The schema field is already there and nullable,
-    so v2 baselines migrate forward without a `schema_version` bump.
+   - **Current main: `dataset_version` is populated from `datasets/meta.json`.**
+     The example module ships the three split files plus `meta.json`; its
+     `ExampleDatasetLoader` (`src/cambium/modules/example/dataset.py`) exposes
+     `load_all()` and validates `input`/`expected`/`canary` per record. The
+     legacy `example_pairs.jsonl` remains a loader fallback for the flat v2
+     format.
+   - **Future module target:** new modules populate `dataset_version` from
+     `datasets/meta.json` (`src/cambium/modules/<name>/datasets/meta.json` per
+     `dataset-format.md` §5), read through the load contract's
+     `Dataset.dataset_version` (`dataset-format.md` §9).
 - `git_sha` makes the recorded number attributable to a concrete tree.
 
 ## 4. What to run when
@@ -256,7 +261,7 @@ class Bench:
         if exitstatus != 0:
             return  # do not anchor a baseline on a red run
         report = compute_report(self, ...)     # times, integrity, metric, canaries
-        drift = compare_against_anchor(report) # tests/baselines/<module>/baseline.json
+        drift = compare_against_anchor(report) # src/cambium/modules/<name>/tests/baselines/baseline.json
         write_artifact(report, ".cambium/baselines/")
         if drift.regressions:
             session.exitstatus = 1             # gate on regression
@@ -321,12 +326,11 @@ def canary_coverage(examples, taxonomy) -> dict:
 
 `taxonomy_coverage < 1` is **reported, not failed** in gate mode — a module may
 legitimately need only some trap kinds. What is always failed: `total == 0`
-(no canaries at all defeats the anti-reward-hacking layer). The current
-example dataset is a flat single-split file (`example_pairs.jsonl`, 9 records,
-2 canaries, `decompose` 4-true/5-false); the three-split format
-(train/eval/canaries.jsonl) and per-record `data.canary.kind` fields from
-`dataset-format.md` are the target shape the harness computes against once
-datasets migrate.
+(no canaries at all defeats the anti-reward-hacking layer). The current example
+dataset uses the three split files (`train.jsonl`, `eval.jsonl`, and
+`canaries.jsonl`) plus `meta.json`: 260 records total, with 200 train, 50 eval,
+and 10 canaries. The legacy `example_pairs.jsonl` remains available as the
+loader's flat-format fallback.
 
 ### Drift comparison
 
@@ -384,3 +388,177 @@ The harness is exercised by its own tests in
   plugin is loaded, so there is no collision with a pytest core option. The
   plugin name stays namespaced (`cambium-bench`) to stay distinct from any
   future third-party plugin.
+
+## 8. DRAFT (v2.1, M8 scope) — Mock git eval environment and AST-assert evaluation
+
+> **Status: DRAFT.** Not implemented. This section adopts the critique-4
+> evaluation enhancements (`#16`): a **mock git environment** so a DSPy
+> optimizer never touches real source, and **AST-assert** scoring so
+> "structure survived" is checked in addition to "tests passed". Both target
+> the Ascensus optimization loop (`docs/architecture/architecture.md` §17.4)
+> and the nightly hill-climb baseline (§4). Nothing here is evidenced by an
+> M8 run; every unmeasured claim is flagged **UNVERIFIED**. Files referenced
+> that do not exist at `main@6109a6a` are explicitly called out as forward
+> references.
+
+### 8.1 Mock git environment — the optimizer never touches real source
+
+**The critique (adopt #16).** In the §17.4 loop today, the candidate is
+scored against the frozen dataset, but the candidate itself — a DSPy program
+behind the `decide()` seam (§17.1) or, later, a diff-producing worker — must
+*act on files* to be evaluated. If that acting happens inside
+`src/cambium/`, the optimizer gains two things it must not have:
+
+1. **Out-of-scope write access.** It could edit its own dataset, metric, or
+   sibling pins — the edits §17.4 step 9 requires human approval for
+   (`architecture.md` §17.4, "Human approval for out-of-scope harness edits").
+2. **Real-repo observation.** The real tree's structure, tests, and canaries
+   are signal the optimizer could overfit — the reward-hacking surface
+   `metric-design.md` §2.3/G7/G8 is explicitly built to deny it ("the
+   optimizer never sees `canaries.jsonl`"; G8 "game the git state").
+
+**Design.** Every optimization iteration runs against a **frozen scratch
+repo**; the real repo is never in the optimization loop:
+
+1. `git init` a scratch repo under `.cambium/mock-envs/<module>/<run_id>/`
+   (gitignored run artifact, same policy as `.cambium/baselines/`, §3).
+2. Populate it with **dummy code fixtures per module** — a deterministic
+   copy of the module scaffold reduced to fixture stubs. For
+   `should_decompose`: `decide.py` + `metric.py` + `dataset.py` headers,
+   a stub `tests/`, and `datasets/train.jsonl` **without canaries**
+   (canaries load only at promotion, §17.4 step 8).
+3. Record the initial commit as `base_ref`. The candidate edits the scratch;
+   scoring reads the scratch state — `git diff base_ref..HEAD` (the same
+   git ops `metric-design.md` §2.2 verifies at ~9 ms), the metric over the
+   frozen splits, and the AST-assert script (§8.2), all run with the scratch
+   as `cwd`.
+4. Promotion (§17.4 step 9) is the **only** step that touches the real tree,
+   via the human-approved versioned-pointer swap (`optimized/<name>/v<N>/`,
+   §17.3 harness state). The optimizer process never has the real repo as
+   `cwd` and never receives real-repo paths.
+
+**Frozen-input rule (citation).** Scratch fixtures are generated only from
+versioned, frozen inputs, per the dataset-format frozen-split rule
+(`docs/architecture/module-template/dataset-format.md` §4):
+`eval.jsonl` is **immutable once frozen** (`eval.frozen_at` in `meta.json`),
+`canaries.jsonl` is frozen and additive-only, `train.jsonl` is grow-only,
+and no record exists in two splits (the loader enforces this with a
+canonical-hash collision check, `src/cambium/modules/example/dataset.py`
+`_check_no_cross_split_collisions`). The shipped `should_decompose` dataset
+already ships the three files plus `meta.json`
+(`src/cambium/modules/example/datasets/{train,eval,canaries}.jsonl`, per
+commit `fe160fd`). Because fixtures derive only from
+`(module, dataset_version, candidate_hash)`, any iteration's environment is
+reconstructible, and fixture drift is impossible without a `dataset_version`
+bump that also invalidates the metric baseline (§3 versioning).
+
+**Eval-cache integration (when merged).** Per-iteration scoring is
+deterministic and therefore cacheable: key `(dataset_version,
+candidate_hash, fixture_hash)`. Reference: `docs/research/feedback-4-assessment.md`
+#15 and `src/cambium/eval_cache.py`. **⚠️ UNVERIFIED — neither file exists at
+`main@6109a6a`**; this is a forward reference per the adoption task, and the
+cache design is carried here only as the keying contract.
+
+### 8.2 AST-assert evaluation — assert structure, not just test outcome
+
+**Motivation.** The §2.1 floor says "tests pass"; the §2.3 brake says "no
+canary tripped". Neither says *the module's seam survived*. A DSPy candidate
+can preserve decision behavior while drifting the module interface — and the
+exact-match metric (`metric.py::should_decompose_metric`) would still score
+1.0 — while breaking every sibling that consumes the module (§17.1). AST
+asserts close that gap by asserting **structural change** via
+definitions/references, machine-checkable and cheap.
+
+**Mechanism.** Use the **stdlib `ast`** module (always present, no new
+dependency — consistent with this harness's stdlib-only rule) to parse the
+candidate's module file and compare a **pre-registered structural
+fingerprint**: definitions (class/function names, parameter names, defaults,
+annotations as source text, decorators) and references (the names siblings
+and the harness import from the module).
+
+**Precedent (verified, on a parallel branch).**
+`docs/research/treesitter-context.md` §3 proves signature coverage is
+machine-checkable via a stdlib `ast` walk plus a regex boundary check —
+100% coverage (10/10 top-level, 23/23 all names) on the example module's 4
+files. **⚠️ Citation note:** that doc lives on branch
+`wt-research-treesitter`, not `main@6109a6a`. Its *compressed view* is
+deliberately not parseable (`ast.parse` accepts 0/20 — §3); the AST asserts
+here run on **parseable candidate source** (the actual module file), so the
+view's "never feed to a compiler" caveat does not apply.
+
+**Placement.** AST asserts ride the cheap path before the scenario suite
+(`metric-design.md` §1 R3 cheap-first ordering): a candidate whose
+fingerprint fails is scored 0 without paying the 10–30 s suite cost.
+
+**Three concrete asserts for the example (`should_decompose`) module:**
+
+| # | AST assert | Fingerprint (source) | Why a test pass is not enough |
+|---|---|---|---|
+| A1 | **`decide()` signature intact** | `ShouldDecomposeModule` still defines `async def decide(self, input: TaskInput) -> DecomposeOutput` — exactly two params, annotation intact (`decide.py:155`) | The eval path calls `module.decide(example.input)` (`metric.py::evaluate_split_async`, `metric.py:38`); a renamed param or dropped return annotation is an integration break no fixture test catches |
+| A2 | **Input/output dataclass fields intact** | `TaskInput` keeps `task: str`, `context: str = ""`; `DecomposeOutput` keeps `decompose: bool`, `reason: str`, `confidence: float = 1.0` (`decide.py:51-65`) | The loader builds inputs with `TaskInput(**record["input"])` (`dataset.py:162`) and the metric reads `prediction.decompose` (`metric.py:24`) — renamed/dropped fields break both |
+| A3 | **Metric seam preserved** | `decide.py` still imports/defines `should_decompose_metric` and the class still exposes `metric(self, example: Example) -> float` bound to it (`decide.py:159-161`, `metric.py:11`) | The bench baseline and drift gate score every split through this method (§3 `metric` block); a candidate that inlines a fake metric or deletes the method silently corrupts every recorded baseline |
+
+Fingerprint sketch (pre-registered, derived from the frozen fixture):
+
+```jsonc
+// .cambium/mock-envs/should_decompose/fingerprint.json
+{
+  "module": "should_decompose",
+  "file": "decide.py",
+  "classes": {
+    "TaskInput":       {"fields": [{"name": "task", "annotation": "str", "default": null},
+                                   {"name": "context", "annotation": "str", "default": "\"\""}]},
+    "DecomposeOutput": {"fields": [{"name": "decompose", "annotation": "bool", "default": null},
+                                   {"name": "reason", "annotation": "str", "default": null},
+                                   {"name": "confidence", "annotation": "float", "default": "1.0"}]},
+    "ShouldDecomposeModule": {
+      "methods": {
+        "decide": {"params": ["self", "input"], "returns": "DecomposeOutput", "async": true},
+        "metric": {"params": ["self", "example"], "returns": "float", "async": false}
+      }
+    }
+  },
+  "references": ["should_decompose_metric"]
+}
+```
+
+Assert pseudocode (stdlib `ast` only; **UNVERIFIED** — not implemented):
+
+```python
+def assert_fingerprint(candidate_src: str, fp: dict) -> list[str]:
+    """Return violations; empty list = pass."""
+    tree = ast.parse(candidate_src)
+    for klass in fp["classes"]:
+        node = next(c for c in tree.body
+                    if isinstance(c, ast.ClassDef) and c.name == klass)
+        # fields: ast.AnnAssign targets + ast.unparse() of annotation and value
+        # methods: ast.FunctionDef / ast.AsyncFunctionDef, args.arg names,
+        #          ast.unparse() of returns annotation
+    # references: top-level imports / assigned names resolve to fp["references"]
+    ...
+```
+
+### 8.3 Falsification note — mock-env + AST asserts must not regress real-metric correlation
+
+The mock env exists to keep the optimizer off the real tree, **not** to
+change what "good" means. Before the mock env is trusted for optimization, a
+**calibration step** is mandatory:
+
+- Run **N baseline tasks in mock vs real env** — same tasks, same candidate
+  program, scored with the same metric (`metric-design.md` §5.1 separation
+  methodology) — and compare the metric deltas (train-gain vs eval-gain, plus
+  canary outcome) between the two envs.
+- If mock-env deltas diverge from real-env deltas beyond a stated tolerance
+  (sign flips, or a mean gap beyond a configurable bound), the fixtures or
+  AST asserts are over-/under-constraining: the optimizer is hill-climbing a
+  fake surface and its gains do not transfer to the real metric.
+- This mirrors the paired-trial discipline already required elsewhere: M9's
+  compile-success criterion (`docs/research/v2-1-review.md` §3 M9) and M8's
+  falsification clause — no candidate meets all gates within budget ⇒ the
+  deterministic baseline stays production (`v2-1-review.md` §3 M8).
+
+**⚠️ UNVERIFIED until M8 runs.** No M8 DSPy optimization exists at
+`main@6109a6a`; N, the tolerance, and the calibration numbers are unmeasured.
+The nightly "train_gain − canary_gain" signature (§4) must be computed in the
+mock env, and only §8.3's calibration lets that number stand in for a
+real-env number. This section is design, not evidence.

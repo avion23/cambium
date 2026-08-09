@@ -6,9 +6,14 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = []
 
+[project.entry-points.pytest11]
+"cambium.bench" = "cambium.bench"
+
 [project.optional-dependencies]
 # test: what CI runs — pytest only.
 test = ["pytest>=9"]
+# ast: optional tree-sitter Python parser; stdlib ast is the core fallback.
+ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
 # dev: superset of test — everything a contributor needs locally.
 # ruff>=0.12, not ruff>=0.9: ruff<0.12 rejects `target-version = "py314"`
 # (verified 0.9.10/0.11.0: "unknown variant `py314`"); 0.12.0 accepts it.
@@ -22,7 +27,7 @@ build-backend = "hatchling.build"
 packages = ["src/cambium"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "src"]
 
 [tool.ruff]
 line-length = 100

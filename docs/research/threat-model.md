@@ -5,7 +5,7 @@
 **Scope:** Security analysis of the Cambium multi-agent coding harness. Design-level only (pre-implementation); no source audit was performed.
 **Sources:**
 - `docs/architecture/system-design.md` (v0.1.0 draft, superseded; cited only where v2 is silent or where it carries the concrete Septum mount list).
-- `docs/architecture/architecture.md` (v2.0.0, **authoritative** — lives on the `wt-arch` branch at `docs/architecture/architecture.md`; this repo's `docs/architecture/system-design.md` is superseded by it).
+- `docs/architecture/architecture.md` (v2.0.0, **authoritative** — finalized and merged into current main; this repo's `docs/architecture/system-design.md` is superseded by it).
 - `docs/architecture/reviews/review-distributed-systems.md` (DS), `docs/architecture/reviews/review-implementation.md` (IMPL), `docs/architecture/reviews/review-llm-design.md` (LLM).
 - `docs/architecture/module-template/dataset-format.md` (canaries), `docs/architecture/module-template/architecture.md` (module template).
 
@@ -149,7 +149,10 @@ Severity = (impact, likelihood). Label: **accepted** = mitigated to an accepted 
 
 ## 6. Concrete Test Scenarios
 
-`docs/test-strategy.md` does not exist in main as of this writing (verified: not present on `main` or `wt-teststrat`). The scenarios below are therefore listed standalone. Each targets a top mitigation and should become the seed of the harness test strategy.
+The harness test strategy now lives at `docs/research/test-strategy.md`; the
+108-test scenario suite in current main is the implementation baseline. The
+scenarios below remain the security-test design record, with each targeting a
+top mitigation.
 
 | # | Scenario | Mitigation exercised | Expected result | Status against current design |
 |---|---|---|---|---|

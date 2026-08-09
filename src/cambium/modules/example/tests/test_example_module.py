@@ -12,15 +12,7 @@ from pathlib import Path
 from cambium.modules.base import DatasetError
 from cambium.modules.example import ExampleDatasetLoader, ShouldDecomposeModule
 
-DATASET_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "src"
-    / "cambium"
-    / "modules"
-    / "example"
-    / "datasets"
-    / "example_pairs.jsonl"
-)
+DATASET_PATH = Path(__file__).resolve().parents[1] / "datasets" / "example_pairs.jsonl"
 
 
 def _run_all() -> list[dict]:

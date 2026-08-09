@@ -1,0 +1,524 @@
+"""Cambium benchmark harness: baseline report + drift gate.
+
+A pytest plugin usable as ``-p cambium.bench`` or through the ``pytest11``
+entry point (``cambium_bench``). It is inert unless ``--bench`` is passed.
+
+Modes::
+
+    pytest -p cambium.bench --bench=report   # measure + write baseline JSON
+    pytest -p cambium.bench --bench=gate     # fail (exit 1) on drift
+
+The report writes ``src/cambium/modules/<name>/tests/baselines/baseline.json``
+per the schema in ``docs/research/bench-harness-design.md``: schema_version, module,
+dataset_version, git_sha, date, python, pytest; metric mean/std/count per
+train/eval/canaries split; canary total/kinds/taxonomy coverage/failed;
+dataset records/duplicate ids/leaks/balance; test count + p50/p90/max wall
+times; and the drift thresholds the gate enforces.
+
+Only the Python standard library plus pytest is used.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as _dt
+import importlib
+import json
+import platform
+import statistics
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from cambium.modules.base import DatasetError, DatasetLoader, Example, Module, load_jsonl
+
+CANARY_TAXONOMY: tuple[str, ...] = (
+    "trivially_atomic",
+    "must_decompose",
+    "ambiguous_calibration",
+    "format_only_hack",
+    "keyword_hack",
+)
+
+DEFAULT_THRESHOLDS: dict[str, Any] = {
+    "metric_mean_delta": 0.05,
+    "wall_p90_ratio": 1.5,
+    "canary_failed_delta": 0,
+    "dataset": {"duplicate_ids": 0, "cross_split_leaks": 0},
+}
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MODULES_DIR = REPO_ROOT / "src" / "cambium" / "modules"
+
+SPLITS = ("train", "eval", "canaries")
+
+_OPTIONS_ADDED = False
+
+
+def _baseline_path(
+    package_name: str,
+    module_name: str,
+    baseline_root: Path | None = None,
+) -> Path:
+    """Return a module-local baseline path, or an explicit root override."""
+    if baseline_root is not None:
+        return baseline_root / module_name / "baseline.json"
+    return MODULES_DIR / package_name / "tests" / "baselines" / "baseline.json"
+
+
+# --------------------------------------------------------------------------
+# Pure helpers: git sha, date, percentiles
+# --------------------------------------------------------------------------
+
+
+def _git_sha() -> str:
+    """Full SHA of the tree the run was executed in, or "" when unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _utc_now_iso() -> str:
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def percentiles(times: list[float]) -> dict[str, float]:
+    """p50/p90/max over wall times via ``statistics.quantiles`` (n=100)."""
+    ordered = sorted(times)
+    if not ordered:
+        return {"p50": 0.0, "p90": 0.0, "max": 0.0}
+    qs = statistics.quantiles(ordered, n=100)
+    return {
+        "p50": round(qs[49], 6),
+        "p90": round(qs[89], 6),
+        "max": round(ordered[-1], 6),
+    }
+
+
+# --------------------------------------------------------------------------
+# Module discovery and dataset/metric computation
+# --------------------------------------------------------------------------
+
+
+def discover_modules() -> list[str]:
+    """Names of modules under ``src/cambium/modules/`` that ship a dataset."""
+    if not MODULES_DIR.is_dir():
+        return []
+    return sorted(
+        child.name
+        for child in MODULES_DIR.iterdir()
+        if child.is_dir() and (child / "datasets").is_dir()
+    )
+
+
+def _module_class(pkg: Any) -> type[Module] | None:
+    for obj in vars(pkg).values():
+        if isinstance(obj, type) and issubclass(obj, Module) and obj is not Module:
+            return obj
+    return None
+
+
+def _loader_class(pkg: Any) -> type[DatasetLoader] | None:
+    for obj in vars(pkg).values():
+        if isinstance(obj, type) and issubclass(obj, DatasetLoader) and obj is not DatasetLoader:
+            return obj
+    return None
+
+
+def _read_meta(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+async def _predict(module: Module, examples: list[Example]) -> list[Example]:
+    scored: list[Example] = []
+    for ex in examples:
+        scored.append(ex.with_prediction(await module.decide(ex.input)))
+    return scored
+
+
+def score_examples(module: Module, scored: list[Example]) -> dict[str, float]:
+    """Metric mean/std/count over already-predicted examples."""
+    scores = [module.metric(ex) for ex in scored]
+    if not scores:
+        return {"mean": 0.0, "std": 0.0, "count": 0}
+    mean = statistics.fmean(scores)
+    std = statistics.pstdev(scores) if len(scores) > 1 else 0.0
+    return {"mean": round(mean, 6), "std": round(std, 6), "count": len(scores)}
+
+
+def dataset_stats(records: list[dict]) -> dict[str, int]:
+    """Duplicate ids, cross-split leaks, class balance over raw records."""
+    ids = [r["id"] for r in records if isinstance(r.get("id"), str)]
+    seen: dict[tuple[str, str], str] = {}
+    leaks = 0
+    for r in records:
+        key = (r["input"]["task"], r["input"]["context"])
+        if key in seen:
+            leaks += 1
+        seen[key] = r.get("id", "")
+    return {
+        "records": len(records),
+        "duplicate_ids": len(ids) - len(set(ids)),
+        "cross_split_leaks": leaks,
+        "decompose_true": sum(1 for r in records if r["expected"]["decompose"] is True),
+        "decompose_false": sum(1 for r in records if r["expected"]["decompose"] is False),
+        "canaries": sum(1 for r in records if r.get("canary", False)),
+    }
+
+
+def canary_stats(raw_canaries: list[dict], canary_scores: list[float]) -> dict[str, Any]:
+    """Canary counts, taxonomy kinds present/coverage, failures.
+
+    A canary "fails" when the module's decision metric is not perfect on it
+    (the anti-reward-hacking pass condition the current metric can check).
+    """
+    kinds = [
+        r["canary_info"]["kind"]
+        for r in raw_canaries
+        if isinstance(r.get("canary_info"), dict)
+        and isinstance(r["canary_info"].get("kind"), str)
+    ]
+    present = sorted(set(kinds))
+    coverage = round(
+        len([kind for kind in CANARY_TAXONOMY if kind in present]) / len(CANARY_TAXONOMY),
+        4,
+    )
+    return {
+        "total": len(raw_canaries),
+        "kinds_present": present,
+        "taxonomy_coverage": coverage,
+        "failed": sum(1 for score in canary_scores if score < 1.0),
+    }
+
+
+def build_module_report(pkg_name: str) -> dict[str, Any]:
+    """Metric/canaries/dataset sections of a module's baseline.
+
+    Reads the three-split datasets (train/eval/canaries.jsonl) through the
+    module's own loader; if the split datasets are unreadable it falls back
+    to the combined ``*_pairs.jsonl`` file and marks the split metric fields
+    null with a ``note``.
+    """
+    pkg = importlib.import_module(f"cambium.modules.{pkg_name}")
+    module_cls = _module_class(pkg)
+    if module_cls is None:
+        raise ValueError(f"cambium.modules.{pkg_name} exports no Module subclass")
+    module = module_cls()
+    datasets_dir = MODULES_DIR / pkg_name / "datasets"
+    meta = _read_meta(datasets_dir / "meta.json")
+    dataset_version = meta.get("dataset_version") if meta else None
+
+    note: str | None = None
+    combined = False
+    try:
+        loader_cls = _loader_class(pkg)
+        if loader_cls is None:
+            raise DatasetError("module exports no DatasetLoader")
+        raw: dict[str, list[dict]] = {}
+        examples: dict[str, list[Example]] = {}
+        for split in SPLITS:
+            path = datasets_dir / f"{split}.jsonl"
+            raw[split] = load_jsonl(path)
+            examples[split] = loader_cls(path).load()
+    except (DatasetError, OSError, ValueError) as exc:
+        combined = True
+        note = (
+            f"three-split dataset unreadable ({exc}); fell back to the combined "
+            "file and split metrics are null"
+        )
+        pairs = datasets_dir / f"{pkg_name}_pairs.jsonl"
+        if not pairs.exists():
+            pairs = datasets_dir / "example_pairs.jsonl"
+        loader_cls = _loader_class(pkg)
+        raw = {"combined": load_jsonl(pairs)}
+        examples = {"combined": loader_cls(pairs).load() if loader_cls else []}
+
+    metric: dict[str, Any] = {}
+    canary_scores: list[float] = []
+    for split in SPLITS:
+        if combined:
+            metric[split] = None
+            continue
+        scored = asyncio.run(_predict(module, examples[split]))
+        metric[split] = score_examples(module, scored)
+        if split == "canaries":
+            canary_scores = [module.metric(ex) for ex in scored]
+    if combined:
+        scored = asyncio.run(_predict(module, examples["combined"]))
+        metric["combined"] = score_examples(module, scored)
+        canary_scores = [module.metric(ex) for ex in scored if ex.canary]
+
+    records = [r for split in SPLITS for r in raw.get(split, [])] or raw.get("combined", [])
+    report: dict[str, Any] = {
+        "module": module.name,
+        "dataset_version": dataset_version,
+        "metric": metric,
+        "canaries": canary_stats(
+            raw.get("canaries") or raw.get("combined", []), canary_scores
+        ),
+        "dataset": dataset_stats(records),
+    }
+    if note:
+        report["note"] = note
+    return report
+
+
+def _assemble_baseline(
+    body: dict[str, Any],
+    timings: dict[str, float],
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Wrap a module body into the full baseline schema."""
+    baseline: dict[str, Any] = {
+        "schema_version": 1,
+        "module": body["module"],
+        "dataset_version": body["dataset_version"],
+        "git_sha": _git_sha(),
+        "date": _utc_now_iso(),
+        "python": platform.python_version(),
+        "pytest": pytest.__version__,
+        "metric": body["metric"],
+        "canaries": body["canaries"],
+        "dataset": body["dataset"],
+        "tests": {
+            "count": len(timings),
+            "wall_seconds": percentiles(list(timings.values())),
+            "by_nodeid": {k: round(v, 6) for k, v in sorted(timings.items())},
+        },
+        "drift_thresholds": dict(thresholds or DEFAULT_THRESHOLDS),
+    }
+    if body.get("note"):
+        baseline["note"] = body["note"]
+    return baseline
+
+
+def compare_against_anchor(report: dict[str, Any], anchor: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return ``[(field, detail)]`` regressions of ``report`` vs ``anchor``.
+
+    Metric means only fail when they fall by more than ``metric_mean_delta``;
+    wall p90 fails when it exceeds ``anchor * wall_p90_ratio``; duplicate ids
+    or cross-split leaks of any size and missing canaries always fail; a
+    canary failure is a regression when it exceeds the anchor's count.
+    Thresholds come from the anchor's own ``drift_thresholds``.
+    """
+    thresholds = dict(DEFAULT_THRESHOLDS)
+    thresholds.update(anchor.get("drift_thresholds") or {})
+    regressions: list[tuple[str, str]] = []
+
+    metric_delta = thresholds["metric_mean_delta"]
+    for split in SPLITS:
+        r_metric = (report.get("metric") or {}).get(split)
+        a_metric = (anchor.get("metric") or {}).get(split)
+        if not isinstance(r_metric, dict) or not isinstance(a_metric, dict):
+            continue
+        drop = a_metric.get("mean", 0.0) - r_metric.get("mean", 0.0)
+        if drop > metric_delta:
+            regressions.append(
+                (
+                    f"metric.{split}.mean",
+                    f"{a_metric['mean']} -> {r_metric['mean']} "
+                    f"(drop {drop:.4f} > {metric_delta})",
+                )
+            )
+
+    r_wall = (report.get("tests") or {}).get("wall_seconds") or {}
+    a_wall = (anchor.get("tests") or {}).get("wall_seconds") or {}
+    if a_wall.get("p90") and r_wall.get("p90"):
+        wall_ratio = thresholds["wall_p90_ratio"]
+        if r_wall["p90"] > a_wall["p90"] * wall_ratio:
+            regressions.append(
+                (
+                    "tests.wall_seconds.p90",
+                    f"{r_wall['p90']} > {a_wall['p90']} * {wall_ratio}",
+                )
+            )
+
+    dataset = report.get("dataset") or {}
+    dataset_thresholds = thresholds.get("dataset") or {}
+    if dataset.get("duplicate_ids", 0) > dataset_thresholds.get("duplicate_ids", 0):
+        regressions.append(("dataset.duplicate_ids", str(dataset["duplicate_ids"])))
+    if dataset.get("cross_split_leaks", 0) > dataset_thresholds.get("cross_split_leaks", 0):
+        regressions.append(("dataset.cross_split_leaks", str(dataset["cross_split_leaks"])))
+
+    r_canaries = report.get("canaries") or {}
+    a_canaries = anchor.get("canaries") or {}
+    if r_canaries.get("total", 0) == 0:
+        regressions.append(("canaries.total", "dataset has no canaries"))
+    if r_canaries.get("failed", 0) > a_canaries.get("failed", 0):
+        regressions.append(
+            (
+                "canaries.failed",
+                f"{a_canaries.get('failed', 0)} -> {r_canaries.get('failed', 0)}",
+            )
+        )
+
+    return regressions
+
+
+# --------------------------------------------------------------------------
+# pytest plugin
+# --------------------------------------------------------------------------
+
+
+class BenchPlugin:
+    """Registered when ``--bench`` is set; collects timings, writes/checks."""
+
+    def __init__(self, config: pytest.Config, thresholds: dict[str, Any] | None = None) -> None:
+        self.mode: str = config.getoption("bench")
+        bench_root = config.getoption("bench_root")
+        self.root = Path(bench_root) if bench_root else None
+        self.thresholds = dict(DEFAULT_THRESHOLDS)
+        if thresholds:
+            self.thresholds.update(thresholds)
+        self.times: dict[str, float] = {}
+        self.module_reports: dict[str, dict[str, Any]] = {}
+        self.regressions: dict[str, list[tuple[str, str]]] = {}
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_makereport(self, item: Any, call: Any) -> None:
+        if call.when == "call":
+            self.times[item.nodeid] = call.duration
+
+    def pytest_sessionfinish(self, session: Any, exitstatus: Any) -> None:
+        if exitstatus != 0:
+            return  # never anchor a baseline on a red run
+        for pkg_name in discover_modules():
+            body = build_module_report(pkg_name)
+            report = _assemble_baseline(body, self.times, self.thresholds)
+            self.module_reports[report["module"]] = report
+            anchor_path = _baseline_path(pkg_name, report["module"], self.root)
+            if self.mode == "report":
+                _write_baseline(report, anchor_path)
+            elif not anchor_path.exists():
+                _write_baseline(report, anchor_path)  # first run anchors + passes
+            else:
+                anchor = json.loads(anchor_path.read_text())
+                regressions = compare_against_anchor(report, anchor)
+                self.regressions[report["module"]] = regressions
+                if regressions:
+                    session.exitstatus = 1
+
+    def pytest_terminal_summary(
+        self, terminalreporter: Any, exitstatus: Any, config: Any
+    ) -> None:
+        if not self.module_reports:
+            return
+        terminalreporter.section("cambium bench", yellow=True)
+        for module, report in sorted(self.module_reports.items()):
+            metric = report["metric"]
+            canaries = report["canaries"]
+            terminalreporter.write_line(
+                f"{module}: dataset records={report['dataset']['records']} "
+                f"metric train={_fmt(metric.get('train'))} "
+                f"eval={_fmt(metric.get('eval'))} "
+                f"canaries={_fmt(metric.get('canaries'))} "
+                f"canary total={canaries['total']} "
+                f"taxonomy_coverage={canaries['taxonomy_coverage']} "
+                f"failed={canaries['failed']}"
+            )
+            for field, detail in self.regressions.get(module, []):
+                terminalreporter.write_line(f"  DRIFT {field}: {detail}", red=True)
+
+
+def _write_baseline(report: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n")
+
+
+def _fmt(stats: Any) -> str:
+    if not isinstance(stats, dict):
+        return "n/a"
+    return f"{stats['mean']:.4f}"
+
+
+def pytest_addoption(parser: Any) -> None:
+    global _OPTIONS_ADDED
+    if _OPTIONS_ADDED:
+        return  # the entry point and -p may both register this module
+    _OPTIONS_ADDED = True
+    group = parser.getgroup("cambium-bench")
+    group.addoption(
+        "--bench",
+        choices=("report", "gate"),
+        default=None,
+        help="run cambium bench: report writes the baseline, gate fails on drift",
+    )
+    group.addoption(
+        "--bench-root",
+        default=None,
+        metavar="DIR",
+        help="baseline root override (default: next to each module)",
+    )
+    group.addoption(
+        "--bench-metric-delta",
+        type=float,
+        default=None,
+        help="override the metric mean drop drift threshold",
+    )
+    group.addoption(
+        "--bench-wall-ratio",
+        type=float,
+        default=None,
+        help="override the wall p90 ratio drift threshold",
+    )
+
+
+def pytest_configure(config: Any) -> None:
+    if config.getoption("bench") is None:
+        return
+    if config.pluginmanager.hasplugin("cambium-bench"):
+        return  # the entry point and -p may both register this module
+    thresholds = dict(DEFAULT_THRESHOLDS)
+    if config.getoption("bench_metric_delta") is not None:
+        thresholds["metric_mean_delta"] = config.getoption("bench_metric_delta")
+    if config.getoption("bench_wall_ratio") is not None:
+        thresholds["wall_p90_ratio"] = config.getoption("bench_wall_ratio")
+    config.pluginmanager.register(BenchPlugin(config, thresholds), "cambium-bench")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI form: ``python -m cambium.bench report|gate`` (no durations)."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    mode = args[0] if args else "report"
+    if mode not in ("report", "gate"):
+        print("usage: python -m cambium.bench report|gate", file=sys.stderr)
+        return 2
+    failures = 0
+    for pkg_name in discover_modules():
+        body = build_module_report(pkg_name)
+        report = _assemble_baseline(body, {})
+        path = _baseline_path(pkg_name, report["module"])
+        if mode == "report":
+            _write_baseline(report, path)
+            print(f"cambium bench: wrote {path}")
+        elif not path.exists():
+            _write_baseline(report, path)
+            print(f"cambium bench: first run wrote {path}")
+        else:
+            anchor = json.loads(path.read_text())
+            regressions = compare_against_anchor(report, anchor)
+            if regressions:
+                failures += 1
+                for field, detail in regressions:
+                    print(f"cambium bench: DRIFT {report['module']}: {field}: {detail}")
+            else:
+                print(f"cambium bench: gate passed: {report['module']}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
