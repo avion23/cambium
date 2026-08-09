@@ -1,12 +1,12 @@
-"""TaskTree DAG-builder scenarios (design-deltas D2 I2.1-I2.7, feedback-2 D8b).
+"""TaskTree DAG-builder scenarios (architecture §3.4/§3.7, invariants I2.1-I2.7).
 
 Pure-logic scenarios for the deterministic task-tree module: build validation
 (unique ids, dependency references, single root, multi-parent rejection,
 depth/width bounds), Kahn cycle detection with the cycle named, topological
 order validity, the supervisor's ready/leaves scheduler inputs, subtree
-info-hiding (I2.4), and the upward result envelope restricted to exactly
-I2.7's field set. The CLI scenarios drive ``python -m cambium.tasktree`` as a
-real subprocess (D8a pipe contract).
+info-hiding (I2.4), and the upward result envelope restricted to exactly the
+current arch §3.4/§3.7 I2.7 key set. The CLI scenarios drive
+``python -m cambium.tasktree`` as a real subprocess (D8a pipe contract).
 """
 
 from __future__ import annotations
@@ -193,7 +193,7 @@ def test_topological_order_raises_on_cyclic_tree() -> None:
         TaskNode("c", TaskKind.TEST, "a", {}, 3, 0, NodeStatus.PENDING),
     )
     tree = TaskTree(nodes=nodes, edges=(("b", "a"), ("c", "b"), ("a", "c")))
-    with pytest.raises(TaskTreeError) as exc:
+    with pytest.raises(CycleError) as exc:
         topological_order(tree)
     assert " -> " in str(exc.value)
     for tid in ("a", "b", "c"):
@@ -310,7 +310,20 @@ def test_subtree_of_unknown_task_raises() -> None:
         subtree_of(tree, "nope")
 
 
-# -- 6. upward_result: the I2.7 envelope -------------------------------------
+# -- 6. upward_result: the arch §3.4/§3.7 I2.7 envelope ----------------------
+
+
+_ENVELOPE_KEYS_EXACT = {
+    "parent_task_id",
+    "unified_diff",
+    "diff_truncated",
+    "summary",
+    "metric_score",
+    "metric_breakdown",
+    "commits",
+    "files_changed",
+    "status",
+}
 
 
 def test_upward_result_exact_envelope_keys() -> None:
@@ -320,19 +333,44 @@ def test_upward_result_exact_envelope_keys() -> None:
         parent_task_id="a",
         spec={
             "unified_diff": "--- a/x\n+++ b/x\n",
+            "diff_truncated": False,
             "summary": "Added the test gate.",
-            "metrics": {"tests": 1.0},
+            "metric_score": 0.84,
+            "metric_breakdown": {"tests": 1.0, "spec_adherence": 0.9},
+            "commits": ["c9f8e7d"],
+            "files_changed": ["src/x.rs"],
         },
         depth=2,
         width_idx=0,
         status=NodeStatus.DONE,
     )
     result = upward_result(node)
-    assert set(result) == {"parent_task_id", "unified_diff", "summary", "metrics"}
+    assert set(result) == _ENVELOPE_KEYS_EXACT
     assert result["parent_task_id"] == "a"
     assert result["unified_diff"].startswith("--- a/x")
+    assert result["diff_truncated"] is False
     assert result["summary"] == "Added the test gate."
-    assert result["metrics"] == {"tests": 1.0}
+    assert result["metric_score"] == 0.84
+    assert result["metric_breakdown"] == {"tests": 1.0, "spec_adherence": 0.9}
+    assert result["commits"] == ["c9f8e7d"]
+    assert result["files_changed"] == ["src/x.rs"]
+    assert result["status"] == NodeStatus.DONE
+
+
+def test_upward_result_carries_diff_truncated_flag() -> None:
+    node = TaskNode(
+        task_id="c",
+        kind=TaskKind.TEST,
+        parent_task_id="a",
+        spec={"unified_diff": "64 KiB overflow", "diff_truncated": True},
+        depth=2,
+        width_idx=0,
+        status=NodeStatus.DONE,
+    )
+    result = upward_result(node)
+    assert set(result) == _ENVELOPE_KEYS_EXACT
+    assert result["unified_diff"] == "64 KiB overflow"
+    assert result["diff_truncated"] is True
 
 
 def test_upward_result_never_carries_scratchpad() -> None:
@@ -343,9 +381,9 @@ def test_upward_result_never_carries_scratchpad() -> None:
         spec={
             "scratchpad": "secret chain-of-thought",
             "reasoning": "hidden trace",
+            "trajectory": [{"tool": "run_shell"}],
             "unified_diff": "d",
             "summary": "s",
-            "metrics": {},
         },
         depth=2,
         width_idx=0,
@@ -353,18 +391,26 @@ def test_upward_result_never_carries_scratchpad() -> None:
     )
     result = upward_result(node)
     # I2.7 "exactly": no scratchpad/reasoning/trajectory fields exist to send
-    assert set(result) == {"parent_task_id", "unified_diff", "summary", "metrics"}
+    assert set(result) == _ENVELOPE_KEYS_EXACT
     assert "scratchpad" not in result
     assert "reasoning" not in result
+    assert "trajectory" not in result
 
 
 def test_upward_result_root_has_null_parent_and_defaults() -> None:
     node = TaskNode("r", TaskKind.FEATURE, None, {}, 0, 0, NodeStatus.PENDING)
-    assert upward_result(node) == {
+    result = upward_result(node)
+    assert set(result) == _ENVELOPE_KEYS_EXACT
+    assert result == {
         "parent_task_id": None,
         "unified_diff": "",
+        "diff_truncated": False,
         "summary": "",
-        "metrics": {},
+        "metric_score": None,
+        "metric_breakdown": {},
+        "commits": [],
+        "files_changed": [],
+        "status": NodeStatus.PENDING,
     }
 
 

@@ -1,7 +1,7 @@
 """TaskTree — deterministic task-DAG builder and supervisor scheduler inputs.
 
-Implements the Task Tree of the architecture (§3.7, formalized in
-``docs/research/design-deltas.md`` D2, invariants I2.1-I2.7) as a pure
+Implements the Task Tree of the current architecture (§3.7, invariants
+I2.1-I2.7; formalized in ``docs/research/design-deltas.md`` D2) as a pure
 JSON-in/JSON-out module (module-template §3, feedback-2 delta D8a):
 
 - I2.1 single root per session; every non-root node has exactly one parent
@@ -10,14 +10,19 @@ JSON-in/JSON-out module (module-template §3, feedback-2 delta D8a):
   multi-parent in v2. Cycle detection = Kahn topological sort on the
   decomposition graph before dispatch (architecture §18.1 DS-M6); a cycle is
   rejected with the cycle path named.
-- I2.3 depth/width bounds: ``max_depth`` (default 3) and ``max_width``
-  (default 8, per-parent fan-out) enforced at build time.
+- I2.3 depth/width bounds: ``max_depth`` (default 3) is enforced at build
+  time. The build-time ``max_width`` is a per-parent fan-out bound; the
+  session-wide parallel-worker cap of the same name is the supervisor's job
+  at dispatch (architecture §3.7 I2.3: "``max_width`` (per-session parallel
+  worker cap, config) are enforced by the supervisor at dispatch").
 - I2.4 info hiding: :func:`subtree_of` gives a node only its own subtree —
   never a sibling's context.
-- I2.7 upward result envelopes (feedback-2 delta D8b): a node's upward
-  envelope carries **exactly** ``parent_task_id``, ``unified_diff``,
-  ``summary``, ``metrics``. There are no scratchpad/reasoning/trajectory
-  fields to send — the rule is structural, not a prompt convention.
+- I2.7 information hiding (envelope-only upward results): a node's upward
+  envelope carries **exactly** the current arch §3.4 key set — ``parent_task_id``,
+  ``unified_diff``, ``diff_truncated``, ``summary``, ``metric_score``,
+  ``metric_breakdown``, ``commits``, ``files_changed``, terminal ``status`` —
+  never the scratchpad/chain-of-thought/trajectory. The rule is structural,
+  not a prompt convention.
 
 The tree is frozen and stateless; the supervisor tracks progress externally
 via the ``finished`` set it feeds to :func:`ready_tasks`. No hidden globals,
@@ -33,11 +38,26 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Any
 
+# Build-time per-parent fan-out bound (I2.3). This is NOT the session-wide
+# parallel-worker cap of the same name: per architecture §3.7 I2.3 that cap
+# is "enforced by the supervisor at dispatch" and is the supervisor's job.
+# The build-time bound is the stricter structural check — no single node may
+# have more than this many children.
 MAX_DEPTH = 3
 MAX_WIDTH = 8
 
-# Upward result envelope: the I2.7 field set and nothing else.
-_ENVELOPE_KEYS = ("parent_task_id", "unified_diff", "summary", "metrics")
+# Upward result envelope: the current arch §3.4/§3.7 I2.7 field set, exactly.
+_ENVELOPE_KEYS = (
+    "parent_task_id",
+    "unified_diff",
+    "diff_truncated",
+    "summary",
+    "metric_score",
+    "metric_breakdown",
+    "commits",
+    "files_changed",
+    "status",
+)
 
 
 class TaskKind(Enum):
@@ -100,7 +120,13 @@ class DepthBoundError(TaskTreeError):
 
 
 class WidthBoundError(TaskTreeError):
-    """A node's fan-out exceeds ``max_width`` (I2.3)."""
+    """A node's fan-out exceeds the build-time ``max_width`` bound.
+
+    This is the stricter per-parent structural check at build time. The
+    session-wide parallel-worker cap — also called ``max_width`` in the
+    architecture (I2.3) — is a dispatch-time config enforced by the
+    supervisor and is not implemented here.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +248,12 @@ def build_tree(
     3. exactly one root (I2.1),
     4. no multi-parent (I2.2),
     5. no cycles (I2.2) — raises :class:`CycleError` naming the cycle,
-    6. ``depth <= max_depth`` and per-parent fan-out ``<= max_width`` (I2.3).
+    6. ``depth <= max_depth`` and per-parent fan-out ``<= max_width``.
+
+    Both bounds in (6) are build-time structural checks. The session-wide
+    ``max_width`` parallel-worker cap named in architecture §3.7 I2.3
+    ("``max_width`` (per-session parallel worker cap, config) are enforced by
+    the supervisor at dispatch") is the supervisor's job, not this module's.
 
     Raises :class:`TaskTreeError` (a subclass) on any violation.
     """
@@ -319,8 +350,8 @@ def build_tree(
 def topological_order(tree: TaskTree) -> list[str]:
     """Return the task ids in a deterministic topological order (Kahn).
 
-    Raises :class:`TaskTreeError` naming the cycle if ``tree`` is cyclic
-    (I2.2) — this is the dispatch-time cycle check (architecture §18.1 DS-M6).
+    Raises :class:`CycleError` naming the cycle if ``tree`` is cyclic (I2.2)
+    — this is the dispatch-time cycle check (architecture §18.1 DS-M6).
     """
     in_degree: dict[str, int] = {node.task_id: 0 for node in tree.nodes}
     children: dict[str, list[str]] = {node.task_id: [] for node in tree.nodes}
@@ -342,7 +373,7 @@ def topological_order(tree: TaskTree) -> list[str]:
     if len(order) != len(in_degree):
         cycle = _find_cycle(list(in_degree), list(tree.edges))
         path = " -> ".join(cycle) if cycle else "(unknown)"
-        raise TaskTreeError(f"cycle in task DAG: {path}")
+        raise CycleError(f"cycle in task DAG: {path}")
     return order
 
 
@@ -420,20 +451,31 @@ def subtree_of(tree: TaskTree, task_id: str) -> TaskTree:
 
 
 def upward_result(node: TaskNode) -> dict[str, Any]:
-    """The I2.7 upward result envelope for a finished node.
+    """The upward result envelope for a finished node (arch §3.4, §3.7 I2.7).
 
-    Returns **exactly** the keys ``parent_task_id``, ``unified_diff``,
-    ``summary``, ``metrics`` (feedback-2 D8b). The child's diff/summary/metrics
-    are read from ``node.spec``; there is no scratchpad/reasoning field, so a
-    parent can never receive one.
+    Returns **exactly** the current normative envelope key set:
+    ``parent_task_id``, ``unified_diff``, ``diff_truncated``, ``summary``,
+    ``metric_score``, ``metric_breakdown``, ``commits``, ``files_changed``,
+    ``status``. The child's result fields are read from ``node.spec`` (empty
+    containers, ``""``, ``False``, or ``None`` when the node has no data);
+    ``status`` comes from the node's :class:`NodeStatus`. There is no
+    scratchpad/reasoning/trajectory field to send, so a parent can never
+    receive one — structural info hiding, enforced by the key set itself
+    (:data:`_ENVELOPE_KEYS` drives the returned dict).
     """
     spec = node.spec
-    return {
+    values = {
         "parent_task_id": node.parent_task_id,
         "unified_diff": spec.get("unified_diff", ""),
+        "diff_truncated": spec.get("diff_truncated", False),
         "summary": spec.get("summary", ""),
-        "metrics": spec.get("metrics", {}),
+        "metric_score": spec.get("metric_score", None),
+        "metric_breakdown": spec.get("metric_breakdown", {}),
+        "commits": spec.get("commits", []),
+        "files_changed": spec.get("files_changed", []),
+        "status": node.status,
     }
+    return {key: values[key] for key in _ENVELOPE_KEYS}
 
 
 def main() -> int:
