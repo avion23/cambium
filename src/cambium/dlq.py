@@ -193,12 +193,17 @@ class DeadLetterQueue:
         self._fsync_directory()
 
     def _ordered_paths_locked(self) -> list[Path]:
-        paths = [
-            path
-            for path in self._directory.iterdir()
-            if path.is_file() and path.suffix == _JSON_SUFFIX
-        ]
-        return sorted(paths, key=lambda path: (path.stat().st_mtime_ns, path.name))
+        ordered: list[tuple[int, str, Path]] = []
+        for path in self._directory.iterdir():
+            if not path.is_file() or path.suffix != _JSON_SUFFIX:
+                continue
+            try:
+                modified_at = path.stat().st_mtime_ns
+            except FileNotFoundError:
+                continue
+            ordered.append((modified_at, path.name, path))
+        ordered.sort(key=lambda entry: (entry[0], entry[1]))
+        return [entry[2] for entry in ordered]
 
     def _path_for_name(self, name: str | Path) -> Path:
         filename = Path(name).name

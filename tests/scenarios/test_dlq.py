@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -57,6 +58,35 @@ def test_bounded_queue_keeps_three_newest_records(tmp_path) -> None:
     paths = [queue.put(_record(f"task-{index}")) for index in range(5)]
 
     assert [entry["file"] for entry in queue.entries()] == [path.name for path in paths[-3:]]
+
+
+def test_prune_skips_file_removed_before_stat(tmp_path, monkeypatch) -> None:
+    queue = DeadLetterQueue(tmp_path, max_entries=1)
+    first = queue.put(_record("task-first"))
+    original_is_file = Path.is_file
+    original_stat = Path.stat
+    removed = False
+
+    def is_file_without_race(path: Path) -> bool:
+        if path == first:
+            return True
+        return original_is_file(path)
+
+    def stat_with_race(path: Path, *args, **kwargs):
+        nonlocal removed
+        if path == first and not removed:
+            first.unlink()
+            removed = True
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", is_file_without_race)
+    monkeypatch.setattr(Path, "stat", stat_with_race)
+
+    second = queue.put(_record("task-second"))
+
+    assert removed
+    assert second.exists()
+    assert [entry["file"] for entry in queue.entries()] == [second.name]
 
 
 def test_summarize_counts_status_and_reason(tmp_path) -> None:
