@@ -130,6 +130,56 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **Engine swap is a strategy pattern.** The rule engine is the primary `decide` implementation today; a DSPy program implementing the same interface can replace it behind the seam without touching callers (v2.1 — `docs/research/dspy-python-314.md`; see `docs/module-template/architecture.md` §5.1/§5.3).
 - **Durable state layout.** Event log and conversation store live in SQLite (WAL mode); low-level IPC is JSON-Lines. All session state sits under the dotted `.cambium/` dir — `docs/architecture.md` §16.2 is canonical on that naming.
 
+### Coding principles (translated constitution)
+
+> The Rust/HFT coding-preference constitution, translated for Cambium's Python 3.14 stack.
+> Detail and citations per principle: `docs/research/coding-constitution.md` (a)–(l).
+> Bullets marked **new** become normative on merge; the rest restate or sharpen existing
+> §7 / `docs/architecture.md` §19 norms.
+> Overlaps with existing §7 bullets are merged — ONE bullet each, the fuller existing bullet
+> wins: "Module shape" absorbs the patch's "Small, JSON-schema-shaped interfaces"; "Engine
+> swap is a strategy pattern" (with the "Flat over nested" tail) absorbs the patch's
+> "Business logic = pure functions on flat structs" — those two patch bullets are one-line
+> pointers below. The "Prefer Protocols" bullet shares the Protocols point with "Module shape"
+> but keeps its new no-deep-hierarchy/no-dynamic-machinery norm.
+
+- **Measure before optimizing.** *New.* Time goes where measurement says it goes: worker cold
+  start is dominated by interpreter startup + `import dspy` (~1–3 s, `docs/reviews/
+  review-implementation.md` §M2), so allocation micro-opts are noise until that floor is
+  addressed. Profile first; do not churn hot paths on speculation. See (a).
+- **Flat records over deep object graphs.** Data lives in frozen `slots=True` dataclasses and
+  lists — `events.py`, `base.py.Example`, `decide.py.TaskInput` are the precedent. Events are
+  flat payloads, not pointer graphs. See (b).
+- **No shared mutable state across threads.** Cambium's architecture is the enforcement:
+  single-writer event-log thread with a bounded queue (`docs/architecture.md` §6.2;
+  `docs/research/custos-asyncio-design.md` §2.4), bounded drop-on-full logging queues
+  (`docs/research/logging-design.md` §2.9), workers as separate processes over stdio pipes
+  (§5.1). Add nothing that shares mutable state across threads. See (c).
+- **asyncio loop-affine state.** Mutable handles are mutated by exactly one loop task per
+  transition, with no `await` between check and set (`docs/research/custos-asyncio-design.md`
+  §3.1). Anything crossing into a thread is an immutable, already-redacted value. See (e).
+- **Business logic = pure functions on flat structs; state and I/O at the edges.** Covered by the existing §7 "Engine swap is a strategy pattern" bullet (`Module.decide()` is the seam) and the "Flat over nested" tail; see `docs/research/coding-constitution.md` (d).
+- **Enums over booleans/ints for domain alternatives.** `WorkerState`, `ResultStatus`,
+  `EventKind`, `SandboxKind` are enums, not strings; booleans are predicates and API
+  compatibility only (existing §7 bullets). New domain alternatives are enum members — the
+  v2.1 `Decision` migration for `should_decompose` is documented in `docs/research/
+  coding-constitution.md` (i); do not change the reviewed v2 contract now.
+- **Prefer Protocols and plain functions over deep class hierarchies.** `base.py`
+  `Output`/`Metric` are the precedent. No dynamic machinery where a plain function suffices.
+  Composition over inheritance; a module is a small interface + a pure core. See (f), (g).
+- **Small, JSON-schema-shaped interfaces; modules deletable without breaking siblings.** Interface shape = the existing §7 "Module shape" bullet; new here: pinned siblings (`docs/architecture.md` §17.2) keep a module removable without breaking siblings — §10 "done" is the deletion checklist; see `docs/research/coding-constitution.md` (g).
+- **Flat control flow.** Early returns, guard clauses, exhaustive `match` over enums (existing
+  §7 "Flat over nested"). See (h).
+- **No globals, no hidden state, no singletons.** Existing §7 "No hidden global state";
+  `docs/architecture.md` §19 item 6, §16.2 invariant 5. New nuance: `functools.cache` and
+  class-level mutable defaults are static state — use them only at explicitly-owned boundaries
+  (the `Diffundo` cache is owned). See (k).
+- **Battle-tested libraries over custom infra.** Stdlib + git + uv + pytest; dspy is an
+  optional extra. No hand-rolled logging, IPC framing, or persistence (`pyproject.toml`;
+  `docs/architecture.md` §1 non-goal 5). See (j).
+- **Delete over add.** *New.* Prefer deleting, composing, or using an existing library over
+  adding new code. A smaller interface is easier to reason about and delete later. See (l).
+
 ---
 
 ## 8. Design norms
