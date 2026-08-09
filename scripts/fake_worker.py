@@ -13,7 +13,10 @@ land) the worker reports ``status="failed"`` in the result_envelope.
 The supervisor's gate command is the authoritative check.
 
 Behavior variants for scenario tests, selected by env ``FAKE_MODE``:
-healthy (default), exit5, noexit, noresult, badrid, noready.
+healthy (default), exit5, noexit, noresult, badrid, noready,
+garbage (garbage lines interleaved with a healthy protocol run),
+garbage_only (pure garbage; never ready), overwrite (replace the first
+'// replace-me' line instead of appending the marker).
 """
 
 from __future__ import annotations
@@ -80,7 +83,17 @@ def do_work(run: dict) -> tuple[str, str | None, list[str], list[str], str]:
         return ("failed", "marker not written (write_marker=false)", [], [], "")
     if not target.exists():
         return ("failed", f"target file missing: {target_file}", [], [], "")
-    target.write_text(target.read_text().rstrip("\n") + "\n" + marker + "\n")
+    if MODE == "overwrite":
+        # Replace the first '// replace-me' line so two concurrent workers
+        # editing the same file are guaranteed a rebase conflict.
+        text = target.read_text()
+        if "// replace-me" in text:
+            text = text.replace("// replace-me", marker, 1)
+        else:
+            text = text.rstrip("\n") + "\n" + marker + "\n"
+        target.write_text(text)
+    else:
+        target.write_text(target.read_text().rstrip("\n") + "\n" + marker + "\n")
     if marker not in target.read_text():
         return ("failed", "edit missing: marker not present after write", [], [], "")
     git("add", target_file, cwd=worktree)
@@ -101,6 +114,17 @@ def main() -> int:
 
     if MODE == "noready":
         time.sleep(1e9)  # never send ready — the supervisor's ready_timeout kills us
+
+    if MODE == "garbage":
+        for _ in range(3):
+            sys.stdout.write("not-json-" + ("x" * 60) + "\n")
+        sys.stdout.flush()
+
+    if MODE == "garbage_only":
+        while True:
+            sys.stdout.write("garbage line\n")
+            sys.stdout.flush()
+            time.sleep(0.01)
 
     send({"type": "ready", "request_id": init_rid, "task_id": task_id,
           "pid": os.getpid(), "generation": init.get("generation", 1), "proto": 1})
