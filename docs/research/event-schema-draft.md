@@ -44,7 +44,7 @@ Field mapping to the seed scaffold (`src/cambium/events.py`), which is **normati
 
 | events.py symbol | draft field | notes |
 |---|---|---|
-| `Event.type` | `kind` | The seed's three `type` strings (`"worker_started"`, `"worker_finished"`, `"log"`) are preserved as `kind` values in this catalog. |
+| `Event.type` | `kind` | The seed's `worker_started`/`worker_finished` `type` strings are preserved as `kind` values; the seed's `log` type is **renamed** `log` → `worker_stdout_line` (the catalog has no `log` kind — see D6 and the `worker_stdout_line` row). |
 | `Event.timestamp` | `ts` | Same source: `time.time()`. |
 | `WorkerStarted.task_id`, `.pid` | `task_id`, `payload.pid` | Draft's `worker_started` (`phase="spawned"`) carries `pid` in payload; `worker_id` is the derived `task_id#generation` (the seed's `pid` is kept as an ephemeral observation, not an identity). |
 | `WorkerFinished.task_id`, `.status`, `.exit_code` | `task_id`, `payload.status`, `payload.exit_code` | Seed default `status="finished"` ↔ draft `worker_finished`; non-default statuses ↔ `worker_failed` / `worker_killed`. |
@@ -90,7 +90,7 @@ Envelope JSON (example — full record for a heartbeat, §3.3):
 | 13 | `merge_failed` | **C** | Unio | arch `merge_progress` failure + `NonFastForward` (§7.8); draft kind (D7) |
 | 14 | `supervisor_started` | **C** | Custos | boot marker; draft kind (D7) |
 | 15 | `supervisor_shutdown` | **C** | Custos | §7.7 shutdown; draft kind (D7) |
-| 16 | `worker_error` | NC | Opifex → Custos | arch `error` message (§5.2), `recoverable` flag (§7.4) |
+| 16 | `worker_error` | NC | Opifex → Custos | arch `error` message (§5.2), `recoverable` flag (§7.4); wire `fatal_error` (IPC draft §2.4) — seam 2 |
 | 17 | `parse_error` | NC | Custos (reader) | arch §5.1 inv. 4 / §5.4c parse-error tagging |
 | 18 | `supervisor_stall` | NC | Custos | arch §5.3 drain-deadline watchdog |
 | 19 | `drop` | NC | Custos (writer) | arch §6.2 overflow drop marker |
@@ -119,9 +119,9 @@ Emitted **twice per generation**: `phase="spawned"` on `create_subprocess_exec` 
   "task_id": "wt-abc-002", "worker_id": "wt-abc-002#1", "request_id": "01H0001...", "generation": 1,
   "payload": { "phase": "ready", "pid": 20471, "worktree": "/abs/.cambium/worktrees/wt-abc-002",
                "base_commit": "a1b2c3d", "resume_from_checkpoint": "checkpoints/wt-abc-002/turn-003.json",
-               "ready_timeout_s": 60 },
-  "liveness": { "process_alive": true, "ipc_ready": true, "checkpoint_seen": "checkpoints/wt-abc-002/turn-003.json",
-                "exit_message": null, "eof_seen": false, "watchdog_armed": { "interval_s": 15, "timeout_s": 90 } } }
+               "ready_timeout_s": 60,
+               "liveness": { "process_alive": true, "ipc_ready": true, "checkpoint_seen": "checkpoints/wt-abc-002/turn-003.json",
+                             "exit_message": null, "eof_seen": false, "watchdog_armed": { "interval_s": 15, "timeout_s": 90 } } } }
 ```
 
 ### 3.3 `worker_heartbeat` — progress, not just liveness
@@ -138,13 +138,15 @@ Emitted by the worker at `interval_s` (default 15) and **from inside long-runnin
 ### 3.4 `worker_stdout_line` — advisory output, bounded
 
 Fields: payload `{stream ("stdout"|"stderr"), level, line, line_no, truncated}`.
-Only **non-protocol** bytes go here: all stderr (arch §13 — forwarded as `log` events with `level`/`module` parsed from common prefixes; unparseable lines stored verbatim at `INFO`) and stdout lines that fail JSON parse (arch §5.1 inv. 4, §5.4c — logged with their line number and skipped). **Valid protocol lines are never echoed raw**; they become their own typed events (D6). `line` is capped (default 4 KiB) and full output spilled to a managed directory per `docs/research/opencode.md` §4.6; `truncated` records the cap so replay tools know the tail is missing.
+Only **non-protocol** bytes go here: all stderr (arch §13 — forwarded to the event log as this draft's `worker_stdout_line` kind, i.e. arch §13's `log` renamed per D6, with `level`/`module` parsed from common prefixes; unparseable lines stored verbatim at `INFO`) and stdout lines that fail JSON parse (arch §5.1 inv. 4, §5.4c — logged with their line number and skipped). **Valid protocol lines are never echoed raw**; they become their own typed events (D6). `line` is capped (default 4 KiB) and full output spilled to a managed directory per `docs/research/opencode.md` §4.6; `truncated` records the cap so replay tools know the tail is missing.
 
 ```json
 { "event_id": "01JX...", "kind": "worker_stdout_line", "seq": 43, "ts": 1754212800.140, "monotonic_ms": 481234567910,
   "task_id": "wt-abc-002", "worker_id": "wt-abc-002#1", "request_id": null, "generation": 1,
   "payload": { "stream": "stderr", "level": "WARNING", "line": "DeprecationWarning: x", "line_no": 12, "truncated": false } }
 ```
+
+**Seam 1 — `progress` ↔ `tool_event` (joint with the IPC draft).** The wire `progress(phase="tool")` message has no v1 event kind in this catalog: `tool_event` is omitted (D12) and valid protocol lines are never raw-echoed (D6). Shared resolution — both drafts state it verbatim: wire `progress(phase="tool")` is recorded as `worker_stdout_line` **only** when it is a non-protocol byte capture (stderr / unparseable stdout); the structured tool-event content is **deferred to a `tool_event` kind in v2.1**, with `progress(phase="tool")` as the v1 wire placeholder. Until v2.1, tool-event consumers reconstruct from `worker_heartbeat.payload.tool` + the checkpoint trail.
 
 ### 3.5 `worker_checkpoint` — durable resume point
 
@@ -174,7 +176,7 @@ Emitted when the worker sends `result` **and** the authoritative `exit` message 
 ### 3.7 `worker_failed` — permanent failure
 
 Fields: payload `{status: "failed", exit_code, error_type, message, partial_commits, recoverable, failure_reason, exit_message: {reason: "crash"|"fatal"}}`.
-Emitted on: non-recoverable worker error (`recoverable: false`, arch §7.4), restart budget exhausted (`burst_max` in `burst_window_s` or `absolute_max`), or wall-time budget exceeded. `failure_reason` is drawn from the `Result` vocabulary (`failed`/`timeout`/`rejected`/`cancelled`, arch §3.4). This is the critical event a caller waits on for "the task cannot complete."
+Emitted on: non-recoverable worker error (`recoverable: false`, arch §7.4), restart budget exhausted (`burst_max` in `burst_window_s` or `absolute_max`), or wall-time budget exceeded. `failure_reason` is drawn from the `Result` vocabulary (`failed`/`timeout`/`rejected`, arch §3.4 — `cancelled` encodes as `worker_killed`, §3.8). This is the critical event a caller waits on for "the task cannot complete."
 
 ```json
 { "event_id": "01JX0004...", "kind": "worker_failed", "seq": 120, "ts": 1754213000.900, "monotonic_ms": 481234590100,
@@ -196,6 +198,17 @@ Emitted whenever Custos terminates a worker: heartbeat watchdog trip (3 missed b
   "payload": { "exit_code": -9, "reason": "ping_no_pong", "elapsed_s": 15.2,
                "exit_message": null } }
 ```
+
+**Terminal status vocabulary (joint seam 2 — cross-referenced from the IPC draft's result-envelope section).** How a task's outcome is encoded across the event log, the Nuntius wire (`result_envelope.status`), and the public `Result` (arch §3.4):
+
+| Outcome | Event kind | Wire `result_envelope.status` | arch `Result.status` |
+|---|---|---|---|
+| clean completion | `worker_finished` (`payload.status="done"`) | `succeeded` | `done` |
+| permanent failure | `worker_failed` | `failed` | `failed` |
+| wall-clock / timeout | `worker_failed` (`failure_reason="timeout"`) or `worker_killed` (`reason="watchdog_timeout"`) | `timeout` | `timeout` |
+| cancellation | `worker_killed` (`reason="cancelled"`) | `cancelled` | `cancelled` |
+
+`rejected` is a `Result`-only status (reviewer verdict after merge, arch §7.1); it has no wire form and encodes as `worker_failed` with `failure_reason="rejected"` (§6.4).
 
 ### 3.9 `restart_scheduled` — policy decision, not a state change
 
@@ -287,7 +300,7 @@ Emitted at the end of the arch §7.7 shutdown sequence, after the writer queue i
 
 All six carry the envelope unchanged; `payload` is listed per kind. `worker_error` and `parse_error` are worker-stream-derived; `supervisor_stall`, `drop`, `recovery_gap`, `eof_seen` are supervisor-generated.
 
-**`worker_error`** (NC) — raw error report from the worker (`recoverable` flag, arch §5.2/§7.4). Never terminal by itself; the terminal decision is the critical `worker_failed`. payload `{error_type, message, partial_commits, recoverable, turn}`.
+**`worker_error`** (NC) — raw error report from the worker (`recoverable` flag, arch §5.2/§7.4). Never terminal by itself; the terminal decision is the critical `worker_failed`. payload `{error_type, message, partial_commits, recoverable, turn}`. It is the event-log encoding of the wire `fatal_error` message (IPC draft §2.4) — the same arch `error` message, with `recoverable` mapping 1:1 (seam 2).
 
 ```json
 { "event_id": "01JX0006...", "kind": "worker_error", "seq": 88, "ts": 1754212870.000, "monotonic_ms": 481234578000,
@@ -367,7 +380,7 @@ All six carry the envelope unchanged; `payload` is listed per kind. `worker_erro
 2. Bootstrap from the last `snapshots` row, then read `events` where `seq > snapshot.seq` (arch §6.1).
 3. Detect `seq` gaps → emit `recovery_gap`; treat the range as absent.
 4. Apply events in `seq` order, maintaining per-`worker_id` chains and per-task terminal state (`worker_finished`/`worker_failed`/`worker_killed`).
-5. Cross-check `refs/heads/main` against the latest `merge_succeeded`; on mismatch, emit `merge_reconciled` (arch §7.8) and record it.
+5. Cross-check `refs/heads/main` against the latest `merge_succeeded`; on mismatch, emit a second `merge_succeeded` with `payload.reconciled=true` (the draft encoding of arch §7.8's `merge_reconciled`, D9/D13) and record it.
 6. Re-publish to fresh `Session.events()` subscribers in `seq` order (arch §6.2 inv. 5, §6.5).
 
 ---
@@ -466,6 +479,7 @@ Heartbeats (layer 3) never fire during normal tool execution because tools emit 
 | CRASHED → SPAWNING | `restart_scheduled` → `worker_started` (generation+1) |
 | CRASHED → FAILED | `worker_failed` (budget exhausted, arch §7.4) |
 | RUNNING → FAILED | `worker_failed` (non-recoverable error / timeout) |
+| RUNNING → CANCELLED | `worker_killed` (`reason="cancelled"`) — cancel/shutdown path (arch §7.7) |
 | any → REJECTED | `worker_failed` with `failure_reason="rejected"` (reviewer verdict, arch §7.1) |
 
 ---
@@ -548,7 +562,7 @@ Everything in this draft is consistent with the architecture's *behavioral* cont
 | D9 | **Merge event naming.** | Draft `merge_started`/`merge_failed` are `merge_progress` phases; `merge_succeeded` = `merge_committed` (+ `merge_reconciled` as `payload.reconciled=true`). | §7.8 defines the behaviors; naming is draft-proposed. |
 | D10 | **`liveness` payload object is a draft encoding.** | Arch §5.3 defines the four-layer model but no event-level encoding. The draft's `liveness` sub-object (`process_alive`, `ipc_ready`, `checkpoint_seen`, `exit_message`, `eof_seen`, `watchdog_armed`) is a proposal for how to expose it; it does not alter any arch behavior. | Encoding-only. |
 | D11 | **DDL additions:** `event_id`, `worker_id`, `events_worker_idx`, `meta` table, `snapshots.schema_version`. | Supersets of arch §6.3. The `meta` table holds `event_schema_version` (§7). | Additive. |
-| D12 | **`tool_event` is not a catalog member.** | The arch lists `tool_event` as a non-critical kind. This draft omits it from the 21-kind catalog because the task's requested catalog did not include it and the behavioral content (`tool`, `cmd`, `exit_code`, `duration_ms`) is already carried by `worker_stdout_line`/heartbeat `tool` and the checkpoint trail. **Reconciliation should decide whether to restore `tool_event` as a first-class kind** — the architecture's tier table explicitly lists it, so the default position is to keep it. | Flag for explicit reconciliation, not silently dropped. |
+| D12 | **`tool_event` is not a catalog member.** | The arch lists `tool_event` as a non-critical kind. This draft omits it from the 21-kind catalog because the task's requested catalog did not include it. **Tool-event content is NOT carried by `worker_stdout_line`** — D6 reserves that kind for non-protocol bytes, and valid protocol lines (the wire `progress(phase="tool")` included) are never raw-echoed. In v1 the content is reconstructible from `worker_heartbeat.payload.tool` + the checkpoint trail; the wire `progress(phase="tool")` message is the placeholder (seam 1). **Deferred to v2.1:** restore `tool_event` as a first-class kind recording the wire `progress(phase="tool")` content — the architecture's tier table explicitly lists it, so the default position is to keep it. | Flag for explicit reconciliation, not silently dropped. |
 | D13 | **`merge_reconciled` naming.** | Arch §7.8 names a `merge_reconciled` event; the draft emits it as `merge_succeeded` with `payload.reconciled=true` (D9). Restore the arch kind string if the final architecture insists. | Naming only. |
 
 ---
@@ -569,7 +583,7 @@ Every field in `src/cambium/events.py` has an exact draft home:
 
 | events.py | draft |
 |---|---|
-| `Event.type` | `kind` (values preserved for the three seed types) |
+| `Event.type` | `kind` (`worker_started`/`worker_finished` preserved; seed `log` renamed `log` → `worker_stdout_line`) |
 | `Event.timestamp` | `ts` |
 | `WorkerStarted.task_id` | `task_id` |
 | `WorkerStarted.pid` | `worker_started` `phase="spawned"` `payload.pid` |
