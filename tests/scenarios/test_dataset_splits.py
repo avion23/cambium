@@ -13,13 +13,14 @@ import json
 import shutil
 from pathlib import Path
 
+from cambium.modules.base import DatasetError
 from cambium.modules.example import (
     DatasetBundle,
     ExampleDatasetLoader,
     ShouldDecomposeModule,
     Split,
 )
-from cambium.modules.example.metric import evaluate_split
+from cambium.modules.example.metric import evaluate_split, evaluate_split_async
 
 DATASETS_DIR = (
     Path(__file__).resolve().parents[2]
@@ -79,10 +80,12 @@ def test_canary_flag_filtered_from_train_file(tmp_path) -> None:
     src = tmp_path / "datasets"
     src.mkdir()
     normal = {
+        "id": "n-1",
         "input": {"task": "Fix the typo.", "context": ""},
         "expected": {"decompose": False, "reason": "atomic"},
     }
     trap = {
+        "id": "t-1",
         "input": {"task": "Trap record.", "context": ""},
         "expected": {"decompose": False, "reason": "trap"},
         "canary": True,
@@ -158,3 +161,140 @@ def test_evaluate_split_reports_mean_std_count() -> None:
     assert result["count"] == EXPECTED_COUNTS[Split.TRAIN]
     assert result["mean"] == 1.0
     assert result["std"] == 0.0
+
+
+def test_evaluate_split_async_inside_event_loop() -> None:
+    module = ShouldDecomposeModule()
+    loader = ExampleDatasetLoader(DATASETS_DIR)
+
+    async def run() -> dict:
+        return await evaluate_split_async(module, loader, Split.EVAL)
+
+    result = asyncio.run(run())
+    assert result["count"] == EXPECTED_COUNTS[Split.EVAL]
+    assert result["mean"] == 1.0
+    assert result["std"] == 0.0
+
+
+def test_evaluate_split_rejects_running_event_loop() -> None:
+    module = ShouldDecomposeModule()
+    loader = ExampleDatasetLoader(DATASETS_DIR)
+
+    async def run() -> None:
+        try:
+            evaluate_split(module, loader, Split.TRAIN)
+        except RuntimeError:
+            return
+        raise AssertionError("expected RuntimeError from a running event loop")
+
+    asyncio.run(run())
+
+
+def test_duplicate_ids_rejected(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    record = {
+        "id": "dup-1",
+        "input": {"task": "Do a thing.", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    (src / "train.jsonl").write_text(
+        json.dumps(record) + "\n" + json.dumps(record) + "\n", encoding="utf-8"
+    )
+    loader = ExampleDatasetLoader(src)
+    try:
+        loader.load_split(Split.TRAIN)
+    except DatasetError as exc:
+        assert "duplicate id" in str(exc)
+    else:
+        raise AssertionError("expected DatasetError for duplicate ids")
+
+
+def test_missing_id_rejected_in_split_file(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    record = {
+        "input": {"task": "Do a thing.", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    (src / "eval.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    loader = ExampleDatasetLoader(src)
+    try:
+        loader.load_split(Split.EVAL)
+    except DatasetError as exc:
+        assert "non-empty string 'id'" in str(exc)
+    else:
+        raise AssertionError("expected DatasetError for a record without an id")
+
+
+def test_cross_split_collision_rejected(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+
+    def rec(record_id: str) -> dict:
+        return {
+            "id": record_id,
+            "input": {"task": "Fix the typo in the README title.", "context": ""},
+            "expected": {"decompose": False, "reason": "atomic"},
+        }
+
+    (src / "train.jsonl").write_text(json.dumps(rec("train-1")) + "\n", encoding="utf-8")
+    (src / "eval.jsonl").write_text(json.dumps(rec("eval-1")) + "\n", encoding="utf-8")
+    canary = {
+        "id": "canary-1",
+        "input": {"task": "Trap record task.", "context": ""},
+        "expected": {"decompose": True, "reason": "trap"},
+        "canary": True,
+    }
+    (src / "canaries.jsonl").write_text(json.dumps(canary) + "\n", encoding="utf-8")
+    loader = ExampleDatasetLoader(src)
+    try:
+        loader.load_all()
+    except DatasetError as exc:
+        assert "cross-split collision" in str(exc)
+    else:
+        raise AssertionError("expected DatasetError for a cross-split collision")
+
+
+def test_schema_version_mismatch_rejected(tmp_path) -> None:
+    src = _fresh_copy(tmp_path)
+    meta_path = src / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["schema_version"] = 2
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    loader = ExampleDatasetLoader(src)
+    try:
+        loader.load_all()
+    except DatasetError as exc:
+        assert "schema_version" in str(exc)
+    else:
+        raise AssertionError("expected DatasetError for a schema_version mismatch")
+
+
+def test_meta_json_non_object_rejected(tmp_path) -> None:
+    src = _fresh_copy(tmp_path)
+    (src / "meta.json").write_text("[]\n", encoding="utf-8")
+    loader = ExampleDatasetLoader(src)
+    try:
+        loader.load_all()
+    except DatasetError as exc:
+        assert "JSON object" in str(exc)
+    else:
+        raise AssertionError("expected DatasetError for a non-object meta.json")
+
+
+def test_validation_errors_report_actual_file(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    (src / "eval.jsonl").write_text(
+        '{"id": "e-1", "input": {"task": 42, "context": ""}, '
+        '"expected": {"decompose": false, "reason": "atomic"}}\n'
+    )
+    loader = ExampleDatasetLoader(src)
+    try:
+        loader.load_split(Split.EVAL)
+    except DatasetError as exc:
+        assert "eval.jsonl" in str(exc)
+        assert "input.task must be a string" in str(exc)
+    else:
+        raise AssertionError("expected DatasetError for a schema-invalid eval record")

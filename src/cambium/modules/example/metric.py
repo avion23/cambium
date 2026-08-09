@@ -24,21 +24,19 @@ def should_decompose_metric(example: Example) -> float:
     return 1.0 if prediction.decompose == expected else 0.0
 
 
-def evaluate_split(module: Module, loader, split) -> dict:
-    """Score one dataset split with the module metric.
+async def evaluate_split_async(module: Module, loader, split) -> dict:
+    """Score one dataset split with the module metric (async form).
 
     Runs the module over every example in the split and returns a
     ``{"mean", "std", "count"}`` summary for the bench harness baseline
-    (docs/research/bench-harness-design.md §3).
+    (docs/research/bench-harness-design.md §3). Call from async code;
+    the sync :func:`evaluate_split` wrapper must not be used from a
+    running event loop.
     """
     scores: list[float] = []
-
-    async def score() -> None:
-        for example in loader.load_split(split):
-            prediction = await module.decide(example.input)
-            scores.append(module.metric(example.with_prediction(prediction)))
-
-    asyncio.run(score())
+    for example in loader.load_split(split):
+        prediction = await module.decide(example.input)
+        scores.append(module.metric(example.with_prediction(prediction)))
     if not scores:
         return {"mean": float("nan"), "std": float("nan"), "count": 0}
     return {
@@ -46,3 +44,19 @@ def evaluate_split(module: Module, loader, split) -> dict:
         "std": statistics.pstdev(scores),
         "count": len(scores),
     }
+
+
+def evaluate_split(module: Module, loader, split) -> dict:
+    """Score one dataset split with the module metric.
+
+    Must not be called from a running event loop; use
+    :func:`evaluate_split_async` in async contexts.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(evaluate_split_async(module, loader, split))
+    raise RuntimeError(
+        "evaluate_split must not be called from a running event loop; "
+        "use evaluate_split_async in async contexts"
+    )

@@ -23,7 +23,7 @@ canaries included — they are scored like any other entry.
 
 from .dataset import DatasetBundle, ExampleDatasetLoader, Split
 from .decide import DecomposeOutput, ShouldDecomposeModule, TaskInput, should_decompose
-from .metric import evaluate_split, should_decompose_metric
+from .metric import evaluate_split, evaluate_split_async, should_decompose_metric
 
 __all__ = [
     "DatasetBundle",
@@ -33,6 +33,7 @@ __all__ = [
     "Split",
     "TaskInput",
     "evaluate_split",
+    "evaluate_split_async",
     "should_decompose",
     "should_decompose_metric",
 ]
