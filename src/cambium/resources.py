@@ -43,6 +43,12 @@ HEAVY_PATTERNS: Final[tuple[str, ...]] = (
 DEFAULT_ACQUIRE_TIMEOUT_S: Final[float] = 60.0
 
 
+class _AcquisitionToken:
+    """Opaque marker for one successful heavy-command acquisition."""
+
+    __slots__ = ()
+
+
 def _matches_prefix(command: list[str], pattern: str) -> bool:
     """Return whether ``command`` starts with the exact tokens in ``pattern``."""
     pattern_tokens = pattern.split()
@@ -96,20 +102,21 @@ class CompileGate:
         self._heavy = 0
         self._waits = 0
         self._timeouts = 0
-        self._held: dict[tuple[str, ...], int] = {}
+        self._held: set[_AcquisitionToken] = set()
 
     def is_heavy(self, command: list[str]) -> bool:
         """Return whether ``command`` has a configured heavy token prefix."""
         return any(_matches_prefix(command, pattern) for pattern in HEAVY_PATTERNS)
 
-    async def acquire(self, command: list[str]) -> bool:
+    async def acquire(self, command: list[str]) -> _AcquisitionToken | None | bool:
         """Acquire a heavy-command permit, or return ``False`` on timeout.
 
-        Non-heavy commands return immediately and do not affect semaphore
-        state or statistics.
+        A successful heavy acquisition returns an opaque token.  Non-heavy
+        commands return ``None`` immediately and do not affect semaphore state
+        or statistics.
         """
         if not self.is_heavy(command):
-            return True
+            return None
 
         if self._semaphore.locked():
             self._waits += 1
@@ -122,22 +129,21 @@ class CompileGate:
             return False
         self._current += 1
         self._heavy += 1
-        key = tuple(command)
-        self._held[key] = self._held.get(key, 0) + 1
-        return True
+        token = _AcquisitionToken()
+        self._held.add(token)
+        return token
 
-    def release(self, command: list[str]) -> None:
-        """Release a permit previously acquired for a heavy command."""
-        if not self.is_heavy(command):
+    def release(self, token: _AcquisitionToken | None) -> None:
+        """Release a permit by its acquisition token.
+
+        ``None`` is the no-op token for non-heavy commands.  Unknown and
+        duplicate tokens are rejected so a permit cannot be leaked silently.
+        """
+        if token is None:
             return
-        key = tuple(command)
-        held = self._held.get(key, 0)
-        if held == 0:
-            return
-        if held == 1:
-            del self._held[key]
-        else:
-            self._held[key] = held - 1
+        if not isinstance(token, _AcquisitionToken) or token not in self._held:
+            raise ValueError("unknown or duplicate acquisition token")
+        self._held.remove(token)
         self._current -= 1
         self._semaphore.release()
 
