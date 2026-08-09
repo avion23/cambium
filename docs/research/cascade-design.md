@@ -59,28 +59,33 @@ Race is **not** the default: architecture removes race mode from the default con
 
 ```
 race(prompt, tier, n):                                   # n = race_redundancy (§6)
-  deadline = min(now + call_budget_s, now + race_timeout_s)
+  start = time.monotonic()
+  deadline = min(start + call_budget_s, start + race_timeout_s)   # fixed at entry
   candidates = first n of tier_list(...)                  # §1.1 filters apply
-  tasks = {p: create_task(attempt(p, timeout=timeout_s[p])) for p in candidates}
+  tasks = {p: create_task(attempt(p, timeout=timeout_s[p]))
+           for p in candidates}                           # explicit provider -> task map
   results = {}; best = None; gated_winner = None
-  while tasks and now < deadline:
+  while tasks:
+      now = time.monotonic()               # refresh each iteration; deadline is fixed
+      if now >= deadline: break
       done, pending = await asyncio.wait(
-          tasks.values(), FIRST_COMPLETED, return_exceptions=True,
-          timeout=deadline - now)
-      for task in done:
-          p = provider_of[task]
-          r = task.result()                  # safe: exceptions returned as values
+          list(tasks.values()), FIRST_COMPLETED, return_exceptions=True,
+          timeout=deadline - now)          # remaining budget shrinks each pass
+      done_by_provider = {p: t for p, t in tasks.items() if t in done}
+      for p, task in done_by_provider.items():
+          r = task.result()                # safe: exceptions returned as values
           results[p] = r
-          if isinstance(r, Exception):       # ★ exception hygiene: a crashed provider
-              record_failure(p, r)           #   never becomes the winner; it is recorded
-              continue                       #   and the race keeps waiting (§1.4)
-          if quality_gate(r):                # ★ first-complete wins ONLY if gate passes
-              gated_winner = (p, r); break   #   else we keep waiting (§1.3.2)
+          if isinstance(r, Exception):     # ★ exception hygiene: a crashed provider
+              record_failure(p, r)         #   never becomes the winner; it is recorded
+              continue                     #   and the race keeps waiting (§1.4)
+          if quality_gate(r):              # ★ first-complete wins ONLY if gate passes
+              gated_winner = (p, r); break #   else we keep waiting (§1.3.2)
           if best is None or score(r) > score(best):
-              best = (p, r)                  # ★ superior result is never discarded (§1.3.3)
+              best = (p, r)                # ★ superior result is never discarded (§1.3.3)
       if gated_winner: break
-      tasks = pending
-  cancel_all(pending)                        # best-effort; may still be billed (§3.4)
+      tasks = {p: t for p, t in tasks.items() if t in pending}   # keep survivors
+  for t in tasks.values():
+      t.cancel()                           # best-effort; may still be billed (§3.4)
   if gated_winner:   return envelope(gated_winner)
   if best is not None: return envelope(best) # ★ no gated pass → best-by-score wins
   raise AllProvidersFailed(sorted(results.items()))   # every attempt ended in exception
@@ -163,27 +168,48 @@ Three rules in the loop are the LLM-M6 fixes:
 
 ### 2.4 Provider health state machine
 
-States and transitions (design, but built on the architecture's cooldown concept `[arch §9.1]` and the "not in cooldown" selection filter `[arch §9.2 step 2]`):
+States and transitions (design, but built on the architecture's cooldown concept `[arch §9.1]` and the "not in cooldown" selection filter `[arch §9.2 step 2]`). Triggers are the attempt-outcome classes of §1.2 (timeout, error, quota, refusal) plus the §2.3 circuit metrics. **Refusals do not drive health transitions** — they are request-level fall-throughs recorded separately (§1.2), so "model refused" never marks a provider down.
+
+**Circuit spine** (forward flow; the recovery loop — every label is a trigger):
 
 ```
-               first success                  retryable failure
-  UNKNOWN ────────────────► HEALTHY ────────────────────► COOLDOWN
-     │                                                   │   │
-     │ first failure                                     │   │ failure rate ≥ threshold
-     ▼                                                   │   ▼
-  COOLDOWN ◄─────────────────────────────────────────────┘   OPEN
-     │ cooldown_s elapsed (probe)                            │ open interval elapsed
-     │ success                                              ▼
-     ▼                                                    HALF_OPEN
-  HEALTHY ◄─────────────────── success ─────────────────────┤
-     │                                                     │ failure
-     │                                                     ▼
-     │                                               OPEN (re-open, longer cooldown)
-     │
-     └─ non-retryable error (auth/config) ───────────► DISABLED   (requires operator action)
+  UNKNOWN ──1st success──► HEALTHY ──retryable failure──► COOLDOWN ──probe fails──► OPEN ──open interval──► HALF_OPEN ──probe succeeds──► HEALTHY
+                                                                (retryable or         (cooldown_s ×
+                                                                 timeout_s)           backoff elapses)
 ```
 
-- `UNKNOWN` — never called. `HEALTHY` — recent success. `COOLDOWN` — a transient failure; the provider is skipped for `cooldown_s` `[arch §9.1]`. `OPEN` — circuit tripped (§2.3); skipped except as a `HALF_OPEN` probe. `DISABLED` — a non-retryable error (invalid auth, malformed config) removed the provider for the session.
+**Back edges and exits** (each also appears in the transition table below):
+
+```
+  COOLDOWN ──probe succeeds (cooldown_s elapsed)────────────────► HEALTHY
+  COOLDOWN ──sliding-window failure rate ≥ failure_threshold────► OPEN          (escalation, §2.3)
+  HALF_OPEN ──probe fails (retryable or timeout_s)──────────────► OPEN          (probe timeout explicit)
+  {UNKNOWN, HEALTHY, COOLDOWN, HALF_OPEN} ──non-retryable error
+      (auth/config)─────────────────────────────────────────────► DISABLED      (terminal; first call included)
+```
+
+**Exit to DISABLED:** every attempt state — `UNKNOWN`, `HEALTHY`, `COOLDOWN`, `HALF_OPEN` — exits to `DISABLED` on a non-retryable error (auth/config), **first call included**. `DISABLED` is terminal for the session (requires operator action) and has no outgoing transitions. `OPEN → DISABLED` is unreachable: while `OPEN` the provider is excluded from candidate selection (only the `HALF_OPEN` probe is admitted), so no non-retryable error can be observed in `OPEN`.
+
+**Transition table (authoritative — diagram, text, and triggers agree):**
+
+| From | To | Trigger | Notes |
+|---|---|---|---|
+| `UNKNOWN` | `HEALTHY` | first attempt succeeds | |
+| `UNKNOWN` | `COOLDOWN` | first attempt fails with a retryable error (timeout/error/quota) | |
+| `UNKNOWN` | `DISABLED` | first attempt hits a non-retryable error (auth/config) | first-call included |
+| `HEALTHY` | `COOLDOWN` | retryable failure (timeout/error/quota) | |
+| `HEALTHY` | `DISABLED` | non-retryable error (auth/config) | |
+| `COOLDOWN` | `HEALTHY` | `cooldown_s` elapsed → probe succeeds | provider re-admitted as one probe candidate |
+| `COOLDOWN` | `OPEN` | `cooldown_s` elapsed → probe fails (retryable or `timeout_s`) | probe-failure path explicit; a failure after a full cooldown window indicates persistence → escalate |
+| `COOLDOWN` | `OPEN` | sliding-window failure rate ≥ `failure_threshold` (§2.3) | escalation can fire before the probe |
+| `COOLDOWN` | `DISABLED` | probe hits a non-retryable error (auth/config) | |
+| `OPEN` | `HALF_OPEN` | open interval (`cooldown_s` × `open_backoff_base`) elapses | |
+| `HALF_OPEN` | `HEALTHY` | probe succeeds | |
+| `HALF_OPEN` | `OPEN` | probe fails — retryable error **or timeout under the per-attempt `timeout_s` (§1.2)** | probe timeout explicit |
+| `HALF_OPEN` | `DISABLED` | probe hits a non-retryable error (auth/config) | |
+| `DISABLED` | — | terminal | no outgoing transitions |
+
+- `UNKNOWN` — never called. `HEALTHY` — recent success. `COOLDOWN` — a transient failure; the provider is skipped for `cooldown_s` `[arch §9.1]`; on expiry it is re-admitted as one probe candidate. `OPEN` — circuit tripped (§2.3); excluded from candidate selection `[arch §9.2 step 2]` until the open interval elapses. `HALF_OPEN` — exactly one probe candidate is admitted; the probe runs under the per-attempt `timeout_s` (§1.2). `DISABLED` — a non-retryable error (invalid auth, malformed config) removed the provider for the session; reachable from any attempt state, **including the first call**; terminal.
 - **(design)** Every transition emits a `provider_health_change` event (§5.2). This is **design** — architecture defines no such event kind; event kinds are extensible `[arch §3.6]` (`kind` is a string with an explicit ellipsis) but the enumeration and event-tier classification are a schema change (§7).
 - Every state is per-`Diffundo`-instance (workers each construct their own client from `fanout_config` `[arch §9.3]`), so health is **not** shared across worker processes — consistent with the no-cross-worker cache rule `[arch §8.1]`; the durable, cross-process signal is the event log (§5.2).
 
