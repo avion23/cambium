@@ -70,11 +70,11 @@ def test_crash_durability_critical_events_survive(tmp_path) -> None:
         "import os, sys\n"
         "from cambium.store import EventStore\n"
         "store = EventStore(sys.argv[1])\n"
-        "for i in range(%d):\n"
-        "    kind = 'result' if i %% 2 == 0 else 'checkpoint'\n"
+        f"for i in range({n}):\n"
+        "    kind = 'result' if i % 2 == 0 else 'checkpoint'\n"
         "    store.append({'kind': kind, 'payload': {'i': i}, 'task_id': 't'})\n"
         "os._exit(9)\n"
-    ) % n
+    )
     proc = subprocess.run(
         [sys.executable, "-c", script, str(path)], capture_output=True, text=True, timeout=120
     )

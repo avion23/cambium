@@ -155,7 +155,7 @@ class WorkerSupervisor:
             if self._stderr_task is not None:
                 try:
                     await asyncio.wait_for(self._stderr_task, 5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except (TimeoutError, asyncio.CancelledError):
                     pass
 
 
