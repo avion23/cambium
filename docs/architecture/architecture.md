@@ -9,15 +9,15 @@
 
 ## 0. TL;DR
 
-Cambium is a **Python 3.14 multi-agent coding-agent harness**, shipped as an embeddable library (headless-first) with an optional TUI. A deterministic supervisor (`Custos`) manages N isolated worker processes (`Opifex`). Each worker runs a DSPy ReAct loop in a private git worktree under a sandbox. Workers communicate with the supervisor over **JSON-Lines on stdio with `request_id` RPC framing**. The orchestrating layer (`Architectus`) decomposes, routes, and evaluates via DSPy modules, each with its own dataset and metric. A serialized merge sequencer (`Unio`) fuses worker branches back onto `main`.
+Cambium is a **Python 3.14 multi-agent coding-agent harness**, shipped as an embeddable library (headless-first) with an optional TUI. A deterministic supervisor (`Custos`) manages N isolated worker processes (`Opifex`). Each worker runs a DSPy ReAct loop in a private git worktree, contained by **worktree isolation + permission allowlists + approval gates** (no sandboxing in the harness — see §4/§7.2 and decision 10). Workers communicate with the supervisor over **JSON-Lines on stdio with `request_id` RPC framing**. The orchestrating layer (`Architectus`) decomposes, routes, and evaluates via DSPy modules, each with its own dataset and metric. A serialized merge sequencer (`Unio`) fuses worker branches back onto `main`.
 
 Cambium is a **leaf module** of a larger system: a host process spawns instances, owns persistence, and reads structured `Result` records. Cambium itself is stateless across sessions.
 
-**What changed since v0.1.0.** Three adversarial reviews (`docs/architecture/reviews/`) catalogued ~25 CRITICAL flaws. v2 resolves every one. The headline fixes: (a) liveness is no longer "stdout EOF = dead" — there is an explicit four-layer liveness model with `request_id` framing, generation fencing tokens, and per-tool heartbeats; (b) all disk I/O is off the asyncio event loop on dedicated writer threads; (c) restart policy has full jitter plus an absolute ceiling; (d) worktrees are recovered (lock cleanup + hard reset) before every respawn and may be fenced by generation; (e) the FanOut cache is opt-in, keyed on task + context + model with a TTL, and lives upstream of workers; (f) the provider cascade actually cascades across models of a declared tier; (g) the merge sequencer holds an `asyncio.Lock` and operates in a throwaway worktree; (h) every DSPy module ships with its own frozen dataset, metric, and held-out eval — the "independently hill-climbable" claim is restated as a hypothesis validated under pinned siblings; (i) secrets are env-only and redacted; (j) logging is stdlib, structured, non-blocking, rotated.
+**What changed since v0.1.0.** Three adversarial reviews (`docs/architecture/reviews/`) catalogued ~25 CRITICAL flaws. v2 resolves every one. The headline fixes: (a) liveness is no longer "stdout EOF = dead" — there is an explicit four-layer liveness model with `request_id` framing, generation fencing tokens, and per-tool heartbeats; (b) all disk I/O is off the asyncio event loop on dedicated writer threads; (c) restart policy has full jitter plus an absolute ceiling; (d) worktrees are recovered (lock cleanup + hard reset) before every respawn and may be fenced by generation; (e) the local LLM response cache is **deleted entirely** (D1) — `Diffundo` is a stateless router and caching is provider-side only, content-addressed and never stale (resolves review LLM-C1 by deletion); (f) the provider cascade actually cascades across models of a declared tier; (g) the merge sequencer holds an `asyncio.Lock` and operates in a throwaway worktree; (h) every DSPy module ships with its own frozen dataset, metric, and held-out eval — the "independently hill-climbable" claim is restated as a hypothesis validated under pinned siblings; (i) secrets are env-only and redacted; (j) logging is stdlib, structured, non-blocking, rotated.
 
 **Primary patterns kept from v0.1:** Erlang/OTP one-for-one transient supervision; git worktree isolation; deterministic/LLM layer separation; DSPy optimization flywheel; subprocess-per-worker with stdio IPC.
 
-**Primary patterns dropped:** free-threaded Python (irrelevant for subprocess design); `.pid` files; Unix sockets; lock files; "stdout EOF is death"; prompt-only cache; the literal `cascade`/`race` implementation in v0.1 M2 (rewritten).
+**Primary patterns dropped:** free-threaded Python (irrelevant for subprocess design); `.pid` files; Unix sockets; lock files; "stdout EOF is death"; the v0.1 prompt-only cache and, per D1, **all local LLM response caching** (provider-side caching only); the literal `cascade`/`race` implementation in v0.1 M2 (rewritten); the in-harness sandbox module (Septum, M8 — removed from v2 scope per decision 10, D7).
 
 ---
 
@@ -28,7 +28,7 @@ Cambium is a **leaf module** of a larger system: a host process spawns instances
 2. **Headless-first.** The TUI is a view over the same JSON-Lines event stream the host reads. Nothing is TUI-only.
 3. **Sound under failure.** Liveness, restart, merge, and crash-recovery have explicit, tested semantics. No "works in demo, dies in production."
 4. **Per-module optimizable.** Each DSPy module has its own dataset, metric, and held-out evaluation. Sibling modules are pinned during optimization.
-5. **Bounded everything.** Restarts, wall time, memory, cache size, log size, and worker counts all have explicit ceilings.
+5. **Bounded everything.** Restarts, wall time, memory, log size, and worker counts all have explicit ceilings. (No cache size bound is needed: there is no local cache — D1.)
 6. **Proto-AGI-friendly.** A host system can spawn/stop/poll/query Cambium instances through a stable contract.
 
 ### Non-Goals
@@ -62,8 +62,9 @@ Cambium is a **leaf module** of a larger system: a host process spawns instances
 │  │  Architectus = ShouldDecompose → TaskDecomposer → TaskRouter    │  │
 │  │               → ResultEvaluator                                 │  │
 │  │  Each is a DSPy module with its OWN frozen dataset + metric.    │  │
-│  │  Diffundo (FanOut): upstream cache, tier-based provider         │  │
-│  │                      cascade, opt-in per-call caching.          │  │
+│  │  Diffundo (FanOut): stateless router, tier-based provider       │  │
+│  │                      cascade, per-provider cooldown + token     │  │
+│  │                      bucket, provider-side caching only (D1).   │  │
 │  └──────────────────────────────┬─────────────────────────────────┘  │
 │                                 │ await run_task(spec) -> Result       │
 │  ┌──────────────────────────────▼─────────────────────────────────┐  │
@@ -72,7 +73,8 @@ Cambium is a **leaf module** of a larger system: a host process spawns instances
 │  │              worktree recovery; durable event log.              │  │
 │  │  Unio      — merge sequencer (asyncio.Lock + throwaway wt).     │  │
 │  │  Surculus  — worktree manager (lock recovery + prune).          │  │
-│  │  Septum    — sandbox (Linux / macOS sandbox-exec / noop).       │  │
+│  │  Containment: worktree isolation + permission allowlists +      │  │
+│  │              approval gates (no sandbox module; see §4 M8).     │  │
 │  │  Nuntius   — IPC protocol (JSON-Lines + request_id framing).    │  │
 │  └──────────────────────────────┬─────────────────────────────────┘  │
 │                                 │ stdin/stdout pipes (one pair/worker) │
@@ -90,7 +92,7 @@ Cambium is a **leaf module** of a larger system: a host process spawns instances
 - The Orchestrator depends on the Deterministic Layer (calls `Custos.run_task`); the reverse is false.
 - Workers depend only on `Nuntius` (protocol) and `Diffundo` (LLM access, injected by config). They never call `Custos` directly.
 - The upper system depends only on the **Public API**. It does not import any module below.
-- `Diffundo` is owned by the Orchestrator. Workers receive a `DiffundoConfig` over the protocol and instantiate their own `Diffundo` client; cache state is **never shared across worker processes** (each worker has its own opt-in cache; see §8).
+- `Diffundo` is owned by the Orchestrator. Workers receive a `DiffundoConfig` over the protocol and instantiate their own `Diffundo` client; `Diffundo` is **stateless across calls** (no local cache — D1), so there is no cache state to share or desynchronize across worker processes (see §8, §9).
 
 ---
 
@@ -119,7 +121,6 @@ class Config:
     fanout: FanOutConfig
     supervisor: SupervisorConfig
     worker: WorkerConfig
-    sandbox: SandboxConfig
     providers: tuple[ProviderConfig, ...]   # never serialized to logs
     # See §11 for full schema.
 
@@ -169,9 +170,12 @@ class Result:
                                         # 3 timeout, 4 cancelled
     commits: tuple[str, ...]            # SHAs produced
     files_changed: tuple[str, ...]
+    unified_diff: str | None            # per-file diff vs base_commit, capped 64 KiB (D8b)
+    diff_truncated: bool                # True when unified_diff overflowed the 64 KiB cap
     summary: str                        # worker-authored, ≤2k chars
     metric_score: float                 # 0.0..1.0, multi-signal (§10)
     metric_breakdown: dict[str, float]  # per-signal scores
+    parent_task_id: str | None          # tree linkage (D2): None for the session root
     event_log_ref: str                  # "sqlite:<session_dir>/.cambium/events.db"
     session_id: str
     started_at: float
@@ -180,6 +184,8 @@ class Result:
 ```
 
 `Result` is JSON-serializable and is the **only** contract the upper system consumes from a finished run. It is written atomically to `${session_dir}/.cambium/result.json` before `Session.run()` returns.
+
+**Result envelopes flow up the Task Tree** (D2): a child node's terminal envelope is a **message** to the parent, not merely a terminal report. The upward envelope carries **exactly**: `parent_task_id`, `unified_diff` (with `diff_truncated` set on overflow), `summary`, `metric_score`, `metric_breakdown`, `commits`, `files_changed`, and terminal `status` — **never the child's scratchpad, chain-of-thought, or trajectory** (normative information-hiding rule, D8b/I2.7). The `Result` dataclass above adds session/root-level fields (`exit_code`, `event_log_ref`, `session_id`, `started_at`, `ended_at`, `failure_reason`) that are populated when the session result is finalized (§16.1); they are **not** part of the upward child envelope. `Nuntius`/`Custos` validate upward messages against this envelope schema and reject unknown top-level fields, so the rule is structural, not a prompt convention.
 
 ### 3.5 `Instance` — proto-AGI leaf handle (control plane)
 
@@ -208,9 +214,9 @@ class Instance:
 ```python
 @dataclass(frozen=True)
 class Event:
-    kind: str               # "task_assigned" | "worker_spawned" | "heartbeat" |
-                            # "tool_event" | "checkpoint" | "merge_progress" |
-                            # "result" | "worker_exit" | "log" | ...
+    kind: str               # "submitted" | "task_decomposed" | "worker_spawned" |
+                            # "heartbeat" | "tool_event" | "checkpoint" |
+                            # "merge_progress" | "result" | "worker_exit" | "log" | ...
     task_id: str | None
     request_id: str | None
     timestamp: float        # time.time()
@@ -219,7 +225,27 @@ class Event:
     payload: dict           # type-specific; redacted of secrets (§9)
 ```
 
-The `Event` stream is the **machine interface**. The TUI renders it; the host system can also subscribe. Durability is tiered (critical vs non-critical events) — see §6.5 for the precise contract; in short, critical events (`result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`) are fsync-d before they are yielded to any subscriber, while non-critical events may be lost within the configured fsync interval (default 1 s) on supervisor crash.
+The `Event` stream is the **machine interface**. The TUI renders it; the host system can also subscribe. Durability is tiered (critical vs non-critical events) — see §6.5 for the precise contract; in short, critical events (`submitted`, `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`) are fsync-d before they are yielded to any subscriber, while non-critical events may be lost within the configured fsync interval (default 1 s) on supervisor crash.
+
+**Event-kind vocabulary (reconciliation).** The canonical name for the task-entry event is **`submitted`** (critical); `task_assigned` is the v2.1-era name for the same event, per the events draft's catalog mapping (`docs/research/event-schema-draft.md` §3.1: `submitted` = arch `task_assigned`). Decomposition output is **`task_decomposed`** (non-critical, draft-proposed; `docs/research/event-schema-draft.md` §3.10). Tree linkage uses `payload.parent_task_id` on both (§3.7, §6.3). The §6.5 tier tables use the canonical names with the v2.1 names mapped inline, not silently divergent.
+
+### 3.7 Task tree (D2)
+
+The task structure is an explicit **`TaskTree`**, not a flat subtask list. Decomposition (`TaskDecomposer`) produces a **DAG with a single root per session**; nodes are sub-LLM sessions (workers), edges are parent/child delegation. The tree is validated by a deterministic helper (proposed `cambium.orchestrator.tasktree` — pure functions for validation, cycle detection, topological ordering) **before any dispatch**; it never imports DSPy (layering invariant, §2).
+
+**Tree linkage in the event log — payload-first.** `parent_task_id` is a payload key on the `submitted` (critical) and `task_decomposed` (non-critical) events — **not** a new SQLite column — per the merged events draft (`docs/research/event-schema-draft.md` §3.1, §3.10). A new required column would be a breaking envelope change under the draft's migration policy (§7.2). Tree reconstruction joins `task_decomposed`/`submitted` records on `payload.parent_task_id`; this lets the host navigate the session tree (§16).
+
+**Normative invariants (D2):**
+
+- **I2.1 Single root.** One root node per session; every non-root node has exactly one parent (`parent_task_id`).
+- **I2.2 No cycles.** The decomposition graph is a DAG — no cycles, no self-loops, no multi-parent in v2. Cycle detection = topological sort (Kahn) on the decomposition graph before dispatch; a cyclic decomposition is **rejected and the decomposer re-prompted** (bounded retries). Cyclic graphs can otherwise leave tasks `pending` forever (reviews DS-M6, LLM-N2).
+- **I2.3 Depth/width bounds.** `max_depth` (default 3) and `max_width` (per-session parallel worker cap, config) are enforced by the supervisor at dispatch.
+- **I2.4 Context composition.** A node's context = its own session log (bounded) + parent summary + subtree result envelopes. A node never reads a sibling's raw session; siblings communicate only through the parent.
+- **I2.5 Tree-level completion.** A node reaches terminal state only when its own work is done **and** every child has returned an envelope (recursively). The §7.1 state machine is per-task; the D4 gate defines "work is done."
+- **I2.6 Append-only session logs.** Nodes' logs are immutable history; steering writes new turns, never edits old ones.
+- **I2.7 Information hiding (D8b).** A child **never** sends its scratchpad, chain-of-thought, reasoning trace, or trajectory upward. The child→parent envelope carries exactly: `parent_task_id`, `unified_diff` (≤64 KiB, `diff_truncated` flag on overflow), `summary` (≤2k chars), `metric_score`, `metric_breakdown`, `commits`, `files_changed`, terminal `status`. Enforcement is deterministic (schema validation at `Nuntius`/`Custos`), not a prompt convention.
+
+**NodeSession terminology (D3).** The public `Session` (§3.3) is **one task execution** of the headless API. A node in the Task Tree owns a **`NodeSession`** — a sub-session identified by `session_id == task_id`, checkpointed and reloadable, with its own conversation/session store under `${session_dir}/.cambium/sessions/<node_id>/` (D2/D8g). The wire messages address `task_id`; `session_id` is the same value until the split is finalized (design-deltas D3 Q3.5).
 
 ---
 
@@ -230,17 +256,21 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 | Code | Name | Layer | Responsibility | State owned |
 |---|---|---|---|---|
 | M1 | Nuntius | Deterministic | IPC protocol: JSON-Lines framing, `request_id` RPC, message schema. | None (pass-through). |
-| M2 | Diffundo | Orchestrator | Multi-provider LLM access: tier-based cascade, opt-in cache, cooldown. | Cache (bounded, opt-in); per-provider cooldown timers. |
+| M2 | Diffundo | Orchestrator | Multi-provider LLM access: tier-based cascade, cooldown, token-bucket rate limiting. Stateless router. | None; per-provider cooldown timers + token buckets. |
 | M3 | Surculus | Deterministic | `git worktree` lifecycle: create, recover, prune, list. | None (state lives in git). |
-| M4 | Custos | Deterministic | Supervisor: lifecycle, watchdog, restart, event log writer. | WorkerHandle table; event log handle; restart counters. |
-| M5 | Opifex | Worker | DSPy ReAct loop; tools; checkpoint; heartbeat. | Per-worker: trajectory, turn counter, generation token. |
+| M4 | Custos | Deterministic | Supervisor: lifecycle, watchdog, restart, event log writer, gate/budget enforcement. | WorkerHandle table; event log handle; restart counters; gate-verdict records. |
+| M5 | Opifex | Worker | DSPy ReAct loop; tools; checkpoint; heartbeat. | Per-node: trajectory, turn counter, generation token, session log. |
 | M6 | Architectus | Orchestrator | Decision modules: `should_decompose` (v2 rule engine; DSPy seam per `docs/architecture/module-template/example-spec.md`), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. All subclass `cambium.modules.base.Module` (`decide()` + `metric()`). | Program versions (read-only at runtime). |
 | M7 | Unio | Deterministic | Merge sequencer: serialized, throwaway worktree, test gate. | None (operates on a temp worktree). |
-| M8 | Septum | Deterministic | Sandbox wrapper: Linux (kernel namespace), `sandbox-exec` (macOS), noop. | None. |
-| M9 | Ascensus | Tooling (offline) | Optimization harness: per-module dataset, metric, held-out eval. | Optimized prompt artifacts under `.cambium/optimized/`. |
+| M8 | Septum | — | Sandbox wrapper (Linux kernel namespace, `sandbox-exec` macOS, noop). | **Removed — out of scope (2026-08-09, decision 10).** Code retained for history; not renumbered (`agents.md` §6: module codes are stable vocabulary). Containment = worktree isolation + permission allowlists + approval gates (§7.2); research evidence retained in `docs/research/sandbox-options.md` (unprivileged user namespaces blocked by AppArmor on this host). |
+| M9 | Ascensus | Tooling (offline) | Optimization harness: per-module dataset, metric, held-out eval, refinement loop. | Optimized prompt artifacts under `.cambium/optimized/`. |
 | M10 | Janus | View | TUI: subscribes to `Session.events()`. Read-only. | None. |
 
 **Module interface contracts are normative.** Each module's `architecture.md` defines its inputs, outputs, state, failure modes, DSPy program, metric, dataset, and test strategy, per the template in `docs/architecture/module-template/architecture.md`.
+
+**Module CLI (D8a).** Every module MUST ship a CLI entry `python -m cambium.modules.<name>`: read one JSON object from stdin, write one JSON object to stdout, exit `0` on success (non-zero with a JSON `{"error": {…}}` object on failure); stderr is reserved for human diagnostics. The strict typed dataclasses (e.g., `TaskInput`/`DecomposeOutput`) are the CLI's schema. `decide()` is the pure function; the CLI is a thin adapter (~30 LOC). Distinct from the v2.1 eval entry `python -m cambium.modules.<name>.eval`.
+
+**Ports and adapters (D8d).** A module's boundary is defined by typed ports (`typing.Protocol`), not concrete imports: v1 port set `LLMProvider` (`call(prompt, tier, temperature) -> response`), `EventSink`, `DatasetStore`. Adapters implement the ports (e.g., `DiffundoAdapter(LLMProvider)`). Module instances are built by constructor injection at a composition root from `Config` (proposed `cambium.container` or `cambium.orchestrator` wiring); a module never constructs a provider itself (except the worker-side `CambiumLM`, config-injected via `init.fanout_config`, §9.3).
 
 ---
 
@@ -265,20 +295,25 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 // ── Supervisor → Worker ──────────────────────────────────────────
 {"type":"init",
  "request_id":"01HXXXX...",            // ULID; echoed in result/error/exit
- "task_id":"wt-abc-001",
+ "task_id":"wt-abc-001",                // == NodeSession session_id (D2/D3)
+ "parent_task_id":"wt-abc-000",        // tree linkage; null for the session root (D2)
  "generation":3,                        // fencing token (§7.3)
  "worktree":"/abs/path",
  "base_commit":"a1b2c3d...",
  "spec":"Refactor dry_run.rs to remove global state",
- "max_turns":20,
  "tools":["read_file","write_file","edit_file","run_shell","git_op","grep_code"],
  "fanout_config":{ /* DiffundoConfig, no api keys */ },
- "provider_env_keys":["DEEPCODE_API_KEY","GEMINI_API_KEY"],  // names only; values from env
- "permissions":{"network":true,"shell":true},
+ "provider_env_keys":["DEEPCODE_API_KEY","GEMINI_API_KEY"],  // names only; values from env (D7)
+ "permissions":{"network":true,"shell":true},                // allowlist; shell gates run_shell (D7)
  "heartbeat":{"interval_s":15,"timeout_s":90},
- "budget":{"max_wall_s":1800,"max_restarts":10}}
+ "budget":{"max_wall_s":1800,"max_restarts":10,
+           "max_turns":20,"max_tokens":200000,"timeout_ms":120000,   // supervisor-owned (D4)
+           "gate_max_retries":2}}      // D4 gate bound; all budget fields enforced by Custos
 
 {"type":"context","request_id":"...","context":"Previous task added kalman_fusion."}
+{"type":"steer","request_id":"...","session_id":"wt-abc-001",      // (D3) parent direction to an
+ "context":"<parent's follow-up / steering turn>"}                  // existing NodeSession; valid
+                                                                   // only after `ready` (RUNNING)
 {"type":"cancel", "request_id":"...","reason":"timeout"}
 {"type":"ping", "request_id":"..."}    // liveness probe; worker must echo via "pong"
 
@@ -315,9 +350,13 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 {"type":"result",
  "request_id":"01HXXXX...",            // echoes init
  "task_id":"wt-abc-001",
+ "parent_task_id":"wt-abc-000",        // child→parent linkage (D2/D3)
  "status":"done",
  "commits":["a1b2c3d"],
  "files_changed":["src/dry_run.rs"],
+ "diff":"...",                          // unified_diff vs base_commit, ≤64 KiB, truncation
+ "diff_truncated":false,                // flagged true on overflow (D8b) — envelope ONLY:
+                                        // no scratchpad/CoT/trajectory may ride upward (I2.7)
  "summary":"Removed 3 global statics; replaced with worker-local config.",
  "metric_score":0.84,
  "metric_breakdown":{"tests":1.0,"spec_adherence":0.9,"diff_quality":0.7,"canaries":1.0}}
@@ -338,6 +377,10 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 ```
 
 The `exit` message is **the authoritative termination signal**. Workers emit it as the final line before process exit. A worker that exits without emitting `exit` is treated as having crashed — even if `result` was already sent (the supervisor cross-checks).
+
+**Admission is a supervisor-internal ack, NOT a wire message (D3).** When `Custos` accepts a spawn it returns admission to the orchestrator/host synchronously **before** the worker is RUNNING; it is a control-plane ack, not a worker→supervisor message. The wire handshake stays `init → ready` with `ready_timeout` unchanged (a pre-`ready` wire message would have no timer slot and would collide with the IPC draft's `PROTO_OUT_OF_ORDER` rule — `docs/research/ipc-protocol-draft.md` §4.1).
+
+**Steering (D3).** After `ready`, the parent may direct a live NodeSession with repeatable `steer` turns; `Custos` routes messages by `session_id` (parent→child steer, child→parent result envelopes). Sibling→sibling messaging is parent-mediated only in v2. Routing is performed by the deterministic supervisor, never directly process-to-process.
 
 ### 5.3 Liveness model (resolves DS-C2)
 
@@ -377,6 +420,7 @@ The event log is the **durable feedback channel**: it is how the orchestrating L
 - **Primary store:** SQLite in **WAL mode** at `${session_dir}/.cambium/events.db`. Stdlib only; atomic commits; crash-safe by construction (resolves DS-C6/M3).
 - **Optional mirror:** JSON-Lines at `${session_dir}/.cambium/events.jsonl` for streaming consumers and human inspection. Off by default; enable via config.
 - **Retention:** per-session DB; the host archives or deletes the session dir. Within a session, an `events` table is append-only; a `snapshots` table stores periodic compaction points. Replay = read `events` since the last `snapshot`.
+- **Conversation store:** per-node session history is a separate queryable SQLite WAL store (`${session_dir}/.cambium/sessions/conversations.db`) — see §6.6 (D8g).
 
 ### 6.2 Writer architecture (resolves DS-C1, DS-M3, IMPL-M7)
 
@@ -433,11 +477,15 @@ CREATE TABLE snapshots (
 
 `seq` is gap-free within a session; gaps signal data loss on replay.
 
+**Tree linkage is payload-first (D2).** `parent_task_id` is a payload key on `submitted` (critical) and `task_decomposed` (non-critical) — **no new column** is added to the `events` table (a new required column would be a breaking envelope change under the events draft's migration policy, `docs/research/event-schema-draft.md` §7.2). Tree reconstruction joins those records on `payload.parent_task_id`; an index over the payload field is a v2.1 optimization if query volume demands it. `task_decomposed.payload.subtasks[]` carries the decomposed child list and `cycle_detected` (I2.2).
+
 ### 6.4 Checkpoint / restart semantics
 
 A worker emits `{"type":"checkpoint", "state_ref":"...", "commits_so_far":[...]}` after every tool call that produces or modifies durable state (file writes, commits). The `state_ref` points to `${session_dir}/.cambium/checkpoints/${task_id}/turn-${N}.json`, written atomically (write-temp + `os.rename`).
 
 On restart (§7.4), `Custos` loads the latest checkpoint for the task and re-injects it into the new worker via the `init` message as `resume_from_checkpoint`. Workers that opt out of checkpointing (e.g., read-only tasks) accept a fresh start.
+
+**Checkpoint semantics extend to session resume (D3).** The checkpoint `state_ref` plus the NodeSession's own session log (§6.6) are the reload state: on crash/restart the supervisor reloads the **session** (own log + DSPy trajectory + steering history) rather than starting a fresh task — answering Prime Agent's observed failure mode "children die mid-work; the isolated session worker stopped during in-flight work" (`docs/research/prime-agent.md` §3.3). Steering turns since the last checkpoint are replayable from the conversation store.
 
 **Checkpoint is not a substitute for the event log.** The event log records *what happened* (for replay, audit, training); checkpoints record *where to resume* (for crash recovery). They are distinct stores.
 
@@ -449,8 +497,8 @@ The previous sections refer to "durability" in several places. This section stat
 
 | Tier | Kinds | Promise |
 |---|---|---|
-| **Critical** | `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`, `task_assigned`, `merge_committed` | Fsync-d to disk **before** the writer returns the ack to the producer and **before** the event is yielded to any `Session.events()` subscriber. Loss window on supervisor crash: zero (last committed transaction may be lost only on simultaneous kernel/page-cache loss, which SQLite WAL + `synchronous=NORMAL` protects against). |
-| **Non-critical** | `heartbeat`, `tool_event`, `log`, `worker_spawned`, `worker_ready` | Appended to the WAL subject to `fsync_interval_s` (default 1 s) checkpoint cadence. Loss window on supervisor crash: at most `fsync_interval_s` of the most recent non-critical events. |
+| **Critical** | `submitted` (v2.1 name: `task_assigned`), `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`, `merge_committed` | Fsync-d to disk **before** the writer returns the ack to the producer and **before** the event is yielded to any `Session.events()` subscriber. Loss window on supervisor crash: zero (last committed transaction may be lost only on simultaneous kernel/page-cache loss, which SQLite WAL + `synchronous=NORMAL` protects against). |
+| **Non-critical** | `heartbeat`, `tool_event`, `log`, `worker_spawned`, `worker_ready`, `task_decomposed` (draft-proposed, §3.6) | Appended to the WAL subject to `fsync_interval_s` (default 1 s) checkpoint cadence. Loss window on supervisor crash: at most `fsync_interval_s` of the most recent non-critical events. |
 
 **Mechanism.** The writer thread holds open the main DB fd **and** the WAL fd. The "fsync" operation is:
 
@@ -473,6 +521,16 @@ Notes:
 
 **What this means for callers.** A caller that needs proof a thing happened must wait for the matching **critical** event (e.g., a `result` event for task completion, a `merge_committed` event for a merge). A caller that observes only heartbeats or tool events cannot prove liveness across a supervisor crash — by design, since these are high-volume advisory signals.
 
+### 6.6 Per-node conversation store (D8g)
+
+The event log answers *"what happened system-wide"*; the **conversation store** answers *"what did this node see and decide"*. It is the queryable substrate the Task Tree (D2) needs for bounded context composition (I2.4) without forwarding scratchpads.
+
+- **Storage:** per-node conversation/session history in **SQLite WAL** at `${session_dir}/.cambium/sessions/conversations.db` (separate from `events.db` — the event log is append-only history; conversations are mutable-queryable state). Same single-writer-thread discipline as §6.2 (one writer per DB; never disk I/O on the event-loop thread).
+- **Content:** the node's protocol transcript — `init`/`steer`/`tool_event`/`checkpoint`/`result` message payloads per NodeSession. Queryable, e.g., `last_turns(node_id, n)`, `cost_by_node`, `context_for(node_id)` returning the bounded D2 I2.4 context. The event log keeps the same facts for cross-cutting audit.
+- **JSONL is retained exactly where it already is:** IPC transport is JSON-Lines (§5.1) and the optional event mirror is JSON-Lines (§6.1). The conversation store is not IPC.
+- **Growth bounds** mirror the event log: per-node snapshot/compaction, bounded retention; a node's store is pruned with its session dir (§16.2).
+- SQLite WAL durability for this store is validated by the same machinery as the event log (`docs/research/sqlite-wal-durability.md` — reader never blocks, sees committed data immediately).
+
 ---
 
 ## 7. Lifecycle
@@ -482,52 +540,75 @@ This section normatively defines how a task moves through the system. Every stat
 ### 7.1 State machine (per task)
 
 ```
-                ┌──────────┐
-                │ PENDING  │  task enqueued by Architectus
-                └────┬─────┘
-                     │ worktree created (Surculus)
-                     ▼
-                ┌──────────┐
-                │ SPAWNING │  Custos.create_subprocess_exec(...)
-                └────┬─────┘
-                     │ ready received
-                     ▼
-                ┌──────────┐  heartbeat ─┐
-            ┌──►│ RUNNING  │◄────────────┘
-            │   └────┬─────┘
-            │        │ result  ──────────────►  ┌──────────┐
-            │        │                          │  DONE    │
-            │        │ timeout/fatal error ───► │ FAILED   │
-            │        │ reviewer-rejected ─────► │ REJECTED │
-            │        ▼
-            │   ┌──────────┐
-            │   │ CRASHED  │  EOF + no result, OR watchdog kill
-            │   └────┬─────┘
-            │        │ restartable & under budget?
-            │        ├─yes─► recover worktree (§7.5), increment generation
-            └────────┘        back to SPAWNING
-                     │no
-                     ▼
-                ┌──────────┐
-                │ FAILED   │  max_restarts reached OR budget exhausted
-                └──────────┘
+                ┌────────────┐
+                │  PENDING   │   task enqueued by Architectus
+                └──────┬─────┘
+                       │ worktree created (Surculus)
+                       ▼
+                ┌────────────┐
+                │  SPAWNING  │   Custos.create_subprocess_exec(...)
+                └──────┬─────┘
+                       │ ready received
+                       ▼
+                ┌────────────┐    heartbeat ─┐
+            ┌──►│  RUNNING   │◄──────────────┘
+            │   └──────┬─────┘
+            │          │ work complete (result envelope received)
+            │          │ cancel / shutdown (§7.7) ──────►  ┌────────────┐
+            │          ▼                                   │ CANCELLED  │
+            │   ┌────────────┐                             └────────────┘
+            │   │  GATING    │    gate passes ──────►      ┌────────────┐
+            │   └──────┬─────┘                             │    DONE    │
+            │          │ gate fails                        └──────┬─────┘
+            │          ▼                                          │ reviewer
+            │   ┌────────────┐                                    │ rejection (§7.8)
+            │   │GATE_FAILED │                                    ▼
+            │   └──────┬─────┘                             ┌────────────┐
+            │          │ retries left ──► back to RUNNING  │  REJECTED  │
+            │          │ retries exhausted                 └────────────┘
+            │          ▼
+            │   ┌────────────┐
+            │   │  FAILED    │   ◄─ timeout / fatal error (from RUNNING)
+            │   └────────────┘
+            │          ▲
+            │          │ not restartable / budget exhausted
+            │   ┌────────────┐
+            │   │  CRASHED   │   EOF + no result, OR watchdog kill
+            │   └──────┬─────┘
+            │          │ restartable & under budget?
+            │          ├─yes─► recover worktree (§7.5), increment generation ──► SPAWNING
+            └──────────┘        back to SPAWNING
 ```
+
+**GATING / GATE_FAILED (D4).** A task completes only when its **gate** passes. When the worker completes its work and `Custos` receives the result envelope (§3.4), the task enters `GATING` and `Custos` runs the task's gate command (e.g., the task's scenario test suite; `Unio`'s test gate at merge time, §7.8). Gate passes → `DONE` (with the gate verdict attached to the result envelope). Gate fails → `GATE_FAILED`: the worker receives the gate's failure evidence (command, output tail, failing assertion) as a steering turn (D3) and may retry up to `gate_max_retries` (default 2, supervisor-owned); retries exceed the bound → the task fails **with evidence** (`status="failed"`, `failure_reason` includes the gate command, exit code, and captured output). "Done" is therefore never self-reported by the worker; the transition into `GATING` is the deterministic result-envelope receipt, not a worker self-report. Skip-if-unchanged and gate-verdict content-addressing are in §7.9.
+
+**Tree-level completion (D2 I2.5).** The state machine is per-task; a node is terminal only when its own work is done **and** every child has returned a result envelope (recursively). The root's envelope is the session result (§3.4, §3.7).
+
+**Terminal result statuses (§3.4).** `DONE` — gate passed (§7.9); `FAILED` — timeout / fatal error, gate retries exhausted, or restart budget exhausted; `REJECTED` — reviewer rejection after the merge gate (§7.8); `CANCELLED` — cancel / shutdown (§7.7). Each is recorded as the terminal `Result.status`.
 
 ### 7.2 Spawn
 
 ```python
 proc = await asyncio.create_subprocess_exec(
-    *sandbox.wrap([sys.executable, "-X", "utf8", "-u", worker_script]),
+    sys.executable, "-X", "utf8", "-u", worker_script,   # direct spawn; no sandbox wrapper (D7)
     stdin=PIPE, stdout=PIPE, stderr=PIPE,
     cwd=worktree_path,
-    env={**os.environ, "PYTHONUNBUFFERED": "1",
-         "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": str(generation)},
+    env=_construct_worker_env(task_id, generation, worktree_path, provider_env_keys),  # D7 (R4)
     start_new_session=True,         # process group for killpg
     pass_fds=(), close_fds=True,
 )
 ```
 
-After spawn, the supervisor sends `init` and **waits for `ready`** before considering the worker RUNNING. There is a `ready_timeout` (default 60 s) covering cold-start cost (IMPL-M2). On timeout, the worker is killed and the restart policy engages.
+After spawn, the supervisor sends `init` and **waits for `ready`** before considering the worker RUNNING. There is a `ready_timeout` (default 60 s) covering cold-start cost (IMPL-M2). On timeout, the worker is killed and the restart policy engages. Spawn returns **admission** — a supervisor-internal ack to the orchestrator/host issued synchronously when the spawn is accepted, before the worker is RUNNING (D3; it is not a wire message — see §5.2).
+
+**Least-privilege worker env (D7, resolves threat-model R4).** The spawn path does **not** pass `{**os.environ, ...}`. `_construct_worker_env` builds a scrubbed dict: `PATH` (minimal), `PYTHONUNBUFFERED=1`, `CAMBIUM_TASK_ID`, `CAMBIUM_GENERATION`, `CAMBIUM_SESSION_ID`, `HOME` (worktree-scoped, optional), **plus only the keys named in `init.provider_env_keys`** (names only; values resolved from the host env — §12.2). Everything else is dropped, so a compromised worker cannot `print(os.environ)` for unrelated secrets (this is the `--setenv` per-worker key-allowlist norm of the removed sandbox, repointed to spawn-time env construction — §18.3 IMPL-M6).
+
+**Containment policy (D7).** With the sandbox module removed, containment is the stack:
+- **Worktree isolation** — per-task throwaway worktrees, `Surculus` recovery, generation fencing, quarantine (§7.3, §7.5).
+- **Permission allowlists** — the primary policy surface: per-task `init.permissions` (`network`, `shell`), the `git_op` op allowlist and list-form `grep_code` (§11), no `fetch_url`/`curl` tool (§11), and the least-privilege worker env above.
+- **Approval gates** — a host-facing `approve(session_id, op)` callback for operations outside the pre-declared allowlist (first-time external-path writes, non-allowlisted network egress), wired through the supervisor.
+
+**Deployment isolation is the host's job (D8e).** The worker is a plain stdio process (`python -m cambium.opifex`, JSON-Lines on stdin/stdout) whether run locally or inside a host-owned container (Docker) or microVM (Firecracker). Cambium neither builds nor assumes containers; a host wraps the process and connects the pipes — the IPC contract is transport-agnostic.
 
 ### 7.3 Fencing tokens (resolves DS-C6)
 
@@ -557,9 +638,11 @@ class RestartPolicy:
 - **Burst cap (Erlang-style):** ≥`burst_max` crashes within `burst_window_s` → escalate.
 - **Absolute cap:** ≥`absolute_max` total restarts → mark FAILED. Closes the DS-C4(b) "crash once per 61 s forever" hole.
 - **Per-task wall-time budget** (from `init.budget.max_wall_s`, default 1800 s): exceeded → mark FAILED.
+- **Supervisor-owned session budgets (D4):** `max_turns`, `max_tokens`, and `timeout_ms` are carried in `init.budget` and enforced by `Custos` — **never self-reported by the worker**. Exceeding any bound → task `FAILED` (or `timeout`, §3.4). `gate_max_retries` is a separate counter from `absolute_max`, but shares the wall-time budget.
 - **Full jitter:** `delay = random.uniform(0, base_delay_s * backoff_base ** n)`. No deterministic thundering herd (DS-C4(a)). Jitter is also applied to the heartbeat watchdog interval, the fsync timer, and the heartbeat emission.
 - **Recoverable errors:** workers set `recoverable: false` on `error` messages that should not be retried (e.g., `invalid_spec`, `unknown_tool`). Non-recoverable errors skip the restart budget and fail immediately.
 - **Provider outage is not a worker failure** (resolves DS-M7): `Diffundo.AllProvidersFailed` raised inside the worker is caught at the worker's tool boundary, logged, and converted to a backoff retry **inside the worker** for up to `provider_patience_s` (default 180 s). Only if the outage persists past that does the worker emit `error` with `recoverable: true`. This isolates provider flapping from the supervisor's restart policy.
+- **Queue-level pause on total provider exhaustion (D8f):** when the cascade exhausts every provider, the **dispatch queue pauses** — the orchestrator stops dispatching new tasks (IMPL-M5 "park dispatch" posture) and the supervisor does not respawn/retry-loop workers awaiting an LLM. A **recovery monitor** (proposed: `Custos` timer watching provider-health events) wakes dispatch when any provider's bucket/cooldown/breaker recovers. Workers in-flight await; they do not crash-loop.
 
 ### 7.5 Worktree recovery (resolves DS-C5, IMPL-M9)
 
@@ -671,6 +754,17 @@ async def publish_merge(self, verified_tip: str) -> str:
 
 **Lock scope.** The `Unio` lock is held across verify-in-throwaway-worktree **and** publish. This serializes the whole merge pipeline. Throughput impact is documented in DS-M1; the throwaway-worktree + batch-test mode mitigates wall-clock cost without weakening the single-writer invariant.
 
+**Unio's test gate is the final gate (D4).** The merge-time test run in the throwaway worktree is the last gate a task's work passes before `main` moves; see §7.9 for the gate lifecycle and the content-addressed skip rule that covers the second run.
+
+### 7.9 Autonomous gate and budgets (D4)
+
+Task completion is gated, and budgets are supervisor-owned:
+
+1. **Task completes only when a gate command passes.** The gate verifies the task's outcome (e.g., the task's scenario test suite; `Unio`'s test gate at merge, §7.8; the `tests` signal in §10). A task whose work is done but whose gate fails does **not** reach `DONE`; it enters `GATE_FAILED` (§7.1). "Done" cannot be self-reported by the worker.
+2. **Failed gate → bounded evidence-backed retries.** On gate failure the worker receives the gate's failure evidence (command, output tail, failing assertion) as a steering turn (D3) and is allowed `gate_max_retries` (default 2). After the bound, the task **fails with evidence**: `status="failed"`, `failure_reason` includes the gate command, exit code, and captured output (§3.4).
+3. **Skip-if-unchanged (content-addressed verdicts).** Gate verdicts are keyed by `sha256(tree-hash of worktree state || gate command || base_commit || gate input spec)` and stored per-session (in the events DB or a small `gate_verdicts` table). If a retry or a crash-restart re-derives an identical key, the prior verdict is reused instead of re-running the gate. This is the same content-addressing argument as D1: the key derives from the exact bytes that determine the outcome, so it cannot serve a verdict for different state. Per-session scope only — cross-session sharing would reintroduce the coherence question D1 removed.
+4. **Budgets owned by the supervisor.** `max_turns`, `max_tokens`, and `timeout_ms` are carried in `init.budget` and enforced by `Custos`, never self-reported by the worker (§7.4). This is the "bounded everything" goal (§1, §19) applied at per-session granularity.
+
 ---
 
 ## 8. Caching & Transparency Policy
@@ -681,23 +775,22 @@ A recurring v0.1 flaw was conflating **pass-through modules** (which carry data 
 |---|---|---|---|
 | **Nuntius** | Pass-through | None | Carries bytes; never interprets payload. No cache. |
 | **Surculus** | Pass-through | None | Delegates to git; state lives in git itself. |
-| **Septum** | Pass-through | None | Wraps a command list; no inspection. |
 | **Unio** | Pass-through | None | Operates on a throwaway worktree; no in-memory state between merges. |
-| **Custos** | Owns (process) | WorkerHandle table, event log | Process state. No LLM cache. |
-| **Opifex** | Owns (per-worker) | Trajectory, turn counter, generation | Per-process; dies with the worker. No cross-worker sharing. |
-| **Diffundo** | Owns (cache) | Per-instance cache, per-provider cooldown | **Cache lives here, upstream of workers**; see §8.1. |
+| **Custos** | Owns (process) | WorkerHandle table, event log, gate-verdict records | Process state. No LLM cache. |
+| **Opifex** | Owns (per-node) | Trajectory, turn counter, generation, session log | Per-process; dies with the worker. No cross-worker sharing. |
+| **Diffundo** | Pass-through (stateless) | None; per-provider cooldown timers + token buckets | **No local cache (D1)** — provider-side caching only; see §8.1. |
 | **Architectus** | Owns (program versions) | DSPy program versions (read-only) | Each submodule has its own dataset; see §9. |
-| **Ascensus** | Owns (offline) | Optimized artifacts | Not on the hot path. |
+| **Ascensus** | Owns (offline) | Optimized artifacts, harness state | Not on the hot path. |
 
-### 8.1 Diffundo cache policy (resolves LLM-C1, LLM-M5)
+*(Septum, M8, is removed from v2 scope — decision 10/D7; it no longer appears in the transparency table.)*
 
-- **Cache is opt-in per call.** Default is `cache=False`. The caller passes `cache=True` and a `cache_namespace` to enable. Workers do not cache codegen by default; the orchestrator caches genuinely stateless calls (e.g., `ShouldDecompose` classifier outputs, given a fixed spec).
-- **Cache key is `sha256(namespace || model || temperature || prompt || context_hash)`.** `context_hash` is caller-supplied and **must** include any world state the answer depends on — for code-aware calls, callers pass `git rev-parse HEAD` plus a hash of the relevant file contents. Calls that omit `context_hash` are rejected when `cache=True`.
-- **TTL:** default 300 s (5 minutes), not the v0.1 3600 s. Configurable per namespace.
-- **Bound:** LRU, default 10 000 entries, per `Diffundo` instance.
-- **No cross-worker sharing.** Each worker process has its own `Diffundo` instance with its own cache. Shared caching is the host system's job (it can subscribe to the event log and replay cache-populating calls if it wants). Cross-process caches invite coherence bugs that the v0.1 reviews rightly flagged.
-- **Transparency:** every cached response is tagged `"cache_hit": true` in the result envelope, with the original generation timestamp. Optimization harnesses can filter cache hits out of trajectory datasets.
-- **Cache upstream of workers.** The orchestrator-side `Diffundo` instance is where shared cross-task caching would live (if ever added). Workers' caches are private and short-lived.
+### 8.1 Diffundo cache policy — no local cache (resolves LLM-C1, LLM-M5 by deletion; D1)
+
+- **There is no local LLM response cache.** Removed: the LRU store, the TTL, per-instance cache state, and the `cache` / `cache_namespace` / `context_hash` parameters on `Diffundo.call` (§9.2). `Diffundo` is a **stateless router**; its only state is per-provider cooldown timers and token buckets (§9).
+- **Provider-side caching is the only caching.** A per-provider `cache_control` config (e.g., Anthropic `{"type":"ephemeral","ttl":"5m"|"1h"}`, OpenAI `prompt_cache_key`/`prompt_cache_breakpoint`/`prompt_cache_options.mode`, DeepSeek automatic — no client knob) replaces the local cache. Provider caches are **content-addressed** (exact-prefix KV) and **never cache the answer**: they store the prompt-prefix computation, so a changed input is a different prefix, the cache misses, and the response is freshly computed (OpenAI / Anthropic / DeepSeek caching docs, verified 2026-08-09 — see `docs/research/design-deltas.md` D1). There is no key under which an old prefix can be served against new content, and no stored response that could go stale. This deletes the review's core defect (LLM-C1: a response cache keyed on `(model, temperature, prompt)` with no repo state) by removing the cache, and makes the threat-model R8 "cache poisoning / stale cache" class structurally impossible.
+- **The worker and orchestrator code do not manage any cache.** They may only place stable prefixes so the provider's cache hits — guidance, not a correctness mechanism (§9.3 prompt structure, D8c).
+- **No `"cache_hit": true` tagging** in result envelopes; optimization harnesses cannot filter on a nonexistent cache.
+- **Host-side cross-session caching is out of scope.** If a host system (outside Cambium) ever adds one, it must be content-addressed and repo-state-aware (D6 residue); shared cross-worker caching was already declared the host's job and is documented so the boundary is explicit.
 
 ### 8.2 Why "transparent" Nuntius matters
 
@@ -730,6 +823,9 @@ class ProviderConfig:
     supports_tools: bool = True     # native function calling?
     cooldown_s: float = 60.0
     max_retries: int = 2
+    rpm: int = 60                   # token-bucket refill tokens/min (D8f)
+    cache_control: dict | None = None   # provider-side caching knobs only (D1):
+                                        #   {"type":"ephemeral","ttl":"5m"} etc.
 ```
 
 ### 9.2 Cascade (default mode)
@@ -737,23 +833,26 @@ class ProviderConfig:
 ```python
 async def call(self, *, prompt: str, tier: str = "fast",
                model: str | None = None, temperature: float = 0.0,
-               cache: bool = False, cache_namespace: str | None = None,
-               context_hash: str | None = None,
                require_tools: bool = False,
                min_context_window: int = 0) -> LLMResponse:
-    # 1. Cache check (only if cache=True and context_hash present)
-    # 2. Filter providers: tier match; tool support if require_tools;
-    #    context window if min_context_window; not in cooldown.
-    # 3. Sort by priority.
-    # 4. Try each in order; on exception, mark cooldown, continue.
-    # 5. If all fail -> raise AllProvidersFailed(providers_tried, last_error).
+    # 1. Filter providers: tier match; tool support if require_tools;
+    #    context window if min_context_window; not in cooldown;
+    #    token bucket non-empty (D8f).
+    # 2. Sort by priority.
+    # 3. Try each in order; on exception, mark cooldown and debit the
+    #    provider's token bucket, continue.
+    # 4. If all fail -> raise AllProvidersFailed(providers_tried, last_error)
+    #    -> the dispatch queue pauses and a recovery monitor wakes it (D8f, §7.4).
 ```
+
+*No cache check exists:* there is no local cache to check (D1).
 
 Key changes from v0.1:
 
 - **`tier` is the primary key.** A request for `"fast"` matches DeepCode v4 Flash, Gemini Flash, OpenAI Mini, Claude Haiku interchangeably. **No exact-model filter except when caller explicitly passes `model=`** (rare; used by optimization to pin a model).
 - **Capability filtering.** `require_tools=True` skips providers with `supports_tools=False`. `min_context_window=600_000` skips Haiku. These are *explicit*, *documented* tradeoffs — not magic.
-- **`AllProvidersFailed` is a real exception class**, defined in `cambium.diffundo.errors`, carrying the list of tried providers and the last error. The orchestrator catches it and parks dispatch (resolves IMPL-M5).
+- **`AllProvidersFailed` is a real exception class**, defined in `cambium.diffundo.errors`, carrying the list of tried providers and the last error. The orchestrator catches it and parks dispatch (resolves IMPL-M5); under D8f the **dispatch queue pauses** and a recovery monitor wakes it when any provider recovers (§7.4).
+- **Token-bucket rate limiting (D8f).** Each provider (optionally per tier) has a token bucket refilled at `rpm` tokens/min (`ProviderConfig.rpm`). Before each cascade attempt, `call` checks the provider's bucket; an empty bucket marks the provider `RATE_LIMITED` and the cascade skips it via the same selection-filter path as cooldown (step 1). The bucket bounds *throughput* — cooldown (`cooldown_s`) only bounds *failures*. Circuit breaker and capability tiers are unchanged (`docs/research/cascade-design.md` §2.3 sliding-window breaker: HEALTHY/COOLDOWN/OPEN/HALF_OPEN).
 - **No per-call `dspy.LM` construction.** LMs are cached per provider on first use (resolves IMPL-N10).
 - **Race mode** is removed from the default config (it was unsafe per LLM-M6 — fastest-typically-weakest bias, cancelled metered requests). If a caller genuinely needs "first of N," they get it by configuring N providers at the same priority; cascade returns the first success.
 
@@ -766,10 +865,13 @@ class CambiumLM(dspy.LM):
     def __init__(self, diffundo: Diffundo, tier: str, **kw):
         self._diffundo = diffundo; self._tier = tier; ...
     def __call__(self, prompt, **kw):
+        # forwards tier/model/temperature only — no cache flags (D1)
         return self._diffundo.call(prompt=prompt, tier=self._tier, ...)
 ```
 
-Workers `dspy.configure(lm=CambiumLM(diffundo, tier="fast"))`. Every DSPy call — `ReAct`, `ChainOfThought`, raw `dspy.LM` — flows through `Diffundo`. The headline provider-failover benefit reaches workers.
+Workers `dspy.configure(lm=CambiumLM(diffundo, tier="fast"))`. Every DSPy call — `ReAct`, `ChainOfThought`, raw `dspy.LM` — flows through `Diffundo`. The headline provider-failover benefit reaches workers. `CambiumLM` passes **no cache flags**; `Diffundo.call` has none (D1).
+
+**Prompt-structure convention (D8c).** Because provider-side caches are exact-prefix content-addressed, every `CambiumLM`/`Diffundo.call` caller follows a normative prompt layout: **static, byte-stable content at the TOP** (system prompt, AGENTS.md-derived guidelines, tool definitions, module instructions, task-independent few-shot context) and **dynamic content at the BOTTOM** (task spec, repo context, observations, tool results). Timestamps, `request_id`s, monotonic values, and per-call nonces are **never** placed at the top — they churn the exact-prefix key and destroy provider cache hits. This is guidance that enables upstream caching, **not** a correctness mechanism (consistent with §8.1); a prompt-lint check in the module test suite asserts static-before-dynamic ordering and no volatile tokens in the static prefix.
 
 ---
 
@@ -779,7 +881,7 @@ There is no single number that captures "did the agent write good code." v2 uses
 
 | Signal | Source | Weight (default) | Gameability mitigation |
 |---|---|---|---|
-| `tests` | `Unio` runs the test command (no `\| tail`, no `set -o pipefail` issue — raw exit code, see §11) | 0.30 (floor) | **Tests are a floor, not a ceiling.** A run that fails tests scores 0.0 overall regardless of other signals. |
+| `tests` | `Unio` runs the test command (no `\| tail`, no `set -o pipefail` issue — raw exit code, see §11) | 0.30 (floor) | **Tests are a floor, not a ceiling.** A run that fails tests scores 0.0 overall regardless of other signals. This is also the task's **D4 gate**: a task whose test gate fails never reaches `DONE` (§7.9). |
 | `spec_adherence` | LLM-judge (`ResultEvaluator`) using a fixed rubric, scored 1–5 normalized to [0,1] | 0.30 | Rubric is **pre-registered per task** in the dataset; judge sees only the spec + diff + test output, not the worker's summary. |
 | `diff_quality` | Deterministic heuristics: diff size in expected range, no test-file deletion, no `# noqa`/`# type: ignore` additions, no commented-out code, no large generated files | 0.20 | Heuristics are versioned in the metric module; changes require dataset re-eval. |
 | `behavioral_checks` | Pre-registered assertions per task ("function X exists", "no `print()` statements", "config files unchanged") | 0.15 | Authored at dataset construction time; not visible to the worker. |
@@ -802,13 +904,13 @@ Final score: `score = (tests × w1 + spec_adherence × w2 + diff_quality × w3 +
 | `read_file(path)` | `Path.read_text(encoding="utf-8")` | Rejects paths outside the worktree. |
 | `write_file(path, content)` | `Path.write_text(content, encoding="utf-8")` | **NOT `write_content`** (the v0.1 bug). Atomic via temp-file + `os.rename`. |
 | `edit_file(path, old_string, new_string)` | Search-and-replace with **uniqueness check**: errors if `old_string` matches 0 or >1 locations. | **New.** Closes the "agent must rewrite the whole file" gap. Matches Claude Code / Aider conventions. |
-| `run_shell(cmd, timeout=120)` | `asyncio.create_subprocess_shell`, wrapped in per-tool heartbeat loop (§7.6). | `shell=True` is allowed because the worker runs in a sandbox with a bounded tool set and process-group kill; the alternative (parsing shell) is worse. **Every** command is logged in the event log. |
+| `run_shell(cmd, timeout=120)` | `asyncio.create_subprocess_shell`, wrapped in per-tool heartbeat loop (§7.6). | `shell=True` remains a **deliberate, permission-gated** capability (D7): it is offered only when `init.permissions.shell == true`, every command is logged verbatim in the event log (§5.2 `tool_event.cmd`), and it runs under the per-task wall/timeout and heartbeat budget (§7.6). No shell where a list form exists — already realized for `git_op` and `grep_code`. It is the documented residual high-privilege tool, gated by the allowlist rather than by a (removed) sandbox. |
 | `git_op(op, args)` | `subprocess.run(["git", op, *shlex.split(args)])` — **list form, no shell** | Eliminates the v0.1 shell-injection vector. `op` is allowlisted (`add`, `commit`, `status`, `diff`, `log`, `stash`); others rejected. |
 | `grep_code(pattern, path)` | `subprocess.run(["rg", "-n", pattern, path])` — **uses ripgrep, list form** | Eliminates the `grep -rn '{pattern}'` injection vector (IMPL-N4). Falls back to stdlib `re` if `rg` not on PATH. **Always `return`s the result** (fixes IMPL-C5). |
 
 **Tools that are deliberately absent** at v2:
 
-- No `fetch_url` / `curl` tool. Network egress is gated by sandbox policy (off by default).
+- No `fetch_url` / `curl` tool. Network egress is gated by the permission allowlist (`init.permissions.network`, off by default) plus host approval gates for non-allowlisted egress (D7).
 - No structured-edit patch tool. The `edit_file` search-and-replace primitive covers the common case; full diff/patch parsing is deferred to v2.1.
 - No AST/symbol search. Planned for v2.1.
 
@@ -823,7 +925,7 @@ Final score: `score = (tests × w1 + spec_adherence × w2 + diff_quality × w3 +
 - **At rest:** no API key is ever written to disk by Cambium. Keys live in the host process's environment.
 - **In transit to workers:** keys are inherited via the subprocess environment; they never appear in protocol messages.
 - **In logs:** every event passes through a redaction filter before it reaches the writer thread.
-- **In sandbox:** the sandbox wrapper injects only the env keys the worker is authorized to receive via `--setenv`.
+- **At spawn (D7, resolves threat-model R4):** the worker env is a **constructed least-privilege dict** — `PATH` (minimal), `PYTHONUNBUFFERED=1`, `CAMBIUM_TASK_ID`, `CAMBIUM_GENERATION`, `CAMBIUM_SESSION_ID`, optional worktree-scoped `HOME`, **plus only the keys named in `init.provider_env_keys`**; everything else is dropped (§7.2). This is the per-worker key allowlist the removed sandbox enforced via `--setenv`, repointed to spawn-time env construction.
 
 ### 12.2 Loading
 
@@ -890,7 +992,7 @@ Applied at enqueue time (before the writer thread sees the event). Belt-and-brac
   Pair it with a documented fallback (`ProcessPoolExecutor` or 3.14's `concurrent.futures.InterpreterPoolExecutor`, both available in 3.14 and verified present in `docs/research/python-3.14.md`), as the implementation review's M1 asks. On the GIL build, `InterpreterPoolExecutor` is preferred for in-process parallelism — it gives real multi-core (per-interpreter GIL, PEP 684) without FT risk.
 - **3.14 features the design relies on**, all verified in `docs/research/python-3.14.md`: `asyncio.to_thread`, `asyncio.timeout`, `asyncio.TaskGroup`; PEP 649/749 lazy annotations (lets DSPy/LiteLLM type-heavy code drop `from __future__ import annotations`); `multiprocessing`'s new `forkserver` default and `Process.interrupt()` for clean worker stop; `concurrent.interpreters` for future worker-pool work. **Migration note:** `forkserver` is now the default multiprocessing start method on Linux — any Cambium code that relied on `fork` semantics must be re-validated (per the same doc).
 - **`asyncio.to_thread`** is used for the rare synchronous, CPU-light blocking call inside the supervisor (e.g., `git` invocations). It runs on the default thread pool, which is fine because no shared mutable state is touched inside those calls.
-- **Subprocess-per-worker** design means each worker is a fresh Python interpreter. Cold-start cost is documented (IMPL-M2) and mitigated by `ready_timeout`. A persistent worker pool (or `InterpreterPoolExecutor`-backed pool) is **deferred to v2.1** — it requires a different IPC model (multiple init messages per process) and is not needed for v2 correctness.
+- **Subprocess-per-worker** design means each worker is a fresh Python interpreter. Cold-start cost is documented (IMPL-M2) and mitigated by `ready_timeout`, and now by **persistent NodeSessions within a task** (D3): the IPC model that v2.0 deferred ("multiple init messages per process") is adopted as repeatable `steer` turns over one session's lifetime (§5.2), amortizing the `import dspy` cold start (~2.1 s) across a session. The **cross-task persistent pool** is still deferred to v2.1, with the measured benchmark recorded in `docs/research/worker-coldstart.md` (branch `wt-coldstart`).
 
 ---
 
@@ -932,9 +1034,14 @@ ${session_dir}/
     ├── status.json                # written on every state change (read by poll())
     ├── worktrees/                 # one subdir per active worktree
     ├── checkpoints/               # one subdir per task
+    ├── sessions/                  # per-node session history (D2/D8g)
+    │   ├── conversations.db       # SQLite WAL, queryable (§6.6)
+    │   └── <node_id>/             # per-node store; pruned with the session dir
     ├── quarantine/                # worktrees that failed recovery
     └── optimized/                 # DSPy artifacts loaded by Ascensus
 ```
+
+*(`sessions/<node_id>/` is introduced by D2 and stored SQLite-WAL-backed by D8g; the event-log `events.db` may additionally hold per-session `gate_verdicts` records, §7.9.)*
 
 ### 16.3 Lifecycle
 
@@ -980,7 +1087,7 @@ Each module is optimized against **frozen references** of its siblings, not thei
 | Module | Optimization input | Sibling pinning | Held-out metric |
 |---|---|---|---|
 | `ShouldDecompose` | `task, context → decompose` | None needed (input is just the spec). | Accuracy on a frozen 50-spec held-out set (train split = 200). |
-| `TaskDecomposer` | `spec → list[SubTask]` | **Stub Worker** that returns canned results per subtask ID. | Subtask-completion rate on a frozen 50-spec dataset with pre-registered gold decompositions. |
+| `TaskDecomposer` | `spec → TaskTree` (DAG, §3.7) | **Stub Worker** that returns canned results per node ID. | Tree-completion rate on a frozen 50-spec dataset with pre-registered gold decompositions (incl. cycle-free DAG validation, I2.2). |
 | `TaskRouter` | `subtask, worker_profiles → route` | Stub Worker pool with declared tiers. | Routing accuracy vs gold routing on 100 cases. |
 | `ResultEvaluator` | `spec, diff, test_results → verdict` | None (input is post-hoc). | Verdict accuracy + F1 on 100 hand-labeled (spec, diff, verdict) triples. |
 | `Opifex` (worker ReAct) | `task, context → action` | **Stub Decomposer** that returns the canonical decomposition for each task. | Multi-signal metric (§10) on 50 reference coding tasks. |
@@ -1004,6 +1111,8 @@ src/cambium/modules/<name>/
 
 **v2 extensions (labeled, opt-in):** the scaffold ships a single combined `datasets/<name>_pairs.jsonl` with inline `canary: true` markers (see `src/cambium/modules/example/` for the reference). Splitting into `train.jsonl` / `eval.jsonl` / `canaries.jsonl` per `docs/architecture/module-template/dataset-format.md` is the planned v2.1 layout — until then, canaries are inlined in the single file and an `eval.py` harness entry point selects them by the `canary` flag. A `siblings-stub.yaml` is added when this module becomes siblings with another (the `should_decompose` reference has none — it is the first module in the pipeline).
 
+**Harness state (D5).** Each module's optimizable surface is its **harness state** — the module's prompt/decide program **plus** skills/memories **plus** dataset **plus** metric — extending the artifact list above. Proposed store: `src/cambium/modules/<name>/harness/` (`prompts.yaml`, `skills/`, `memories/`, `meta.json` with refinement history), with promoted artifacts under `optimized/<name>/` (§16.2) and `meta.json.sibling_pins` tracking pinned sibling versions.
+
 ### 17.4 Optimization loop (in `Ascensus`)
 
 ```
@@ -1020,6 +1129,13 @@ src/cambium/modules/<name>/
 ```
 
 Steps 8 and 9 are the **brakes** the v0.1 flywheel lacked.
+
+**Refinement loop (D5).** Each module's optimization is an **evidence-backed refinement loop over its own harness state**, making the plan/apply split above first-class:
+
+- **Plan/apply split.** A refinement is first a **proposal** (a `refinement_id` + the planned edit to harness state + the evidence behind it, including a mandatory before/after eval delta table per signal). Only after the proposal passes its gates is it **applied** (promoted) via the versioned pointer swap (`optimized/<name>/v<N>/`).
+- **Rollback by refinement ID.** Every applied refinement records a `refinement_id`; promotion is a symlink-swap and any refinement can be rolled back atomically by restoring the previous pointer.
+- **Canary-gated.** The gate is the existing three-split evaluation: mean metric on frozen `eval.jsonl` ≥ threshold **and** canary pass rate 100% (§10, `docs/architecture/module-template/dataset-format.md` §6). A degraded canary score → the refinement is **rejected**, i.e., rolled back to the previous `refinement_id`. Frozen, dataset-time-authored canaries that are invisible to the refiner are the defense against reward-hacking refinements (e.g., a module teaching itself to game the metric — deleting failing tests, `assert True`, no-op patches).
+- **Human approval for out-of-scope harness edits.** Edits to the module's **own** prompt/decide program are gateable by eval alone; edits that reach **beyond module scope** — the dataset (labels, splits, canaries), the metric, or sibling pins (`meta.json.sibling_pins`) — require **human approval** before apply (an approval-gate callback in the host, the same mechanism as D7's approval gates, or an explicit halt-and-queue state).
 
 ### 17.5 Independence claim, restated
 
@@ -1044,7 +1160,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 | DS-M1 | Merge sequencer serialization bottleneck | `asyncio.Lock`; throwaway worktree; batch-then-test mode (configurable); fast pre-merge checks, full suite once. | §4, §7 (Unio) |
 | DS-M2 | Race on `WorkerHandle` state | State machine with guarded transitions; mutations serialized through the supervisor's single event-loop task; `ProcessLookupError` caught in watchdog. | §7.1 |
 | DS-M3 | Event log no durability (no fsync) | SQLite WAL (atomic by construction); explicit fsync cadence. | §6.1, §6.2 |
-| DS-M4 | FanOut cache/provider state unsafe under threads | Cache is per-instance and only mutated from the owning process; cascade no longer uses `asyncio.to_thread` for shared-state mutation (LM construction cached per provider; cooldown tracked in a `threading.Lock`-protected structure when needed). | §8.1, §9 |
+| DS-M4 | FanOut cache/provider state unsafe under threads | The cache is deleted (D1) — nothing left to race. What remains: LM construction cached per provider (per-process) and cooldown/token-bucket state tracked in a `threading.Lock`-protected structure when needed. | §8.1, §9 |
 | DS-M5 | Python 3.14 free-threaded unnecessary | Standard CPython 3.14; free-threading is opt-in extra; documented. | §14 |
 | DS-M6 | Orchestrator cycle detection / broken task-ID counter | DAG validation in `Architectus`: topological sort with cycle detection before dispatch; cyclic graphs rejected and re-prompted; ULID-based `request_id` and `task_id` from `Custos`. | §4 (Architectus) |
 | DS-M7 | No isolation between FanOut failure and worker liveness | Workers retry provider outage inside the tool boundary for `provider_patience_s` before emitting `error`; provider outage no longer kills workers. | §7.4 |
@@ -1058,7 +1174,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 
 | ID | Flaw | Resolution | Section |
 |---|---|---|---|
-| LLM-C1 | FanOut cache ignores repo state | Opt-in per call; key includes `context_hash` (caller-supplied); default TTL 300 s; cache hits tagged. | §8.1 |
+| LLM-C1 | FanOut cache ignores repo state | **Resolved by deletion (D1).** No local cache exists; provider-side caching is content-addressed and never stale. | §8.1 |
 | LLM-C2 | Cascade not cascading across models | `tier` field; cascade tries all providers in tier; no exact-model filter except when caller explicitly pins. | §9.2 |
 | LLM-C3 | Provider/model transparency assumed | Capability metadata on `ProviderConfig` (`supports_tools`, `context_window`); `require_tools` and `min_context_window` filters; tradeoffs documented. | §9.1, §9.2 |
 | LLM-C4 | "Independently hill-climbable" is false | Claim restated: "per-module optimizable against pinned siblings"; held-out eval per module; canary rejection. | §17 |
@@ -1068,7 +1184,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 | LLM-M2 | Worker tool set inadequate | Adds `edit_file` (search-and-replace with uniqueness); fixes `write_file`/`grep_code`; structured-edit tool documented as v2.1. | §11 |
 | LLM-M3 | Optimization flywheel coupled, no stability | Held-out eval, canaries, human gate, rollback. | §10, §17.4 |
 | LLM-M4 | `ReAct` checkpoint callback doesn't exist in DSPy | v2 implements checkpointing via a `ReAct` subclass (`OpifexReAct`) that overrides the step loop to call `checkpoint()` between steps; documented in `Opifex` architecture. | §6.4, module template |
-| LLM-M5 | Cache per-instance nearly useless | Cache is **upstream of workers** (orchestrator-side, for genuinely stateless calls); worker caches are private and opt-in. The "shared cross-worker cache" benefit is the host's job. | §8.1 |
+| LLM-M5 | Cache per-instance nearly useless | **Resolved by deletion (D1).** No local cache at all — the per-instance cache, its upstream variant, and the "shared cross-worker cache is the host's job" residue all disappear with it. | §8.1 |
 | LLM-M6 | Race mode unsafe (cancellation, weak-model bias) | Race mode removed from default; same-priority providers in cascade give equivalent latency behavior without the pathologies. | §9.2 |
 
 ### 18.3 Implementation review (`review-implementation.md`)
@@ -1081,7 +1197,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 | IMPL-C4 | `write_content` nonexistent | v2 spec uses `Path.write_text`. | §11 |
 | IMPL-C5 | `grep_code` no return | v2 spec returns the combined output. | §11 |
 | IMPL-C6 | `def __task_id_counter` syntax error | Removed; task IDs assigned by `Custos` via ULID. | §4 (Architectus) |
-| IMPL-C7 | Sandbox space in identifier + undefined `sys` | v2 `Septum` spec uses valid identifiers and imports `sys`. | §4 (Septum) |
+| IMPL-C7 | Sandbox space in identifier + undefined `sys` | **Moot by removal (D7).** The Septum module no longer exists; there is no sandbox identifier to fix. | §4 (M8) |
 | IMPL-C8 | Orchestrator awaits sync methods / undefined merge/evaluate | `Architectus` interface normatively defined; sync vs async decided per method. | §4 (Architectus) |
 | IMPL-C9 | Metric syntax errors (`polymorphism`, missing `==`) | v2 metric module is syntactically valid Python; tested before merge. | §10 |
 | IMPL-C10 | Cascade no-op when model resolved | Resolved by LLM-C2 mechanism. | §9.2 |
@@ -1090,9 +1206,9 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 | IMPL-M1 | Python 3.14 free-threaded experimental | Standard 3.14; free-threading opt-in. | §14 |
 | IMPL-M2 | Subprocess cold-start unbounded | Documented; `ready_timeout` (default 60 s); persistent pool deferred to v2.1. | §14 |
 | IMPL-M3 | Git worktree concurrency / `gc.auto` | `Surculus` sets `gc.auto=0` on the cambium-managed repo; retries `worktree add` on lock contention; never mutates `main` from worker code. | §7 (Surculus) |
-| IMPL-M4 | Linux-only sandbox backend | `Septum` has a kernel-namespace backend (Linux), `SandboxExecSandbox` (macOS, best-effort), `NoopSandbox` (dev/CI). | §4 (Septum) |
-| IMPL-M5 | `AllProvidersFailed` undefined / unhandled | Defined in `cambium.diffundo.errors`; orchestrator catches it and parks dispatch. | §9.2 |
-| IMPL-M6 | No secrets management | Env-only; redaction filter; never in JSON init; sandbox `--setenv` per-worker key allowlist. | §12 |
+| IMPL-M4 | Linux-only sandbox backend | **Moot by removal (D7).** Septum is removed from v2 scope; there is no kernel-namespace / `SandboxExecSandbox` / `NoopSandbox` backend. Containment = worktree isolation + permission allowlists + approval gates (§7.2). | §4 (M8) |
+| IMPL-M5 | `AllProvidersFailed` undefined / unhandled | Defined in `cambium.diffundo.errors`; orchestrator catches it and parks dispatch; queue pauses + recovery monitor (D8f). | §9.2, §7.4 |
+| IMPL-M6 | No secrets management | Env-only; redaction filter; never in JSON init; **per-worker key allowlist enforced at spawn-time env construction** — the removed sandbox's `--setenv` norm is retained, its enforcement mechanism repointed to the least-privilege worker env (D7). | §12, §7.2 |
 | IMPL-M7 | No real logging | stdlib `logging` + `JsonFormatter`; `QueueHandler` + `QueueListener`; rotation; correlation IDs. | §13 |
 | IMPL-M8 | No test strategy | Module template requires test strategy; `Ascensus` ships with fake-LLM and fake-worker harnesses. | §17, module template |
 | IMPL-M9 | Restart reuses corrupted worktree | Fixed by `Surculus.recover()` (DS-C5). | §7.5 |
@@ -1102,7 +1218,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 ### 18.4 Consensus items (`system-design.md` §9 table)
 
 Every F1–F12 item in the v0.1 consensus table is resolved by the matrix above:
-F1=§6.2, F2=§8.1, F3=§7(Unio), F4=§9.3, F5=§9.2, F6=§7.6, F7=per-module specs, F8=§11, F9=§17, F10=§10, F11=§6, F12=§4(Septum).
+F1=§6.2, F2=§8.1 (cache deleted by D1), F3=§7(Unio), F4=§9.3, F5=§9.2, F6=§7.6, F7=per-module specs, F8=§11, F9=§17, F10=§10, F11=§6, F12=§4(M8 — Septum removed from v2 scope by D7).
 
 ---
 
@@ -1130,20 +1246,20 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 
 10. **Explicit concurrency guards.** Merge sequencer is locked. FanOut cooldown is locked. Event log is single-writer. Worker subprocesses are in their own process group. Nothing races implicitly. Addressed: §6.2, §7, §8, §9.
 
-11. **Cross-platform from day 1.** The sandbox has Linux, macOS, and noop backends, abstracted so that no single platform tool is assumed. macOS is a first-class dev platform. Addressed: §4 (Septum).
+11. **Cross-platform by construction.** v2 has **no sandbox backend to abstract** — containment (worktree isolation + permission allowlists + approval gates) is pure git + subprocess mechanics, identical on every platform (D7). Deployment-side isolation (containers/microVMs) is the host's choice, not a Cambium platform layer (D8e). macOS is a first-class dev platform. Addressed: §4 (M8), §7.2.
 
-12. **Secrets handled once, correctly.** Env-only at rest, inherited via subprocess env, never in protocol messages, redacted at the log boundary, sandboxed per-worker via `--setenv`. Documented threat model. Addressed: §12.
+12. **Secrets handled once, correctly.** Env-only at rest, inherited via subprocess env, never in protocol messages, redacted at the log boundary, **per-worker env allowlist enforced at spawn** (the removed sandbox's `--setenv` norm, repointed — D7). Documented threat model. Addressed: §12, §7.2.
 
 13. **Real logging.** stdlib `logging`, structured (JSON), non-blocking (QueueHandler/QueueListener), rotated (100 MB × 5), redacted, correlated (task_id + request_id + generation). No `print()` in worker code. Addressed: §13.
 
-14. **Bounded everything.** Restarts (10 absolute), wall time (1800 s/task), memory (event ring buffer 10 000; queue 10 000), cache (LRU 10 000), log size (rotation), worker count (config). No resource grows without bound. Addressed: §6.2, §7.4, §8.1.
+14. **Bounded everything.** Restarts (10 absolute), wall time (1800 s/task), turns/tokens/timeout (supervisor-owned per session, D4), gate retries (2), memory (event ring buffer 10 000; queue 10 000), log size (rotation), worker count (config). No resource grows without bound — and no cache-size bound is needed because there is no local cache (D1). Addressed: §6.2, §7.4.
 
-15. **Smoke test as gate.** No module is marked complete until the end-to-end smoke test (fake LLM + 1 worker + 1 merge) passes against it. This is the single highest-leverage practice the v0.1 reviews identified. Addressed: `agents.md` documents the gate; the example module spec (`docs/architecture/module-template/example-spec.md`) demonstrates it.
+15. **Smoke test as gate.** No module is marked complete until the end-to-end smoke test (fake LLM + 1 worker + 1 merge) passes against it. This is the single highest-leverage practice the v0.1 reviews identified. Addressed: `agents.md` documents the gate; the example module spec (`docs/architecture/module-template/example-spec.md`) demonstrates it. **Milestone 0 is the FIRST implementation milestone (D6 residue (b))**: "one worker, one file, one merge" — spawn, single `edit_file`, scenario test gate passes, branch merges via atomic `update-ref`, `result.json` written, clean exit. Nothing is P0-complete until it passes.
 
 **Failure modes this design does not yet address (honest gaps):**
-- Cold-start latency for subprocess-per-worker (mitigation documented; persistent pool deferred).
+- No kernel-namespace boundary for `run_shell` — the accepted residual risk of the no-sandbox posture (threat-model R3 re-rated "accepted — out of scope"); the remaining controls are worktree isolation, permission allowlists, and approval gates (D7). Deployment-side containers/microVMs are the host's isolation vehicle (D8e).
+- Cold-start latency for subprocess-per-worker (mitigation documented: persistent NodeSessions within a task amortize the `import dspy` cost — D3; the cross-task persistent pool is deferred to v2.1).
 - Cross-model prompt transfer during optimization (documented; mitigation is per-model optimization, deferred to v2.1).
-- Macos sandbox is weaker than Linux (documented as best-effort).
 - The "doom loop detector" pattern from Claude Code is on the v2.1 list, not in v2.
 
 ---
@@ -1171,3 +1287,36 @@ The research docs live under `docs/research/` in main. They are not present on t
 - `docs/architecture/module-template/dataset-format.md` — dataset JSONL schema, versioning, splits, canaries.
 - `docs/architecture/module-template/example-spec.md` — reference module (`ShouldDecompose`) for first implementation.
 - `agents.md` — repo-root orientation for new agents.
+
+### Adopted deltas (authoritative amendments — see §21)
+- `docs/research/design-deltas.md` — D1–D7 (v1.0.0). D1 (no local cache), D2 (task tree), D3 (persistent sessions/steer), D4 (gate + budgets), D5 (refinement loop), D6 (honest status + smoke-test milestone), D7 (no sandboxing; Septum removed).
+- `docs/research/feedback-2-deltas.md` — D8a–D8g (v1.0.0). D8a (module CLI), D8b (envelope-only info hiding), D8c (prompt prefix layout), D8d (ports/adapters + DI), D8e (deployment isolation outside the harness), D8f (token bucket + queue pause), D8g (SQLite WAL conversation store).
+- `docs/research/event-schema-draft.md` — event-log schema draft; payload-first `parent_task_id` (cited by §3.7, §6.3).
+- `docs/research/ipc-protocol-draft.md` — IPC protocol draft; `steer`, `ready` gating, `PROTO_OUT_OF_ORDER`, `result_envelope` (cited by §5.2, §7.2).
+- `docs/research/sandbox-options.md` — superseded evidence record for decision 10 / D7 (unprivileged user namespaces blocked by AppArmor on this host).
+- `docs/research/worker-coldstart.md` — fork-per-task vs persistent-pool benchmark (branch `wt-coldstart`; cited by §14).
+
+---
+
+## 21. Adopted deltas (fold record)
+
+**Date:** 2026-08-09. **Source docs:** `docs/research/design-deltas.md` (D1–D7), `docs/research/feedback-2-deltas.md` (D8a–D8g), `docs/research/event-schema-draft.md`, `docs/research/ipc-protocol-draft.md`, `implementation-plan.md` (decisions 8–10). This document (v2.0.0) was amended in place to reflect the adopted deltas; the delta docs remain authoritative for the reasoning and open questions behind each fold.
+
+| Delta | Folded into this document |
+|---|---|
+| D1 — No local LLM cache; Diffundo is a stateless router | §0, §1, §2 (Diffundo line + invariant), §4 (M2), §8, §8.1 (replaced), §9.1/§9.2/§9.3 (cache params removed, `cache_control` config), §18.2 (LLM-C1/LLM-M5 resolved by deletion), §18.4 (F2), §19.14 |
+| D2 — Task tree | §3.4 (Result `parent_task_id`), §3.7 (new: task-tree invariants I2.1–I2.7), §4 (M6), §5.2 (`init.parent_task_id`, `result.parent_task_id`), §6.3 (payload-first linkage), §6.6 (§16.2 `sessions/`), §7.1 (tree-level completion), §16.2 |
+| D3 — Persistent sessions: steer/admission, NodeSession | §3.3/§3.7 (NodeSession terminology), §5.2 (`steer`, admission = supervisor-internal ack, result messages), §6.4 (session resume), §7.2 (admission), §14 (pool re-scoped), §19 (honest gaps) |
+| D4 — Gate + budgets | §5.2 (`init.budget` + `gate_max_retries`), §7.1 (GATING/GATE_FAILED), §7.4 (supervisor-owned budgets), §7.8 (final-gate note), §7.9 (new: gate lifecycle + skip-if-unchanged), §10 |
+| D5 — Refinement loop | §4 (M9/Ascensus), §17.3 (harness state), §17.4 (refinement loop: plan/apply, rollback-by-id, canary gate, human approval) |
+| D6 — Honest status residue | §8.1 (repo-state-aware dedup), §19.15 (smoke-test-first milestone) |
+| D7 — No sandboxing; Septum removed | §0, §1, §2 (diagram + containment box), §3.2 (Config), §4 (M8 removed), §5.2, §7.2 (spawn env + containment policy), §7.4, §11 (run_shell), §12 (secrets at spawn), §18.3 (IMPL-M4/IMPL-C7 moot, IMPL-M6 repointed), §19.11/19.12/19.14 + honest gaps |
+| D8a — Module CLI | §4 (module catalog) |
+| D8b — Envelope-only info hiding | §3.4 (Result `unified_diff` + I2.7), §5.2 (`result.diff`) |
+| D8c — Prompt prefix layout | §9.3 (prompt-structure convention) |
+| D8d — Ports/adapters + DI | §4 (module catalog) |
+| D8e — Deployment isolation outside the harness | §7.2 (stdio worker in containers), §19.11 + honest gaps |
+| D8f — Token bucket + queue pause | §9.1 (`rpm`), §9.2 (bucket check, AllProvidersFailed → queue pause), §7.4 |
+| D8g — SQLite WAL conversation store | §6.1, §6.6 (new), §16.2 (`sessions/` + `conversations.db`) |
+
+**Posture statements (normative after this fold):** (1) **No local LLM cache** — caching is provider-side only, content-addressed and never stale (D1). (2) **No sandboxing in the harness** — containment = git worktree isolation + permission allowlists + approval gates; Septum (M8) is removed from v2 scope; deployment-side containers/microVMs are the host's job (D7, D8e). (3) **Task tree is first-class** — DAG with payload-first `parent_task_id`, envelope-only upward results (D2, D8b).
