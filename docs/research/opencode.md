@@ -31,7 +31,7 @@ OpenCode is an open-source AI coding agent with a terminal UI, desktop app, web 
 
 ## 2. What it does well
 
-1. **Provider/model breadth.** 17+ AI-SDK adapters plus arbitrary OpenAI-compatible proxies and OpenCode Zen make it trivial to run any model. The local install defines 11 providers and 28 models purely in JSON (see §5). Cached model catalog at `~/.cache/opencode/models.json` (3.6 MB).
+1. **Provider/model breadth.** 17+ AI-SDK adapters plus arbitrary OpenAI-compatible proxies and OpenCode Zen make it trivial to run any model. The local install defines 11 providers and 28 explicitly-named custom models in JSON (counting rule: `provider.<id>.models` entries in `opencode.json` only; see §5). Cached model catalog at `~/.cache/opencode/models.json` (3.6 MB).
 2. **Granular, glob-based permission system.** Every tool can be `allow`/`ask`/`deny`, per agent and per command pattern, with last-matching-rule-wins semantics (e.g. `bash: { "*": "ask", "git diff": "allow" }`). Permissions also gate external directories, the `task` tool, and skill loading. — https://opencode.ai/docs/permissions/, https://opencode.ai/docs/agents/
 3. **Extensibility without code.** Custom agents (JSON or Markdown frontmatter), skills (`SKILL.md`, discovered from `.opencode/skills`, `.claude/skills`, `.agents/skills`, Claude-compatible), MCP servers, custom tools, commands, and npm plugins — all config-driven. — https://opencode.ai/docs/agents/, https://opencode.ai/docs/skills/, https://opencode.ai/docs/plugins/
 4. **Durable session UX.** Everything persists to SQLite: sessions, messages, parts, todos, permissions, share URLs, and per-session token/cost counters. Undo/redo is backed by internal git snapshots; sessions can be resumed (`-c`/`--session`), forked, exported, and shared as URLs. — local DB schema (§5), https://opencode.ai/docs/
@@ -43,7 +43,7 @@ OpenCode is an open-source AI coding agent with a terminal UI, desktop app, web 
 ## 3. What it does poorly / limitations
 
 1. **Subagents run sequentially.** Confirmed by the maintainers themselves: issue #29638 "Subagents dispatched sequentially instead of in parallel" (closed **as not planned**), reporting that the session loop `tasks.pop()` → `handleSubtask(...)` blocks until each subagent finishes; the reporter suggested `Effect.forEach(..., { concurrency: "unbounded" })`. Parallel fan-out is not a supported pattern. — https://github.com/anomalyco/opencode/issues/29638
-2. **Heavy resource footprint.** The binary is 140 MB; the global SQLite DB was 292 MB after only 87 sessions / 5,004 messages / 21,054 parts; individual managed tool-output files reach ~1 MB each; the package/cache dir is 91 MB (see §5). This is a JS/Bun + Effect + SQLite stack — far heavier than Cambium's zero-runtime-dependency Python plan.
+2. **Heavy resource footprint.** The binary is 140 MB; the global SQLite DB was 299 MB at measurement time (104 sessions / 5,362 messages / 22,754 parts, as of 2026-08-09T21:04:47Z — see §5); individual managed tool-output files reach ~1 MB each; the package/cache dir is 91 MB (see §5). This is a JS/Bun + Effect + SQLite stack — far heavier than Cambium's zero-runtime-dependency Python plan.
 3. **Snapshot/undo indexing cost.** The docs themselves warn that snapshots "can cause slow indexing and significant disk usage as it tracks all changes using an internal git repository," and undo/redo only works inside a git repo. — https://opencode.ai/docs/config/ (Snapshot)
 4. **Provider-package churn.** OpenCode "dynamically installs provider packages as needed and caches them locally"; the troubleshooting page's standard fix for API errors is `rm -rf ~/.cache/opencode`. Config carries a long legacy/deprecation tail (`maxSteps` → `steps`, `tools` → `permission`, `theme`/`keybinds` moved from `opencode.json` to `tui.json`). — https://opencode.ai/docs/troubleshooting/, https://opencode.ai/docs/agents/
 5. **Compaction is a lossy LLM pass.** When context is full, a hidden `compaction` agent summarizes the session (auto-compaction, optional pruning). It burns an extra model call and can lose detail; the docs expose only coarse knobs (`reserved`, `prune`). There is no replay-based durable checkpoint as Cambium plans. — https://opencode.ai/docs/config/ (Compaction), https://opencode.ai/docs/agents/ (Built-in)
@@ -83,22 +83,22 @@ Config locations (both present, JSONC-capable per docs):
 
 ```
 ~/.opencode/           # 15 skill dirs, node_modules (plugin deps), bun.lock, .env (API keys for openai/openrouter/google/groq/z.ai/kimi/moltbook/websearch)
-~/.config/opencode/    # opencode.json (810 lines), tui.json, opencode.json.bak-*, skills/i-have-adhd, openai-compact/checkpoints.db (1.8MB WAL), .git (13 commits), patch-models-cache.py
+~/.config/opencode/    # opencode.json (809 lines, `wc -l`), tui.json, opencode.json.bak-*, skills/i-have-adhd, openai-compact/checkpoints.db (1.8MB WAL), .git (12 commits, `git log --oneline | wc -l`), patch-models-cache.py
 ```
 
-Effective agents (`opencode agent list`): build, compaction, explore, general, plan, summary, title (built-ins) + deepseek, glm, kimi, luna, reviewer, sol (custom subagents). Config file (`~/.config/opencode/opencode.json`) defines 10 agents, 11 providers, 28 models. Style: pure-JSON, per-agent `model: "provider/model-id"` + `variant` + `mode` (`all`/`primary`/`subagent`) + `steps` + `permission`, with provider blocks declaring custom model names/limits/reasoning variants (e.g. `openai/gpt-5.6-sol`, `zai-coding-plan/glm-5.2`, `opencode-go/deepseek-v4-flash`). Default agent is `build` on `opencode-go/deepseek-v4-flash`.
+Effective agents (`opencode agent list`): build, compaction, explore, general, plan, summary, title (built-ins) + deepseek, glm, kimi, luna, reviewer, sol (custom subagents). Config file (`~/.config/opencode/opencode.json`) defines 10 agents, 11 providers, and 28 explicitly-named custom models (counting rule: entries under `provider.<id>.models` in `opencode.json` only — catalog entries from `~/.cache/opencode/models.json` are not counted; `opencode models` would list far more). Style: pure-JSON, per-agent `model: "provider/model-id"` + `variant` + `mode` (`all`/`primary`/`subagent`) + `steps` + `permission`, with provider blocks declaring custom model names/limits/reasoning variants (e.g. `openai/gpt-5.6-sol`, `zai-coding-plan/glm-5.2`, `opencode-go/deepseek-v4-flash`). Default agent is `build` on `opencode-go/deepseek-v4-flash`.
 
-Data store (single global SQLite DB):
+Data store (single global SQLite DB; live and growing — all counts are a point-in-time snapshot as of the measurement moment, not stable truth):
 
 ```
-$ sqlite3 ~/.local/share/opencode/opencode-dev.db "SELECT count(*) FROM session; SELECT count(*) FROM message; SELECT count(*) FROM part;"
-87
-5004
-21054
-$ ls -la ~/.local/share/opencode/opencode-dev.db    # 292,880,384 bytes (292 MB)
+$ sqlite3 ~/.local/share/opencode/opencode-dev.db "SELECT (SELECT count(*) FROM session), (SELECT count(*) FROM message), (SELECT count(*) FROM part);"
+104|5362|22754        # as of 2026-08-09T21:04:47Z
+$ stat -c %s ~/.local/share/opencode/opencode-dev.db   # 313,778,176 bytes (299 MB) as of 2026-08-09T21:04:47Z
 $ du -sh ~/.cache/opencode                           # 91 M (incl. models.json 3.6 MB)
 $ ls -la ~/.local/share/opencode/log/opencode.log    # 8,066,508 bytes, first entry 2026-08-08T14:21Z
 ```
+
+The DB grew from the first draft of this doc (87/5,004/21,054; 292,880,384 B) to 104/5,362/22,754; 313,778,176 B within ~30 minutes because the research sessions themselves are writing to it.
 
 Recent activity (all timestamps UTC, `sqlite3 ... SELECT title, datetime(time_updated/1000,'unixepoch'), agent FROM session ORDER BY time_updated DESC`): the immediately-preceding work is a **Cambium design/research sprint on 2026-08-09 20:38–20:52** in `/home/ubuntu/cambium`: "Designing Python coding agent with subagents" (build), "Design Cambium architecture (@sol subagent)" (GPT-5.6 Sol), and nine parallel `@general` research subagent sessions (Python 3.14, TUI best practices, Cloud Code, py.dev assistant, Prime Agent, OMP, Pi, Codex, and "Research OpenCode agent" — the session running this task), each costing $0.001–0.005. Prior to that: `polymarket-arbitrage` build work throughout 2026-08-09 (age-knob, tip-gate, telemetry, reviews via `@glm`), and `bench-harness` sessions on 2026-08-08. Log confirms `version=0.0.0-dev-202608071959` on every created session.
 
