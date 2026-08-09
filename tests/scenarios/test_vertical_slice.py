@@ -106,3 +106,120 @@ def test_vertical_slice_gate_failure_no_merge(tmp_path) -> None:
 
     events = _load_events(session_dir)
     assert _protocol_sequence(events) == ["init", "ready", "run_task", "result", "exit"]
+
+
+def test_worker_nonzero_exit_fails(tmp_path, monkeypatch) -> None:
+    # Reviewer case worker_exit5.py: envelope says succeeded, exit_message present,
+    # but the worker process exits 5. Must FAIL and the exit code must reflect 5.
+    monkeypatch.setenv("FAKE_MODE", "exit5")
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.exit_code == 5  # reflects the worker's real exit code
+    assert result.worker_exit_code == 5
+    assert result.worker_status == "succeeded"  # envelope's status was overridden
+    assert result.merge_sha is None
+    tip = subprocess.run(
+        ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert tip == base  # no merge
+
+
+def test_missing_exit_message_fails(tmp_path, monkeypatch) -> None:
+    # Reviewer case worker_noexit.py: envelope succeeded, exit_message omitted.
+    monkeypatch.setenv("FAKE_MODE", "noexit")
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert result.worker_exit_code == 0
+    assert result.worker_status == "succeeded"
+    assert result.merge_sha is None
+    tip = subprocess.run(
+        ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert tip == base
+
+
+def test_missing_result_envelope_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FAKE_MODE", "noresult")
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert result.worker_status is None
+    assert result.merge_sha is None
+
+
+def test_misrouted_result_envelope_fails(tmp_path, monkeypatch) -> None:
+    # Undeliverable result: the envelope does not echo run_task's request_id.
+    monkeypatch.setenv("FAKE_MODE", "badrid")
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert result.merge_sha is None
+    tip = subprocess.run(
+        ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert tip == base
+    assert any(e["kind"] == "protocol" for e in _load_events(session_dir))
+
+
+def test_result_envelope_echoes_run_task_request_id(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "succeeded"
+    events = _load_events(session_dir)
+    by_kind = {e["kind"]: e["payload"] for e in events}
+    init_rid = by_kind["init"]["request_id"]
+    run_rid = by_kind["run_task"]["request_id"]
+    assert by_kind["ready"]["request_id"] == init_rid  # ready echoes init
+    assert by_kind["result"]["request_id"] == run_rid  # envelope echoes run_task
+    assert "request_id" not in by_kind["exit"]  # exit_message carries no request_id
+
+
+def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
+    # A worker that never sends ready must be killed within the (env-configured) budget.
+    monkeypatch.setenv("FAKE_MODE", "noready")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "2")
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.exit_code == 3  # timeout per arch §16.4
+    assert result.timed_out is True
+    assert result.timeout_phase == "ready"
+    assert result.worker_exit_code is not None and result.worker_exit_code != 0  # killed
+    assert result.merge_sha is None
+    events = _load_events(session_dir)
+    assert any(e["kind"] == "timeout" for e in events)
