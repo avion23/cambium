@@ -104,7 +104,8 @@ NDJSON requires **nothing after the final newline** except stream close (EOF).
 ### 1.6 stderr
 
 stderr is free-form advisory log output. The supervisor reads it opportunistically and
-writes it to the event log as `kind="log"` events, level-tagged. **No protocol semantics
+writes it to the event log as `worker_stdout_line` events (the events catalog's name for
+arch §13's `log`; §8.1), level-tagged. **No protocol semantics
 depend on stderr** (`arch §5.1.5`, `§13`). The `result_envelope.stderr_tail` (§3) is the
 only place stderr content enters the protocol, and it is advisory.
 
@@ -167,7 +168,7 @@ not process any other request before `init`.
 | Field | Type | Notes / source |
 |---|---|---|
 | `type` | `"init"` | |
-| `request_id` | ULID | echoed by `ready`, `result_envelope`, `fatal_error`, `exit_message` (`arch §5.2`) |
+| `request_id` | ULID | echoed by `ready`, `result_envelope`, `fatal_error` (`arch §5.2`); echoed by `exit_message` as a **draft extension** — arch §5.2's `exit` message carries no `request_id` (Reconciliation #7) |
 | `proto` | int | draft protocol version (§5) |
 | `task_id` | str | stable task id, not PID (`system-design §2.1`; `arch §5.2`) |
 | `generation` | int | fencing token, monotonically increasing per task (`arch §7.3`) |
@@ -276,15 +277,18 @@ errors from the worker (unparseable request, unknown request type, out-of-order)
 
 ### 2.4 Worker → orchestrator: events (fire-and-forget)
 
-All events carry `task_id`; `heartbeat`, `progress`, `checkpoint` additionally echo
-`generation` (`arch §7.3` requires generation on heartbeat/checkpoint; the draft extends
-it to `progress`). `result_envelope`, `fatal_error`, and `exit_message` echo the `init`
-`request_id` (as in `arch §5.2`). Events are never acknowledged.
+All events carry `task_id`. `heartbeat`, `checkpoint`, `result_envelope`, `fatal_error`,
+and `exit_message` additionally echo `generation` — `arch §7.3` requires generation on
+`heartbeat`/`checkpoint`/`result`/`error`/`exit` (of which `fatal_error`/`exit_message`
+are the draft's wire names for `error`/`exit`); the draft extends it to `progress`.
+`result_envelope` and `fatal_error` echo the `init` `request_id` (`arch §5.2`);
+`exit_message` echoes it as a **draft extension** — arch §5.2's `exit` message carries no
+`request_id` (Reconciliation #7). Events are never acknowledged.
 
 | Event | Purpose | Key fields | Source |
 |---|---|---|---|
 | `heartbeat` | Liveness: "I am alive and working" | `turn`, `tool` (currently-running tool or null), `status` (≤200 chars), `monotonic_ms` | `arch §5.2`, `§7.6` |
-| `progress` | Work-in-progress detail (draft generalization of arch `tool_event`) | `turn`, `phase` (`"tool"` \| `"reasoning"` \| `"llm"`), `tool`/`cmd`/`exit_code`/`duration_ms` when `phase=="tool"` | draft; arch `tool_event` `arch §5.2` |
+| `progress` | Work-in-progress detail (draft generalization of arch `tool_event`) | `turn`, `phase` (`"tool"` \| `"reasoning"` \| `"llm"`), `message` (≤200 chars), `tool`/`cmd`/`exit_code`/`duration_ms` when `phase=="tool"` | draft; arch `tool_event` `arch §5.2` |
 | `checkpoint` | Durable resume point | `turn`, `state_ref` (atomic write), `commits_so_far` | `arch §5.2`, `§6.4` |
 | `result_envelope` | Terminal outcome | full schema in §3 | arch `result` `arch §5.2` |
 | `fatal_error` | Terminal error | `error_type`, `message`, `partial_commits`, `recoverable` | arch `error` `arch §5.2` |
@@ -296,6 +300,14 @@ Notes on the event set:
   tool-level `tool_event` (`arch §5.2`) is a `progress` event with `phase:"tool"` and the
   `tool`/`cmd`/`exit_code`/`duration_ms` fields populated. `cmd` is truncated to ≤512
   chars at emit.
+- **`progress` ↔ event-log mapping (seam 1, joint with the events draft).** The wire
+  `progress(phase="tool")` message is the v1 placeholder for the events catalog's deferred
+  `tool_event` kind (events draft D12). Valid protocol lines are never raw-echoed (events
+  draft D6), so a `progress` line is *not* recorded as `worker_stdout_line`; only the
+  tool's non-protocol bytes (stderr / unparseable stdout) land there. The structured
+  tool-event content is deferred to a `tool_event` kind in v2.1; until then consumers
+  reconstruct from `heartbeat.tool` + the checkpoint trail. The events draft states the
+  identical resolution (seam 1).
 - **`exit_message` is mandatory.** It is the final line before process exit. A worker
   that exits without emitting `exit_message` is treated as crashed, **even if
   `result_envelope` was already sent** — the supervisor cross-checks (`arch §5.2`,
@@ -346,11 +358,18 @@ supervisor enriches it with session-level fields when writing `result.json` (§8
 | `files_changed` | list[str] | Paths changed (`arch §3.4` `Result.files_changed`). |
 | `diff` | str | Draft addition — `arch §3.4` `Result` has no diff field, but the `ResultEvaluator` consumes a `diff` (`arch §10`, `§17.3`). Draft: `git diff base_commit..worktree`, capped at 64 KiB; empty when no work was produced. |
 | `stdout_tail` | str | Draft addition. Last ≤200 lines of tool output the worker chooses to attach (worker stdout itself is protocol-only, `arch §5.1.2`). Optional; empty when unset. |
-| `stderr_tail` | str | Draft addition. Last ≤200 lines of the worker's own stderr record; the supervisor independently retains its own capture as `kind="log"` events (`arch §5.1.5`). |
+| `stderr_tail` | str | Draft addition. Last ≤200 lines of the worker's own stderr record; the supervisor independently retains its own capture as `worker_stdout_line` events (`arch §5.1.5`). |
 | `summary` | str | Worker-authored, ≤2k chars (`arch §3.4`). |
 | `metrics` | object | Draft nests the arch-flat `metric_score`/`metric_breakdown` (`arch §5.2` `result`) under a `metrics` object; the supervisor flattens when writing `Result`. Multi-signal metric per `arch §10`. |
 | `failure_reason` | str? | Set when `status != "succeeded"` (`arch §3.4`). |
 | `started_at` / `ended_at` | float | Wall-clock bounds (`arch §3.4`); `ended_at` doubles as the envelope timestamp. |
+
+**Terminal vocabulary cross-reference (seam 2):** the events draft
+(`docs/research/event-schema-draft.md`, §3.8 "Terminal status vocabulary") defines the
+shared mapping between `result_envelope.status`, the event-log terminal kinds, and
+`Result.status`: `succeeded` → `worker_finished` (`done`), `failed` → `worker_failed`,
+`timeout` → `worker_failed`(`timeout`) / `worker_killed`(`watchdog_timeout`), `cancelled`
+→ `worker_killed`(`cancelled`). This section and that table must stay in lockstep.
 
 Supervisor-side enrichment (not on the wire): `session_id`, `event_log_ref` — `Result`
 fields (`arch §3.4`) assembled by Custos when writing
@@ -385,7 +404,7 @@ Sent as `fatal_error` (terminal) or `error` (response):
 | Tool failure | `build_failure`, `test_failure`, `command_error` | `true` | Restart policy engages (burst cap, backoff, wall budget) — `arch §7.4` |
 | Spec/config error | `unknown_tool`, `invalid_spec`, `tool_not_allowed` | `false` | **No retry**; task fails immediately — `arch §7.4` "Non-recoverable errors skip the restart budget and fail immediately" |
 | Provider outage | `AllProvidersFailed` | `true` | Worker retries inside the tool boundary for `provider_patience_s` (180 s) before emitting; only then is it a worker failure — `arch §7.4` |
-| Internal error | unhandled exception type | `false` | Worker emits `fatal_error`, then `exit_message` `reason:"fatal"`; stderr traceback captured as `kind="log"` |
+| Internal error | unhandled exception type | `false` | Worker emits `fatal_error`, then `exit_message` `reason:"fatal"`; stderr traceback captured as `worker_stdout_line` (events catalog §3.4) |
 | Fencing violation | `generation_mismatch` | `false` | `exit_message` `reason:"fatal"` — `arch §7.3` |
 
 `partial_commits` accompanies `fatal_error` so the supervisor knows what survived
@@ -509,7 +528,7 @@ resolves each row, the architecture doc wins.
 | 4 | Generic `ok`/`error` response envelopes | No generic envelope; each response message carries the echoed `request_id` directly (`arch §5.2` `ready`/`result`/`error`/`exit`). | Draft generalization. `ready` is kept as the concrete `init` response so the arch's message survives; `ok`/`error` are syntactic sugar over the same correlation rule. |
 | 5 | `progress` event | `tool_event` message (`arch §5.2`). | Draft generalization (tool_event = progress with `phase:"tool"`). Retain `tool_event` as an alias in v1 to avoid breaking the event-log contract (`arch §3.6` lists `tool_event` as an event kind). |
 | 6 | `fatal_error` event | `error` message with `recoverable` flag (`arch §5.2`, `§7.4`). | Draft rename emphasizing terminality; must keep the `recoverable` flag semantics. |
-| 7 | `exit_message` event | `exit` message, `reason` ∈ {done,crash,cancelled,fatal} (`arch §5.2`, `§5.3`). | Draft name only; the message itself is authoritative and identical. |
+| 7 | `exit_message` event | `exit` message, `reason` ∈ {done,crash,cancelled,fatal} (`arch §5.2`, `§5.3`). | Draft name only; the message itself is authoritative and identical. **Draft extension:** the draft's `exit_message` also echoes the `init` `request_id` — arch §5.2's `exit` message carries no `request_id`; drop the echo if the review prefers strict parity. |
 | 8 | `result_envelope.status` ∈ {succeeded,failed,timeout,cancelled} | `Result.status` ∈ {done,failed,rejected,timeout,cancelled} (`arch §3.4`, `§16.4`). | Draft maps `succeeded`→`done`. `rejected` (2) is an orchestrator/merge outcome, never a worker status — the draft intentionally omits it from the wire envelope; `Result` still carries it. |
 | 9 | `proto` version field on `init`/`ready` | No version field defined in `arch §5.2`. | Draft addition — required by the versioning requirement; low risk since both ends ship together. |
 | 10 | `MAX_LINE_BYTES` = 1 MiB; sender-side truncation caps | No line-length cap specified; torn lines accepted for parser simplicity (`arch §5.4(c)`). | Draft addition — the 1 MiB cap does not weaken the torn-line handling; a torn line over the cap is still dropped and resynced. |
@@ -533,11 +552,16 @@ produce when it implements the Nuntius wire loop.
 
 ### 8.1 Wire message → `events.py` event mapping
 
-| Wire message | Scaffold event (`events.py`) | Notes |
+| Wire message | Scaffold event (`events.py`) / catalog kind | Notes |
 |---|---|---|
 | `ready` (init response) | `WorkerStarted(task_id, pid)` | `pid` and `task_id` come straight from the `ready` body; `type="worker_started"`. |
-| `result_envelope` | `WorkerFinished(task_id, status, exit_code)` | `status` (any string is legal — the draft's `succeeded`/`failed`/`timeout`/`cancelled` assign cleanly) and `exit_code` map 1:1. |
-| `heartbeat`, `progress`, `checkpoint`, `exit_message`, `fatal_error` | no dedicated type yet | The scaffold comment says these four types "are the seed; the contract will grow with the architecture doc" (`events.py` docstring). `Event.kind` strings in `arch §3.6` (`heartbeat`, `tool_event`, `checkpoint`, `worker_exit`, `result`, …) are the intended growth. `LogEvent` is the catch-all for protocol errors (`level="error"`) and stderr (`level` parsed from prefixes, `arch §13`). |
+| `result_envelope` | `WorkerFinished(task_id, status, exit_code)` | `status` (any string is legal — the draft's `succeeded`/`failed`/`timeout`/`cancelled` assign cleanly) and `exit_code` map 1:1. Terminal vocabulary is shared with the events draft (§3.8, seam 2). |
+| `heartbeat` | `worker_heartbeat` (events draft §3.3) | `turn`, `tool`, `status` → payload; `monotonic_ms` → envelope. |
+| `checkpoint` | `worker_checkpoint` (events draft §3.5) | `state_ref`, `commits_so_far` → payload. |
+| `progress` (phase="tool") | no v1 kind — deferred `tool_event` (seam 1) | Valid protocol lines are never raw-echoed into `worker_stdout_line` (events draft D6); reconstruct from `heartbeat.tool` + the checkpoint trail; the `tool_event` kind lands in v2.1. Same resolution as the events draft (seam 1). |
+| `fatal_error` | `worker_error` (events draft §3.16) | Same arch `error` message (`arch §5.2`, `§7.4`); `recoverable` maps 1:1 (seam 2). |
+| `exit_message` | terminal encoding, by `reason` | `reason="done"` → `worker_finished`; `reason="crash"`/`"fatal"` → `worker_failed`; `reason="cancelled"` → `worker_killed` (events draft terminal vocabulary, seam 2). |
+| stderr | `worker_stdout_line` (events draft §3.4) | Non-protocol bytes; `level` parsed from prefixes (`arch §13`). |
 | protocol errors (§4.1) | `LogEvent(level="error")` | advisory; never affects control flow (`arch §5.1.4`). |
 
 The scaffold `Event` base (`type`, `timestamp`) and `WorkerStarted`/`WorkerFinished`
@@ -581,7 +605,8 @@ can be added as fields later, matching `arch §3.6` `Event` schema).
  "tool":"grep_code","status":"locating global statics","monotonic_ms":...}
 
 {"type":"progress","task_id":"wt-abc-001","generation":3,"turn":1,"phase":"tool",
- "tool":"grep_code","cmd":"rg 'static' src/","exit_code":0,"duration_ms":1200}
+ "message":"locating global statics","tool":"grep_code","cmd":"rg 'static' src/",
+ "exit_code":0,"duration_ms":1200}
 
 {"type":"checkpoint","task_id":"wt-abc-001","generation":3,"turn":3,
  "state_ref":".../checkpoints/wt-abc-001/turn-003.json","commits_so_far":["a1b2c3d"]}
@@ -594,6 +619,7 @@ can be added as fields later, matching `arch §3.6` `Event` schema).
 
 {"type":"exit_message","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1","task_id":"wt-abc-001",
  "generation":3,"reason":"done","monotonic_ms":...}
+// request_id echo on exit_message is a draft extension — arch's exit carries none (Reconciliation #7)
 // EOF; proc.wait() == 0 within 100 ms → clean exit, task DONE (arch §5.3)
 ```
 
