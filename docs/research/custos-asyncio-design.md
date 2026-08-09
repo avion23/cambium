@@ -198,7 +198,7 @@ Read: `src/cambium/orchestrator.py` (59 lines) and `src/cambium/events.py` (47 l
 
 ## 6. Test scenarios
 
-There is **no test-strategy document in `main`** at this commit (`docs/` contains only `research/`, `reviews/`, `system-design.md`). The harness strategy lives in the un-merged arch worktree: `docs/architecture/module-template/architecture.md` §9 (unit tests, eval harness, canary suite, integration smoke test, sibling pinning) and the scaffold's `tests/scenarios/test_example_module.py` precedent (real fixtures, no mocks). The scenarios below slot into that strategy's §9.4 integration tier and extend the smoke test.
+There is **no test-strategy document in `main`** at this commit (`docs/` contains only `research/`, `reviews/`, `system-design.md`). The harness strategy lives in the un-merged arch worktree: `docs/architecture/module-template/architecture.md` §9 (unit tests, eval harness, canary suite, integration smoke test, sibling pinning) and the scaffold's colocated `src/cambium/modules/example/tests/test_example_module.py` precedent (real fixtures, no mocks). The scenarios below slot into that strategy's §9.4 integration tier and extend the smoke test.
 
 All scenarios use a **fake worker** (`tests/fixtures/fake_worker.py`): a script that speaks canned NDJSON over stdout at a scripted pace, controllable via env vars — no DSPy, no network, deterministic.
 

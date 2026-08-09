@@ -73,8 +73,8 @@ decomposition outright (an explicit prior decomposition wins).
 
 ## Test strategy
 
-One scenario test (`tests/scenarios/test_example_module.py`), no
-mocking, no network:
+Module tests live in `src/cambium/modules/example/tests/`; no mocking, no
+network:
 
 1. Load the real dataset; assert it loads and every record is
    schema-valid, plus a negative case: a malformed record raises

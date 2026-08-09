@@ -78,18 +78,19 @@ The drift check exit code matters: **exit 1 on regression** so CI gates on it.
 
 Two choices were weighed:
 
-- `tests/baselines/` — committed, versioned with the repo, reviewable in PRs.
+- `src/cambium/modules/<name>/tests/baselines/` — committed next to each module,
+  versioned with the repo, and reviewable in PRs.
   **Chosen for the committed reference** baselines: they are source of truth
   and must survive machine changes.
 - `.cambium/` — already in `.gitignore`, machine-generated, unbounded growth.
 
 Split: the **committed reference** lives in
-`tests/baselines/<module>/baseline.json` (one file per module, plus
-`tests/baselines/manifest.json`). Run artifacts and ephemeral drift reports
+`src/cambium/modules/<name>/tests/baselines/baseline.json` (one file per module).
+Run artifacts and ephemeral drift reports
 are written to `.cambium/baselines/` (gitignored). The committed file is the
 anchor for the drift gate; the `.cambium/` copies are forensic history.
 
-### JSON schema (`tests/baselines/<module>/baseline.json`)
+### JSON schema (`src/cambium/modules/<name>/tests/baselines/baseline.json`)
 
 ```jsonc
 {
@@ -125,8 +126,8 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
       "p50": 0.004, "p90": 0.011, "max": 0.02
     },
     "by_nodeid": {
-      "tests/scenarios/test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.004,
-      "tests/scenarios/test_example_module.py::test_malformed_record_is_rejected": 0.011
+      "src/cambium/modules/example/tests/test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.004,
+      "src/cambium/modules/example/tests/test_example_module.py::test_malformed_record_is_rejected": 0.011
     }
   },
   "drift_thresholds": {                 // defaults; configurable per module
@@ -256,7 +257,7 @@ class Bench:
         if exitstatus != 0:
             return  # do not anchor a baseline on a red run
         report = compute_report(self, ...)     # times, integrity, metric, canaries
-        drift = compare_against_anchor(report) # tests/baselines/<module>/baseline.json
+        drift = compare_against_anchor(report) # src/cambium/modules/<name>/tests/baselines/baseline.json
         write_artifact(report, ".cambium/baselines/")
         if drift.regressions:
             session.exitstatus = 1             # gate on regression

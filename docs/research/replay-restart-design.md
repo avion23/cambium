@@ -246,7 +246,7 @@ Numbered step semantics:
 
 ## 6. Test scenarios
 
-**Linking note:** there is no dedicated `test-strategy.md` in main as of this branch. Test-strategy guidance lives in `docs/architecture/module-template/architecture.md` §9 ("Test Strategy") and in the scenario-test pattern already used at `tests/scenarios/test_example_module.py` (real components, no mocks). **[PROPOSED]** the scenarios below become `tests/scenarios/test_crash_recovery.py` on the same pattern, plus a `cambium doctor` consistency check (§13) as the post-crash assertion oracle.
+**Linking note:** there is no dedicated `test-strategy.md` in main as of this branch. Test-strategy guidance lives in `docs/architecture/module-template/architecture.md` §9 ("Test Strategy") and in the colocated scenario-test pattern already used at `src/cambium/modules/example/tests/test_example_module.py` (real components, no mocks). **[PROPOSED]** the scenarios below become `tests/scenarios/test_crash_recovery.py` on the same harness pattern, plus a `cambium doctor` consistency check (§13) as the post-crash assertion oracle.
 
 Fault-injection primitive: a test hook that kills the supervisor process (SIGKILL) at an event-loop checkpoint, then starts a new supervisor over the same `${session_dir}` and asserts on `events.db` + `worktrees/` + `checkpoints/` + `result.json`.
 

@@ -87,7 +87,7 @@ Standard checks (run from repo root unless noted):
 
 **Test hygiene** (on top of the checks above):
 
-- Scenario/integration tests are the primary module tests (`tests/scenarios/test_<module>.py`); no TDD ceremony — write a test when it earns its place.
+- Scenario/integration tests are the primary module tests and live with the module (`src/cambium/modules/<name>/tests/`); no TDD ceremony — write a test when it earns its place.
 - Supervision tests use **fake workers**, not real ones.
 - **No network in tests.** Anything that dials a provider is a manual or gated run.
 - Harness code is **stdlib + git only**. `dspy` is an optional extra, lazy-imported, never a hard dependency.
@@ -126,7 +126,7 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 - **No shell=True with user input.** Use list-form `subprocess.run`. `git_op` and `grep_code` enforce this.
 - **API keys are env-only.** Never log them. Never put them in protocol messages. See `docs/architecture/architecture.md` §12.
 - **Every disk write off the event loop.** Use `asyncio.to_thread` or a writer thread. See `docs/architecture/architecture.md` §6.2.
-- **Module shape** (per `docs/architecture/module-template/*`): modules are pure JSON-in/JSON-out functions with strict JSON schemas, each with a CLI entry — `python -m cambium.modules.<name>` reads JSON from stdin, writes JSON to stdout. Modules depend on `Protocol`s (ports/adapters), never concrete providers; dependency injection happens at the root.
+- **Module shape** (per `docs/architecture/module-template/*`): modules are pure JSON-in/JSON-out functions with strict JSON schemas, each with a CLI entry — `python -m cambium.modules.<name>` reads JSON from stdin, writes JSON to stdout. Modules depend on `Protocol`s (ports/adapters), never concrete providers; dependency injection happens at the root. Tests live with the module: `src/cambium/modules/<name>/tests/`; a module is fully removable by deleting its directory (code + tests + datasets + its `architecture.md`). Harness-level tests (supervisor, store, merge, ipc, worker, tasktree, diffundo, bench, redact, doctor, cli, conformance) live in `tests/scenarios/`.
 - **Engine swap is a strategy pattern.** The rule engine is the primary `decide` implementation today; a DSPy program implementing the same interface can replace it behind the seam without touching callers (v2.1 — `docs/research/dspy-python-314.md`; see `docs/architecture/module-template/architecture.md` §5.1/§5.3).
 - **Durable state layout.** Event log and conversation store live in SQLite (WAL mode); low-level IPC is JSON-Lines. All session state sits under the dotted `.cambium/` dir — `docs/architecture/architecture.md` §16.2 is canonical on that naming.
 
@@ -214,8 +214,8 @@ A module is **done** when **all** of the following hold:
 
 1. Its `architecture.md` (per template) is committed.
 2. Its datasets are committed with explicit schema/version markers. **v2:** a single `<name>_pairs.jsonl` with inline `canary: true` records (see `src/cambium/modules/example/`); **v2.1:** the `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split per `docs/architecture/module-template/dataset-format.md`.
-3. Its metric and eval harness run green over the full dataset (including canaries) — in v2, via the scenario test (§9 of `docs/architecture/module-template/architecture.md`).
-4. Its unit tests pass.
+3. Its metric and eval harness run green over the full dataset (including canaries) — in v2, via the colocated scenario test in `src/cambium/modules/<name>/tests/` (§9 of `docs/architecture/module-template/architecture.md`).
+4. Its colocated module tests in `src/cambium/modules/<name>/tests/` pass.
 5. The end-to-end smoke test passes with the module wired in.
 6. An adversarial review has been committed under `docs/architecture/reviews/` (or an existing one updated and re-run).
 7. The change has been verified (VERIFIED, not UNVERIFIED) per §5.

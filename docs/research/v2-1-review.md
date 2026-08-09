@@ -73,7 +73,8 @@ audited release baseline.
    git, event-store integrity, datasets, worktrees, and secret-file hygiene
    (`src/cambium/doctor.py`, exercised by `tests/scenarios/test_tooling.py`). The reference
    module now has train/eval/canary splits and loader rules
-   (`src/cambium/modules/example/datasets/`, `tests/scenarios/test_dataset_splits.py`).
+   (`src/cambium/modules/example/datasets/`,
+   `src/cambium/modules/example/tests/test_dataset_splits.py`).
 
 #### Orchestration and provider modules available on implementation branches
 

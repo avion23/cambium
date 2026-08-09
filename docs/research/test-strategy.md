@@ -227,7 +227,7 @@ Cascade"):
 ### 6.2 Decision modules against dataset + metric
 
 `ShouldDecompose` is the reference (scenario S14, existing
-`tests/scenarios/test_example_module.py`). The pattern every future module
+`src/cambium/modules/example/tests/test_example_module.py`). The pattern every future module
 repeats, per `docs/architecture/module-template/architecture.md` §9:
 
 1. Load the real dataset; every record schema-valid; a malformed record raises
@@ -267,7 +267,7 @@ uses `tmp_path_factory` scratch repos and the fake workers of §2.
 | **S11** | Orphan fencing after supervisor crash | Spawn a worker, SIGKILL the supervisor, leave the orphan running; start a new supervisor in the same session dir | New supervisor bumps generation; the orphan's next git op reads `.cambium/generation`, detects the mismatch, emits `exit reason=fatal`, and dies — no split-brain writes |
 | **S12** | Diffundo cascade failover | Fake providers: A=429, B=200 (same tier) | Result from B; A in cooldown; no "only first provider ever tried" behavior |
 | **S13** | Provider outage parks dispatch | All fake providers down | `AllProvidersFailed` caught by the orchestrator; dispatch parked; an already-running worker survives (no provider-outage mass kill) |
-| **S14** | ShouldDecompose dataset + metric + canaries | Existing `tests/scenarios/test_example_module.py` | Metric 1.0 over the full dataset; both canaries present and passing; `DatasetError` on malformed records |
+| **S14** | ShouldDecompose dataset + metric + canaries | Existing `src/cambium/modules/example/tests/test_example_module.py` | Metric 1.0 over the full dataset; both canaries present and passing; `DatasetError` on malformed records |
 | **S15** | Shutdown hygiene | Cancel a mid-task session (`cancel` → SIGTERM → SIGKILL per `docs/architecture/architecture.md` §7.7) | Graceful cancel path completes; straggler process groups SIGKILLed (no `.kill()` on asyncio Tasks — IMPL-C11); worktrees pruned; event-log writer flushed and DB closed |
 
 S01 is the `cambium.tests.smoke` entry point referenced by `agents.md` §5 and
@@ -473,7 +473,7 @@ Tested on CPython 3.14.7 with pytest 8.x (installed via
 ## 11. Scope note
 
 This document is a **design** for the harness tests. Today only S14 exists
-(`tests/scenarios/test_example_module.py`, the reference module). Every other
+(`src/cambium/modules/example/tests/test_example_module.py`, the reference module). Every other
 test lands alongside its module (Custos, Nuntius, Surculus, Unio, Diffundo,
 Septum), in the same PR that implements the module, gated by the L1 smoke test
 (S01). A module that ships without its scenario test is not complete

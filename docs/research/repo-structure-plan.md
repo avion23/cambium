@@ -50,7 +50,7 @@ src/cambium/                        events.py, orchestrator.py, __init__.py
 src/cambium/modules/                base.py, __init__.py
 src/cambium/modules/example/        architecture.md, dataset.py, decide.py, metric.py, __init__.py
 src/cambium/modules/example/datasets/example_pairs.jsonl
-tests/scenarios/test_example_module.py
+src/cambium/modules/example/tests/test_example_module.py
 ```
 
 ### What is junk

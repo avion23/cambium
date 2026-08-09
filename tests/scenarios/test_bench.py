@@ -37,8 +37,8 @@ SCHEMA_KEYS = {
 }
 
 FAST_TESTS = [
-    "tests/scenarios/test_example_module.py::test_dataset_is_loadable_and_schema_valid",
-    "tests/scenarios/test_example_module.py::test_malformed_record_is_rejected",
+    "tests/scenarios/test_tooling.py::test_ruff_check_clean_on_src",
+    "tests/scenarios/test_tasktree.py::test_task_kind_is_the_enum_norm",
 ]
 
 WALL_RATIO = "--bench-wall-ratio=100"

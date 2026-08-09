@@ -22,14 +22,7 @@ from cambium.modules.example import (
 )
 from cambium.modules.example.metric import evaluate_split, evaluate_split_async
 
-DATASETS_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "src"
-    / "cambium"
-    / "modules"
-    / "example"
-    / "datasets"
-)
+DATASETS_DIR = Path(__file__).resolve().parents[1] / "datasets"
 
 EXPECTED_COUNTS = {Split.TRAIN: 200, Split.EVAL: 50, Split.CANARIES: 10}
 EXAMPLE_PAIRS_COUNT = 9
