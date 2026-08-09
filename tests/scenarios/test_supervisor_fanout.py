@@ -32,13 +32,6 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKER = str(ROOT / "scripts" / "fake_worker.py")
 CRASH_WORKER = str(ROOT / "tests" / "fixtures" / "crash_worker.py")
 
-try:
-    import cambium.worker  # noqa: F401
-
-    HAVE_CAMBIUM_WORKER = True
-except ImportError:
-    HAVE_CAMBIUM_WORKER = False
-
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
