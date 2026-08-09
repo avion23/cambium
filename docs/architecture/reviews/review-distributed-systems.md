@@ -343,7 +343,7 @@ These are implementation errors, not architecture, but they indicate the code ha
 
 ### N3. Sandbox (M8) is incomplete and references undefined `sys`
 
-`_bwrap_command` uses `sys.executable` but doesn't import `sys`. The `Sandbox.wrap()` method returns a command list but `_spawn_worker` in M4 doesn't use it — workers are spawned with `[sys.executable, self.worker_script]` directly. The sandbox is not wired into the supervisor.
+`_sandbox_command` uses `sys.executable` but doesn't import `sys`. The `Sandbox.wrap()` method returns a command list but `_spawn_worker` in M4 doesn't use it — workers are spawned with `[sys.executable, self.worker_script]` directly. The sandbox is not wired into the supervisor.
 
 ### N4. `grep_code` is a shell-injection vector
 

@@ -147,7 +147,7 @@ Each module has a **clear interface boundary**, a **testable contract**, and can
 | **M5: Worker Runtime** | **Opifex** | DSPy ReAct loop, tool execution, checkpointing | M1, M2 | ~600 | P0 |
 | **M6: Orchestrator** | **Architectus** | LLM-driven task decomposition, routing, evaluation | M2, DSPy | ~400 | P1 |
 | **M7: Merge Sequencer** | **Unio** | Sequential rebase merge, conflict detection, test gate | git CLI, M3 | ~300 | P1 |
-| **M8: Sandbox Wrapper** | **Septum** | bubblewrap/firejail process wrapping, per-task policy | bwrap/firejail | ~150 | P2 |
+| **M8: Sandbox Wrapper** | **Septum** | namespace process wrapping, per-task policy | namespace wrapper, firejail | ~150 | P2 |
 | **M9: DSPy Optimization Harness** | **Ascensus** | Record trajectories, define metrics, run SIMBA/GEPA | DSPy, M5 | ~400 | P2 |
 | **M10: CLI / TUI** | **Janus** | User interface, task submission, status monitoring | M4, M6 | ~500 | P2 |
 
@@ -1034,13 +1034,13 @@ from typing import Optional
 
 class Sandbox:
     """
-    bubblewrap-based isolation per worker.
+    namespace-based isolation per worker.
     Workers can only see their worktree + read-only system dirs.
     """
 
-    def __ bwrap_command(self, worktree_path: str, allow_network: bool = False) -> list[str]:
+    def __ sandbox_command(self, worktree_path: str, allow_network: bool = False) -> list[str]:
         cmd = [
-            "bwrap", "--die-with-parent",
+            "sandbox", "--die-with-parent",
             "--ro-bind", "/usr", "/usr",
             "--ro-bind", "/lib", "/lib",
             "--ro-bind", "/lib64", "/lib64",
@@ -1057,7 +1057,7 @@ class Sandbox:
 
     def wrap(self, worktree_path: str, allow_network: bool = False) -> list[str]:
         """Return the command list to run a sandboxed worker."""
-        return self._bwrap_command(worktree_path, allow_network)
+        return self._sandbox_command(worktree_path, allow_network)
 ```
 
 ---
@@ -1226,7 +1226,7 @@ FanOut is injected into both the supervisor's orchestrator layer and the workers
 | Single-attempt compaction guard | Claude Code | Prevents infinite compaction loops |
 | Explicit truncation detection | OpenCode (lesson) | Don't doom-loop on truncated tool calls |
 | BM25 tool search | Codex | When MCP servers expose hundreds of tools |
-| OS-native sandboxing | Codex | bubblewrap namespaces + seccomp |
+| OS-native sandboxing | Codex | namespace-based isolation + seccomp |
 | Two-phase memory | Codex | Light model extracts, strong model consolidates |
 | RLM context-as-variables | Prime Agent | Long sessions without losing access to past info |
 | Continual harness self-improvement | Prime Agent | Agent CRUD on its own prompts/skills |
@@ -1332,12 +1332,12 @@ All three agree: the architecture is correct, the CS foundations are well-chosen
 | **F4** | **Workers bypass FanOut** — worker.py creates `dspy.LM(model=model)` directly. Provider cascade/race/cache doesn't protect the workers (which are the majority of LLM calls). | IMPL-C12 | Inject FanOut config into worker via init message. Worker constructs FanOut locally. |
 | **F5** | **FanOut cascade is a no-op across models** — `if provider.model != model: continue` skips every provider that doesn't match the exact model string. The headline multi-provider feature literally doesn't work. | LLM-C2 | Remove the model-match guard. Cascade should try ANY available provider, not just exact-match. |
 | **F6** | **Heartbeat timeout (60s) < tool timeout (120s)** — `run_shell` has a 120s timeout. A worker running `cargo build` sends no heartbeat for up to 120s → killed at 60s by the watchdog. | DS-C3 | Per-tool heartbeat (long-running tools emit heartbeats mid-execution). Raise default timeout to 180s. Add jitter. |
-| **F7** | **~12 syntax errors in code samples** — `os.getpid()` without importing `os`, `self.root` instead of `self.repo_root`, `write_content()` instead of `write_text()`, broken `__task_id_counter`, `__ bwrap_command` typo, missing `import asyncio` in orchestrator, etc. | IMPL-C3-C9 | These are draft bugs. The coding agent will write correct code. But they prove the code hasn't been smoke-tested. |
+| **F7** | **~12 syntax errors in code samples** — `os.getpid()` without importing `os`, `self.root` instead of `self.repo_root`, `write_content()` instead of `write_text()`, broken `__task_id_counter`, `__ sandbox_command` typo, missing `import asyncio` in orchestrator, etc. | IMPL-C3-C9 | These are draft bugs. The coding agent will write correct code. But they prove the code hasn't been smoke-tested. |
 | **F8** | **No structured edit tool** — only `write_file` (full overwrite) and `run_shell`. Every production agent (Claude Code, Codex, OpenCode) has a diff/patch tool. Without it, the agent is strictly weaker. | LLM-C3 | Add `edit_file(path, old_string, new_string)` tool. Consider structured patch parsing (Lark grammar, per Codex). |
 | **F9** | **Independent hill-climbing claim is overstated** — worker optimization data depends on decomposer quality. Coupled nodes can't truly be optimized independently. | LLM-C4 | Document as hypothesis to validate. Start with worker-only optimization (most data, clearest metric). |
 | **F10** | **No automatic coding metric for SIMBA/GEPA** — "did tests pass" is necessary but insufficient. Gameable (empty patches pass). | LLM-C5 | Multi-signal metric: tests pass (floor) + LLM-judge quality score + diff size reasonableness + behavioral checks. |
 | **F11** | **Event log writes are not crash-safe** — `open(path, "a")` + write is not atomic. Supervisor crash mid-write corrupts the log. | DS-C6 | Use `os.fsync()` after each write. Or use SQLite WAL mode (atomic by default). |
-| **F12** | **bubblewrap is Linux-only** — user has a macOS build machine. No fallback documented. | IMPL-M4 | Platform abstraction: `bubblewrap` (Linux), `sandbox-exec` (macOS), none (Windows/CI). |
+| **F12** | **Sandbox backend is Linux-only** — user has a macOS build machine. No fallback documented. | IMPL-M4 | Platform abstraction: Linux namespace tool, `sandbox-exec` (macOS), none (Windows/CI). |
 
 ### Moderate Issues (Fix During Implementation)
 
