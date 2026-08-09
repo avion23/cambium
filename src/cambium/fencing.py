@@ -11,6 +11,11 @@ import os
 import tempfile
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+
 FENCE_FILE = ".cambium/generation"
 
 
@@ -58,8 +63,41 @@ def write_generation(worktree: Path, generation: int) -> int:
 
 
 def next_generation(worktree: Path) -> int:
-    """Advance the worktree fence and return the new generation."""
-    return write_generation(worktree, read_generation(worktree) + 1)
+    """Advance the worktree fence and return the new generation.
+
+    Recovery is expected to have one recovery process.  On POSIX, an exclusive
+    ``fcntl.flock`` on the fence file also serializes concurrent callers while
+    they read and write the generation.  ``fcntl`` is not available in the
+    standard library on Windows, so the Windows fallback relies on the
+    single-recovery-process assumption and does not provide cross-process
+    locking.
+    """
+    fence_dir = Path(worktree) / ".cambium"
+    fence_dir.mkdir(parents=True, exist_ok=True)
+    fence_path = fence_dir / "generation"
+
+    with fence_path.open("a+", encoding="ascii", newline="\n") as fence:
+        if fcntl is not None:
+            fcntl.flock(fence.fileno(), fcntl.LOCK_EX)
+        try:
+            fence.seek(0)
+            try:
+                current = int(fence.read().strip(), 10)
+            except (UnicodeError, ValueError):
+                current = 0
+            if current < 0:
+                current = 0
+
+            generation = current + 1
+            fence.seek(0)
+            fence.truncate()
+            fence.write(f"{generation}\n")
+            fence.flush()
+            os.fsync(fence.fileno())
+            return generation
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fence.fileno(), fcntl.LOCK_UN)
 
 
 def validate_worker_generation(worktree: Path, worker_generation: int | None) -> bool:
