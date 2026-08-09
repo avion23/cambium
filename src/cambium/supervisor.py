@@ -34,9 +34,10 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 PROTO = 1
 WORKER_STDIN_LIMIT = 1_048_576
@@ -130,10 +131,10 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
 async def _next_message(
     messages: asyncio.Queue[dict[str, Any] | None], deadline: float
 ) -> dict[str, Any] | None:
-    """Next message, or None at EOF. Raises asyncio.TimeoutError when deadline passes."""
+    """Next message, or None at EOF. Raises TimeoutError when deadline passes."""
     remaining = deadline - asyncio.get_running_loop().time()
     if remaining <= 0:
-        raise asyncio.TimeoutError
+        raise TimeoutError
     return await asyncio.wait_for(messages.get(), remaining)
 
 
@@ -147,7 +148,7 @@ async def _run_gate(
     )
     try:
         _out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         log.emit("gate", task_id=task_id, command=command, exit_code=None, timed_out=True)
@@ -263,7 +264,7 @@ async def run_session(
     while True:
         try:
             msg = await _next_message(messages, ready_deadline)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             timeout_kind = "ready"
             break
         if msg is None:
@@ -291,7 +292,7 @@ async def run_session(
         while True:
             try:
                 msg = await _next_message(messages, wall_deadline)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 timeout_kind = "wall"
                 break
             if msg is None:
@@ -344,7 +345,7 @@ async def run_session(
             try:
                 gate_rc = await _run_gate(
                     task_spec["gate"], worktree, log, task_id, timeout=min(gate_timeout, remaining))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 gate_rc = None
                 timed_out = True
                 timeout_kind = "gate"

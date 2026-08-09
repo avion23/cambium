@@ -27,7 +27,7 @@ class Example:
     prediction: Any | None = None
     canary: bool = False
 
-    def with_prediction(self, prediction: Any) -> "Example":
+    def with_prediction(self, prediction: Any) -> Example:
         """Return a copy of this example with a prediction attached."""
         return Example(
             input=self.input,
