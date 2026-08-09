@@ -205,7 +205,6 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 | Debug a worker crash / restart loop | `docs/architecture/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
 | Debug a merge failure | `docs/architecture/architecture.md` §4 (Unio), §7.8 |
 | Understand an old design choice | `docs/architecture/system-design.md` (v0.1) + the three `docs/architecture/reviews/` |
-| Find what to copy for a sandbox backend (out of v2 scope) | `src/cambium/septum/` + §4 (Septum) in architecture.md; removal rationale in design-deltas D7 |
 
 ---
 
