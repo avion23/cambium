@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from cambium.merge import (
+    GitError,
     MergeConflictError,
     MergeSequencer,
     NonFastForwardError,
@@ -301,3 +302,147 @@ def test_reconcile_reads_current_main(tmp_path) -> None:
     # a missing ref reports None (no main yet)
     _run(repo, "update-ref", "-d", "refs/heads/main")
     assert seq.reconcile(repo) is None
+
+
+def test_publish_rejects_empty_and_zero_expected_old(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    wt_a = tmp_path / "wt-a"
+    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    _run(repo, "update-ref", "-d", "refs/heads/main")  # first-publish state: main absent
+
+    seq = MergeSequencer(task_id="empty-old")
+    for bad in ("", "0" * 40):
+        with pytest.raises(NonFastForwardError):
+            seq.publish_merge(repo, tip_a, bad)
+        # the backdoor is closed: git would read the empty/zero old-value as
+        # "ref must not exist" and CREATE main — assert it was not created
+        assert _run(repo, "rev-parse", "--verify", "refs/heads/main", check=False).returncode != 0
+
+    # the legitimate first-publish path still works
+    seq.create_main(repo, tip_a)
+    assert _rev(repo, "refs/heads/main") == tip_a
+
+
+def test_publish_rejects_non_fast_forward_tips(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    wt_a = tmp_path / "wt-a"
+    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    wt_b = tmp_path / "wt-b"
+    tip_b = _worker_commit(repo, "wt-b", wt_b, {"b.txt": "b\n"}, tip_a)
+
+    seq = MergeSequencer(task_id="ff-1")
+    seq.publish_merge(repo, tip_a, base)  # genuine fast-forward works
+    assert _rev(repo, "refs/heads/main") == tip_a
+    seq.publish_merge(repo, tip_b, tip_a)
+    assert _rev(repo, "refs/heads/main") == tip_b
+
+    # rewind: publishing the now-ancestor tip_a against the current tip_b must
+    # be refused even though the expected-old check alone would pass
+    with pytest.raises(NonFastForwardError) as exc:
+        seq.publish_merge(repo, tip_a, tip_b)
+    assert "descendant" in str(exc.value)
+    assert _rev(repo, "refs/heads/main") == tip_b
+
+    # sideways: a divergent commit is not a descendant either
+    wt_c = tmp_path / "wt-c"
+    tip_c = _worker_commit(repo, "wt-c", wt_c, {"c.txt": "c\n"}, base)
+    with pytest.raises(NonFastForwardError):
+        seq.publish_merge(repo, tip_c, tip_b)
+    assert _rev(repo, "refs/heads/main") == tip_b
+
+
+def test_create_main_first_publish(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    wt_a = tmp_path / "wt-a"
+    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    _run(repo, "update-ref", "-d", "refs/heads/main")
+
+    seq = MergeSequencer(task_id="create-1")
+    assert seq.reconcile(repo) is None
+    seq.create_main(repo, tip_a)
+    assert _rev(repo, "refs/heads/main") == tip_a
+
+    # a second create is refused and changes nothing
+    with pytest.raises(NonFastForwardError):
+        seq.create_main(repo, tip_a)
+    assert _rev(repo, "refs/heads/main") == tip_a
+
+    # publish_merge from the created main works (ff)
+    wt_b = tmp_path / "wt-b"
+    tip_b = _worker_commit(repo, "wt-b", wt_b, {"b.txt": "b\n"}, tip_a)
+    seq.publish_merge(repo, tip_b, tip_a)
+    assert _rev(repo, "refs/heads/main") == tip_b
+
+
+def test_staging_conflict_with_spaced_path(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    (repo / "my file.txt").write_text("orig\n")
+    _run(repo, "add", "my file.txt")
+    _run(repo, "commit", "-m", "add spaced file")
+    base = _rev(repo, "HEAD")
+
+    wt_a = tmp_path / "wt-a"
+    _worker_commit(repo, "wt-a", wt_a, {"my file.txt": "from-a\n"}, base)
+    wt_m = tmp_path / "wt-m"
+    _worker_commit(repo, "wt-m", wt_m, {"my file.txt": "from-m\n"}, base)
+    _publish(repo, _rev(repo, "refs/heads/wt-m"), base)
+
+    seq = MergeSequencer(task_id="conf-space")
+    with pytest.raises(MergeConflictError) as exc:
+        seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
+    assert "my file.txt" in exc.value.conflicts  # unquoted by the -z parse
+    assert _rev(repo, "refs/heads/main") == _rev(repo, "refs/heads/wt-m")  # untouched
+    seq.cleanup_staging(repo)
+
+
+def test_prepare_staging_fetches_branch_from_remote(tmp_path) -> None:
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True
+    )
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _run(repo, "remote", "add", "origin", str(remote))
+    _run(repo, "push", "-u", "origin", "main")
+
+    builder = tmp_path / "builder"
+    subprocess.run(["git", "clone", "-q", str(remote), str(builder)], check=True)
+    for key, value in (("user.name", "merge-test"), ("user.email", "merge@test"),
+                       ("gc.auto", "0")):
+        _run(builder, "config", key, value)
+    _run(builder, "checkout", "-b", "wt-remote")
+    (builder / "remote.txt").write_text("remote\n")
+    _run(builder, "add", "remote.txt")
+    _run(builder, "commit", "-m", "remote work")
+    tip_remote = _rev(builder, "HEAD")
+    _run(builder, "push", "origin", "wt-remote")
+
+    # the main repo has neither the local branch nor the remote-tracking ref yet
+    assert _run(repo, "rev-parse", "--verify", "refs/heads/wt-remote",
+                check=False).returncode != 0
+    assert _run(repo, "rev-parse", "--verify", "refs/remotes/origin/wt-remote",
+                check=False).returncode != 0
+
+    seq = MergeSequencer(task_id="fetch-1")
+    staged = seq.prepare_staging(repo, tmp_path / "staging", "wt-remote", "main")
+    assert staged == tip_remote  # fetched and rebased onto the unchanged main
+    assert _rev(repo, "refs/cambium/staging/fetch-1") == staged
+    seq.cleanup_staging(repo)
+
+
+def test_repo_path_that_is_a_file_raises_git_error(tmp_path) -> None:
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.write_text("a file, not a directory\n")
+    seq = MergeSequencer(task_id="bad-path")
+
+    with pytest.raises(GitError) as exc:
+        seq.publish_merge(not_a_repo, "a" * 40, "b" * 40)
+    assert "not-a-repo" in str(exc.value)
+
+    # reconcile is best-effort: a broken repo path reports None, not a crash
+    assert seq.reconcile(not_a_repo) is None
