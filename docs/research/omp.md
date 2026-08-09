@@ -9,7 +9,7 @@
 
 ## What it is / stack
 
-`omp` is **Oh My Pi**, a terminal AI coding agent by GitHub user `can1357` (Can Bölük), a fork of [badlogic/pi-mono](https://github.com/badlogic/pi-mono) (Pi, by Mario Zechner).
+`omp` is **Oh My Pi**, a terminal AI coding agent by GitHub user `can1357` (Can Bölük), derived from [badlogic/pi-mono](https://github.com/badlogic/pi-mono) (Pi, by Mario Zechner). **Provenance note:** GitHub API reports `fork:false, parent:None, source:None` for `can1357/oh-my-pi` (`curl -s https://api.github.com/repos/can1357/oh-my-pi | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['fork'], d.get('parent'), d.get('source'))"` → `False None None`), i.e. it is a standalone repo, not a GitHub fork of pi-mono; the derivation is inferred from the inherited `PI_` env prefix and config-layout similarity (see "Naming" below), not from GitHub fork metadata.
 
 - **Runtime:** Bun-compiled single-file JavaScript. The local binary starts with `#!/usr/bin/env bun` and `// @bun`; `file` reports `JavaScript source, ASCII text, with very long lines (10260)`, 12,099,834 bytes, executable, mtime 2026-08-07 21:54. Local `bun` is 1.3.14 (matches the package's `engines: bun >= 1.3.14`).
 - **Stack (web):** TypeScript monorepo with a ~80k-line Rust core (`pi-natives`, `pi-shell`, `pi-ast`, `pi-walker`, `pi-iso`, `pi-voice`) shipped as an N-API addon; in-process grep/glob/find and a vendored bash fork with 58 ported coreutils. Claimed: 60+ providers, 31 built-in tools, 14 LSP ops, 28 DAP ops. (https://github.com/can1357/oh-my-pi)
@@ -49,7 +49,7 @@
 ## What it does poorly / limitations (observed locally)
 
 1. **`omp stats` hangs.** `omp stats` produced no output and was killed after 120 s by the runner (`shell tool terminated command after exceeding timeout 120000 ms`). Admin/telemetry commands can hang non-interactively.
-2. **Secrets in plaintext config.** `~/.omp/agent/models.yml` stores live API keys for 6+ providers in cleartext (redacted here). A harness that is "open all the way down" puts credential hygiene on the user.
+2. **Secrets in plaintext config.** `~/.omp/agent/models.yml` stores live API keys for 6 providers in cleartext (redacted here). A harness that is "open all the way down" puts credential hygiene on the user.
 3. **Brittle optional tooling.** Startup log `omp.2026-08-08.3858494.log` shows `MCP tool load failed path:"mcp:codebase-memory-mcp" error:"ENOENT … /home/ubuntu/.local/bin/codebase-memory-mcp"` — a configured MCP server whose binary does not exist still errors at load.
 4. **Config drift against catalog.** Same log: `No models match pattern "openai-codex/gpt-5.6-sol"` (×3, twice per boot) — the config references models the bundled catalog no longer resolves; warnings only, no resolution. The operator's own config was also edited live during bench runs (`config.yml.bak-bench` backup exists alongside `config.yml`).
 5. **Single giant JS blob.** The installed artifact is a 12 MB Bun bundle with an embedded model catalog (`omp models` prints 950 model rows). Startup pays for a full interpreter + catalog load.
@@ -94,7 +94,7 @@
 - Binary: 12,099,834 bytes, JavaScript, executable, mtime 2026-08-07 21:54.
 - Local version `omp/17.2.10`; npm latest `17.2.12`; `omp models` lists 950 model rows across 13 provider groups.
 - 760 session transcripts / 765 MB under `~/.omp/agent/sessions`; polymarket transcripts up to 5.6 MB each.
-- 6 configured providers with 5+ plaintext keys in `models.yml`; `maxInFlightRequests` cap 12 on openai-codex.
+- `models.yml` has 7 providers, 6 with inline plaintext `apiKey` (`openai-codex` is an override without a key); `modelProviderOrder` in `config.yml` has 6 entries; `maxInFlightRequests` cap 12 on openai-codex.
 
 ---
 
