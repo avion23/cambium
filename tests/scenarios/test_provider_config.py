@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from cambium.diffundo import ProviderTier
-from cambium.provider_config import env_report, load_providers
+diffundo = pytest.importorskip("cambium.diffundo")
+
+from cambium.provider_config import env_report, load_providers  # noqa: E402
 
 
 def _provider(name: str = "openai", **overrides: object) -> dict[str, object]:
@@ -42,7 +43,7 @@ def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
 
     assert len(providers) == 1
     assert providers[0].name == "openai"
-    assert providers[0].tier is ProviderTier.STRONG
+    assert providers[0].tier is diffundo.ProviderTier.STRONG
     assert providers[0].api_key_env == "OPENAI_API_KEY"
 
 

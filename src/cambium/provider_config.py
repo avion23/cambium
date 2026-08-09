@@ -13,9 +13,11 @@ import os
 import re
 from dataclasses import fields
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from .diffundo import ProviderConfig, ProviderTier
+if TYPE_CHECKING:
+    from .diffundo import ProviderConfig, ProviderTier
 
 _DEFAULT_PATH = Path(".cambium/providers.json")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -121,7 +123,18 @@ def _validate_api_key_env(value: object, location: str) -> str:
     return api_key_env
 
 
+def _diffundo_types() -> tuple[type[ProviderConfig], type[ProviderTier]]:
+    try:
+        from .diffundo import ProviderConfig, ProviderTier
+    except ModuleNotFoundError as exc:
+        if exc.name != "cambium.diffundo":
+            raise
+        raise ImportError("diffundo not merged yet") from exc
+    return ProviderConfig, ProviderTier
+
+
 def _provider_from_mapping(raw: object, index: int) -> ProviderConfig:
+    ProviderConfig, ProviderTier = _diffundo_types()
     location = f"providers[{index}]"
     if not isinstance(raw, dict):
         raise _error(location, "must be an object")
@@ -266,6 +279,16 @@ def env_report(providers: list[ProviderConfig] | tuple[ProviderConfig, ...]) -> 
     environment-variable name or value.
     """
     return {provider.name: provider.api_key_env in os.environ for provider in providers}
+
+
+def __getattr__(name: str) -> object:
+    if name == "ProviderConfig":
+        provider_config, _ = _diffundo_types()
+        return provider_config
+    if name == "ProviderTier":
+        _, provider_tier = _diffundo_types()
+        return provider_tier
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = ["DEFAULT_SAMPLE", "ProviderConfig", "ProviderTier", "env_report", "load_providers"]
