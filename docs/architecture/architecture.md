@@ -13,7 +13,7 @@ Cambium is a **Python 3.14 multi-agent coding-agent harness**, shipped as an emb
 
 Cambium is a **leaf module** of a larger system: a host process spawns instances, owns persistence, and reads structured `Result` records. Cambium itself is stateless across sessions.
 
-**What changed since v0.1.0.** Three adversarial reviews (`docs/reviews/`) catalogued ~25 CRITICAL flaws. v2 resolves every one. The headline fixes: (a) liveness is no longer "stdout EOF = dead" — there is an explicit four-layer liveness model with `request_id` framing, generation fencing tokens, and per-tool heartbeats; (b) all disk I/O is off the asyncio event loop on dedicated writer threads; (c) restart policy has full jitter plus an absolute ceiling; (d) worktrees are recovered (lock cleanup + hard reset) before every respawn and may be fenced by generation; (e) the FanOut cache is opt-in, keyed on task + context + model with a TTL, and lives upstream of workers; (f) the provider cascade actually cascades across models of a declared tier; (g) the merge sequencer holds an `asyncio.Lock` and operates in a throwaway worktree; (h) every DSPy module ships with its own frozen dataset, metric, and held-out eval — the "independently hill-climbable" claim is restated as a hypothesis validated under pinned siblings; (i) secrets are env-only and redacted; (j) logging is stdlib, structured, non-blocking, rotated.
+**What changed since v0.1.0.** Three adversarial reviews (`docs/architecture/reviews/`) catalogued ~25 CRITICAL flaws. v2 resolves every one. The headline fixes: (a) liveness is no longer "stdout EOF = dead" — there is an explicit four-layer liveness model with `request_id` framing, generation fencing tokens, and per-tool heartbeats; (b) all disk I/O is off the asyncio event loop on dedicated writer threads; (c) restart policy has full jitter plus an absolute ceiling; (d) worktrees are recovered (lock cleanup + hard reset) before every respawn and may be fenced by generation; (e) the FanOut cache is opt-in, keyed on task + context + model with a TTL, and lives upstream of workers; (f) the provider cascade actually cascades across models of a declared tier; (g) the merge sequencer holds an `asyncio.Lock` and operates in a throwaway worktree; (h) every DSPy module ships with its own frozen dataset, metric, and held-out eval — the "independently hill-climbable" claim is restated as a hypothesis validated under pinned siblings; (i) secrets are env-only and redacted; (j) logging is stdlib, structured, non-blocking, rotated.
 
 **Primary patterns kept from v0.1:** Erlang/OTP one-for-one transient supervision; git worktree isolation; deterministic/LLM layer separation; DSPy optimization flywheel; subprocess-per-worker with stdio IPC.
 
@@ -225,7 +225,7 @@ The `Event` stream is the **machine interface**. The TUI renders it; the host sy
 
 ## 4. Module Catalog
 
-Each row maps to one self-contained module with its own `architecture.md` (see `docs/module-template/`). Latin names retained for continuity with v0.1; **no module requires the Latin name to be used in code**.
+Each row maps to one self-contained module with its own `architecture.md` (see `docs/architecture/module-template/`). Latin names retained for continuity with v0.1; **no module requires the Latin name to be used in code**.
 
 | Code | Name | Layer | Responsibility | State owned |
 |---|---|---|---|---|
@@ -234,13 +234,13 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 | M3 | Surculus | Deterministic | `git worktree` lifecycle: create, recover, prune, list. | None (state lives in git). |
 | M4 | Custos | Deterministic | Supervisor: lifecycle, watchdog, restart, event log writer. | WorkerHandle table; event log handle; restart counters. |
 | M5 | Opifex | Worker | DSPy ReAct loop; tools; checkpoint; heartbeat. | Per-worker: trajectory, turn counter, generation token. |
-| M6 | Architectus | Orchestrator | Decision modules: `should_decompose` (v2 rule engine; DSPy seam per `docs/module-template/example-spec.md`), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. All subclass `cambium.modules.base.Module` (`decide()` + `metric()`). | Program versions (read-only at runtime). |
+| M6 | Architectus | Orchestrator | Decision modules: `should_decompose` (v2 rule engine; DSPy seam per `docs/architecture/module-template/example-spec.md`), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. All subclass `cambium.modules.base.Module` (`decide()` + `metric()`). | Program versions (read-only at runtime). |
 | M7 | Unio | Deterministic | Merge sequencer: serialized, throwaway worktree, test gate. | None (operates on a temp worktree). |
 | M8 | Septum | Deterministic | Sandbox wrapper: `bwrap` (Linux), `sandbox-exec` (macOS), noop. | None. |
 | M9 | Ascensus | Tooling (offline) | Optimization harness: per-module dataset, metric, held-out eval. | Optimized prompt artifacts under `.cambium/optimized/`. |
 | M10 | Janus | View | TUI: subscribes to `Session.events()`. Read-only. | None. |
 
-**Module interface contracts are normative.** Each module's `architecture.md` defines its inputs, outputs, state, failure modes, DSPy program, metric, dataset, and test strategy, per the template in `docs/module-template/architecture.md`.
+**Module interface contracts are normative.** Each module's `architecture.md` defines its inputs, outputs, state, failure modes, DSPy program, metric, dataset, and test strategy, per the template in `docs/architecture/module-template/architecture.md`.
 
 ---
 
@@ -787,7 +787,7 @@ There is no single number that captures "did the agent write good code." v2 uses
 
 Final score: `score = (tests × w1 + spec_adherence × w2 + diff_quality × w3 + behavioral_checks × w4) × canaries`. Weights are per-task-type in config; defaults above.
 
-**Held-out evaluation set.** `Ascensus` ships with 20+ reference coding tasks (in `src/cambium/modules/<name>/datasets/eval.jsonl`, schema in `docs/module-template/dataset-format.md`) with gold diffs and pre-registered rubrics. The held-out set is **never** used for training; it is the gate for shipping optimized prompts to production.
+**Held-out evaluation set.** `Ascensus` ships with 20+ reference coding tasks (in `src/cambium/modules/<name>/datasets/eval.jsonl`, schema in `docs/architecture/module-template/dataset-format.md`) with gold diffs and pre-registered rubrics. The held-out set is **never** used for training; it is the gate for shipping optimized prompts to production.
 
 **Reward-hacking canaries.** Each held-out task ships with 3–5 canary assertions designed to detect the failure modes the metric would otherwise incentivize (deleting failing tests, no-op patches, `# noqa` additions, etc.). A prompt variant that improves the training metric while regressing the canary rate is **rejected** by the optimization harness, even if its score went up.
 
@@ -971,7 +971,7 @@ The host may rely on the following invariants across v2.x:
 
 ### 17.1 The coupling problem, restated
 
-`Architectus` has four decision modules: `should_decompose` (v2 rule engine today, DSPy seam documented in `docs/module-template/example-spec.md` §5.1), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. `Opifex` has its own worker ReAct module. All are `cambium.modules.base.Module` subclasses with `decide()` + `metric()` methods (see the scaffold at `src/cambium/modules/base.py`). v0.1 claimed all five were "independently hill-climbable." They are not: the worker metric depends on the decomposer's output, the decomposer metric depends on the worker's competence, etc. SIMBA on one module with the others held fixed is a moving-target optimization.
+`Architectus` has four decision modules: `should_decompose` (v2 rule engine today, DSPy seam documented in `docs/architecture/module-template/example-spec.md` §5.1), `TaskDecomposer`, `TaskRouter`, `ResultEvaluator`. `Opifex` has its own worker ReAct module. All are `cambium.modules.base.Module` subclasses with `decide()` + `metric()` methods (see the scaffold at `src/cambium/modules/base.py`). v0.1 claimed all five were "independently hill-climbable." They are not: the worker metric depends on the decomposer's output, the decomposer metric depends on the worker's competence, etc. SIMBA on one module with the others held fixed is a moving-target optimization.
 
 ### 17.2 Decoupling via pinned siblings and held-out eval
 
@@ -991,7 +991,7 @@ Each module ships, under `src/cambium/modules/<name>/`:
 
 ```
 src/cambium/modules/<name>/
-├── architecture.md           # per-module design (template: docs/module-template/architecture.md)
+├── architecture.md           # per-module design (template: docs/architecture/module-template/architecture.md)
 ├── __init__.py               # public exports (module class, input/output, loader, metric)
 ├── decide.py                 # primary implementation (rule engine today) + the Module subclass;
 │                             #   this file is also the DSPy seam — a future DSPy program
@@ -1002,7 +1002,7 @@ src/cambium/modules/<name>/
     └── <name>_pairs.jsonl    # v2: single combined dataset; records may carry `canary: true`.
 ```
 
-**v2 extensions (labeled, opt-in):** the scaffold ships a single combined `datasets/<name>_pairs.jsonl` with inline `canary: true` markers (see `src/cambium/modules/example/` for the reference). Splitting into `train.jsonl` / `eval.jsonl` / `canaries.jsonl` per `docs/module-template/dataset-format.md` is the planned v2.1 layout — until then, canaries are inlined in the single file and an `eval.py` harness entry point selects them by the `canary` flag. A `siblings-stub.yaml` is added when this module becomes siblings with another (the `should_decompose` reference has none — it is the first module in the pipeline).
+**v2 extensions (labeled, opt-in):** the scaffold ships a single combined `datasets/<name>_pairs.jsonl` with inline `canary: true` markers (see `src/cambium/modules/example/` for the reference). Splitting into `train.jsonl` / `eval.jsonl` / `canaries.jsonl` per `docs/architecture/module-template/dataset-format.md` is the planned v2.1 layout — until then, canaries are inlined in the single file and an `eval.py` harness entry point selects them by the `canary` flag. A `siblings-stub.yaml` is added when this module becomes siblings with another (the `should_decompose` reference has none — it is the first module in the pipeline).
 
 ### 17.4 Optimization loop (in `Ascensus`)
 
@@ -1063,7 +1063,7 @@ For each CRITICAL item in the three reviews, the mechanism v2 uses to resolve it
 | LLM-C3 | Provider/model transparency assumed | Capability metadata on `ProviderConfig` (`supports_tools`, `context_window`); `require_tools` and `min_context_window` filters; tradeoffs documented. | §9.1, §9.2 |
 | LLM-C4 | "Independently hill-climbable" is false | Claim restated: "per-module optimizable against pinned siblings"; held-out eval per module; canary rejection. | §17 |
 | LLM-C5 | No automatic metric for coding tasks | Multi-signal metric: tests (floor) + spec-adherence (LLM judge) + diff-quality (heuristics) + behavioral checks + canaries (gate). | §10 |
-| LLM-C6 | No "do not decompose" path | `ShouldDecompose` classifier module; single-task fast path bypasses decomposition. (Spec'd as the reference example module — `docs/module-template/example-spec.md`.) | §4 (Architectus), §17 |
+| LLM-C6 | No "do not decompose" path | `ShouldDecompose` classifier module; single-task fast path bypasses decomposition. (Spec'd as the reference example module — `docs/architecture/module-template/example-spec.md`.) | §4 (Architectus), §17 |
 | LLM-M1 | Default test command broken (`\| tail`) | `Unio` uses raw `subprocess.run` exit code; no shell pipe; full output captured, truncated in Python. | §10, §11 |
 | LLM-M2 | Worker tool set inadequate | Adds `edit_file` (search-and-replace with uniqueness); fixes `write_file`/`grep_code`; structured-edit tool documented as v2.1. | §11 |
 | LLM-M3 | Optimization flywheel coupled, no stability | Held-out eval, canaries, human gate, rollback. | §10, §17.4 |
@@ -1110,7 +1110,7 @@ F1=§6.2, F2=§8.1, F3=§7(Unio), F4=§9.3, F5=§9.2, F6=§7.6, F7=per-module sp
 
 Concrete factors, and how this design addresses each. Ordered roughly by observed frequency of failure in comparable systems.
 
-1. **Testability without TDD.** TDD is not required, but every module ships with a test strategy (template field) and a smoke test that must pass before the module is marked P0-complete. The v0.1 reviews identified ~12 syntax bugs that a single dry run would have caught — that gate now exists. Addressed: §17, `docs/module-template/architecture.md` (test strategy field).
+1. **Testability without TDD.** TDD is not required, but every module ships with a test strategy (template field) and a smoke test that must pass before the module is marked P0-complete. The v0.1 reviews identified ~12 syntax bugs that a single dry run would have caught — that gate now exists. Addressed: §17, `docs/architecture/module-template/architecture.md` (test strategy field).
 
 2. **Verifiable metrics.** Every DSPy module has a metric that runs without human-in-the-loop scoring, against a frozen held-out set. Without this, optimization hill-climbs toward a proxy. Addressed: §10, §17.
 
@@ -1118,7 +1118,7 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 
 4. **Incremental milestones.** Each module is independently buildable and independently testable. The build phases (P0/P1/P2) have explicit entry conditions, not just exit conditions. Addressed: §4; per-module `architecture.md`.
 
-5. **Adversarial review gates.** Every module passes an adversarial review before merge; integration reviews re-run on every cross-module contract change. The three v0.1 reviews are the template for what a review looks like. Addressed: `docs/reviews/` are now first-class artifacts; `agents.md` documents the review gate.
+5. **Adversarial review gates.** Every module passes an adversarial review before merge; integration reviews re-run on every cross-module contract change. The three v0.1 reviews are the template for what a review looks like. Addressed: `docs/architecture/reviews/` are now first-class artifacts; `agents.md` documents the review gate.
 
 6. **No hidden global state.** Config is explicit (`Config` dataclass, frozen). No module-level mutables. All runtime state lives under `${session_dir}/.cambium/`. Two Cambium instances in two session dirs do not interfere. Addressed: §16.2 invariant 5.
 
@@ -1138,7 +1138,7 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 
 14. **Bounded everything.** Restarts (10 absolute), wall time (1800 s/task), memory (event ring buffer 10 000; queue 10 000), cache (LRU 10 000), log size (rotation), worker count (config). No resource grows without bound. Addressed: §6.2, §7.4, §8.1.
 
-15. **Smoke test as gate.** No module is marked complete until the end-to-end smoke test (fake LLM + 1 worker + 1 merge) passes against it. This is the single highest-leverage practice the v0.1 reviews identified. Addressed: `agents.md` documents the gate; the example module spec (`docs/module-template/example-spec.md`) demonstrates it.
+15. **Smoke test as gate.** No module is marked complete until the end-to-end smoke test (fake LLM + 1 worker + 1 merge) passes against it. This is the single highest-leverage practice the v0.1 reviews identified. Addressed: `agents.md` documents the gate; the example module spec (`docs/architecture/module-template/example-spec.md`) demonstrates it.
 
 **Failure modes this design does not yet address (honest gaps):**
 - Cold-start latency for subprocess-per-worker (mitigation documented; persistent pool deferred).
@@ -1151,10 +1151,10 @@ Concrete factors, and how this design addresses each. Ordered roughly by observe
 ## 20. References
 
 ### Review and prior-design artifacts
-- `docs/system-design.md` — v0.1 draft (superseded).
-- `docs/reviews/review-distributed-systems.md` — DS review (391 lines).
-- `docs/reviews/review-llm-design.md` — LLM review (242 lines).
-- `docs/reviews/review-implementation.md` — implementation review (326 lines).
+- `docs/architecture/system-design.md` — v0.1 draft (superseded).
+- `docs/architecture/reviews/review-distributed-systems.md` — DS review (391 lines).
+- `docs/architecture/reviews/review-llm-design.md` — LLM review (242 lines).
+- `docs/architecture/reviews/review-implementation.md` — implementation review (326 lines).
 
 ### Research docs (in main; cited from this document)
 
@@ -1167,7 +1167,7 @@ The research docs live under `docs/research/` in main. They are not present on t
 - `docs/research/opencode.md`, `docs/research/cloud-code.md`, `docs/research/omp.md`, `docs/research/pi.md`, `docs/research/pydev.md` — additional competitive-analysis context informing §4 module decomposition and §19 success factors. Not cited inline but tracked as background.
 
 ### Templates and orientation
-- `docs/module-template/architecture.md` — per-module design template.
-- `docs/module-template/dataset-format.md` — dataset JSONL schema, versioning, splits, canaries.
-- `docs/module-template/example-spec.md` — reference module (`ShouldDecompose`) for first implementation.
+- `docs/architecture/module-template/architecture.md` — per-module design template.
+- `docs/architecture/module-template/dataset-format.md` — dataset JSONL schema, versioning, splits, canaries.
+- `docs/architecture/module-template/example-spec.md` — reference module (`ShouldDecompose`) for first implementation.
 - `agents.md` — repo-root orientation for new agents.

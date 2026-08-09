@@ -1,14 +1,14 @@
 # Cambium — Test Strategy for the Harness Itself
 
 Research date: 2026-08-10. Purpose: answer **IMPL-M8** ("No test strategy for the
-harness itself", `docs/reviews/review-implementation.md`) and the test-relevant
+harness itself", `docs/architecture/reviews/review-implementation.md`) and the test-relevant
 findings of the distributed-systems and LLM-design reviews. The strategy
-applies to the harness as designed in `docs/architecture.md` (v2, pending merge
+applies to the harness as designed in `docs/architecture/architecture.md` (v2, pending merge
 from the architecture worktree): Custos (supervisor), Opifex (workers), Nuntius
 (IPC), Surculus (worktrees), Unio (merge sequencer), Diffundo (provider
 cascade), and the event log.
 
-Constraints honored from `agents.md` §5 and `docs/architecture.md` §19:
+Constraints honored from `agents.md` §5 and `docs/architecture/architecture.md` §19:
 
 - **No TDD / unit-test ceremony.** Scenario and integration tests are the norm.
   A module is done when its dataset/metric eval runs green, its scenario test
@@ -49,7 +49,7 @@ Ordering rule: a change that adds a harness behavior must add (or extend) an
 L5/L4 scenario *or* an L3 contract test — never a mock-heavy unit test that
 reimplements the module's internals. The v0.1 implementation review found
 "~12 syntax errors and undefined-name bugs" that a single dry run would have
-caught (`docs/reviews/review-implementation.md` verdict); the L1 smoke gate is
+caught (`docs/architecture/reviews/review-implementation.md` verdict); the L1 smoke gate is
 what closes that class.
 
 ---
@@ -57,15 +57,15 @@ what closes that class.
 ## 2. Fake workers — the four liveness modes
 
 The distributed-systems review (DS-C2) showed that "stdout EOF = worker dead"
-is unsound. The liveness model in `docs/architecture.md` §5.3 is four-layer
+is unsound. The liveness model in `docs/architecture/architecture.md` §5.3 is four-layer
 (process exit → `exit` message → heartbeat watchdog → EOF advisory). To test it
 we drive real worker *scripts* through the real spawn path
-(`asyncio.create_subprocess_exec`, `docs/architecture.md` §7.2: `start_new_session=True`,
+(`asyncio.create_subprocess_exec`, `docs/architecture/architecture.md` §7.2: `start_new_session=True`,
 `PYTHONUNBUFFERED=1`) and give the supervisor exactly the four worker behaviors
 the liveness model must distinguish.
 
 One script, `tests/fakes/worker_liveness.py`, mode selected by env
-`FAKE_MODE`; each mode speaks the Nuntius protocol (`docs/architecture.md` §5.2): read `init` from
+`FAKE_MODE`; each mode speaks the Nuntius protocol (`docs/architecture/architecture.md` §5.2): read `init` from
 stdin, echo the `request_id`, emit `ready`, then behave per mode.
 
 | Mode | Script behavior | What it exercises | Expected supervisor outcome |
@@ -93,8 +93,8 @@ if the supervisor itself misbehaves (which is the bug we are trying to catch).
 ## 3. Deterministic event-log replay tests
 
 The event log is SQLite-WAL with a dedicated writer thread, critical-event
-fsync, gap-free `seq`, and snapshot compaction (`docs/architecture.md` §6).
-These are the tests that make the durability contract (`docs/architecture.md`
+fsync, gap-free `seq`, and snapshot compaction (`docs/architecture/architecture.md` §6).
+These are the tests that make the durability contract (`docs/architecture/architecture.md`
 §6.5) a tested claim rather than a design aspiration:
 
 1. **Writer thread, not event loop.** Enqueue a burst while the writer thread
@@ -110,7 +110,7 @@ These are the tests that make the durability contract (`docs/architecture.md`
    "crash", reopen; assert the replayed stream equals the post-snapshot events
    in `seq` order and that `seq` is gap-free.
 4. **Result recovery.** A `result` written to the checkpoint store before emit
-   (`docs/architecture.md` §5.4 mode c) must be recoverable even when the `result` line itself was
+   (`docs/architecture/architecture.md` §5.4 mode c) must be recoverable even when the `result` line itself was
    torn — scenario S05 covers this end-to-end.
 5. **Drain-deadline watchdog (DS-C2 mode d).** Stall the supervisor's stdout
    reader for past the drain deadline and assert a `supervisor_stall` event is
@@ -125,7 +125,7 @@ These run on a temp DB in `tmp_path_factory.mktemp("log")` — **VERIFIED** that
 
 ## 4. Worktree lifecycle tests (Surculus)
 
-Surculus owns `worktree add / recover / prune` (`docs/architecture.md` §7.5).
+Surculus owns `worktree add / recover / prune` (`docs/architecture/architecture.md` §7.5).
 All tests run against a real scratch repo (`git init` in a temp dir, `gc.auto=0`
 set as the design requires — IMPL-M3):
 
@@ -143,7 +143,7 @@ set as the design requires — IMPL-M3):
 3. **Quarantine on recovery failure.** Make the reset fail (e.g., a worktree
    with a corrupted `.git`); assert the tree is moved to
    `${session_dir}/cambium/quarantine/<task_id>-<generation>/` and a fresh
-   worktree is created from `base_commit` (`docs/architecture.md` §7.5).
+   worktree is created from `base_commit` (`docs/architecture/architecture.md` §7.5).
 4. **Prune.** Create stale `git worktree` administrative entries; assert
    `prune()` on startup and shutdown removes them (DS-N7).
 
@@ -152,7 +152,7 @@ set as the design requires — IMPL-M3):
 ## 5. Merge-sequencer concurrency tests (Unio)
 
 Unio is serialized by an `asyncio.Lock`, verifies in a throwaway worktree, and
-publishes via an atomic `git update-ref` (`docs/architecture.md` §7.8). These
+publishes via an atomic `git update-ref` (`docs/architecture/architecture.md` §7.8). These
 tests are where the IMPL-C1 / DS-M1 "parallel workers, serial merge, no
 corruption" claim is proven:
 
@@ -176,7 +176,7 @@ corruption" claim is proven:
 4. **`reconcile()` closes the crash gap.** Simulate a crash between
    `update-ref` and the `merge_committed` event emit: advance `refs/heads/main`
    behind the log's back, run `Unio.reconcile()`, assert a `merge_reconciled`
-   event is emitted and the ref/log gap is closed (`docs/architecture.md`
+   event is emitted and the ref/log gap is closed (`docs/architecture/architecture.md`
    §7.8).
 
 ---
@@ -193,7 +193,7 @@ per-provider behavior selected by path or header: canned `200` completion,
 network is touched; every test resolves providers to `http://127.0.0.1:<port>`.
 
 Tests call `Diffundo.call(...)` directly (not through a full DSPy ReAct), so
-they cover the contract of `docs/architecture.md` §9 ("Diffundo — Provider
+they cover the contract of `docs/architecture/architecture.md` §9 ("Diffundo — Provider
 Cascade"):
 
 1. **Tier cascade actually cascades.** Two providers in tier `"fast"`; the
@@ -207,7 +207,7 @@ Cascade"):
 4. **`AllProvidersFailed` is typed and carries evidence.** All providers down
    → the exception carries `providers_tried` and `last_error`; the orchestrator
    catches it and parks dispatch instead of crashing (IMPL-M5,
-   `docs/architecture.md` §9.2).
+   `docs/architecture/architecture.md` §9.2).
 5. **Cache is opt-in, keyed, TTL'd.** `cache=True` without `context_hash` is
    rejected; with `context_hash`, a repeat call is served with
    `"cache_hit": true`; a different `context_hash` is a miss; TTL expiry and
@@ -228,7 +228,7 @@ Cascade"):
 
 `ShouldDecompose` is the reference (scenario S14, existing
 `tests/scenarios/test_example_module.py`). The pattern every future module
-repeats, per `docs/module-template/architecture.md` §9:
+repeats, per `docs/architecture/module-template/architecture.md` §9:
 
 1. Load the real dataset; every record schema-valid; a malformed record raises
    `DatasetError` (the loader is a hard gate, never caught).
@@ -241,7 +241,7 @@ repeats, per `docs/module-template/architecture.md` §9:
 
 The `TaskDecomposer`/`TaskRouter`/`ResultEvaluator` datasets, when they land,
 add the sibling-pinning rule: they are evaluated against **stub** siblings
-(frozen references, `docs/architecture.md` §17.2), never against live
+(frozen references, `docs/architecture/architecture.md` §17.2), never against live
 co-adapted modules.
 
 ---
@@ -268,10 +268,10 @@ uses `tmp_path_factory` scratch repos and the fake workers of §2.
 | **S12** | Diffundo cascade failover | Fake providers: A=429, B=200 (same tier) | Result from B; A in cooldown; no "only first provider ever tried" behavior |
 | **S13** | Provider outage parks dispatch | All fake providers down | `AllProvidersFailed` caught by the orchestrator; dispatch parked; an already-running worker survives (no provider-outage mass kill) |
 | **S14** | ShouldDecompose dataset + metric + canaries | Existing `tests/scenarios/test_example_module.py` | Metric 1.0 over the full dataset; both canaries present and passing; `DatasetError` on malformed records |
-| **S15** | Shutdown hygiene | Cancel a mid-task session (`cancel` → SIGTERM → SIGKILL per `docs/architecture.md` §7.7) | Graceful cancel path completes; straggler process groups SIGKILLed (no `.kill()` on asyncio Tasks — IMPL-C11); worktrees pruned; event-log writer flushed and DB closed |
+| **S15** | Shutdown hygiene | Cancel a mid-task session (`cancel` → SIGTERM → SIGKILL per `docs/architecture/architecture.md` §7.7) | Graceful cancel path completes; straggler process groups SIGKILLed (no `.kill()` on asyncio Tasks — IMPL-C11); worktrees pruned; event-log writer flushed and DB closed |
 
 S01 is the `cambium.tests.smoke` entry point referenced by `agents.md` §5 and
-the smoke-test gate of `docs/architecture.md` §19 item 15. Every new harness
+the smoke-test gate of `docs/architecture/architecture.md` §19 item 15. Every new harness
 module must first pass S01 (or extend it), because that is the test the v0.1
 reviews proved was missing.
 
@@ -280,7 +280,7 @@ reviews proved was missing.
 ## 8. Canary policy — catching reward hacking in tests
 
 Canaries are the brakes on the optimization flywheel
-(`docs/architecture.md` §10, §17.4; `docs/module-template/dataset-format.md`
+(`docs/architecture/architecture.md` §10, §17.4; `docs/architecture/module-template/dataset-format.md`
 §6). They are enforced at **three** points, all testable:
 
 1. **Dataset-integrity canaries (module tests).** Each dataset ships trap
@@ -294,10 +294,10 @@ Canaries are the brakes on the optimization flywheel
    verb-clause analysis.
 2. **Optimization canaries (Ascensus eval gate).** `python -m
    cambium.modules.<name>.eval --suite canaries` exits non-zero on the first
-   canary failure (`docs/module-template/architecture.md` §9.3). This is the
+   canary failure (`docs/architecture/module-template/architecture.md` §9.3). This is the
    promotion gate: a prompt variant that improves the training metric while
    regressing the canary rate is **rejected** even if its score went up
-   (`docs/architecture.md` §17.4 step 8). In v2 the single-file dataset with
+   (`docs/architecture/architecture.md` §17.4 step 8). In v2 the single-file dataset with
    inline `canary: true` markers achieves the same effect via the
    1.0-aggregate assertion.
 3. **Dataset hygiene gates.** The loader refuses records containing secret
@@ -309,7 +309,7 @@ Rule of thumb: **any metric signal that can be gamed by deleting code, editing
 tests, or padding output must have a canary that specifically traps that
 gaming behavior** — e.g., "the worker did not delete the failing test", "the
 worker did not add `assert True`", "no `.cambium/` writes from the worker"
-(`docs/architecture.md` §10 table). Each held-out task ships 3–5 such
+(`docs/architecture/architecture.md` §10 table). Each held-out task ships 3–5 such
 canaries.
 
 ---

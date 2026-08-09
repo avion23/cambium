@@ -1,8 +1,8 @@
 # Metric Design — Automatic Coding Metric
 
 **Status:** Research. Fills the gap flagged as LLM-C5 ("the automatic metric for coding tasks
-does not exist") in `docs/reviews/review-llm-design.md`, and specifies the multi-signal metric
-outlined in `docs/architecture.md` §10 and the promotion gate in §17.4.
+does not exist") in `docs/architecture/reviews/review-llm-design.md`, and specifies the multi-signal metric
+outlined in `docs/architecture/architecture.md` §10 and the promotion gate in §17.4.
 
 **Scope.** The metric scored by `Ascensus` (DSPy SIMBA/GEPA) and by `Unio` (merge-time gate) for
 modules whose output is a **diff against a repository**: the `Opifex` worker ReAct module, and any
@@ -11,11 +11,11 @@ future module that produces or consumes a patch. Decision modules (`should_decom
 `src/cambium/modules/example/metric.py`); this design generalizes theirs where noted (§4).
 
 **Companions (normative).**
-- `docs/module-template/dataset-format.md` — dataset schema, splits, versioning, canary taxonomy.
-- `docs/module-template/architecture.md` §6 (metric field) and §9 (test strategy field).
+- `docs/architecture/module-template/dataset-format.md` — dataset schema, splits, versioning, canary taxonomy.
+- `docs/architecture/module-template/architecture.md` §6 (metric field) and §9 (test strategy field).
 - `src/cambium/modules/example/metric.py` — the exact-match metric seed every module's metric must be
   able to fall back to.
-- `docs/architecture.md` §10 (Coding Metric) and §17 (DSPy-per-Module Strategy).
+- `docs/architecture/architecture.md` §10 (Coding Metric) and §17 (DSPy-per-Module Strategy).
 
 ---
 
@@ -33,7 +33,7 @@ individual example**. A human appears only at fixed, batch boundaries:
 3. **Promotion** (approving a trained prompt for production) — `architecture.md` §17.4 step 9, the
    existing human gate. This is a gate on *deploying* a prompt, not on *scoring* it.
 
-This matches the module-template rule (`docs/module-template/architecture.md` §6): "Must be computable
+This matches the module-template rule (`docs/architecture/module-template/architecture.md` §6): "Must be computable
 without human-in-the-loop scoring for the automatic optimization path; can use LLM-as-judge as one
 signal, but the LLM judge must itself be evaluated against a human-graded held-out subset."
 
@@ -114,7 +114,7 @@ task record (eval/train jsonl):
 
 1. Run `cmd` with `cwd` = candidate worktree, hard timeout (default 120 s), **full output captured**.
    Exit code is the test process's own — never `cmd | tail` and never `set -o pipefail` (this is the
-   exact M1 defect from `docs/reviews/review-llm-design.md`: `"cargo test 2>&1 | tail -5"` makes the
+   exact M1 defect from `docs/architecture/reviews/review-llm-design.md`: `"cargo test 2>&1 | tail -5"` makes the
    gate structurally unable to fail).
 2. Parse the summary line for counts (`pytest`: `N passed, M failed`; `cargo`: `test result: ok. N
    passed`). Per-test pass/fail is parsed from the report when weights/critical flags are used;
@@ -356,7 +356,7 @@ design keeps it **off the per-iteration path** (R3) and defines its role as:
   deferred. Cost ≈ 1 call per eval task per promotion candidate — a batch, not a loop.
 - The judge **must itself be calibrated**: a held-out human-graded subset scores judge agreement,
   and judge output is not used for any candidate whose agreement is below the module's configured
-  floor (`docs/module-template/architecture.md` §6). This is the single human-in-the-loop
+  floor (`docs/architecture/module-template/architecture.md` §6). This is the single human-in-the-loop
   *validation*, batch, not per-scoring.
 - The judge sees only `(spec, diff, test_output)` — never the worker's summary (which is self-report
   and reward-hackable, LLM-C5). Rubric is pre-registered per task in the dataset record.
@@ -545,10 +545,10 @@ The separation test is itself automated and re-run on every metric-config change
 - A config change requires: re-run the known-good/known-bad separation (§5.1), re-eval the frozen
   `eval.jsonl`, and a `dataset_version` bump (`dataset-format.md` §5: minor for canary additions,
   major for label/frozen-set changes) — mirroring the rule in
-  `docs/module-template/example-spec.md` §6 ("changes require a dataset `schema_version` bump and a
+  `docs/architecture/module-template/example-spec.md` §6 ("changes require a dataset `schema_version` bump and a
   re-eval against the frozen held-out set").
 - Production prompt promotion is a symlink swap under `optimized/<name>/v<N>/`
-  (`docs/module-template/architecture.md` §10) with the previous version retained for rollback.
+  (`docs/architecture/module-template/architecture.md` §10) with the previous version retained for rollback.
 
 ---
 
@@ -580,7 +580,7 @@ patches still score low after any config change.
 
 ## 7. Scenario tests
 
-The module test strategy lives in `docs/module-template/architecture.md` §9 (per-module `architecture.md`
+The module test strategy lives in `docs/architecture/module-template/architecture.md` §9 (per-module `architecture.md`
 §"Test strategy"; example implementation: `tests/scenarios/test_example_module.py`). This design adds
 one scenario file, `tests/scenarios/test_metric_antigaming.py`, that exercises the **metric against
 synthetic gaming candidates** in a scratch git repo (real `git`, no mocking — same convention as the
@@ -603,7 +603,7 @@ Plus one calibration anchor:
 
 These run in the metric module's own CI gate (`architecture.md` §17); they do not replace the
 per-module eval harness (`python -m cambium.modules.<name>.eval`) or the canary suite gate
-(`--suite canaries`, `docs/module-template/architecture.md` §9.3).
+(`--suite canaries`, `docs/architecture/module-template/architecture.md` §9.3).
 
 ---
 

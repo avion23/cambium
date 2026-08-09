@@ -2,7 +2,7 @@
 
 **STATUS: DRAFT — docs only, not normative.** This document is a design draft of the
 M1 Nuntius wire contract. It is **not** authoritative for behavior: the authoritative
-specification is `docs/architecture.md` §5 (IPC Protocol), which this draft must be
+specification is `docs/architecture/architecture.md` §5 (IPC Protocol), which this draft must be
 reviewed against before any implementation. Divergences from the architecture doc are
 flagged inline and collected in §7.
 
@@ -10,8 +10,8 @@ flagged inline and collected in §7.
 **Date:** 2026-08-09
 **Author:** research task `wt-ipc` (docs-only)
 **Sources read (read-only):**
-- `/home/ubuntu/cambium/docs/system-design.md` §4.1 (M1 Nuntius — v0.1, superseded) — cited as `system-design §4.1`.
-- `docs/architecture.md` §5 (IPC: JSON-Lines on stdio, `request_id` RPC framing, authoritative `exit` message), plus §3.4 (`Result`), §6.4 (checkpoints), §7 (lifecycle), §16.4 (exit codes) — cited as `arch §5`, `arch §3.4`, etc.
+- `/home/ubuntu/cambium/docs/architecture/system-design.md` §4.1 (M1 Nuntius — v0.1, superseded) — cited as `system-design §4.1`.
+- `docs/architecture/architecture.md` §5 (IPC: JSON-Lines on stdio, `request_id` RPC framing, authoritative `exit` message), plus §3.4 (`Result`), §6.4 (checkpoints), §7 (lifecycle), §16.4 (exit codes) — cited as `arch §5`, `arch §3.4`, etc.
 - `/home/ubuntu/cambium/src/cambium/orchestrator.py`, `/home/ubuntu/cambium/src/cambium/events.py` (merged scaffold) — cited as `orchestrator.py`, `events.py`.
 
 **Purpose:** a complete, implementation-ready message catalogue for the Nuntius module:

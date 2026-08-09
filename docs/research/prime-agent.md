@@ -16,7 +16,7 @@
 - **Two core abstractions** (README + repo readme):
   1. **RLM — Recursive Language Model**: context as variables, the model drives a persistent IPython kernel (the *only* built-in tool, "Available built-in tools: `ipython`" in CLI reference), and recursive subagents are programmatic function calls via `rlm(...)`.
   2. **Continual Harness**: prompts, memories, skills, and subagent specs stored as durable state the agent can refine via `/refine` (evidence-backed, snapshot/rollback, never rewrites the base system prompt).
-- **Runtime architecture** (installed `docs/architecture.md`, "System at a Glance"): interactive TUI / headless clients → `AgentConnection` → **Daemon supervisor** (Unix socket; routing, attachments, recovery) → **session workers** (one root session tree each: `AgentSessionRuntime`, root `AgentSession`, scheduler, root IPython kernel, RLM child runtimes) → model providers + JSONL session storage. "Workers and kernels are separate processes for lifecycle and failure containment, **not** security sandboxes."
+- **Runtime architecture** (installed `docs/architecture/architecture.md`, "System at a Glance"): interactive TUI / headless clients → `AgentConnection` → **Daemon supervisor** (Unix socket; routing, attachments, recovery) → **session workers** (one root session tree each: `AgentSessionRuntime`, root `AgentSession`, scheduler, root IPython kernel, RLM child runtimes) → model providers + JSONL session storage. "Workers and kernels are separate processes for lifecycle and failure containment, **not** security sandboxes."
 - **Sessions:** append-only JSONL under `~/.prime/agent/sessions/` with a tree (`id`/`parentId`); in-place branching, `/fork`, `/clone`, compaction.
 - **Config dir `~/.prime/agent`:** `settings.json`, `models.json`, `auth.json`, `AGENTS.md`, `SYSTEM.md`, `APPEND_SYSTEM.md`, `harness/harness_state.json`, `kernel-venv/` (bundled IPython venv), `sessions/`, `session-leases/`, `logs/`.
 - **Model configuration (local, `models.json`):** 3 custom OpenAI-compatible providers — `opencode-go` (DeepSeek V4 Flash/Pro, 1M context), `nvidia` (MiniMax M3), `tokenrouter` (`auto:balance/fast/cost/quality`, Kimi K3 Free). `auth.json` holds credentials for `google`, `openrouter`, `zai`, `kimi-coding`, `openai-codex`. `settings.json`: defaultProvider `opencode-go`, defaultModel `deepseek-v4-flash`, thinking `high`, retry enabled (2 retries, 3s base delay), compaction on (`reserveTokens 24576`, `keepRecentTokens 24000`).
@@ -43,7 +43,7 @@
 
 ## 4. Relevant lessons for Cambium
 
-Cambium's design doc (`docs/system-design.md`) already cites Prime Agent as the source for: append-only JSONL sessions, RLM context-as-variables, the continual-harness self-improvement loop, and (as anti-pattern) `.pid` files + Unix-socket supervision. This research corroborates and sharpens those choices:
+Cambium's design doc (`docs/architecture/system-design.md`) already cites Prime Agent as the source for: append-only JSONL sessions, RLM context-as-variables, the continual-harness self-improvement loop, and (as anti-pattern) `.pid` files + Unix-socket supervision. This research corroborates and sharpens those choices:
 
 1. **Process-per-worker isolation is the differentiator that matters.** Prime Agent's single-Node-process-per-session (parent + all children in one heap) produces OOM/earlyoom incidents under subagent swarms. Cambium's supervisor spawns each worker as an independent process (PID-based identity, pipe EOF = death, one crash restarts only that worker) is the direct, incident-validated contrast. Keep it.
 2. **Supervise memory, not just process liveness.** The 2026-08-09 incident shows wall-clock/process health checks miss heap exhaustion. Cambium's heartbeat watchdog should watch per-worker RSS/heap and per-tool duration (design doc fix F6: per-tool heartbeat) to avoid the "killed mid-swarm" cascade.
@@ -85,7 +85,7 @@ Cambium's design doc (`docs/system-design.md`) already cites Prime Agent as the 
 - GitHub repo (stars/forks/commits/README): https://github.com/PrimeIntellect-ai/prime-agent
 - Installed README: `/home/ubuntu/.local/npm-global/lib/node_modules/prime-agent/README.md`
 - Installed CHANGELOG (0.7.1 released 2026-08-07, PR/issue links to PrimeIntellect-ai/prime-agent): `/home/ubuntu/.local/npm-global/lib/node_modules/prime-agent/CHANGELOG.md`
-- Installed architecture doc: `/home/ubuntu/.local/npm-global/lib/node_modules/prime-agent/docs/architecture.md`
+- Installed architecture doc: `/home/ubuntu/.local/npm-global/lib/node_modules/prime-agent/docs/architecture/architecture.md`
 - Local config/sessions/logs: `~/.prime/agent/*`, `~/.prime/worktrees/*`, `~/.npm/_logs/2026-08-09T18_51_34_372Z-debug-0.log`
 - **UNVERIFIED (claimed by project, not independently checked):** arXiv continual-harness paper `arxiv.org/abs/2605.09998`; the RLM design blog post `https://www.primeintellect.ai/blog/rlm`; accuracy of the 10.8k-star figure beyond the fetched page snapshot.
 

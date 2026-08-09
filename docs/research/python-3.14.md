@@ -312,12 +312,12 @@ the default build**. The precise truth, verified:
 **Pin: `requires-python = ">=3.14,<3.15"` on the regular (GIL) build. Do not
 target the free-threaded build by default.**
 
-Reasoning, tied to the system design and the reviews in `docs/reviews/`:
+Reasoning, tied to the system design and the reviews in `docs/architecture/reviews/`:
 
 - Cambium's parallelism is **subprocess-based** (git-worktree workers) plus
   async I/O. Process isolation already gives true multi-core parallelism; the
   GIL is only a constraint for *in-process CPU-bound threads*. The review
-  `docs/reviews/review-distributed-systems.md` M5 already makes exactly this
+  `docs/architecture/reviews/review-distributed-systems.md` M5 already makes exactly this
   point, and nothing in 3.14 changes it. The only in-process thread use in the
   design is `asyncio.to_thread` for LLM calls, which is I/O-bound — the GIL is
   released during blocking I/O anyway.

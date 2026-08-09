@@ -1,7 +1,7 @@
 # Research: `pi` — @earendil-works/pi-coding-agent
 
 Competitive analysis of the locally installed `pi` coding agent, prepared as input to the
-Cambium system design (`docs/system-design.md`).
+Cambium system design (`docs/architecture/system-design.md`).
 
 Date: 2026-08-09. All local facts cite the exact command + trimmed output. Web facts cite URLs.
 Anything not directly observed is marked **UNVERIFIED**.

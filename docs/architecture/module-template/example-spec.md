@@ -284,7 +284,7 @@ This canary has zero `HIGH_SIGNAL` keyword hits — a keyword-greedy replacement
 
 ### 7.1 v2 dataset policy (single-file; split deferred)
 
-v2 uses a single combined `example_pairs.jsonl` with inline `canary: true` markers. The eval harness selects canaries by the `canary` flag. The frozen `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split described in `docs/module-template/dataset-format.md` is the **v2.1 target** — until the dataset grows past ~50 records, the single file is simpler and the loader already supports it.
+v2 uses a single combined `example_pairs.jsonl` with inline `canary: true` markers. The eval harness selects canaries by the `canary` flag. The frozen `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split described in `docs/architecture/module-template/dataset-format.md` is the **v2.1 target** — until the dataset grows past ~50 records, the single file is simpler and the loader already supports it.
 
 **Dataset-format compliance.** The single-file layout complies with `dataset-format.md` §1 (JSONL container), §2 (record envelope — `input`/`expected`/`canary`), and §6 (canary taxonomy: `trivially_atomic` and `must_decompose` kinds, with the `canary: true` marker). The full envelope (`id`, `schema_version`, `dataset_version`, `split`, `added_at`, `added_by`, `source`, `license`, `redacted`, `data`) is the v2.1 target; the v2 records use the minimal subset the loader validates today.
 
@@ -400,7 +400,7 @@ src/cambium/modules/example/
 **Extensions that align with this spec but are NOT yet in the scaffold** (label as v2.1, do not implement in v2):
 
 - `eval.py` — standalone eval entry point (`python -m cambium.modules.example.eval`).
-- `train.jsonl` / `eval.jsonl` / `canaries.jsonl` — the three-file split per `docs/module-template/dataset-format.md`. v2 uses the single combined file.
+- `train.jsonl` / `eval.jsonl` / `canaries.jsonl` — the three-file split per `docs/architecture/module-template/dataset-format.md`. v2 uses the single combined file.
 - `decide.py` DSPy subclass — `ShouldDecomposeModuleDSPy`, behind a config flag.
 - `siblings-stub.yaml` — empty placeholder; added when this module becomes siblings with another.
 - `optimized/should_decompose/v<N>/` — promoted-prompt artifacts, written by `Ascensus`.

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 **Author:** research task (docs-only, no code)
-**Scope:** interface strategy for the Cambium coding-agent harness (`docs/system-design.md`, module M10 "Janus"). Cambium is Python 3.14 (free-threaded target), a reusable leaf module inside a larger proto-AGI system, and the higher layer spawns/persists Cambium instances programmatically. The interface must therefore be **embeddable**: TUI optional, never core.
+**Scope:** interface strategy for the Cambium coding-agent harness (`docs/architecture/system-design.md`, module M10 "Janus"). Cambium is Python 3.14 (free-threaded target), a reusable leaf module inside a larger proto-AGI system, and the higher layer spawns/persists Cambium instances programmatically. The interface must therefore be **embeddable**: TUI optional, never core.
 
 All local claims cite the exact command and output. All web claims cite URLs. Anything not verifiable is marked **UNVERIFIED**.
 

@@ -4,10 +4,10 @@
 **Date:** 2026-08-09
 **Scope:** Security analysis of the Cambium multi-agent coding harness. Design-level only (pre-implementation); no source audit was performed.
 **Sources:**
-- `docs/system-design.md` (v0.1.0 draft, superseded; cited only where v2 is silent or where it carries the concrete Septum mount list).
-- `docs/architecture.md` (v2.0.0, **authoritative** — lives on the `wt-arch` branch at `docs/architecture.md`; this repo's `docs/system-design.md` is superseded by it).
-- `docs/reviews/review-distributed-systems.md` (DS), `docs/reviews/review-implementation.md` (IMPL), `docs/reviews/review-llm-design.md` (LLM).
-- `docs/module-template/dataset-format.md` (canaries), `docs/module-template/architecture.md` (module template).
+- `docs/architecture/system-design.md` (v0.1.0 draft, superseded; cited only where v2 is silent or where it carries the concrete Septum mount list).
+- `docs/architecture/architecture.md` (v2.0.0, **authoritative** — lives on the `wt-arch` branch at `docs/architecture/architecture.md`; this repo's `docs/architecture/system-design.md` is superseded by it).
+- `docs/architecture/reviews/review-distributed-systems.md` (DS), `docs/architecture/reviews/review-implementation.md` (IMPL), `docs/architecture/reviews/review-llm-design.md` (LLM).
+- `docs/architecture/module-template/dataset-format.md` (canaries), `docs/architecture/module-template/architecture.md` (module template).
 
 **Verification convention.** Every claim about the design cites the source document and section. Where the sources are silent, the row is explicitly marked **UNVERIFIED**. No feature is invented. Severity is `Critical / High / Medium / Low` = (impact, likelihood). Every residual risk carries a label: **accepted** (mitigated to an accepted level or explicitly out of scope) or **needs v2** (gap to close before production hardening).
 

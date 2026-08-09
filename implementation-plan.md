@@ -4,7 +4,7 @@ Status date: 2026-08-09. Orchestrator-owned tracker. Each subagent reads this to
 everyone else is doing. Worktrees: /tmp/opencode/cambium-<name> (branches wt-<name>).
 
 ## Phase 0 — Foundation (DONE)
-- git init (main, a0fc528), docs moved: docs/system-design.md, docs/reviews/ (3 adversarial reviews).
+- git init (main, a0fc528), docs moved: docs/architecture/system-design.md, docs/architecture/reviews/ (3 adversarial reviews).
 - Python: pin CPython 3.14.7 REGULAR build (free-threaded exists but optional; GIL verified present in default build — the "GIL is gone" assumption is FALSE for default 3.14). See docs/research/python-3.14.md.
 - Scaffold: pyproject.toml (requires-python >=3.14), src/cambium (orchestrator skeleton, events, modules/base.py, modules/example/ with dataset + canaries + scenario test). Merged f66bdc6 + review fixes 93db348.
 
@@ -28,8 +28,8 @@ Key research conclusions (see docs for details):
 
 ## Phase 2 — Architecture (DONE — fb17089, wt-arch; review in progress)
 GLM-5.2 (GPT-5.6 Sol backend unavailable — sol/reviewer/luna returned empty, kimi misconfigured).
-Deliverables: docs/architecture.md (1063 LOC, 21 sections, resolution matrix for all 24 CRITICAL flaws),
-agents.md, docs/module-template/{architecture,dataset-format,example-spec}.md.
+Deliverables: docs/architecture/architecture.md (1063 LOC, 21 sections, resolution matrix for all 24 CRITICAL flaws),
+agents.md, docs/architecture/module-template/{architecture,dataset-format,example-spec}.md.
 Key decisions: standard CPython 3.14; SQLite WAL event store single-writer-thread; JSON-Lines stdio IPC
 with request_id RPC framing + authoritative exit message (four-layer liveness model); headless-first public
 API (Cambium/Session/Result/Instance/Event); TUI as optional view; Diffundo cache keyed on task+context+model

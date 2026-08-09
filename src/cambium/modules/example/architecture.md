@@ -2,7 +2,7 @@
 
 Reference example of the Cambium per-module pattern. Template for future
 modules; the DSPy-per-module design keeps each module independently
-hill-climbable (see `docs/system-design.md` §M9, Ascensus).
+hill-climbable (see `docs/architecture/system-design.md` §M9, Ascensus).
 
 ## Purpose
 

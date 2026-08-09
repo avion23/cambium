@@ -1,13 +1,13 @@
 # Research — Crash Recovery: Event-Log Replay and Supervisor Restart Semantics
 
-**Status:** Design research (docs only). Companion to `docs/architecture.md` (v2, wt-arch branch — pending merge into main per `implementation-plan.md`).
+**Status:** Design research (docs only). Companion to `docs/architecture/architecture.md` (v2, wt-arch branch — pending merge into main per `implementation-plan.md`).
 **Date:** 2026-08-09
 **Scope:** Supervisor (Custos, M4) crash recovery; worker-originated crashes covered only where they interact with supervisor restart. Merge recovery (§7.8) covered for the idempotency and sequence diagrams.
 
 **Normative sources (cited inline by section):**
-- `docs/architecture.md` — v2 architecture. **Authoritative.** §5 (Nuntius IPC / liveness), §6 (event log), §7 (lifecycle: state machine, spawn, fencing, restart policy, worktree recovery, shutdown, publish), §16 (session-dir contract), §18.1 (DS-C6/C5/M3 resolution matrix).
-- `docs/reviews/review-distributed-systems.md` — DS review. **C6** (supervisor crash orphans workers, split-brain), **M3** (event log has no durability guarantees), **C5** (worktree locks survive crashes).
-- `docs/system-design.md` — v0.1 draft (superseded by v2). **M4 decision notes 6–7** ("No `.pid` files to go stale", "stdout EOF = dead").
+- `docs/architecture/architecture.md` — v2 architecture. **Authoritative.** §5 (Nuntius IPC / liveness), §6 (event log), §7 (lifecycle: state machine, spawn, fencing, restart policy, worktree recovery, shutdown, publish), §16 (session-dir contract), §18.1 (DS-C6/C5/M3 resolution matrix).
+- `docs/architecture/reviews/review-distributed-systems.md` — DS review. **C6** (supervisor crash orphans workers, split-brain), **M3** (event log has no durability guarantees), **C5** (worktree locks survive crashes).
+- `docs/architecture/system-design.md` — v0.1 draft (superseded by v2). **M4 decision notes 6–7** ("No `.pid` files to go stale", "stdout EOF = dead").
 
 **Verification convention:** statements that are explicit in the architecture are cited to a section. Statements that this document **proposes** (gaps the architecture leaves open) are marked **[PROPOSED]**. Claims that could not be verified against a source are marked **UNVERIFIED**.
 
@@ -246,7 +246,7 @@ Numbered step semantics:
 
 ## 6. Test scenarios
 
-**Linking note:** there is no dedicated `test-strategy.md` in main as of this branch. Test-strategy guidance lives in `docs/module-template/architecture.md` §9 ("Test Strategy") and in the scenario-test pattern already used at `tests/scenarios/test_example_module.py` (real components, no mocks). **[PROPOSED]** the scenarios below become `tests/scenarios/test_crash_recovery.py` on the same pattern, plus a `cambium doctor` consistency check (§13) as the post-crash assertion oracle.
+**Linking note:** there is no dedicated `test-strategy.md` in main as of this branch. Test-strategy guidance lives in `docs/architecture/module-template/architecture.md` §9 ("Test Strategy") and in the scenario-test pattern already used at `tests/scenarios/test_example_module.py` (real components, no mocks). **[PROPOSED]** the scenarios below become `tests/scenarios/test_crash_recovery.py` on the same pattern, plus a `cambium doctor` consistency check (§13) as the post-crash assertion oracle.
 
 Fault-injection primitive: a test hook that kills the supervisor process (SIGKILL) at an event-loop checkpoint, then starts a new supervisor over the same `${session_dir}` and asserts on `events.db` + `worktrees/` + `checkpoints/` + `result.json`.
 
@@ -272,15 +272,15 @@ Cross-cutting assertions (each scenario): event log parses cleanly; `cambium doc
 3. **UNIQUE dedup index on `(task_id, monotonic_ms, kind, generation)`.** Hardening for consumer-side duplicate reads (§3); conflicts with the normative §6.3 schema as written — needs an explicit decision.
 4. **Checkpoint file fsync.** §6.4 specifies atomic rename but not `fsync`; power loss can leave a durable `checkpoint` event referencing a lost file. Worker-side fsync before emitting the checkpoint event is recommended (§4.3). **UNVERIFIED** — not specified in §6.4.
 5. **Worker-side pipe-break handling.** When the supervisor dies, a worker's `stdout.write` fails with SIGPIPE/BrokenPipeError; §5.3 covers the supervisor's side, not the worker's reaction. A worker-side rule ("on BrokenPipeError, exit code 0 and try to persist state_ref first") would make orphan cleanup more deterministic. **UNVERIFIED** — no worker-side specification in §5.
-6. **Where does the first restart's supervisor get the *previous* supervisor's session ownership?** This design assumes the host re-invokes Cambium with the same `${session_dir}` (§16.2). Host-side restart orchestration (who calls it, with what grace) is outside `docs/architecture.md` and is the host's contract (§16.1). **UNVERIFIED** — no host-restart guidance exists in the reviewed docs.
+6. **Where does the first restart's supervisor get the *previous* supervisor's session ownership?** This design assumes the host re-invokes Cambium with the same `${session_dir}` (§16.2). Host-side restart orchestration (who calls it, with what grace) is outside `docs/architecture/architecture.md` and is the host's contract (§16.1). **UNVERIFIED** — no host-restart guidance exists in the reviewed docs.
 7. **`result.json` reconstruction ownership.** §2.2 proposes the new supervisor reconstruct `result.json` from the `result` event; §3.4/§16.4 say it is written by `Session.run()`'s flow. Whether reconstruction is Custos's job or the host's is a boundary decision. **[PROPOSED]**.
 8. **Un-mirror durability.** If the JSONL mirror is enabled, its durability contract (final-line rule, §4.2) must be documented as advisory; it must never be treated as the recovery source of truth. Decision deferred to the config-schema work.
 
 ## 8. Sources and verification
 
-- `docs/architecture.md`: §0 (pid files dropped), §3.4/§3.6 (Result, Event), §5.2/§5.3/§5.4 (protocol, liveness, EOF modes), §6.1–§6.5 (store, writer, schema, checkpoint, durability), §7.1–§7.8 (state machine, spawn, fencing, restart policy, worktree recovery, per-tool heartbeat, shutdown, publish), §13 (`cambium doctor`), §16 (session dir, exit codes), §18.1 (DS-C5/C6/M3 resolution).
-- `docs/reviews/review-distributed-systems.md`: C6 (orphan/split-brain), C5 (stale locks), M3 (no fsync / torn line), M2 (kill-on-dead-process race).
-- `docs/system-design.md`: M4 decision notes 6–7 (rejected pid files, EOF=dead — superseded by v2 §5.3).
+- `docs/architecture/architecture.md`: §0 (pid files dropped), §3.4/§3.6 (Result, Event), §5.2/§5.3/§5.4 (protocol, liveness, EOF modes), §6.1–§6.5 (store, writer, schema, checkpoint, durability), §7.1–§7.8 (state machine, spawn, fencing, restart policy, worktree recovery, per-tool heartbeat, shutdown, publish), §13 (`cambium doctor`), §16 (session dir, exit codes), §18.1 (DS-C5/C6/M3 resolution).
+- `docs/architecture/reviews/review-distributed-systems.md`: C6 (orphan/split-brain), C5 (stale locks), M3 (no fsync / torn line), M2 (kill-on-dead-process race).
+- `docs/architecture/system-design.md`: M4 decision notes 6–7 (rejected pid files, EOF=dead — superseded by v2 §5.3).
 - No SQLite-WAL experiment doc exists under `docs/research/` on this branch (verified). §4 therefore specifies both store options and notes the tradeoff.
 
 **UNVERIFIED items:** §2.6 step ordering and the §7.3 startup-kill trigger; §2.2 terminal-decision table details; §3 UNIQUE-index proposal; §4.3 checkpoint fsync; §7 open questions 5–7. All are flagged inline; none contradict an explicit architecture statement.

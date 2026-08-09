@@ -5,7 +5,7 @@ described in implementation review **IMPL-M7** ("no real logging framework;
 synchronous file I/O on the hot path") with a stdlib-only, non-blocking,
 structured, rotated, redacted logging design.
 
-Sources read: `docs/reviews/review-implementation.md` (M7, M6), `docs/architecture.md`
+Sources read: `docs/architecture/reviews/review-implementation.md` (M7, M6), `docs/architecture/architecture.md`
 (§5.1 item 2 stdout contract, §6 event log, §12 secrets, §13 logging, §14 Python stance, §16.2
 session-dir contract), `src/cambium/**` scaffold (`events.py`, `orchestrator.py`,
 `modules/base.py`).

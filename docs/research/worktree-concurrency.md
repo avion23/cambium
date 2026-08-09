@@ -6,9 +6,9 @@
 **Verification rule:** every claim cites the exact command + observed output (exit code where meaningful). Anything not reproduced is marked **UNVERIFIED**. Experiments are real concurrent runs (`&` + `wait`), not simulations.
 
 Sources read before experimentation:
-- `docs/system-design.md` — M3 Surculus (§M3), M7 Unio (§M7).
-- `docs/reviews/review-distributed-systems.md` — DS-C5 (worktree locks), DS-M1 (merge serialization), IMPL-M3 (git worktree concurrency).
-- `docs/reviews/review-implementation.md` — IMPL-C1 (merge sequencer no concurrency guard).
+- `docs/architecture/system-design.md` — M3 Surculus (§M3), M7 Unio (§M7).
+- `docs/architecture/reviews/review-distributed-systems.md` — DS-C5 (worktree locks), DS-M1 (merge serialization), IMPL-M3 (git worktree concurrency).
+- `docs/architecture/reviews/review-implementation.md` — IMPL-C1 (merge sequencer no concurrency guard).
 - `architecture.md` §7.5 (worktree recovery), §7.8 (atomic `refs/heads/main` update via `update-ref`).
 
 ---

@@ -3,7 +3,7 @@
 **Version:** 1.0.0
 **Date:** 2026-08-09
 **Branch:** `wt-deltas2` (`/tmp/opencode/cambium-deltas2`)
-**Status:** Authoritative design-delta record. Supplements `docs/architecture.md` (v2.0.0) and supersedes it wherever a delta is marked **adopt**. Each delta states the arch section it amends.
+**Status:** Authoritative design-delta record. Supplements `docs/architecture/architecture.md` (v2.0.0) and supersedes it wherever a delta is marked **adopt**. Each delta states the arch section it amends.
 
 **Sources incorporated:** (1) the external re-review of the v2 architecture (in flight at the time of writing — see §0.2); (2) the Prime Agent good parts, researched in `docs/research/prime-agent.md`; (3) explicit orchestrator/user directives dated 2026-08-09.
 
@@ -23,15 +23,15 @@
 
 This document is written **as of** the current state of:
 
-- `docs/architecture.md` v2.0.0 — **as of commit `17ef25f` on branch `wt-arch`** (`docs(architecture): fix review findings — durability contract, spec-scaffold alignment, eval sizes, DSPy idioms, merge terminal step`). A **re-review of the v2 architecture is in flight**; this delta document records the dispositions and adopted residue for that review (D6) and must be reconciled against the re-review text when it lands.
-- `agents.md` and `docs/module-template/*` — **as of the same `wt-arch` commit**.
-- `docs/system-design.md` (v0.1, superseded), `docs/reviews/*` (v0.1 adversarial reviews), and the research subset present in this worktree — **as merged in `main` at the branch point**. `main` has since advanced (research merges for IPC, events, threat-model, sandbox-options, benchmark, etc.); files cited here that are not in this worktree were read from `main` — see §0.3.
+- `docs/architecture/architecture.md` v2.0.0 — **as of commit `17ef25f` on branch `wt-arch`** (`docs(architecture): fix review findings — durability contract, spec-scaffold alignment, eval sizes, DSPy idioms, merge terminal step`). A **re-review of the v2 architecture is in flight**; this delta document records the dispositions and adopted residue for that review (D6) and must be reconciled against the re-review text when it lands.
+- `agents.md` and `docs/architecture/module-template/*` — **as of the same `wt-arch` commit**.
+- `docs/architecture/system-design.md` (v0.1, superseded), `docs/architecture/reviews/*` (v0.1 adversarial reviews), and the research subset present in this worktree — **as merged in `main` at the branch point**. `main` has since advanced (research merges for IPC, events, threat-model, sandbox-options, benchmark, etc.); files cited here that are not in this worktree were read from `main` — see §0.3.
 
 ### 0.3 Files cited that are not in `main` (branch provenance)
 
 | Path | Branch | Content |
 |---|---|---|
-| `docs/architecture.md`, `agents.md`, `docs/module-template/*` | `wt-arch` @ `17ef25f` | v2 architecture, orientation, module template |
+| `docs/architecture/architecture.md`, `agents.md`, `docs/architecture/module-template/*` | `wt-arch` @ `17ef25f` | v2 architecture, orientation, module template |
 | `docs/research/threat-model.md` | `main` (merged after this worktree branched; first drafted on `wt-threat` @ `b863084`) | Threat model (R1..R10) — cited by D7 |
 | `docs/research/sandbox-options.md` | `main` (merged after this worktree branched; first drafted on `wt-sandbox` @ `242a509`) | Septum sandbox options on this host — retained as evidence by D7 |
 | `docs/research/event-schema-draft.md` | `main` | Event-log schema draft — cited by D2 (payload-first `parent_task_id`) |
@@ -58,7 +58,7 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 **Source:** USER DIRECTIVE (2026-08-09). Also resolves review LLM-C1 by deletion.
 **Status:** **adopt**
-**Amends:** `docs/architecture.md` §2 (layering diagram, Diffundo line), §4 (module catalog, M2 row), §8 (transparency table, Diffundo row), §8.1 (deleted/replaced), §9.2 (cascade `call` step 1), §9.3 (worker-side `CambiumLM` cache flags), §18.2 (LLM-C1 and LLM-M5 rows — the LLM Design table), §18.4 (F2 row reference); `docs/system-design.md` §M2 (superseded, for history).
+**Amends:** `docs/architecture/architecture.md` §2 (layering diagram, Diffundo line), §4 (module catalog, M2 row), §8 (transparency table, Diffundo row), §8.1 (deleted/replaced), §9.2 (cascade `call` step 1), §9.3 (worker-side `CambiumLM` cache flags), §18.2 (LLM-C1 and LLM-M5 rows — the LLM Design table), §18.4 (F2 row reference); `docs/architecture/system-design.md` §M2 (superseded, for history).
 
 ### WHAT changes
 
@@ -73,7 +73,7 @@ These are the same stable-path references the v2 architecture itself uses for re
   - **OpenAI — Prompt caching:** https://platform.openai.com/docs/guides/prompt-caching — "Cache hits are only possible for exact prefix matches within a prompt" and "Prompt Caching does not change how the model generates output. The model computes a new response from the cached prompt prefix." The cache stores KV activations of the prompt **prefix**, never a response; a changed input is a different prefix, so the cache misses and the answer is freshly computed.
   - **Anthropic — Prompt caching:** https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching — "Cache hits require 100% identical prompt segments" and "Because the hash is cumulative, covering everything up to and including the breakpoint, changing any block at or before the breakpoint produces a different hash on the next request." "What invalidates the cache" documents that modifying tools/system/messages invalidates that level and all levels after it. Caches are isolated per organization/workspace.
   - **DeepSeek — Context Caching:** https://api-docs.deepseek.com/guides/kv_cache — enabled by default for all users; "A subsequent request can only hit the cache if it **fully matches** a **cache prefix unit**"; best-effort, auto-cleared when unused.
-- **Resolves LLM-C1 by deletion.** The review's core defect was a *response* cache keyed on `(model, temperature, prompt)` with no repo state (`docs/reviews/review-llm-design.md` C1; consensus F2 in `docs/system-design.md` §9). Without a local cache there is no cache key, no TTL, no coherence window, and no stored response that could be served stale. The deletion also resolves LLM-M5 ("cache per-instance nearly useless") and threat-model R8 ("FanOut cache poisoning / stale cache", `docs/research/threat-model.md` §5 R8) — both are moot by removal.
+- **Resolves LLM-C1 by deletion.** The review's core defect was a *response* cache keyed on `(model, temperature, prompt)` with no repo state (`docs/architecture/reviews/review-llm-design.md` C1; consensus F2 in `docs/architecture/system-design.md` §9). Without a local cache there is no cache key, no TTL, no coherence window, and no stored response that could be served stale. The deletion also resolves LLM-M5 ("cache per-instance nearly useless") and threat-model R8 ("FanOut cache poisoning / stale cache", `docs/research/threat-model.md` §5 R8) — both are moot by removal.
 - **The critique's "`git rev-parse HEAD` in the cache key" concern is moot without a local cache.** Provider-side caching lacks the stale-repo problem for three structural reasons:
   1. **Content-addressed.** The cache key is the exact token prefix. If repo content changed, the tokens reflecting that state changed, the prefix hash differs, and the cache misses. There is no key under which an old prefix can be served against new content (OpenAI/Anthropic/DeepSeek, cited above).
   2. **Per-conversation / per-organization, not a global prompt→answer map.** A cache entry belongs to the request stream that wrote it and its organization (`anthropic prompt caching — cache storage and sharing`); two tasks with different contexts never share a prefix by construction.
@@ -94,7 +94,7 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 **Source:** USER DIRECTIVE (2026-08-09).
 **Status:** **adopt**
-**Amends:** `docs/architecture.md` §3.4 (`Result` envelope), §3.6/§6.3 (Event schema — `parent_task_id` in payload, not a column), §4 (Architectus — decomposition produces the tree), §7.1 (per-task state machine gains a tree-level completion rule), §16 (host navigation of the session tree); `docs/module-template/example-spec.md` §3 (decomposition output feeds the tree); `docs/research/event-schema-draft.md` §3.1/§3.10 (payload-first `parent_task_id`, adopted).
+**Amends:** `docs/architecture/architecture.md` §3.4 (`Result` envelope), §3.6/§6.3 (Event schema — `parent_task_id` in payload, not a column), §4 (Architectus — decomposition produces the tree), §7.1 (per-task state machine gains a tree-level completion rule), §16 (host navigation of the session tree); `docs/architecture/module-template/example-spec.md` §3 (decomposition output feeds the tree); `docs/research/event-schema-draft.md` §3.1/§3.10 (payload-first `parent_task_id`, adopted).
 
 ### WHAT changes
 
@@ -112,7 +112,7 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 ### WHY
 
-- The v0.1/v2 design treats subtasks as a flat `list[SubTask]` with a loose `depends_on` field whose lifecycle is under-specified. The reviews flagged exactly this: **DS-M6** "Orchestrator has no cycle detection and a broken task-ID counter" (a cyclic graph leaves tasks `pending` forever) and **LLM review N2** "`SubTask.depends_on` default and DAG handling — no cycle detection; a subtask whose dependency failed sits in `pending` permanently." (Note: the directive cites "DS-M6/LLM-M6", but in `docs/reviews/review-llm-design.md` the DAG/cycle item is **N2**; M6 is the race-mode item. The cycle-detection citation in the LLM review is N2.) The Task Tree makes cycle detection and failed-dependency handling first-class instead of an emergent property of the dispatch loop.
+- The v0.1/v2 design treats subtasks as a flat `list[SubTask]` with a loose `depends_on` field whose lifecycle is under-specified. The reviews flagged exactly this: **DS-M6** "Orchestrator has no cycle detection and a broken task-ID counter" (a cyclic graph leaves tasks `pending` forever) and **LLM review N2** "`SubTask.depends_on` default and DAG handling — no cycle detection; a subtask whose dependency failed sits in `pending` permanently." (Note: the directive cites "DS-M6/LLM-M6", but in `docs/architecture/reviews/review-llm-design.md` the DAG/cycle item is **N2**; M6 is the race-mode item. The cycle-detection citation in the LLM review is N2.) The Task Tree makes cycle detection and failed-dependency handling first-class instead of an emergent property of the dispatch loop.
 - The tree is also the **durable conversation structure** the persistent-session model (D3) needs: a node is the unit of session identity, checkpointing, steering, and result aggregation. Prime Agent's session tree (`id`/`parentId`, §1), compaction summaries carrying "goal/constraints/progress/blocked/decisions" forward (§4.6 — §2.5 names only the shorter "goals/progress/decisions"), and the named-child list (§4.5) are the proven precedents this delta adopts.
 - Without `parent_task_id` the event log cannot answer "who asked for this, and what did it produce" — the core feedback question of the orchestrating LLM. Modeling it payload-first (events draft §3.1/§3.10) keeps the log schema stable (no breaking envelope change, events draft §7.2) while making the causal chain first-class.
 
@@ -129,7 +129,7 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 **Source:** PRIME AGENT good part (persistent sub-agents + steering). Direct precedent: `docs/research/prime-agent.md` §2.2 ("Native subagents... results/usage are attributed back... agents message each other without user routing (`agent_message`)"), §2.3 ("Daemon-backed continuity. Sessions, IPython state, schedules, and subagents survive terminal detach and can be reattached (`prime-agent attach`); goals, heartbeats, schedules, and bounded autonomous mode with user-defined gates").
 **Status:** **adopt**
-**Amends:** `docs/architecture.md` §5.1 (channel invariants), §5.2 (message schema — add `steer`; child→parent result semantics), §6.4 (checkpoint — session reload), §7.2 (spawn returns admission — supervisor-internal ack), §7.1 (lifecycle), §14 (cold-start paragraph — pool deferral re-scoped), §16.3 (proto-AGI lifecycle); `docs/research/ipc-protocol-draft.md` §2.2/§2.3/§3 (`steer`, `ready` gating, `result_envelope`) and §4.1 (`PROTO_OUT_OF_ORDER` — admission collision, resolved).
+**Amends:** `docs/architecture/architecture.md` §5.1 (channel invariants), §5.2 (message schema — add `steer`; child→parent result semantics), §6.4 (checkpoint — session reload), §7.2 (spawn returns admission — supervisor-internal ack), §7.1 (lifecycle), §14 (cold-start paragraph — pool deferral re-scoped), §16.3 (proto-AGI lifecycle); `docs/research/ipc-protocol-draft.md` §2.2/§2.3/§3 (`steer`, `ready` gating, `result_envelope`) and §4.1 (`PROTO_OUT_OF_ORDER` — admission collision, resolved).
 
 ### WHAT changes
 
@@ -162,7 +162,7 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 **Source:** PRIME AGENT good part (autonomous mode with user-defined gates and limits). Direct precedent: `docs/research/prime-agent.md` §2.3 ("bounded autonomous mode with user-defined gates"), §5 `--autonomous` ("w/ gates+limits").
 **Status:** **adopt**
-**Amends:** `docs/architecture.md` §7.1 (state machine — add `GATING`/`GATE_FAILED`), §7.4 (budget fields — add `max_turns`/`max_tokens`/`timeout_ms` ownership), §5.2 (`init` message `budget` block), §10 (tests-as-floor becomes the gate), §7.8 (Unio test gate is the final gate), §4 (Architectus/Unio).
+**Amends:** `docs/architecture/architecture.md` §7.1 (state machine — add `GATING`/`GATE_FAILED`), §7.4 (budget fields — add `max_turns`/`max_tokens`/`timeout_ms` ownership), §5.2 (`init` message `budget` block), §10 (tests-as-floor becomes the gate), §7.8 (Unio test gate is the final gate), §4 (Architectus/Unio).
 
 ### WHAT changes
 
@@ -189,7 +189,7 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 **Source:** PRIME AGENT good part (continual-harness self-improvement). Direct precedent: `docs/research/prime-agent.md` §1 (continual harness — "prompts, memories, skills, and subagent specs stored as durable state the agent can refine via `/refine` (evidence-backed, snapshot/rollback, never rewrites the base system prompt)") and §2.4 (local `harness/harness_state.json` with a `refine_workflow` prompt and refinement history).
 **Status:** **adopt**
-**Amends:** `docs/architecture.md` §17.3 (per-module artifacts — add harness state), §17.4 (optimization loop → refinement loop), §10 (canaries gate), §4 (Ascensus M9); `docs/module-template/architecture.md` §10 (optimization plan — plan/apply, rollback by refinement ID); `docs/module-template/dataset-format.md` §6 (canary taxonomy is the gate).
+**Amends:** `docs/architecture/architecture.md` §17.3 (per-module artifacts — add harness state), §17.4 (optimization loop → refinement loop), §10 (canaries gate), §4 (Ascensus M9); `docs/architecture/module-template/architecture.md` §10 (optimization plan — plan/apply, rollback by refinement ID); `docs/architecture/module-template/dataset-format.md` §6 (canary taxonomy is the gate).
 
 ### WHAT changes
 
@@ -220,11 +220,11 @@ These are the same stable-path references the v2 architecture itself uses for re
 
 **Source:** EXTERNAL CRITIQUE (the v2 re-review, in flight at the time of writing — see §0.2).
 **Status:** **adopt** for the residue ((a) repo-state awareness, (b) smoke-test milestone); **reject-with-reason** for the critique's EOF claim.
-**Amends:** `docs/architecture.md` §0 (what changed), §5.3 (four-layer liveness — reaffirmed), §18 (resolution matrix — status notes), §19.15 (smoke test → first milestone); the smoke-test gate referenced in `agents.md` §5/§9 and `docs/module-template/example-spec.md` §9.4.
+**Amends:** `docs/architecture/architecture.md` §0 (what changed), §5.3 (four-layer liveness — reaffirmed), §18 (resolution matrix — status notes), §19.15 (smoke test → first milestone); the smoke-test gate referenced in `agents.md` §5/§9 and `docs/architecture/module-template/example-spec.md` §9.4.
 
 ### WHAT — already resolved before the critique arrived
 
-These items in the critique were **already resolved in `docs/architecture.md` v2.0.0 before the critique was written**; the delta is only a status note so the resolution matrix is honest about provenance:
+These items in the critique were **already resolved in `docs/architecture/architecture.md` v2.0.0 before the critique was written**; the delta is only a status note so the resolution matrix is honest about provenance:
 
 | Critique item | Resolved by | Citation |
 |---|---|---|
@@ -235,7 +235,7 @@ These items in the critique were **already resolved in `docs/architecture.md` v2
 
 ### WHAT — the critique item that is rejected
 
-- **The critique praised "stdout EOF = death" as a liveness signal. That is rejected.** `architecture.md` §5.3 states the opposite, normatively: v0.1 conflated EOF with death; the v2 **four-layer liveness model** treats EOF as **advisory only** (rank 4 of 4), with process exit (`proc.wait()`) and the `exit` message as definitive, heartbeat watchdog as strong, and a drain-deadline watchdog so supervisor-induced stalls are not blamed on the worker (§5.3, §5.4). The critique's own predecessor review (DS-C2, `docs/reviews/review-distributed-systems.md`) documented four EOF failure modes — grandchild pipe inheritance, Python block-buffering, torn partial writes, supervisor stalls — all of which §5.3/§5.4 explicitly handle. The four-layer model **stands**; re-deriving death from EOF would reopen DS-C2.
+- **The critique praised "stdout EOF = death" as a liveness signal. That is rejected.** `architecture.md` §5.3 states the opposite, normatively: v0.1 conflated EOF with death; the v2 **four-layer liveness model** treats EOF as **advisory only** (rank 4 of 4), with process exit (`proc.wait()`) and the `exit` message as definitive, heartbeat watchdog as strong, and a drain-deadline watchdog so supervisor-induced stalls are not blamed on the worker (§5.3, §5.4). The critique's own predecessor review (DS-C2, `docs/architecture/reviews/review-distributed-systems.md`) documented four EOF failure modes — grandchild pipe inheritance, Python block-buffering, torn partial writes, supervisor stalls — all of which §5.3/§5.4 explicitly handle. The four-layer model **stands**; re-deriving death from EOF would reopen DS-C2.
 
 ### WHAT — adopted residue
 
@@ -254,7 +254,7 @@ Acceptance criteria (each must be VERIFIED with a cited command, per `agents.md`
 6. **Result.** `result.json` is written atomically with `status="done"` (§3.4, §16.4) and `Session.run()` returns the `Result`.
 7. **Clean exit.** No orphan processes, no leftover worktree entries (`Surculus.prune()`), exit code 0 (§7.7).
 
-This milestone is currently referenced but not yet built: `agents.md` §5 ("`python -m cambium.tests.smoke`"), §9 (item 5), and `docs/module-template/example-spec.md` §9.4 ("pending `Architectus.execute` wiring"). D6 makes it the **entry condition for Phase 1** — nothing else is P0-complete until Milestone 0 passes, which is exactly the gate the v0.1 reviews demanded ("Get the smoke test to pass" — `docs/system-design.md` §9 "Revised Build Priority", Phase 0).
+This milestone is currently referenced but not yet built: `agents.md` §5 ("`python -m cambium.tests.smoke`"), §9 (item 5), and `docs/architecture/module-template/example-spec.md` §9.4 ("pending `Architectus.execute` wiring"). D6 makes it the **entry condition for Phase 1** — nothing else is P0-complete until Milestone 0 passes, which is exactly the gate the v0.1 reviews demanded ("Get the smoke test to pass" — `docs/architecture/system-design.md` §9 "Revised Build Priority", Phase 0).
 
 ### Open questions
 
@@ -268,7 +268,7 @@ This milestone is currently referenced but not yet built: `agents.md` §5 ("`pyt
 
 **Source:** USER DIRECTIVE (2026-08-09).
 **Status:** **adopt**
-**Amends:** `docs/architecture.md` §2 (layering diagram — remove the Septum box), §4 (module catalog — M8 Septum removed from v2 scope; code retained for history, not renumbered), §7.2 (spawn — direct `create_subprocess_exec`, no `sandbox.wrap`), §8 (transparency table — Septum row removed), §11 (run_shell justification), §12.1 (env allowlist enforced at spawn), §19 (items 11, 12, 14 and the "honest gaps" line), §18.3 (rows IMPL-M4, IMPL-M6, IMPL-C7 — status notes). Threat-model `R3` re-rated; `R4` becomes a required fix.
+**Amends:** `docs/architecture/architecture.md` §2 (layering diagram — remove the Septum box), §4 (module catalog — M8 Septum removed from v2 scope; code retained for history, not renumbered), §7.2 (spawn — direct `create_subprocess_exec`, no `sandbox.wrap`), §8 (transparency table — Septum row removed), §11 (run_shell justification), §12.1 (env allowlist enforced at spawn), §19 (items 11, 12, 14 and the "honest gaps" line), §18.3 (rows IMPL-M4, IMPL-M6, IMPL-C7 — status notes). Threat-model `R3` re-rated; `R4` becomes a required fix.
 
 ### WHAT changes
 
