@@ -486,7 +486,7 @@ different labels. Both are decision-labeled, so the v2 exact-match metric enforc
 scaffold's single-file `example_pairs.jsonl` inlines the two canonical kinds (`trivially_atomic`
 and `must_decompose`, both `canary: true`). The example metric scores them exactly like ordinary
 records (decision exact-match), and the scenario test asserts they are loaded and score 1.0
-(`tests/scenarios/test_example_module.py::test_canary_entries_are_processed`).
+(`src/cambium/modules/example/tests/test_example_module.py::test_canary_entries_are_processed`).
 
 **Coding-task extension** (this design). The kinds above cover decision modules. For diff-producing
 modules, canaries use the same record form (`"canary": true` + `canary_info.kind`) with diff-level
@@ -581,7 +581,7 @@ patches still score low after any config change.
 ## 7. Scenario tests
 
 The module test strategy lives in `docs/architecture/module-template/architecture.md` §9 (per-module `architecture.md`
-§"Test strategy"; example implementation: `tests/scenarios/test_example_module.py`). This design adds
+§"Test strategy"; example implementation: `src/cambium/modules/example/tests/test_example_module.py`). This design adds
 one scenario file, `tests/scenarios/test_metric_antigaming.py`, that exercises the **metric against
 synthetic gaming candidates** in a scratch git repo (real `git`, no mocking — same convention as the
 example module's no-mock, no-network scenario test). Five tests that would each catch a gaming

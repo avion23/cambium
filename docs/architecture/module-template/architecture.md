@@ -201,9 +201,16 @@ List at least five. If you cannot think of five, the module is under-specified.
 
 ## 9. Test Strategy
 
+Module tests are colocated with the module in `src/cambium/modules/<name>/tests/`.
+Module baselines live in `src/cambium/modules/<name>/tests/baselines/`.
+Harness-level tests (supervisor, store, merge, ipc, worker, tasktree, diffundo, bench,
+redact, doctor, cli, conformance) live in `tests/scenarios/`. A module is removable by
+deleting its directory, including its code, tests, datasets, baselines, and
+`architecture.md`.
+
 ### 9.1 Unit tests
 
-`tests/unit/test_<module>.py`. Cover:
+`src/cambium/modules/<name>/tests/test_<module>.py`. Cover:
 
 - Happy path (≥3 inputs).
 - Each failure mode in §8.
@@ -212,7 +219,7 @@ List at least five. If you cannot think of five, the module is under-specified.
 
 ### 9.2 Eval harness
 
-**v2:** the scenario/integration test (§9.4, `tests/scenarios/test_<module>.py`) loads the real dataset, runs `decide()` over every pair, attaches predictions, and scores with `metric()` — this subsumes the role of a standalone eval harness in v2.
+**v2:** the colocated scenario/integration test (§9.4, `src/cambium/modules/<name>/tests/test_<module>.py`) loads the real dataset, runs `decide()` over every pair, attaches predictions, and scores with `metric()` — this subsumes the role of a standalone eval harness in v2.
 
 **v2.1 target:** a standalone `python -m cambium.modules.<name>.eval` runs the metric over the frozen eval set and prints per-signal breakdown. Exit code 0 if mean metric ≥ module's threshold (state the threshold here; default 0.75).
 
@@ -224,7 +231,7 @@ List at least five. If you cannot think of five, the module is under-specified.
 
 ### 9.4 Integration
 
-- **Scenario test (`tests/scenarios/test_<module>.py`, v2):** loads the real dataset, asserts schema validity (plus a negative case that raises `DatasetError`), runs `decide()` over every pair, attaches predictions, and asserts the aggregate metric is at threshold (for the `should_decompose` reference: 1.0 — see `docs/architecture/module-template/example-spec.md` §9.1). This is the v2 eval-harness substitute (§9.2).
+- **Scenario test (`src/cambium/modules/<name>/tests/test_<module>.py`, v2):** loads the real dataset, asserts schema validity (plus a negative case that raises `DatasetError`), runs `decide()` over every pair, attaches predictions, and asserts the aggregate metric is at threshold (for the `should_decompose` reference: 1.0 — see `docs/architecture/module-template/example-spec.md` §9.1). This is the v2 eval-harness substitute (§9.2).
 - **Smoke test (`cambium.tests.smoke`):** where this module is exercised end-to-end once the orchestrator is wired. If not exercised, justify.
 
 ### 9.5 Sibling pinning
