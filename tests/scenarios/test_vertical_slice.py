@@ -33,7 +33,11 @@ def _make_scratch(repo: Path) -> str:
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     (repo / "hello.txt").write_text("hello from the vertical slice\n")
     subprocess.run(["git", "-C", str(repo), "add", "hello.txt"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -78,7 +82,9 @@ def test_vertical_slice_happy_path(tmp_path) -> None:
     assert result.worker_status == "succeeded"
     assert result.gate_exit_code == 0
     assert result.merge_sha is not None
-    assert (scratch / "hello.txt").read_text() == "hello from the vertical slice\n// cambium-slice\n"
+    assert (scratch / "hello.txt").read_text() == (
+        "hello from the vertical slice\n// cambium-slice\n"
+    )
 
     events = _load_events(session_dir)
     assert _protocol_sequence(events) == ["init", "ready", "run_task", "result", "exit"]

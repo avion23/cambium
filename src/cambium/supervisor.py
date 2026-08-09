@@ -678,7 +678,7 @@ class _FallbackSequencer:
 def _resolve_merge_sequencer() -> type | None:
     try:
         mod = importlib.import_module("cambium.merge")
-        return getattr(mod, "MergeSequencer")
+        return mod.MergeSequencer
     except (ImportError, AttributeError):
         return None
 
@@ -686,7 +686,7 @@ def _resolve_merge_sequencer() -> type | None:
 def _resolve_event_store() -> type | None:
     try:
         mod = importlib.import_module("cambium.store")
-        return getattr(mod, "EventStore")
+        return mod.EventStore
     except (ImportError, AttributeError):
         return None
 
@@ -843,7 +843,7 @@ class _Runtime:
                     asyncio.gather(*(h.proc.wait() for h in alive), return_exceptions=True),
                     TERM_GRACE_S,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 for h in alive:
                     if h.proc.returncode is not None:
                         continue
@@ -892,7 +892,9 @@ class _Runtime:
             )
         return result
 
-    async def _git(self, path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    async def _git(
+        self, path: Path, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         return await asyncio.to_thread(self._git_sync, path, args, check)
 
     async def _git_stdout(self, path: Path, *args: str, check: bool = True) -> str | None:
@@ -971,7 +973,9 @@ class _Runtime:
         env["CAMBIUM_GENERATION"] = str(generation)
         return env
 
-    def _run_payload(self, spec: dict[str, Any], run_rid: str, wall_budget: float) -> dict[str, Any]:
+    def _run_payload(
+        self, spec: dict[str, Any], run_rid: str, wall_budget: float
+    ) -> dict[str, Any]:
         repo = Path(spec["repo"])
         return {
             "task_id": spec["task_id"],
@@ -1053,7 +1057,9 @@ class _Runtime:
             )
             if outcome.clean:
                 gate_rc = await self._run_gate(spec, worktree)
-                verdict_ok = bool(outcome.envelope and outcome.envelope.get("status") == "succeeded")
+                verdict_ok = bool(
+                    outcome.envelope and outcome.envelope.get("status") == "succeeded"
+                )
                 if verdict_ok and gate_rc == 0:
                     merged = await self._merge_task(spec, handle)
                     if merged is not None:
@@ -1237,7 +1243,7 @@ class _Runtime:
                 remaining = next_deadline - loop.time()
                 try:
                     msg = await asyncio.wait_for(messages.get(), max(remaining, 0.0))
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
                 if msg is None:
                     # EOF alone is never death (arch §5.3): 5s grace, then poll.
@@ -1269,9 +1275,10 @@ class _Runtime:
                     )
                     run_rid = self._next_rid()
                     payload = self._run_payload(spec, run_rid, wall_budget)
-                    if not await _write_json(
-                        proc, {"type": "run_task", "request_id": run_rid, "task_id": task_id, **payload}
-                    ):
+                    if not await _write_json(proc, {
+                        "type": "run_task", "request_id": run_rid,
+                        "task_id": task_id, **payload,
+                    }):
                         await self.emit("protocol", task_id=task_id, note="run_task write failed")
                     await self.emit(
                         "run_task", task_id=task_id, request_id=run_rid, generation=generation
@@ -1389,7 +1396,9 @@ class _Runtime:
         skip a rerun when the worktree tree hash is unchanged since the last run."""
         task_id = spec["task_id"]
         gate = spec.get("gate", "true")
-        timeout = _cfg_float(spec, "gate_timeout_s", "CAMBIUM_GATE_TIMEOUT_S", DEFAULT_GATE_TIMEOUT_S)
+        timeout = _cfg_float(
+            spec, "gate_timeout_s", "CAMBIUM_GATE_TIMEOUT_S", DEFAULT_GATE_TIMEOUT_S
+        )
         if not Path(worktree).exists():
             await self.emit("gate", task_id=task_id, exit_code=127, note="worktree missing")
             return 127
@@ -1406,7 +1415,7 @@ class _Runtime:
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
             rc = proc.returncode if proc.returncode is not None else 1
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 proc.kill()
             except ProcessLookupError:
@@ -1661,7 +1670,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--task-spec",
-        help="path to task spec JSON (slice mode; default: <session-dir>/task.json, else built-in defaults)",
+        help=(
+            "path to task spec JSON (slice mode; default: <session-dir>/task.json, "
+            "else built-in defaults)"
+        ),
     )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)

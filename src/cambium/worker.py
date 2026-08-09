@@ -265,7 +265,7 @@ async def _run_task(
         # A hard cancel is only a fallback if the loop fails to drain promptly.
         try:
             await asyncio.wait_for(hb, timeout=HEARTBEAT_INTERVAL_S + 1.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError):
             hb.cancel()
             try:
                 await hb
@@ -360,7 +360,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
 
     try:
         first = await asyncio.wait_for(read_message(reader), timeout=init_timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return await _fatal(writer, {}, "init timeout: no init message within deadline")
     except MessageTooLong:
         return await _fatal(writer, {}, "wire line exceeded the length cap")
@@ -410,7 +410,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
 
         try:
             msg = read_task.result()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # No message from the supervisor within the idle deadline: the
             # supervisor is presumed gone. Abort any current task and exit
             # gracefully (documented in the module docstring).
