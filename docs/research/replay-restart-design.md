@@ -127,7 +127,7 @@ The task asks: recreate from main, or discard dirty? Per §7.5 (and the DS-C5/IM
 
 - **Reuse the worktree path, never reuse its dirty state.** Before every respawn (first spawn *and* every restart), `Surculus.recover(worktree, base_commit)` runs: remove `*.lock` under `worktree/.git` and `repo/.git/worktrees/<id>`; abort in-progress `rebase`/`merge`/`cherry-pick`/`revert`; `git reset --hard ${base_commit}` (drop working-tree changes); `git clean -fd` (remove untracked build artifacts); write the new `generation`; optionally restore checkpoint commits by cherry-picking `commits_so_far` onto `base_commit` (fall back to fresh start if the cherry-pick fails).
 - **base_commit, not current main.** The reset target is the task's fork-point `base_commit` from the `init` message (§5.2, §7.2), so the worktree is deterministically reconstructible regardless of how far `main` moved during the crash. §7.5's normative text says `git reset --hard ${base_commit}`.
-- **Quarantine on failure.** If recovery fails (step 3 non-zero), the worktree is moved to `${session_dir}/cambium/quarantine/${task_id}-${generation}/` and a fresh worktree is created from `base_commit` (§7.5). This is the C6 option-3 fallback (fresh worktree per restart) applied only where in-place recovery cannot guarantee a clean tree.
+- **Quarantine on failure.** If recovery fails (step 3 non-zero), the worktree is moved to `${session_dir}/.cambium/quarantine/${task_id}-${generation}/` and a fresh worktree is created from `base_commit` (§7.5). This is the C6 option-3 fallback (fresh worktree per restart) applied only where in-place recovery cannot guarantee a clean tree.
 - **`Surculus.prune()`** runs on supervisor startup (and shutdown) to clean stale `git worktree` admin entries (§7.5).
 
 Result: IMPL-M9 ("restart reuses possibly-corrupted worktrees") is resolved by construction — the reused path is reset to a known-good state before any new worker touches it.
@@ -136,9 +136,9 @@ Result: IMPL-M9 ("restart reuses possibly-corrupted worktrees") is resolved by c
 
 **UNVERIFIED / [PROPOSED]** — the architecture mandates fencing + process-group kill at startup (§7.3, §18.1) but not the concrete steps. The following is the minimal consistent protocol:
 
-1. Open `${session_dir}/cambium/events.db` (SQLite replays the WAL automatically — §6.5). Detect `seq` gaps → emit `recovery_gap` event (§6.5).
+1. Open `${session_dir}/.cambium/events.db` (SQLite replays the WAL automatically — §6.5). Detect `seq` gaps → emit `recovery_gap` event (§6.5).
 2. Replay `events` since the last `snapshots` row; rebuild the per-task state machine (§2.2) and restart budgets.
-3. For each task whose last durable event is a `worker_spawned` (with pid) and no terminal event: probe `os.kill(pid, 0)`; if alive, `os.killpg(pid, SIGKILL)`. Log a `worker_exit`-style recovery event for each killed group.
+3. For each task whose last durable event is a `worker_spawned` (with pid) and no terminal event: probe `os.kill(pid, 0)`; if alive, `os.killpg(pid, SIGKILL)`. Log a `worker_exit`-style recovery event for each killed group. **The sweep is best-effort**: `worker_spawned` is a non-critical (advisory) event that may be lost within `fsync_interval_s` (§2.2), so a task whose spawn record never became durable has no kill target. The guarantee of convergence is generation fencing (§7.3), not the sweep: an orphan that survives the kill (or was never targeted) reads the bumped `.cambium/generation` before its next git operation or `state_ref` write and self-terminates with `exit reason="fatal"`.
 4. `Surculus.prune()` (§7.5).
 5. For each in-flight task: run `Surculus.recover()` (§7.5), then apply restart policy (§7.4) and respawn with `generation+1`, `resume_from_checkpoint` set per §2.4.
 6. `Unio.reconcile()`: compare `refs/heads/main` to the latest `merge_committed` event; emit `merge_reconciled` if the ref advanced without a durable event (§7.8).
@@ -211,7 +211,7 @@ Supervisor crash at `✂` with one task T in flight (checkpointed at turn 3), on
  8   replay since last snapshot; rebuild per-task states:
         T → last durable event = checkpoint turn-3, no terminal → in-flight, resume pt=turn-3
         D → last durable event = result → DONE
- 9   orphan sweep: for in-flight tasks, probe kill(P,0); if alive → killpg(P,SIGKILL)
+ 9   orphan sweep [best-effort]: for in-flight tasks, probe kill(P,0); if alive → killpg(P,SIGKILL)
 10   Surculus.prune()
 11   for T: Surculus.recover(wt, base_commit)                        [§7.5]
         - remove *.lock; abort rebase/merge; reset --hard base; clean -fd
@@ -234,7 +234,7 @@ Numbered step semantics:
 6. **Restart** — new supervisor, same `${session_dir}` (§16.2).
 7. **WAL auto-recovery** — no torn rows (§4.1).
 8. **State rebuild** — last-durable-event table (§2.2).
-9. **Orphan sweep** — event-log-derived pgid targets, OS probe, process-group kill (§2.3).
+9. **Orphan sweep** — event-log-derived pgid targets, OS probe, process-group kill; **best-effort** — lost `worker_spawned` events leave no target, so fencing (step 15) is the convergence guarantee (§2.3).
 10. **Prune** — stale worktree admin entries (§7.5).
 11. **Worktree recovery** — discard dirty, restore base + checkpoint commits, bump generation (§7.5). Resolves IMPL-M9.
 12. **Merge reconcile** — closes the crash-window between `update-ref` and `merge_committed` (§7.8).
@@ -254,7 +254,7 @@ Fault-injection primitive: a test hook that kills the supervisor process (SIGKIL
 |---|---|---|---|
 | 1 | After `task_assigned`, before `worker_ready` | no checkpoint | Task reruns from scratch; exactly one `worker_spawned`-generation bump; no resume. Last durable event is `task_assigned` → PENDING path (§2.2). |
 | 2 | After `checkpoint` turn-3, worker alive | checkpoint file turn-3 exists, `commits_so_far` present | Resume: new worker's `init.resume_from_checkpoint == turn-3`; worktree reset to base + cherry-picked commits (§2.4, §7.5). |
-| 3 | SIGKILL supervisor while orphaned worker is still alive and mid-tool-call (pipes break but worker survives) | orphan mutating worktree | No split-brain: orphan's `pgid` killed (step 9) **or** orphan self-terminates on generation mismatch; worktree clean after recover; one writer at all times (§2.3, §7.3). |
+| 3 | SIGKILL supervisor while orphaned worker is still alive and mid-tool-call (pipes break but worker survives) | orphan mutating worktree | No split-brain: the best-effort sweep kills the orphan's `pgid` (step 9) **or** the orphan self-terminates on generation mismatch; the generation fence — not the sweep — is what guarantees at most one writer; worktree clean after recover (§2.3, §7.3). |
 | 4 | After durable `result` event committed, before `result.json` rename | task D done | `result.json` reconstructed from the `result` event; task D is DONE and is **not** re-run; status file consistent (§2.2). |
 | 5 | SIGKILL before `fsync_interval_s` elapses (non-critical tail in queue) | recent heartbeats un-fsync'd | `seq` gap detected → `recovery_gap` event; critical events (checkpoints/result) all present; no corrupt rows (§1.1.3, §4.1). |
 | 6 | Kill between `update-ref` and `merge_committed` (Unio publish window) | main ref advanced | `Unio.reconcile()` emits `merge_reconciled`; `refs/heads/main ==` newest `merge_committed`/reconciled SHA; no re-merge (§7.8, §3). |
