@@ -170,8 +170,8 @@ class Result:
                                         # 3 timeout, 4 cancelled
     commits: tuple[str, ...]            # SHAs produced
     files_changed: tuple[str, ...]
-    unified_diff: str | None            # per-file diff vs base_commit, capped 64 KiB
-                                        # (D8b); truncated flag via diff_truncated
+    unified_diff: str | None            # per-file diff vs base_commit, capped 64 KiB (D8b)
+    diff_truncated: bool                # True when unified_diff overflowed the 64 KiB cap
     summary: str                        # worker-authored, ≤2k chars
     metric_score: float                 # 0.0..1.0, multi-signal (§10)
     metric_breakdown: dict[str, float]  # per-signal scores
@@ -185,7 +185,7 @@ class Result:
 
 `Result` is JSON-serializable and is the **only** contract the upper system consumes from a finished run. It is written atomically to `${session_dir}/.cambium/result.json` before `Session.run()` returns.
 
-**Result envelopes flow up the Task Tree** (D2): a child node's terminal envelope is exactly this shape plus `parent_task_id`, and it is a **message** to the parent, not merely a terminal report. The envelope carries **only** `unified_diff`, `summary`, `metric_breakdown`, `commits`, `files_changed`, and terminal `status` upward — **never the child's scratchpad, chain-of-thought, or trajectory** (normative information-hiding rule, D8b/I2.7). `Nuntius`/`Custos` validate upward messages against this envelope schema and reject unknown top-level fields, so the rule is structural, not a prompt convention.
+**Result envelopes flow up the Task Tree** (D2): a child node's terminal envelope is a **message** to the parent, not merely a terminal report. The upward envelope carries **exactly**: `parent_task_id`, `unified_diff` (with `diff_truncated` set on overflow), `summary`, `metric_score`, `metric_breakdown`, `commits`, `files_changed`, and terminal `status` — **never the child's scratchpad, chain-of-thought, or trajectory** (normative information-hiding rule, D8b/I2.7). The `Result` dataclass above adds session/root-level fields (`exit_code`, `event_log_ref`, `session_id`, `started_at`, `ended_at`, `failure_reason`) that are populated when the session result is finalized (§16.1); they are **not** part of the upward child envelope. `Nuntius`/`Custos` validate upward messages against this envelope schema and reject unknown top-level fields, so the rule is structural, not a prompt convention.
 
 ### 3.5 `Instance` — proto-AGI leaf handle (control plane)
 
@@ -214,9 +214,9 @@ class Instance:
 ```python
 @dataclass(frozen=True)
 class Event:
-    kind: str               # "task_assigned" | "worker_spawned" | "heartbeat" |
-                            # "tool_event" | "checkpoint" | "merge_progress" |
-                            # "result" | "worker_exit" | "log" | ...
+    kind: str               # "submitted" | "task_decomposed" | "worker_spawned" |
+                            # "heartbeat" | "tool_event" | "checkpoint" |
+                            # "merge_progress" | "result" | "worker_exit" | "log" | ...
     task_id: str | None
     request_id: str | None
     timestamp: float        # time.time()
@@ -225,7 +225,9 @@ class Event:
     payload: dict           # type-specific; redacted of secrets (§9)
 ```
 
-The `Event` stream is the **machine interface**. The TUI renders it; the host system can also subscribe. Durability is tiered (critical vs non-critical events) — see §6.5 for the precise contract; in short, critical events (`result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`) are fsync-d before they are yielded to any subscriber, while non-critical events may be lost within the configured fsync interval (default 1 s) on supervisor crash.
+The `Event` stream is the **machine interface**. The TUI renders it; the host system can also subscribe. Durability is tiered (critical vs non-critical events) — see §6.5 for the precise contract; in short, critical events (`submitted`, `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`) are fsync-d before they are yielded to any subscriber, while non-critical events may be lost within the configured fsync interval (default 1 s) on supervisor crash.
+
+**Event-kind vocabulary (reconciliation).** The canonical name for the task-entry event is **`submitted`** (critical); `task_assigned` is the v2.1-era name for the same event, per the events draft's catalog mapping (`docs/research/event-schema-draft.md` §3.1: `submitted` = arch `task_assigned`). Decomposition output is **`task_decomposed`** (non-critical, draft-proposed; `docs/research/event-schema-draft.md` §3.10). Tree linkage uses `payload.parent_task_id` on both (§3.7, §6.3). The §6.5 tier tables use the canonical names with the v2.1 names mapped inline, not silently divergent.
 
 ### 3.7 Task tree (D2)
 
@@ -241,7 +243,7 @@ The task structure is an explicit **`TaskTree`**, not a flat subtask list. Decom
 - **I2.4 Context composition.** A node's context = its own session log (bounded) + parent summary + subtree result envelopes. A node never reads a sibling's raw session; siblings communicate only through the parent.
 - **I2.5 Tree-level completion.** A node reaches terminal state only when its own work is done **and** every child has returned an envelope (recursively). The §7.1 state machine is per-task; the D4 gate defines "work is done."
 - **I2.6 Append-only session logs.** Nodes' logs are immutable history; steering writes new turns, never edits old ones.
-- **I2.7 Information hiding (D8b).** A child **never** sends its scratchpad, chain-of-thought, reasoning trace, or trajectory upward. The child→parent envelope carries exactly: `unified_diff` (≤64 KiB, `diff_truncated` flag on overflow), `summary` (≤2k chars), `metric_breakdown`, `commits`, `files_changed`, terminal `status`. Enforcement is deterministic (schema validation at `Nuntius`/`Custos`), not a prompt convention.
+- **I2.7 Information hiding (D8b).** A child **never** sends its scratchpad, chain-of-thought, reasoning trace, or trajectory upward. The child→parent envelope carries exactly: `parent_task_id`, `unified_diff` (≤64 KiB, `diff_truncated` flag on overflow), `summary` (≤2k chars), `metric_score`, `metric_breakdown`, `commits`, `files_changed`, terminal `status`. Enforcement is deterministic (schema validation at `Nuntius`/`Custos`), not a prompt convention.
 
 **NodeSession terminology (D3).** The public `Session` (§3.3) is **one task execution** of the headless API. A node in the Task Tree owns a **`NodeSession`** — a sub-session identified by `session_id == task_id`, checkpointed and reloadable, with its own conversation/session store under `${session_dir}/.cambium/sessions/<node_id>/` (D2/D8g). The wire messages address `task_id`; `session_id` is the same value until the split is finalized (design-deltas D3 Q3.5).
 
@@ -353,7 +355,7 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
  "commits":["a1b2c3d"],
  "files_changed":["src/dry_run.rs"],
  "diff":"...",                          // unified_diff vs base_commit, ≤64 KiB, truncation
-                                        // flagged `diff_truncated:true` (D8b) — envelope ONLY:
+ "diff_truncated":false,                // flagged true on overflow (D8b) — envelope ONLY:
                                         // no scratchpad/CoT/trajectory may ride upward (I2.7)
  "summary":"Removed 3 global statics; replaced with worker-local config.",
  "metric_score":0.84,
@@ -495,8 +497,8 @@ The previous sections refer to "durability" in several places. This section stat
 
 | Tier | Kinds | Promise |
 |---|---|---|
-| **Critical** | `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`, `task_assigned`, `merge_committed` | Fsync-d to disk **before** the writer returns the ack to the producer and **before** the event is yielded to any `Session.events()` subscriber. Loss window on supervisor crash: zero (last committed transaction may be lost only on simultaneous kernel/page-cache loss, which SQLite WAL + `synchronous=NORMAL` protects against). |
-| **Non-critical** | `heartbeat`, `tool_event`, `log`, `worker_spawned`, `worker_ready` | Appended to the WAL subject to `fsync_interval_s` (default 1 s) checkpoint cadence. Loss window on supervisor crash: at most `fsync_interval_s` of the most recent non-critical events. |
+| **Critical** | `submitted` (v2.1 name: `task_assigned`), `result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`, `merge_committed` | Fsync-d to disk **before** the writer returns the ack to the producer and **before** the event is yielded to any `Session.events()` subscriber. Loss window on supervisor crash: zero (last committed transaction may be lost only on simultaneous kernel/page-cache loss, which SQLite WAL + `synchronous=NORMAL` protects against). |
+| **Non-critical** | `heartbeat`, `tool_event`, `log`, `worker_spawned`, `worker_ready`, `task_decomposed` (draft-proposed, §3.6) | Appended to the WAL subject to `fsync_interval_s` (default 1 s) checkpoint cadence. Loss window on supervisor crash: at most `fsync_interval_s` of the most recent non-critical events. |
 
 **Mechanism.** The writer thread holds open the main DB fd **and** the WAL fd. The "fsync" operation is:
 
@@ -538,40 +540,51 @@ This section normatively defines how a task moves through the system. Every stat
 ### 7.1 State machine (per task)
 
 ```
-                ┌──────────┐
-                │ PENDING  │  task enqueued by Architectus
-                └────┬─────┘
-                     │ worktree created (Surculus)
-                     ▼
-                ┌──────────┐
-                │ SPAWNING │  Custos.create_subprocess_exec(...)
-                └────┬─────┘
-                     │ ready received
-                     ▼
-                ┌──────────┐  heartbeat ─┐
-            ┌──►│ RUNNING  │◄────────────┘
-            │   └────┬─────┘
-            │        │ work done (self-reported) ──► GATING
-            │        │ timeout/fatal error ────────► FAILED
-            │        ▼
-            │   ┌──────────┐
-            │   │ CRASHED  │  EOF + no result, OR watchdog kill
-            │   └────┬─────┘
-            │        │ restartable & under budget?
-            │        ├─yes─► recover worktree (§7.5), increment generation
-            └────────┘        back to SPAWNING
-                     │no
-                     ▼
-                ┌──────────┐
-                │ FAILED   │  max_restarts reached OR budget exhausted
-                └──────────┘
+                ┌────────────┐
+                │  PENDING   │   task enqueued by Architectus
+                └──────┬─────┘
+                       │ worktree created (Surculus)
+                       ▼
+                ┌────────────┐
+                │  SPAWNING  │   Custos.create_subprocess_exec(...)
+                └──────┬─────┘
+                       │ ready received
+                       ▼
+                ┌────────────┐    heartbeat ─┐
+            ┌──►│  RUNNING   │◄──────────────┘
+            │   └──────┬─────┘
+            │          │ work complete (result envelope received)
+            │          │ cancel / shutdown (§7.7) ──────►  ┌────────────┐
+            │          ▼                                   │ CANCELLED  │
+            │   ┌────────────┐                             └────────────┘
+            │   │  GATING    │    gate passes ──────►      ┌────────────┐
+            │   └──────┬─────┘                             │    DONE    │
+            │          │ gate fails                        └──────┬─────┘
+            │          ▼                                          │ reviewer
+            │   ┌────────────┐                                    │ rejection (§7.8)
+            │   │GATE_FAILED │                                    ▼
+            │   └──────┬─────┘                             ┌────────────┐
+            │          │ retries left ──► back to RUNNING  │  REJECTED  │
+            │          │ retries exhausted                 └────────────┘
+            │          ▼
+            │   ┌────────────┐
+            │   │  FAILED    │   ◄─ timeout / fatal error (from RUNNING)
+            │   └────────────┘
+            │          ▲
+            │          │ not restartable / budget exhausted
+            │   ┌────────────┐
+            │   │  CRASHED   │   EOF + no result, OR watchdog kill
+            │   └──────┬─────┘
+            │          │ restartable & under budget?
+            │          ├─yes─► recover worktree (§7.5), increment generation ──► SPAWNING
+            └──────────┘        back to SPAWNING
 ```
 
-**GATING / GATE_FAILED (D4).** A task completes only when its **gate** passes. When the worker reports its work done, the task enters `GATING` and `Custos` runs the task's gate command (e.g., the task's scenario test suite; `Unio`'s test gate at merge time, §7.8). Gate passes → `DONE` (with the gate verdict attached to the result envelope). Gate fails → `GATE_FAILED`: the worker receives the gate's failure evidence (command, output tail, failing assertion) as a steering turn (D3) and may retry up to `gate_max_retries` (default 2, supervisor-owned); retries exceed the bound → the task fails **with evidence** (`status="failed"`, `failure_reason` includes the gate command, exit code, and captured output). "Done" is therefore never self-reported by the worker. Skip-if-unchanged and gate-verdict content-addressing are in §7.9.
+**GATING / GATE_FAILED (D4).** A task completes only when its **gate** passes. When the worker completes its work and `Custos` receives the result envelope (§3.4), the task enters `GATING` and `Custos` runs the task's gate command (e.g., the task's scenario test suite; `Unio`'s test gate at merge time, §7.8). Gate passes → `DONE` (with the gate verdict attached to the result envelope). Gate fails → `GATE_FAILED`: the worker receives the gate's failure evidence (command, output tail, failing assertion) as a steering turn (D3) and may retry up to `gate_max_retries` (default 2, supervisor-owned); retries exceed the bound → the task fails **with evidence** (`status="failed"`, `failure_reason` includes the gate command, exit code, and captured output). "Done" is therefore never self-reported by the worker; the transition into `GATING` is the deterministic result-envelope receipt, not a worker self-report. Skip-if-unchanged and gate-verdict content-addressing are in §7.9.
 
 **Tree-level completion (D2 I2.5).** The state machine is per-task; a node is terminal only when its own work is done **and** every child has returned a result envelope (recursively). The root's envelope is the session result (§3.4, §3.7).
 
-Reviewer rejection after the merge gate (§7.8) maps to the `REJECTED` result status (§3.4) — a `Result`-only status, not a separate per-task state.
+**Terminal result statuses (§3.4).** `DONE` — gate passed (§7.9); `FAILED` — timeout / fatal error, gate retries exhausted, or restart budget exhausted; `REJECTED` — reviewer rejection after the merge gate (§7.8); `CANCELLED` — cancel / shutdown (§7.7). Each is recorded as the terminal `Result.status`.
 
 ### 7.2 Spawn
 
