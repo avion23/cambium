@@ -6,7 +6,7 @@ synchronous file I/O on the hot path") with a stdlib-only, non-blocking,
 structured, rotated, redacted logging design.
 
 Sources read: `docs/reviews/review-implementation.md` (M7, M6), `docs/architecture.md`
-(§2 stdout contract, §6 event log, §12 secrets, §13 logging, §14 Python stance, §16.2
+(§5.1 item 2 stdout contract, §6 event log, §12 secrets, §13 logging, §14 Python stance, §16.2
 session-dir contract), `src/cambium/**` scaffold (`events.py`, `orchestrator.py`,
 `modules/base.py`).
 
@@ -246,12 +246,16 @@ Levels are logger levels set in `setup_logging(levels: dict[str, str])`, read fr
 | `cambium` | `INFO` | Supervisor + library |
 | `cambium.opifex.<task_id>` | `INFO` | Per-worker (per arch §13) |
 | `cambium.diffundo`, `cambium.nuntius`, … | `INFO` | Per-module, individually tunable |
-| `dspy`, `litellm`, `httpx`, `urllib3`, `tokenizers`, `asyncio` | `WARNING` | Chatty libraries; **stdout redirected** per arch §2/§11 |
+| `dspy`, `litellm`, `httpx`, `urllib3`, `tokenizers`, `asyncio` | `WARNING` | Chatty libraries; **stdout redirected** per arch §5.1 item 2 (§11 secondary) |
 
 `QueueListener(respect_handler_level=True)` lets the file handler's own `level`
 (global floor) also gate what the writer processes.
 
 ### 2.7 Log file layout
+
+**Canonical session prefix:** `.cambium/` (dotted) is canonical for the Cambium-owned
+session subtree (arch §16.2). Every path below resolves against `$SESSION_DIR/.cambium/`;
+the non-dotted `cambium/` form is not used in this design.
 
 ```
 $SESSION_DIR/                     # = the repo root when session_dir is the repo root
@@ -274,10 +278,18 @@ $SESSION_DIR/                     # = the repo root when session_dir is the repo
 - Worker stderr is still captured by the supervisor and mirrored into the event log
   as `kind="log"` events (arch §13), so a worker that crashes before its logger is
   configured remains observable, and log verbosity never corrupts the stdout protocol
-  (arch §2: stdout is reserved for the JSON-Lines IPC; no `print()` in worker code).
-- Refinement over arch §16.2 (which listed `cambium.log` directly under `cambium/`):
+  (arch §5.1 item 2: stdout is reserved for the JSON-Lines IPC; no `print()` in worker
+  code).
+- Refinement over arch §16.2 (which listed `cambium.log` directly under `.cambium/`):
   logs move into `logs/` so the diagnostics tree and the event store are cleanly
   separated (§1.6).
+- **Session-absolute paths.** Log paths resolve against `$SESSION_DIR`, never the
+  worker's cwd: workers spawn with `cwd = worktree` (arch §7.2), so
+  `.cambium/logs/workers/<task_id>.log` must be constructed from the session dir, not a
+  relative `.cambium/...` (a relative path would land inside the worktree).
+- **`.cambium/` is gitignored.** `Surculus.recover()` runs `git clean -fd` before every
+  respawn (arch §7.5 step 4); `.cambium/` is in `.gitignore`, so the clean cannot delete
+  worker logs or the `generation` file.
 
 ### 2.8 Rotation policy
 
