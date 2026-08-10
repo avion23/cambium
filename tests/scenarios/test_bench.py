@@ -48,7 +48,12 @@ FAST_TESTS = [
 WALL_RATIO = "--bench-wall-ratio=100"
 
 
-def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Path:
+def _write_fixture_module(
+    tmp_path: Path,
+    *,
+    manifest: dict | None = None,
+    invalid_output: bool = False,
+) -> Path:
     """Create one importable module that is driven only through its JSON CLI."""
     source_root = tmp_path / "src"
     modules_dir = source_root / "cambium" / "modules"
@@ -71,6 +76,9 @@ def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Pa
 
             def main():
                 payload = json.load(sys.stdin)
+                if __INVALID_OUTPUT__:
+                    sys.stdout.buffer.write(b"\\xff")
+                    return
                 if payload["operation"] != "evaluate":
                     raise ValueError("fixture only supports evaluate")
                 results = []
@@ -97,7 +105,7 @@ def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Pa
                     }))
                     raise SystemExit(1)
             """
-        )
+        ).replace("__INVALID_OUTPUT__", repr(invalid_output))
     )
     records = {
         "train": {
@@ -333,6 +341,67 @@ def test_cli_timeout_fails_without_combined_fallback(tmp_path, monkeypatch, caps
     assert len(calls[0]) == 1
     assert not (bench_root / "fixture_module" / "baseline.json").exists()
     assert "ERROR ModuleCLIError: simulated train-split timeout" in capsys.readouterr().err
+
+
+def test_invalid_utf8_cli_output_raises_module_cli_error(tmp_path) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path, invalid_output=True)
+
+    with pytest.raises(bench.ModuleCLIError, match="could not be decoded"):
+        bench.run_module_cli(
+            "cambium.modules.fixture",
+            {"operation": "evaluate", "records": []},
+            cwd=REPO_ROOT,
+            source_root=modules_dir.parents[1],
+        )
+
+
+def test_invalid_utf8_cli_output_fails_without_combined_fallback_or_baseline(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+        invalid_output=True,
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    datasets_dir = modules_dir / "fixture" / "datasets"
+    (datasets_dir / "example_pairs.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "combined-1",
+                "input": {"task": "Combined", "context": ""},
+                "expected": {"decompose": False, "reason": "atomic"},
+            }
+        )
+        + "\n"
+    )
+    calls: list[list[dict]] = []
+    real_run_module_cli = bench.run_module_cli
+
+    def record_call(_cli_module, payload, **kwargs):
+        calls.append(payload["records"])
+        return real_run_module_cli(_cli_module, payload, **kwargs)
+
+    monkeypatch.setattr(bench, "run_module_cli", record_call)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert len(calls) == 1
+    assert len(calls[0]) == 1
+    captured = capsys.readouterr()
+    assert "ERROR ModuleCLIError" in captured.err
+    assert "fell back to the combined file" not in captured.err
+    assert not (bench_root / "fixture_module" / "baseline.json").exists()
 
 
 def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:

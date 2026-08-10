@@ -226,6 +226,10 @@ def run_module_cli(
             timeout=timeout,
             check=False,
         )
+    except UnicodeError as exc:
+        raise ModuleCLIError(
+            f"module {cli_module!r}: CLI output could not be decoded: {exc}"
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise ModuleCLIError(f"module {cli_module!r}: CLI could not run: {exc}") from exc
 
