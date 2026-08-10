@@ -18,10 +18,14 @@ and the six findings the sequencer encodes:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -32,7 +36,10 @@ from cambium.merge import (
     MergeSequencer,
     NonFastForwardError,
     QuarantineError,
+    StagingCleanupError,
 )
+from cambium.store import EventStore
+from cambium.supervisor import _Runtime, read_events, run_plan
 
 SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 
@@ -62,10 +69,25 @@ def _init_repo(repo: Path) -> str:
     return _rev(repo, "HEAD")
 
 
+def _init_separate_git_dir_repo(repo: Path, git_dir: Path) -> str:
+    subprocess.run(
+        ["git", "init", "-b", "main", f"--separate-git-dir={git_dir}", str(repo)],
+        check=True, capture_output=True,
+    )
+    for key, value in (("user.name", "merge-test"), ("user.email", "merge@test"),
+                       ("gc.auto", "0")):
+        _run(repo, "config", key, value)
+    (repo / "base.txt").write_text("base\n")
+    _run(repo, "add", "base.txt")
+    _run(repo, "commit", "-m", "initial")
+    return _rev(repo, "HEAD")
+
+
 def _worker_commit(repo: Path, branch: str, wt: Path, files: dict[str, str], from_: str) -> str:
     """Worker-style worktree on ``branch`` with one commit. Returns the tip SHA."""
     _run(repo, "worktree", "add", "-b", branch, str(wt), from_)
     for name, content in files.items():
+        (wt / name).parent.mkdir(parents=True, exist_ok=True)
         (wt / name).write_text(content)
         _run(wt, "add", name)
     _run(wt, "commit", "-m", f"{branch}: {','.join(files)}")
@@ -224,7 +246,7 @@ def test_staging_conflict_lists_file_and_keeps_main(tmp_path) -> None:
     _worker_commit(repo, "wt-m", wt_m, {"base.txt": "base\nfrom-m\n"}, base)
     _publish(repo, _rev(repo, "refs/heads/wt-m"), base)
 
-    seq = MergeSequencer(task_id="conf-1")
+    seq = MergeSequencer(task_id="conf-1", session_dir=tmp_path)
     with pytest.raises(MergeConflictError) as exc:
         seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
     assert "base.txt" in exc.value.conflicts
@@ -242,11 +264,12 @@ def test_staging_sha_survives_worktree_removal(tmp_path) -> None:
     tip_m = _worker_commit(repo, "wt-m", wt_m, {"m.txt": "m\n"}, base)
     _publish(repo, tip_m, base)  # main advances so the rebase rewrites the commit
 
-    seq = MergeSequencer(task_id="dangle")
+    seq = MergeSequencer(task_id="dangle", session_dir=tmp_path)
     staging = tmp_path / "staging"
     staged = seq.prepare_staging(repo, staging, "wt-a", "main")
     assert staged != tip_a  # rewritten by the rebase; only refs keep it alive
-    staging_ref = "refs/cambium/staging/dangle"
+    staging_ref = seq.staging_ref
+    assert staging_ref is not None
     assert _rev(repo, staging_ref) == staged
 
     # the throwaway worktree dies (crash / external removal) — the commit must
@@ -392,7 +415,7 @@ def test_staging_conflict_with_spaced_path(tmp_path) -> None:
     _worker_commit(repo, "wt-m", wt_m, {"my file.txt": "from-m\n"}, base)
     _publish(repo, _rev(repo, "refs/heads/wt-m"), base)
 
-    seq = MergeSequencer(task_id="conf-space")
+    seq = MergeSequencer(task_id="conf-space", session_dir=tmp_path)
     with pytest.raises(MergeConflictError) as exc:
         seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
     assert "my file.txt" in exc.value.conflicts  # unquoted by the -z parse
@@ -429,10 +452,11 @@ def test_prepare_staging_fetches_branch_from_remote(tmp_path) -> None:
     assert _run(repo, "rev-parse", "--verify", "refs/remotes/origin/wt-remote",
                 check=False).returncode != 0
 
-    seq = MergeSequencer(task_id="fetch-1")
+    seq = MergeSequencer(task_id="fetch-1", session_dir=tmp_path)
     staged = seq.prepare_staging(repo, tmp_path / "staging", "wt-remote", "main")
     assert staged == tip_remote  # fetched and rebased onto the unchanged main
-    assert _rev(repo, "refs/cambium/staging/fetch-1") == staged
+    assert seq.staging_ref is not None
+    assert _rev(repo, seq.staging_ref) == staged
     seq.cleanup_staging(repo)
 
 
@@ -504,3 +528,707 @@ def test_post_checkout_hook_during_staging_sees_no_provider_key(tmp_path, monkey
     for record in records:
         assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in record
         assert "hook-secret" not in json.dumps(record)
+
+
+def _quarantined(seq: MergeSequencer) -> tuple[dict, Path]:
+    events = seq.drain_events()
+    payload = next(payload for kind, payload in events if kind == "merge_staging_quarantined")
+    session = seq._session_dir  # scenario assertion against the public on-disk contract
+    assert session is not None
+    return payload, session / ".cambium" / "quarantine" / payload["quarantine_id"]
+
+
+@pytest.mark.parametrize(
+    "dirty_kind", ["tracked", "indexed", "untracked", "ignored", "in-progress"]
+)
+def test_dirty_staging_kinds_are_moved_byte_for_byte(tmp_path, dirty_kind) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    if dirty_kind == "ignored":
+        (repo / ".gitignore").write_text("secret-name.bin\n")
+        _run(repo, "add", ".gitignore")
+        _run(repo, "commit", "-m", "ignore forensic fixture")
+        base = _rev(repo, "HEAD")
+    worker = tmp_path / "worker"
+    _worker_commit(repo, "worker", worker, {"worker.txt": "worker\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id=f"dirty-{dirty_kind}", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    name = "secret-name.bin" if dirty_kind == "ignored" else "evidence.bin"
+    evidence = b"forensic\x00bytes\xff"
+    if dirty_kind == "tracked":
+        name = "worker.txt"
+    (staging / name).write_bytes(evidence)
+    if dirty_kind == "indexed":
+        _run(staging, "add", name)
+    if dirty_kind == "in-progress":
+        git_dir = Path(
+            _run(staging, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+        )
+        (git_dir / "MERGE_HEAD").write_text(base + "\n")
+
+    branch, ref = seq.staging_branch, seq.staging_ref
+    seq.cleanup_staging(repo)
+    payload, destination = _quarantined(seq)
+
+    assert (destination / name).read_bytes() == evidence
+    assert branch and _run(repo, "show-ref", "--verify", f"refs/heads/{branch}").returncode == 0
+    assert ref and _run(repo, "show-ref", "--verify", ref).returncode == 0
+    serialized = repr(payload)
+    assert "secret-name.bin" not in serialized
+    assert "forensic" not in serialized
+
+
+def test_clean_cleanup_removes_worktree_branch_and_ref(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id="clean", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    branch, ref = seq.staging_branch, seq.staging_ref
+    seq.cleanup_staging(repo)
+    assert not staging.exists()
+    assert branch and _run(
+        repo, "show-ref", "--verify", f"refs/heads/{branch}", check=False
+    ).returncode
+    assert ref and _run(repo, "show-ref", "--verify", ref, check=False).returncode
+
+
+def test_traversal_task_id_stays_below_quarantine_root(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "../../escape/secret"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "dirty").write_text("evidence")
+    seq.cleanup_staging(repo)
+    payload, destination = _quarantined(seq)
+    root = tmp_path / ".cambium" / "quarantine"
+    assert destination.resolve().is_relative_to(root.resolve())
+    assert payload["quarantine_id"].startswith(
+        "merge/task-" + hashlib.sha256(task_id.encode()).hexdigest()[:16] + "/"
+    )
+    assert task_id not in payload["quarantine_id"]
+
+
+def test_oversized_newest_is_registered_and_fails_closed(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(
+        task_id="oversized", session_dir=tmp_path, quarantine_max_bytes=1,
+        quarantine_min_free_bytes=0,
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "large").write_bytes(b"x" * 8192)
+    with pytest.raises(StagingCleanupError, match="exceeds"):
+        seq.cleanup_staging(repo)
+    payload, destination = _quarantined(seq)
+    assert destination.exists()
+    assert str(destination.resolve()) in _run(repo, "worktree", "list", "--porcelain").stdout
+    assert payload["allocated_bytes"] > 1
+
+
+def test_symlink_target_is_not_counted(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"x" * 1024 * 1024)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(
+        task_id="symlink", session_dir=tmp_path, quarantine_max_bytes=512 * 1024,
+        quarantine_min_free_bytes=0,
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "link").symlink_to(outside)
+    seq.cleanup_staging(repo)
+    payload, _ = _quarantined(seq)
+    assert payload["allocated_bytes"] < outside.stat().st_size
+
+
+def test_precreated_quarantine_task_symlink_is_refused(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "symlink-escape"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must stay here")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    quarantine = tmp_path / ".cambium" / "quarantine" / "merge"
+    quarantine.mkdir(parents=True)
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    (quarantine / f"task-{task_key}").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StagingCleanupError, match="symlink"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must stay here"
+    assert not list(outside.iterdir())
+
+
+def test_task_directory_swap_at_move_boundary_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "swap-at-move"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must remain at source")
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
+    outside = tmp_path / "outside"
+    displaced = outside / "displaced"
+    sink = outside / "sink"
+    outside.mkdir()
+    sink.mkdir()
+    original = seq._run_repo
+    swapped = False
+
+    def swap_then_move(repo_path, *args, **kwargs):
+        nonlocal swapped
+        if args[:2] == ("worktree", "move") and not swapped:
+            swapped = True
+            task_dir.rename(displaced)
+            task_dir.symlink_to(sink, target_is_directory=True)
+        return original(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(seq, "_run_repo", swap_then_move)
+    with pytest.raises(StagingCleanupError, match="changed during worktree move"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must remain at source"
+    assert not list(displaced.iterdir())
+    assert not list(sink.iterdir())
+
+
+def test_task_directory_swap_after_final_check_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "swap-after-check"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must return to source")
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
+    outside = tmp_path / "outside"
+    displaced = outside / "displaced"
+    sink = outside / "sink"
+    outside.mkdir()
+    sink.mkdir()
+    original = seq._is_open_child
+    checks = 0
+
+    def swap_after_check(parent_fd, name, child_fd):
+        nonlocal checks
+        contained = original(parent_fd, name, child_fd)
+        checks += 1
+        if checks == 8:
+            task_dir.rename(displaced)
+            task_dir.symlink_to(sink, target_is_directory=True)
+        return contained
+
+    monkeypatch.setattr(seq, "_is_open_child", swap_after_check)
+    with pytest.raises(StagingCleanupError, match="changed during worktree move"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must return to source"
+    assert not list(displaced.iterdir())
+    assert not list(sink.iterdir())
+
+
+def test_task_directory_rename_before_recording_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "rename-before-recording"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    branch = seq.staging_branch
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must not be stranded")
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
+    displaced = tmp_path / "displaced"
+    original = seq._event
+
+    def rename_before_recording(kind, **payload):
+        if kind == "merge_staging_quarantined":
+            task_dir.rename(displaced)
+        original(kind, **payload)
+
+    monkeypatch.setattr(seq, "_event", rename_before_recording)
+
+    with pytest.raises(StagingCleanupError, match="quarantine path changed"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must not be stranded"
+    registered = _run(repo, "worktree", "list", "--porcelain").stdout
+    assert str(staging.resolve()) in registered
+    assert str(displaced.resolve()) not in registered
+    assert branch is not None
+    assert _rev(staging, "HEAD") == _rev(repo, f"refs/heads/{branch}")
+    assert not any(kind == "merge_staging_quarantined" for kind, _ in seq.drain_events())
+    assert not list(displaced.iterdir())
+
+
+def test_quarantine_is_durable_before_cleanup_returns_and_reconciles_rename(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    persisted: list[tuple[str, dict]] = []
+
+    def persist(kind: str, payload: dict) -> None:
+        destination = (
+            tmp_path / ".cambium" / "quarantine" / payload["quarantine_id"]
+        )
+        assert destination.is_dir()
+        persisted.append((kind, payload))
+
+    seq = MergeSequencer(
+        task_id="durable-before-return", session_dir=tmp_path, durable_event=persist
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "evidence.bin").write_bytes(b"must be recorded before descriptors close")
+
+    seq.cleanup_staging(repo)
+    assert [kind for kind, _ in persisted] == ["merge_staging_quarantined"]
+    destination = (
+        tmp_path / ".cambium" / "quarantine" / persisted[0][1]["quarantine_id"]
+    )
+    displaced = tmp_path / "displaced-after-cleanup"
+    destination.rename(displaced)  # the old supervisor flush happened after this boundary
+
+    recovery = MergeSequencer(task_id="durable-before-return", session_dir=tmp_path)
+    recovery.reconcile(repo, quarantine_events=[persisted[0][1]])
+
+    assert destination.is_dir()
+    assert not displaced.exists()
+    assert (destination / "evidence.bin").read_bytes() == (
+        b"must be recorded before descriptors close"
+    )
+
+
+def test_operator_removes_quarantine_then_restart_records_removal_and_spawns(tmp_path) -> None:
+    session = tmp_path / "session"
+    repo = session / "repo"
+    base = _init_repo(repo)
+    _worker_commit(
+        repo, "artifact-source", session / "artifact-source",
+        {"artifact.txt": "artifact\n"}, base,
+    )
+
+    async def quarantine() -> tuple[str, Path]:
+        store = EventStore(session / ".cambium" / "events.db")
+        runtime = _Runtime(session, store)
+        await runtime.start()
+        seq = runtime._make_sequencer("artifact-owner")
+        staging = session / "artifact-staging"
+        seq.prepare_staging(repo, staging, "artifact-source", "main")
+        (staging / "evidence.bin").write_bytes(b"operator may remove this evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+        event = next(
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        )
+        quarantine_id = event["payload"]["quarantine_id"]
+        artifact = session / ".cambium" / "quarantine" / quarantine_id
+        await runtime.shutdown()
+        return quarantine_id, artifact
+
+    quarantine_id, artifact = asyncio.run(quarantine())
+    _run(repo, "worktree", "remove", "--force", str(artifact))
+    assert not artifact.exists()
+
+    worker = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
+    plan = {"tasks": [{
+        "task_id": "restart-worker",
+        "task": "edit base.txt",
+        "repo": str(repo),
+        "worktree_path": str(session / "restart-worker"),
+        "branch": "restart-worker",
+        "worker": str(worker),
+        "target_file": "base.txt",
+        "marker": "// restarted",
+        "write_marker": True,
+        "gate": "grep -q '// restarted' base.txt",
+        "base_commit": base,
+    }]}
+
+    result = asyncio.run(run_plan(session, plan))
+    events = read_events(session)
+
+    assert result.exit_code == 0
+    assert result.results[0].status == "succeeded"
+    spawned = next(event for event in events if event["kind"] == "spawned")
+    removals = [
+        event for event in events
+        if event["kind"] == "merge_staging_pruned"
+        and event["payload"].get("quarantine_id") == quarantine_id
+        and event["payload"].get("reason") == "operator-removed"
+    ]
+    assert len(removals) == 1
+    assert removals[0]["seq"] < spawned["seq"]
+
+
+def test_operator_removed_tombstone_observer_cancellation_still_spawns(tmp_path) -> None:
+    session = tmp_path / "session"
+    repo = session / "repo"
+    base = _init_repo(repo)
+    _worker_commit(
+        repo, "artifact-source", session / "artifact-source",
+        {"artifact.txt": "artifact\n"}, base,
+    )
+
+    async def quarantine() -> tuple[str, Path]:
+        store = EventStore(session / ".cambium" / "events.db")
+        runtime = _Runtime(session, store)
+        await runtime.start()
+        seq = runtime._make_sequencer("artifact-owner")
+        staging = session / "artifact-staging"
+        seq.prepare_staging(repo, staging, "artifact-source", "main")
+        (staging / "evidence.bin").write_bytes(b"observer cancellation must not stop recovery")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+        event = next(
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        )
+        quarantine_id = event["payload"]["quarantine_id"]
+        artifact = session / ".cambium" / "quarantine" / quarantine_id
+        await runtime.shutdown()
+        return quarantine_id, artifact
+
+    quarantine_id, artifact = asyncio.run(quarantine())
+    _run(repo, "worktree", "remove", "--force", str(artifact))
+    assert not artifact.exists()
+
+    worker = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
+    plan = {"tasks": [{
+        "task_id": "restart-worker",
+        "task": "edit base.txt",
+        "repo": str(repo),
+        "worktree_path": str(session / "restart-worker"),
+        "branch": "restart-worker",
+        "worker": str(worker),
+        "target_file": "base.txt",
+        "marker": "// restarted",
+        "write_marker": True,
+        "gate": "grep -q '// restarted' base.txt",
+        "base_commit": base,
+    }]}
+
+    async def cancel_on_tombstone(event: dict) -> None:
+        if (
+            event["kind"] == "merge_staging_pruned"
+            and event["payload"].get("quarantine_id") == quarantine_id
+            and event["payload"].get("reason") == "operator-removed"
+        ):
+            raise asyncio.CancelledError
+
+    result = asyncio.run(run_plan(session, plan, on_event=cancel_on_tombstone))
+    events = read_events(session)
+    tombstones = [
+        event for event in events
+        if event["kind"] == "merge_staging_pruned"
+        and event["payload"].get("quarantine_id") == quarantine_id
+        and event["payload"].get("reason") == "operator-removed"
+    ]
+    spawned = [event for event in events if event["kind"] == "spawned"]
+
+    assert result.exit_code == 0
+    assert result.results[0].status == "succeeded"
+    assert len(tombstones) == 1
+    assert len(spawned) == 1
+    assert tombstones[0]["seq"] < spawned[0]["seq"]
+
+
+def test_observer_failure_after_durable_append_does_not_restore_staging(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    store = EventStore(tmp_path / ".cambium" / "events.db")
+
+    def reject_event(_event: dict) -> None:
+        raise RuntimeError("observer rejected durable event")
+
+    async def quarantine() -> None:
+        runtime = _Runtime(tmp_path, store, on_event=reject_event)
+        seq = runtime._make_sequencer("observer-failure")
+        seq.prepare_staging(repo, staging, "worker", "main")
+        (staging / "evidence.bin").write_bytes(b"observer cannot strand evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+
+    try:
+        asyncio.run(quarantine())
+        events = [
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        ]
+    finally:
+        store.close()
+
+    assert len(events) == 1
+    destination = tmp_path / ".cambium" / "quarantine" / events[0]["payload"]["quarantine_id"]
+    assert destination.is_dir()
+    assert not staging.exists()
+    assert (destination / "evidence.bin").read_bytes() == b"observer cannot strand evidence"
+
+
+def test_observer_cancellation_after_durable_append_does_not_restore_staging(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    store = EventStore(tmp_path / ".cambium" / "events.db")
+
+    async def cancel_observer(_event: dict) -> None:
+        raise asyncio.CancelledError
+
+    async def quarantine() -> None:
+        runtime = _Runtime(tmp_path, store, on_event=cancel_observer)
+        seq = runtime._make_sequencer("observer-cancellation")
+        seq.prepare_staging(repo, staging, "worker", "main")
+        (staging / "evidence.bin").write_bytes(b"cancellation cannot strand evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+
+    try:
+        asyncio.run(quarantine())
+        events = [
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        ]
+    finally:
+        store.close()
+
+    assert len(events) == 1
+    destination = tmp_path / ".cambium" / "quarantine" / events[0]["payload"]["quarantine_id"]
+    assert destination.is_dir()
+    assert not staging.exists()
+    assert (destination / "evidence.bin").read_bytes() == b"cancellation cannot strand evidence"
+
+
+def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id="move-fail", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    secret = staging / "secret-filename.txt"
+    secret.write_text("secret-content")
+    original = seq._run_repo
+
+    def fail_move(repo_path, *args, **kwargs):
+        if args[:2] == ("worktree", "move"):
+            return subprocess.CompletedProcess(args, 1, "", "denied secret-filename.txt")
+        return original(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(seq, "_run_repo", fail_move)
+    with pytest.raises(StagingCleanupError):
+        seq.cleanup_staging(repo)
+    assert secret.read_text() == "secret-content"
+    events = seq.drain_events()
+    payload = next(payload for kind, payload in events if kind == "merge_staging_cleanup_failed")
+    assert "secret-filename" not in repr(payload)
+    assert "secret-content" not in repr(payload)
+
+
+def test_low_disk_keeps_newest_and_fails_closed(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id="low-disk", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "dirty").write_text("evidence")
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr("cambium.merge.shutil.disk_usage", lambda _: usage(100, 100, 0))
+    with pytest.raises(StagingCleanupError, match="bounds"):
+        seq.cleanup_staging(repo)
+    _, destination = _quarantined(seq)
+    assert (destination / "dirty").read_text() == "evidence"
+
+
+def test_count_and_aggregate_byte_caps_prune_oldest(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+
+    first = MergeSequencer(task_id="first", session_dir=tmp_path, quarantine_min_free_bytes=0)
+    first_path = tmp_path / "staging-first"
+    first.prepare_staging(repo, first_path, "worker", "main")
+    (first_path / "dirty").write_bytes(b"a" * 4096)
+    first.cleanup_staging(repo)
+    first_payload, first_destination = _quarantined(first)
+
+    second_path = tmp_path / "staging-second"
+    second = MergeSequencer(
+        task_id="second", session_dir=tmp_path, quarantine_max_entries=1,
+        quarantine_max_bytes=first_payload["allocated_bytes"] + 8192,
+        quarantine_min_free_bytes=0,
+    )
+    second.prepare_staging(repo, second_path, "worker", "main")
+    (second_path / "dirty").write_bytes(b"b" * 4096)
+    second.cleanup_staging(repo)
+    events = second.drain_events()
+    second_payload = next(
+        payload for kind, payload in events if kind == "merge_staging_quarantined"
+    )
+    second_destination = tmp_path / ".cambium" / "quarantine" / second_payload["quarantine_id"]
+
+    assert not first_destination.exists()
+    assert second_destination.exists()
+    assert any(kind == "merge_staging_pruned" for kind, _ in events)
+
+
+def test_count_cap_prunes_quarantine_entry_from_owning_repo(tmp_path) -> None:
+    repo_a = tmp_path / "repo-a"
+    base_a = _init_repo(repo_a)
+    _worker_commit(repo_a, "worker-a", tmp_path / "worker-a", {"a.txt": "a\n"}, base_a)
+    first = MergeSequencer(task_id="repo-a", session_dir=tmp_path, quarantine_min_free_bytes=0)
+    first_staging = tmp_path / "staging-a"
+    first.prepare_staging(repo_a, first_staging, "worker-a", "main")
+    (first_staging / "dirty").write_text("repo a evidence")
+    first.cleanup_staging(repo_a)
+    _, first_destination = _quarantined(first)
+
+    repo_b = tmp_path / "repo-b"
+    base_b = _init_repo(repo_b)
+    _worker_commit(repo_b, "worker-b", tmp_path / "worker-b", {"b.txt": "b\n"}, base_b)
+    second = MergeSequencer(
+        task_id="repo-b", session_dir=tmp_path, quarantine_max_entries=1,
+        quarantine_min_free_bytes=0,
+    )
+    second_staging = tmp_path / "staging-b"
+    second.prepare_staging(repo_b, second_staging, "worker-b", "main")
+    (second_staging / "dirty").write_text("repo b evidence")
+    second.cleanup_staging(repo_b)
+    events = second.drain_events()
+    second_payload = next(
+        payload for kind, payload in events if kind == "merge_staging_quarantined"
+    )
+    second_destination = tmp_path / ".cambium" / "quarantine" / second_payload["quarantine_id"]
+
+    assert not first_destination.exists()
+    assert second_destination.exists()
+    assert any(kind == "merge_staging_pruned" for kind, _ in events)
+
+
+def test_expired_artifact_is_pruned_on_reconcile(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(
+        task_id="expired", session_dir=tmp_path, quarantine_retention_ns=1,
+        quarantine_min_free_bytes=0,
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "dirty").write_text("expired evidence")
+    seq.cleanup_staging(repo)
+    _, destination = _quarantined(seq)
+    assert destination.exists()
+    time.sleep(0.001)
+    seq.reconcile(repo)
+    assert not destination.exists()
+    assert any(kind == "merge_staging_pruned" for kind, _ in seq.drain_events())
+
+
+def test_expired_artifact_is_pruned_with_separate_git_dir(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_separate_git_dir_repo(repo, tmp_path / "repo-git")
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(
+        task_id="separate-expired", session_dir=tmp_path, quarantine_retention_ns=1,
+        quarantine_min_free_bytes=0,
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "dirty").write_text("expired evidence")
+    seq.cleanup_staging(repo)
+    _, destination = _quarantined(seq)
+    time.sleep(0.001)
+
+    seq.reconcile(repo)
+
+    assert not destination.exists()
+
+
+def test_count_cap_prunes_with_separate_git_dir(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_separate_git_dir_repo(repo, tmp_path / "repo-git")
+    _worker_commit(repo, "worker-a", tmp_path / "worker-a", {"a.txt": "a\n"}, base)
+    first = MergeSequencer(
+        task_id="separate-first", session_dir=tmp_path, quarantine_min_free_bytes=0,
+    )
+    first_staging = tmp_path / "staging-a"
+    first.prepare_staging(repo, first_staging, "worker-a", "main")
+    (first_staging / "dirty").write_text("first evidence")
+    first.cleanup_staging(repo)
+    _, first_destination = _quarantined(first)
+
+    _worker_commit(repo, "worker-b", tmp_path / "worker-b", {"b.txt": "b\n"}, base)
+    second = MergeSequencer(
+        task_id="separate-second", session_dir=tmp_path, quarantine_max_entries=1,
+        quarantine_min_free_bytes=0,
+    )
+    second_staging = tmp_path / "staging-b"
+    second.prepare_staging(repo, second_staging, "worker-b", "main")
+    (second_staging / "dirty").write_text("second evidence")
+    second.cleanup_staging(repo)
+    _, second_destination = _quarantined(second)
+
+    assert not first_destination.exists()
+    assert second_destination.exists()
+
+
+def test_sparse_dirty_staging_is_preserved(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(
+        repo, "worker", tmp_path / "worker",
+        {"keep/file.txt": "keep\n", "omit/file.txt": "omit\n"}, base,
+    )
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id="sparse", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    _run(staging, "sparse-checkout", "set", "keep")
+    (staging / "keep" / "evidence.bin").write_bytes(b"sparse evidence")
+    seq.cleanup_staging(repo)
+    _, destination = _quarantined(seq)
+    assert (destination / "keep" / "evidence.bin").read_bytes() == b"sparse evidence"
+    assert _run(destination, "sparse-checkout", "list").stdout.strip() == "keep"
+
+
+def test_hook_generated_staging_is_quarantined_before_publish(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text("#!/bin/sh\nprintf 'hook evidence' > hook-secret-name.txt\n")
+    hook.chmod(0o700)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id="hook-generated", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    with pytest.raises(StagingCleanupError, match="quarantined before publish"):
+        seq.ensure_staging_clean(repo)
+    payload, destination = _quarantined(seq)
+    assert (destination / "hook-secret-name.txt").read_text() == "hook evidence"
+    assert "hook-secret-name" not in repr(payload)
+    assert "hook evidence" not in repr(payload)

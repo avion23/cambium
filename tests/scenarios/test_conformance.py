@@ -37,6 +37,10 @@ EXPECTED_CRITICAL_KINDS = {
     "merge_progress",
     "task_assigned",
     "merge_committed",
+    "merge_staging_quarantined",
+    "merge_staging_cleanup_failed",
+    "merge_staging_prune_started",
+    "merge_staging_pruned",
 }
 
 EXPECTED_EVENT_COLUMNS = {
@@ -193,7 +197,13 @@ def test_upward_result_has_exact_architecture_envelope_keys() -> None:
 
 
 def test_critical_event_kinds_are_exactly_architecture_critical_set() -> None:
-    assert set(CRITICAL_KINDS) == EXPECTED_CRITICAL_KINDS
+    store_kinds = set(CRITICAL_KINDS)
+    fallback_kinds = set(supervisor.CRITICAL_KINDS)
+
+    assert EXPECTED_CRITICAL_KINDS <= store_kinds
+    assert store_kinds <= EXPECTED_CRITICAL_KINDS
+    assert EXPECTED_CRITICAL_KINDS <= fallback_kinds
+    assert fallback_kinds <= EXPECTED_CRITICAL_KINDS
 
 
 def test_event_store_ddl_matches_architecture_and_keeps_iso_ts_text(tmp_path: Path) -> None:

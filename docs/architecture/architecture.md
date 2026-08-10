@@ -674,6 +674,33 @@ If recovery fails (step 3 returns non-zero), the worktree is **quarantined** to 
 
 `Surculus.prune()` is called on supervisor startup and shutdown to clean stale `git worktree` administrative entries.
 
+Merge staging uses a stricter cleanup contract than worker respawn recovery. A
+clean merge staging tree is removed with `git worktree remove`, followed by its
+staging branch and `refs/cambium/staging/*` ref. Any tracked, indexed, untracked,
+ignored, in-progress-operation, or hook-generated state makes the tree dirty.
+Dirty merge staging is never reset, cleaned, checked out, or aborted. It is moved
+intact with `git worktree move` to
+`${session_dir}/.cambium/quarantine/merge/task-<sha256(task_id)[0:16]>/<time_ns>-<nonce>/`.
+The raw task ID is not a path component. The staging branch, staging ref, index,
+git-operation state, symlinks, sparse-checkout state, and file bytes remain
+available as forensic evidence. Quarantine parent directories have mode `0700`.
+
+Merge quarantine is bounded to 15 entries and 1 GiB of allocated storage by
+default. Allocated storage is `st_blocks * 512`, including the worktree git admin
+directory and without following symlinks. Entries expire after seven days;
+startup and insertion prune expired entries first and then the oldest entries to
+meet count, byte, and 1 GiB minimum-free-space bounds. An operator can delete an
+artifact sooner with `git worktree remove --force`. On startup, reconciliation
+first restores an artifact found at another path by its recorded device and inode.
+If the inode is absent, reconciliation treats this as the documented operator
+removal, durably appends a `merge_staging_pruned` tombstone with reason
+`operator-removed`, and continues startup. A path that exists with the wrong
+identity still fails closed. If the newest artifact alone exceeds a cap, or bounds
+cannot be met, it remains registered and merge processing fails closed. Forensic
+content is not redacted. Events contain only task identity, staging SHA, relative
+quarantine ID, allocated bytes, reason, and expiry; they never contain evidence
+filenames or content.
+
 ### 7.6 Per-tool heartbeat (resolves DS-C3)
 
 Long-running tools heartbeat from inside the tool wrapper:
@@ -760,7 +787,21 @@ async def publish_merge(self, verified_tip: str) -> str:
 
 - `git update-ref` is the atomic primitive: it takes `.git/refs/heads/main.lock`, writes the new SHA to a tempfile, and renames over the ref file. A crash before the rename leaves `main.lock` (recovered by `Surculus.recover()`, §7.5) and `main` unchanged. A crash after the rename has `main` pointing at the new SHA. There is no torn state.
 - The expected-old-SHA argument (`update-ref <ref> <new> <old>`) makes the publish **fail loudly** if anything — including a human `git push` to `main` while Cambium is running — moved the ref between read and write. The orchestrator treats `NonFastForward` as "main moved; re-merge from the new main."
-- The `merge_committed` event is **critical** (§6.5). It is fsync-d before `publish_merge` returns, so a supervisor crash immediately after `update-ref` is observable on recovery: the event log shows the new main SHA, and `result.json` can be written against it. A crash *between* `update-ref` and the event emit leaves the ref advanced but the event log unaware — on recovery, `Unio.reconcile()` reads `refs/heads/main`, compares to the latest `merge_committed` event, and emits a `merge_reconciled` event to close the gap.
+- The `merge_committed` event is **critical** (§6.5). The supervisor fsyncs it
+  immediately after `publish_merge` returns and before cleanup. A crash between
+  the ref update and event commit leaves the ref advanced but the event log
+  unaware; startup reconciliation closes this gap.
+- Git ref updates and SQLite event commits are not transactionally atomic. The
+  supervisor emits and fsyncs `merge_committed` immediately after `update-ref`,
+  while still holding the single-writer lock, before staging cleanup. This only
+  minimizes the window. On startup the supervisor calls `Unio.reconcile()` for
+  each repository. A staging ref that equals `main` proves an interrupted publish;
+  the supervisor emits `merge_reconciled`. Startup also scans merge quarantine to
+  emit a missing `merge_staging_quarantined` event when `git worktree move`
+  completed before its event commit.
+- `merge_staging_quarantined`, `merge_staging_cleanup_failed`,
+  `merge_staging_prune_started`, and `merge_staging_pruned` are critical events.
+  Cleanup and move failures are not suppressed.
 - No working-tree checkout of `main` is performed by `Unio`. The publish is purely a ref update; the working tree of `main` (if any) is updated by the host system or a separate Cambium command, never automatically. This is the same lesson Codex's CLI applies ("create git checkpoints; do not auto-mutate the working tree") — see `docs/research/codex.md`.
 
 **Lock scope.** The `Unio` lock is held across verify-in-throwaway-worktree **and** publish. This serializes the whole merge pipeline. Throughput impact is documented in DS-M1; the throwaway-worktree + batch-test mode mitigates wall-clock cost without weakening the single-writer invariant.
@@ -1048,7 +1089,10 @@ ${session_dir}/
     ├── sessions/                  # per-node session history (D2/D8g)
     │   ├── conversations.db       # SQLite WAL, queryable (§6.6)
     │   └── <node_id>/             # per-node store; pruned with the session dir
-    ├── quarantine/                # worktrees that failed recovery
+    ├── quarantine/                # preserved worktrees; parent mode 0700
+    │   └── merge/                 # bounded merge-staging forensic evidence
+    │       └── task-<id-hash>/
+    │           └── <time-nonce>/  # registered worktree moved intact
     └── optimized/                 # DSPy artifacts loaded by Ascensus
 ```
 

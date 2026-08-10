@@ -18,6 +18,7 @@ Scenarios:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shlex
@@ -29,7 +30,12 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 from cambium import supervisor
+from cambium import supervisor as supervisor_module
+from cambium.merge import MergeSequencer
+from cambium.store import EventStore
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -400,6 +406,85 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
     assert _show(repo, "main", "a.txt") == "file a\n"
 
 
+def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-observer-cancel"
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-observer-cancel",
+                branch="wt-observer-cancel", target_file="a.txt",
+                marker="// observer-cancel", gate="grep -q '// observer-cancel' a.txt",
+            )
+        ]
+    }
+
+    async def cancel_merge_committed(event: dict) -> None:
+        if event["kind"] == "merge_committed":
+            raise asyncio.CancelledError
+
+    result = asyncio.run(run_plan(session_dir, plan, on_event=cancel_merge_committed))
+    events = read_events(session_dir)
+    main_tip = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert result.exit_code == 0
+    assert len(result.results) == 1
+    assert result.results[0].task_id == task_id
+    assert result.results[0].status == "succeeded"
+    assert main_tip != base
+    assert len(_kinds(events, "spawned")) == 1
+    committed = _kinds(events, "merge_committed")
+    assert len(committed) == 1
+    assert committed[0]["payload"]["new"] == main_tip
+
+
+def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, "t-external-cancel", worktree="wt-external-cancel",
+                branch="wt-external-cancel", target_file="a.txt", marker="// must-not-merge",
+                gate="grep -q '// must-not-merge' a.txt",
+            )
+        ]
+    }
+    observer_started = asyncio.Event()
+
+    async def suspend_on_result(event: dict) -> None:
+        if event["kind"] != "result":
+            return
+        observer_started.set()
+        await asyncio.Event().wait()
+
+    async def cancel_plan() -> None:
+        task = asyncio.create_task(run_plan(session_dir, plan, on_event=suspend_on_result))
+        await asyncio.wait_for(observer_started.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+    asyncio.run(cancel_plan())
+    events = read_events(session_dir)
+    main_tip = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert main_tip == base
+    assert not _kinds(events, "gate")
+    assert not _kinds(events, "merge_committed")
+    assert _kinds(events, "session_ended")[-1]["payload"]["session_status"] == "cancelled"
+
+
 # ---------------------------------------------------------------------------
 # T2: hang — a worker that never sends ready is killed and restarted, then the
 # task fails on the restart cap with no merge.
@@ -681,6 +766,326 @@ def test_t7_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monke
     assert "CAMBIUM_PROVIDER_bad_API_KEY" not in spawned_env
     assert spawned_env["CAMBIUM_TASK_ID"] == "t-env"
     assert spawned_env["CAMBIUM_GENERATION"] == "1"
+
+
+def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-publish-gap"
+    worker_tree = session_dir / "wt-gap"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-gap", str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-gap", "main")
+    secret_name = "secret-kill-window.txt"
+    (staging / secret_name).write_text("secret kill-window content")
+    seq.publish_merge(repo, staged, base)  # simulated kill before merge_committed
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-gap", branch="wt-gap",
+                target_file="a.txt", marker="// after-restart",
+                gate="grep -q '// after-restart' a.txt",
+            )
+        ]
+    }
+    result = asyncio.run(run_plan(session_dir, plan))
+    assert result.exit_code == 0
+    events = read_events(session_dir)
+    reconciled = _kinds(events, "merge_reconciled")
+    quarantined = _kinds(events, "merge_staging_quarantined")
+    assert reconciled and reconciled[0]["payload"]["new"] == staged
+    assert quarantined
+    quarantine_id = quarantined[0]["payload"]["quarantine_id"]
+    artifact = session_dir / ".cambium" / "quarantine" / quarantine_id
+    assert (artifact / secret_name).read_text() == "secret kill-window content"
+    payloads = json.dumps([event["payload"] for event in quarantined])
+    assert secret_name not in payloads
+    assert "secret kill-window content" not in payloads
+
+
+def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-clean-publish-gap"
+    worker_tree = session_dir / "wt-clean-gap"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-clean-gap", str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-clean-gap", "main")
+    seq.publish_merge(repo, staged, base)
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-clean-gap", branch="wt-clean-gap",
+                target_file="a.txt", marker="// must-not-rerun",
+                gate="grep -q '// must-not-rerun' a.txt",
+            )
+        ]
+    }
+    result = asyncio.run(run_plan(session_dir, plan))
+    events = read_events(session_dir)
+
+    assert result.exit_code == 0
+    assert result.results[0].merge_sha == staged
+    assert not staging.exists()
+    assert not _kinds(events, "spawned")
+    committed = _kinds(events, "merge_committed")
+    assert len(committed) == 1
+    assert committed[0]["payload"]["reason"] == "recovered-ref-advance"
+    reconciled = _kinds(events, "merge_reconciled")
+    assert len(reconciled) == 1
+    assert reconciled[0]["task_id"] == task_id
+    assert reconciled[0]["payload"]["new"] == staged
+
+
+def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-reconcile-observer-failure"
+    worker_tree = session_dir / "wt-reconcile-observer-failure"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-reconcile-observer-failure",
+         str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-reconcile-observer-failure", "main")
+    seq.publish_merge(repo, staged, base)
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-reconcile-observer-failure",
+                branch="wt-reconcile-observer-failure", target_file="a.txt",
+                marker="// must-not-run", gate="grep -q '// must-not-run' a.txt",
+            )
+        ]
+    }
+
+    def fail_on_reconciliation(event: dict) -> None:
+        if event["kind"] == "merge_reconciled":
+            raise RuntimeError("merge_reconciled observer failed")
+
+    with pytest.raises(RuntimeError, match="merge_reconciled observer failed"):
+        asyncio.run(run_plan(session_dir, plan, on_event=fail_on_reconciliation))
+
+    events = read_events(session_dir)
+    assert _kinds(events, "merge_reconciled")
+    assert not _kinds(events, "spawned")
+
+
+def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
+    tmp_path, monkeypatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-lost-reconciliation"
+    worker_tree = session_dir / "wt-lost-reconciliation"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-lost-reconciliation",
+         str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-lost-reconciliation", "main")
+    (staging / "recovery-evidence.bin").write_bytes(b"preserve this evidence")
+    seq.publish_merge(repo, staged, base)
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-lost-reconciliation",
+                branch="wt-lost-reconciliation", target_file="a.txt",
+                marker="// must-never-run", gate="grep -q '// must-never-run' a.txt",
+            )
+        ]
+    }
+    original_emit = supervisor_module._Runtime.emit
+
+    async def lose_reconciliation(self, kind, **kwargs):
+        if kind == "merge_reconciled":
+            return None
+        return await original_emit(self, kind, **kwargs)
+
+    monkeypatch.setattr(supervisor_module._Runtime, "emit", lose_reconciliation)
+    first = asyncio.run(run_plan(session_dir, plan))
+    assert first.exit_code == 0
+    assert not staging.exists()
+    first_events = read_events(session_dir)
+    assert not _kinds(first_events, "spawned")
+    assert not _kinds(first_events, "merge_reconciled")
+    committed = _kinds(first_events, "merge_committed")
+    assert len(committed) == 1
+    quarantined = _kinds(first_events, "merge_staging_quarantined")
+    assert len(quarantined) == 1
+    assert committed[0]["seq"] < quarantined[0]["seq"]
+    artifact = (
+        session_dir / ".cambium" / "quarantine"
+        / quarantined[0]["payload"]["quarantine_id"]
+    )
+    assert (artifact / "recovery-evidence.bin").read_bytes() == b"preserve this evidence"
+    expired = time.time_ns() - 8 * 24 * 60 * 60 * 1_000_000_000
+    os.utime(artifact, ns=(expired, expired))
+    commits_after_recovery = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    second = asyncio.run(run_plan(session_dir, plan))
+    events = read_events(session_dir)
+
+    assert second.exit_code == 0
+    assert second.results[0].merge_sha == staged
+    assert not _kinds(events, "spawned")
+    assert len(_kinds(events, "merge_committed")) == 1
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == commits_after_recovery
+
+
+def test_next_startup_ignores_durably_pruned_quarantine_and_spawns_worker(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-after-prune"
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-after-prune",
+                branch="wt-after-prune", target_file="a.txt", marker="// after-prune",
+                gate="grep -q '// after-prune' a.txt",
+            )
+        ]
+    }
+
+    async def quarantine() -> Path:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        await runtime.start()
+        seq = runtime._make_sequencer("expired-evidence")
+        staging = session_dir / "expired-staging"
+        seq.prepare_staging(repo, staging, "main", "main")
+        (staging / "evidence.bin").write_bytes(b"expired evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+        event = next(
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        )
+        artifact = session_dir / ".cambium" / "quarantine" / event["payload"]["quarantine_id"]
+        await runtime.shutdown()
+        return artifact
+
+    artifact = asyncio.run(quarantine())
+    expired = time.time_ns() - 8 * 24 * 60 * 60 * 1_000_000_000
+    os.utime(artifact, ns=(expired, expired))
+
+    async def prune_on_startup() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        await runtime.start()
+        await runtime.reconcile(plan["tasks"])
+        await runtime.shutdown()
+
+    asyncio.run(prune_on_startup())
+    assert not artifact.exists()
+    quarantine_id = artifact.relative_to(session_dir / ".cambium" / "quarantine").as_posix()
+    assert any(
+        event["payload"].get("quarantine_id") == quarantine_id
+        for event in _kinds(read_events(session_dir), "merge_staging_pruned")
+    )
+
+    result = asyncio.run(run_plan(session_dir, plan))
+    events = read_events(session_dir)
+
+    assert result.exit_code == 0
+    assert result.results[0].status == "succeeded"
+    assert _kinds(events, "spawned")
+
+
+def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypatch) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-store-failure"
+    original_append = EventStore.append
+
+    def fail_merge_committed(self, event):
+        if event.get("kind") == "merge_committed":
+            raise RuntimeError("injected merge_committed persistence failure")
+        return original_append(self, event)
+
+    monkeypatch.setattr(EventStore, "append", fail_merge_committed)
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-store", branch="wt-store",
+                target_file="a.txt", marker="// published-before-store-failure",
+                gate="grep -q '// published-before-store-failure' a.txt",
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    events = read_events(session_dir)
+
+    assert result.exit_code != 0
+    assert result.results[0].status == "failed"
+    assert not _kinds(events, "merge_committed")
+    assert _kinds(events, "merge_failed")
+    assert staging.exists()
+    assert (staging / "a.txt").read_text().endswith("// published-before-store-failure\n")
+    assert _show(repo, "main", "a.txt").endswith("// published-before-store-failure\n")
+    refs = subprocess.run(
+        ["git", "-C", str(repo), "for-each-ref", "--format=%(refname)",
+         f"refs/cambium/staging/{task_key}-*"],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(refs) == 1
 
 
 def test_t8_supervisor_git_sync_post_checkout_hook_sees_no_provider_key(
