@@ -9,16 +9,18 @@ counts, signatures, and author metadata stay intact.
 The module has no I/O and does not stringify arbitrary objects.  Structured
 redaction walks mappings and sequences, preserves ordinary scalar objects,
 does not mutate its input, and keeps the common mapping/list cycles finite.
-Worker environment construction is an allowlist operation: the default is the
-small non-secret runtime set, and named provider variables are added only when
-the caller names them explicitly.
+Worker environment construction uses a deterministic runtime base, and named
+provider variables are added only when the caller names them explicitly.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from enum import Enum
+from os import PathLike
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -406,12 +408,29 @@ _COOKIE_CONTEXT_RE = re.compile(
 )
 
 _NEXT_FIELD_RE = re.compile(r"[ \t]+(?=[a-z][a-z0-9_.-]*[ \t]*[:=])", re.I)
+_CONTEXT_CANDIDATE_RE = re.compile(
+    r"(?ix)"
+    r"(?<![a-z0-9_.-])"
+    r"(?P<key_quote>[\"']?)"
+    r"(?P<name>[a-z][a-z0-9_.-]*)"
+    r"(?P=key_quote)"
+    r"[ \t]*[:=][ \t]*"
+)
 
 
 def _replacement_sub(pattern: re.Pattern[str], text: str, replacement: str) -> str:
     """Use a callable replacement so replacement text is always literal."""
 
     return pattern.sub(lambda _match: replacement, text)
+
+
+def _exact_value_pattern(values: frozenset[str]) -> re.Pattern[str] | None:
+    if not values:
+        return None
+    # Longest-first makes overlapping registrations deterministic and prevents
+    # a short value from partially consuming a longer registered value.
+    alternatives = sorted(values, key=lambda value: (-len(value), value))
+    return re.compile("|".join(re.escape(value) for value in alternatives))
 
 
 def _marker_positions(text: str, marker: str) -> Iterable[int]:
@@ -568,53 +587,113 @@ _FIELD_NAME_CHARS = frozenset(
 _VALUE_STOP_CHARS = frozenset(" \t\r\n,;{}[])")
 _HEADER_VALUE_STOP_CHARS = frozenset("\r\n,;{}[])")
 _COOKIE_VALUE_STOP_CHARS = frozenset("\r\n,{}[])")
+_DELIMITED_VALUE_ENDS = {"{": "}", "[": "]"}
+
+
+def _record_stop(text: str, start: int, stop_chars: frozenset[str]) -> int:
+    position = start
+    while position < len(text) and text[position] not in stop_chars:
+        position += 1
+    return position
+
+
+def _delimited_value_end(text: str, start: int) -> int:
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    position = start
+    while position < len(text):
+        character = text[position]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character in _DELIMITED_VALUE_ENDS:
+            stack.append(_DELIMITED_VALUE_ENDS[character])
+        elif stack and character == stack[-1]:
+            stack.pop()
+            if not stack:
+                return position + 1
+        position += 1
+    return len(text)
+
+
+def _field_follows_separator(text: str, start: int) -> bool:
+    position = start
+    while position < len(text) and text[position] in " \t":
+        position += 1
+    return _CONTEXT_CANDIDATE_RE.match(text, position) is not None
+
+
+def _separator_gap_is_boundary(gap: str) -> bool:
+    if not gap:
+        return True
+    last_boundary = -1
+    for index, character in enumerate(gap):
+        if character in "\r\n,;{}[]":
+            last_boundary = index
+    if last_boundary >= 0:
+        gap = gap[last_boundary + 1 :]
+    return not gap.strip(" \t")
+
+
+def _header_value_end(text: str, start: int) -> int:
+    position = start
+    while position < len(text):
+        character = text[position]
+        if character in _HEADER_VALUE_STOP_CHARS:
+            return position
+        if ("a" <= character.lower() <= "z" or character in "\"'") and (
+            position == start or text[position - 1] not in _FIELD_NAME_CHARS
+        ):
+            candidate = _CONTEXT_CANDIDATE_RE.match(text, position)
+            if candidate is not None:
+                end = position
+                while end > start and text[end - 1] in " \t":
+                    end -= 1
+                return end
+        position += 1
+    return len(text)
 
 
 def _context_edits(text: str, replacement: str) -> list[tuple[int, int, str]]:
-    """Find contextual value spans by anchoring on the rare separators."""
-
-    separators: list[int] = []
-    for separator in (":", "="):
-        start = 0
-        while True:
-            position = text.find(separator, start)
-            if position < 0:
-                break
-            separators.append(position)
-            start = position + 1
-    separators.sort()
+    """Find contextual value spans with one forward pass through *text*."""
 
     edits: list[tuple[int, int, str]] = []
-    for separator in separators:
-        name_end = separator - 1
-        while name_end >= 0 and text[name_end] in " \t":
-            name_end -= 1
-        if name_end < 0:
-            continue
+    position = 0
+    field_chain = False
+    while position < len(text):
+        candidate = _CONTEXT_CANDIDATE_RE.search(text, position)
+        if candidate is None:
+            break
 
-        if text[name_end] in "\"'":
-            quote = text[name_end]
-            name_start = text.rfind(quote, 0, name_end)
-            if name_start < 0:
-                continue
-            name = text[name_start + 1 : name_end]
-        else:
-            name_start = name_end
-            while name_start >= 0 and text[name_start] in _FIELD_NAME_CHARS:
-                name_start -= 1
-            name = text[name_start + 1 : name_end + 1]
-
+        name = candidate.group("name")
         normalised = _normalise_name(name)
         cookie_field = normalised in _COOKIE_FIELD_NAMES
-        if not cookie_field and normalised not in _MULTIWORD_CONTEXT_NAMES:
-            if not is_secret_name(name):
-                continue
+        multiword_field = normalised in _MULTIWORD_CONTEXT_NAMES
+        secret_field = is_secret_name(name)
+        relevant = cookie_field or multiword_field or secret_field
 
-        value_start = separator + 1
-        while value_start < len(text) and text[value_start] in " \t":
-            value_start += 1
+        gap = text[position : candidate.start()]
+        field_boundary = _separator_gap_is_boundary(gap)
+        record_boundary = any(character in "\r\n,;{}[]" for character in gap)
+        if multiword_field and not (
+            field_boundary and (field_chain or candidate.start() == 0 or record_boundary)
+        ):
+            position = candidate.end()
+            field_chain = False
+            continue
+
+        value_start = candidate.end()
         if value_start >= len(text):
             edits.append((value_start, value_start, replacement))
+            position = value_start
+            field_chain = True
             continue
 
         if text[value_start] in "\"'":
@@ -636,7 +715,10 @@ def _context_edits(text: str, replacement: str) -> list[tuple[int, int, str]]:
                 )
             else:
                 replacement_text = replacement
-            edits.append((body_start, body_end, replacement_text))
+            if relevant:
+                edits.append((body_start, body_end, replacement_text))
+            position = min(value_end + 1, len(text))
+            field_chain = True
             continue
 
         bearer_prefix = text[value_start : value_start + 7].casefold() in {
@@ -645,30 +727,29 @@ def _context_edits(text: str, replacement: str) -> list[tuple[int, int, str]]:
         }
         if cookie_field:
             stop_chars = _COOKIE_VALUE_STOP_CHARS
-        elif normalised in _MULTIWORD_CONTEXT_NAMES or bearer_prefix:
+        elif multiword_field or bearer_prefix:
             stop_chars = _HEADER_VALUE_STOP_CHARS
         else:
             stop_chars = _VALUE_STOP_CHARS
-        value_end = value_start
-        while value_end < len(text):
-            character = text[value_end]
-            if character not in stop_chars:
-                value_end += 1
-                continue
-            if character == ";" and not cookie_field:
-                probe = value_end + 1
-                while probe < len(text) and text[probe] in " \t":
-                    probe += 1
-                field_start = probe
-                while probe < len(text) and text[probe] in _FIELD_NAME_CHARS:
-                    probe += 1
-                while probe < len(text) and text[probe] in " \t":
-                    probe += 1
-                if field_start < probe and probe < len(text) and text[probe] in ":=":
-                    break
-                value_end += 1
-                continue
-            break
+
+        if text[value_start] in _DELIMITED_VALUE_ENDS:
+            value_end = _delimited_value_end(text, value_start)
+        elif cookie_field:
+            value_end = _record_stop(text, value_start, stop_chars)
+        elif multiword_field or bearer_prefix:
+            value_end = _header_value_end(text, value_start)
+        else:
+            value_end = value_start
+            while value_end < len(text):
+                character = text[value_end]
+                if character not in stop_chars:
+                    value_end += 1
+                    continue
+                if character == ";" and not _field_follows_separator(text, value_end + 1):
+                    value_end += 1
+                    continue
+                break
+
         if cookie_field:
             body = text[value_start:value_end]
             replacement_text = _redact_cookie_body(
@@ -676,7 +757,10 @@ def _context_edits(text: str, replacement: str) -> list[tuple[int, int, str]]:
             )
         else:
             replacement_text = replacement
-        edits.append((value_start, value_end, replacement_text))
+        if relevant:
+            edits.append((value_start, value_end, replacement_text))
+        position = value_end
+        field_chain = True
     return edits
 
 
@@ -718,6 +802,12 @@ class _StructuredContext(Enum):
     COOKIES = "cookies"
 
 
+class _FieldRole(Enum):
+    NORMAL = "normal"
+    COOKIE_VALUE = "cookie_value"
+    COOKIE_ATTRIBUTE = "cookie_attribute"
+
+
 class _TuplePlaceholder:
     __slots__ = ("value",)
 
@@ -729,14 +819,34 @@ _MISSING = object()
 
 
 class _CloneState:
-    __slots__ = ("memo",)
+    __slots__ = ("memo", "patterns")
 
-    def __init__(self) -> None:
-        self.memo: dict[int, object] = {}
+    def __init__(self, patterns: tuple[re.Pattern[str], ...]) -> None:
+        self.patterns = patterns
+        self.memo: dict[
+            tuple[int, tuple[re.Pattern[str], ...], _StructuredContext, _FieldRole], object
+        ] = {}
 
 
-def _cached(state: _CloneState, node: object) -> object:
-    return state.memo.get(id(node), _MISSING)
+def _cached(
+    state: _CloneState,
+    node: object,
+    context: _StructuredContext,
+    role: _FieldRole,
+) -> object:
+    key = (id(node), state.patterns, context, role)
+    return state.memo.get(key, _MISSING)
+
+
+def _memoise(
+    state: _CloneState,
+    node: object,
+    context: _StructuredContext,
+    role: _FieldRole,
+    value: object,
+) -> None:
+    key = (id(node), state.patterns, context, role)
+    state.memo[key] = value
 
 
 def _cookie_context_value_key(key: object, value: object) -> bool:
@@ -775,58 +885,85 @@ def _child_context(key: object, value: object, context: _StructuredContext) -> _
     return context
 
 
+def _child_role(key: object, value: object, context: _StructuredContext) -> _FieldRole:
+    if context is not _StructuredContext.COOKIES or not isinstance(key, str):
+        return _FieldRole.NORMAL
+    if _cookie_name_is_attribute(key):
+        return _FieldRole.COOKIE_ATTRIBUTE
+    if _cookie_context_value_key(key, value):
+        return _FieldRole.COOKIE_VALUE
+    return _FieldRole.NORMAL
+
+
+def _redact_mapping_key(key: object, redactor: Redactor) -> object:
+    if not isinstance(key, str):
+        return key
+    if is_secret_name(key):
+        return redactor.replacement
+    return redactor.redact(key)
+
+
 def _clone_structured(
     node: object,
     redactor: Redactor,
     state: _CloneState,
     context: _StructuredContext,
+    role: _FieldRole,
 ) -> object:
-    if isinstance(node, str):
-        if context is _StructuredContext.COOKIES:
-            return redactor.replacement
-        return redactor.redact(node)
-
-    cached = _cached(state, node)
+    cached = _cached(state, node, context, role)
     if cached is not _MISSING:
         if isinstance(cached, _TuplePlaceholder):
             return cached
         return cached
 
+    if isinstance(node, str):
+        if context is _StructuredContext.COOKIES and role is not _FieldRole.COOKIE_ATTRIBUTE:
+            result_string = redactor.replacement
+        else:
+            result_string = redactor.redact(node)
+        _memoise(state, node, context, role, result_string)
+        return result_string
+
     if isinstance(node, Mapping):
         result: dict[object, object] = {}
-        state.memo[id(node)] = result
+        _memoise(state, node, context, role, result)
         for key, value in node.items():
             key_name = key if isinstance(key, str) else None
-            if context is _StructuredContext.COOKIES and _cookie_context_value_key(key, value):
-                result[key] = redactor.replacement
+            result_key = _redact_mapping_key(key, redactor)
+            cookie_value = context is _StructuredContext.COOKIES and _cookie_context_value_key(
+                key, value
+            )
+            if cookie_value:
+                result[result_key] = redactor.replacement
                 continue
             if key_name is not None and is_secret_name(key_name):
-                result[key] = redactor.replacement
+                result[result_key] = redactor.replacement
                 continue
-            result[key] = _clone_structured(
+            result[result_key] = _clone_structured(
                 value,
                 redactor,
                 state,
                 _child_context(key, value, context),
+                _child_role(key, value, context),
             )
         return result
 
     if isinstance(node, list):
         result_list: list[object] = []
-        state.memo[id(node)] = result_list
+        _memoise(state, node, context, role, result_list)
         result_list.extend(
-            _clone_structured(item, redactor, state, context) for item in node
+            _clone_structured(item, redactor, state, context, role) for item in node
         )
         return result_list
 
     if isinstance(node, tuple):
         placeholder = _TuplePlaceholder()
-        state.memo[id(node)] = placeholder
+        _memoise(state, node, context, role, placeholder)
         result_tuple = tuple(
-            _clone_structured(item, redactor, state, context) for item in node
+            _clone_structured(item, redactor, state, context, role) for item in node
         )
         placeholder.value = result_tuple
-        state.memo[id(node)] = result_tuple
+        _memoise(state, node, context, role, result_tuple)
         return result_tuple
 
     if isinstance(node, Sequence) and not isinstance(node, (bytes, bytearray)):
@@ -834,9 +971,9 @@ def _clone_structured(
         # avoids invoking an arbitrary constructor while still redacting their
         # elements without using repr().
         result_sequence: list[object] = []
-        state.memo[id(node)] = result_sequence
+        _memoise(state, node, context, role, result_sequence)
         result_sequence.extend(
-            _clone_structured(item, redactor, state, context) for item in node
+            _clone_structured(item, redactor, state, context, role) for item in node
         )
         return result_sequence
 
@@ -893,8 +1030,10 @@ class Redactor:
     ``patterns`` defaults to :data:`DEFAULT_PATTERNS`.  A caller-supplied
     pattern collection is authoritative: only those patterns run for string
     values, while secret-named structured keys remain whole-value redaction
-    boundaries.  ``replacement`` is inserted literally, even when it contains
-    backslashes or digits.
+    boundaries.  ``secret_values`` is an immutable set of exact, case-sensitive
+    values that is applied additively before the configured pattern behavior.
+    ``replacement`` is inserted literally, even when it contains backslashes
+    or digits.
     """
 
     def __init__(
@@ -902,19 +1041,41 @@ class Redactor:
         patterns: Iterable[re.Pattern[str]] | None = None,
         *,
         replacement: str = _DEFAULT_REPLACEMENT,
+        secret_values: Iterable[str] | None = None,
     ) -> None:
         if not isinstance(replacement, str):
             raise TypeError("replacement must be a string")
         self._patterns = DEFAULT_PATTERNS if patterns is None else tuple(patterns)
         if any(not isinstance(pattern, re.Pattern) for pattern in self._patterns):
             raise TypeError("patterns must contain compiled regular expressions")
+        if isinstance(secret_values, (str, bytes)):
+            raise TypeError("secret_values must be an iterable of values, not a string")
+        registered = frozenset() if secret_values is None else frozenset(secret_values)
+        if any(not isinstance(value, str) for value in registered):
+            raise TypeError("secret_values must contain strings")
+        if any(not value for value in registered):
+            raise ValueError("secret_values must not contain empty strings")
+        self._secret_values = registered
+        self._exact_value_pattern = _exact_value_pattern(registered)
         self.replacement = replacement
+
+    @property
+    def secret_values(self) -> frozenset[str]:
+        """Return the immutable exact-value registry captured at construction."""
+
+        return self._secret_values
+
+    def _redact_exact_values(self, text: str) -> str:
+        if self._exact_value_pattern is None:
+            return text
+        return _replacement_sub(self._exact_value_pattern, text, self.replacement)
 
     def redact(self, text: str) -> str:
         """Redact secrets and email addresses from *text*."""
 
         if not isinstance(text, str):
             raise TypeError("text must be a string")
+        text = self._redact_exact_values(text)
         if self._patterns == DEFAULT_PATTERNS:
             return _redact_default(text, self.replacement)
         for pattern in self._patterns:
@@ -931,8 +1092,10 @@ class Redactor:
         ``repr`` on any input value.
         """
 
-        state = _CloneState()
-        copied = _clone_structured(mapping, self, state, _StructuredContext.NORMAL)
+        state = _CloneState(self._patterns)
+        copied = _clone_structured(
+            mapping, self, state, _StructuredContext.NORMAL, _FieldRole.NORMAL
+        )
         return _resolve_tuple_placeholders(copied, set())
 
     def is_secret_name(self, name: str) -> bool:
@@ -941,8 +1104,10 @@ class Redactor:
         return is_secret_name(name)
 
 
-# Explicitly safe runtime variables.  Provider variables are never inherited
-# merely because they do not look secret; they must be named in ``allowlist``.
+# Explicitly safe runtime variable names.  Their values are constructed by
+# build_worker_env, not copied from the host environment.  Provider variables
+# are never inherited merely because they do not look secret; they must be
+# named in ``allowlist``.
 NON_SECRET_BASICS = frozenset(
     {
         "PATH",
@@ -954,30 +1119,67 @@ NON_SECRET_BASICS = frozenset(
     }
 )
 
+_WORKER_ID_NAMES = frozenset(
+    {
+        "CAMBIUM_TASK_ID",
+        "CAMBIUM_GENERATION",
+        "CAMBIUM_SESSION_ID",
+    }
+)
+
 
 def build_worker_env(
     base: Mapping[str, str],
     allowlist: Iterable[str] | None = None,
+    *,
+    worktree: str | PathLike[str] | None = None,
+    overrides: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a strict worker environment from *base*.
 
-    The result contains :data:`NON_SECRET_BASICS` plus only names explicitly
-    supplied in ``allowlist``.  ``None`` is a safe basics-only default, not an
-    instruction to inherit every non-secret-looking host variable.  Values are
-    passed through unchanged and no value is printed or stringified.
+    ``base`` supplies values for explicitly allowlisted provider names only.
+    The runtime base is deterministic: ``PATH`` uses :data:`os.defpath`,
+    ``PYTHONUNBUFFERED`` is ``"1"``, and ``HOME`` is scoped below ``worktree``
+    when supplied.  Cambium task, generation, and session IDs may be set
+    explicitly with ``overrides``.  Host runtime values are never copied.
     """
 
     if not isinstance(base, Mapping):
         raise TypeError("base must be a mapping")
-    if isinstance(allowlist, str):
+    if isinstance(allowlist, (str, bytes)):
         raise TypeError("allowlist must be an iterable of names, not a string")
+    if overrides is not None and not isinstance(overrides, Mapping):
+        raise TypeError("overrides must be a mapping")
 
-    requested = frozenset() if allowlist is None else frozenset(allowlist)
-    if any(not isinstance(name, str) for name in requested):
+    requested_values = () if allowlist is None else tuple(allowlist)
+    if any(not isinstance(name, str) for name in requested_values):
         raise TypeError("allowlist must contain strings")
-    keep = NON_SECRET_BASICS | requested
-    return {
-        key: value
-        for key, value in base.items()
-        if isinstance(key, str) and key in keep
+    requested = frozenset(requested_values)
+
+    if overrides is not None:
+        invalid = tuple(name for name in overrides if name not in _WORKER_ID_NAMES)
+        if invalid:
+            raise ValueError(f"environment override is not allowlisted: {invalid!r}")
+        if any(not isinstance(value, str) for value in overrides.values()):
+            raise TypeError("environment overrides must contain strings")
+
+    env = {
+        "PATH": os.defpath,
+        "PYTHONUNBUFFERED": "1",
     }
+    if worktree is not None:
+        env["HOME"] = str(Path(worktree).resolve() / ".cambium" / "home")
+
+    if overrides is not None:
+        env.update(overrides)
+
+    # HOME, PATH, and PYTHONUNBUFFERED are controlled above, even if a caller
+    # mistakenly includes them in the provider allowlist.
+    for name in requested - NON_SECRET_BASICS:
+        if name not in base:
+            continue
+        value = base[name]
+        if not isinstance(value, str):
+            raise TypeError(f"environment value for {name!r} must be a string")
+        env[name] = value
+    return env

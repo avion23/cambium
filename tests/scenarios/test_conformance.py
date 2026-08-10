@@ -259,14 +259,18 @@ def test_diffundo_is_cacheless_and_lints_volatile_prompt_prefix() -> None:
         diffundo.validate_prompt_structure(prompt)
 
 
-def test_worker_env_drops_api_key_names_and_keeps_path() -> None:
+def test_worker_env_drops_api_key_names_and_controls_path(tmp_path: Path) -> None:
     redact = pytest.importorskip("cambium.redact")
     env = redact.build_worker_env({
         "TEST_API_KEY_DEMO": "not-for-workers",
-        "PATH": "/usr/bin",
-    })
+        "PATH": "/host/bin",
+        "HOME": "/home/host",
+    }, worktree=tmp_path / "worker")
     assert "TEST_API_KEY_DEMO" not in env
-    assert env["PATH"] == "/usr/bin"
+    assert env["PATH"] == os.defpath
+    assert env["HOME"] == str((tmp_path / "worker").resolve() / ".cambium" / "home")
+    assert "/host/bin" not in env.values()
+    assert "/home/host" not in env.values()
 
 
 def test_supervisor_spawn_sites_use_sensitive_env_stripper() -> None:
