@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import os
+import shlex
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -14,11 +15,12 @@ from typing import Any
 
 import pytest
 
+from cambium import worker
 from cambium.supervisor import read_events, run_plan, run_session
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = "cambium.worker"
-PROVIDER_KEY = "CAMBIUM_LOOPBACK_PROVIDER_KEY"
+PROVIDER_KEY = "CAMBIUM_PROVIDER_LOOPBACK_PROVIDER_API_KEY"
 PROVIDER_SECRET = "loopback-provider-secret"
 STATIC_PREFIX = (
     "You are Cambium's deterministic coding worker.\n"
@@ -356,3 +358,32 @@ def test_run_session_provider_mode_missing_task_fails_before_spawn(tmp_path) -> 
             )
         )
     assert not (session_dir / ".cambium" / "events.jsonl").exists()
+
+
+def test_worker_git_worktree_hook_does_not_receive_provider_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+    record = tmp_path / "hook-environment"
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\nenv > {shlex.quote(str(record))}\n", encoding="utf-8")
+    hook.chmod(0o700)
+    provider_name = "CAMBIUM_PROVIDER_OPENAI_API_KEY"
+    monkeypatch.setenv(provider_name, "provider-secret")
+
+    worktree = tmp_path / "worktree"
+    returncode, _stdout, stderr = worker.git(
+        "worktree", "add", "-b", "worker-test", str(worktree), "main", cwd=repo
+    )
+
+    assert returncode == 0, stderr
+    assert record.exists(), "the post-checkout hook never ran"
+    hook_environment = record.read_text(encoding="utf-8").splitlines()
+    assert not any(line.startswith(f"{provider_name}=") for line in hook_environment)

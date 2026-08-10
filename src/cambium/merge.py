@@ -41,6 +41,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from .auth import scrub_environment
+
 MAIN_REF = "refs/heads/main"
 STAGING_REF_PREFIX = "refs/cambium/staging"
 
@@ -173,8 +175,10 @@ class MergeSequencer:
 
     @staticmethod
     def _git_env() -> dict[str, str]:
-        """Environment for git subprocesses, quarantine-free (finding F5)."""
-        return {key: value for key, value in os.environ.items() if key != _QUARANTINE_ENV}
+        """Credential-scrubbed env for git subprocesses and their hooks."""
+        env = scrub_environment()
+        env.pop(_QUARANTINE_ENV, None)
+        return env
 
     def _run(
         self,

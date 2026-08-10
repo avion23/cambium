@@ -28,6 +28,7 @@ from typing import Any
 
 from . import ast_tools
 from .approval import ApprovalGate
+from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
 
@@ -448,6 +449,7 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
             subprocess.run,
             command,
             cwd=ctx.cwd,
+            env=scrub_environment(),
             capture_output=True,
             text=True,
             check=False,
@@ -563,6 +565,7 @@ async def _run_process(
         subprocess.run,
         command,
         cwd=cwd,
+        env=scrub_environment(),
         capture_output=True,
         text=True,
         check=False,

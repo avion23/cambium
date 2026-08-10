@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .auth import scrub_environment
+
 
 def _location_value(diagnostic: dict[str, Any], direct: str, nested: str) -> Any:
     location = diagnostic.get("location")
@@ -115,6 +117,7 @@ class LintDiag:
             capture_output=True,
             text=True,
             check=False,
+            env=scrub_environment(),
         )
         return _parse_diagnostics(path, result.stdout)
 

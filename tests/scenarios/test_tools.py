@@ -517,6 +517,43 @@ def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     assert len(result.output.encode()) <= MAX_OUTPUT_BYTES
 
 
+def test_tool_subprocesses_do_not_inherit_provider_credentials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "tool-secret")
+    command = [
+        sys.executable,
+        "-c",
+        "import os; print('CAMBIUM_PROVIDER_OPENAI_API_KEY' in os.environ)",
+    ]
+
+    result = _run("run_shell", {"cmd": command}, ToolContext(tmp_path))
+
+    assert result.ok
+    assert result.output == "False\n"
+
+
+def test_tool_lint_result_does_not_contain_provider_key(tmp_path: Path, monkeypatch) -> None:
+    """A linter that echoes its environment proves the tool result carries no
+    provider credential (regression: the linter subprocess inherited os.environ)."""
+    from cambium.lint_diag import LintDiag
+
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "lint-secret")
+    script = (
+        "import json, os, sys\n"
+        "secret = os.environ.get('CAMBIUM_PROVIDER_OPENAI_API_KEY', 'NO-SECRET')\n"
+        "print(json.dumps([{'code': 'E001', 'message': secret, "
+        "'filename': sys.argv[1], 'location': {'row': 1, 'column': 1}}]))\n"
+    )
+    ctx = ToolContext(tmp_path, lint=LintDiag(lint_cmd=[sys.executable, "-c", script]))
+
+    result = _run("write_file", {"path": "new.py", "content": "ok\n"}, ctx)
+
+    assert result.ok
+    assert "lint-secret" not in (result.output or "")
+    assert "NO-SECRET" in (result.output or "")
+
+
 def test_run_tool_validates_before_dispatch_and_rejects_unknown_tools(tmp_path: Path) -> None:
     invalid = _run("read_file", {}, ToolContext(tmp_path))
     assert not invalid.ok

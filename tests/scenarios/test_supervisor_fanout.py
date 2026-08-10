@@ -29,11 +29,13 @@ import textwrap
 import time
 from pathlib import Path
 
+from cambium import supervisor
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = str(ROOT / "scripts" / "fake_worker.py")
 CRASH_WORKER = str(ROOT / "tests" / "fixtures" / "crash_worker.py")
+ENV_WORKER = str(ROOT / "tests" / "fixtures" / "env_worker.py")
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
@@ -643,3 +645,76 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
     assert "init" in kinds
     assert "session_ended" in kinds
     assert kinds[-1] == "session_ended"
+
+
+# ---------------------------------------------------------------------------
+# T7: env confinement — the actually spawned worker env carries only the
+# authorized canonical provider keys, and supervisor git hooks see no key.
+# ---------------------------------------------------------------------------
+
+
+def test_t7_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "authorized-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_bad_API_KEY", "noncanonical-secret")
+    dump_path = tmp_path / "worker-env.json"
+    monkeypatch.setenv("ENV_DUMP_PATH", str(dump_path))
+
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    plan = {
+        "tasks": [
+            _task(session_dir, repo, base, "t-env", worktree="wt-env", branch="wt-env",
+                  target_file="a.txt", marker="// cambium-env",
+                  gate="grep -q '// cambium-env' a.txt", worker=ENV_WORKER),
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    (task,) = result.results
+    assert task.status == "succeeded"
+    spawned_env = json.loads(dump_path.read_text(encoding="utf-8"))
+    assert spawned_env["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == "authorized-secret"
+    assert "OPENAI_API_KEY" not in spawned_env
+    assert "CAMBIUM_PROVIDER_bad_API_KEY" not in spawned_env
+    assert spawned_env["CAMBIUM_TASK_ID"] == "t-env"
+    assert spawned_env["CAMBIUM_GENERATION"] == "1"
+
+
+def test_t8_supervisor_git_sync_post_checkout_hook_sees_no_provider_key(
+    tmp_path, monkeypatch
+) -> None:
+    """A post-checkout hook executed by ``_Runtime._git_sync`` git operations
+    must not see any provider credential in its env."""
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "hook-secret")
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+
+    hook_dump = tmp_path / "hook-env.jsonl"
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        f"with open({str(hook_dump)!r}, 'a', encoding='utf-8') as f:\n"
+        "    f.write(json.dumps(dict(os.environ)) + chr(10))\n"
+    )
+    hook.chmod(0o755)
+
+    runtime = supervisor._Runtime.__new__(supervisor._Runtime)
+    worktree = session_dir / "wt-hook"
+    runtime._git_sync(
+        repo, ("worktree", "add", "-b", "wt-hook", str(worktree), base), check=True
+    )
+
+    records = [
+        json.loads(line)
+        for line in hook_dump.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records, "the post-checkout hook never ran"
+    for record in records:
+        assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in record
+        assert "hook-secret" not in json.dumps(record)

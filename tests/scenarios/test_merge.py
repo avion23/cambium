@@ -18,6 +18,7 @@ and the six findings the sequencer encodes:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -446,3 +447,60 @@ def test_repo_path_that_is_a_file_raises_git_error(tmp_path) -> None:
 
     # reconcile is best-effort: a broken repo path reports None, not a crash
     assert seq.reconcile(not_a_repo) is None
+
+
+def _install_post_checkout_hook(repo: Path, dump: Path) -> None:
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        f"with open({str(dump)!r}, 'a', encoding='utf-8') as f:\n"
+        "    f.write(json.dumps(dict(os.environ)) + chr(10))\n"
+    )
+    hook.chmod(0o755)
+
+
+def _hook_records(dump: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in dump.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_git_env_is_scrubbed_and_quarantine_free(monkeypatch) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
+    monkeypatch.setenv("PATH", "/bin")
+
+    env = MergeSequencer._git_env()
+
+    assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "GIT_QUARANTINE_PATH" not in env
+    assert env["PATH"] == "/bin"
+
+
+def test_post_checkout_hook_during_staging_sees_no_provider_key(tmp_path, monkeypatch) -> None:
+    """A post-checkout hook run by MergeSequencer git operations (worktree add /
+    checkout) must not see any provider credential in its environment."""
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "hook-secret")
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    dump = tmp_path / "hook-env.jsonl"
+    _install_post_checkout_hook(repo, dump)
+
+    wt_a = tmp_path / "wt-a"
+    _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+    dump.write_text("")  # drop hook runs made by the test's own git (full env)
+
+    seq = MergeSequencer(task_id="hook-1")
+    staged = seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
+    assert staged is not None
+    seq.cleanup_staging(repo)
+
+    records = _hook_records(dump)
+    assert records, "the post-checkout hook never ran during staging"
+    for record in records:
+        assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in record
+        assert "hook-secret" not in json.dumps(record)
