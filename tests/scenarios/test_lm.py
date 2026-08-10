@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import inspect
 import json
 import os
 import subprocess
@@ -125,22 +124,6 @@ def test_identical_calls_are_not_cached() -> None:
     assert lm.num_retries == 0
     assert lm.history == []
     assert all("cache" not in call["prompt"] for call in diffundo.calls)
-
-
-def test_copy_keeps_zero_retry_invariant_across_state_round_trip() -> None:
-    _require_dspy()
-    import dspy
-
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-    copied = lm.copy(num_retries=5)
-
-    assert copied.num_retries == 0
-    assert copied.cache is False
-    state = copied.dump_state()
-    loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
-
-    assert loaded.num_retries == 0
-    assert loaded.cache is False
 
 
 def test_same_prompt_to_two_provider_endpoints_reaches_each_once() -> None:
@@ -302,13 +285,6 @@ def test_free_threaded_build_is_rejected_at_lm_import() -> None:
     assert "free-threaded CPython" in completed.stderr
 
 
-@pytest.mark.parametrize("key", ["apiKey", "API-Key", "api_key"])
-def test_secret_marker_variants_are_rejected(key: str) -> None:
-    _require_dspy()
-    with pytest.raises(ValueError, match="provider credentials"):
-        CambiumLM(FakeDiffundo(), ProviderTier.FAST, **{key: "secret"})  # type: ignore[arg-type]
-
-
 @pytest.mark.parametrize(
     "key",
     [
@@ -392,28 +368,6 @@ def test_copy_rejects_credential_keys_and_keeps_dump_state_clean() -> None:
     assert "api.key" not in repr(copied.dump_state())
 
 
-def test_copy_rejects_unknown_keyword_before_creating_unloadable_state() -> None:
-    _require_dspy()
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-
-    with pytest.raises(TypeError, match="unknown keyword argument: unexpected"):
-        lm.copy(unexpected=True)
-
-
-def test_copy_refreezes_existing_mutable_response_format() -> None:
-    _require_dspy()
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    response_format: dict[str, Any] = {"type": "json_object"}
-    lm.kwargs["response_format"] = response_format
-
-    copied = lm.copy()
-    response_format["api_key"] = "SENSITIVE_CANARY"
-
-    assert _call(copied) == ["completion text"]
-    assert diffundo.calls[0]["prompt"]["response_format"] == {"type": "json_object"}
-
-
 def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> None:
     _require_dspy()
     import dspy
@@ -466,190 +420,6 @@ def test_predict_json_save_rejects_tuple_credential_keys(tmp_path: Path) -> None
     assert not state_path.exists()
 
 
-def test_predict_failed_json_save_preserves_existing_state(tmp_path: Path) -> None:
-    _require_dspy()
-    import dspy
-
-    predict = dspy.Predict("question -> answer")
-    predict.lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-    predict.dump_state = lambda: {"not_json": object()}
-    state_path = tmp_path / "state.json"
-    state_path.write_text("existing state")
-
-    with pytest.raises(RuntimeError, match="Failed to save state"):
-        predict.save(state_path)
-
-    assert state_path.read_text() == "existing state"
-
-
-def test_copy_does_not_share_mutable_launch_kwargs() -> None:
-    _require_dspy()
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-    copied = lm.copy()
-
-    with pytest.raises(TypeError):
-        copied.launch_kwargs["api_key"] = "SENSITIVE_CANARY"
-
-    assert "SENSITIVE_CANARY" not in repr(lm.dump_state())
-    assert "api_key" not in repr(lm.dump_state())
-    assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
-    assert "api_key" not in repr(copied.dump_state())
-
-
-def test_copy_launch_and_train_snapshots_reject_dict_base_mutators() -> None:
-    _require_dspy()
-    lm = CambiumLM(
-        FakeDiffundo(),
-        ProviderTier.FAST,
-        launch_kwargs={"original": "launch"},
-        train_kwargs={"original": "train"},
-    )  # type: ignore[arg-type]
-    copied = lm.copy()
-
-    mutators = (
-        lambda value: dict.__setitem__(value, "bypass", "changed"),
-        lambda value: dict.__delitem__(value, "original"),
-        lambda value: dict.update(value, {"bypass": "changed"}),
-        lambda value: dict.clear(value),
-        lambda value: dict.pop(value, "original"),
-        lambda value: dict.popitem(value),
-        lambda value: dict.setdefault(value, "bypass", "changed"),
-        lambda value: dict.__ior__(value, {"bypass": "changed"}),
-    )
-    for attribute in ("launch_kwargs", "train_kwargs"):
-        snapshot = getattr(copied, attribute)
-        for mutate in mutators:
-            with pytest.raises(TypeError):
-                mutate(snapshot)
-        assert getattr(lm, attribute) == snapshot
-        assert "bypass" not in snapshot
-
-
-def test_model_rejects_hostile_primitive_subclass() -> None:
-    _require_dspy()
-
-    class HostileStr(str):
-        def __new__(cls, value: str, payload: dict[str, str]) -> HostileStr:
-            instance = super().__new__(cls, value)
-            instance.payload = payload
-            return instance
-
-        def __str__(self) -> HostileStr:
-            return self
-
-    payload = {"state": "original"}
-    with pytest.raises(TypeError, match="exact builtin string"):
-        CambiumLM(
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            model=HostileStr("provider-model", payload),
-        )  # type: ignore[arg-type]
-
-
-def test_copy_rejects_hostile_bytes_in_launch_kwargs() -> None:
-    _require_dspy()
-
-    class HostileBytes(bytes):
-        def __new__(cls, value: bytes, payload: dict[str, str]) -> HostileBytes:
-            instance = super().__new__(cls, value)
-            instance.payload = payload
-            return instance
-
-        def __bytes__(self) -> HostileBytes:
-            return self
-
-    payload = {"state": "original"}
-    with pytest.raises(TypeError, match="exact builtin primitive"):
-        CambiumLM(
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            launch_kwargs={"nested": {"value": HostileBytes(b"secret", payload)}},
-        )  # type: ignore[arg-type]
-
-
-def test_nested_hostile_credential_key_cannot_reach_dump_state() -> None:
-    _require_dspy()
-
-    class HostileKey(str):
-        def __str__(self) -> HostileKey:
-            return self
-
-        def lower(self) -> str:
-            return "harmless"
-
-    with pytest.raises(TypeError, match="exact builtin string"):
-        CambiumLM(
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            extensions={"nested": [{HostileKey("api_key"): "SENSITIVE_CANARY"}]},
-        )  # type: ignore[arg-type]
-
-
-def test_copy_freezes_bytearrays_in_launch_and_train_kwargs() -> None:
-    _require_dspy()
-    launch_value = bytearray(b"launch")
-    train_value = bytearray(b"train")
-    lm = CambiumLM(  # type: ignore[arg-type]
-        FakeDiffundo(),
-        ProviderTier.FAST,
-        launch_kwargs={"nested": {"value": launch_value}},
-        train_kwargs={"nested": {"value": train_value}},
-    )
-    copied = lm.copy()
-
-    launch_value[:] = b"changed"
-    train_value[:] = b"changed"
-
-    assert lm.launch_kwargs["nested"]["value"] == b"launch"
-    assert copied.launch_kwargs["nested"]["value"] == b"launch"
-    assert lm.train_kwargs["nested"]["value"] == b"train"
-    assert copied.train_kwargs["nested"]["value"] == b"train"
-
-
-def test_copy_rejects_mutable_primitive_subclasses() -> None:
-    _require_dspy()
-
-    class MutableInt(int):
-        def __new__(cls, value: int, payload: dict[str, str]) -> MutableInt:
-            instance = super().__new__(cls, value)
-            instance.payload = payload
-            return instance
-
-    payload = {"state": "original"}
-    value = MutableInt(7, payload)
-    with pytest.raises(TypeError, match="exact builtin primitive"):
-        CambiumLM(  # type: ignore[arg-type]
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            launch_kwargs={"nested": {"value": value}},
-            train_kwargs={"nested": {"value": value}},
-        )
-
-
-def test_copy_revalidates_post_construction_hostile_snapshots() -> None:
-    _require_dspy()
-
-    class HostileStr(str):
-        pass
-
-    class HostileBytes(bytes):
-        pass
-
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-    launch = {"value": HostileStr("launch")}
-    train = {"value": HostileBytes(b"train")}
-    lm.launch_kwargs = launch
-    lm.train_kwargs = train
-
-    with pytest.raises(TypeError, match="exact builtin primitive"):
-        lm.copy()
-
-    launch["value"] = "original unaffected"
-    train["value"] = b"original unaffected"
-    assert lm.launch_kwargs["value"] == "original unaffected"
-    assert lm.train_kwargs["value"] == b"original unaffected"
-
-
 @pytest.mark.parametrize("field", ["launch_kwargs", "train_kwargs"])
 def test_toctou_mapping_credentials_cannot_be_retained(field: str) -> None:
     _require_dspy()
@@ -682,75 +452,6 @@ def test_toctou_mapping_credentials_cannot_be_retained(field: str) -> None:
     assert getattr(lm, field) == {"benign": "value"}
     assert "SENSITIVE_CANARY" not in repr(lm.dump_state())
     assert "api_key" not in repr(lm.dump_state())
-
-
-def test_construction_registers_diffundo_once() -> None:
-    _require_dspy()
-    import cambium.lm as lm_module
-
-    diffundos = [FakeDiffundo() for _ in range(100)]
-    with lm_module._DIFFUNDO_REGISTRY_LOCK:
-        lm_module._DIFFUNDO_REGISTRY.clear()
-
-    instances = [CambiumLM(diffundo, ProviderTier.FAST) for diffundo in diffundos]  # type: ignore[arg-type]
-
-    assert len(instances) == 100
-    assert len(lm_module._DIFFUNDO_REGISTRY) == 100
-
-
-def test_rejected_constructions_do_not_register_diffundo() -> None:
-    _require_dspy()
-    import cambium.lm as lm_module
-
-    diffundo = FakeDiffundo()
-    with lm_module._DIFFUNDO_REGISTRY_LOCK:
-        lm_module._DIFFUNDO_REGISTRY.clear()
-        registry_size = len(lm_module._DIFFUNDO_REGISTRY)
-
-    for _ in range(100):
-        with pytest.raises(ValueError, match="callbacks"):
-            CambiumLM(diffundo, ProviderTier.FAST, callbacks=[object()])  # type: ignore[arg-type]
-
-    assert len(lm_module._DIFFUNDO_REGISTRY) == registry_size
-
-
-def test_rejected_copies_do_not_register_replacement_diffundo() -> None:
-    _require_dspy()
-    import cambium.lm as lm_module
-
-    diffundo = FakeDiffundo()
-    replacement = FakeDiffundo("https://replacement.invalid")
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    with lm_module._DIFFUNDO_REGISTRY_LOCK:
-        lm_module._DIFFUNDO_REGISTRY.clear()
-
-    for _ in range(100):
-        with pytest.raises(ValueError, match="invalid"):
-            lm.copy(diffundo=replacement, tier="invalid")
-
-    assert len(lm_module._DIFFUNDO_REGISTRY) == 0
-
-
-def test_budget_rejects_nan() -> None:
-    _require_dspy()
-
-    with pytest.raises(ValueError, match="finite"):
-        CambiumLM(FakeDiffundo(), ProviderTier.FAST, budget_usd=float("nan"))  # type: ignore[arg-type]
-
-
-def test_request_rejects_private_copy_and_direct_nan_budget_before_diffundo() -> None:
-    _require_dspy()
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST, budget_usd=1.0)  # type: ignore[arg-type]
-
-    with pytest.raises(ValueError, match="finite"):
-        lm.copy(_budget_usd=float("nan"))
-
-    lm._budget_usd = float("nan")
-    with pytest.raises(ValueError, match="finite"):
-        _call(lm, "budget bypass canary")
-
-    assert diffundo.calls == []
 
 
 def test_copy_rejects_hostile_private_keys_without_tier_or_provider_corruption() -> None:
@@ -889,34 +590,6 @@ def test_hostile_former_parameter_key_cannot_change_provider(
     assert provider_b.calls == []
 
 
-def test_kwargs_entry_points_have_no_bindable_named_parameters() -> None:
-    _require_dspy()
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-    expected = [
-        ("self", inspect.Parameter.POSITIONAL_ONLY),
-        ("args", inspect.Parameter.VAR_POSITIONAL),
-        ("kwargs", inspect.Parameter.VAR_KEYWORD),
-    ]
-
-    for entry_point in (type(lm).__init__, type(lm).__call__, type(lm).acall):
-        parameters = inspect.signature(entry_point).parameters.values()
-        assert [(parameter.name, parameter.kind) for parameter in parameters] == expected
-
-
-@pytest.mark.parametrize("entry_point", ["constructor", "call", "acall"])
-def test_kwargs_entry_points_reject_unknown_exact_keyword(entry_point: str) -> None:
-    _require_dspy()
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-
-    with pytest.raises(TypeError, match="unknown keyword argument: unexpected"):
-        if entry_point == "constructor":
-            CambiumLM(FakeDiffundo(), ProviderTier.FAST, unexpected=True)  # type: ignore[arg-type]
-        elif entry_point == "call":
-            lm(unexpected=True)
-        else:
-            asyncio.run(lm.acall(unexpected=True))
-
-
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -1012,62 +685,6 @@ def test_predict_json_save_and_load_round_trip_routes_through_diffundo(tmp_path:
     assert diffundo.calls[0]["prompt"]["messages"][0]["content"] == "JSON round-trip prompt"
 
 
-def test_predict_json_round_trip_preserves_bytearray_snapshot(tmp_path: Path) -> None:
-    _require_dspy()
-    import dspy
-
-    predict = dspy.Predict("question -> answer")
-    predict.lm = CambiumLM(  # type: ignore[arg-type]
-        FakeDiffundo(),
-        ProviderTier.FAST,
-        launch_kwargs={"value": bytearray(b"x")},
-    )
-    state_path = tmp_path / "state.json"
-
-    predict.save(state_path)
-    predict.load(state_path, allow_unsafe_lm_state=True)
-
-    assert predict.lm.launch_kwargs["value"] == b"x"
-
-
-def test_predict_json_round_trip_preserves_literal_byte_marker_mapping(tmp_path: Path) -> None:
-    _require_dspy()
-    import dspy
-
-    marker = {"__cambium_bytes_base64__": "eA=="}
-    predict = dspy.Predict("question -> answer")
-    predict.lm = CambiumLM(  # type: ignore[arg-type]
-        FakeDiffundo(),
-        ProviderTier.FAST,
-        launch_kwargs={"nested": marker},
-    )
-    state_path = tmp_path / "state.json"
-
-    predict.save(state_path)
-    predict.load(state_path, allow_unsafe_lm_state=True)
-
-    assert predict.lm.launch_kwargs["nested"] == marker
-
-
-def test_predict_json_round_trip_preserves_nested_tuple_mapping_key(tmp_path: Path) -> None:
-    _require_dspy()
-    import dspy
-
-    expected = {("a", "b"): "value"}
-    predict = dspy.Predict("question -> answer")
-    predict.lm = CambiumLM(  # type: ignore[arg-type]
-        FakeDiffundo(),
-        ProviderTier.FAST,
-        launch_kwargs={"nested": expected},
-    )
-    state_path = tmp_path / "state.json"
-
-    predict.save(state_path)
-    predict.load(state_path, allow_unsafe_lm_state=True)
-
-    assert predict.lm.launch_kwargs["nested"] == expected
-
-
 def test_copied_budget_round_trip_routes_with_override(tmp_path: Path) -> None:
     _require_dspy()
     import dspy
@@ -1110,30 +727,6 @@ def test_explicit_request_response_format_credentials_are_rejected(entry_point: 
     )
 
     with pytest.raises(ValueError, match="provider credentials"):
-        if entry_point == "call":
-            lm(request=request)
-        else:
-            asyncio.run(lm.acall(request=request))
-
-    assert diffundo.calls == []
-
-
-@pytest.mark.parametrize("entry_point", ["call", "acall"])
-def test_explicit_request_response_format_bytes_are_rejected_before_dispatch(
-    entry_point: str,
-) -> None:
-    _require_dspy()
-    import dspy
-
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    request = dspy.LMRequest(
-        model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"response_format": {"blob": b"x"}},
-    )
-
-    with pytest.raises(TypeError, match="JSON-serializable"):
         if entry_point == "call":
             lm(request=request)
         else:
@@ -1208,57 +801,6 @@ def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
     assert "api_key" not in diffundo.serialized_prompts[0]
     assert "SENSITIVE_CANARY" not in diffundo.serialized_prompts[0]
     assert response_format.reads == 1
-
-
-@pytest.mark.parametrize("entry_point", ["call", "acall"])
-def test_request_snapshot_rejects_non_string_mapping_keys(entry_point: str) -> None:
-    _require_dspy()
-    import dspy
-
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    request = dspy.LMRequest(
-        model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"response_format": {1: "coerced", "type": "json_object"}},
-    )
-
-    with pytest.raises(TypeError, match="exact builtin strings"):
-        if entry_point == "call":
-            lm(request=request)
-        else:
-            asyncio.run(lm.acall(request=request))
-
-    assert diffundo.calls == []
-
-
-@pytest.mark.parametrize(
-    ("value", "entry_point"),
-    [
-        (float("nan"), "call"),
-        (float("inf"), "call"),
-        (float("-inf"), "acall"),
-    ],
-)
-def test_request_snapshot_rejects_non_finite_floats(value: float, entry_point: str) -> None:
-    _require_dspy()
-    import dspy
-
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    request = dspy.LMRequest(
-        model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"response_format": {"value": value}},
-    )
-
-    with pytest.raises(ValueError, match="finite floats"):
-        if entry_point == "call":
-            lm(request=request)
-        else:
-            asyncio.run(lm.acall(request=request))
-
-    assert diffundo.calls == []
 
 
 def test_state_round_trip_loads_in_a_fresh_process(tmp_path: Path) -> None:

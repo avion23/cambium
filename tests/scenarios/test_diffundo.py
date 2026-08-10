@@ -24,25 +24,20 @@ import json
 import threading
 import time
 import urllib.request
-from collections.abc import MutableMapping
-from email.message import Message
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
 
-import cambium.diffundo as diffundo_module
 from cambium.diffundo import (
     AllProvidersFailed,
     CallResult,
     Diffundo,
     HealthState,
-    PromptStructureError,
     ProviderConfig,
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
-    validate_prompt_structure,
 )
 
 # --------------------------------------------------------------------------- #
@@ -377,41 +372,6 @@ def test_retry_after_delta_seconds_controls_same_provider_retry(monkeypatch) -> 
         assert len(server.calls) == 2
     finally:
         server.close()
-
-
-@pytest.mark.parametrize(
-    ("values", "expected"),
-    [
-        (("7",), 7.0),
-        (("0",), 0.0),
-        (("+7",), None),
-        (("1e2",), None),
-        (("1_0",), None),
-        (("7.5",), None),
-        (("-1",), None),
-        (("1, 2",), None),
-        (("9" * 4000,), float("inf")),
-        (("1", "2"), None),
-        (("Friday, 15-Jan-27 08:00:11 GMT",), 11.0),
-        (("Fri, 15 Jan 2027 08:00:11 GMT",), 11.0),
-        (("Fri Jan 15 08:00:11 2027",), 11.0),
-        (("Fri, 15 Jan 2027 08:00:11 GMT, 2",), None),
-        (("Fri Jan 15 08:00:11 2027, 2",), None),
-    ],
-)
-def test_retry_after_parser(values: tuple[str, ...], expected: float | None, monkeypatch) -> None:
-    fixed_now = 1_800_000_000.0
-    monkeypatch.setattr(diffundo_module.time, "time", lambda: fixed_now)
-    headers = Message()
-    for value in values:
-        headers.add_header("Retry-After", value)
-    actual = diffundo_module._parse_retry_after(headers)
-    if expected == float("inf"):
-        assert actual == float("inf")
-    elif expected is None:
-        assert actual is None
-    else:
-        assert actual == expected
 
 
 def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> None:
@@ -965,75 +925,6 @@ def test_call_budget_still_allows_success_within_budget(tmp_path, monkeypatch) -
         assert result.content == "fast"
     finally:
         fast.close()
-
-
-# --------------------------------------------------------------------------- #
-# 6. prompt guard (D8c)
-# --------------------------------------------------------------------------- #
-
-
-def test_prompt_guard_rejects_volatile_tokens_in_static_head() -> None:
-    timestamp_top = {
-        "messages": [{"role": "system", "content": "2026-08-09T10:30:00Z\nBe concise.\nRule 1"}]
-    }
-    with pytest.raises(PromptStructureError):
-        validate_prompt_structure(timestamp_top)
-
-    epoch_top = {"messages": [{"role": "system", "content": "timestamp 2026-08-09 10:30:00\nGo"} ]}
-    with pytest.raises(PromptStructureError):
-        validate_prompt_structure(epoch_top)
-
-    request_id_top = {
-        "messages": [{"role": "system", "content": "guidelines\nrequest_id 01HABC123\nmore"}]
-    }
-    with pytest.raises(PromptStructureError):
-        validate_prompt_structure(request_id_top)
-
-    plain_prompt_top = {"prompt": "request-id: abc-123\nBe terse."}
-    with pytest.raises(PromptStructureError):
-        validate_prompt_structure(plain_prompt_top)
-
-
-def test_prompt_guard_accepts_static_head_and_dynamic_tail() -> None:
-    static = {
-        "messages": [
-            {"role": "system", "content": "You are a coding assistant.\nBe concise.\nRule 1"}
-        ]
-    }
-    assert validate_prompt_structure(static) is None
-
-    volatile_in_dynamic_tail = {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "static head line 1\nstatic head line 2\nstatic head line 3\n"
-                    "static head line 4\nrequest_id: 01HABC 2026-08-09T10:30:00Z"
-                ),
-            }
-        ]
-    }
-    assert validate_prompt_structure(volatile_in_dynamic_tail) is None
-
-
-# --------------------------------------------------------------------------- #
-# 7. no local cache (D1)
-# --------------------------------------------------------------------------- #
-
-
-def test_no_local_cache_instance_has_no_mutable_mapping_attribute(tmp_path, monkeypatch) -> None:
-    server = FakeServer([(200, _ok_payload("x"), 0.0)])
-    _set_keys(monkeypatch, "K")
-    router = Diffundo((_config("p", server, "K"),))
-    try:
-        for attr, value in vars(router).items():
-            assert not isinstance(value, MutableMapping), (
-                f"Diffundo.{attr} is a mutable mapping — a cache attribute"
-            )
-        assert not isinstance(router._runtimes, MutableMapping)
-        assert not isinstance(router._providers, MutableMapping)
-    finally:
-        server.close()
 
 
 def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> None:

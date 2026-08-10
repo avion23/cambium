@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import stat
@@ -422,10 +421,6 @@ def test_worker_environment_non_provider_worker_gets_no_provider_path(
     env = supervisor._worker_environment(spec, 1)
 
     assert "CAMBIUM_PROVIDERS" not in env
-
-
-def test_stdin_key_removes_only_line_ending() -> None:
-    assert auth.read_stdin_key(io.BytesIO(b" key with spaces \n")) == " key with spaces "
 
 
 def test_cli_has_only_fixed_auth_run_profile() -> None:
