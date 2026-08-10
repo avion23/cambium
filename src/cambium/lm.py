@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sysconfig
 from collections.abc import Mapping
 from typing import Any
 
+if sysconfig.get_config_var("Py_GIL_DISABLED") or os.environ.get("Py_GIL_DISABLED") == "1":
+    raise RuntimeError(
+        "CambiumLM does not support free-threaded CPython; use a GIL-enabled CPython build"
+    )
+
+# isort: off
 from .diffundo import CallResult, Diffundo, ProviderTier
+
+# isort: on
 
 _GENERATION_FIELDS = (
     "temperature",
@@ -20,23 +29,41 @@ _GENERATION_FIELDS = (
     "response_format",
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
-_SECRET_MARKERS = ("api_key", "authorization", "password", "secret", "token")
+_SECRET_MARKERS = ("apikey", "authorization", "password", "secret", "token")
 
 
 def _load_dspy() -> Any:
-    """Load DSPy on first use and reject unsupported free-threaded CPython.
+    """Load DSPy on first use without enabling its process-wide disk cache.
 
     Packaging has no GIL ABI environment marker, so uv can resolve DSPy for
-    cp314t. CambiumLM enforces the GIL-build requirement at runtime instead.
+    cp314t. CambiumLM rejects that build when this module is imported instead.
     """
-    if sysconfig.get_config_var("Py_GIL_DISABLED"):
-        raise RuntimeError(
-            "CambiumLM does not support free-threaded CPython; use a GIL-enabled CPython build"
-        )
+    previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
+    os.environ["DSPY_CACHEDIR"] = os.devnull
     try:
-        import dspy
-    except ImportError as exc:
-        raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
+        try:
+            import dspy
+        except ImportError as exc:
+            raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
+    finally:
+        if previous_cache_dir is None:
+            os.environ.pop("DSPY_CACHEDIR", None)
+        else:
+            os.environ["DSPY_CACHEDIR"] = previous_cache_dir
+
+    configure_cache = getattr(dspy, "configure_cache", None)
+    if not callable(configure_cache):
+        raise RuntimeError("CambiumLM requires a DSPy version with cache configuration")
+    cache = getattr(dspy, "cache", None)
+    if (
+        getattr(cache, "enable_disk_cache", True)
+        or getattr(cache, "enable_memory_cache", True)
+    ):
+        configure_cache(
+            enable_disk_cache=False,
+            enable_memory_cache=False,
+            disk_cache_dir=None,
+        )
     return dspy
 
 
@@ -142,7 +169,12 @@ class _CambiumLMMixin:
     def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         safe = {key: value for key, value in kwargs.items() if key not in _CACHE_FIELDS}
         forbidden = [
-            key for key in safe if any(marker in key.lower() for marker in _SECRET_MARKERS)
+            key
+            for key in safe
+            if any(
+                marker in key.replace("_", "").replace("-", "").lower()
+                for marker in _SECRET_MARKERS
+            )
         ]
         if forbidden:
             raise ValueError(

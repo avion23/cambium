@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import subprocess
 import sys
@@ -16,7 +17,16 @@ from cambium.diffundo import CallResult, ProviderTier
 from cambium.lm import ArchitectusLM, CambiumLM
 from cambium.tasktree import build_tree
 
-dspy = pytest.importorskip("dspy")
+
+def _require_dspy() -> None:
+    if importlib.util.find_spec("dspy") is None:
+        pytest.skip("dspy extra is not installed")
+
+
+def _tree(root: Path) -> tuple[str, ...]:
+    if not root.exists():
+        return ()
+    return tuple(sorted(str(path.relative_to(root)) for path in root.rglob("*")))
 
 
 class FakeDiffundo:
@@ -33,6 +43,8 @@ class FakeDiffundo:
         model: str | None = None,
         budget_usd: float | None = None,
     ) -> CallResult:
+        import dspy
+
         self.calls.append(
             {"endpoint": self.endpoint, "tier": tier, "prompt": prompt, "model": model}
         )
@@ -56,10 +68,44 @@ def _call(lm: CambiumLM, prompt: str = "same prompt") -> list[str]:
     return output
 
 
-def test_identical_calls_are_not_cached_and_do_not_write_dspy_cache(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_dspy_import_and_construction_do_not_write_home(tmp_path: Path) -> None:
+    _require_dspy()
+    source = Path(__file__).resolve().parents[2] / "src"
+    real_cache = Path.home() / ".dspy_cache"
+    real_cache_before_exists = real_cache.exists()
+    real_cache_before = _tree(real_cache)
+    script = """
+import sys
+from cambium.diffundo import ProviderTier
+from cambium.lm import CambiumLM
+
+fake_diffundo = type("FakeDiffundo", (), {"call": lambda *args, **kwargs: None})()
+CambiumLM(fake_diffundo, ProviderTier.FAST)
+import dspy
+assert dspy.cache.enable_disk_cache is False
+assert dspy.cache.enable_memory_cache is False
+"""
+    env = os.environ.copy()
+    env.pop("DSPY_CACHEDIR", None)
+    env.pop("DSPY_CACHE_LIMIT", None)
+    env.pop("Py_GIL_DISABLED", None)
+    env["HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = str(source)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert _tree(tmp_path) == ()
+    assert real_cache.exists() is real_cache_before_exists
+    assert _tree(real_cache) == real_cache_before
+
+
+def test_identical_calls_are_not_cached() -> None:
+    _require_dspy()
     diffundo = FakeDiffundo()
     lm = CambiumLM(diffundo, ProviderTier.FAST, temperature=0.0)  # type: ignore[arg-type]
     assert _call(lm) == ["completion text"]
@@ -68,11 +114,11 @@ def test_identical_calls_are_not_cached_and_do_not_write_dspy_cache(
     assert lm.cache is False
     assert lm.num_retries == 0
     assert lm.history == []
-    assert not (tmp_path / ".dspy_cache").exists()
     assert all("cache" not in call["prompt"] for call in diffundo.calls)
 
 
 def test_same_prompt_to_two_provider_endpoints_reaches_each_once() -> None:
+    _require_dspy()
     first = FakeDiffundo("https://provider-a.invalid")
     second = FakeDiffundo("https://provider-b.invalid")
     assert _call(CambiumLM(first, ProviderTier.FAST)) == ["completion text"]  # type: ignore[arg-type]
@@ -82,8 +128,10 @@ def test_same_prompt_to_two_provider_endpoints_reaches_each_once() -> None:
 
 
 def test_session_context_is_isolated_and_retains_no_prompt() -> None:
+    _require_dspy()
     diffundo = FakeDiffundo()
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    dspy = sys.modules["dspy"]
     original_marker = object()
     with dspy.context(cambium_session=original_marker):
         assert _call(lm, "PROMPT-CANARY") == ["completion text"]
@@ -94,6 +142,7 @@ def test_session_context_is_isolated_and_retains_no_prompt() -> None:
 
 
 def test_architectus_real_decide_port_uses_cambium_lm() -> None:
+    _require_dspy()
     diffundo = FakeDiffundo()
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
     tree = build_tree(
@@ -108,6 +157,15 @@ def test_core_module_imports_never_import_dspy() -> None:
     source = Path(__file__).resolve().parents[2] / "src"
     script = """
 import sys
+import builtins
+
+real_import = builtins.__import__
+def reject_dspy(name, *args, **kwargs):
+    if name == "dspy" or name.startswith("dspy."):
+        raise AssertionError("core imports dspy eagerly")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = reject_dspy
 sys.path.insert(0, sys.argv[1])
 import cambium
 import cambium.architectus
@@ -126,13 +184,24 @@ assert 'dspy' not in sys.modules
     assert completed.returncode == 0, completed.stderr
 
 
-def test_free_threaded_build_is_rejected_before_dspy_use(monkeypatch: pytest.MonkeyPatch) -> None:
-    import cambium.lm as lm_module
-
-    monkeypatch.setattr(
-        lm_module.sysconfig,
-        "get_config_var",
-        lambda name: int(name == "Py_GIL_DISABLED"),
+def test_free_threaded_build_is_rejected_at_lm_import() -> None:
+    source = Path(__file__).resolve().parents[2] / "src"
+    script = "import sys; sys.path.insert(0, sys.argv[1]); import cambium.lm"
+    env = os.environ.copy()
+    env["Py_GIL_DISABLED"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    with pytest.raises(RuntimeError, match="free-threaded CPython"):
-        CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    assert completed.returncode != 0
+    assert "free-threaded CPython" in completed.stderr
+
+
+@pytest.mark.parametrize("key", ["apiKey", "API-Key", "api_key"])
+def test_secret_marker_variants_are_rejected(key: str) -> None:
+    _require_dspy()
+    with pytest.raises(ValueError, match="provider credentials"):
+        CambiumLM(FakeDiffundo(), ProviderTier.FAST, **{key: "secret"})  # type: ignore[arg-type]
