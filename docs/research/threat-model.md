@@ -8,7 +8,9 @@ source/tests, and [`v2-1-status.md`](v2-1-status.md).
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; provider cascade is source-defined and honors
 `Retry-After`; worker stdout/event admission is bounded; there is no per-worker OS
-sandbox or approval; DLQ and eval cache are absent.
+sandbox or production approval service. `ToolContext` accepts an optional
+`ApprovalGate`, but the run-plan worker path does not inject one. DLQ and eval cache
+are absent.
 
 Sources: superseded `system-design.md` (only concrete Septum mount list), authoritative
 `architecture.md` v2.0.0, distributed-systems (DS), implementation (IMPL), and LLM
@@ -29,7 +31,9 @@ likelihood; residual labels are **accepted** or **needs v2**.
 The historical boundary was worker↔host: subprocess + NDJSON, worktree isolation,
 generation fencing, and (then-proposed) Septum. Decision 10 removed sandboxing; the
 historical analysis listed worktree isolation, permission allowlists, and approval gates.
-The current source has no per-worker OS sandbox or approval hook.
+The current source has no per-worker OS sandbox or production approval service.
+`tools.ToolContext` accepts an optional `ApprovalGate`, but the worker `run_plan`
+path does not inject one.
 
 ## 2. Threat actors
 
@@ -61,7 +65,8 @@ The current source has no per-worker OS sandbox or approval hook.
    trust boundary between file content and model. **UNVERIFIED, needs v2**; metric and
    canaries do not prove absence. Canary 6.9.
 7. **Secrets (M2/M4/M5):** env inheritance, logs, events, stderr, and trajectories can
-   expose keys. Redaction (`architecture.md` §12.3/§13) helps, but split/reformatted
+   expose keys. The current credential/redaction boundary is described in
+   `architecture.md` §2, but split/reformatted
    secrets bypass regex; env allowlist must be enforced. Canary 6.5/6.6.
 8. **Merge/main tampering (M7):** expected-old-SHA `update-ref` rejects concurrent
    mutation (`NonFastForward`), but event log at rest has no signing/checksum. Canary 6.7.
@@ -138,8 +143,8 @@ that a Git worktree `.git` indirection reached the repository admin directory; t
 mount list omitted it.
 
 The env test placed `DEEPCODE_API_KEY`, `GEMINI_API_KEY`, and unrelated
-`AWS_SECRET_ACCESS_KEY` in the host. Architecture §7.2's `{**os.environ,...}` copied all
-three, contradicting §12.1's names-only allowlist. With no network, a worker could write
+`AWS_SECRET_ACCESS_KEY` in the host. The historical snapshot's `{**os.environ,...}` copied all
+three, contradicting its names-only allowlist. With no network, a worker could write
 a key to a tracked file and merge it. R4 therefore remained **needs v2**. Redaction
 tests covered canonical `sk-`/`AIza` forms, `api_key=`, and split secrets; split values
 documented R7's regex gap.

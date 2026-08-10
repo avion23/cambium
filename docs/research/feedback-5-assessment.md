@@ -10,14 +10,15 @@ feedback-4, research, and source modules. Current readers use `docs/architecture
 
 **Historical snapshot / current pointer:** provider loop, Diffundo, EventStore, and root
 `Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent; no
-per-worker sandbox or production shell approval exists, and dynamic hierarchy is absent. The
-old branch module/commit claims below are evidence, not current-main status.
+per-worker OS sandbox or production approval service exists, and dynamic hierarchy is absent.
+`ToolContext` accepts an optional `ApprovalGate`, but the run-plan worker path does not inject
+one. The old branch module/commit claims below are evidence, not current-main status.
 
 ## 0. Evidence convention
 
 The critique text was not committed; claim numbers reproduce the orchestrator disposition. All
 citations are repository-relative or explicitly marked **UNVERIFIED**. Sources included
-architecture §§5–7/16.2, `v2-1-review.md` §4 (M2/M7), `architectus-design.md`,
+the historical architecture snapshot, current `architecture.md` §§1–3, `v2-1-review.md` §4 (M2/M7), `architectus-design.md`,
 `m1-canonicalization-plan.md`, feedback-4, worker-coldstart, bench/replay research, the three
 v0.1 reviews, and `implementation-plan.md`.
 
@@ -26,24 +27,24 @@ v0.1 reviews, and `implementation-plan.md`.
 | # | Claim | Disposition | Retained reason/evidence |
 |---|---|---|---|
 | 1 | Dedicated FD 3 IPC | **ADOPT** | v2.1 review decision B moves protocol to inherited FD 3; stdout/stderr become captured logs; one transport bump, no runtime negotiation (`v2-1-review` §3B/§4 M2; `ipc.py`; supervisor spawn). |
-| 2 | One SQLite DB for events/conversations/blackboard | **REJECT** | Separate single-writer `events.db`, `conversations.db`, proposed `shared.db`; event is durable fact and projections rebuild (`architecture` §§6.1, 6.6; `v2-1-review` §3C; replay-restart §2.1; architectus-design §3.6). |
-| 3 | Delete `events.py` + `orchestrator.py` | **ALREADY-PLANNED** | M1 canonicalization rows 4/13 and Step 4 delete both with `git grep` gate (`m1-canonicalization-plan.md` §§2.1–2.2, 3, 4; v2-1-review §5). |
-| 4 | Delete `system-design.md` | **REJECT** | Immutable v0.1 origin record, cross-referenced by architecture §20/resolution matrix and all three reviews; v2-1-review §5 says keep immutable. |
-| 5 | Delete fixtures/use `-c` injection | **PARTIAL** | `fake_worker.py` remains fixture-only; `crash_worker.py` is needed for T3 crash/recovery proof and real reset between generations (`m1-canonicalization-plan.md` §2.4/§4 Step 5; `tests/fixtures/crash_worker.py`; `test_supervisor_fanout.py`). |
-| 6 | Trim generation/monotonic/ts from worker envelope | **PARTIAL** | Supervisor stamps authoritative `ts`/`monotonic_ms`, store reserves `seq`; generation remains fencing data and request ID remains correlation (`supervisor.py` emit; `store.py` append; `worker.py`; architecture §§5.1, 7.3). |
+| 2 | One SQLite DB for events/conversations/blackboard | **REJECT** | Separate single-writer `events.db`, `conversations.db`, proposed `shared.db`; event is durable fact and projections rebuild (`architecture` §1; `v2-1-review` §3C; replay-restart §2.1; architectus-design §3.1). |
+| 3 | Delete `events.py` + `orchestrator.py` | **ALREADY-PLANNED** | M1 §1(c) names both deletions and §1(e) requires the structural grep gate (`m1-canonicalization-plan.md`; `v2-1-review` §5). |
+| 4 | Delete `system-design.md` | **REJECT** | It is an immutable v0.1 origin record retained by the historical anchors in `v2-1-review.md` §§5 and 8; the review says to keep it immutable. |
+| 5 | Delete fixtures/use `-c` injection | **PARTIAL** | `fake_worker.py` remains fixture-only; `crash_worker.py` is needed for T3 crash/recovery proof and real reset between generations (`tests/fixtures/crash_worker.py`; `tests/scenarios/test_supervisor_fanout.py`). |
+| 6 | Trim generation/monotonic/ts from worker envelope | **PARTIAL** | Supervisor stamps authoritative `ts`/`monotonic_ms`, store reserves `seq`; generation remains fencing data and request ID remains correlation (`supervisor.py` emit; `store.py` append; `worker.py`; architecture §§1–2). |
 | 7 | Use `graphlib.TopologicalSorter` | **REJECT** | Hand Kahn provides deterministic order/message control and is covered by 29 tests; correction retained: Python 3.14.7 `CycleError.args[1]` does expose a path (`tasktree.py`; `test_tasktree.py`; DS-M6/I2.2). |
-| 8 | Sandbox is theater; containers at deployment | **ALREADY-IMPLEMENTED (historical disposition; current boundary: PARTIAL)** | D7 removed Septum. An optional `ApprovalGate` primitive exists, but no production approval callback or per-worker OS sandbox exists; worktrees/allowlists are harness controls and containers/microVMs are host-owned D8e (`architecture` §§0,2,4,7.2,18.4; implementation-plan decision 5; feedback-2 D8e). |
-| 9 | cgroups + `wait_for_resources` | **ADOPT-LITE** | `resources.py:CompileGate` and `system_health.py:can_run_heavy` are agent-side gates; `systemd-run` is a deployment note (`v2-1-review` §4 M4; architecture §7.2). |
-| 10 | Global PID pacing | **ADOPT-LITE** | D8f token buckets/pause already exist in the snapshot Diffundo; PID reset-window pacing is a v2.1 enhancement (`diffundo.py`; architecture §§7.4, 9.2; D8f). Addendum later supersedes PID with GCRA F6-04. |
-| 11 | ≤200-token root Core Directive | **ADOPT** | Static prefix segment in Architectus context, before dynamic content (architectus-design §3.1/§3.2; D8c); wiring was a separate task. |
-| 12 | Three gate failures → reset/retry; `evaluate_goal` | **ADOPT-LITE** | Existing reset/clean before respawn and bounded `gate_max_retries`; codify reset once then abort and treat `evaluate_goal` as the existing gate (supervisor `_recover_worktree_locked`; architecture §§7.1, 7.5, 7.9; architectus-design §6). |
-| 13 | Serialized JSON TaskInput fixtures | **ALREADY-IMPLEMENTED** | Frozen train/eval/canary JSONL and timestamps exist without supervisor; mock-git/AST wrapper is DRAFT M8 (`datasets/*`, `meta.json`, `dataset.py`, bench §8). |
-| 14 | DSPy prompts/few-shots + DLQ mining | **ADOPT** | M8 SIMBA refinement may mine corrected DLQ trajectories. The old snapshot said DLQ was merged; current note says DLQ is absent, so this remains plan-level (`dlq.py` then; `v2-1-review` §4 M8; architectus-design §4.2). |
-| 15 | Only lock is Unio merge lock | **PARTIAL** | The narrow Unio publication lock spans verify/publish, but store `threading.Lock` and other synchronization also exist; “only lock” is false. Preserve the merge-publication lock as the intended boundary (`architecture §7.8`; event-schema §3.11; worktree-concurrency; feedback-4 claim 11). |
-| 16 | Batch tool executions | **ALREADY-IN-DESIGN** | Architectus §4.4 proposes speculative `read_file` batching with ≥30% M6 bar; sequential heartbeat loop remains v2. |
-| 17 | Semantic code search `get_signature` | **ALREADY-IMPLEMENTED (snapshot partial wiring)** | `ast_tools.py` has `extract_signature`/references and schemas/dispatch merged, but schema exposure was the remaining task at the original assessment (`ast_tools.py`; `tools.py` 74ff5aa; `schemas.py`; architecture §11). |
-| 18 | Drop upward `unified_diff` | **REJECT** | Keep 64 KiB diff + `diff_truncated`; `include_diff:false` is optional for higher tiers and default-on for evaluator (`feedback-4` claims 7/21; architecture §3.4; architectus-design §3.7; tasktree envelope keys). |
-| 19 | Pre-warmed pool, 3 READY/refill | **ADOPT** | Cold-start measurement ~2.22 s/worker and ~7.0 s/10 versus warm 5.6 ms/39 ms; M7 makes reusable pool the production fan-out gate (`worker-coldstart`; `v2-1-review` §§3D, 4 M7; architecture §14). |
+| 8 | Sandbox is theater; containers at deployment | **ALREADY-IMPLEMENTED (historical disposition; current boundary: PARTIAL)** | D7 removed Septum. An optional `ApprovalGate` primitive exists, but no production approval callback or per-worker OS sandbox exists; worktrees/allowlists are harness controls and containers/microVMs are host-owned D8e (`architecture`, “Per-worker containment and approval”; feedback-2 D8e). |
+| 9 | cgroups + `wait_for_resources` | **ADOPT-LITE** | `resources.py:CompileGate` and `system_health.py:can_run_heavy` are agent-side gates; `systemd-run` is a deployment note (`v2-1-review` §4 M4; architecture §3, per-worker containment and approval). |
+| 10 | Global PID pacing | **ADOPT-LITE** | D8f token buckets/pause already exist in the snapshot Diffundo; PID reset-window pacing is a v2.1 enhancement (`diffundo.py`; architecture §1, worker and providers; D8f). Addendum later supersedes PID with GCRA F6-04. |
+| 11 | ≤200-token root Core Directive | **ADOPT** | Static prefix segment in Architectus context, before dynamic content (architectus-design §3; D8c); wiring was a separate task. |
+| 12 | Three gate failures → reset/retry; `evaluate_goal` | **ADOPT-LITE** | Existing reset/clean before respawn and bounded `gate_max_retries`; codify reset once then abort and treat `evaluate_goal` as the existing gate (supervisor `_recover_worktree_locked`; architecture §§1 and 4; architectus-design §6). |
+| 13 | Serialized JSON TaskInput fixtures | **ALREADY-IMPLEMENTED** | Frozen train/eval/canary JSONL and timestamps exist without supervisor; mock-git/AST wrapper is DRAFT M8 (`datasets/*`, `meta.json`, `dataset.py`, bench-harness-design §7 and Appendix D). |
+| 14 | DSPy prompts/few-shots + DLQ mining | **ADOPT** | M8 SIMBA refinement may mine corrected DLQ trajectories. The old snapshot said DLQ was merged; current note says DLQ is absent, so this remains plan-level (`dlq.py` then; `v2-1-review` §4 M8; architectus-design §4). |
+| 15 | Only lock is Unio merge lock | **PARTIAL** | The narrow Unio publication lock spans verify/publish, but store `threading.Lock` and other synchronization also exist; “only lock” is false. Preserve the merge-publication lock as the intended boundary (architecture §2, ownership and invariants; event-schema §3, ordering/durability/liveness; worktree-concurrency; feedback-4 claim 11). |
+| 16 | Batch tool executions | **ALREADY-IN-DESIGN** | Architectus §4 (speculative-read proposal) proposes bounded `read_file` batching with a ≥30% M6 bar; sequential heartbeat loop remains v2. |
+| 17 | Semantic code search `get_signature` | **ALREADY-IMPLEMENTED (snapshot partial wiring)** | `ast_tools.py` has `extract_signature`/references and schemas/dispatch merged, but schema exposure was the remaining task at the original assessment (`ast_tools.py`; `tools.py` 74ff5aa; `schemas.py`). |
+| 18 | Drop upward `unified_diff` | **REJECT** | Keep 64 KiB diff + `diff_truncated`; `include_diff:false` is optional for higher tiers and default-on for evaluator (`feedback-4` claims 7/21; architecture §3, target contracts; architectus-design §3.2; tasktree envelope keys). |
+| 19 | Pre-warmed pool, 3 READY/refill | **ADOPT** | Cold-start measurement ~2.22 s/worker and ~7.0 s/10 versus warm 5.6 ms/39 ms; M7 makes reusable pool the production fan-out gate (`worker-coldstart`; `v2-1-review` §§3D, 4 M7; architecture §3, target contracts). |
 
 **Counts:** REJECT 4 (2,4,7,18) · ADOPT 4 (1,11,14,19) · ADOPT-LITE 3 (9,10,12) ·
 ALREADY-IMPLEMENTED 3 (8,13,17) · ALREADY-PLANNED 1 (3) · ALREADY-IN-DESIGN 1 (16) ·
@@ -59,7 +60,7 @@ claim 15 is partial because the merge-publication lock is not the only synchroni
 ## 2. Plan consequences
 
 Retained follow-ups: FD-3 M2 transport; Core Directive/static-prefix lint; reset/retry row;
-M8 corrected DLQ demos; M3 deployment cgroups; M7 pool; architecture §6 separate-DB tradeoff;
+M8 corrected DLQ demos; M3 deployment cgroups; M7 pool; architecture §1 separate-store runtime;
 graphlib alternative comment (`9b071e0` recorded done); and AST tool schema/dispatch wiring
 (`74ff5aa`, then `6ff9c42`/`b941c81`). No disposition reverts adopted deltas, separate stores,
 historical `system-design.md`, cycle-path Kahn, or default-on diff.
@@ -81,12 +82,13 @@ historical §§1–3 text and changes only these items:
 
 - **F5-10:** PID pacing is superseded/rejected by feedback-6 F6-04: adopt session-global
   GCRA-style pacing (`max_in_flight`, 60/rpm, per-retry permits; verified `Retry-After` only),
-  reject knapsack/PID. `implementation-plan.md:41` recorded it OPEN and not implemented.
+  reject knapsack/PID. The `implementation-plan.md` section **Provider usage, prompt stability,
+  and quota contract** recorded it OPEN and not implemented.
 - **F5-17:** `get_signature` is wired: `schemas.py` `TOOL_SCHEMAS` lines 120/166–184,
   `tools.py` `TOOL_DISPATCH` line 680/685, validation in `run_tool`; commits `6ff9c42` and
   `b941c81` are ancestors. F6-12 remains PARTIAL for other AST functions.
-- **F5-18:** `include_diff` note landed in architecture §3.4 via `16e61cf`/`66e5a16`, and
-  `glossary.md:43` records it.
+- **F5-18:** `include_diff` note landed in the target-contract portion of architecture §3 via `16e61cf`/`66e5a16`, and
+  the `include_diff` term in `docs/research/glossary.md` records it.
 - **Follow-ups:** Core Directive and reset/retry rows are codified in `architectus-design.md`
   and `architectus.py` via `8dd1aee`; supervisor wiring remains OPEN.
 
@@ -107,7 +109,8 @@ showed `pass_fds=()` and is therefore historical evidence of work remaining, not
 The one-DB proposal was rejected for causal reasons. Events are append-only durable facts used by
 replay (`replay-restart-design.md` §2.1); conversations and blackboard are rebuildable,
 query-heavy projections. Separate single-writer databases avoid contention and do not promise
-cross-store atomicity. This preserves architecture §6.1/§6.6 and `v2-1-review` §3C. The
+cross-store atomicity. This preserves the current architecture's store boundary in §1 and
+`v2-1-review` §3C. The
 canonicalization plan's deletion of `events.py`/`orchestrator.py` is already planned, but the
 historical audit retains both until the M1 cleanliness gate.
 
@@ -141,7 +144,7 @@ state machine, but supervisor wiring remained open.
 
 Frozen JSONL fixtures are safe for an eval-only cache because `eval_frozen_at` and
 `canary_frozen_at` make prompts/data immutable; D1's production no-cache remains intact. The
-mock-git environment and AST-assert scoring in `bench-harness-design.md` §8 are DRAFT, so only
+mock-git environment and AST-assert scoring in `bench-harness-design.md` §7 and Appendix D are DRAFT, so only
 the fixture half is “implemented.” The snapshot's DLQ claim came from a branch that described a
 bounded redacted queue; the current pointer explicitly says DLQ is absent, so D8/M8 DLQ mining
 is plan-level rather than a current security control.
