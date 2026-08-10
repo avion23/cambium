@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from cambium import supervisor as supervisor_module
 from cambium.merge import MergeSequencer
 from cambium.store import EventStore
@@ -168,6 +170,48 @@ def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
     committed = _kinds(events, "merge_committed")
     assert len(committed) == 1
     assert committed[0]["payload"]["new"] == main_tip
+
+
+def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, "t-external-cancel", worktree="wt-external-cancel",
+                branch="wt-external-cancel", target_file="a.txt", marker="// must-not-merge",
+                gate="grep -q '// must-not-merge' a.txt",
+            )
+        ]
+    }
+    observer_started = asyncio.Event()
+
+    async def suspend_on_result(event: dict) -> None:
+        if event["kind"] != "result":
+            return
+        observer_started.set()
+        await asyncio.Event().wait()
+
+    async def cancel_plan() -> None:
+        task = asyncio.create_task(run_plan(session_dir, plan, on_event=suspend_on_result))
+        await asyncio.wait_for(observer_started.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+    asyncio.run(cancel_plan())
+    events = read_events(session_dir)
+    main_tip = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert main_tip == base
+    assert not _kinds(events, "gate")
+    assert not _kinds(events, "merge_committed")
+    assert _kinds(events, "session_ended")[-1]["payload"]["session_status"] == "cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +554,50 @@ def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(tmp_pat
     assert len(reconciled) == 1
     assert reconciled[0]["task_id"] == task_id
     assert reconciled[0]["payload"]["new"] == staged
+
+
+def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-reconcile-observer-failure"
+    worker_tree = session_dir / "wt-reconcile-observer-failure"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-reconcile-observer-failure",
+         str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-reconcile-observer-failure", "main")
+    seq.publish_merge(repo, staged, base)
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-reconcile-observer-failure",
+                branch="wt-reconcile-observer-failure", target_file="a.txt",
+                marker="// must-not-run", gate="grep -q '// must-not-run' a.txt",
+            )
+        ]
+    }
+
+    def fail_on_reconciliation(event: dict) -> None:
+        if event["kind"] == "merge_reconciled":
+            raise RuntimeError("merge_reconciled observer failed")
+
+    with pytest.raises(RuntimeError, match="merge_reconciled observer failed"):
+        asyncio.run(run_plan(session_dir, plan, on_event=fail_on_reconciliation))
+
+    events = read_events(session_dir)
+    assert _kinds(events, "merge_reconciled")
+    assert not _kinds(events, "spawned")
 
 
 def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
