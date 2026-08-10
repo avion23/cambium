@@ -468,3 +468,95 @@ def test_step_back_reset_rerun_and_replayed_second_failure_abort() -> None:
     ]
     assert core.in_flight == set()
     assert asyncio.run(core.step([])) == []
+
+
+def test_failure_batch_processes_every_exhausted_gate() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("a", "TEST", ["root"], None),
+                ("b", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [
+                [{"action": "spawn", "task_id": "root"}],
+                [
+                    {"action": "spawn", "task_id": "a"},
+                    {"action": "spawn", "task_id": "b"},
+                ],
+            ]
+        ),
+        tree=tree,
+        max_width=2,
+    )
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+    core.aggregate("root", _envelope(None))
+    assert asyncio.run(core.step([])) == [
+        {"action": "spawn", "task_id": "a"},
+        {"action": "spawn", "task_id": "b"},
+    ]
+
+    events = [
+        {
+            "kind": "gate_failed",
+            "task_id": "a",
+            "retries_remaining": 0,
+            "reset_retry_attempted": True,
+        },
+        {
+            "kind": "gate_failed",
+            "task_id": "b",
+            "retries_remaining": 0,
+            "reset_retry_attempted": True,
+        },
+    ]
+    assert asyncio.run(core.step(events)) == [
+        {"action": "abort_subtree", "task_id": "a"},
+        {"action": "abort_subtree", "task_id": "b"},
+    ]
+    assert core.action_history[-2:] == [
+        {"action": "abort_subtree", "task_id": "a"},
+        {"action": "abort_subtree", "task_id": "b"},
+    ]
+    assert core.in_flight == set()
+
+
+def test_repeated_reset_retry_aborts_running_task_and_releases_slot() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [
+                [{"action": "spawn", "task_id": "root"}],
+                [
+                    {"action": "reset_retry", "task_id": "root"},
+                    {"action": "reset_retry", "task_id": "root"},
+                ],
+                [],
+            ]
+        ),
+        tree=tree,
+    )
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+    assert asyncio.run(core.step([])) == [
+        {"action": "reset_retry", "task_id": "root"},
+        {"action": "abort_subtree", "task_id": "root"},
+    ]
+    assert core.action_history[-2:] == [
+        {"action": "reset_retry", "task_id": "root"},
+        {"action": "abort_subtree", "task_id": "root"},
+    ]
+    assert core.in_flight == set()
+
+    assert asyncio.run(core.step([])) == []
+    assert core.in_flight == set()

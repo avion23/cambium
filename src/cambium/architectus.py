@@ -357,10 +357,11 @@ class ArchitectusCore:
         if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
             raise TypeError("events must be a list of dictionaries")
 
-        failure_action = self._failure_action(events)
-        if failure_action is not None:
-            self._record_action(failure_action)
-            return [copy.deepcopy(failure_action)]
+        failure_actions = self._failure_actions(events)
+        if failure_actions:
+            for action in failure_actions:
+                self._record_action(action)
+            return copy.deepcopy(failure_actions)
 
         blocked = self._blocked_task_ids()
         ready = [
@@ -456,8 +457,9 @@ class ArchitectusCore:
         """Apply the pure failure table without reading core state."""
         return decide_failure(event)
 
-    def _failure_action(self, events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
-        """Route exhausted gate failures through the stateful failure edge."""
+    def _failure_actions(self, events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Route all exhausted gate failures through the stateful failure edge."""
+        actions: list[dict[str, Any]] = []
         for event in events:
             try:
                 decision = decide_failure(event)
@@ -480,11 +482,12 @@ class ArchitectusCore:
                 and not _reset_retry_attempted(fields)
             ):
                 self._reset_retry_tasks.add(task_id)
-                return {"action": ActionKind.RESET_RETRY.value, "task_id": task_id}
+                actions.append({"action": ActionKind.RESET_RETRY.value, "task_id": task_id})
+                continue
 
             self._mark_subtree_failed(task_id)
-            return {"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id}
-        return None
+            actions.append({"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id})
+        return actions
 
     def _mark_subtree_failed(self, task_id: str) -> None:
         """Record an abort and release the failed task's execution slot."""
@@ -534,6 +537,7 @@ class ArchitectusCore:
                             "action": ActionKind.ABORT_SUBTREE.value,
                             "task_id": task_id,
                         }
+                        self._mark_subtree_failed(task_id)
                     else:
                         self._reset_retry_tasks.add(task_id)
                 elif kind is ActionKind.ABORT_SUBTREE:
