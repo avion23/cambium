@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import fields, replace
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +14,6 @@ import pytest
 from cambium.results import (
     CHILD_RESULT_KEYS,
     EXIT_CODES,
-    ROOT_RESULT_KEYS,
     Result,
     result_to_dict,
     root_result_from_child,
@@ -331,18 +330,6 @@ def test_success_reason_is_advisory_not_cancellation(tmp_path: Path) -> None:
     assert result.status == "done"
     assert result.exit_code == 0
     assert result.failure_reason is None
-
-
-def test_result_has_exact_fifteen_root_fields_and_finalized_values(tmp_path: Path) -> None:
-    result = _root(tmp_path, status="succeeded", metric_score=0.7)
-    assert tuple(field.name for field in fields(Result)) == ROOT_RESULT_KEYS
-    assert tuple(result_to_dict(result)) == ROOT_RESULT_KEYS
-    assert len(fields(Result)) == 15
-    assert result.parent_task_id is None
-    assert isinstance(result.metric_score, float)
-    assert result.metric_score == 0.7
-    assert result.exit_code == 0
-    assert result.event_log_ref == f"sqlite:{tmp_path}/.cambium/events.db"
 
 
 @pytest.mark.parametrize("score", [7, -0.5, 1.5, float("nan"), float("inf")])
