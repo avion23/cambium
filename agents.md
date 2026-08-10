@@ -20,8 +20,8 @@ Trace callers and tests; a failed name search is not proof of absence.
 ### Current truth
 
 Current code is a deterministic Python harness. `src/cambium/__init__.py` exports only `__version__`; no public `Cambium`/`Session`/`Result` API exists.
-`worker.do_work` is a deterministic marker/commit seed; no DSPy ReAct loop is present.
-There is no example eval harness or smoke module in the tracked source; these are targets only. The example module has a module CLI entry point (`python -m cambium.modules.example`).
+`worker.do_work` is a deterministic marker/commit seed in default mode and invokes the Diffundo provider router in provider-fanout mode; no DSPy ReAct loop is present.
+The example module has a split evaluation harness (`modules/example/metric.py`; `__main__.py` `evaluate` operation) and a module CLI entry point (`python -m cambium.modules.example`).
 Custos, Opifex, Nuntius, Surculus, and Unio are architecture target names mapped to current supervisor, worker, ipc, worktree, and merge portions and symbols.
 Matching role modules are not proof. No TUI exists.
 
@@ -43,14 +43,17 @@ Matching role modules are not proof. No TUI exists.
 - Use same-version dataset, canary, schema, and baseline evidence. If the baseline moves, stop and record a new anchor before comparing results; never silently re-anchor.
 - Report VERIFIED only with command, cwd, exit status, and evidence. Use UNVERIFIED for an unrun claim and BLOCKED for an external blocker.
 - Protocol handling is boundary-specific; malformed advisory lines are logged/skipped, while fatal cases are listed under IPC below; model parsing follows the module's bounded failure policy.
-- Use enums for domain alternatives. Cite only `Decision` in `src/cambium/modules/example/decide.py` and `NodeStatus` in `src/cambium/tasktree.py`.
+- Use enums for domain alternatives. Cite enums verified in current source.
+- Regular GIL build is the target; synchronization remains required.
+- `asyncio.Queue` is loop-local; cross-thread handoff uses thread-safe primitives; external ingress is bounded.
+- Finite subprocess waits are deadline-bound; long-lived workers use lifecycle budgets.
 
-Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a fail-closed environment allowlist. Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
+Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a fail-closed environment allowlist; worker message queues and the supervisor event queue are unbounded `asyncio.Queue`s (`supervisor.py`). Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
 
 `supervisor.run_plan` concurrently fans out supplied tasks under one `asyncio.TaskGroup`; `tasktree.py` validates but does not schedule. The architecture DAG is target only.
 Boundary failure policy:
 - `PLAN` (`tasktree.build_tree`): task-tree validation rejects malformed, duplicate, or cyclic plans.
-- `IPC` (`_Runtime._drive_generation`; framing `ipc.read_message`, worker `worker.run`): handling is per-boundary, not universally fail/restart; malformed frames, stale pongs, and oversized lines are fatal at their protocol checks, while duplicate task IDs are rejected by `tasktree.build_tree`. A wrong-request-id `ready` currently only emits a protocol event, so the task may still start. Missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged/skipped.
+- `IPC` (`_Runtime._drive_generation`; framing `ipc.read_message`, worker `worker.run`): handling is per-boundary, not universally fail/restart; malformed frames, stale pongs, and oversized lines are fatal at their protocol checks, while duplicate task IDs are rejected by `tasktree.build_tree`. A wrong-request-id `ready` is fatal: the worker is killed before task dispatch. Missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged/skipped.
 - `GATE` (`_Runtime._run_gate`): a nonzero exit or timeout fails before merge.
 - `MERGE` (`_Runtime._merge_task`): a conflict or non-fast-forward emits `merge_failed`; nothing is published.
 - `APPROVAL` (`ApprovalGate.is_approved` in `src/cambium/approval.py`): approval is fail-closed by default; `fail_open` configuration permits execution without a reviewer — verify configuration. With `fail_open=True`, approval returns true without a callback for a command requiring approval.
@@ -67,11 +70,11 @@ Tools: `src/cambium/schemas.py`, `src/cambium/tools.py` (`TOOL_DISPATCH`), and `
 Decision module: `src/cambium/modules/example/`; harness scenarios are in `tests/scenarios/`.
 Current data is the split `{train,eval,canaries}.jsonl`; combined `example_pairs.jsonl` is legacy fallback only.
 Fallback references: `src/cambium/modules/example/dataset.py:59-77` and the `bench.py` fallback path.
-`pyproject.toml` has `dependencies = []` and no `[dspy]` extra yet; `requires-python` is `>=3.14` with no packaging upper bound.
+`pyproject.toml` requires `pytest>=9` and ships a `[dspy]` extra; `requires-python` is `>=3.14` with no packaging upper bound.
 Architecture's `>=3.14,<3.15` claim is open packaging work, not a fact.
 The docs tree is `docs/architecture/...` and `docs/research/...`.
 Milestone status lives in `docs/research/v2-1-status.md`; re-check it against `main` before relying on it.
-Coding principles pointer: `docs/research/coding-constitution.md`.
+Coding principles pointer: `docs/research/coding-constitution.md` (historical, non-normative).
 
 ## Commands
 
