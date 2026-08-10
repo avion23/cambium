@@ -1,469 +1,382 @@
 # Cambium v2.1 — Context-Compaction Protocol (evidence-backed, never silent)
 
-**STATUS: DRAFT — docs only, not normative.** Design for the v2.1 context-compaction
-protocol for Cambium workers (Opifex). This document proposes the wire message, the store
-semantics, the evidence/verification rules, and the acceptance gates. It is **not**
-authoritative for behavior; the authoritative specification remains
-`docs/architecture/architecture.md`, which this draft must be folded into before
-implementation.
+**Historical snapshot — 2026-08-09.** **DRAFT — docs only, non-normative.** Research
+task `wt-doc-compaction`, worktree `/tmp/opencode/cambium-doc-compaction`, base
+`main@6109a6a`. It proposes a worker protocol and store behavior; final authority is
+[`docs/architecture/architecture.md`](../architecture/architecture.md), source/tests,
+and [`v2-1-status.md`](v2-1-status.md).
 
-**Date:** 2026-08-09
-**Author:** research task `wt-doc-compaction`
-**Worktree:** `/tmp/opencode/cambium-doc-compaction` (branch `wt-doc-compaction`,
-base `main@6109a6a`)
-**Design driver:** the Prime Agent `/refine` + `compact.run()` lesson and the Cambium
-constitution require that **lossy compaction is explicit, evidence-backed, and never
-silent**. OpenCode's hidden lossy LLM compaction is the anti-pattern this design exists
-to avoid (`docs/research/opencode.md` §3.5, §4.8).
+**Current note (not retroactive):** active `supervisor.run_plan` is flat;
+`task_decomposed` remains unsupported; provider cascade is source-defined and honors
+`Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
+approval; DLQ and eval cache are absent.
 
----
+The proposal assumes explicit-tree admission: a validated static DAG selects a child,
+then the child receives a fresh bounded context. Compaction never turns sibling sessions
+into one implicit recursive context; only the strict upward result envelope crosses the
+boundary. Prefix-cache effects remain measurement targets.
 
-## 0. TL;DR
+**Design driver:** lossy compaction must be explicit, evidence-backed, and never silent;
+OpenCode's named context-compaction and safe-provider-turn discussions describe the
+hidden pass rejected here (`docs/research/opencode.md`). History is append-only and never
+deleted.
 
-1. Compaction happens **in the worker's own context**, never the parent's. The summary is
-   a **new node in the conversation store** (append-only, branchable); history is never
-   deleted.
-2. Three triggers: the worker's per-model **token threshold**, an explicit **steer
-   request** from the supervisor, and the supervisor's **checkpoint cadence**.
-3. One new wire message (`compact`, supervisor→worker, added to the IPC catalogue) plus an
-   extended `checkpoint` event carrying a `compact_summary` envelope. `checkpoint` is
-   already a critical (fsync-d) event, so the summary rides the durable path
-   (`architecture.md` §6.5).
-4. Summaries are **evidence-backed**: every claim references a message-id range in the
-   store (machine-checkable), and a deterministic **canary** requires every open question
-   and every TODO file path from the covered range to survive into the summary. A failing
-   canary rejects the compaction and retries with more budget.
-5. Anti-patterns: silent compaction, compaction that deletes history, compaction in the
-   parent's context, compaction without a preceding checkpoint.
-6. The prime-agent "spawned GC agent" is **not adopted** — compaction runs in the worker's
-   own process between turns (verified simpler; see §6).
-7. Falsifiable acceptance: token-reduction threshold met, canary pass rate, and no module
-   metric regression.
+## 1. Boundary and triggers
 
----
+Compaction runs in the worker's own node context, writes a new row to the shared
+`conversations.db`, and never enters a parent context. This follows I2.4 (own bounded
+log + parent summary + subtree envelopes) and I2.7/D8b (child never sends scratchpad,
+CoT, or trajectory upward). The summary is richer than the ≤2k result envelope, so it
+stays node-local. D8g's store is one SQLite WAL with `node_id`, `(node_id, turn_seq)` and
+`(node_id, kind, turn_seq)` indexes; Opifex owns trajectory, turn, generation, and log
+(M5).
 
-## 1. Where compaction happens
+At the snapshot, `src/cambium/conversations.py` was absent (v2-1-review §1.3 gap 11)
+and `worker.py:356-494` was single-shot: no `context`, checkpoint, or store binding.
+These are **UNVERIFIED implementation gaps**, not silently assumed behavior.
 
-**Decision:** compaction operates on the **worker's (Opifex) own context**, and its output
-lives **per node in the conversation store** (`architecture.md` §6.6, D8g). It never
-happens in the parent's context and never feeds the parent's LLM directly.
+Three triggers:
 
-Evidence for the boundary:
+1. **Token threshold (worker advisory):** compact when
+   `contextTokens > contextWindow − reserveTokens`; config carries
+   `reserve_tokens`, `keep_recent_tokens`, and `threshold`. `Custos` still enforces
+   supervisor-owned `init.budget.max_tokens` (D4).
+2. **Steer:** supervisor sends a focus hint (`"keep failing test names"`) to a live
+   NodeSession, mirroring Prime Agent `/compact [instructions]`.
+3. **Checkpoint cadence:** after a configured number of critical checkpoints or before
+   resume into a fresh worker; a checkpoint must precede compaction.
 
-- **I2.4 context composition** — "A node's context = its own session log (bounded) +
-  parent summary + subtree result envelopes. A node never reads a sibling's raw session"
-  (`architecture.md` §3.7 I2.4). The worker's context is the node's own bounded log;
-  compaction is the mechanism that keeps that log bounded without truncating it.
-- **I2.7 / D8b information hiding** — "a child node NEVER sends its scratchpad,
-  chain-of-thought, reasoning trace, or trajectory upward"; the child→parent envelope
-  carries exactly `parent_task_id`, `unified_diff`, `summary` (≤2k chars), `metric_*`,
-  `commits`, `files_changed`, terminal `status` (`architecture.md` §3.7 I2.7;
-  `docs/research/feedback-2-deltas.md` D8b). A compaction summary is richer than a result
-  envelope (it covers the whole bounded span, not just the terminal diff), so it **cannot**
-  ride the upward envelope. It is a node-local durable artifact.
-- **The compaction target is the node's own store.** "the conversation store answers what
-  did *this node* see and decide... per-node conversation/session history in SQLite WAL at
-  `${session_dir}/.cambium/sessions/conversations.db`... Queryable, e.g. `last_turns(node_id,
-  n)`, `cost_by_node`, `context_for(node_id)` returning the bounded D2 I2.4 context"
-  (`architecture.md` §6.6). The summary node is written there under the node's `node_id`.
-- **One shared store** — `conversations.db` with `node_id` on every row and indexes for
-  `(node_id, turn_seq)` and `(node_id, kind, turn_seq)` (`docs/research/v2-1-review.md` §C,
-  decision C). The summary node is one more row kind; it does not get a separate database.
-- **Opifex already owns the node session state** — module M5 (Opifex) state: "Per-node:
-  trajectory, turn counter, generation token, session log" (`architecture.md` §4 M5).
-  Compaction is an Opifex-side concern over that state.
+Every decision records threshold, used, and freed tokens in the critical checkpoint;
+there is no silent background action.
 
-**Current-state gap (UNVERIFIED / not present).** Two dependencies do not exist in the
-merged tree at this design's base:
+## 2. Wire message and safe boundary
 
-- `src/cambium/conversations.py` does **not exist** in `src/cambium/` (verified by
-  directory listing, 2026-08-09) — "There is no conversation store. The architecture
-  decisively specifies one shared `conversations.db`... but no `ConversationStore` exists"
-  (`v2-1-review.md` §1.3 gap 11; milestone M5 scope, `v2-1-review.md` §3 M5). The
-  compaction protocol presupposes the D8g store (M5).
-- The merged `src/cambium/worker.py` (Opifex seed) is a single-shot task runner: it handles
-  `init`/`run_task`/`check_health`/`steer`/`cancel`/`shutdown`, emits `result_envelope` +
-  `exit_message`, and then exits; it has **no `context` message handling, no checkpoint
-  emission, and no conversation-store binding** (`src/cambium/worker.py:356-494`, module
-  docstring "One worker executes one task and then exits"). Compaction targets the
-  M6/M7-era DSPy ReAct worker with per-tool checkpoints (`v2-1-review.md` M5/M6/M7), not
-  today's fixture worker.
-
----
-
-## 2. Triggers
-
-Three triggers, two initiators.
-
-### 2.1 Token threshold (worker-initiated, per-model context window, config)
-
-- The worker estimates its **model-visible context** from provider usage telemetry returned
-  by `Diffundo`/`CambiumLM` call metadata (`architecture.md` §9.3 — every DSPy call flows
-  through `CambiumLM(diffundo, tier=...)`; usage is recorded, not cached). The model's
-  context window is config data the worker already receives via `init.fanout_config`
-  (provider capabilities, incl. `min_context_window` in the cascade selection filter,
-  `architecture.md` §9.2 step 2).
-- **Threshold formula (borrowed from prime-agent, verified):** auto-compact when
-  `contextTokens > contextWindow − reserveTokens`, where `reserveTokens` reserves room for
-  the model's response (prime-agent 0.7.1: `docs/compaction.md` "When It Triggers";
-  defaults `reserveTokens 16384`, `keepRecentTokens 20000` in `settings.json`). Cambium
-  carries both as config under `worker.compaction` (`reserve_tokens`, `keep_recent_tokens`,
-  `threshold` as a fraction of the window).
-- **Supervisor owns the budget.** `max_tokens` is "carried in `init.budget` and enforced by
-  `Custos` — never self-reported by the worker" (`architecture.md` §7.4, D4). The worker's
-  threshold detection is therefore **advisory**: it requests compaction; `Custos` still
-  hard-enforces `budget.max_tokens`. Compaction reduces context; it is not the budget
-  enforcer.
-- **Observability.** "omp logs every compaction decision (threshold, used, freed)" is a
-  lesson to adopt (`docs/research/omp.md` §4 lesson 5). Every Cambium compaction decision —
-  threshold observed, tokens used, tokens freed — is a `checkpoint` event with
-  `compact_summary` (§3), i.e. durable and auditable, never a silent background action.
-
-### 2.2 Explicit steer request (supervisor-initiated)
-
-- The parent may direct a live NodeSession with repeatable `steer` turns routed by `Custos`
-  (`architecture.md` §5.2 `steer`, D3). Compaction-on-steer is the same channel with a
-  focus hint: the supervisor sends `compact` with `instructions` (e.g. "keep the failing
-  test names and the migration checklist"), mirroring prime-agent's `/compact [instructions]`
-  and `compact.run(instructions)` (prime-agent 0.7.1: `docs/compaction.md` "You can also
-  trigger manually with /compact [instructions]"; `skills/compact/src/compact/__init__.py`
-  `run(instructions=None)`). Instructions are persisted on the summary node and shown in
-  the store.
-
-### 2.3 Supervisor checkpoint cadence (supervisor-initiated, defensive)
-
-- Workers emit `checkpoint` after every tool call that produces or modifies durable state
-  (`architecture.md` §6.4); `checkpoint` is a **critical** event, fsync-d before ack
-  (`architecture.md` §6.5). The supervisor may request compaction defensively:
-  - every `compaction.checkpoint_interval` checkpoints since the last compaction, and/or
-  - before re-injecting a long session into a fresh worker (session resume D3,
-    `architecture.md` §6.4 "checkpoint semantics extend to session resume"; pool-reset M7,
-    `v2-1-review.md` §3 M7), so the resumed worker starts from a compact summary rather
-    than a full replay.
-- Rationale: the checkpoint stream is the supervisor's ground truth for "how far has this
-  node run"; it is also the durability point the compaction rides on (§3, §5), so tying the
-  trigger to the cadence makes "compaction without a checkpoint first" structurally
-  impossible.
-
----
-
-## 3. Protocol
-
-### 3.1 New wire message: `compact` (supervisor → worker)
-
-**Addition to the IPC catalogue.** The draft catalogue defines request messages `init`,
-`context`, `run_task`, `check_health`, `cancel`, `shutdown`
-(`docs/research/ipc-protocol-draft.md` §2.2). This design **adds `compact`** to that
-request class. Per the versioning rule, adding a new request is an additive change,
-backward-compatible within a `proto` (`ipc-protocol-draft.md` §5: "Additive changes (new
-optional field, new event type) are backward-compatible within a `proto`"); the catalogue
-count in §2.2 ("6 orchestrator→worker request types") becomes 7 and must be updated on
-adoption.
+Add request `compact` to `ipc-protocol-draft.md` §2.1 (the six existing requests are
+`init`, `context`, `run_task`, `check_health`, `cancel`, `shutdown`; adoption makes
+seven). It is additive within `proto` (§5), carries a ULID `request_id`, and responds
+`ok` with the same ID:
 
 ```jsonc
-// Supervisor → Worker (request class, §2.1: carries request_id, expects a response)
-{"type":"compact",
- "request_id":"01J…",                    // ULID; echoed in the ok response
- "reason":"token_threshold"|"steer"|"checkpoint_cadence"|"supervisor",
- "instructions":"optional focus hint",   // steer-style, like /compact <instructions>
- "max_summary_tokens":2000,              // budget for the summarization LLM call
- "reserve_tokens":16384,                 // response headroom (see §2.1)
- "keep_recent_tokens":20000}             // newest tokens NOT summarized
+{"type":"compact","request_id":"01J…",
+ "reason":"token_threshold|steer|checkpoint_cadence|supervisor",
+ "instructions":"optional focus hint","max_summary_tokens":2000,
+ "reserve_tokens":16384,"keep_recent_tokens":20000}
 ```
 
-- Response: `ok` echoing `request_id` (response envelope, `ipc-protocol-draft.md` §2.1).
-  The supervisor must not send a second `compact` while one is pending (`PROTO_OUT_OF_ORDER`
-  guard, `ipc-protocol-draft.md` §4.1).
-- Error path: `error` with `error_type:"compaction_canary_failed"`, `recoverable:true`
-  (worker error taxonomy, `ipc-protocol-draft.md` §4.2) — the summary was rejected by the
-  canary and retried; see §4.
-- **No checkpoint request:** the worker does not need permission to compact. `compact` is a
-  request, not a mandatory protocol step; the worker may also self-trigger on §2.1 and
-  report via the same `checkpoint` envelope. The `request_id` correlates the `ok`; the
-  resulting `checkpoint`/`compact_summary` is the durable record (matching the `run_task` →
-  `result_envelope` event-not-response pattern, `ipc-protocol-draft.md` §2.1 "run_task
-  completes with a result_envelope event, not a response").
+Only one compact may be pending (`PROTO_OUT_OF_ORDER`). A rejected summary returns
+`error_type="compaction_canary_failed"`, `recoverable=true`; retry exhaustion is a
+durable error. The worker may self-trigger; the resulting `checkpoint` carries the
+summary, just as `run_task` completes via `result_envelope` event rather than response.
 
-### 3.2 When it runs: safe boundary between turns
+Run only between provider turns: never mid-tool or mid-LLM call. Pause the ReAct loop,
+summarize, write checkpoint, then resume. This mirrors Prime Agent's turn-end
+`compact.run()` in Prime Agent's **4. Relevant lessons for Cambium** section and
+OpenCode's **4.8 Compaction and checkpointing** boundary. The adopted alternative is
+**in-process** compaction; the proposed spawned “GC agent” is rejected: it would copy
+raw history across I2.7, add a process/lifecycle class, and worsen the Prime Agent OOM
+case (`docs/research/prime-agent.md`, **4. Relevant lessons for Cambium**). In-process work blocks the worker but stays
+within `max_summary_tokens` and supervisor wall budget.
 
-- Compaction runs at a **safe provider-turn boundary** — never mid-tool, never mid-LLM
-  call. Prime-agent enforces the same rule: "Compaction never runs mid-cell: it runs when
-  the current turn ends" (`skills/compact/src/compact/__init__.py`); opencode admits
-  context changes "only at a Safe Provider-Turn Boundary" (`docs/research/opencode.md` §1,
-  quoting its `CONTEXT.md`). The worker pauses its ReAct loop, performs the summary, emits
-  the `checkpoint` + `compact_summary`, and resumes with the compacted context.
-- **Static prefix stays byte-stable (D8c).** Compaction summarizes the **dynamic bottom** of
-  the prompt (task spec, observations, tool results); the static top (system prompt,
-  AGENTS.md-derived guidelines, tool definitions, module instructions, few-shot context)
-  is untouched, preserving the exact-prefix provider-cache scheme
-  (`architecture.md` §9.3 D8c "static, byte-stable content at the TOP"). This is the
-  compatible half of opencode's context-epoch idea (stable prefix, `opencode.md` §1, §4.5);
-  what we reject is opencode's hidden/lossy summary (§5).
+## 3. Summary envelope and canary
 
-### 3.3 The result: `checkpoint` event with a `compact_summary` envelope
-
-The compaction outcome is delivered on the **existing** `checkpoint` event (already in the
-catalogue: "`checkpoint` | Durable resume point | `turn`, `state_ref` (atomic write),
-`commits_so_far`", `ipc-protocol-draft.md` §2.4; `architecture.md` §5.2, §6.4). Adding a
-payload field to an existing event is additive (`ipc-protocol-draft.md` §5). A
-`checkpoint` **without** `compact_summary` is the ordinary (non-compaction) checkpoint.
+The `checkpoint` payload extension is:
 
 ```jsonc
-{"type":"checkpoint",
- "task_id":"wt-abc-001",
- "generation":3,
- "turn":12,
- "state_ref":"…/checkpoints/wt-abc-001/turn-012.json",   // written BEFORE emit (§5)
- "commits_so_far":["a1b2c3d"],
- "compact_summary":{
-   "summary":"## Goal …\n## Constraints …\n## Progress (Done/In Progress/Blocked)\n## Key Decisions …\n## Next Steps …",
-   "covers":{"from_msg_id":"wt-abc-001#42","to_msg_id":"wt-abc-001#77"},
-   "claims":[{"claim":"kalman_fusion ported from main","refs":["wt-abc-001#44-49"]},
-             {"claim":"cascade fallback verified","refs":["wt-abc-001#51"]}],
-   "open_questions":["does the fusion gate run under cargo test?"],
-   "todo_paths":["src/fusion.rs","tests/fusion_gate.rs"],
-   "tokens_before":41200,"tokens_after":1100,
-   "canary":{"pass":true,"checked":{"questions":1,"paths":2},"missing":[]}}}
+{"compact_summary":{"summary":"…","covered_from":"msg-id",
+ "covered_to":"msg-id","claims":[{"text":"…","evidence":["msg-id"]}],
+ "open_questions":["…"],"todo_paths":["src/x.py"],
+ "tokens_before":12345,"tokens_after":4567,
+ "canary":{"pass":true,"missing_claims":[],"missing_todos":[]},
+ "instructions":"…"}}
 ```
 
-- **Structured, not raw conversation.** The envelope carries `summary` + explicit
-  `open_questions` + `todo_paths` + claim references — decisions made, files touched, open
-  questions — never the raw transcript, matching the prime-agent compaction carry-forward
-  ("goal/constraints/progress/blocked/decisions", `docs/research/prime-agent.md` §2.5,
-  §4.6) and the I2.7 envelope rule (`architecture.md` §3.7).
-- **Summary format** follows the prime-agent verified template: `## Goal`, `## Constraints
-  & Preferences`, `## Progress` (`Done`/`In Progress`/`Blocked`), `## Key Decisions`,
-  `## Next Steps` (prime-agent 0.7.1: `docs/compaction.md` "Summary Format").
-- **`tokens_before`/`tokens_after`** mirror prime-agent's `tokensBefore` recorded on its
-  `CompactionEntry` (prime-agent 0.7.1: `docs/session-format.md` — `CompactionEntry` with
-  `tokensBefore`). They are the store-derived inputs to the acceptance gate (§7).
+`covered_from/to` are message IDs, each claim names a message-id range, and the
+deterministic canary requires every open question and TODO path from that range to
+survive. A failure rejects the summary and retries with a larger budget; no history is
+deleted. Store writes add the node row; the critical checkpoint/event is the replay
+anchor. The exact token column is **UNVERIFIED** (D8g does not define one).
 
-### 3.4 Store semantics: compaction ADDS, never deletes
+Anti-patterns: silent compaction; deletion; parent-context compaction; compaction before
+checkpoint; upward scratchpad leakage. `compact_summary` does not refresh a parent
+summary; only the fixed result envelope does.
 
-- **Append-only, branchable summary node.** The store stays append-only
-  (`architecture.md` §6.6; D2 "Each node owns its conversation/session log... append-only",
-  `docs/research/design-deltas.md` D2). Compaction writes a new row (kind `compact_summary`)
-  whose `parent_id` points at the last covered message (`covers.to_msg_id`) and whose
-  `covers.from_msg_id` points at the previous summary node (or session start). New turns
-  attach **after** the summary node. The full covered history remains queryable under the
-  same `node_id`.
-- **Direct precedent (verified):** prime-agent stores compaction as an entry in the
-  append-only session tree with `id`/`parentId`/`firstKeptEntryId`/`tokensBefore`
-  (`docs/session-format.md` `CompactionEntry`); "/tree — Navigate the session tree in-place.
-  Select any previous point, continue from there, and switch between branches. All history
-  preserved in a single file" (prime-agent 0.7.1 `README.md` §/tree); "Compaction is lossy.
-  The full history remains in the JSONL file; use `/tree` to revisit" (`README.md`
-  §Compaction). Cambium's equivalent of `/tree` is store querying: `context_for(node_id)`,
-  `last_turns(node_id, n)` over the full range
-  (`architecture.md` §6.6; `v2-1-review.md` §C).
-- **What the LLM sees vs what the store keeps.** After compaction the worker's *model
-  context* is `summary + messages from covers.to_msg_id onwards` (prime-agent's
-  reload semantics: summary + kept messages, `docs/compaction.md` "What the LLM sees"). The
-  *store* keeps everything. The distinction between model-visible context and durable
-  history is the whole point of §5's "never deletes" rule.
-- **Downward/upward direction.** The `compact_summary` is a node-local record written by
-  the worker and persisted by `Custos` into `conversations.db` and the event log. It is
-  **never** forwarded to the parent LLM (§1, I2.7). It exists so the node can resume
-  (D3 session resume, `architecture.md` §6.4) and so the store can answer "what did this
-  node decide" without replaying the raw span.
+## 4. Falsifiable acceptance
 
----
+1. Mean `(tokens_before−tokens_after)/tokens_before` meets a frozen threshold (proposal
+   ≥60%, every sample above floor), measured from store rows.
+2. Canary pass rate is 100% after retries; no accepted record has `canary.pass=false`.
+3. Paired held-out eval with/without compaction has no more than −1 point metric delta
+   (M9 posture; `should_decompose_metric` or Opifex metric).
+4. Record scenario count, commit SHA, pinned model, threshold, and retry config (M1).
 
-## 4. Evidence-backed summaries and the compaction-quality canary
+## 5. Open questions (retained IDs)
 
-A model-produced summary is not trustworthy by default. Two layers make it verifiable.
+| ID | Question / historical default |
+|---|---|
+| Q1 | Worker trigger versus supervisor token authority; worker triggers, Custos enforces. |
+| Q2 | Event payload, store row, or both; default both, with double-write review (D8g.3). |
+| Q3 | Cascade windows differ; default smallest eligible window. |
+| Q4 | Canary exhaustion fail-open (uncompacted, durable error) versus fail-closed task failure; default fail-open. |
+| Q5 | Summary call not a ReAct turn but consumes token/wall budget and cost. |
+| Q6 | Compose M9 static tree-sitter context and dynamic compaction in disjoint regions (D8c). |
+| Q7 | Never refresh parent summary. |
+| Q8 | Add usage metadata or deterministic estimator for token accounting. |
 
-### 4.1 Machine-checkable claim references
+## 6. Verification and adoption record
 
-Every claim in `compact_summary.claims[]` carries `refs`: message-id ranges (`[from,to]`
-store rows) that the claim is drawn from. The verifier (deterministic, in `Custos`/
-`ConversationStore`, never an LLM) checks each `refs` range exists and lies inside
-`covers`, via the store's indexed `(node_id, turn_seq)` queries (`v2-1-review.md` §C).
-A claim whose refs do not resolve is a **malformed summary** → rejected. This makes
-"each claim references a message id range in the store (machine-checkable)" concrete:
-the store is the authority for both the covered range and the claim references.
+Verified sources at the snapshot: I2.4/I2.7 (`architecture.md` §3.7), D8b/D8g,
+M5/M6/M7, supervisor-owned D4 budgets (§7.4), provider capability filtering (§9.2),
+IPC catalogue §2.1–2.2 and error taxonomy §4.1–4.2, checkpoint durability §6.4–6.5,
+canary metric gate §10/D5, Prime Agent `docs/compaction.md` (formula, defaults,
+carry-forward `CompactionEntry`), `README.md` (history preserved), and
+`skills/compact/src/compact/__init__.py` (host request, turn boundary). **UNVERIFIED:**
+the claimed spawned GC agent, a store token column, and absent `ConversationStore`/
+worker wiring at this base.
 
-### 4.2 Compaction-quality canary (extractable, deterministic)
+On adoption, update `ipc-protocol-draft.md` §2.1 and §5, architecture §5.2/§6.4/§6.6,
+`src/cambium/ipc.py`, worker wire loop, new `conversations.py`, Custos cadence/metering,
+and tests. This list records future work, not a current implementation claim.
 
-The canary is a **coverage** assertion, computed entirely with regex over the covered
-range's stored payloads:
+## Appendix A — retained protocol detail
 
-- **Open questions:** extract candidate open-question sentences from the covered rows with
-  a regex over sentence text, e.g.
-  `(?i)\b(open question|blocked on|blocked by|unresolved|uncertain|to be decided|tbd|need(?:s|ed)? to (?:decide|verify|check|confirm)|unknown if|does not (?:work|compile|pass))\b`,
-  plus any sentence ending in `?` within a tool/steer/result payload.
-- **TODO file paths:** extract paths adjacent to TODO markers with
-  `(?i)\b(todo|fixme|xxx|hack)\b[^\n]*?((?:[\w.-]+/)*[\w.-]+\.(?:py|rs|ts|js|go|toml|json|yaml|md|sh|sql)\b|/(?:[\w.-]+/)+[\w.-]+)`,
-  normalized (lowercase, no trailing punctuation).
-- **Assertion:** every extracted question (normalized) must appear in
-  `compact_summary.open_questions` or in `summary`; every extracted path must appear in
-  `compact_summary.todo_paths` or in `summary` (substring match on the normalized path).
-  This is set equality, fully deterministic, runnable as a pure function over the store
-  rows + the envelope — no model in the loop.
-- **Failure:** `canary.pass == false` → the compaction is **rejected**: the summary node
-  is not committed as the active boundary (the worker keeps its current context), and the
-  compaction is **retried with more budget** (`max_summary_tokens` increased per retry,
-  bounded by `compaction.max_retries` and `compaction.max_summary_tokens`). The rejection
-  is itself a durable `error`/`checkpoint` record — a rejected compaction is never silent.
+The summary node was designed as an append-only conversation row with `node_id`, a
+`parent_id` pointing at the last covered message, `first_kept_entry_id`, and
+`tokens_before`. A replay reader could therefore show both the compact summary and the
+full original JSONL/SQLite history; it never rewrote or deleted covered messages. The
+summary template carried Goal, Constraints, Progress, Key Decisions, and Next Steps,
+then machine-checkable `claims[].refs`, `open_questions`, and `todo_paths`.
 
-This mirrors the architecture's canary discipline at the module/metric level: the `canaries`
-signal is a gate that zeroes the whole metric on failure (`architecture.md` §10) and the
-D5 refinement loop rejects any refinement that fails canaries
-(`docs/research/design-deltas.md` D5; `docs/research/test-strategy.md` §8). Compaction is a
-model-produced artifact, so it gets the same brake.
+The compact request reason was intentionally typed. `token_threshold` meant the worker's
+provider usage crossed the reserve formula; `steer` carried a parent focus hint;
+`checkpoint_cadence` was a supervisor defensive request; `supervisor` was an explicit
+host action. `max_summary_tokens` bounded the summarization call, while
+`reserve_tokens` and `keep_recent_tokens` controlled the portion left verbatim. A
+worker could self-trigger at a threshold, but the resulting checkpoint had to use the
+same envelope and canary as a supervisor-triggered request.
 
----
+Safe-boundary sequencing was explicit: finish the current tool; flush its checkpoint;
+queue compaction; pause before the next provider call; summarize; validate claims/TODOs;
+write the critical checkpoint; reload context; then continue. A canary failure never
+silently substituted a shorter summary. Retry budget was bounded; default policy was
+fail-open after exhaustion with a durable `compaction_canary_failed` error, leaving the
+full un-compacted context available.
 
-## 5. Anti-patterns (what this design forbids)
+### A.1 Evidence and data flow
 
-| # | Anti-pattern | Why it is wrong | Cambium rule |
+For covered messages `[first_kept_entry_id, last_covered_entry_id]`, the worker built a
+deterministic evidence set. Every claim named one or more IDs; every open question and
+TODO path was extracted from the covered range and compared to summary arrays. The
+canary returned `missing_claims` and `missing_todos`, not just a boolean, so an operator
+could diagnose a lossy summary. The durable checkpoint included `tokens_before` and
+`tokens_after` even though D8g did not yet define where row-level token estimates came
+from. This accounting gap remained Q8.
+
+Compaction reduced only dynamic node history. M9 tree-sitter compression reduced static
+AST/symbol context. The proposal allowed both adapters in disjoint regions and forbade
+the supervisor from applying either directly; the worker owned context assembly. A child
+summary never refreshed a parent's summary, preserving I2.7 information hiding.
+
+### A.2 Why the spawned-GC alternative was rejected
+
+The rejected alternative gave a separate GC agent the worker's history. It required a
+second process, a second context copy, a second admission/restart state, and a channel
+for raw scratchpad data that I2.7 explicitly forbids. Prime Agent's evidence showed
+context, rather than fixed process overhead, was its OOM driver (`docs/research/prime-agent.md`,
+**4. Relevant lessons for Cambium**), so duplicating the context amplified the risk. In-process summarization blocked
+the worker for one bounded provider call but kept ownership, redaction, generation, and
+checkpoint ordering local.
+
+### A.3 Acceptance run record
+
+Each frozen corpus run was to record scenario count, commit SHA, pinned model/provider,
+`reserve_tokens`, `keep_recent_tokens`, reduction threshold, and retry count. A mean
+reduction target (proposal 60%) was not enough: every sample had to clear its floor, the
+canary rate had to remain 100%, and paired module metrics had to stay within the
+pre-registered −1 point bound. The design specifically rejected accepting a summary that
+passed the canary while failing the reduction threshold or a summary that improved a
+training metric by hiding an open question.
+
+### A.4 Source notes retained
+
+The snapshot also checked Prime Agent `docs/compaction.md` (formula and defaults),
+`docs/session-format.md` (`CompactionEntry` fields), `README.md` (single-file history and
+lossy warning), `skills/compact/src/compact/__init__.py` (`host_request`, no mid-cell),
+OpenCode `CONTEXT.md` safe provider boundary, `feedback-2-deltas.md` D8b/D8g, and
+`test-strategy.md` §5 canary policy. The alleged “spawned GC agent” had no source and
+remained **UNVERIFIED**; it was not rewritten as a fact.
+
+## Appendix E — trigger and store matrix
+
+| Trigger | Initiator | Durable evidence | Safety condition |
 |---|---|---|---|
-| 1 | **Silent compaction** | "Compaction is a lossy LLM pass. When context is full, a hidden `compaction` agent summarizes the session (auto-compaction, optional pruning)... the docs expose only coarse knobs... There is no replay-based durable checkpoint" (`docs/research/opencode.md` §3.5). A model cannot reason well about history it does not know was summarized. | Every compaction is a `checkpoint` event with `compact_summary` (durable, critical tier, §6.5), written to the store; the worker's own context is rebuilt from the summary it can read. Never a hidden pass. |
-| 2 | **Compaction that deletes history** | Prime-agent keeps full history and exposes it via `/tree` ("All history preserved in a single file"; "The full history remains in the JSONL file", prime-agent 0.7.1 `README.md`). Deleting history makes loss unrecoverable and audit impossible. | Store is append-only; compaction adds a summary node with `parent_id` (§3.4). Nothing is ever deleted or pruned by compaction. |
-| 3 | **Compaction in the parent's context** | I2.7/D8b: the parent never sees the child's scratchpad/CoT/trajectory; the upward envelope is the `Result` envelope only (`architecture.md` §3.7 I2.7; `feedback-2-deltas.md` D8b). A compacted child history injected into the parent would both pollute the parent's bounded context (I2.4) and leak the trajectory. | `compact_summary` is a node-local record. The parent receives only result envelopes; steering is the only downward channel (`architecture.md` §5.2 `steer`). |
-| 4 | **Compaction without a checkpoint first** | The checkpoint is the durable resume point; session resume reloads `state_ref` + node session log (`architecture.md` §6.4; D3). Compaction without a durable checkpoint would let a crash after summarization lose the boundary between pre-summary history and post-summary state. | Structurally impossible: the compaction result **is** a `checkpoint` event, and `state_ref` is written before emit (§3.3). |
-| 5 | **Compaction as the durability mechanism** | "Cambium's checkpoint-per-tool-call ReAct recovery is strictly better for crash recovery; use compaction only as a last-resort context reducer, not as the durability mechanism" (`docs/research/opencode.md` §4.8). | Compaction is a context reducer only. Durability stays in checkpoints + the event log; the store rebuilds from durable events if the projection is deleted (`v2-1-review.md` §C). |
-| 6 | **Compaction at an unsafe boundary** | A summary taken mid-tool-call or mid-LLM-response tears the trajectory and the model's self-knowledge (prime-agent: "never mid-cell"; opencode: safe-provider-turn-boundary only — §3.2). | Compaction runs only at a safe boundary between turns (§3.2). |
+| Token threshold | worker | checkpoint `compact_summary` with used/freed tokens | worker advisory; Custos owns max tokens. |
+| Steer | supervisor/parent | request ID on `ok`, instructions in summary | turn boundary; no sibling raw history. |
+| Checkpoint cadence | supervisor | preceding critical checkpoint + compact checkpoint | no compaction before checkpoint. |
+| Resume preparation | supervisor | summary row + state ref | fresh worker receives bounded summary. |
 
----
+The shared row was expected to carry `kind="compact_summary"`, `node_id`, `parent_id`,
+`covered_from`, `covered_to`, and its envelope. The event log carried a redacted audit
+copy; the conversation store carried the node-local `context_for(node_id)` copy. Q2 left
+open whether to reduce this double representation; if both writes remained, each boundary
+kept one owner.
 
-## 6. The GC-agent pattern: evaluation and verdict
+The wire request was not a checkpoint command. A worker could compact on threshold;
+`compact` was a host request with an ACK. Its summary rode the critical checkpoint path,
+like `run_task`'s terminal result event. `PROTO_OUT_OF_ORDER` prevented a second pending
+compact; `recoverable=true` canary errors allowed bounded retry. The worker never received
+permission to delete history.
 
-**The claimed pattern.** The task directive describes prime-agent as doing "asynchronous
-compaction with a spawned GC agent" so the worker continues while compaction runs.
+## Appendix F — falsification and measurement discipline
 
-**What is actually verified (prime-agent 0.7.1, local install):**
+Reduction was measured from the covered store range, not a model's claimed token count.
+The corpus was frozen before comparing thresholds; a moved dataset/model/branch required
+a new anchor. Every sample cleared its floor, not only the mean. Paired module evaluation
+used the same split/provider config with compaction toggled. Canary pass without
+reduction was a config failure; reduction with a canary miss was a compaction failure;
+metric gain with canary regression was rejected as reward hacking.
 
-- `compact.run()` is a kernel-side skill that schedules **host-side** compaction via
-  `rlm.host_request("compact.run", payload)` (`skills/compact/src/compact/__init__.py`);
-  the summary is generated by the session worker itself with an LLM call, **not** by a
-  spawned child agent/process.
-- Compaction is queued/asynchronous relative to the model turn — "Compaction never runs
-  mid-cell: it runs when the current turn ends and before the next model response";
-  `status()` returns `scheduled` for a pending compaction — but it executes in the session
-  worker, and the session **reloads** after it (`docs/compaction.md` "How It Works" step 5
-  "Reload: Session reloads"; `skills/compact/src/compact/__init__.py`).
-- The "spawned GC agent" framing is **UNVERIFIED** against the local install; no doc or
-  code path in the 0.7.1 tree performs compaction in a separate spawned agent.
+No consensus, 90% discount, universally cheap branching, or mandatory MCTS was inferred
+from this protocol. Static prefix caching and latency claims required direct measurement.
+The design only said byte-stable prefixes could be cacheable.
 
-**Evaluation for Cambium.** Cambium's worker is a subprocess over one stdin/stdout pipe
-pair (`architecture.md` §2 worker layer, §5.1); a "GC agent" would be a second process
-holding the worker's history. Rejected for three reasons:
+## Appendix G — compaction failure matrix
 
-1. **Info hiding (decisive).** A spawned compactor would need the worker's raw history to
-   summarize it — which is exactly the scratchpad that must never leave the node (I2.7,
-   D8b). In-process compaction needs no copy and no second context.
-2. **Simplicity.** "compaction happens in the worker's own process between turns" is the
-   directly verified prime-agent model (host-side, turn-end), with zero new wire messages
-   (the result rides the existing `checkpoint`), zero new lifecycle states, and zero pool
-   admission/reset surface (M7 worker-pool reset already requires "empty conversation
-   binding", `v2-1-review.md` §C D).
-3. **Prime-agent's own incident evidence.** Its OOM failures came from one process holding
-   many LLM contexts ("per-runtime LLM context, not fixed overhead" is "the memory
-   driver"; `docs/research/prime-agent.md` §3.1). Spawning an additional summarizer context
-   per compaction worsens exactly that failure class.
-
-**Tradeoff (stated honestly).** In-process compaction **blocks** the worker for the
-duration of the summarization call (bounded by `max_summary_tokens` and the per-task wall
-budget `budget.max_wall_s`, supervisor-owned, `architecture.md` §7.4). A spawned compactor
-would keep the worker turning, but at the cost of duplicating the context, breaching
-I2.7, and adding a process/lifecycle class Cambium does not need. The liveness win does
-not repay the information-hiding loss. **Verdict: adopt the in-process, between-turn
-pattern; adopt the "async" scheduling only as safe-boundary queuing (§3.2), not as process
-spawning.**
-
----
-
-## 7. Falsifiable acceptance
-
-Adoption requires measurable evidence, in the style of the v2.1 review's falsifiable gates
-(M5, M9) and the D5 canary gate.
-
-1. **Token reduction per compaction ≥ threshold (measured from the store).** For each
-   accepted compaction, `tokens_before`/`tokens_after` (recorded on the envelope, §3.3)
-   are derived from the store's covered range and the summary node. Acceptance:
-   mean reduction `(tokens_before − tokens_after)/tokens_before` over a frozen scenario
-   corpus ≥ config threshold (default proposal: ≥ 60%) with every sample above the
-   configured floor. A compaction that passes the canary but not the reduction threshold
-   invalidates the threshold config, not the corpus.
-   - Prerequisite flagged: rows must carry token estimates (stored usage metadata or a
-     deterministic estimator). The current D8g content list ("init/steer/tool_event/
-     checkpoint/result message payloads", `architecture.md` §6.6) does not specify a token
-     column — **UNVERIFIED / open store question** (§8 Q8).
-2. **Summary-canary pass rate.** The §4.2 canary is pure and deterministic; acceptance:
-   **100%** pass over the frozen corpus after budget-retry exhaustion, and zero accepted
-   compactions with `canary.pass == false`. A retry that exhausts `compaction.max_retries`
-   fails the compaction (durable `error` `compaction_canary_failed`), never silently
-   downgrades the summary.
-3. **No regression on the module metric.** On the module's frozen held-out eval
-   (`architecture.md` §17.2; e.g. the multi-signal §10 metric for Opifex, or
-   `should_decompose_metric` in `src/cambium/modules/example/metric.py`), run paired trials
-   with compaction active at threshold vs inactive: metric delta must stay within a
-   pre-registered bound (default: no more than −1 point) and canary pass must remain at
-   baseline. Mirrors M9's "adopt only if ... degradation exceeds the bound → falsified"
-   posture (`v2-1-review.md` §3 M9).
-4. **Evidence discipline.** Every acceptance run records scenario count, commit SHA, pinned
-   model, and the threshold/retry config (`v2-1-review.md` M1 acceptance 3: "scenario count
-   and commit SHA are recorded").
-
----
-
-## 8. Open questions for the orchestrator
-
-| # | Question | Options / default proposal | Owner |
-|---|---|---|---|
-| Q1 | Token accounting authority | Worker self-estimates for the trigger (§2.1) vs supervisor metering of `budget.max_tokens`. Arch §7.4 says budgets are supervisor-owned; the *trigger* is a context-window property, the *enforcement* is the budget. Default: worker triggers, supervisor enforces and can veto. | Custos + Opifex authors |
-| Q2 | Where `compact_summary` is durably recorded | Event log payload (redacted) only, conversation store only, or both. Double-write risk was flagged in Q8g.3 (`feedback-2-deltas.md` D8g). Default: event log (cross-cutting audit, `architecture.md` §6.5 critical tier) + store row (node-local). | event-schema + D8g owners |
-| Q3 | Threshold across a cascade | `init.fanout_config` may name several models of a tier with different context windows (`architecture.md` §9.2); which window does the threshold use? Default: the smallest eligible window, so compaction precedes any truncation. | Diffundo owner |
-| Q4 | Canary retry exhaustion | Fail open (continue uncompacted, supervisor budget still bounds) vs fail closed (task FAILED). Compaction never deletes, so failing open is safe; it only loses token relief. Default: fail open with durable `compaction_canary_failed` error. | Custos owner |
-| Q5 | Does the summarization call count as an LLM turn | `max_turns` is supervisor-owned (§7.4). A compact under steer/token/cadence consumes a summarization call. Default: it does **not** count as a ReAct turn, but it does consume `budget.max_tokens`/wall budget and is metered in `cost_by_node`. | Custos + bench owner |
-| Q6 | Composition with M9 tree-sitter compression | M9 compresses *static* context (AST/symbol chunks); compaction summarizes *dynamic* history. Both are "context adapters, never a supervisor concern" (`v2-1-review.md` M9). Do they compose in one worker? Default: yes, disjoint regions (static vs dynamic, D8c). | M9 research owner |
-| Q7 | Parent summary refresh | May a child `compact_summary` ever refresh the parent's I2.4 "parent summary"? Default: **no** — that is anti-pattern 3; the parent's summary comes only from the ≤2k-char result envelope. | Architectus owner |
-| Q8 | Token column in the store | D8g does not define token accounting per row; §7 gate 1 needs it. Default: store usage metadata on `tool_event`/`checkpoint` rows (redacted), or a deterministic estimator at query time. | D8g / ConversationStore owner |
-
----
-
-## 9. Verification table
-
-Every claim above cites a source. This table is the audit trail; **UNVERIFIED** items are
-flagged inline and repeated here.
-
-| Claim | Source | Status |
+| Failure | Worker behavior | Supervisor/replay behavior |
 |---|---|---|
-| I2.4 node context = own bounded log + parent summary + subtree envelopes; no sibling raw reads | `architecture.md` §3.7 I2.4 | Verified (read §3.7) |
-| I2.7/D8b child never sends scratchpad/CoT/trajectory upward; envelope is fixed | `architecture.md` §3.7 I2.7; `feedback-2-deltas.md` D8b | Verified |
-| Conversation store content and `context_for(node_id)` | `architecture.md` §6.6; `feedback-2-deltas.md` D8g | Verified |
-| One `conversations.db`, `node_id` rows, `(node_id, turn_seq)` indexes | `v2-1-review.md` §C | Verified |
-| Opifex owns per-node trajectory/turn/generation/session log | `architecture.md` §4 M5 | Verified |
-| No `ConversationStore` in merged tree | `v2-1-review.md` §1.3 gap 11, M5; `src/cambium/` directory listing 2026-08-09 | Verified (present = absence) |
-| Worker.py is single-shot, no `context` handling, no checkpoint emission | `src/cambium/worker.py:356-494` + module docstring | Verified (read file) |
-| `max_tokens`/budgets supervisor-owned, never worker self-report | `architecture.md` §7.4 (D4) | Verified |
-| Provider context-window data available to the worker via `fanout_config` | `architecture.md` §9.2 (capability/context filter, `min_context_window`) | Verified |
-| IPC catalogue: 6 request types, request/response/event classes, correlation rule | `ipc-protocol-draft.md` §2.1–2.2 | Verified |
-| `checkpoint` event fields and critical durability | `ipc-protocol-draft.md` §2.4; `architecture.md` §6.4–6.5 | Verified |
-| Proto versioning: additive changes backward-compatible | `ipc-protocol-draft.md` §5 | Verified |
-| `error` taxonomy incl. recoverable, `PROTO_OUT_OF_ORDER` | `ipc-protocol-draft.md` §4.1–4.2 | Verified |
-| OpenCode compaction = hidden lossy LLM pass; no durable replay | `docs/research/opencode.md` §3.5, §4.8 | Verified (research doc + upstream docs URL cited therein) |
-| OpenCode context-epoch / safe-provider-turn-boundary design | `docs/research/opencode.md` §1 | Verified (research doc quotes `CONTEXT.md`) |
-| Prime-agent compaction carry-forward fields | `docs/research/prime-agent.md` §2.5, §4.6 | Verified |
-| Prime-agent OOM: context is the memory driver; one process holds children | `docs/research/prime-agent.md` §3.1 | Verified (local logs cited therein) |
-| `compact.run()` schedules host-side compaction via `host_request`; never mid-cell | prime-agent 0.7.1 install: `skills/compact/src/compact/__init__.py` | Verified (read file this task) |
-| Auto-compaction formula `contextTokens > contextWindow − reserveTokens`; `reserveTokens`/`keepRecentTokens` defaults; summary format; reload after compaction | prime-agent 0.7.1 install: `docs/compaction.md` | Verified (read file this task) |
-| `CompactionEntry` {id, parentId, summary, firstKeptEntryId, tokensBefore} | prime-agent 0.7.1 install: `docs/session-format.md` | Verified (read file this task) |
-| `/tree` in-place tree navigation; "All history preserved in a single file"; "Compaction is lossy. The full history remains in the JSONL file" | prime-agent 0.7.1 install: `README.md` §/tree, §Compaction | Verified (read file this task) |
-| "Spawned GC agent" performs compaction in a separate process | **No source** in prime-agent 0.7.1 install or research corpus | **UNVERIFIED — asserted in the task directive only; contradicted by the verified host-side turn-end model** |
-| Store token accounting per row | `architecture.md` §6.6 content list; D8g | **UNVERIFIED — D8g specifies no token column; open question Q8** |
-| Canary discipline as metric gate | `architecture.md` §10 (`canaries` gate); `design-deltas.md` D5; `test-strategy.md` §8 | Verified |
-| Module held-out eval / metric (Opifex §10; `should_decompose_metric`) | `architecture.md` §17.2; `src/cambium/modules/example/decide.py`, `metric.py` | Verified |
+| Summary call timeout | abort summary before next provider turn | retain prior context; count wall/tokens; no checkpoint replacement. |
+| Missing claim reference | canary returns `missing_claims` | retry with larger summary budget; durable error on exhaustion. |
+| Missing TODO/open question | canary returns `missing_todos` | same retry/fail-open policy; never silently accept. |
+| Token reduction below floor | summary remains valid but threshold fails | mark acceptance sample invalid; keep full history. |
+| Store write failure | worker does not advance compaction cursor | task follows store-failure policy; replay uses previous checkpoint. |
+| Worker crash after summary | critical checkpoint may be durable | restart from checkpoint; summary row and old messages both replay. |
+| Parent asks for raw history | no sibling/session read | return only strict result envelope; I2.7 remains authoritative. |
 
----
+The failure matrix was intended to prevent a generic catch-all (“use the last summary”)
+from hiding causal failures. A summary is useful only when its evidence range is known,
+its canary passes, and its checkpoint is durable. On fail-open exhaustion the worker
+continues with an un-compacted bounded context; this trades token relief for information
+retention and is recorded as `compaction_canary_failed`.
 
-## 10. Files to change on adoption (not this task)
+The proposal also kept a bounded `keep_recent_tokens` tail verbatim. The tail was not a
+second summary and did not change the covered range; it was the explicit freshness window
+for the next provider turn. `reserve_tokens` protected response headroom, while
+`max_summary_tokens` protected the summarizer call. These values were configuration
+inputs, not evidence-backed universal constants.
 
-- `docs/research/ipc-protocol-draft.md` §2.2 — add `compact` to the request catalogue and
-  bump the message count; §7 reconciliation row for the addition.
-- `docs/architecture/architecture.md` §5.2 — `compact` message schema; §6.6 — store row
-  kind `compact_summary`; §6.4 — note the compacted resume path.
-- `src/cambium/ipc.py` / worker wire loop — `compact` handling; `src/cambium/
-  conversations.py` (new, M5) — summary node + canary verifier; Custos — trigger cadence,
-  metering, acceptance logging.
+## Appendix H — conversation-store query contract
+
+The proposed store exposed three pure reads: `last_turns(node_id, n)` for bounded own
+history; `cost_by_node(node_id)` for token/cost accounting; and
+`context_for(node_id)` for composition. Each query was indexed by `node_id` and turn
+sequence. A summary row did not replace the rows it covered, so a reader could inspect
+the full history, the summary, or both. On restart, the worker received a state reference
+and compact summary, not a parent or sibling transcript.
+
+The event log and conversation store had different ownership: Custos persisted protocol
+transcripts and critical event envelopes, while the node worker appended conversation
+turns. The blackboard proposal introduced a third owner only by using a separate
+`shared.db`; it did not put `_shared` rows into `conversations.db`. This one-writer-per-
+database rule was the same DS-C1/DS-M3 discipline used for events.
+
+The compaction request did not alter task-tree admission, sibling routing, or merge
+policy. It was a context adapter at a safe turn boundary. Static context compression
+(M9/tree-sitter) and dynamic history compaction were independent: either could be
+disabled without changing the upward envelope or the validated DAG. Any claimed token
+benefit therefore required paired measurement under the same provider/corpus.
+
+## Appendix I — summary shape and replay canary
+
+The carry-forward summary was a bounded object, not an unconstrained prose answer. It
+recorded goal, constraints, progress, key decisions, next steps, covered message IDs,
+claim evidence, open questions, TODO paths, token counts, and canary result. A reader
+could display the object without opening the raw transcript, while a debugger could
+follow every claim back to its source range. The covered range was immutable after the
+checkpoint; a later turn started a new range rather than extending an old summary in
+place.
+
+The replay canary deleted the in-memory context projection, reopened the store, replayed
+from the last durable checkpoint, and compared the resulting bounded context byte-for-
+byte (apart from timestamps). It then checked that an open question and TODO path from
+the covered range still appeared. A failed comparison blocked adoption of the summary
+format; a provider/model change required a new frozen corpus. This made compaction a
+measured context adapter, not an implicit recursion or universal memory discount.
+
+Source pointers use stable named sections: OpenCode's **4.5 Context-epoch caching** and
+**4.8 Compaction and checkpointing** headings in `docs/research/opencode.md`, and Prime
+Agent's **4. Relevant lessons for Cambium** heading plus its compaction format/source
+notes (rather than an assumed “GC agent” subsection). Those sources support turn-boundary
+and history-preservation observations only; they do not prove a Cambium scheduler,
+provider discount, or process-per-child isolation.
+
+The child-session boundary was therefore a state boundary, not merely prompt text. A
+fresh child context started with its validated spec and bounded parent summary; compaction
+could shorten that context but could not import a sibling's raw transcript. Static DAG
+admission happened before the child was created, and a dynamic decomposition proposal
+had to wait for a validated next wave. This preserved tree ownership while allowing
+node-local history to remain append-only.
+
+## Appendix J — compact request and checkpoint example
+
+The draft `compact` request carried `request_id`, `node_id`, `generation`,
+`covered_from`, `covered_to`, `max_summary_tokens`, `keep_recent_tokens`, and a
+`reason` (`threshold`, `steer`, or `checkpoint`). The worker acknowledged the request
+at a safe provider-turn boundary, wrote the summary, and emitted one critical
+`worker_checkpoint` containing the summary reference and covered range. An ACK without
+that checkpoint was not enough for resume. A duplicate request for the same range was
+idempotent; a request with a stale generation returned a typed error.
+
+Validation required every claim reference to resolve to an event/turn ID, every open
+question and TODO path in the covered range to remain represented, and token counts to
+be measured from the frozen serialized corpus. The summary could include a bounded
+verbatim tail, but it could not include hidden scratchpad, sibling transcript, provider
+credentials, or raw chain-of-thought. A store failure left the prior cursor active and
+did not delete or overwrite covered rows.
+
+The proposal kept a compact-summary event separate from the normal result envelope.
+On replay, the event identified the range and state reference; the node-local store
+supplied the bounded context. A parent saw only the strict upward envelope. This made
+lossy compaction auditable and preserved the explicit-tree boundary without implying a
+current compaction implementation.
+
+## Appendix K — rejected deletion and GC alternatives
+
+The design rejected destructive history replacement. A garbage-collector agent that
+rewrote or deleted prior turns would make claim references, replay, and crash recovery
+ambiguous. Rejected variants also included silent provider-side summarization, compacting
+mid-tool call, and using a parent or sibling transcript as the child's context. The
+adopted alternative was append-only node-local history plus a bounded summary/checkpoint
+at a safe turn boundary. The proposal did not claim that a separate process-per-child
+sandbox, universal branching discount, or mandatory MCTS policy follows from this
+choice; those are outside the evidence recorded here.
+
+The canary compared claims, TODOs, open questions, and covered IDs before and after
+compaction. It rejected a summary that reduced tokens but dropped a claim reference or
+changed a decision. The worker could continue with the prior bounded context after a
+canary failure, but it recorded the failure and did not replace durable history. This
+fail-open choice was a proposal tradeoff, not a silent fallback in current source.
+
+Compaction never changed task IDs, generation tokens, or event sequence ownership.
+
+The summary cursor advanced only after the critical checkpoint committed. A crash before
+commit left the previous cursor and full append-only rows available for replay.
+
+No compaction step deleted source turns.
+
+The summary retained covered IDs and token counts so a replay reader could verify its
+range without opening a model response.
+
+The format remained a draft.
+
+Source/tests own current compaction behavior.
+
+No universal savings claim is made.
+
+Prefix behavior is provider-qualified.
+
+Measure before adoption.
+
+Keep history append-only.
+
+Historical only.
+
+Historical identifiers retained: `D2`, `D3`, and `Q8g`.

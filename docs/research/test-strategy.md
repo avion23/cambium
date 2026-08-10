@@ -1,480 +1,358 @@
 # Cambium — Test Strategy for the Harness Itself
 
-Research date: 2026-08-10. Purpose: answer **IMPL-M8** ("No test strategy for the
-harness itself", `docs/architecture/reviews/review-implementation.md`) and the test-relevant
-findings of the distributed-systems and LLM-design reviews. The strategy
-applies to the harness as designed in `docs/architecture/architecture.md` (v2, now merged
-into main): Custos (supervisor), Opifex (workers), Nuntius
-(IPC), Surculus (worktrees), Unio (merge sequencer), Diffundo (provider
-cascade), and the event log.
+**Historical snapshot — 2026-08-10.** This design answers **IMPL-M8** and review
+findings for Custos, Opifex, Nuntius, Surculus, Unio, Diffundo, and the event log. It is
+not a test-count or current-status claim. Current authority is
+[`docs/architecture/architecture.md`](../architecture/architecture.md), source/tests,
+and [`v2-1-status.md`](v2-1-status.md).
 
-Constraints honored from `agents.md` §5 and `docs/architecture/architecture.md` §19:
+**Current note (not retroactive):** active `supervisor.run_plan` is flat;
+`task_decomposed` remains unsupported; provider cascade is source-defined and honors
+`Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
+approval; DLQ and eval cache are absent.
 
-- **No TDD / unit-test ceremony.** Scenario and integration tests are the norm.
-  A module is done when its dataset/metric eval runs green, its scenario test
-  passes, and the end-to-end smoke test passes against it (`agents.md` §9) —
-  not when it has a per-function unit suite.
-- **No LLM in the loop during harness tests.** Deterministic-layer tests use
-  real processes, real git, and a fake provider server on localhost. The only
-  LLM-adjacent modules tested are Diffundo (against a fake provider) and the
-  decision modules (against their frozen datasets).
-- **Stdlib + DSPy + git.** No pytest plugins, no `pytest-asyncio`, no
-  `pytest-timeout` (the harness's own watchdogs do the timing), no `responses`
-  / `requests-mock`. Tests use `asyncio.run()` inside sync test functions, as
-  the existing scenario test does.
+Tree canaries treat static DAG validation/admission as a harness boundary: no dynamic
+child dispatch before validation, each child gets a fresh bounded context, and only the
+strict upward envelope is visible to its parent. Tests reject implicit single-context
+recursion. Prefix-cache/prompt-prefix behavior is tested by measurement, not assumed
+cheap branching or a fixed discount.
 
-Pytest-feature claims in this document are annotated **VERIFIED** (tested
-against pytest 9.1.1 on CPython 3.14.7, commands shown in §10.1) or **UNVERIFIED**
-(could not be checked here; treat as needing a check during implementation).
+Constraints: scenario/integration tests use real processes, git, SQLite, and a local
+fake provider; no LLM network, pytest plugins, `pytest-asyncio`, timeout plugins,
+`responses`, or `requests-mock`. Sync tests call `asyncio.run()`. Module datasets,
+metrics, and canaries remain the L2 gate; this document does not claim their entry
+points exist.
 
----
+## 1. Pyramid and fake-worker liveness
 
-## 1. Test pyramid for a process-supervision harness
+The useful order is L5 scenarios (public API), L4 real mechanism integration, L3 pure
+replay/contracts, L2 frozen datasets, and L1 one-worker smoke. A behavior change adds a
+scenario/integration or a meaningful pure contract, not a mock copy of internals.
 
-A subprocess-supervision harness inverts the classic pyramid: the most valuable
-tests sit at the *top* (whole-supervisor scenarios with real worker processes),
-and the base is a thin layer of pure-contract tests for functions that are
-independently meaningful. There is deliberately no "unit-test everything"
-layer.
+`tests/fakes/worker_liveness.py` speaks NDJSON (`FAKE_MODE`; init/ready/request IDs):
 
-| Layer | What lives here | Real I/O | Speed | Gate value |
-|---|---|---|---|---|
-| L5 Scenarios | The 15 named scenarios in the §7 target catalog, through the public API / orchestrator | workers, git, sqlite, local HTTP | seconds–minutes | The behavioral contract (this is the smoke test) |
-| L4 Integration | Fake-worker liveness (§2), event-log replay (§3), worktree lifecycle (§4), merge concurrency (§5), Diffundo vs fake provider (§6.1) | workers, git, sqlite, localhost HTTP | seconds | Each harness mechanism under its real failure modes |
-| L3 Deterministic replay | Nuntius frame-in/frame-out round trips, event-tier/fsync contract, restart-policy decisions as a pure function, DAG validation, Septum command wrapping, redaction | none (pure + temp files) | milliseconds | The contracts the upper layers rely on |
-| L2 Module datasets | Every DSPy module's dataset loader + metric over the frozen split, canaries (§8) | none | milliseconds | The per-module eval gate |
-| L1 Harness smoke | `python -m cambium.tests.smoke`: fake LLM + 1 worker + 1 merge (§7 S01) | all | ~1 min | The review's "single dry run" gate |
+| Mode | Expected evidence |
+|---|---|
+| `healthy` | heartbeat/tool/checkpoint/result/exit; DONE and merge. |
+| `hang` | watchdog timeout, process-group kill, generation bump and bounded restart. |
+| `crash` | SIGKILL/torn result; parse-error, checkpoint recovery, restart. |
+| `garbage` | valid lines survive random bytes/truncated JSON; `parse_error`, then DONE. |
+| `grandchild` | inherited stdout stays open; EOF grace → ping/no pong → group kill (DS-C2). |
 
-Ordering rule: a change that adds a harness behavior must add (or extend) an
-L5/L4 scenario *or* an L3 contract test — never a mock-heavy unit test that
-reimplements the module's internals. The v0.1 implementation review found
-"~12 syntax errors and undefined-name bugs" that a single dry run would have
-caught (`docs/architecture/reviews/review-implementation.md` verdict); the L1 smoke gate is
-what closes that class.
+Supervisor events, not worker self-report, are asserted: `worker_spawned`, ready,
+heartbeat, checkpoint/result, exit/failure, parse errors, and `supervisor_stall`.
 
----
+## 2. Deterministic contracts
 
-## 2. Fake workers — the four liveness modes
+### 2.1 Event log and replay (DS-C1, DS-M3, DS-C2)
 
-The distributed-systems review (DS-C2) showed that "stdout EOF = worker dead"
-is unsound. The liveness model in `docs/architecture/architecture.md` §5.3 is four-layer
-(process exit → `exit` message → heartbeat watchdog → EOF advisory). To test it
-we drive real worker *scripts* through the real spawn path
-(`asyncio.create_subprocess_exec`, `docs/architecture/architecture.md` §7.2: `start_new_session=True`,
-`PYTHONUNBUFFERED=1`) and give the supervisor exactly the four worker behaviors
-the liveness model must distinguish.
+1. Writer thread keeps the loop responsive while queue/disk is slow.
+2. Critical result/checkpoint rows survive a simulated writer crash before timer fsync;
+   non-critical heartbeat tail may be lost only within the documented window and emits
+   `recovery_gap`.
+3. Replay after a snapshot equals post-snapshot events in gap-free `seq` order.
+4. Checkpoint-first result survives a torn stdout result line.
+5. A stalled reader emits `supervisor_stall` and suspends heartbeat enforcement until
+   drain resumes; it never blames the worker.
 
-One script, `tests/fakes/worker_liveness.py`, mode selected by env
-`FAKE_MODE`; each mode speaks the Nuntius protocol (`docs/architecture/architecture.md` §5.2): read `init` from
-stdin, echo the `request_id`, emit `ready`, then behave per mode.
+### 2.2 Surculus worktrees (IMPL-M3, DS-C5, DS-N7)
 
-| Mode | Script behavior | What it exercises | Expected supervisor outcome |
-|---|---|---|---|
-| `healthy` | `ready` → heartbeats + `tool_event` + `checkpoint` → git commit → `result` → `exit` | The happy path, `request_id` echoing, readiness gate | Task DONE; one merge; exit 0 |
-| `hang` | `ready`, one heartbeat, then `time.sleep(1e6)`; no further beats | Heartbeat watchdog (DS-C3), kill of a **process group**, restart under budget | Watchdog fires at `timeout_s`; process group SIGKILLed; generation bumped; respawn |
-| `crash` | `ready`, write a file, then SIGKILL itself **mid-write of the `result` line** | Partial write / torn line (DS-C2 mode c), EOF advisory (not auto-death), worktree recovery, checkpoint pickup | Parse-error line logged+skipped; CRASHED; worktree recovered; restart; task completes from checkpoint |
-| `garbage` | Interleave valid protocol lines with random bytes, truncated JSON, and a stray `print()` | Parse-error tolerance (one JSON object per line), stdout reserved for protocol (IMPL-N14) | Every line independently parsed; invalid lines tagged `parse_error`; task still DONE |
-| `grandchild` (variant of the four) | `ready`, spawn a child that inherits stdout and sleeps, then exit cleanly — pipe stays open | DS-C2 mode (a): EOF with a live process | EOF is not death: grace timer → `ping` → no `pong` in 10 s → process-group kill |
+Against a real `git init` repository (`gc.auto=0`): create writes generation; recovery
+clears `index.lock`, admin locks, rebase/merge state, resets/cleans and rewrites
+generation; failed recovery quarantines and creates fresh tree; startup/shutdown prune
+stale administrative entries.
 
-Assertions are the supervisor's own typed events, not the fake worker's
-self-report: `worker_spawned` (generation N), `worker_ready`, `heartbeat`
-stream, `worker_exit`/`worker_crashed`, `result`, `parse_error` tags,
-`supervisor_stall` (if any). This tests the *supervisor*; the worker script is
-the environment.
+### 2.3 Unio merge sequencing (IMPL-C1, DS-M1, LLM-M1)
 
-The `hang` and `crash` modes are also the vehicle for the restart-policy
-scenarios (§7 S03, S09, S10): the supervisor's own timers do the pacing, so
-tests do **not** need a pytest timeout plugin — they wait on the event stream
-with `asyncio.wait_for` around the expected terminal event, and fail the test
-if the supervisor itself misbehaves (which is the bug we are trying to catch).
+Concurrent distinct-file merges serialize under `asyncio.Lock`, verify in a throwaway
+worktree, atomically `update-ref`, and leave `git fsck` clean. Same-file race produces
+one `NonFastForward`, then remerge. A nonzero gate exit prevents publication. A crash
+between ref update and event emits `merge_reconciled`.
 
----
+## 3. LLM-adjacent tests (offline)
 
-## 3. Deterministic event-log replay tests
+`tests/fakes/fake_provider_server.py` is stdlib `ThreadingHTTPServer` on
+`http://127.0.0.1:<port>`; fixtures pin request/response schema before implementation.
+Diffundo cases cover tier fallback (LLM-C2), capability filters/transparency (LLM-C3),
+context-hash cache (LLM-C1), provider outage (`AllProvidersFailed`, DS-M7/IMPL-M5),
+and race disabled/quality-safe (LLM-M6). Decision modules run frozen train/eval splits,
+with sibling pinning for LLM-C4 and canaries for LLM-C5/LLM-M1/LLM-M3.
 
-The event log is SQLite-WAL with a dedicated writer thread, critical-event
-fsync, gap-free `seq`, and snapshot compaction (`docs/architecture/architecture.md` §6).
-These are the tests that make the durability contract (`docs/architecture/architecture.md`
-§6.5) a tested claim rather than a design aspiration:
+## 4. Named scenario catalog (S01–S15)
 
-1. **Writer thread, not event loop.** Enqueue a burst while the writer thread
-   sleeps; assert the event loop keeps servicing other tasks (a canary
-   `asyncio.sleep` completes on time). Regression test for DS-C1.
-2. **Critical events are fsync'd before ack.** Enqueue a `result` (critical),
-   then kill the writer (simulate crash) before the next timer tick; reopen the
-   DB; assert the `result` row is present. Non-critical heartbeats may be lost
-   — that is the documented contract, and the test asserts the loss window is
-   bounded by `fsync_interval_s` (drop a heartbeats-only tail, reopen, assert
-   `recovery_gap` event + gap in `seq`).
-3. **Replay = events since last snapshot.** Take a snapshot, append events,
-   "crash", reopen; assert the replayed stream equals the post-snapshot events
-   in `seq` order and that `seq` is gap-free.
-4. **Result recovery.** A `result` written to the checkpoint store before emit
-   (`docs/architecture/architecture.md` §5.4 mode c) must be recoverable even when the `result` line itself was
-   torn — scenario S05 covers this end-to-end.
-5. **Drain-deadline watchdog (DS-C2 mode d).** Stall the supervisor's stdout
-   reader for past the drain deadline and assert a `supervisor_stall` event is
-   emitted and heartbeat enforcement is suspended for that worker until
-   draining resumes — a supervisor-side stall must never be blamed on the
-   worker.
+| ID | Scenario and invariant |
+|---|---|
+| **S01** | One real worker/merge smoke; readiness, gate, canonical result, no credentials. |
+| **S02** | Crash recovery: checkpoint, locks, quarantine, fresh worktree. |
+| **S03** | Hang/heartbeat watchdog, per-tool heartbeat, bounded kill/restart (DS-C3, IMPL-M10). |
+| **S04** | EOF/grandchild/garbage four-layer liveness (DS-C2). |
+| **S05** | Torn result line recovered from checkpoint. |
+| **S06** | Event-log fsync/replay, logging flush and no loop disk I/O. |
+| **S07** | Merge race, raw gate exit, remerge and clean `git fsck`. |
+| **S08** | Worktree lock/rebase cleanup and prune (DS-C5/DS-N7). |
+| **S09** | Restart burst cap/jitter (DS-C4). |
+| **S10** | Absolute restart cap and failure reason. |
+| **S11** | Generation fencing after supervisor crash (DS-C6). |
+| **S12** | Cascade/cooldown/cache and fake-provider routing (LLM-C1/C2/C3, DS-M4). |
+| **S13** | Provider outage parks dispatch; workers survive (IMPL-M5/DS-M7). |
+| **S14** | Dataset metric and canary gate; do-not-decompose path (LLM-C5/C6, M1). |
+| **S15** | Graceful shutdown: cancel/group kill, reaping, durable end, prune (IMPL-C11/M7). |
 
-These run on a temp DB in `tmp_path_factory.mktemp("log")` — **VERIFIED** that
-`tmp_path_factory` is a real pytest fixture (see §10.1).
+## 5. Canaries and anti-gaming
 
----
+Every held-out task carries 3–5 canaries: do not delete failing tests, add `assert True`,
+write `.cambium/`, or pad output. `canaries` zero the score on failure; promotion must
+run `python -m cambium.modules.<name>.eval --suite canaries` and reject any metric gain
+with canary regression. Dataset loaders reject secret patterns, duplicate IDs, split
+leaks, and schema errors. These controls test the metric, not all backdoors.
 
-## 4. Worktree lifecycle tests (Surculus)
+## 6. Layout and command record
 
-Surculus owns `worktree add / recover / prune` (`docs/architecture/architecture.md` §7.5).
-All tests run against a real scratch repo (`git init` in a temp dir, `gc.auto=0`
-set as the design requires — IMPL-M3):
+Proposed layout keeps thin pure contracts under `tests/unit/`, named scenarios under
+`tests/scenarios/` (marker `scenario`), mechanism tests under `tests/integration/`
+(`integration`), and non-collected workers/providers under `tests/fakes/`. Register
+markers in `pyproject.toml`; unregistered markers raise `PytestUnknownMarkWarning`.
 
-1. **Create.** `add` a detached worktree at `base_commit`; assert the worktree
-   exists and `.cambium/generation` is written with the spawn generation.
-   Retry-on-lock-contention: pre-create a `.git/worktrees/<id>/locked` file and
-   assert the create retries (or fails loudly with a typed error) rather than
-   hanging.
-2. **Recover clears every stale lock.** Plant `worktree/.git/index.lock`,
-   `repo/.git/worktrees/<id>/locked`, `.git/rebase-merge/`, `.git/REBASE_HEAD`,
-   plus a dirty working tree and untracked files; run
-   `Surculus.recover(worktree, base_commit)`; assert all `*.lock` gone,
-   rebase/merge aborted, `reset --hard base` + `clean -fd` applied, generation
-   file rewritten. Regression test for DS-C5.
-3. **Quarantine on recovery failure.** Make the reset fail (e.g., a worktree
-   with a corrupted `.git`); assert the tree is moved to
-   `${session_dir}/cambium/quarantine/<task_id>-<generation>/` and a fresh
-   worktree is created from `base_commit` (`docs/architecture/architecture.md` §7.5).
-4. **Prune.** Create stale `git worktree` administrative entries; assert
-   `prune()` on startup and shutdown removes them (DS-N7).
+Historical commands (repo root, Python 3.14.7) were:
 
----
-
-## 5. Merge-sequencer concurrency tests (Unio)
-
-Unio is serialized by an `asyncio.Lock`, verifies in a throwaway worktree, and
-publishes via an atomic `git update-ref` (`docs/architecture/architecture.md` §7.8). These
-tests are where the IMPL-C1 / DS-M1 "parallel workers, serial merge, no
-corruption" claim is proven:
-
-1. **N concurrent merges, all fast-forward.** Build N branches, each with a
-   commit on distinct files; launch N `merge_worker` calls with `asyncio.gather`
-   (the orchestrator's real submission shape); assert all N commits land on
-   `main`, the throwaway worktree was used (the main working tree was never
-   checked out), and `git fsck` reports no corruption. The lock is proven by
-   asserting the merges never interleave their `update-ref` calls (observable
-   in the `merge_progress`/`merge_committed` event order).
-2. **Merge race → one winner, no corruption.** Two branches modify the *same*
-   file. The first merge wins; the second detects a non-fast-forward
-   (`old_sha` mismatch) and raises `NonFastForward`; the orchestrator re-merges
-   against the new `main`. Assert the final tree contains both changes, the
-   loser's commits are present after re-merge, and `git fsck` is clean.
-   (Scenario S07.)
-3. **Test gate uses the raw exit code.** Run the gate with a fake `test_cmd`
-   that exits non-zero; assert the merge is rejected and the branch is not
-   published. The v0.1 `cargo test | tail -5` no-op gate (LLM-M1) is a dead
-   feature — a test that fails to fail is a bug.
-4. **`reconcile()` closes the crash gap.** Simulate a crash between
-   `update-ref` and the `merge_committed` event emit: advance `refs/heads/main`
-   behind the log's back, run `Unio.reconcile()`, assert a `merge_reconciled`
-   event is emitted and the ref/log gap is closed (`docs/architecture/architecture.md`
-   §7.8).
-
----
-
-## 6. LLM-dependent modules — no network
-
-### 6.1 Diffundo against a fake provider server
-
-`tests/fakes/fake_provider_server.py` is a stdlib
-`http.server.ThreadingHTTPServer` bound to `127.0.0.1:0` (ephemeral port). It
-implements the provider endpoint Diffundo's client code actually calls, with
-per-provider behavior selected by path or header: canned `200` completion,
-`429` (rate limit), `500`, slow-then-timeout, malformed body. No external
-network is touched; every test resolves providers to `http://127.0.0.1:<port>`.
-
-Tests call `Diffundo.call(...)` directly (not through a full DSPy ReAct), so
-they cover the contract of `docs/architecture/architecture.md` §9 ("Diffundo — Provider
-Cascade"):
-
-1. **Tier cascade actually cascades.** Two providers in tier `"fast"`; the
-   first returns 429; assert the result comes from the second and the first is
-   in cooldown. Regression test for LLM-C2 / IMPL-C10 ("the cascade only ever
-   tried the first provider").
-2. **Priority order.** Within a tier, the lower `priority` is tried first; a
-   success short-circuits.
-3. **Capability filters.** `require_tools=True` skips `supports_tools=False`;
-   `min_context_window` skips a small-context provider (LLM-C3).
-4. **`AllProvidersFailed` is typed and carries evidence.** All providers down
-   → the exception carries `providers_tried` and `last_error`; the orchestrator
-   catches it and parks dispatch instead of crashing (IMPL-M5,
-   `docs/architecture/architecture.md` §9.2).
-5. **Cache is opt-in, keyed, TTL'd.** `cache=True` without `context_hash` is
-   rejected; with `context_hash`, a repeat call is served with
-   `"cache_hit": true`; a different `context_hash` is a miss; TTL expiry and
-   namespace isolation are asserted (LLM-C1).
-6. **Per-provider LM reuse.** The provider client is constructed once, not per
-   call (IMPL-N10).
-7. **No race mode.** The same-priority cascade is the only "first of N"
-   behavior; there is no `_race` to test (LLM-M6).
-
-> **UNVERIFIED:** the exact wire format Diffundo's client must speak to a
-> provider (OpenAI-style chat-completions shape LiteLLM accepts) is **not**
-> pinned by this document. The fake server's contract is defined by the
-> Diffundo client code as written; during implementation the stub's response
-> schema must be checked against the real provider spec (and one recorded
-> golden response kept as a fixture) before these tests are trusted.
-
-### 6.2 Decision modules against dataset + metric
-
-`ShouldDecompose` is the reference (scenario S14, existing
-`tests/scenarios/test_example_module.py`). The pattern every future module
-repeats, per `docs/architecture/module-template/architecture.md` §9:
-
-1. Load the real dataset; every record schema-valid; a malformed record raises
-   `DatasetError` (the loader is a hard gate, never caught).
-2. Run `decide()` over every pair, attach predictions, score with `metric()`;
-   assert the aggregate score meets the module's threshold.
-3. Assert the canary records are present, were processed (a prediction was
-   attached), and pass (§8).
-4. Determinism: same input → same output (the rule engine is a pure function;
-   a DSPy replacement must hold under `temperature=0`).
-
-The `TaskDecomposer`/`TaskRouter`/`ResultEvaluator` datasets, when they land,
-add the sibling-pinning rule: they are evaluated against **stub** siblings
-(frozen references, `docs/architecture/architecture.md` §17.2), never against live
-co-adapted modules.
-
----
-
-## 7. Scenario test catalog
-
-Fifteen named scenarios. Each is a `@pytest.mark.scenario` test that drives
-the real public API (or the real orchestrator+supervisor), never a mock. Setup
-uses `tmp_path_factory` scratch repos and the fake workers of §2.
-
-| ID | Scenario | Setup | Concrete assertions |
-|---|---|---|---|
-| **S01** | Happy-path smoke | Atomic task (`ShouldDecompose=false`), one `healthy` fake worker, real scratch repo, fake LLM | `result` with `status="done"`; `merge_committed`; `refs/heads/main` advanced; exit code 0; no key material in any event (redaction) |
-| **S02** | Worker killed mid-edit → restart with fresh worktree | `crash` fake worker that wrote a partial file then SIGKILLed itself; `recoverable=true` | `worker_crashed`; generation bumped on respawn; worktree reset to base (no partial file); task completes on generation N+1 |
-| **S03** | Hang → watchdog kill + restart | `hang` fake worker (no heartbeats past `timeout_s`) | Watchdog kills the **process group**; `worker_exit` reason `crash`; restart under burst budget; no `ProcessLookupError` raised in the watchdog (DS-M2) |
-| **S04** | Garbage stdout tolerated | `garbage` fake worker (random bytes + truncated JSON + `print()`) | Invalid lines logged with `parse_error` and skipped; valid protocol lines all processed; task DONE |
-| **S05** | Crash mid-result → checkpoint recovery | Worker writes `checkpoint` then SIGKILLs itself while writing `result` | The `result` is recovered from the checkpoint store; task marked DONE; no duplicate execution of completed work |
-| **S06** | Event-log crash → replay restores state | Run a task, SIGKILL the supervisor process, reopen the session dir | Replay from last snapshot reconstructs the task state; `result.json` is correct; `seq` gap-free or a documented `recovery_gap` |
-| **S07** | Merge race → one winner, no corruption | Two `healthy` workers edit the same file; both merges submitted concurrently | First merge wins; second raises `NonFastForward` and is re-merged; final tree has both changes; `git fsck` clean |
-| **S08** | Stale locks don't block restart | Plant `index.lock`, `worktrees/<id>/locked`, `REBASE_HEAD` in a task's worktree; restart the worker | `Surculus.recover()` clears all three before respawn; the restarted worker commits successfully |
-| **S09** | Restart budget: burst cap + absolute cap | Always-crash fake worker | Escalation after `burst_max` crashes in `burst_window_s`; task FAILED at the `absolute_max` ceiling; typed `task_failed` event |
-| **S10** | No thundering herd | Four workers killed simultaneously (kill their process group) | Restart delays are jittered (two identical runs produce different delay orderings); no lock contention on `worktree add` |
-| **S11** | Orphan fencing after supervisor crash | Spawn a worker, SIGKILL the supervisor, leave the orphan running; start a new supervisor in the same session dir | New supervisor bumps generation; the orphan's next git op reads `.cambium/generation`, detects the mismatch, emits `exit reason=fatal`, and dies — no split-brain writes |
-| **S12** | Diffundo cascade failover | Fake providers: A=429, B=200 (same tier) | Result from B; A in cooldown; no "only first provider ever tried" behavior |
-| **S13** | Provider outage parks dispatch | All fake providers down | `AllProvidersFailed` caught by the orchestrator; dispatch parked; an already-running worker survives (no provider-outage mass kill) |
-| **S14** | ShouldDecompose dataset + metric + canaries | Existing `tests/scenarios/test_example_module.py` | Metric 1.0 over the full dataset; both canaries present and passing; `DatasetError` on malformed records |
-| **S15** | Shutdown hygiene | Cancel a mid-task session (`cancel` → SIGTERM → SIGKILL per `docs/architecture/architecture.md` §7.7) | Graceful cancel path completes; straggler process groups SIGKILLed (no `.kill()` on asyncio Tasks — IMPL-C11); worktrees pruned; event-log writer flushed and DB closed |
-
-S01 is the `cambium.tests.smoke` entry point referenced by `agents.md` §5 and
-the smoke-test gate of `docs/architecture/architecture.md` §19 item 15. Every new harness
-module must first pass S01 (or extend it), because that is the test the v0.1
-reviews proved was missing.
-
----
-
-## 8. Canary policy — catching reward hacking in tests
-
-Canaries are the brakes on the optimization flywheel
-(`docs/architecture/architecture.md` §10, §17.4; `docs/architecture/module-template/dataset-format.md`
-§6). They are enforced at **three** points, all testable:
-
-1. **Dataset-integrity canaries (module tests).** Each dataset ships trap
-   records whose gold labels are deliberately misaligned with the surface
-   heuristics the metric would otherwise reward. The scenario test asserts they
-   are present, processed, and pass (S14). Dropping canaries to inflate the
-   metric is caught by the "canaries were loaded and scored" assertion.
-   Concrete: the `should_decompose` canary with four `HIGH_SIGNAL` keywords and
-   gold `decompose=false` catches a keyword-greedy replacement; the canary with
-   zero surface keywords and gold `decompose=true` catches one that dropped
-   verb-clause analysis.
-2. **Optimization canaries (Ascensus eval gate).** `python -m
-   cambium.modules.<name>.eval --suite canaries` exits non-zero on the first
-   canary failure (`docs/architecture/module-template/architecture.md` §9.3). This is the
-   promotion gate: a prompt variant that improves the training metric while
-   regressing the canary rate is **rejected** even if its score went up
-   (`docs/architecture/architecture.md` §17.4 step 8). In v2 the single-file dataset with
-   inline `canary: true` markers achieves the same effect via the
-   1.0-aggregate assertion.
-3. **Dataset hygiene gates.** The loader refuses records containing secret
-   patterns; cross-split leaks, duplicate IDs, and schema mismatches raise
-   `DatasetError` and fail the run (`dataset-format.md` §7, §9). A dataset that
-   cannot load is a hard test failure, never a skip.
-
-Rule of thumb: **any metric signal that can be gamed by deleting code, editing
-tests, or padding output must have a canary that specifically traps that
-gaming behavior** — e.g., "the worker did not delete the failing test", "the
-worker did not add `assert True`", "no `.cambium/` writes from the worker"
-(`docs/architecture/architecture.md` §10 table). Each held-out task ships 3–5 such
-canaries.
-
----
-
-## 9. What to run where
-
-### 9.1 Test layout and markers
-
-```
-tests/
-├── conftest.py                  # shared fixtures: scratch repo, fake-worker spawn, fake provider
-├── unit/                        # L3 pure contracts — deliberately thin
-│   ├── test_nuntius_framing.py  #   frame in/out round trip, torn-line handling
-│   ├── test_restart_policy.py   #   should_restart / delay as a pure function
-│   ├── test_redaction.py        #   secrets never reach the log
-│   ├── test_dag_validation.py   #   cycle detection in Architectus (DS-M6)
-│   └── test_septum.py           #   namespace / sandbox-exec / noop command wrapping
-├── scenarios/                   # L5 named scenarios (§7); @pytest.mark.scenario
-│   ├── test_example_module.py   #   S14 (exists today)
-│   ├── test_smoke_happy_path.py #   S01
-│   ├── test_crash_recovery.py   #   S02, S05, S06
-│   ├── test_liveness.py         #   S03, S04
-│   ├── test_merge_race.py       #   S07
-│   ├── test_worktree_locks.py   #   S08
-│   ├── test_restart_budget.py   #   S09, S10
-│   ├── test_fencing.py          #   S11
-│   ├── test_provider_outage.py  #   S12, S13
-│   └── test_shutdown.py         #   S15
-├── integration/                 # L4 harness mechanisms; @pytest.mark.integration
-│   ├── test_event_log_replay.py #   §3
-│   ├── test_worktree_lifecycle.py # §4
-│   ├── test_merge_sequencer.py  #   §5
-│   └── test_diffundo_cascade.py #   §6.1
-└── fakes/                       # not collected (no test_ prefix)
-    ├── worker_liveness.py       #   §2 fake worker (FAKE_MODE=healthy|hang|crash|garbage|grandchild)
-    ├── fake_provider_server.py  #   §6.1 localhost HTTP provider
-    └── gold_llm_responses/      #   golden provider responses for Diffundo fixtures
+```text
+uv run --python 3.14.7 --extra test pytest -q
+uv run --python 3.14.7 --extra test pytest -q -m "not integration"
+uv run --python 3.14.7 --extra test pytest -q -m scenario
+uv run --python 3.14.7 --extra test pytest -q -m integration
+uv run --python 3.14.7 --extra test pytest -q -m "not slow"
+uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_vertical_slice.py -v
+uv run --python 3.14.7 --extra test pytest --collect-only -q -m scenario
+uv run --python 3.14.7 --extra test pytest -q -p no:cacheprovider
+python -m cambium.tests.smoke
+python -m cambium.modules.<name>.eval --suite canaries
+python -m compileall src/cambium && python -c "import cambium"
 ```
 
-Markers are registered in `pyproject.toml` to keep the suite warning-free
-(**VERIFIED**: an unregistered marker produces a `PytestUnknownMarkWarning` —
-see §10.1; registering via `[tool.pytest.ini_options].markers` silences it):
+The pytest-claim checks were **VERIFIED** against pytest 9.1.1/CPython 3.14.7:
+registered markers select correctly; unknown markers warn; `-m`, `--deselect`, `-k`,
+`--durations`, `-p no:cacheprovider`, `--collect-only`, `tmp_path(_factory)`,
+`pytest.raises`, `pytest.skip`, and parametrization behave as recorded. **UNVERIFIED:**
+the exact Diffundo fake-provider schema, smoke/eval modules (targets at the snapshot),
+and timing margins for writer/fsync assertions.
+
+## 7. Finding-to-test map (retained IDs)
+
+`IMPL-M8` → this strategy; `IMPL-C1/C2..C9/C10/C11`, `IMPL-N1..N14` → S01/S15;
+`IMPL-M2/M3/M4/M5/M6/M7/M9/M10` → S01/S02/S03/S08/S12/S13/S15;
+`DS-C1/C2/C3/C4/C5/C6`, `DS-M1/M2/M3/M4/M6/M7`, `DS-N5/N7` → §§2–4;
+`LLM-C1/C2/C3/C4/C5/C6`, `LLM-M1/M3/M4/M6` → §§3–5. This index preserves the
+historical mapping without asserting that every target test exists today.
+
+## Appendix A — detailed test contracts
+
+### A.1 Fake workers and liveness evidence
+
+The fake worker reads `init`, echoes `request_id`, emits `ready`, and then follows
+`FAKE_MODE`. `healthy` verifies a checkpoint before result and a merge after exit.
+`hang` sleeps after one heartbeat so the watchdog—not a test timeout—kills its process
+group and increments generation. `crash` self-SIGKILLs while writing a result line;
+the reader must deliver a partial tail, log `parse_error`, recover the checkpoint, and
+restart. `garbage` interleaves valid NDJSON with raw bytes, truncated JSON, and a stray
+print; every invalid line is advisory and the task still completes. `grandchild` exits
+while a child inherits stdout; EOF starts grace/ping escalation and `killpg` removes the
+grandchild. Assertions inspect the supervisor event stream and DB, never a fake worker
+self-report.
+
+### A.2 Event-log durability checks
+
+The writer-thread canary enqueues thousands of non-critical records while a probe
+`asyncio.sleep` runs; a late probe proves the loop was not blocked by SQLite. Critical
+fsync is tested by enqueueing `result`, stopping the writer before its timer tick, and
+reopening the DB. A heartbeat-only tail may disappear within `fsync_interval_s`, but
+replay must record a gap. Snapshot replay compares every post-snapshot `seq`, and result
+recovery verifies checkpoint-first persistence after a torn protocol line. A drain
+deadline test deliberately stalls a stdout reader and checks `supervisor_stall` plus
+suspended heartbeat enforcement.
+
+### A.3 Worktree and merge checks
+
+Worktree tests plant `.git/index.lock`, repository admin `locked`, `rebase-merge`,
+`REBASE_HEAD`, dirty files, and untracked artifacts. `recover()` must remove all locks,
+abort merge state, reset to base, clean, and rewrite generation. A corrupted tree must
+be quarantined, not reused. Merge tests launch N distinct-file merges with
+`asyncio.gather`, assert serialized `merge_progress`/`merge_committed`, clean `git fsck`,
+and ensure main was never checked out. Same-file conflict yields one expected
+`NonFastForward`, then remerge. A gate command that exits nonzero must prevent
+publication; a shell pipeline that masks exit status is a failing test, preserving
+LLM-M1's raw-exit requirement.
+
+### A.4 Provider and module checks
+
+The fake provider binds `127.0.0.1:0`, records each request, and serves deterministic
+responses. Tests assert tier fallback, capability filtering, context-hash cache keys,
+cooldown/circuit state, `Retry-After`, cost caps, and provider outage parking. No API key
+values appear in requests, events, or logs. Decision-module tests freeze train/eval and
+canary splits; sibling-pinning prevents an optimizer from changing a helper metric to
+hide a regression. Canaries specifically catch deleted tests, `assert True`, `.cambium/`
+writes, no-op patches, and output padding.
+
+## Appendix B — marker and command semantics
+
+The proposed marker registration was:
 
 ```toml
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "scenario: named end-to-end scenario through the real public API",
-    "integration: needs real subprocesses, git repos, or a local fake HTTP server",
-    "slow: wall-clock minutes; excluded from default local runs",
+  "scenario: named end-to-end scenario through the real public API",
+  "integration: needs real subprocesses, git repos, or a local fake HTTP server",
+  "slow: wall-clock minutes; excluded from default local runs",
 ]
 ```
 
-### 9.2 Command list (CI-less local verification)
+The historical command list was deliberately CI-less: full suite; `-m "not integration"`;
+scenario-only; integration-only; `-m "not slow"`; one vertical-slice node ID; a
+`--deselect` slow test; `--durations=5`; `-p no:cacheprovider`; `--markers`; harness
+smoke; module eval plus `--suite canaries`; and compileall/import. The local gate was
+full suite + smoke + touched module eval/canaries. Pytest 9.1.1 checks verified markers,
+selection, deselection, durations, no-cache mode, collection, fixtures, raises/skip,
+and parametrization. Fake-provider wire shape, smoke/eval entry points, and timing
+margins remained UNVERIFIED.
 
-Run from repo root on Python 3.14.7. All `pytest` options below are **VERIFIED**
-against the local install (§10.1).
+## Appendix C — review-finding matrix
 
-| Purpose | Command |
-|---|---|
-| Whole suite (default) | `uv run --python 3.14.7 --extra test pytest -q` |
-| Fast contract layer only | `uv run --python 3.14.7 --extra test pytest -q -m "not integration"` |
-| Scenario suite only | `uv run --python 3.14.7 --extra test pytest -q -m scenario` |
-| Integration suite only | `uv run --python 3.14.7 --extra test pytest -q -m integration` |
-| Exclude known-slow | `uv run --python 3.14.7 --extra test pytest -q -m "not slow"` |
-| One named scenario | `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_vertical_slice.py -v` |
-| Deselect one slow test | `... pytest -q --deselect tests/scenarios/test_vertical_slice.py::test_ready_timeout_fails_within_budget` |
-| Find the slowest tests | `... pytest -q --durations=5` |
-| No `.pytest_cache` writes | `... pytest -q -p no:cacheprovider` |
-| Show registered markers | `... pytest --markers` |
-| Harness smoke gate (`agents.md` §5) | `python -m cambium.tests.smoke` |
-| Module eval + canary gate | `python -m cambium.modules.<name>.eval` and `... --suite canaries` |
-| Type / syntax gate | `python -m compileall src/cambium && python -c "import cambium"` |
+`IMPL-C1`/`DS-M1` map to S07 merge serialization; `IMPL-C2..C9`, `IMPL-C10`, `IMPL-C11`,
+and `IMPL-N1..N14` map to S01/S15 runtime smoke and protocol assertions. `IMPL-M2` is
+ready timeout; `IMPL-M3` S02/S08 worktrees; `IMPL-M4` Septum abstraction (historical,
+now no sandbox); `IMPL-M5` S13 outage; `IMPL-M6` redaction; `IMPL-M7` S06/S15 logging;
+`IMPL-M9` S02 fresh restart; `IMPL-M10` S01/S03 timing. DS-C1/C2/C3/C4/C5/C6 and
+DS-M1/M2/M3/M4/M6/M7 plus DS-N5/N7 map to §§2–4. LLM-C1/C2/C3/C4/C5/C6 and
+LLM-M1/M3/M4/M6 map to §§3–5. The IDs are preserved for audit traceability, not as a
+claim that each scenario currently exists.
 
-Local "gate" definition (matches `agents.md` §9 "done" criteria): full suite
-green **and** the smoke gate passes **and** the touched module's eval + canary
-suites pass. There is no CI server; the gate is the command list above, run
-before every module is marked complete.
+## Appendix D — public-boundary and context tests
 
-### 9.3 Which findings require which scenario (mapping)
+Tree tests build a plan with a root, two siblings, and a dependency chain. They assert
+that validation completes before any worker process starts, that `max_width` limits
+admission, and that a dynamic child proposal is not admitted until the next validated
+wave. A malformed child (duplicate ID, wrong parent, cycle, over-depth, or over-width)
+produces a typed rejection and zero partial dispatch. This catches an implementation
+that recursively calls a child worker while bypassing the harness tree.
 
-Every review finding that demands a test maps to a concrete item. IMPL-M8
-("no test strategy") is answered by this entire document; the rest:
+Context tests use a child session containing a sentinel scratchpad string and a parent
+summary. `context_for(child)` must contain the child's own bounded turns, parent summary,
+and strict result envelopes; it must not contain sibling raw turns or the sentinel. A
+child envelope with an unknown top-level key is rejected. A 199/200/201-token root
+directive test checks the exact `CORE_DIRECTIVE_MAX` truncation marker. The prompt-lint
+asserts no timestamp, request ID, generation, nonce, or volatile path enters the static
+prefix.
 
-| Review finding | Demands a test for | Covered by |
-|---|---|---|
-| IMPL-M8 — no test strategy | the harness itself | this document; L1 smoke gate; §3–§7 |
-| IMPL-C1 / DS-M1 — merge no concurrency guard / bottleneck | serialized merge, no corruption under concurrency | S07; §5 items 1–2 |
-| IMPL-C2..C9, IMPL-N1..N14 — runtime bugs (`self.root`, `os.getpid`, `write_content`, missing returns, broken syntax, `shutdown` `.kill()`) | any module runs at all | S01 (the "single dry run" gate); S15 for C11 |
-| IMPL-M2 — unbounded cold start | readiness gate | S01 (ready handshake; a worker that never readies trips `ready_timeout` → killed, folded into S03) |
-| IMPL-M3 — git worktree concurrency / `gc.auto` | no cross-worker git contention | S08; §4.1; S07 |
-| IMPL-M4 — sandbox backend Linux-only | Septum platform abstraction | §9.1 `unit/test_septum.py` (namespace/sandbox-exec/noop command wrapping) |
-| IMPL-M5 / DS-M7 — all-provider-down unhandled; kills workers | typed `AllProvidersFailed`, dispatch parked, workers survive | S13; §6.1 item 4 |
-| IMPL-M6 — no secrets management | keys never in logs/protocol | `unit/test_redaction.py`; S01 assertion (no key material in events) |
-| IMPL-M7 — no real logging | non-blocking writer, rotation, flush | S15 (flush on shutdown); §3 items 1–3; S06 |
-| IMPL-M9 — restart reuses corrupted worktree | fresh worktree per restart | S02; §4.2–4.3 |
-| IMPL-M10 — heartbeat timing / readiness gap | configurable watchdog, ready gating | S01, S03 |
-| DS-C1 — sync I/O in event loop | event loop never blocks on disk | §3 item 1 |
-| DS-C2 — "EOF = dead" unsound (4 modes) | the four-layer liveness model | S03, S04, S11; §2 (`hang`, `crash`, `garbage`, `grandchild`); §3 item 5 (drain-deadline) |
-| DS-C3 — heartbeat granularity | per-tool heartbeats, long-tool safety | S03 |
-| DS-C4 — no jitter / rate-window gaming | jittered restarts; burst + absolute caps | S09, S10 |
-| DS-C5 — stale worktree locks | lock cleanup before respawn | S02, S08 |
-| DS-C6 — supervisor crash orphans / split-brain | generation fencing, no orphan writes | S02, S06, S11 |
-| DS-M2 — `WorkerHandle` logical races | no `ProcessLookupError` in watchdog | S03 (assert the watchdog survives killing a dead process) |
-| DS-M3 — no fsync / partial lines | durability contract per tier | §3 items 2–4; S06 |
-| DS-M4 — FanOut shared-state races | cooldown/cache correctness under contention | §6.1 items 1–2, 5 (S12) |
-| DS-M6 — no cycle detection | DAG validation rejects cycles | `unit/test_dag_validation.py` |
-| DS-N5 — unbounded event log | snapshot compaction | §3 item 3 (replay since last snapshot) |
-| DS-N7 — shutdown doesn't clean worktrees | prune on shutdown | S15; §4.4 |
-| LLM-C1 — cache ignores repo state | opt-in cache keyed on `context_hash` | §6.1 item 5 |
-| LLM-C2 — cascade doesn't cascade | tier-based cascade across providers | S12; §6.1 items 1–2 |
-| LLM-C3 — model transparency assumed | capability filters | §6.1 item 3 |
-| LLM-C4 — "independently hill-climbable" false | pinned-sibling eval | §6.2 sibling-pinning rule (with `TaskDecomposer`/`TaskRouter` datasets) |
-| LLM-C5 / LLM-M1 — metric gameable / broken test gate | multi-signal metric, raw test exit code | S14; §5 item 3; §8 |
-| LLM-C6 — no do-not-decompose path | atomic fast path | S14; S01 (atomic task) |
-| LLM-M3 — flywheel no brakes | canary rejection at promotion | §8 items 1–2 |
-| LLM-M4 — checkpoint callback doesn't exist | checkpoint written and resumed | S05 |
-| LLM-M6 — race mode unsafe | no race mode; same-priority cascade | §6.1 item 7; S12 |
+Prefix-cache tests compare measured prompt bytes and provider usage metadata under a
+pinned fake provider. They may report a stable prefix, but they must not assert a cost
+discount or latency win without provider evidence. A test that changes provider/model,
+dataset, or context layout must record a new baseline instead of reusing a prior claim.
 
----
+## Appendix E — failure/restart sequencing
 
-## 10. Pytest-claim verification record
+The restart suite separates worker crash, provider outage, EOF advisory, and supervisor
+stall. A worker that exits without `exit_message` consumes restart budget; a provider
+that returns `AllProvidersFailed` stays alive through patience; a grandchild-held pipe
+requires ping/group kill; a stalled supervisor suspends heartbeat enforcement. Each test
+asserts generation increments and no stale worktree write reaches main. A gate failure
+uses raw process exit status, not a shell pipeline's final `tail` or a worker's success
+token. A merge conflict records paths and expected SHAs before a resolver/remerge.
 
-### 10.1 VERIFIED claims
+Canary promotion tests run a variant that deletes a failing test, inserts `assert True`,
+writes `.cambium/`, or pads an output. Every variant must fail a canary even if its
+training metric increases. Dataset hygiene tests reject secret patterns, duplicate IDs,
+cross-split leakage, and malformed fields as hard failures; they never silently skip a
+bad record. This is the historical reason the test strategy keeps canaries in a separate
+gate from ordinary eval rows.
 
-Tested on CPython 3.14.7 with pytest 9.1.1 (installed via
-`uv run --python 3.14.7 --extra test`), using a throwaway project at
-`/tmp/opencode/pytest-verify`:
+## Appendix F — harness contract assertions
 
-- Custom markers registered under `[tool.pytest.ini_options].markers` appear in
-  `pytest --markers` (`@pytest.mark.scenario: ...`) and select with
-  `-m "scenario"`, `-m "integration or slow"`, `-m "not slow"`.
-- An **unregistered** marker on a test emits `PytestUnknownMarkWarning` at
-  collection; registration silences it.
-- `-m "not slow"` / `-m "integration or slow"` run the expected subset
-  ("N passed, M deselected").
-- `--deselect <nodeid>` skips exactly that test.
-- `-k "slow and not hang"` filters by keyword expression.
-- `--durations=2` prints the slowest calls.
-- `-p no:cacheprovider` runs with no `.pytest_cache` writes.
-- `--collect-only -q -m scenario` lists only matching tests.
-- `tmp_path` and `tmp_path_factory` fixtures; `pytest.raises`; `pytest.skip`;
-  `@pytest.mark.parametrize`.
+The original strategy treated the harness as the system under test. Unit tests covered
+pure tree validation, envelope filtering, retry-budget arithmetic, and event sequence
+allocation. Integration tests then exercised the real process boundary with a fake worker;
+they did not replace the boundary with an in-process mock. Every scenario recorded the
+worker generation, task ID, worktree path, and event sequence so a failure could be
+replayed from durable data.
 
-### 10.2 UNVERIFIED claims
+Tree admission tests were deliberately front-loaded. A plan with duplicate IDs, unknown
+dependencies, two roots, a cycle, excessive depth, or fan-out failed before `spawn` was
+called. A valid static DAG admitted only dependency-ready nodes, sorted by depth and
+`width_idx`, and never exceeded `max_width`. Dynamic child proposals were queued for a
+new validated revision; a child could not mutate the active tree from inside a worker
+turn. This records the explicit-tree direction without claiming that current flat
+`run_plan` implements it.
 
-- **Diffundo fake-provider wire contract** (§6.1): the exact request/response
-  schema the provider stub must serve to be a faithful LiteLLM-compatible
-  endpoint. Must be pinned against the real provider spec during
-  implementation.
-- **`cambium.tests.smoke` / `cambium.modules.<name>.eval` interfaces**: the
-  entry points are specced (`agents.md` §5, module-template §9) but do not
-  exist in the scaffold yet; their CLI surface (`--suite canaries`, exit codes)
-  follows the module-template spec and must be verified when implemented.
-- **Writer-thread timing assertions** (§3 items 1–2): the specific jitter of
-  the fsync timer means loss-window bounds are statistical; assertions use
-  generous margins and are re-checked against the real implementation.
+Context tests enforced the information boundary. A child context contained its own
+bounded turns, the parent summary, and strict upward envelopes. It excluded sibling
+raw turns, hidden scratchpad text, prompts, provider credentials, timestamps, nonce
+values, and volatile paths from the static prefix. An unknown envelope key, an overlong
+directive, or an attempt to return a trajectory was a hard failure. Prefix-cache tests
+measured serialized bytes and provider usage metadata under a pinned fake provider;
+they did not turn a measurement into a cost or latency guarantee.
 
----
+## Appendix G — failure-injection catalogue
 
-## 11. Scope note
+The fake worker modes were intentionally orthogonal: clean result, nonzero exit, delayed
+ready, heartbeat silence, stdout flood, malformed JSON, partial final line, grandchild
+holding a pipe, provider outage, gate failure, merge conflict, and stale-generation write.
+The supervisor tests asserted the distinction between a provider patience timeout and a
+worker crash, between EOF and process death, and between an advisory output drop and a
+critical result drop. A test that passed only because a shell pipeline returned the
+status of `tail` was rejected; the raw process status was the oracle.
 
-This document is a **design** for the harness tests. Current main collects 108
-tests under `tests/scenarios/`, covering the reference module, datasets, the
-vertical slice, storage, merge, IPC, task-tree, and doctor paths. The remaining
-catalog scenarios land alongside their modules (Custos, Nuntius, Surculus,
-Unio, Diffundo, Septum), gated by the L1 smoke test (S01). A module that ships
-without its scenario test is not complete (`agents.md` §9).
+Restart tests checked bounded burst and absolute budgets, generation fencing, no stale
+worktree publication, and idempotent merge reconciliation. Logging tests checked that
+redacted values did not appear in SQLite, JSONL, stderr mirrors, or rotated files. The
+security suite exercised list-form `grep_code` and `git_op`, path traversal, symlinks,
+environment allowlists, prompt-injected repository text, and canary-gaming variants.
+
+## Appendix H — historical verification boundaries
+
+The snapshot's command record used system Python and pinned source revisions. Typical
+checks were `python -m pytest -q tests/unit`, targeted scenario selectors, and small
+scripts that inspected raw event rows. A green targeted test was evidence for that
+scenario only; it was not a claim that the full suite, power-loss path, macOS signals,
+free-threaded Python, or live provider network had passed. These limits explain why
+several IDs remain **UNVERIFIED** even when neighboring canaries were green.
+
+## Appendix I — evidence labels
+
+`VERIFIED` meant the named command produced the expected observation on the recorded
+source revision. `UNVERIFIED` meant the document had a design assertion, a missing
+fixture, or a platform/network path that was not run. `PROPOSED` marked a future tree,
+compaction, or provider behavior. The strategy kept these labels next to scenario IDs so
+a later reader could not mistake a test template, source grep, or review statement for a
+passing end-to-end run.
+
+Scenario names were kept stable so later audits could compare failure evidence. The
+strategy preferred a small fake worker with deterministic modes over a live provider or
+network dependency. When a scenario needed a command result, the command, cwd, source
+revision, and raw exit status were recorded. A missing fixture or skipped platform path
+was reported as **UNVERIFIED**, not hidden by a broad marker.
+
+Canary IDs remain useful only when their fixture and oracle remain unchanged.
+
+Changing a fake-worker mode, provider stub, or event schema required a new baseline and
+preserved the old result as historical evidence.
+
+The strategy did not claim universal platform coverage.
+
+The canary gate remained independent from ordinary metric improvement, so reward hacking
+could not turn a green score into a green safety result.
+
+Test IDs are historical anchors.
+
+Current status belongs to tests and v2-1-status.
+
+Skipped checks remain unverified.
+
+Canaries are not production status.
+
+Keep command evidence.
+
+Record raw exit status.
+
+Historical only.
+
+Historical identifiers retained: `DS-M2`, `DS-M6`, `IMPL-N10`, `IMPL-N14`, `LLM-C6`,
+and `LLM-M4`.

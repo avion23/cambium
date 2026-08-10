@@ -1,645 +1,451 @@
 # Nuntius IPC Protocol — Message Catalogue (DRAFT)
 
-**STATUS: DRAFT — docs only, not normative.** This document is a design draft of the
-M1 Nuntius wire contract. It is **not** authoritative for behavior: the authoritative
-specification is `docs/architecture/architecture.md` §5 (IPC Protocol), which this draft must be
-reviewed against before any implementation. Divergences from the architecture doc are
-flagged inline and collected in §7.
+**Historical snapshot — proto 1, 2026-08-09.** Docs-only draft by research task
+`wt-ipc` (M1); sources included superseded `system-design.md` §4.1 and the merged
+`orchestrator.py`/`events.py` scaffold. It is not normative; architecture §5 wins.
+Current authority is [`docs/architecture/architecture.md`](../architecture/architecture.md),
+source/tests, and [`v2-1-status.md`](v2-1-status.md).
 
-**Version:** proto 1 (draft proposal, see §5)
-**Date:** 2026-08-09
-**Author:** research task `wt-ipc` (docs-only)
-**Sources read (read-only):**
-- `/home/ubuntu/cambium/docs/architecture/system-design.md` §4.1 (M1 Nuntius — v0.1, superseded) — cited as `system-design §4.1`.
-- `docs/architecture/architecture.md` §5 (IPC: JSON-Lines on stdio, `request_id` RPC framing, authoritative `exit` message), plus §3.4 (`Result`), §6.4 (checkpoints), §7 (lifecycle), §16.4 (exit codes) — cited as `arch §5`, `arch §3.4`, etc.
-- `/home/ubuntu/cambium/src/cambium/orchestrator.py`, `/home/ubuntu/cambium/src/cambium/events.py` (merged scaffold) — cited as `orchestrator.py`, `events.py`.
+**Current note (not retroactive):** active `supervisor.run_plan` is flat;
+`task_decomposed` remains unsupported; provider cascade is source-defined and honors
+`Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
+approval; DLQ and eval cache are absent.
 
-**Purpose:** a complete, implementation-ready message catalogue for the Nuntius module:
-framing, per-direction message list, result-envelope schema, error taxonomy, versioning,
-timeouts, and a flagged reconciliation against `arch §5`.
+The explicit-tree boundary is historical design intent: the harness validates a static
+DAG and admits only dependency-ready tasks; each admitted child receives a fresh bounded
+context, and only the strict upward result envelope is returned. The wire does not model
+implicit single-context recursion. Any prefix-cache claim is a measurement target, not a
+discount or guarantee.
 
----
+## 1. Framing and invariants
 
-## 1. Framing
+NDJSON over UTF-8 stdio: one JSON object per newline, one writer/reader per pipe,
+supervisor→worker stdin and worker→supervisor stdout. stdout is protocol-only,
+diagnostics go to advisory stderr; workers flush each message, use
+`PYTHONUNBUFFERED=1`, `start_new_session=True`, `pass_fds=()`, and `close_fds=True`.
 
-Transport is **NDJSON over stdio**: exactly one pair of pipes per worker (supervisor
-writes worker stdin, worker writes supervisor stdout), UTF-8, one JSON object per
-`\n`-terminated line. This is the v0.1 transport carried into v2 unchanged
-(`system-design §4.1` "Newline-delimited JSON over stdin/stdout pipes"; `arch §5`
-"JSON-Lines (one JSON object per `\n`-terminated line, UTF-8)").
+Blank lines are skipped; invalid UTF-8/JSON is logged with line number and skipped;
+there is no length prefix. A partial line is buffered mid-stream, discarded/logged as
+`partial_line` at EOF, and never fabricated. EOF is advisory, not death; checkpoint-first
+result persistence recovers a torn `result` line. The draft adds `MAX_LINE_BYTES=1_048_576`:
+over-limit lines resync at the next newline, log `line_too_long`, and are discarded;
+sender caps are heartbeat status ≤200 chars, progress message ≤200, command ≤512.
+stderr has no protocol semantics and is mirrored as advisory `worker_stdout_line`.
 
-### 1.1 Channel invariants (from `arch §5.1`)
+## 2. Message classes and envelopes
 
-1. **One writer, one reader per pipe.** Supervisor is the only writer of worker stdin;
-   worker is the only writer of supervisor stdout. Worker blocks on `readline()`
-   between messages; no polling.
-2. **stdout is reserved for the protocol.** Worker debug output goes to **stderr**,
-   which is unstructured and advisory only (`arch §5.1.5`; `system-design §4.1`
-   "Worker stdout is never used for debug logging"). No `print()` in worker code or its
-   dependencies; stdout is re-shim'd and `PYTHONUNBUFFERED=1` is set (`arch §5.1.2`,
-   `§5.1.3`).
-3. **No shared FDs.** Worker-spawned subprocesses use `pass_fds=()` and `close_fds=True`;
-   workers are spawned with `start_new_session=True` so the whole subtree can be killed
-   via process group (`arch §5.1.6`, `§7.2`).
-4. **Blocking reads, buffered writes.** Supervisor writes to worker stdin through
-   `asyncio` pipe buffering; the worker blocks on read (`arch §5.1.1`). Worker flushes
-   stdout after every message (`flush=True`) — implied by `system-design §4.1` "Worker
-   must flush stdout after each message".
-
-### 1.2 Line discipline
-
-- Each line must be a **single JSON object** (`json.loads`). A line that fails to parse
-  is **logged with its line number and skipped**; the stream is not corrupted
-  (`arch §5.1.4`). It is a protocol error, not a connection failure (see §4.1).
-- **Empty and whitespace-only lines are skipped, not errors.** `json.loads` of a blank
-  line is a parse failure, so receivers skip blank lines *before* parsing (this matches
-  the v0.1 supervisor loop: `line = line.strip(); if not line: continue` in
-  `system-design §4.1` M4 `_read_worker_output`).
-- **Encoding:** UTF-8 both ways. Non-UTF-8 bytes in a line are a `bad_json` protocol
-  error (decoding failure), logged and skipped.
-- **Message boundaries are the newline only.** No length prefixes, no binary framing.
-  This is a deliberate trade: rare torn lines are accepted and handled (below) in
-  exchange for parser simplicity (`arch §5.4(c)` "Length-prefixed framing is not used").
-
-### 1.3 Partial lines
-
-- **Mid-stream:** a partial line is simply buffered by the reader until the terminating
-  newline arrives. No action is needed; NDJSON framing is self-synchronizing at the
-  newline.
-- **At EOF:** a partial line (bytes after the last newline, or a line torn by SIGKILL
-  mid-`write()`) is **discarded and logged** (`partial_line` protocol event). The
-  receiver must not fabricate a message from it. Consequence risk (a torn `result`
-  envelope lost) is mitigated by the architecture, not by framing: the worker persists
-  its result to the checkpoint store **before** emitting the envelope, and the
-  supervisor recovers from checkpoints (`arch §5.4(c)`).
-- **EOF itself is not death** — see §4.4. EOF triggers the escalation sequence, not an
-  immediate "worker dead" conclusion (`arch §5.3`).
-
-### 1.4 Max line length policy
-
-The architecture doc specifies no line-length cap; this is a **draft addition**
-(flagged in §7).
-
-- **Default cap: 1 MiB per line** (`MAX_LINE_BYTES = 1_048_576`). All lines in the
-  normal catalogue are far below this: `summary` is capped at 2k chars (`arch §3.4`),
-  `status`/`message` strings are bounded by sender-side truncation (see below). The cap
-  exists to bound reader memory against a pathological or malicious peer.
-- **On exceed:** the receiver stops buffering the line, continues consuming bytes until
-  the next `\n` (resync), logs a `line_too_long` protocol event with the byte count, and
-  discards the line. The stream remains usable.
-- **Sender-side truncation (draft):** free-text fields that can grow are truncated at
-  emit time to bound line size — `heartbeat.status` ≤ 200 chars, `progress.message` ≤
-  200 chars, `progress.cmd` ≤ 512 chars. `result_envelope` tails are already capped (§3).
-
-### 1.5 Trailing garbage
-
-NDJSON requires **nothing after the final newline** except stream close (EOF).
-
-- Trailing bytes that do not form a complete line are a *partial line* (handled in
-  §1.3): discarded and logged at EOF.
-- A trailing empty line (bare newline) is skipped (§1.2).
-- Trailing bytes that do form complete lines are legitimate protocol messages — there is
-  no concept of "extra" lines in NDJSON. The stream ends only when the pipe closes.
-
-### 1.6 stderr
-
-stderr is free-form advisory log output. The supervisor reads it opportunistically and
-writes it to the event log as `worker_stdout_line` events (the events catalog's name for
-arch §13's `log`; §8.1), level-tagged. **No protocol semantics
-depend on stderr** (`arch §5.1.5`, `§13`). The `result_envelope.stderr_tail` (§3) is the
-only place stderr content enters the protocol, and it is advisory.
-
----
-
-## 2. Message catalogue
-
-Two directions, three message classes:
-
-| Class | Who sends | Semantics |
-|---|---|---|
-| **Request** | orchestrator → worker | Carries `request_id`; expects a response (ok/error envelope) |
-| **Response** | worker → orchestrator | Correlates to a request via the echoed `request_id` |
-| **Event** | worker → orchestrator | Fire-and-forget; no response; `request_id` only where it echoes `init` for correlation |
-
-`request_id` is a ULID (monotonic-ish), assigned by the sender; every response echoes it
-(`arch §5` "Every request carries a request_id (ULID, monotonic-ish). Every response
-that completes a request echoes the same request_id"). Wire messages are flat JSON
-objects (`type`, then `request_id` for requests/responses, then type-specific fields)
-matching the flat style of `arch §5.2` examples.
-
-Message count in this catalogue: **6 orchestrator→worker request types, 3 worker→
-orchestrator response kinds, 6 worker→orchestrator event types — 15 message kinds**
-(counting the optional retained `context` request; the abstract `ok`/`error` envelopes
-cover the request types).
-
-### 2.1 Envelope shapes
-
-Request envelope (abstract; `request_id` required):
+Requests carry sender-assigned ULID `request_id`; responses echo exactly one ID. Events
+are fire-and-forget. Draft count: six requests (`init`, `context`, `run_task`,
+`check_health`, `cancel`, `shutdown`), specialized `ready` plus generic `ok`/`error`,
+and six events (`heartbeat`, `progress`, `checkpoint`, `result_envelope`, `fatal_error`,
+`exit_message`) — 15 kinds. There are no ACK loops.
 
 ```jsonc
-{"type":"<request_type>", "request_id":"01J…", /* type-specific fields */}
+{"type":"<request>","request_id":"01J…",…}
+{"type":"ok","request_id":"01J…",…}
+{"type":"error","request_id":"01J…|null",
+ "error":{"code":"PROTO_…|WORKER_…","message":"…","recoverable":false}}
 ```
 
-Response envelopes (worker → orchestrator):
+Unparseable/oversized input has `request_id:null`; unknown response IDs are
+`PROTO_UNKNOWN_REQUEST_ID`, logged/dropped.
+
+### 2.1 Requests (orchestrator → worker)
+
+**`init`** is first and configures one task:
+
+| Field | Type / definition |
+|---|---|
+| `type` | `"init"` |
+| `request_id` | ULID; echoed by ready/result/error; exit echo is draft extension (#7). |
+| `proto` | int draft version (1). |
+| `task_id` | stable string, never PID. |
+| `generation` | monotonic fencing token. |
+| `worktree`, `base_commit` | absolute worktree path and starting SHA. |
+| `spec`, `context?` | task text and optional context. |
+| `max_turns` | ReAct loop bound. |
+| `tools` | allowlist; unknown tool is nonrecoverable. |
+| `fanout_config` | Diffundo config, no API keys. |
+| `provider_env_keys` | names only (values are environment-bound). |
+| `permissions` | e.g. `{"network":false,"shell":true}`. |
+| `heartbeat` | `{"interval_s":15,"timeout_s":90}`. |
+| `budget` | `{"max_wall_s":1800,"max_restarts":10}`. |
+| `resume_from_checkpoint?` | checkpoint `state_ref` on restart. |
+
+Response is `ready`; default `ready_timeout=60 s`. Unsupported proto or unknown tool is
+`error`, `recoverable:false`.
+
+**`context`** (`request_id`, `context`) is a best-effort push with no required response.
+**`run_task`** (`request_id`, `task_id`, `spec`, `max_turns?`, `context?`) is a draft
+persistent-worker extension; `ok` acknowledges start, terminal state is an event.
+**`check_health`** (`request_id`) is the draft name for arch `ping`; `ok` carries
+`task_id`, `monotonic_ms` (pong), deadline 10 s. **`cancel`** (`request_id`, `reason?`)
+returns `ok`, then cancelled result/exit; **`shutdown`** (`request_id`, `reason?`) is a
+cooperative draft extension, with signal escalation still authoritative.
+
+### 2.2 Responses and events (worker → orchestrator)
+
+`ready` echoes `task_id`, `pid`, `generation`, `proto`, `monotonic_ms`; no further request
+is sent before it. Generic `ok` covers run/health/cancel/shutdown; `error` uses §4 codes.
+
+| Event | Fields | Semantics |
+|---|---|---|
+| `heartbeat` | `task_id`, `generation`, `turn`, `tool|null`, `status≤200`, `monotonic_ms` | progress/liveness, not death proof. |
+| `progress` | `task_id`, `generation`, `turn`, `phase=tool|reasoning|llm`, `message≤200`, optional `tool/cmd≤512/exit_code/duration_ms` | draft generalization of arch `tool_event`; D6 says valid line is never raw output. |
+| `checkpoint` | `task_id`, `generation`, `turn`, atomic `state_ref`, `commits_so_far` | durable resume point. |
+| `result_envelope` | request/task/generation plus §3 | terminal report. |
+| `fatal_error` | request/task/generation, `error_type`, `message`, `partial_commits`, `recoverable` | arch `error`; followed by exit. |
+| `exit_message` | task/generation, `reason=done|crash|cancelled|fatal`, `monotonic_ms` | mandatory authoritative terminal signal; request echo is draft extension. |
+
+`progress(phase="tool")` is deferred `tool_event` (events D12); reconstruct from
+heartbeat/checkpoint until reconciled. Missing exit means CRASHED even if result arrived;
+generation mismatch emits fatal exit (optionally `fatal_error`).
+
+## 3. Result envelope
 
 ```jsonc
-{"type":"ok",    "request_id":"01J…", /* echoes the request's id; type-specific fields */}
-
-{"type":"error", "request_id":"01J…|null", "error":{
-    "code":"PROTO_…|WORKER_…", "message":"human-readable", "recoverable":bool}}
+{"type":"result_envelope","request_id":"01J…","task_id":"wt-abc-001","generation":3,
+ "status":"succeeded","exit_code":0,"commits":["a1b2c3d"],
+ "files_changed":["src/dry_run.rs"],"diff":"…","stdout_tail":"","stderr_tail":"…",
+ "summary":"Removed 3 global statics.",
+ "metrics":{"metric_score":0.84,"metric_breakdown":{"tests":1.0,"spec_adherence":0.9,"diff_quality":0.7,"canaries":1.0}},
+ "failure_reason":null,"started_at":1786147200.0,"ended_at":1786147800.0}
 ```
 
-- `request_id` in an `error` is the echoed id when the request was parseable, else
-  `null` (bad-JSON/oversized lines cannot be correlated; the supervisor logs them with a
-  line number instead — `arch §5.1.4`).
-- **Correlation rule:** the worker sends exactly one response per request (see the
-  per-request tables; `run_task` completes with a `result_envelope` *event*, not a
-  response). A response whose `request_id` the orchestrator does not recognize is a
-  `PROTO_UNKNOWN_REQUEST_ID` protocol error (§4.1), logged and dropped.
-- **No ACK loops.** Events never produce acknowledgements (matches the v0.1 anti-pattern
-  "bidirectional agent-to-agent messaging degenerates into ACK loops",
-  `system-design §2.2`).
+| Field | Definition |
+|---|---|
+| `status` | `succeeded|failed|timeout|cancelled` draft vocabulary; maps succeeded→arch `done`; `rejected` is supervisor-only. |
+| `exit_code` | 0 done, 1 failed, 3 timeout, 4 cancelled; 2 rejected and >100 supervisor crash are not worker outcomes. |
+| `commits`, `files_changed` | Produced SHAs and changed paths. |
+| `diff` | Draft `git diff base..worktree`, capped 64 KiB; evaluator input. |
+| `stdout_tail`, `stderr_tail` | Optional ≤200-line diagnostics; stdout protocol remains clean. |
+| `summary` | Worker-authored, ≤2k chars. |
+| `metrics` | Draft nesting of `metric_score`/`metric_breakdown`; flatten when writing `Result`. |
+| `failure_reason` | Set when status is not succeeded. |
+| `started_at`, `ended_at` | Wall-clock bounds; ended is envelope timestamp. |
 
-### 2.2 Orchestrator → worker: requests
+Terminal mapping (events seam 2): succeeded→`worker_finished`/done; failed→`worker_failed`;
+timeout→failed/watchdog kill; cancelled→`worker_killed`. Custos adds `session_id` and
+`event_log_ref` when writing `result.json`.
 
-**`init`** — spawn-time configuration. Sent once, first, over stdin; the worker must
-not process any other request before `init`.
+## 4. Error and liveness policy
 
-| Field | Type | Notes / source |
+### 4.1 Protocol errors
+
+| Code | Condition | Handling |
 |---|---|---|
-| `type` | `"init"` | |
-| `request_id` | ULID | echoed by `ready`, `result_envelope`, `fatal_error` (`arch §5.2`); echoed by `exit_message` as a **draft extension** — arch §5.2's `exit` message carries no `request_id` (Reconciliation #7) |
-| `proto` | int | draft protocol version (§5) |
-| `task_id` | str | stable task id, not PID (`system-design §2.1`; `arch §5.2`) |
-| `generation` | int | fencing token, monotonically increasing per task (`arch §7.3`) |
-| `worktree` | abs path | the worker's private worktree (`arch §5.2`) |
-| `base_commit` | sha | worktree starts here (`arch §5.2`, `§7.5`) |
-| `spec` | str | the task spec (`arch §5.2`) |
-| `context` | str? | optional; draft folds the arch `context` message here (see below) |
-| `max_turns` | int | ReAct loop bound (`arch §5.2`) |
-| `tools` | list[str] | tool allowlist; a tool outside this set is `unknown_tool` (`arch §5.2`, `§7.4`) |
-| `fanout_config` | object | `DiffundoConfig`, **no API keys** (`arch §5.2`, `§9.3`) |
-| `provider_env_keys` | list[str] | env-var **names only**; values from inherited env (`arch §5.2`, `§12`) |
-| `permissions` | object | e.g. `{"network":false,"shell":true}` (`arch §5.2`) |
-| `heartbeat` | object | `{"interval_s":15,"timeout_s":90}` (`arch §5.2`, `§7.6`) |
-| `budget` | object | `{"max_wall_s":1800,"max_restarts":10}` (`arch §5.2`, `§7.4`) |
-| `resume_from_checkpoint` | str? | checkpoint `state_ref` re-injected on restart (`arch §6.4`) |
-
-Response: `ready` (specialized `ok`, §2.3). **Deadline:** `ready_timeout`, default 60 s
-(§6). Error paths: unsupported `proto` → `error` `recoverable:false` (§5); `unknown_tool`
-in `tools` → `error` `recoverable:false` (`arch §7.4`).
-
-**`context`** — additional context push, retained from `arch §5.2`
-(`{"type":"context","request_id":"…","context":"…"}`). Best-effort; may be sent any time
-after `init` and before the worker finishes. **No required response** — the arch schema
-shows none, so the draft treats it as a request-with-request_id but no response deadline
-(flagged in §7).
-
-**`run_task`** — task dispatch. In the architecture, one worker process executes exactly
-one task delivered entirely by `init` (`arch §14` defers a persistent pool to v2.1
-"because it requires a different IPC model (multiple init messages per process)"). This
-draft nevertheless defines `run_task` as the **task-enqueue request** so the catalogue
-covers the persistent-worker shape the arch defers; for v2 the supervisor sends `init`
-followed by `run_task` with the same spec body, and the worker responds `ok` once its
-ReAct loop starts. This is a **draft extension**, flagged in §7.
-
-| Field | Type |
-|---|---|
-| `type` | `"run_task"` |
-| `request_id` | ULID |
-| `task_id` | str |
-| `spec` | str |
-| `max_turns` | int? |
-| `context` | str? |
-
-Response: `ok` (loop started). **No RPC deadline** — the run is bounded by
-`budget.max_wall_s` and the heartbeat watchdog (§6). Terminal outcome arrives as the
-`result_envelope` event (§2.4).
-
-**`check_health`** — liveness probe. Draft name for the arch `ping` request
-(`{"type":"ping","request_id":"…"}`, `arch §5.2`); semantics identical (flagged in §7).
-Used during the EOF-escalation sequence (§4.4) and on demand.
-
-| Field | Type |
-|---|---|
-| `type` | `"check_health"` |
-| `request_id` | ULID |
-
-Response: `ok` (with `task_id`, `monotonic_ms` — the arch `pong` body, `arch §5.2`).
-**Deadline:** 10 s pong deadline (§6). Silence → escalation sequence (§4.4).
-
-**`cancel`** — cooperative cancellation of the current task.
-
-| Field | Type |
-|---|---|
-| `type` | `"cancel"` |
-| `request_id` | ULID |
-| `reason` | str? (e.g. `"timeout"`, `"user"`, `"host"`) |
-
-Response: `ok` (acknowledged). The worker then terminates, emitting `result_envelope`
-(status `cancelled`) and/or `exit_message` (`reason:"cancelled"`) (§2.4, §4.4). **No
-strict RPC deadline**: the orchestrator waits `graceful_s` (default 10 s) before SIGTERM,
-then `term_grace_s` (default 5 s) before SIGKILL, on the process group (`arch §7.7`).
-
-**`shutdown`** — graceful worker termination. **Draft extension**: the arch has no wire
-shutdown message — the supervisor terminates via process-group signals (`arch §7.7`).
-Draft retains it as the cooperative path; on receipt the worker must finish its current
-step and exit with `exit_message` `reason:"cancelled"` (flagged in §7).
-
-| Field | Type |
-|---|---|
-| `type` | `"shutdown"` |
-| `request_id` | ULID |
-| `reason` | str? |
-
-Response: `ok`. Deadline: `graceful_s` (10 s) before SIGTERM escalation (`arch §7.7`).
-
-### 2.3 Worker → orchestrator: responses
-
-**`ready`** — the `ok` specialization for `init` (arch-listed message, `arch §5.2`):
-
-```jsonc
-{"type":"ready","request_id":"01J…","task_id":"wt-abc-001","pid":12345,
- "generation":3,"proto":1,"monotonic_ms":…}
-```
-
-`generation` confirms the worker accepted this fencing generation (`arch §7.3`); `proto`
-echoes the negotiated protocol version (§5). The orchestrator must not send further
-requests until `ready` (`arch §7.2` "waits for ready before considering the worker
-RUNNING").
-
-**`ok`** — generic success response for `run_task`, `check_health`, `cancel`, `shutdown`
-(abstract shape in §2.1; body is request-specific).
-
-**`error`** — generic failure response (shape in §2.1; codes in §4). Sender-side protocol
-errors from the worker (unparseable request, unknown request type, out-of-order) use
-`request_id:null` unless the request was parseable.
-
-### 2.4 Worker → orchestrator: events (fire-and-forget)
-
-All events carry `task_id`. `heartbeat`, `checkpoint`, `result_envelope`, `fatal_error`,
-and `exit_message` additionally echo `generation` — `arch §7.3` requires generation on
-`heartbeat`/`checkpoint`/`result`/`error`/`exit` (of which `fatal_error`/`exit_message`
-are the draft's wire names for `error`/`exit`); the draft extends it to `progress`.
-`result_envelope` and `fatal_error` echo the `init` `request_id` (`arch §5.2`);
-`exit_message` echoes it as a **draft extension** — arch §5.2's `exit` message carries no
-`request_id` (Reconciliation #7). Events are never acknowledged.
-
-| Event | Purpose | Key fields | Source |
-|---|---|---|---|
-| `heartbeat` | Liveness: "I am alive and working" | `turn`, `tool` (currently-running tool or null), `status` (≤200 chars), `monotonic_ms` | `arch §5.2`, `§7.6` |
-| `progress` | Work-in-progress detail (draft generalization of arch `tool_event`) | `turn`, `phase` (`"tool"` \| `"reasoning"` \| `"llm"`), `message` (≤200 chars), `tool`/`cmd`/`exit_code`/`duration_ms` when `phase=="tool"` | draft; arch `tool_event` `arch §5.2` |
-| `checkpoint` | Durable resume point | `turn`, `state_ref` (atomic write), `commits_so_far` | `arch §5.2`, `§6.4` |
-| `result_envelope` | Terminal outcome | full schema in §3 | arch `result` `arch §5.2` |
-| `fatal_error` | Terminal error | `error_type`, `message`, `partial_commits`, `recoverable` | arch `error` `arch §5.2` |
-| `exit_message` | **The authoritative death signal — the ONLY death signal per the liveness model** | `reason` ∈ {`done`,`crash`,`cancelled`,`fatal`}, `monotonic_ms` | `arch §5.2`, `§5.3` |
-
-Notes on the event set:
-
-- **`progress` subsumes `tool_event`** (draft reconciliation, flagged in §7): a
-  tool-level `tool_event` (`arch §5.2`) is a `progress` event with `phase:"tool"` and the
-  `tool`/`cmd`/`exit_code`/`duration_ms` fields populated. `cmd` is truncated to ≤512
-  chars at emit.
-- **`progress` ↔ event-log mapping (seam 1, joint with the events draft).** The wire
-  `progress(phase="tool")` message is the v1 placeholder for the events catalog's deferred
-  `tool_event` kind (events draft D12). Valid protocol lines are never raw-echoed (events
-  draft D6), so a `progress` line is *not* recorded as `worker_stdout_line`; only the
-  tool's non-protocol bytes (stderr / unparseable stdout) land there. The structured
-  tool-event content is deferred to a `tool_event` kind in v2.1; until then consumers
-  reconstruct from `heartbeat.tool` + the checkpoint trail. The events draft states the
-  identical resolution (seam 1).
-- **`exit_message` is mandatory.** It is the final line before process exit. A worker
-  that exits without emitting `exit_message` is treated as crashed, **even if
-  `result_envelope` was already sent** — the supervisor cross-checks (`arch §5.2`,
-  `§5.3`).
-- **`fatal_error` covers the arch `error` message**, including `recoverable`. The draft
-  names it `fatal_error` because it always precedes `exit_message` (`reason:"fatal"` for
-  `recoverable:false`, `reason:"crash"` for `recoverable:true`).
-- **Generation-mismatch termination** (`arch §7.3`) is `exit_message` `reason:"fatal"`
-  directly, optionally preceded by `fatal_error` with `error_type:"generation_mismatch"`.
-
----
-
-## 3. Result envelope schema
-
-The `result_envelope` event is the worker's terminal report. It maps onto the public
-`Result` dataclass (`arch §3.4`) and the scaffold's `WorkerFinished` (`events.py`); the
-supervisor enriches it with session-level fields when writing `result.json` (§8.2).
-
-```jsonc
-{
-  "type": "result_envelope",
-  "request_id": "01J…",              // echoes init
-  "task_id": "wt-abc-001",
-  "generation": 3,
-  "status": "succeeded",             // succeeded | failed | timeout | cancelled
-  "exit_code": 0,                    // arch §16.4 mapping: 0/1/3/4 (see §4.3)
-  "commits": ["a1b2c3d"],
-  "files_changed": ["src/dry_run.rs"],
-  "diff": "diff --git a/src/dry_run.rs b/src/dry_run.rs …",   // draft, capped 64 KiB
-  "stdout_tail": "",                 // draft, capped (see below)
-  "stderr_tail": "WARNING …",        // draft, capped (see below)
-  "summary": "Removed 3 global statics.",    // ≤2k chars (arch §3.4)
-  "metrics": {
-    "metric_score": 0.84,
-    "metric_breakdown": {"tests":1.0,"spec_adherence":0.9,"diff_quality":0.7,"canaries":1.0}
-  },
-  "failure_reason": null,            // populated when status != succeeded (arch §3.4)
-  "started_at": 1786147200.0,
-  "ended_at": 1786147800.0
-}
-```
-
-| Field | Type | Notes |
-|---|---|---|
-| `status` | enum | `succeeded` \| `failed` \| `timeout` \| `cancelled`. Draft names; **flag:** arch `Result.status` uses `done` and adds `rejected` (§7). `timeout` is normally supervisor-assigned (§2.4/§6), not self-reported. |
-| `exit_code` | int | Task-level code following `arch §16.4`: 0 done, 1 failed, 3 timeout, 4 cancelled (2 `rejected` and >100 supervisor crash are not worker outcomes). |
-| `commits` | list[str] | SHAs produced (`arch §3.4` `Result.commits`). |
-| `files_changed` | list[str] | Paths changed (`arch §3.4` `Result.files_changed`). |
-| `diff` | str | Draft addition — `arch §3.4` `Result` has no diff field, but the `ResultEvaluator` consumes a `diff` (`arch §10`, `§17.3`). Draft: `git diff base_commit..worktree`, capped at 64 KiB; empty when no work was produced. |
-| `stdout_tail` | str | Draft addition. Last ≤200 lines of tool output the worker chooses to attach (worker stdout itself is protocol-only, `arch §5.1.2`). Optional; empty when unset. |
-| `stderr_tail` | str | Draft addition. Last ≤200 lines of the worker's own stderr record; the supervisor independently retains its own capture as `worker_stdout_line` events (`arch §5.1.5`). |
-| `summary` | str | Worker-authored, ≤2k chars (`arch §3.4`). |
-| `metrics` | object | Draft nests the arch-flat `metric_score`/`metric_breakdown` (`arch §5.2` `result`) under a `metrics` object; the supervisor flattens when writing `Result`. Multi-signal metric per `arch §10`. |
-| `failure_reason` | str? | Set when `status != "succeeded"` (`arch §3.4`). |
-| `started_at` / `ended_at` | float | Wall-clock bounds (`arch §3.4`); `ended_at` doubles as the envelope timestamp. |
-
-**Terminal vocabulary cross-reference (seam 2):** the events draft
-(`docs/research/event-schema-draft.md`, §3.8 "Terminal status vocabulary") defines the
-shared mapping between `result_envelope.status`, the event-log terminal kinds, and
-`Result.status`: `succeeded` → `worker_finished` (`done`), `failed` → `worker_failed`,
-`timeout` → `worker_failed`(`timeout`) / `worker_killed`(`watchdog_timeout`), `cancelled`
-→ `worker_killed`(`cancelled`). This section and that table must stay in lockstep.
-
-Supervisor-side enrichment (not on the wire): `session_id`, `event_log_ref` — `Result`
-fields (`arch §3.4`) assembled by Custos when writing
-`${session_dir}/cambium/result.json` (`arch §16.2`).
-
----
-
-## 4. Error taxonomy
-
-### 4.1 Protocol errors (wire-level; detectable by either side)
-
-| Code | Condition | Handling | Source |
-|---|---|---|---|
-| `PROTO_BAD_JSON` | Line is not a valid JSON object, or not UTF-8 | Log with **line number**, skip line; stream unaffected | `arch §5.1.4` |
-| `PROTO_LINE_TOO_LONG` | Line exceeds `MAX_LINE_BYTES` (1 MiB, draft) | Log, resync to next `\n`, discard | draft §1.4 |
-| `PROTO_UNKNOWN_TYPE` | `type` missing or not in the catalogue | Receiver logs and ignores; a worker that received a parseable request responds `error` (`request_id` echoed) | draft; consistent with `arch §5.1.4` skip-and-continue |
-| `PROTO_MISSING_REQUEST_ID` | Request/response without `request_id` | Log and drop; a worker may ignore the request | draft |
-| `PROTO_OUT_OF_ORDER` | Message violates the state machine (result before `ready`; `run_task` before `init`; duplicate `init`; anything after `exit_message`) | Log and ignore; repeated violations on a worker → treat as crash (kill + restart) | draft; state machine is `arch §7.1` |
-| `PROTO_UNKNOWN_REQUEST_ID` | Response/event correlates to a request the supervisor never sent | Log and drop | draft; correlation rule §2.1 |
-
-Protocol errors never kill the supervisor and never corrupt the stream
-(`arch §5.1.4`). They are recorded as event-log entries; the draft maps them to the
-scaffold's `LogEvent(level="error")` (`events.py`) or a future `kind="parse_error"`
-event (v0.1 used `log_parse_error`, `system-design §4.1` M4).
-
-### 4.2 Worker errors (domain)
-
-Sent as `fatal_error` (terminal) or `error` (response):
-
-| Class | Example `error_type` | `recoverable` | Handling |
-|---|---|---|---|
-| Tool failure | `build_failure`, `test_failure`, `command_error` | `true` | Restart policy engages (burst cap, backoff, wall budget) — `arch §7.4` |
-| Spec/config error | `unknown_tool`, `invalid_spec`, `tool_not_allowed` | `false` | **No retry**; task fails immediately — `arch §7.4` "Non-recoverable errors skip the restart budget and fail immediately" |
-| Provider outage | `AllProvidersFailed` | `true` | Worker retries inside the tool boundary for `provider_patience_s` (180 s) before emitting; only then is it a worker failure — `arch §7.4` |
-| Internal error | unhandled exception type | `false` | Worker emits `fatal_error`, then `exit_message` `reason:"fatal"`; stderr traceback captured as `worker_stdout_line` (events catalog §3.4) |
-| Fencing violation | `generation_mismatch` | `false` | `exit_message` `reason:"fatal"` — `arch §7.3` |
-
-`partial_commits` accompanies `fatal_error` so the supervisor knows what survived
-(`arch §5.2` `error.partial_commits`).
-
-### 4.3 Exit codes and their meaning
-
-Two distinct code spaces; do not conflate:
-
-**Worker process exit code** (observed via `proc.wait()`): the wire contract is the
-presence of `exit_message`, not the code (`arch §5.3` "matches #1 inside 100 ms"). Draft
-convention: `0` = clean exit with `exit_message` emitted as the final line; non-zero or
-signal-death (`returncode < 0`) = abnormal, with signal number available. The supervisor
-must not rely on the code alone — see §4.4.
-
-**Task/session exit codes** (host contract, `arch §16.4`, `arch §3.4`):
-
-| Code | Meaning |
-|---|---|
-| 0 | done (draft: `succeeded`) |
-| 1 | failed |
-| 2 | rejected (reviewer verdict; not a worker outcome) |
-| 3 | timeout |
-| 4 | cancelled |
-| >100 | supervisor crash |
-
-The `result_envelope.exit_code` field (§3) uses this space. `rejected` (2) is assigned by
-the orchestrator's `ResultEvaluator` after merge (`arch §7.1` REJECTED state), never by a
-worker.
-
-### 4.4 How the supervisor distinguishes crash vs clean exit
-
-The liveness model is authoritative (`arch §5.3`, four layers in descending authority):
-(1) process exit, (2) `exit_message`, (3) heartbeat watchdog, (4) EOF (advisory).
-
-- **Clean exit:** `exit_message` received **and** `proc.wait()` agrees inside 100 ms.
-  `reason:"done"` → task DONE, no restart. `reason:"cancelled"` → task CANCELLED, no
-  restart. `reason:"fatal"` → task FAILED, no restart. `reason:"crash"` → restart policy
-  engages (`arch §7.4`).
-- **Crash:** process exited **without** `exit_message` — even if `result_envelope` was
-  already sent (supervisor cross-checks, `arch §5.2`). Restart policy engages
-  (`arch §7.4`); task FAILED once the absolute cap (10) or wall budget is exhausted.
-- **Ambiguous (EOF but process alive):** EOF alone is **not** death. The supervisor
-  schedules a 5 s grace timer, then `proc.poll()`. If still alive (e.g., a grandchild
-  holds the pipe), it escalates with `check_health` (`ping`); no `pong` within 10 s →
-  kill the **process group** (`arch §5.3`, `§5.4(a)`). Workers are spawned with
-  `start_new_session=True` for exactly this (`arch §7.2`).
-- **Watchdog kill:** 3 missed heartbeats (> `heartbeat.timeout_s`, default 90 s) → the
-  supervisor kills the worker; the kill path also handles grandchild pipe-holders
-  (`arch §5.3`, `§7.6`).
-- **Supervisor-induced stalls** are flagged, not blamed on the worker: a 30 s drain
-  deadline suspends heartbeat enforcement while the supervisor is stalled
-  (`arch §5.3`).
-
----
-
-## 5. Versioning
-
-- **Draft addition:** a `proto` integer field (draft value `1`), carried on `init`
-  (supervisor→worker) and echoed on `ready` (worker→supervisor). The architecture doc
-  defines no version field in §5.2 (flagged in §7).
-- **Semantics:** `proto` bumps on breaking changes — message removed/renamed, a required
-  field added, framing changed. Additive changes (new optional field, new event type)
-  are backward-compatible within a `proto`.
-- **Negotiation at init:** the supervisor sends `init` with its `proto`. If the worker
-  understands it, it echoes the same `proto` in `ready` — negotiation is then complete,
-  and the worker must not emit protocol messages before that. If the worker cannot
-  support the `proto`, it responds `error` with `recoverable:false` and
-  `error_type:"proto_unsupported"`, then exits; the supervisor marks the task FAILED
-  (per the `arch §7.4` non-recoverable rule). Because both ends ship in the same harness
-  release today, this path is defensive.
-- **Future:** a minor/major split or feature-negotiation handshake is deferred; the
-  draft deliberately keeps a single integer for v1.
-
----
-
-## 6. Timeouts
-
-Which messages require response deadlines, and the liveness timers.
-
-| Timer | Value | Applies to | Source |
-|---|---|---|---|
-| `ready_timeout` | 60 s (default) | `init` → `ready` response | `arch §7.2` |
-| `pong_deadline` | 10 s | `check_health` (`ping`) → `ok` (`pong`) response | `arch §5.3` |
-| `heartbeat.interval_s` | 15 s (default, per task in `init`) | worker → `heartbeat` events | `arch §5.2`, `§7.6` |
-| `heartbeat.timeout_s` | 90 s (default; 3 missed beats) | watchdog kill | `arch §5.2`, `§7.6` |
-| `budget.max_wall_s` | 1800 s (default, per task in `init`) | `run_task` wall clock | `arch §5.2`, `§7.4` |
-| `eof_grace_s` | 5 s | EOF → `proc.poll()` before escalation | `arch §5.3` |
-| `drain_deadline_s` | 30 s | supervisor read-loop stall (suspends heartbeat enforcement) | `arch §5.3` |
-| `graceful_s` / `term_grace_s` | 10 s / 5 s | `cancel`/`shutdown` → SIGTERM → SIGKILL on process group | `arch §7.7` |
-
-Response-deadline summary:
-
-- **`init` requires a response deadline** (`ready_timeout`). On expiry the worker is
-  killed and the restart policy engages (`arch §7.2`).
-- **`check_health` requires a response deadline** (`pong_deadline`). Silence feeds the
-  §4.4 escalation path.
-- **`cancel` and `shutdown` have no strict RPC deadline**; they are bounded by the
-  `graceful_s`/`term_grace_s` escalation ladder (`arch §7.7`).
-- **`run_task` and `context` have no response deadline**; the run is bounded by
-  `budget.max_wall_s` and the heartbeat watchdog.
-- **Events have no deadlines** — fire-and-forget by definition. Liveness is enforced by
-  the heartbeat watchdog, not by per-event responses.
-- Timer values are sent to the worker in `init.heartbeat`/`init.budget` so both sides
-  agree (`arch §5.2`). The architecture applies full jitter to the watchdog interval,
-  the fsync timer, and heartbeat emission (`arch §7.4`); the draft inherits that.
-
----
-
-## 7. Reconciliation vs architecture doc (flagged)
-
-This draft is a **proposal**. Where it names or structures messages differently from
-`arch §5.2` (the normative spec), the divergence is flagged here. Until a review
-resolves each row, the architecture doc wins.
-
-| # | Draft | Architecture doc (`arch §5.2` unless noted) | Flag |
-|---|---|---|---|
-| 1 | `run_task` request | No wire dispatch message; one task per process, delivered entirely by `init`. Persistent pool deferred to v2.1 ("requires a different IPC model", `arch §14`). | Draft extension — keep only if/when the persistent-worker IPC shape lands; harmless for v2 (send `init`+`run_task`). |
-| 2 | `shutdown` request | No wire shutdown message; supervisor terminates via process-group SIGTERM/SIGKILL (`arch §7.7`). | Draft extension — cooperative path is optional; signals remain the enforcement. |
-| 3 | `check_health` request | `ping` request (`arch §5.2`, `§5.3`). | Draft name only; wire semantics identical. Suggest adopting `ping`/`pong` verbatim or resolving names in review. |
-| 4 | Generic `ok`/`error` response envelopes | No generic envelope; each response message carries the echoed `request_id` directly (`arch §5.2` `ready`/`result`/`error`/`exit`). | Draft generalization. `ready` is kept as the concrete `init` response so the arch's message survives; `ok`/`error` are syntactic sugar over the same correlation rule. |
-| 5 | `progress` event | `tool_event` message (`arch §5.2`). | Draft generalization (tool_event = progress with `phase:"tool"`). Retain `tool_event` as an alias in v1 to avoid breaking the event-log contract (`arch §3.6` lists `tool_event` as an event kind). |
-| 6 | `fatal_error` event | `error` message with `recoverable` flag (`arch §5.2`, `§7.4`). | Draft rename emphasizing terminality; must keep the `recoverable` flag semantics. |
-| 7 | `exit_message` event | `exit` message, `reason` ∈ {done,crash,cancelled,fatal} (`arch §5.2`, `§5.3`). | Draft name only; the message itself is authoritative and identical. **Draft extension:** the draft's `exit_message` also echoes the `init` `request_id` — arch §5.2's `exit` message carries no `request_id`; drop the echo if the review prefers strict parity. |
-| 8 | `result_envelope.status` ∈ {succeeded,failed,timeout,cancelled} | `Result.status` ∈ {done,failed,rejected,timeout,cancelled} (`arch §3.4`, `§16.4`). | Draft maps `succeeded`→`done`. `rejected` (2) is an orchestrator/merge outcome, never a worker status — the draft intentionally omits it from the wire envelope; `Result` still carries it. |
-| 9 | `proto` version field on `init`/`ready` | No version field defined in `arch §5.2`. | Draft addition — required by the versioning requirement; low risk since both ends ship together. |
-| 10 | `MAX_LINE_BYTES` = 1 MiB; sender-side truncation caps | No line-length cap specified; torn lines accepted for parser simplicity (`arch §5.4(c)`). | Draft addition — the 1 MiB cap does not weaken the torn-line handling; a torn line over the cap is still dropped and resynced. |
-| 11 | `result_envelope` gains `diff`, `stdout_tail`, `stderr_tail`, nested `metrics` | arch `result` carries `status`, `commits`, `files_changed`, `summary`, `metric_score`, `metric_breakdown` (`arch §5.2`); `Result` has no diff/tails (`arch §3.4`). | Draft additions; `diff` is justified by `ResultEvaluator` input (`arch §10`). Tails are advisory diagnostics. Flatten `metrics` when writing `Result`. |
-| 12 | `context` folded into `init` (optional) and kept as separate request | Separate `context` request (`arch §5.2`). | Draft keeps both shapes; no behavioral change. |
-| 13 | Error taxonomy codes (`PROTO_*`) | `arch §5.1.4` covers parse failures only; other wire errors are unspecified. | Draft fills the gap consistently with skip-and-continue. |
-| 14 | `stdout_tail`/`stderr_tail` in result envelope | Worker stdout reserved for protocol; stderr advisory (`arch §5.1.2`, `§5.1.5`). | Draft additions do not write to stdout; they summarize already-captured content. |
-
-Not flagged (aligned): framing/NDJSON (`§5`), channel invariants (`§5.1`), `init` field
-set (`§5.2`), `ready` as the handshake response (`§7.2`), heartbeat semantics (`§7.6`),
-fencing (`§7.3`), restart policy (`§7.4`), checkpoint `state_ref` protocol (`§6.4`),
-`exit_message` authority (`§5.3`), task exit codes (`§16.4`).
-
----
-
-## 8. Consistency with the merged scaffold
-
-Verification rule: the catalogue must not contradict `events.py` or the `orchestrator.py`
-loop as merged. Read them; the following mapping is what the supervisor (Custos) will
-produce when it implements the Nuntius wire loop.
-
-### 8.1 Wire message → `events.py` event mapping
-
-| Wire message | Scaffold event (`events.py`) / catalog kind | Notes |
-|---|---|---|
-| `ready` (init response) | `WorkerStarted(task_id, pid)` | `pid` and `task_id` come straight from the `ready` body; `type="worker_started"`. |
-| `result_envelope` | `WorkerFinished(task_id, status, exit_code)` | `status` (any string is legal — the draft's `succeeded`/`failed`/`timeout`/`cancelled` assign cleanly) and `exit_code` map 1:1. Terminal vocabulary is shared with the events draft (§3.8, seam 2). |
-| `heartbeat` | `worker_heartbeat` (events draft §3.3) | `turn`, `tool`, `status` → payload; `monotonic_ms` → envelope. |
-| `checkpoint` | `worker_checkpoint` (events draft §3.5) | `state_ref`, `commits_so_far` → payload. |
-| `progress` (phase="tool") | no v1 kind — deferred `tool_event` (seam 1) | Valid protocol lines are never raw-echoed into `worker_stdout_line` (events draft D6); reconstruct from `heartbeat.tool` + the checkpoint trail; the `tool_event` kind lands in v2.1. Same resolution as the events draft (seam 1). |
-| `fatal_error` | `worker_error` (events draft §3.16) | Same arch `error` message (`arch §5.2`, `§7.4`); `recoverable` maps 1:1 (seam 2). |
-| `exit_message` | terminal encoding, by `reason` | `reason="done"` → `worker_finished`; `reason="crash"`/`"fatal"` → `worker_failed`; `reason="cancelled"` → `worker_killed` (events draft terminal vocabulary, seam 2). |
-| stderr | `worker_stdout_line` (events draft §3.4) | Non-protocol bytes; `level` parsed from prefixes (`arch §13`). |
-| protocol errors (§4.1) | `LogEvent(level="error")` | advisory; never affects control flow (`arch §5.1.4`). |
-
-The scaffold `Event` base (`type`, `timestamp`) and `WorkerStarted`/`WorkerFinished`
-carry the same correlation fields the wire does (`task_id`; `request_id`/`generation`
-can be added as fields later, matching `arch §3.6` `Event` schema).
-
-### 8.2 Relationship to `orchestrator.py` (the scaffold loop)
-
-- `src/cambium/orchestrator.py` is an **orchestration-layer placeholder** (`Architectus`
-  territory): `submit(task_spec)` enqueues and `run()` drains, emitting
-  `WorkerStarted`/`WorkerFinished` to a caller callback. It contains **no wire code**.
-- Per the layering (`arch §2`, `§4`), the wire endpoint is **Nuntius + Custos** in the
-  Deterministic Layer: Custos spawns the worker, sends `init` (the v0.1 supervisor
-  already does exactly this: `json.dumps({"type": "init", **spec})` in
-  `system-design §4.1` M4 `_spawn_worker`), and reads the worker's stdout line loop
-  (`system-design §4.1` M4 `_read_worker_output`). The draft's messages are the bytes on
-  that pipe; the scaffold's `WorkerStarted`/`WorkerFinished` events are emitted from the
-  `ready` and `result_envelope`/`exit_message` outcomes respectively.
-- The scaffold's `run()` loop is "placeholder lifecycle only" (`orchestrator.py`
-  docstring): it does not yet gate on `ready`, apply restart policy, or read the wire.
-  Nothing in this draft conflicts with its public surface; the wire loop lands in Custos.
-
-### 8.3 Example session trace
+| `PROTO_BAD_JSON` | invalid UTF-8/object | log line number, skip |
+| `PROTO_LINE_TOO_LONG` | >1 MiB | log, resync, discard |
+| `PROTO_UNKNOWN_TYPE` | missing/unknown type | log/ignore; parseable request gets error |
+| `PROTO_MISSING_REQUEST_ID` | missing correlation | log/drop |
+| `PROTO_OUT_OF_ORDER` | before ready, before init, duplicate init, after exit | log/ignore; repeated violation may kill/restart |
+| `PROTO_UNKNOWN_REQUEST_ID` | unsent correlation | log/drop |
+
+### 4.2 Worker errors
+
+`build_failure`, `test_failure`, `command_error` are recoverable; `unknown_tool`,
+`invalid_spec`, `tool_not_allowed`, internal exceptions, and `generation_mismatch` are
+nonrecoverable. `AllProvidersFailed` is recoverable after worker patience (180 s), not a
+worker restart. `partial_commits` is retained in fatal errors.
+
+### 4.3 Exit code/liveness distinction
+
+Process code alone is insufficient. Task/session codes are 0 done, 1 failed, 2 rejected,
+3 timeout, 4 cancelled, >100 supervisor crash. Clean requires exit message plus
+`proc.wait()` within 100 ms. Missing exit is crash/restart. EOF starts 5 s grace + poll,
+then ping/pong (10 s) and process-group kill; three missed heartbeats at 90 s kills.
+A 30 s drain deadline emits `supervisor_stall` and suspends heartbeat enforcement.
+
+## 5. Versioning, timers, reconciliation
+
+`proto=1` is a draft addition on init/ready. Breaking message/required-field/framing
+changes bump proto; optional fields/events are compatible. Draft timers: ready 60 s,
+pong 10 s, heartbeat 15/90 s, wall budget 1,800 s, EOF grace 5 s, drain 30 s,
+graceful/term grace 10/5 s. Events have no response deadlines.
+
+Reconciliation (all retained): (1) run_task extends arch init-only process; (2) shutdown
+extends signal-only shutdown; (3) check_health aliases ping/pong; (4) generic ok/error
+generalizes per-message responses; (5) progress aliases `tool_event`; (6) fatal_error
+aliases error + recoverable; (7) exit request echo is draft-only; (8) status maps to
+`Result` vocabulary; (9) proto field is additive; (10) 1 MiB cap/truncation is additive;
+(11) diff/tails/nested metrics are draft additions; (12) context is both init field and
+request; (13) PROTO taxonomy fills an unspecified gap; (14) tails summarize captured
+output. Architecture §5.2 wins unresolved rows. The event mapping remains ready→started,
+result→finished, heartbeat/checkpoint direct, fatal→worker_error, exit reason→terminal
+kind, stderr→worker_stdout_line; `orchestrator.py` remains a placeholder at this snapshot.
+
+Historical trace IDs/refs are retained: init request `01JWCKQN2E1Z9K5Y3M8P7R4T1`, task
+`wt-abc-001`, generation `3`, worker PID `12345`, tool `grep_code`, and `M1 Nuntius`.
+Open questions: ping naming, generic envelopes, run_task retention, cap sizes, and proto
+string versus int. This draft does not claim any of these proposals are current.
+
+## Appendix A — wire traces and boundary examples
+
+The historical happy-path trace used a stable request ID and generation:
 
 ```jsonl
-// supervisor → worker (stdin)
 {"type":"init","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1","task_id":"wt-abc-001",
- "proto":1,"generation":3,"worktree":"/abs/worktrees/wt-abc-001","base_commit":"a1b2c3d",
- "spec":"Refactor dry_run.rs to remove global state","max_turns":20,
+ "proto":1,"generation":3,"worktree":"/abs/worktrees/wt-abc-001",
+ "base_commit":"a1b2c3d","spec":"Refactor dry_run.rs","max_turns":20,
  "tools":["read_file","write_file","edit_file","run_shell","git_op","grep_code"],
- "fanout_config":{...},"provider_env_keys":["DEEPCODE_API_KEY"],
+ "fanout_config":{},"provider_env_keys":["DEEPCODE_API_KEY"],
  "permissions":{"network":false,"shell":true},
- "heartbeat":{"interval_s":15,"timeout_s":90},
- "budget":{"max_wall_s":1800,"max_restarts":10}}
-
-// worker → supervisor (stdout)
+ "heartbeat":{"interval_s":15,"timeout_s":90},"budget":{"max_wall_s":1800,"max_restarts":10}}
 {"type":"ready","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1","task_id":"wt-abc-001",
- "pid":12345,"generation":3,"proto":1,"monotonic_ms":...}
-
+ "pid":12345,"generation":3,"proto":1,"monotonic_ms":100}
 {"type":"heartbeat","task_id":"wt-abc-001","generation":3,"turn":1,
- "tool":"grep_code","status":"locating global statics","monotonic_ms":...}
-
+ "tool":"grep_code","status":"locating global statics","monotonic_ms":200}
 {"type":"progress","task_id":"wt-abc-001","generation":3,"turn":1,"phase":"tool",
  "message":"locating global statics","tool":"grep_code","cmd":"rg 'static' src/",
  "exit_code":0,"duration_ms":1200}
-
 {"type":"checkpoint","task_id":"wt-abc-001","generation":3,"turn":3,
  "state_ref":".../checkpoints/wt-abc-001/turn-003.json","commits_so_far":["a1b2c3d"]}
-
-{"type":"result_envelope","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1","task_id":"wt-abc-001",
- "generation":3,"status":"succeeded","exit_code":0,"commits":["a1b2c3d"],
- "files_changed":["src/dry_run.rs"],"diff":"...","summary":"Removed 3 global statics.",
- "metrics":{"metric_score":0.84,"metric_breakdown":{...}},
- "failure_reason":null,"started_at":...,"ended_at":...}
-
-{"type":"exit_message","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1","task_id":"wt-abc-001",
- "generation":3,"reason":"done","monotonic_ms":...}
-// request_id echo on exit_message is a draft extension — arch's exit carries none (Reconciliation #7)
-// EOF; proc.wait() == 0 within 100 ms → clean exit, task DONE (arch §5.3)
+{"type":"result_envelope","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1",
+ "task_id":"wt-abc-001","generation":3,"status":"succeeded","exit_code":0,
+ "commits":["a1b2c3d"],"files_changed":["src/dry_run.rs"],"diff":"…",
+ "summary":"Removed 3 global statics.","metrics":{"metric_score":0.84},
+ "failure_reason":null,"started_at":1.0,"ended_at":2.0}
+{"type":"exit_message","request_id":"01JWCKQN2E1Z9K5Y3M8P7R4T1",
+ "task_id":"wt-abc-001","generation":3,"reason":"done","monotonic_ms":300}
 ```
 
-Crash counter-example: the worker dies (SIGKILL) between the two lines above —
-`exit_message` never arrives → supervisor marks CRASHED regardless of the
-`result_envelope` already read (`arch §5.2` "treated as having crashed — even if result
-was already sent").
+The request echo on `exit_message` is explicitly a draft extension: strict architecture
+parity can drop it while keeping `exit` authoritative. If the worker dies between the
+result and exit lines, the supervisor marks CRASHED even if it already read the result;
+checkpoint/result durability is the recovery path. An EOF with a live grandchild runs
+the 5-second grace, `proc.poll()`, ping/pong, then process-group kill.
 
----
+## Appendix B — response and error examples
 
-## 9. Open questions for review (draft-only)
+`ready` is the only response that admits RUNNING. Generic `ok` bodies are request
+specific:
 
-1. Adopt `ping`/`pong` or keep `check_health` (Reconciliation #3)? Recommend `ping`/
-   `pong` verbatim for zero divergence.
-2. Keep the generic `ok`/`error` envelopes, or go fully per-type responses (#4)?
-3. Is `run_task` worth keeping in v1 (#1), or should v2 ship `init`-only dispatch?
-4. Are the draft caps sane: `MAX_LINE_BYTES` 1 MiB, `diff` 64 KiB, `status` 200 chars,
-   `cmd` 512 chars, tails 200 lines (#10, #11)?
-5. Should `proto` be a string like `"1"` for JSON-compat, or stay int (#9)?
+```json
+{"type":"ok","request_id":"01J…","task_id":"wt-abc-001","monotonic_ms":123}
+{"type":"error","request_id":"01J…","error":{"code":"WORKER_UNKNOWN_TOOL",
+ "message":"tool not in init.tools","recoverable":false}}
+```
 
+Protocol errors never crash the supervisor: `PROTO_BAD_JSON` records line number and
+skips; `PROTO_LINE_TOO_LONG` consumes through newline and resyncs; unknown type/request
+ID is logged/dropped; out-of-order input is ignored and repeated violations may cause a
+worker kill/restart. Domain classes remain separate:
 
+| Class | Example | Recoverable | Historical action |
+|---|---|:---:|---|
+| Tool | `build_failure`, `test_failure`, `command_error` | yes | bounded restart/backoff. |
+| Spec/config | `unknown_tool`, `invalid_spec`, `tool_not_allowed` | no | fail immediately. |
+| Provider | `AllProvidersFailed` | yes | worker patience 180 s, then recoverable error. |
+| Internal | unhandled exception | no | fatal error + fatal exit; stderr advisory. |
+| Fencing | `generation_mismatch` | no | fatal exit; no retry. |
 
+`partial_commits` remains attached to fatal errors so recovery knows what survived.
 
+## Appendix C — timer and state-machine matrix
+
+| Timer/state | Draft value | Trigger and action |
+|---|---:|---|
+| `ready_timeout` | 60 s | init without ready → kill/restart. |
+| `pong_deadline` | 10 s | ping without pong during EOF escalation → group kill. |
+| `heartbeat.interval_s` | 15 s | worker heartbeat cadence. |
+| `heartbeat.timeout_s` | 90 s | three missed beats → watchdog kill. |
+| `budget.max_wall_s` | 1,800 s | hard supervisor wall budget. |
+| `eof_grace_s` | 5 s | EOF then poll before escalation. |
+| `drain_deadline_s` | 30 s | read stall → `supervisor_stall`, suspend blame. |
+| `graceful_s/term_grace_s` | 10/5 s | cancel/shutdown → SIGTERM then SIGKILL. |
+
+Clean exit requires authoritative `exit_message` and `proc.wait()` within 100 ms.
+Process return code alone cannot distinguish a worker that emitted result then crashed.
+Task/session codes remain 0 done, 1 failed, 2 rejected, 3 timeout, 4 cancelled, >100
+supervisor crash; code 2 is never worker-generated.
+
+## Appendix D — reconciliation and scaffold boundaries
+
+The fourteen draft/architecture rows are retained: run_task persistent shape versus
+init-only worker; cooperative shutdown versus signal-only architecture; check_health
+versus ping; generic envelopes versus direct per-message responses; progress versus
+tool_event; fatal_error versus error; exit request echo; status succeeded versus Result
+done/rejected; proto field; one-MiB line cap; diff/tail/metrics fields; context in init
+plus separate request; PROTO taxonomy; and advisory output tails. Framing, init fields,
+ready gate, heartbeat/fencing/restart/checkpoint/exit authority and task codes align with
+architecture. Unresolved rows remain proposal-only.
+
+At the snapshot `orchestrator.py` queued specs and emitted seed
+`WorkerStarted`/`WorkerFinished`; it did not read wire messages, apply restart policy, or
+gate ready. Intended mapping was ready→started, result→finished, heartbeat/checkpoint
+direct, fatal→worker_error, exit reason→terminal event, stderr→worker_stdout_line. This
+mapping is historical and does not assert the scaffold owns Nuntius today.
+
+## Appendix E — protocol admission and bounded output
+
+The receiver state machine was intentionally strict at the boundary:
+
+```text
+NEW → INIT_SENT → READY → RUNNING → TERMINAL → EXITED
+             ↘ ERROR (recoverable or fatal)
+```
+
+`run_task`, `context`, `cancel`, and `shutdown` before `ready` produced
+`PROTO_OUT_OF_ORDER`; a duplicate `init` or any message after `exit_message` was also
+out of order. A worker response with an unknown request ID was logged and dropped rather
+than delivered to a later request. Events were not acknowledged, so a malformed advisory
+line could not create an ACK loop.
+
+The 1 MiB cap protected the supervisor against a malicious or accidental unbounded
+summary/diff. The receiver consumed bytes through the next newline before resuming, so a
+large line could not poison all following messages. Sender-side caps remained part of
+the contract: heartbeat/status 200 chars, progress message 200, command 512, summary
+2,000, diff 64 KiB, stdout/stderr tails 200 lines. These caps were draft additions to
+an architecture that deliberately used newline framing; they did not claim length-
+prefixed transport or atomic pipe writes.
+
+## Appendix F — worker/session exit mapping
+
+The wire and host code spaces were kept separate. Worker process `returncode=0` was only
+clean when an exit message arrived; `returncode<0` exposed a signal but still required
+the liveness state machine. Host task codes were 0 done, 1 failed, 2 rejected, 3 timeout,
+4 cancelled, >100 supervisor crash. A worker never emitted rejected (2), and the
+supervisor never treated a worker's `exit_code` as authoritative over a failed gate.
+
+Mapping by exit reason was deterministic: `done` plus wait→worker_finished; `cancelled`
+plus wait→worker_killed; `fatal`→worker_failed/nonrecoverable; `crash` or missing exit→
+restart policy. A result envelope followed by no exit remained a crash in the live path,
+even though replay used a durable critical result as DONE. This apparent difference was
+intentional: live liveness needed process evidence, while crash recovery needed durable
+evidence.
+
+`provider_env_keys` always carried names, never values. `fanout_config` could include
+provider tiers and capabilities but no API key. Permissions were descriptive in this
+draft; current source/tests, not this proposal, decide whether shell/network controls
+are enforced. stdout remained protocol-only even when a library attempted to print; such
+bytes were parse errors/advisory diagnostics, never debug semantics.
+
+## Appendix G — request field ownership and redaction
+
+`init.spec` and `context` were task data, not diagnostics; implementations were to log
+only size/checksum and correlation IDs. `fanout_config` carried routing choices but no
+API keys; `provider_env_keys` carried names and the host boundary resolved values. The
+permissions object described network/shell intent, while actual enforcement belonged to
+source-owned controls. The protocol itself never promised an OS sandbox or per-worker
+approval.
+
+`resume_from_checkpoint` was accepted only after generation fencing and worktree
+recovery. A stale checkpoint from another task or generation was a protocol/domain
+error, not a fresh context fallback. `request_id` linked the request to ready/result/error
+but did not identify the worker; task ID plus generation did. `pid` was an observation
+for event logs and orphan recovery, not an identity key.
+
+The result envelope was bounded before serialization: summary ≤2k, diff ≤64 KiB,
+stdout/stderr tails ≤200 lines, and metrics contained scalar score/breakdown fields only.
+The supervisor added session/result references after the worker event; it did not trust a
+worker's status over gate/merge verdict. These limits were proposal checks for a future
+Nuntius implementation, not a claim that a current worker emits this exact envelope.
+
+## Appendix H — explicit-tree wire boundary
+
+The draft intentionally had no implicit child-recursion message. Static DAG validation
+and admission happened in the harness; a dynamic `task_decomposed` proposal required a
+new validated wave. Each admitted child received a fresh bounded context, and only the
+strict upward result envelope was allowed back. A future `steer` or `shared_update` event
+was a distinct control-plane surface, not a way to send raw sibling history. Prefix
+stability could be measured for cache behavior, but this protocol made no provider-
+independent cost or latency claim.
+
+## Appendix I — framing corner cases
+
+Whitespace-only lines were skipped before `json.loads`, so a worker's final newline did
+not create a protocol error. Non-UTF-8 bytes were logged as `PROTO_BAD_JSON`; the reader
+did not attempt replacement decoding because a replacement character could change a
+request field. A partial line in the middle of a stream stayed buffered; a partial line
+at EOF was discarded and tagged. Complete lines after an otherwise valid message were
+not “trailing garbage”—NDJSON permits any number of messages until pipe close.
+
+When a line exceeded 1 MiB, the receiver stopped retaining bytes but continued consuming
+until newline to resynchronize. It then emitted a bounded advisory event with the byte
+count. The sender caps were applied before JSON serialization, so a large diff or stderr
+tail could not defeat the reader limit. This was a memory-safety draft addition to a
+newline protocol, not a promise that every source path currently enforces the cap.
+
+## Appendix J — request/response deadlines
+
+`init` required `ready` within 60 s; failure killed the process group and entered restart
+policy. `check_health`/`ping` required pong within 10 s during EOF escalation. `cancel`
+and `shutdown` had no strict RPC deadline because the host's 10 s/5 s signal ladder was
+the authority. `run_task` and `context` had no response deadline; wall budget and
+heartbeat watchdog bounded them. Events had no acknowledgement or deadline. Timer values
+were carried in init heartbeat/budget objects, and jitter was applied by the supervisor,
+not self-reported by the worker.
+
+The draft kept all request IDs sender-assigned and all response IDs echoed. A response
+cannot be matched by task ID alone because one persistent-worker shape could have several
+requests in flight; the current one-task-per-process architecture deferred that shape.
+This is why `run_task` was marked an explicit extension instead of silently treated as
+implemented.
+
+## Appendix K — typed error and reconciliation rules
+
+Protocol errors were transport facts. `PROTO_BAD_JSON` carried the stream and line
+number; `PROTO_TOO_LARGE` carried the discarded byte count; `PROTO_OUT_OF_ORDER` carried
+the observed state and message type; `PROTO_UNKNOWN_REQUEST` carried the request ID.
+They were never converted to a successful worker result. Domain errors were separate:
+`AllProvidersFailed` was recoverable during provider patience, a missing required field
+was nonrecoverable, and a generation mismatch fenced the sender. The host added gate,
+merge, timeout, cancellation, and supervisor errors after it had process evidence.
+
+The request/response examples preserved one important distinction: an `ok` response
+acknowledged receipt, while `worker_finished` or `result_envelope` carried the durable
+task outcome. A worker could return `ok` for `shutdown` and still fail to exit; the host
+then used the signal ladder and process-group wait. Similarly, a `checkpoint` event
+proved a resume point but did not prove that `result.json` or `refs/heads/main` had been
+published. Reconciliation consumed the authoritative store/ref evidence rather than
+guessing from a final line.
+
+The protocol's redaction boundary applied before logging, queue admission, and observer
+publication. API-key values, prompts, scratchpad text, and raw trajectories were never
+wire fields. `provider_env_keys` and permissions were names/intent only; this historical
+draft did not promise a per-worker OS sandbox or approval callback. A future explicit-tree
+harness could add control messages, but it would still require fresh context, bounded
+payloads, and strict upward envelopes.
+
+## Appendix L — handshake and generation examples
+
+The intended sequence was `init(request_id, task_id, generation)` → `ready(echo_id)` →
+`run_task`/events → terminal result → `exit_message` → process wait. A `ready` with the
+wrong request ID, a missing protocol version, duplicate init, or a result from an older
+generation was rejected and logged with its typed code. A new generation reused the task
+ID but changed `worker_id`; PID reuse therefore could not join old and new event streams.
+These checks were draft protocol tests, not evidence that every current worker path
+enforces them.
+
+The draft kept one writer per pipe. A supervisor request was serialized before write and
+flushed; a worker event was serialized by the worker and flushed before the next turn.
+Concurrent writes, shell diagnostics on stdout, and replacement decoding were rejected
+because they could corrupt request IDs or field boundaries. stderr remained advisory and
+bounded. These rules were protocol invariants, not a claim that a current process obeys
+them on every code path.
+
+The draft did not add a length prefix, binary side channel, or implicit child session.
+
+Every wire payload was bounded before serialization. Oversized advisory text was marked
+truncated; oversized critical fields caused a typed failure rather than silent growth.
+
+The worker could not enlarge a supervisor-owned limit.
+
+EOF triggered liveness inspection, not immediate failure. Process state and ping/group
+kill supplied the authoritative decision.
+
+This EOF rule was historical.
+
+Current framing is source-owned.
+
+No sandbox is implied.
+
+Approval is not promised.
+
+Source tests decide enforcement.
+
+NDJSON framing remains historical.
+
+Historical only.
+
+Historical review identifier retained: `M4`.
