@@ -260,8 +260,8 @@ demand when `merge_failed` resolution requires it (§7.8)."
   48): "PARTIAL. core directive in architectus; wiring verification remains." — the
   supervisor wiring is still OPEN.
 - **Reset/retry failure-table row (claim 12, ADOPT-LITE; §2 item 3): DONE.**
-  `architectus-design.md` §6 row 5 (line 737) codifies "Gate fail → steering
-  retries → exhausted → reset/retry once → abort" and row 14 (line 746) the
+  `architectus-design.md` §7 scenario 5 (line 737) codifies "Gate fail → steering
+  retries → exhausted → reset/retry once → abort" and scenario 14 (line 746) the
   "Directive and reset boundary/replay checks". `src/cambium/architectus.py`
   implements the reset/retry state machine (`FailureDecision.RESET_RETRY` line 64,
   `ActionKind.RESET_RETRY` line 52, `_reset_retry_attempted` lines 191–204,
