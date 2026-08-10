@@ -9,6 +9,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -16,6 +17,8 @@ import pytest
 
 import cambium.supervisor as supervisor_module
 from cambium.fencing import read_generation, validate_worker_generation, write_generation
+from cambium.ipc import MAX_LINE_BYTES
+from cambium.store import EventStore
 from cambium.supervisor import (
     DuplicateTaskIDError,
     SessionAlreadyRunningError,
@@ -166,6 +169,126 @@ def test_observer_mutation_does_not_change_queued_event_payload(tmp_path: Path) 
 
     persisted = _kinds(read_events(session_dir), "log")
     assert persisted[0]["payload"]["message"] == "durable-original"
+
+
+def test_write_json_accepts_max_content_and_rejects_one_byte_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Stdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+        async def drain(self) -> None:
+            return
+
+    class Process:
+        pid = 0
+
+        def __init__(self) -> None:
+            self.stdin = Stdin()
+
+    killed: list[Process] = []
+
+    async def record_kill(proc: Process) -> None:
+        killed.append(proc)
+
+    monkeypatch.setattr(supervisor_module, "_kill_worker", record_kill)
+
+    def message_with_content_size(size: int) -> dict[str, str]:
+        prefix = len(json.dumps({"payload": ""}).encode("utf-8"))
+        return {"payload": "x" * (size - prefix)}
+
+    async def scenario() -> Process:
+        exact = Process()
+        assert await supervisor_module._write_json(
+            exact, message_with_content_size(MAX_LINE_BYTES)
+        )
+        assert len(exact.stdin.writes) == 1
+        assert len(exact.stdin.writes[0][:-1]) == MAX_LINE_BYTES
+
+        oversized = Process()
+        assert not await supervisor_module._write_json(
+            oversized, message_with_content_size(MAX_LINE_BYTES + 1)
+        )
+        assert oversized.stdin.writes == []
+        return oversized
+
+    oversized = asyncio.run(scenario())
+    assert killed == [oversized]
+
+
+def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    worker = tmp_path / "stdout_flood_worker.py"
+    worker.write_text(
+        "import json, sys, time\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "ready = {'type': 'ready', 'request_id': init['request_id'], 'proto': 1}\n"
+        "print(json.dumps(ready), flush=True)\n"
+        "json.loads(sys.stdin.readline())\n"
+        "for index in range(1000):\n"
+        "    print(json.dumps({'type': 'log', 'message': str(index)}), flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    spec = _slice_spec(session_dir, str(worker))
+    spec["wall_budget_s"] = 0.25
+
+    async def observer(event: dict) -> None:
+        if event["kind"] == "log":
+            await asyncio.sleep(0.01)
+
+    started = time.monotonic()
+    result = asyncio.run(run_session(session_dir, spec, observer))
+
+    assert result.status == "failed"
+    assert result.timed_out is True
+    assert time.monotonic() - started < 5.0
+
+
+def test_runtime_event_admission_counts_noncritical_drops(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    started = threading.Event()
+    release = threading.Event()
+
+    def stalled_fsync(_store: EventStore) -> None:
+        started.set()
+        release.wait(5.0)
+
+    original_fsync = EventStore._fsync_now
+    EventStore._fsync_now = stalled_fsync
+    store = EventStore(
+        session_dir / ".cambium" / "events.db",
+        fsync_interval_s=0.01,
+        max_queue_size=1,
+    )
+    runtime = supervisor_module._Runtime(session_dir, store)
+
+    async def scenario() -> None:
+        await runtime.start()
+        await runtime.emit("log", message="first")
+        await asyncio.wait_for(asyncio.to_thread(started.wait, 2.0), timeout=3.0)
+        for index in range(100):
+            await runtime.emit("log", message=str(index))
+        assert store.dropped > 0
+        release.set()
+        await runtime.shutdown()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        EventStore._fsync_now = original_fsync
+        release.set()
+
+    persisted = _kinds(read_events(session_dir), "log")
+    assert len(persisted) < 101
 
 
 def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
