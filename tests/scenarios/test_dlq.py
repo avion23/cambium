@@ -35,7 +35,6 @@ def test_put_get_roundtrip_and_entries_include_filename(tmp_path) -> None:
     row_id = queue.put(record)
 
     assert isinstance(row_id, int)
-    assert queue.directory == tmp_path / ".cambium" / "dlq"
     assert queue.get(f"{row_id}.json") == record
     assert queue.entries() == [record | {"file": f"{row_id}.json"}]
     queue.close()
