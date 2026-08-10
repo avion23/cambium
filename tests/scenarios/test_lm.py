@@ -7,7 +7,6 @@ import importlib.util
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,7 @@ import pytest
 
 from cambium.architectus import ArchitectusCore
 from cambium.diffundo import CallResult, ProviderTier
-from cambium.lm import ArchitectusLM, CambiumLM, _load_dspy
+from cambium.lm import ArchitectusLM, CambiumLM
 from cambium.tasktree import build_tree
 
 
@@ -239,16 +238,71 @@ def test_credential_marker_variants_cannot_reach_dump_state(key: str) -> None:
         )  # type: ignore[arg-type]
 
 
-def test_concurrent_dspy_loads_preserve_cache_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_concurrent_dspy_loads_preserve_cache_environment() -> None:
     _require_dspy()
-    sentinel = "/tmp/cambium-dspy-cache-sentinel"
-    monkeypatch.setenv("DSPY_CACHEDIR", sentinel)
+    source = Path(__file__).resolve().parents[2] / "src"
+    script = """
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-    def load_repeatedly(_: int) -> None:
-        for _ in range(2000):
-            _load_dspy()
+sys.path.insert(0, sys.argv[1])
+import cambium.lm as lm
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        list(executor.map(load_repeatedly, range(16)))
+assert lm._DSPY is None
+assert "dspy" not in sys.modules
 
-    assert os.environ["DSPY_CACHEDIR"] == sentinel
+sentinel = "/tmp/cambium-dspy-cache-sentinel"
+os.environ["DSPY_CACHEDIR"] = sentinel
+cold_load_count = 0
+cold_load_count_lock = threading.Lock()
+start = threading.Barrier(16)
+
+
+real_temporary_directory = lm.tempfile.TemporaryDirectory
+
+
+def tracked_temporary_directory(*args, **kwargs):
+    global cold_load_count
+    with cold_load_count_lock:
+        cold_load_count += 1
+        first_load = cold_load_count == 1
+    if first_load:
+        time.sleep(0.1)
+    return real_temporary_directory(*args, **kwargs)
+
+
+class TempfileProxy:
+    TemporaryDirectory = staticmethod(tracked_temporary_directory)
+
+
+lm.tempfile = TempfileProxy()
+
+
+def load_repeatedly(_: int) -> list[object]:
+    start.wait()
+    return [lm._load_dspy() for _ in range(2000)]
+
+
+with ThreadPoolExecutor(max_workers=16) as executor:
+    loads = list(executor.map(load_repeatedly, range(16)))
+results = [value for load in loads for value in load]
+assert len(results) == 16 * 2000
+assert len({id(value) for value in results}) == 1
+assert lm._DSPY is results[0]
+assert cold_load_count == 1, cold_load_count
+assert os.environ["DSPY_CACHEDIR"] == sentinel
+"""
+    env = os.environ.copy()
+    env.pop("Py_GIL_DISABLED", None)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
