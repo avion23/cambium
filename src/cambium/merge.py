@@ -41,6 +41,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from cambium.process_env import build_subprocess_env
+
 MAIN_REF = "refs/heads/main"
 STAGING_REF_PREFIX = "refs/cambium/staging"
 
@@ -172,9 +174,15 @@ class MergeSequencer:
     # -- git plumbing -------------------------------------------------------
 
     @staticmethod
-    def _git_env() -> dict[str, str]:
-        """Environment for git subprocesses, quarantine-free (finding F5)."""
-        return {key: value for key, value in os.environ.items() if key != _QUARANTINE_ENV}
+    def _git_env(
+        cwd: str | Path | None = None,
+        overrides: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Strict environment for git and its hooks, quarantine-free."""
+        return build_subprocess_env(
+            worktree=Path(cwd) if cwd is not None else None,
+            overrides=overrides,
+        )
 
     def _run(
         self,
@@ -183,13 +191,19 @@ class MergeSequencer:
         check: bool = True,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        trusted_overrides = {
+            key: env[key]
+            for key in ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+            if env is not None and key in env
+        }
         try:
             result = subprocess.run(
                 ["git", *args],
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
-                env=self._git_env() if env is None else env,
+                env=self._git_env(cwd, trusted_overrides),
+                start_new_session=True,
             )
         except OSError as exc:
             # e.g. the repo path is a file, not a directory (NotADirectoryError)
@@ -243,11 +257,11 @@ class MergeSequencer:
             ) from None
 
     @staticmethod
-    def _rebase_env() -> dict[str, str]:
-        env = MergeSequencer._git_env()
-        env["GIT_EDITOR"] = "true"
-        env["GIT_SEQUENCE_EDITOR"] = "true"
-        return env
+    def _rebase_env(cwd: str | Path | None = None) -> dict[str, str]:
+        return MergeSequencer._git_env(
+            cwd,
+            {"GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"},
+        )
 
     def _conflicted_paths(
         self, worktree_path: Path, rebase_output: str
@@ -327,7 +341,8 @@ class MergeSequencer:
         self._staging_ref = staging_ref
 
         rebase = self._run(
-            worktree_path, "rebase", base_tip, check=False, env=self._rebase_env()
+            worktree_path, "rebase", base_tip, check=False,
+            env=self._rebase_env(worktree_path),
         )
         if rebase.returncode != 0:
             conflicts = self._conflicted_paths(worktree_path, rebase.stdout + rebase.stderr)
