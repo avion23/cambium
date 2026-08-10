@@ -930,3 +930,73 @@ def test_fresh_reset_invalidates_finished_task_and_suppresses_descendant_spawn()
     core.aggregate("root", _envelope(None, summary="rerun"))
     assert core.finished["root"]["summary"] == "rerun"
     assert core.in_flight == set()
+
+
+def test_rejected_mixed_failure_wave_preserves_deterministic_reset() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("a", "TEST", ["root"], None),
+                ("b", "TEST", ["root"], None),
+            ]
+        )
+    )
+    llm = ScriptedLLM(
+        [
+            [{"action": "spawn", "task_id": "root"}],
+            [
+                {"action": "spawn", "task_id": "a"},
+                {"action": "spawn", "task_id": "b"},
+            ],
+            [
+                {"action": "replan", "task_id": "b"},
+                {"action": "unknown_action", "task_id": "b"},
+            ],
+        ]
+    )
+    core = ArchitectusCore(llm, tree=tree, max_width=2)
+
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+    core.aggregate("root", _envelope(None))
+    assert asyncio.run(core.step([])) == [
+        {"action": "spawn", "task_id": "a"},
+        {"action": "spawn", "task_id": "b"},
+    ]
+
+    gate_event = {"kind": "gate_failed", "task_id": "a", "retries_remaining": 0}
+    conflict_event = {"kind": "merge_failed", "task_id": "b", "reason": "conflict"}
+    with pytest.raises(ValueError, match="unknown Architectus action"):
+        asyncio.run(core.step([gate_event, conflict_event]))
+
+    assert core.reset_retry_tasks == frozenset()
+    assert core.in_flight == {"a", "b"}
+    assert core.action_history == [
+        {"action": "spawn", "task_id": "root"},
+        {"action": "spawn", "task_id": "a"},
+        {"action": "spawn", "task_id": "b"},
+    ]
+
+    assert asyncio.run(core.step([gate_event])) == [
+        {"action": "reset_retry", "task_id": "a"}
+    ]
+    assert core.reset_retry_tasks == frozenset({"a"})
+    assert core.in_flight == {"a", "b"}
+    assert core.action_history[-1] == {"action": "reset_retry", "task_id": "a"}
+
+
+def test_event_fresh_reset_invalidates_finished_result_for_rerun() -> None:
+    tree = build_tree(_plan([("root", "FEATURE", [], None)]))
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+    core.aggregate("root", _envelope(None, summary="stale"))
+
+    event = {"kind": "gate_failed", "task_id": "root", "retries_remaining": 0}
+    assert asyncio.run(core.step([event])) == [
+        {"action": "reset_retry", "task_id": "root"}
+    ]
+    assert core.finished == {}
+    assert core.in_flight == {"root"}
+
+    core.aggregate("root", _envelope(None, summary="rerun"))
+    assert core.finished["root"]["summary"] == "rerun"
+    assert core.in_flight == set()

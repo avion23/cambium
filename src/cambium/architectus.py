@@ -364,28 +364,30 @@ class ArchitectusCore:
         if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
             raise TypeError("events must be a list of dictionaries")
 
-        failure_actions, deferred_events = self._failure_actions(events)
-        if failure_actions:
-            for action in failure_actions:
-                self._record_action(action)
+        wave = self._copy_for_wave()
+        failure_actions, deferred_events = wave._failure_actions(events)
         if failure_actions and not deferred_events:
+            for action in failure_actions:
+                wave._record_action(action)
+            self._commit_wave(wave)
             return copy.deepcopy(failure_actions)
 
-        blocked = self._blocked_task_ids()
+        blocked = wave._blocked_task_ids()
         ready = [
             node
-            for node in ready_tasks(self._tree, set(self._finished) | blocked)
-            if node.task_id not in self._in_flight and node.task_id not in blocked
+            for node in ready_tasks(wave._tree, set(wave._finished) | blocked)
+            if node.task_id not in wave._in_flight and node.task_id not in blocked
         ]
-        state = self._tree_state(ready, blocked)
+        state = wave._tree_state(ready, blocked)
         proposed = await self._llm.decide(copy.deepcopy(state), copy.deepcopy(events))
         if isinstance(proposed, (str, bytes)) or not isinstance(proposed, Sequence):
             raise TypeError("LLM decide must return a sequence of action mappings")
 
-        admitted_actions = self._admit_actions(proposed, ready)
+        admitted_actions = wave._admit_actions(proposed, ready)
         actions = [*failure_actions, *admitted_actions]
-        for action in admitted_actions:
-            self._record_action(action)
+        for action in actions:
+            wave._record_action(action)
+        self._commit_wave(wave)
         return copy.deepcopy(actions)
 
     def compose_context(self, task_id: str) -> dict[str, Any]:
@@ -500,7 +502,7 @@ class ArchitectusCore:
                 and task_id not in blocked
                 and not _reset_retry_attempted(fields)
             ):
-                self._reset_retry_tasks.add(task_id)
+                self._consume_fresh_reset(task_id)
                 actions.append({"action": ActionKind.RESET_RETRY.value, "task_id": task_id})
                 continue
 
@@ -600,13 +602,7 @@ class ArchitectusCore:
                         aborted_descendant_spawn_ids.update(subtree - {task_id})
                         spawn_segment += 1
                     else:
-                        self._reset_retry_tasks.add(task_id)
-                        if task_id in self._finished:
-                            self._finished.pop(task_id)
-                            self._in_flight.add(task_id)
-                            suppressed_spawn_ids.update(
-                                self._subtree_task_ids(task_id) - {task_id}
-                            )
+                        suppressed_spawn_ids.update(self._consume_fresh_reset(task_id))
                 elif kind is ActionKind.ABORT_SUBTREE:
                     subtree = self._mark_subtree_failed(task_id)
                     aborted_spawn_ids.update(subtree)
@@ -671,6 +667,33 @@ class ArchitectusCore:
 
     def _record_action(self, action: dict[str, Any]) -> None:
         self._action_history.append(copy.deepcopy(action))
+
+    def _copy_for_wave(self) -> ArchitectusCore:
+        """Return an isolated mutable state for validating one scheduling wave."""
+        wave = copy.copy(self)
+        wave._finished = copy.deepcopy(self._finished)
+        wave._in_flight = set(self._in_flight)
+        wave._failed_subtrees = set(self._failed_subtrees)
+        wave._reset_retry_tasks = set(self._reset_retry_tasks)
+        wave._action_history = copy.deepcopy(self._action_history)
+        return wave
+
+    def _commit_wave(self, wave: ArchitectusCore) -> None:
+        """Commit a fully validated wave's mutable state."""
+        self._finished = wave._finished
+        self._in_flight = wave._in_flight
+        self._failed_subtrees = wave._failed_subtrees
+        self._reset_retry_tasks = wave._reset_retry_tasks
+        self._action_history = wave._action_history
+
+    def _consume_fresh_reset(self, task_id: str) -> set[str]:
+        """Consume a fresh reset and invalidate any finished result for its task."""
+        self._reset_retry_tasks.add(task_id)
+        if task_id not in self._finished:
+            return set()
+        self._finished.pop(task_id)
+        self._in_flight.add(task_id)
+        return self._subtree_task_ids(task_id) - {task_id}
 
     def _normalise_action(self, raw_action: Mapping[str, Any]) -> dict[str, Any]:
         action = copy.deepcopy(dict(raw_action))
