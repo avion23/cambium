@@ -901,7 +901,7 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     worker = tmp_path / "tool-event-worker.py"
     worker.write_text(
-        "import json, sys\n"
+        "import json, subprocess, sys\n"
         "def send(message):\n"
         "    print(json.dumps(message), flush=True)\n"
         "init = json.loads(sys.stdin.readline())\n"
@@ -916,6 +916,10 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
         "'batch_index': 0, 'batch_size': 1, 'ok': True, 'duration_ms': 12})\n"
         "    with open(run['target_file'], 'a', encoding='utf-8') as handle:\n"
         "        handle.write('\\n// tool-event-validated\\n')\n"
+        "    subprocess.run(['git', 'add', run['target_file']], "
+        "cwd=run['worktree_path'], check=True)\n"
+        "    subprocess.run(['git', 'commit', '-m', 'tool event validation'], "
+        "cwd=run['worktree_path'], check=True, capture_output=True)\n"
         "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
         "'status': 'succeeded'})\n"
         "    send({'type': 'exit_message', 'reason': 'done'})\n",
@@ -936,7 +940,7 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
 
     task_result = result.results[0]
-    assert task_result.status == "succeeded"
+    assert task_result.status == "succeeded", task_result
     events = read_events(session_dir)
     tool_events = _kinds(events, "tool_event")
     assert len(tool_events) == 1
