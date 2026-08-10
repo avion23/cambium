@@ -21,9 +21,9 @@ research documents label targets separately.
   supplied tasks concurrently with `asyncio.TaskGroup`. It does not schedule a
   DAG.
 - `tasktree.build_tree` validates dependency graphs, but the current
-  `run_plan` path does not call it for scheduling. `ArchitectusCore` and the
-  `worker_pool` state machine are tested standalone and are not connected to
-  the supervisor. The orchestrator remains a skeleton.
+  `run_plan` path does not call it for scheduling. `ArchitectusCore` is tested
+  standalone and is not connected to the supervisor. The orchestrator remains
+  a skeleton, and persistent worker reuse is not implemented.
 - The package has no public library API: `src/cambium/__init__.py` exports only
   `__version__`. Use the CLI or the module-level supervisor functions.
 - Canonicalization is incomplete. The supervisor still contains the one-task

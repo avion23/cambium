@@ -81,8 +81,7 @@ not use these helpers to schedule a DAG.
 port. Tests cover its decisions and topological waves, but no supervisor module
 imports it. `orchestrator.py` remains a submit/drain skeleton.
 
-`worker_pool.py` is a pure worker-pool state machine. It has scenario tests but
-no production caller, so persistent worker reuse is not implemented.
+Persistent worker reuse is not implemented.
 
 ### Implemented supporting modules
 
@@ -288,7 +287,6 @@ slice/fallback and queue/redaction wiring gaps listed above.
 | Worker | `src/cambium/worker.py` | Marker mode and bounded provider tool loop |
 | Task validation | `src/cambium/tasktree.py` | Pure validation/order helpers; not run-plan scheduling |
 | Architectus | `src/cambium/architectus.py`, `src/cambium/orchestrator.py` | Pure core; not wired |
-| Worker pool | `src/cambium/worker_pool.py` | Pure state machine; not wired |
 | IPC | `src/cambium/ipc.py` | NDJSON framing and request IDs |
 | Store and merge | `src/cambium/store.py`, `src/cambium/merge.py` | Canonical modules used by the plan runtime when available |
 | Controls | `approval.py`, `resources.py`, `fencing.py`, `tools.py`, `schemas.py` | Independently tested; integration is partial |

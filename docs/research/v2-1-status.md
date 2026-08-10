@@ -13,7 +13,7 @@ or commit bookkeeping.
 | Providers and LM | Diffundo routing, provider configuration, `CambiumLM`, and `ArchitectusLM` are merged; loopback provider integration is tested. | No public package API exposes these capabilities, and external-provider acceptance is unverified. |
 | Task tree | `build_tree`, `topological_order`, and `ready_tasks` validate and inspect dependency graphs. | `run_plan` bypasses them; fixed-tree scheduling is not wired. |
 | Architectus | Pure `ArchitectusCore` behavior is covered with injected test LLMs. | No production caller; `orchestrator.py` is still a skeleton. |
-| Worker pool | Pure state-machine seed and scenario tests exist. | No supervisor integration or persistent worker reuse. |
+| Worker reuse | Not implemented. | Persistent worker reuse remains a future capability. |
 | Persistence and merge | SQLite WAL `EventStore`, `MergeSequencer`, fencing, worktree cleanup, and result-record modules exist and are tested. | Supervisor still keeps `EventLog`, fallback store/sequencer, and slice paths; canonical redaction/result wiring is incomplete. |
 | IPC and controls | NDJSON framing, request IDs, line limits, gates, approval, resource helpers, schemas, provider environment filtering, redaction, and DLQ modules exist. | End-to-end bounded supervisor queues, durable overflow routing, and some control wiring remain open. |
 | Example module | `modules/example` has deterministic decision logic, train/eval/canary data, a metric, CLI, and DSPy seam. | It is not the runtime planner or a proof of whole-system optimization. |
@@ -31,7 +31,7 @@ or commit bookkeeping.
 ## Evidence pointers
 
 - Runtime entry points: `src/cambium/supervisor.py`, `worker.py`,
-  `tasktree.py`, `architectus.py`, and `worker_pool.py`.
+  `tasktree.py`, and `architectus.py`.
 - Provider and adapter tests: `tests/scenarios/test_worker_provider.py`,
   `test_lm.py`, and `test_diffundo*.py`.
 - Plan, merge, IPC, controls, and store tests: the corresponding files under
