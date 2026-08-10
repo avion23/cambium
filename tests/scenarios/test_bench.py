@@ -13,11 +13,15 @@ assertions isolate the metric/exit-code behavior.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,6 +46,69 @@ FAST_TESTS = [
 ]
 
 WALL_RATIO = "--bench-wall-ratio=100"
+
+
+def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Path:
+    """Create one importable module that is driven only through its JSON CLI."""
+    source_root = tmp_path / "src"
+    modules_dir = source_root / "cambium" / "modules"
+    package_dir = modules_dir / "fixture"
+    datasets_dir = package_dir / "datasets"
+    datasets_dir.mkdir(parents=True)
+    (source_root / "cambium" / "__init__.py").write_text("")
+    (modules_dir / "__init__.py").write_text("")
+    (package_dir / "__init__.py").write_text("")
+    if manifest is not None:
+        (package_dir / "module.json").write_text(json.dumps(manifest))
+    (package_dir / "__main__.py").write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+
+            def main():
+                payload = json.load(sys.stdin)
+                if payload["operation"] != "evaluate":
+                    raise ValueError("fixture only supports evaluate")
+                results = []
+                for record in payload["records"]:
+                    expected = record["expected"]["decompose"]
+                    results.append({
+                        "prediction": {"decompose": expected},
+                        "score": 1.0,
+                    })
+                print(json.dumps({"results": results}))
+
+            if __name__ == "__main__":
+                main()
+            """
+        )
+    )
+    records = {
+        "train": {
+            "id": "fixture-train-1",
+            "input": {"task": "Fixture train", "context": ""},
+            "expected": {"decompose": False, "reason": "atomic"},
+        },
+        "eval": {
+            "id": "fixture-eval-1",
+            "input": {"task": "Fixture eval", "context": ""},
+            "expected": {"decompose": True, "reason": "parallel"},
+        },
+        "canaries": {
+            "id": "fixture-canary-1",
+            "input": {"task": "Fixture canary", "context": ""},
+            "expected": {"decompose": False, "reason": "atomic"},
+            "canary": True,
+            "canary_info": {"kind": "trivially_atomic"},
+        },
+    }
+    for split, record in records.items():
+        (datasets_dir / f"{split}.jsonl").write_text(json.dumps(record) + "\n")
+    (datasets_dir / "meta.json").write_text(
+        json.dumps({"schema_version": 1, "dataset_version": "fixture-1"})
+    )
+    return modules_dir
 
 
 def run_bench(
@@ -98,6 +165,105 @@ def test_report_writes_valid_baseline(tmp_path) -> None:
     assert baseline["tests"]["count"] == len(FAST_TESTS)
     assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
     assert baseline["tests"]["by_nodeid"].keys() == set(FAST_TESTS)
+
+
+def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    baseline = json.loads(
+        (bench_root / "fixture_module" / "baseline.json").read_text()
+    )
+    assert baseline["dataset_version"] == "fixture-1"
+    assert baseline["dataset"]["records"] == 3
+    assert baseline["metric"]["train"] == {"mean": 1.0, "std": 0.0, "count": 1}
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
+
+
+def test_module_contract_violation_fails_closed_with_module_diagnostic(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+
+    with pytest.raises(ValueError, match="fixture.*module_name"):
+        bench.discover_modules()
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert "fixture" in capsys.readouterr().err
+    assert not bench_root.exists()
+
+
+def test_scripts_use_the_neutral_module_boundary() -> None:
+    check = subprocess.run(
+        [sys.executable, "scripts/check_dataset_v1.py"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert "through the neutral CLI" in check.stdout
+
+    generated = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy; "
+                "m = runpy.run_path('scripts/generate_should_decompose_v1.py'); "
+                "print(m['neutral_decide']('Fix one typo.', ''))"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    assert "'decompose': False" in generated.stdout
+
+
+def test_bench_and_scripts_have_no_concrete_module_imports() -> None:
+    paths = [
+        REPO_ROOT / "src" / "cambium" / "bench.py",
+        REPO_ROOT / "scripts" / "check_dataset_v1.py",
+        REPO_ROOT / "scripts" / "generate_should_decompose_v1.py",
+    ]
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        assert "importlib" not in source
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("cambium.modules.example")
+            for node in ast.walk(tree)
+        )
 
 
 def test_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
