@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
+import hashlib
 import json
 import math
 import platform
@@ -61,9 +62,34 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
     "dataset": {"duplicate_ids": 0, "cross_split_leaks": 0},
 }
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULES_DIR = REPO_ROOT / "src" / "cambium" / "modules"
-RUNTIME_BASELINE_DIR = REPO_ROOT / ".cambium" / "baselines"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+def _find_repo_root() -> Path:
+    """Return the git checkout root, or the package root in a wheel install.
+
+    A real source checkout keeps ``cambium`` under ``<root>/src/cambium``.
+    A wheel has no repository; keep all resource-relative operations inside
+    the installed package instead of guessing from the caller's cwd.
+    """
+    source = Path(__file__).resolve().parent
+    for candidate in (source, *source.parents):
+        if (candidate / ".git").exists() and source == candidate / "src" / "cambium":
+            return candidate
+    return source
+
+
+REPO_ROOT = _find_repo_root()
+# Prefer the checkout modules dir when a real source checkout is detected;
+# otherwise fall back to the installed package resources. The wheel does not
+# carry ``src/``, so ``parents[2]/"src"`` must never be derived from here.
+if REPO_ROOT != PACKAGE_ROOT:
+    MODULES_DIR = REPO_ROOT / "src" / "cambium" / "modules"
+else:
+    MODULES_DIR = PACKAGE_ROOT / "modules"
+# Standalone runtime baselines live under the invocation directory so an
+# installed wheel run never writes into the checkout or the package.
+RUNTIME_BASELINE_DIR = Path.cwd() / ".cambium" / "baselines"
 
 SPLITS = ("train", "eval", "canaries")
 
@@ -133,16 +159,25 @@ def discover_modules() -> list[str]:
 
     Discovery is deliberately a filesystem operation.  Every candidate is
     validated before any report work starts, so a malformed sibling cannot be
-    silently skipped after another module has already passed.
+    silently skipped after another module has already passed.  Fails closed
+    with :class:`ModuleBoundaryError` when no module resources exist at all
+    or when none of them are dataset-bearing, so report/gate never succeed
+    silently on an empty or wheel-broken installation.
     """
     if not MODULES_DIR.is_dir():
-        return []
+        raise ModuleBoundaryError(
+            f"no modules discovered: modules directory does not exist at {MODULES_DIR}"
+        )
     names: list[str] = []
     for child in sorted(MODULES_DIR.iterdir(), key=lambda path: path.name):
         if not child.is_dir() or not (child / "datasets").is_dir():
             continue
         load_module_manifest(child, child.name)
         names.append(child.name)
+    if not names:
+        raise ModuleBoundaryError(
+            f"no modules discovered: no dataset-bearing modules under {MODULES_DIR}"
+        )
     return names
 
 
@@ -294,6 +329,25 @@ def canary_stats(raw_canaries: list[dict], canary_scores: list[float]) -> dict[s
     }
 
 
+def _compute_split_digests(
+    datasets_dir: Path, meta: dict[str, Any] | None
+) -> dict[str, str]:
+    """SHA-256 map of the exact split JSONL bytes, meta.json values as fallback."""
+    recorded = meta.get("split_digests") if isinstance(meta, dict) else None
+    digests: dict[str, str] = {}
+    for split in SPLITS:
+        path = datasets_dir / f"{split}.jsonl"
+        if path.is_file():
+            digests[split] = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif (
+            isinstance(recorded, dict)
+            and isinstance(recorded.get(split), str)
+            and len(recorded[split]) == 64
+        ):
+            digests[split] = recorded[split]
+    return digests
+
+
 def build_module_report(pkg_name: str) -> dict[str, Any]:
     """Metric/canaries/dataset sections of a module's baseline.
 
@@ -372,6 +426,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
     report: dict[str, Any] = {
         "module": manifest.module_name,
         "dataset_version": dataset_version,
+        "split_digests": _compute_split_digests(datasets_dir, meta),
         "metric": metric,
         "canaries": canary_stats(canary_records, canary_scores),
         "dataset": dataset_stats(records),
@@ -391,6 +446,7 @@ def _assemble_baseline(
         "schema_version": 1,
         "module": body["module"],
         "dataset_version": body["dataset_version"],
+        "split_digests": dict(body["split_digests"]),
         "git_sha": _git_sha(),
         "date": _utc_now_iso(),
         "python": platform.python_version(),
@@ -522,6 +578,7 @@ class BenchPlugin:
         if thresholds:
             self.thresholds.update(thresholds)
         self.times: dict[str, float] = {}
+        self.item_paths: dict[str, Path] = {}
         self.module_reports: dict[str, dict[str, Any]] = {}
         self.regressions: dict[str, list[tuple[str, str]]] = {}
         self.reanchored: dict[str, str] = {}
@@ -531,21 +588,39 @@ class BenchPlugin:
     def pytest_runtest_makereport(self, item: Any, call: Any) -> None:
         if call.when == "call":
             self.times[item.nodeid] = call.duration
+            raw_path = getattr(item, "path", None)
+            if raw_path is None:
+                raw_path = item.fspath
+            if raw_path is not None:
+                self.item_paths[item.nodeid] = Path(str(raw_path)).resolve()
+
+    def _module_timings(self, pkg_name: str) -> dict[str, float]:
+        """Timings whose collected test file is under one module's ``tests/``."""
+        module_tests_dir = (MODULES_DIR / pkg_name / "tests").resolve()
+        return {
+            nodeid: duration
+            for nodeid, duration in self.times.items()
+            if (path := self.item_paths.get(nodeid)) is not None
+            and path.is_relative_to(module_tests_dir)
+        }
 
     def pytest_sessionfinish(self, session: Any, exitstatus: Any) -> None:
         if exitstatus != 0:
             return  # never anchor a baseline on a red run
         try:
             package_names = discover_modules()
-            pending = [
-                (
-                    pkg_name,
-                    _assemble_baseline(
-                        build_module_report(pkg_name), self.times, self.thresholds
-                    ),
+            pending = []
+            for pkg_name in package_names:
+                pending.append(
+                    (
+                        pkg_name,
+                        _assemble_baseline(
+                            build_module_report(pkg_name),
+                            self._module_timings(pkg_name),
+                            self.thresholds,
+                        ),
+                    )
                 )
-                for pkg_name in package_names
-            ]
         except (ModuleBoundaryError, DatasetError) as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             session.exitstatus = 1
@@ -657,12 +732,53 @@ def pytest_configure(config: Any) -> None:
     config.pluginmanager.register(BenchPlugin(config, thresholds), "cambium-bench")
 
 
+def _write_drift_report(
+    root: Path,
+    module_reports: dict[str, dict[str, Any]],
+    regressions: dict[str, list[tuple[str, str]]],
+    *,
+    mode: str,
+    full: bool,
+) -> Path:
+    """Write a drift artifact summarizing each module against its anchor."""
+    artifact: dict[str, Any] = {
+        "schema_version": 1,
+        "date": _utc_now_iso(),
+        "python": platform.python_version(),
+        "mode": mode,
+        "full": full,
+        "modules": {
+            module: {
+                "dataset_version": report["dataset_version"],
+                "metric": report["metric"],
+                "canaries": report["canaries"],
+                "regressions": regressions.get(module, []),
+            }
+            for module, report in sorted(module_reports.items())
+        },
+    }
+    path = root / "drift-report.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(artifact, indent=2) + "\n")
+    return path
+
+
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m cambium.bench",
         description="Run the Cambium benchmark report or drift gate.",
     )
     parser.add_argument("mode", nargs="?", default="report", metavar="{report,gate}")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="full (nightly/release) run; include the drift artifact sections",
+    )
+    parser.add_argument(
+        "--drift-report",
+        action="store_true",
+        help="write a drift artifact to the baseline root (default: .cambium/baselines/)",
+    )
     parser.add_argument(
         "--bench-root",
         type=Path,
@@ -700,18 +816,22 @@ def main(argv: list[str] | None = None) -> int:
     failures = 0
     root = args.bench_root or RUNTIME_BASELINE_DIR
     try:
-        pending = [
-            (
-                pkg_name,
-                _assemble_baseline(build_module_report(pkg_name), {}, thresholds),
+        pending = []
+        for pkg_name in discover_modules():
+            pending.append(
+                (
+                    pkg_name,
+                    _assemble_baseline(build_module_report(pkg_name), {}, thresholds),
+                )
             )
-            for pkg_name in discover_modules()
-        ]
     except (ModuleBoundaryError, DatasetError) as exc:
         print(f"cambium bench: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    module_reports: dict[str, dict[str, Any]] = {}
+    drift: dict[str, list[tuple[str, str]]] = {}
     for pkg_name, report in pending:
+        module_reports[report["module"]] = report
         path = _baseline_path(pkg_name, report["module"], root)
         if mode == "report":
             _write_baseline(report, path)
@@ -721,19 +841,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cambium bench: missing pre-existing anchor for {report['module']}: {path}")
         else:
             anchor = json.loads(path.read_text())
-            regressions = compare_against_anchor(report, anchor, thresholds)
-            if regressions is None:
+            module_drift = compare_against_anchor(report, anchor, thresholds)
+            if module_drift is None:
                 _write_baseline(report, path)
                 print(
                     f"cambium bench: re-anchored {report['module']}: "
                     f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
                 )
-            elif regressions:
+            elif module_drift:
                 failures += 1
-                for field, detail in regressions:
+                drift[report["module"]] = module_drift
+                for field, detail in module_drift:
                     print(f"cambium bench: DRIFT {report['module']}: {field}: {detail}")
             else:
                 print(f"cambium bench: gate passed: {report['module']}")
+    if args.drift_report:
+        written = _write_drift_report(
+            root,
+            module_reports,
+            drift,
+            mode=mode,
+            full=args.full,
+        )
+        print(f"cambium bench: wrote drift report {written}")
     return 1 if failures else 0
 
 

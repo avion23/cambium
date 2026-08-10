@@ -829,6 +829,49 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
     assert not session_dir.exists()
 
 
+def test_default_spec_selects_installed_worker_module() -> None:
+    spec = supervisor_module._default_spec(Path("/tmp/session"))
+
+    assert spec["worker"] == "cambium.worker"
+
+
+def test_worker_command_prefers_installed_module_and_preserves_script_paths() -> None:
+    module_cmd = [sys.executable, "-u", "-m", "cambium.worker"]
+    runtime = supervisor_module._Runtime(Path("/tmp/session"), None)
+    assert (
+        runtime._worker_command({"task_id": "t", "worker": "cambium.worker"}) == module_cmd
+    )
+    assert runtime._worker_command({"task_id": "t"}) == module_cmd
+    script = "/some/worker/script.py"
+    assert runtime._worker_command({"task_id": "t", "worker": script}) == [
+        sys.executable,
+        "-u",
+        script,
+    ]
+
+
+def test_slice_runtime_runs_the_installed_worker_module(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    spec = _slice_spec(session_dir, "cambium.worker")
+    spec["marker"] = "// slice-module-worker"
+    spec["gate"] = "grep -q '// slice-module-worker' hello.txt"
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "succeeded"
+    assert result.exit_code == 0
+    assert result.worker_exit_code == 0
+    events = [
+        json.loads(line)
+        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    spawned = [event for event in events if event["kind"] == "spawned"]
+    assert spawned
+    assert "cambium.worker" in spawned[0]["payload"]["worker"]
+
+
 def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
     return {
         "task_id": "slice-too-long",

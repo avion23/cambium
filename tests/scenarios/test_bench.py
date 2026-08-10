@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -29,6 +30,7 @@ SCHEMA_KEYS = {
     "schema_version",
     "module",
     "dataset_version",
+    "split_digests",
     "git_sha",
     "date",
     "python",
@@ -40,10 +42,17 @@ SCHEMA_KEYS = {
     "drift_thresholds",
 }
 
-FAST_TESTS = [
-    "tests/scenarios/test_tooling.py::test_ruff_check_clean_on_src",
+MODULE_TESTS = [
+    "src/cambium/modules/example/tests/test_dataset_splits.py::test_all_260_records_score_perfectly",
+    "src/cambium/modules/example/tests/test_dataset_splits.py::test_split_loads_return_expected_counts",
+    "src/cambium/modules/example/tests/test_example_module.py::test_dataset_is_loadable_and_schema_valid",
+]
+
+UNRELATED_TESTS = [
     "tests/scenarios/test_tasktree.py::test_task_kind_is_the_enum_norm",
 ]
+
+FAST_TESTS = MODULE_TESTS + UNRELATED_TESTS
 
 WALL_RATIO = "--bench-wall-ratio=100"
 
@@ -191,9 +200,15 @@ def test_report_writes_valid_baseline(tmp_path) -> None:
     assert baseline["dataset"]["duplicate_ids"] == 0
     assert baseline["dataset"]["cross_split_leaks"] == 0
     assert baseline["dataset"]["canaries"] == 10
-    assert baseline["tests"]["count"] == len(FAST_TESTS)
+    meta = json.loads(
+        (REPO_ROOT / "src/cambium/modules/example/datasets/meta.json").read_text()
+    )
+    assert baseline["split_digests"] == meta["split_digests"]
+    assert baseline["tests"]["count"] == len(MODULE_TESTS)
     assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
-    assert baseline["tests"]["by_nodeid"].keys() == set(FAST_TESTS)
+    # Only the module's own test nodeids enter the baseline, never unrelated
+    # scenario tests collected in the same run.
+    assert set(baseline["tests"]["by_nodeid"]) == set(MODULE_TESTS)
 
 
 def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypatch) -> None:
@@ -753,6 +768,53 @@ def test_gate_honors_cli_metric_delta_override(tmp_path) -> None:
     assert "DRIFT" not in ok.stdout  # drop 0.005 <= 0.01
 
 
+def test_missing_modules_dir_fails_closed_for_report_and_gate(tmp_path) -> None:
+    """A wheel without modules must not let report/gate succeed silently."""
+    bench_root = tmp_path / "baselines"
+    missing = tmp_path / "no-such-modules"
+    (tmp_path / "bench_missing_modules.py").write_text(
+        "import cambium.bench as _bench\n"
+        "from pathlib import Path\n"
+        f"_bench.MODULES_DIR = Path({str(missing)!r})\n"
+    )
+    env = {"PYTHONPATH": str(tmp_path)}
+
+    report = run_bench(bench_root, "report", "-p", "bench_missing_modules", env=env)
+    assert report.returncode == 1, report.stdout + report.stderr
+    assert "no modules discovered" in report.stdout + report.stderr
+    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+
+    gate = run_bench(bench_root, "gate", "-p", "bench_missing_modules", env=env)
+    assert gate.returncode == 1, gate.stdout + gate.stderr
+    assert "no modules discovered" in gate.stdout + gate.stderr
+
+
+def test_standalone_cli_missing_modules_dir_fails_closed(tmp_path, monkeypatch, capsys) -> None:
+    import cambium.bench as bench
+
+    missing = tmp_path / "no-such-modules"
+    monkeypatch.setattr(bench, "MODULES_DIR", missing)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert "no modules discovered" in capsys.readouterr().err
+    assert not bench_root.exists()
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+
+
+def test_standalone_cli_empty_modules_dir_fails_closed(tmp_path, monkeypatch, capsys) -> None:
+    import cambium.bench as bench
+
+    empty = tmp_path / "empty-modules"
+    empty.mkdir()
+    monkeypatch.setattr(bench, "MODULES_DIR", empty)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert "no modules discovered" in capsys.readouterr().err
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+
+
 def test_cli_report_protects_committed_baseline(tmp_path) -> None:
     """CLI report without --bench-root writes to .cambium/, never the
     committed baseline, and leaves the tree clean."""
@@ -799,3 +861,123 @@ def test_cli_report_protects_committed_baseline(tmp_path) -> None:
         timeout=60,
     ).stdout
     assert status_after == status_before, status_after  # only gitignored writes
+
+
+def test_cli_full_drift_report_writes_artifact(tmp_path) -> None:
+    """``report --full --drift-report`` writes a drift artifact to the root."""
+    bench_root = tmp_path / "baselines"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cambium.bench",
+            "report",
+            "--full",
+            "--drift-report",
+            "--bench-root",
+            str(bench_root),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (bench_root / "should_decompose" / "baseline.json").is_file()
+    artifact = json.loads((bench_root / "drift-report.json").read_text())
+    assert artifact["full"] is True
+    assert artifact["mode"] == "report"
+    assert "should_decompose" in artifact["modules"]
+    assert artifact["modules"]["should_decompose"]["dataset_version"] == "1.1.0"
+
+
+def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> None:
+    """``gate --drift-report`` still fails on drift and records it."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    monkeypatch.setattr(
+        bench,
+        "score_examples",
+        lambda _module, scored: {"mean": 0.9, "std": 0.0, "count": len(scored)},
+    )
+    assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
+    artifact = json.loads((bench_root / "drift-report.json").read_text())
+    regressions = artifact["modules"]["should_decompose"]["regressions"]
+    assert any(field == "metric.train.mean" for field, _detail in regressions)
+
+
+def _build_and_install_wheel(site_dir: Path) -> Path:
+    dist = site_dir / "dist"
+    dist.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "build", "--target", str(site_dir)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(dist)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    wheel = next(dist.glob("cambium-*.whl"))
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "--target", str(site_dir), str(wheel)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return wheel
+
+
+def test_installed_package_discovery_from_unrelated_cwd(tmp_path) -> None:
+    """A wheel install discovers modules from its own resources, not the repo."""
+    uv = shutil.which("uv")
+    assert uv is not None
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=unrelated, check=True)
+    site = tmp_path / "site-packages"
+    dist = tmp_path / "dist"
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(dist)],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheel = next(dist.glob("cambium-*.whl"))
+    subprocess.run(
+        [uv, "pip", "install", "--python", sys.executable, "--target", str(site), str(wheel)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    bench_root = tmp_path / "baselines"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cambium.bench",
+            "report",
+            "--bench-root",
+            str(bench_root),
+        ],
+        cwd=unrelated,
+        env={**os.environ, "PYTHONPATH": str(site)},
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
+    assert baseline["module"] == "should_decompose"
+    assert baseline["split_digests"]
