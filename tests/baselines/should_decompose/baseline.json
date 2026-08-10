@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "module": "should_decompose",
+  "dataset_version": "1.0.0",
+  "git_sha": "8129ce61436c45136383f038f3b52c9127cf8cdb",
+  "date": "2026-08-09T22:49:38Z",
+  "python": "3.14.7",
+  "pytest": "9.1.1",
+  "metric": {
+    "train": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 200
+    },
+    "eval": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 50
+    },
+    "canaries": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 10
+    }
+  },
+  "canaries": {
+    "total": 10,
+    "kinds_present": [
+      "ambiguous_calibration",
+      "context_suppression",
+      "format_only_hack",
+      "keyword_hack",
+      "must_decompose",
+      "near_duplicate_contradiction",
+      "trivially_atomic"
+    ],
+    "taxonomy_coverage": 1.0,
+    "failed": 0
+  },
+  "dataset": {
+    "records": 260,
+    "duplicate_ids": 0,
+    "cross_split_leaks": 0,
+    "decompose_true": 128,
+    "decompose_false": 132,
+    "canaries": 10
+  },
+  "tests": {
+    "count": 41,
+    "wall_seconds": {
+      "p50": 0.206575,
+      "p90": 1.065517,
+      "max": 5.910477
+    },
+    "by_nodeid": {
+      "tests/scenarios/test_bench.py::test_gate_fails_on_metric_drift": 0.838265,
+      "tests/scenarios/test_bench.py::test_gate_passes_without_drift": 0.995256,
+      "tests/scenarios/test_bench.py::test_report_writes_valid_baseline": 0.525805,
+      "tests/scenarios/test_example_module.py::test_canary_entries_are_processed": 0.001023,
+      "tests/scenarios/test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.001483,
+      "tests/scenarios/test_example_module.py::test_engine_tolerates_leading_separators": 0.000522,
+      "tests/scenarios/test_example_module.py::test_malformed_record_is_rejected": 0.000328,
+      "tests/scenarios/test_example_module.py::test_missing_expected_reason_is_rejected": 0.00039,
+      "tests/scenarios/test_example_module.py::test_module_scores_perfect_on_its_dataset": 0.002783,
+      "tests/scenarios/test_merge.py::test_concurrent_publish_exactly_one_winner": 1.083082,
+      "tests/scenarios/test_merge.py::test_create_main_first_publish": 0.165075,
+      "tests/scenarios/test_merge.py::test_happy_path_two_sequential_publishes": 0.251898,
+      "tests/scenarios/test_merge.py::test_prepare_staging_fetches_branch_from_remote": 0.253444,
+      "tests/scenarios/test_merge.py::test_publish_rejects_empty_and_zero_expected_old": 0.06341,
+      "tests/scenarios/test_merge.py::test_publish_rejects_non_fast_forward_tips": 0.129718,
+      "tests/scenarios/test_merge.py::test_publish_rejects_quarantine_env": 0.127062,
+      "tests/scenarios/test_merge.py::test_publish_rejects_stale_expected_old": 0.161457,
+      "tests/scenarios/test_merge.py::test_publish_works_through_staged_poison": 0.16699,
+      "tests/scenarios/test_merge.py::test_reconcile_reads_current_main": 0.116721,
+      "tests/scenarios/test_merge.py::test_repo_path_that_is_a_file_raises_git_error": 0.001202,
+      "tests/scenarios/test_merge.py::test_staging_conflict_lists_file_and_keeps_main": 0.215139,
+      "tests/scenarios/test_merge.py::test_staging_conflict_with_spaced_path": 0.206575,
+      "tests/scenarios/test_merge.py::test_staging_sha_survives_worktree_removal": 0.191342,
+      "tests/scenarios/test_store.py::test_append_read_back_fields_and_monotonic_seq": 0.19585,
+      "tests/scenarios/test_store.py::test_close_drains_pending_appends": 0.747119,
+      "tests/scenarios/test_store.py::test_corrupt_db_init_raises_not_hangs": 0.002449,
+      "tests/scenarios/test_store.py::test_crash_durability_critical_events_survive": 0.558678,
+      "tests/scenarios/test_store.py::test_events_after_returns_only_newer_ordered": 0.652548,
+      "tests/scenarios/test_store.py::test_non_critical_append_does_not_block_on_fsync": 1.219517,
+      "tests/scenarios/test_store.py::test_writer_dead_on_locked_db_critical_append_raises": 5.910477,
+      "tests/scenarios/test_tooling.py::test_doctor_exits_zero_on_healthy_repo": 0.237349,
+      "tests/scenarios/test_tooling.py::test_doctor_fails_on_corrupt_event_store": 0.359102,
+      "tests/scenarios/test_tooling.py::test_ruff_check_clean_on_src": 0.079864,
+      "tests/scenarios/test_vertical_slice.py::test_misrouted_result_envelope_fails": 0.170383,
+      "tests/scenarios/test_vertical_slice.py::test_missing_exit_message_fails": 0.276873,
+      "tests/scenarios/test_vertical_slice.py::test_missing_result_envelope_fails": 0.297986,
+      "tests/scenarios/test_vertical_slice.py::test_ready_timeout_fails_within_budget": 2.035849,
+      "tests/scenarios/test_vertical_slice.py::test_result_envelope_echoes_run_task_request_id": 0.142658,
+      "tests/scenarios/test_vertical_slice.py::test_vertical_slice_gate_failure_no_merge": 0.265203,
+      "tests/scenarios/test_vertical_slice.py::test_vertical_slice_happy_path": 0.489078,
+      "tests/scenarios/test_vertical_slice.py::test_worker_nonzero_exit_fails": 0.213381
+    }
+  },
+  "drift_thresholds": {
+    "metric_mean_delta": 0.05,
+    "wall_p90_ratio": 1.5,
+    "canary_failed_delta": 0,
+    "dataset": {
+      "duplicate_ids": 0,
+      "cross_split_leaks": 0
+    }
+  }
+}
