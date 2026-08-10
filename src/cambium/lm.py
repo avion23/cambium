@@ -452,6 +452,7 @@ class _CambiumLMMixin:
     def copy(self, /, *args: Any, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
         _require_exact_keyword_keys(kwargs)
+        _reject_unknown_keyword_keys(kwargs, _CONSTRUCTOR_FIELDS | _ADAPTER_PRIVATE_FIELDS)
         if args:
             raise TypeError("CambiumLM.copy accepts keyword arguments only")
         self._validate_model(self._provider_model)
@@ -492,6 +493,7 @@ class _CambiumLMMixin:
         safe_kwargs["cache"] = False
         safe_kwargs["num_retries"] = 0
         copied = super().copy(**safe_kwargs)
+        copied.kwargs = self._safe_kwargs(copied.kwargs)
         copied.cache = False
         copied.num_retries = 0
         copied.launch_kwargs = safe_kwargs.get("launch_kwargs", launch_kwargs)
@@ -679,6 +681,8 @@ class _CambiumLMMixin:
                 prompt[field] = config[field]
         if request.tools:
             prompt["tools"] = [self._tool(tool) for tool in request.tools]
+
+        self._safe_kwargs(prompt)
 
         model = self._validate_model(self._provider_model)
         budget_usd = self._validate_budget(self._budget_usd)

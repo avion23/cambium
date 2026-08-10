@@ -382,6 +382,28 @@ def test_copy_rejects_credential_keys_and_keeps_dump_state_clean() -> None:
     assert "api.key" not in repr(copied.dump_state())
 
 
+def test_copy_rejects_unknown_keyword_before_creating_unloadable_state() -> None:
+    _require_dspy()
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="unknown keyword argument: unexpected"):
+        lm.copy(unexpected=True)
+
+
+def test_copy_refreezes_existing_mutable_response_format() -> None:
+    _require_dspy()
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    response_format: dict[str, Any] = {"type": "json_object"}
+    lm.kwargs["response_format"] = response_format
+
+    copied = lm.copy()
+    response_format["api_key"] = "SENSITIVE_CANARY"
+
+    assert _call(copied) == ["completion text"]
+    assert diffundo.calls[0]["prompt"]["response_format"] == {"type": "json_object"}
+
+
 def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> None:
     _require_dspy()
     import dspy
@@ -1062,6 +1084,28 @@ def test_per_call_max_tokens_reaches_diffundo() -> None:
         "completion text"
     ]
     assert diffundo.calls[0]["prompt"]["max_tokens"] == 1
+
+
+@pytest.mark.parametrize("entry_point", ["call", "acall"])
+def test_explicit_request_response_format_credentials_are_rejected(entry_point: str) -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"response_format": {"api_key": "SENSITIVE_CANARY"}},
+    )
+
+    with pytest.raises(ValueError, match="provider credentials"):
+        if entry_point == "call":
+            lm(request=request)
+        else:
+            asyncio.run(lm.acall(request=request))
+
+    assert diffundo.calls == []
 
 
 def test_reasoning_and_tool_choice_reach_diffundo() -> None:
