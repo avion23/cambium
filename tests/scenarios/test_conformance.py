@@ -1,7 +1,10 @@
 """Conformance pins for the normative Cambium architecture contracts.
 
-These checks use the shipped modules, SQLite schema, git, and a real worker
-process to verify the wire and storage contracts end-to-end.
+These checks intentionally use the shipped modules, SQLite schema, git, and a
+real worker process.  The supervisor environment checks are the one exception
+to runtime exercise: they parse the module with :mod:`ast` so every direct
+``create_subprocess_exec`` and ``subprocess.run`` call is checked without
+starting a full supervisor.
 """
 
 from __future__ import annotations
