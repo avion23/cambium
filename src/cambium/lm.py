@@ -206,8 +206,9 @@ class _CambiumLMMixin:
         forbidden = [
             key
             for key in safe
+            if key not in _GENERATION_FIELDS
             if any(
-                marker in key.replace("_", "").replace("-", "").lower()
+                marker in "".join(character for character in key.lower() if character.isalnum())
                 for marker in _SECRET_MARKERS
             )
         ]

@@ -213,6 +213,7 @@ def test_secret_marker_variants_are_rejected(key: str) -> None:
     [
         "credential",
         "CREDENTIAL",
+        "api.key",
         "client_secret",
         "client-secret",
         "CLIENT-SECRET",
@@ -236,6 +237,17 @@ def test_credential_marker_variants_cannot_reach_dump_state(key: str) -> None:
             ProviderTier.FAST,
             **{key: "SENSITIVE_CANARY"},
         )  # type: ignore[arg-type]
+
+
+def test_per_call_max_tokens_reaches_diffundo() -> None:
+    _require_dspy()
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+
+    assert lm(messages=[{"role": "user", "content": "hello"}], max_tokens=1) == [
+        "completion text"
+    ]
+    assert diffundo.calls[0]["prompt"]["max_tokens"] == 1
 
 
 def test_concurrent_dspy_loads_preserve_cache_environment() -> None:
