@@ -106,7 +106,7 @@ adapters:
 uv run --python 3.14.7 --extra test cambium --help
 ```
 
-Available subcommands are `auth`, `supervisor`, `doctor`, `bench report|gate`,
+Available subcommands are `auth`, `supervisor`, `doctor`, `bench report|gate|re-anchor`,
 `tasktree`, `module-test`, and `version`.
 
 In plan mode the target `repo` is a ref-publication/control repository: a
