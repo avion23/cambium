@@ -358,11 +358,16 @@ class _RawResponse:
             )
         content = message.get("content")
         raw_tool_calls = message.get("tool_calls")
-        tool_calls = (
-            tuple(tool_call for tool_call in raw_tool_calls if isinstance(tool_call, dict))
-            if isinstance(raw_tool_calls, list) and raw_tool_calls
-            else None
-        ) or None
+        tool_calls: tuple[dict[str, Any], ...] | None = None
+        if isinstance(raw_tool_calls, list) and raw_tool_calls:
+            for tool_call in raw_tool_calls:
+                if _tool_call_name(tool_call) is None:
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: tool call without a function name",
+                    )
+            tool_calls = tuple(raw_tool_calls)
         if not isinstance(content, str):
             if tool_calls is None:
                 raise ProviderError(
@@ -402,6 +407,20 @@ def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> fl
         prompt_tokens / 1_000_000 * provider.price_per_1m_in
         + completion_tokens / 1_000_000 * provider.price_per_1m_out
     )
+
+
+def _tool_call_name(tool_call: Any) -> str | None:
+    """Return the function name of an OpenAI-shaped tool call, else None."""
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if isinstance(function, dict) and type(function.get("name")) is str:
+        name = function["name"]
+    elif type(tool_call.get("name")) is str:
+        name = tool_call["name"]
+    else:
+        return None
+    return name if name.strip() else None
 
 
 def _default_quality_gate(result: CallResult) -> bool:

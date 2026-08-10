@@ -187,6 +187,22 @@ def _error_payload(message: str) -> dict[str, Any]:
     return {"error": {"message": message, "type": "test_error", "code": "test"}}
 
 
+def _tool_call_payload(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-tool",
+        "object": "chat.completion",
+        "model": "m-tool",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+    }
+
+
 PROMPT = {"messages": [{"role": "user", "content": "hello"}]}
 STATIC_HEAD = {
     "messages": [{"role": "system", "content": "You are a coding assistant.\nBe concise.\n"}]
@@ -421,6 +437,10 @@ def test_provider_request_uses_stable_cambium_user_agent_and_keeps_authorization
                 "Authorization": "Bearer sk-test-K_UA",
             }
         ]
+    finally:
+        server.close()
+
+
 def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) -> None:
     # A normal OpenAI tool-call completion carries content:null plus tool_calls;
     # it is a success, not a "content missing" malformed response.
@@ -492,6 +512,105 @@ def test_tool_call_response_with_text_content_keeps_both(tmp_path, monkeypatch) 
         assert result.content == "explaining the call"
         assert result.tool_calls is not None
         assert result.tool_calls[0]["id"] == "call_2"
+    finally:
+        server.close()
+
+
+def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypatch) -> None:
+    # A bare {} tool call has no function name; it must be rejected as a
+    # malformed response, not forwarded as a valid-looking (name="") call.
+    malformed = FakeServer([(200, _tool_call_payload([{}]), 0.0)])
+    _set_keys(monkeypatch, "K_MAL")
+    router = Diffundo((_config("p_mal", malformed, "K_MAL"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
+        assert "tool call without a function name" in exc.value.last_error.message
+        assert router.health("p_mal") is HealthState.COOLDOWN
+    finally:
+        malformed.close()
+
+
+def test_tool_call_response_rejects_empty_function_name(tmp_path, monkeypatch) -> None:
+    # A tool call whose function.name is "" must be rejected, never accepted as
+    # a quality-passing result.
+    malformed = FakeServer(
+        [(200, _tool_call_payload([{"function": {"name": "", "arguments": "{}"}}]), 0.0)]
+    )
+    _set_keys(monkeypatch, "K_EMPTY")
+    router = Diffundo((_config("p_empty", malformed, "K_EMPTY"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
+        assert "tool call without a function name" in exc.value.last_error.message
+        assert router.health("p_empty") is HealthState.COOLDOWN
+    finally:
+        malformed.close()
+
+
+def test_race_rejects_malformed_tool_call_before_quality_acceptance(
+    tmp_path, monkeypatch
+) -> None:
+    # cascade-design §1.3: a malformed [{}] tool-call completion is an ERROR
+    # attempt, so it can never win the race through the quality gate.
+    malformed = FakeServer([(200, _tool_call_payload([{}]), 0.0)])
+    ok = FakeServer([(200, _ok_payload("right"), 0.1)])
+    _set_keys(monkeypatch, "K_MAL", "K_OK")
+    router = Diffundo(
+        (
+            _config("p_mal", malformed, "K_MAL"),
+            _config("p_ok", ok, "K_OK"),
+        )
+    )
+    try:
+        result = asyncio.run(router.call_race(ProviderTier.FAST, PROMPT, race_timeout_s=5.0))
+        assert result.provider == "p_ok"
+        assert result.content == "right"
+        assert router.health("p_mal") is HealthState.COOLDOWN
+    finally:
+        malformed.close()
+        ok.close()
+
+
+def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypatch) -> None:
+    # A real read_file tool call with concrete arguments must still pass
+    # unchanged through the malformed-call guard.
+    server = FakeServer(
+        [
+            (
+                200,
+                _tool_call_payload(
+                    [
+                        {
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path": "README.md", "offset": 5}',
+                            },
+                        }
+                    ]
+                ),
+                0.0,
+            )
+        ]
+    )
+    _set_keys(monkeypatch, "K_READ")
+    router = Diffundo((_config("p_read", server, "K_READ"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == ""
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert (
+            result.tool_calls[0]["function"]["arguments"]
+            == '{"path": "README.md", "offset": 5}'
+        )
+        assert router.health("p_read") is HealthState.HEALTHY
     finally:
         server.close()
 

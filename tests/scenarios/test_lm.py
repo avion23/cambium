@@ -1314,6 +1314,43 @@ print("fresh-process load OK")
     assert "fresh-process load OK" in loaded.stdout
 
 
+def test_state_serialization_rejects_userinfo_base_url_raw_state_canary() -> None:
+    _require_dspy()
+    from cambium.diffundo import Diffundo, ProviderConfig
+
+    url_secret = "URL_SECRET"
+    credential_diffundo = Diffundo(
+        [
+            ProviderConfig(
+                name="p",
+                tier=ProviderTier.FAST,
+                base_url=f"https://{url_secret}_user:{url_secret}_pass@fake.invalid",
+                api_key_env="K_FAKE",
+                model="m",
+            )
+        ]
+    )
+    lm = CambiumLM(credential_diffundo, ProviderTier.FAST)
+
+    with pytest.raises(ValueError, match="URL credentials"):
+        lm.dump_state()
+
+    valid_diffundo = Diffundo(
+        [
+            ProviderConfig(
+                name="p",
+                tier=ProviderTier.FAST,
+                base_url="https://api.example.invalid/v1",
+                api_key_env="K_FAKE",
+                model="m",
+            )
+        ]
+    )
+    raw_state = repr(CambiumLM(valid_diffundo, ProviderTier.FAST).dump_state())
+    assert url_secret not in raw_state
+    assert "https://api.example.invalid/v1" in raw_state
+
+
 def test_reasoning_and_tool_choice_reach_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -1399,6 +1436,86 @@ def test_tool_call_completion_reaches_dspy_outputs() -> None:
             },
         }
     ]
+
+
+@pytest.mark.parametrize("tool_calls", [({},), ({"function": {"name": ""}},)])
+def test_malformed_tool_calls_are_rejected_at_dspy_boundary(
+    tool_calls: tuple[dict[str, Any], ...],
+) -> None:
+    _require_dspy()
+    import dspy
+
+    class MalformedDiffundo(FakeDiffundo):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            return CallResult(
+                provider=self.endpoint,
+                model=model or "fake-model",
+                tier=tier,
+                content="",
+                latency_s=0.01,
+                tool_calls=tool_calls,
+            )
+
+    lm = CambiumLM(MalformedDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="non-empty function name"):
+        lm(
+            request=dspy.LMRequest(
+                model="cambium/fast",
+                messages=[{"role": "user", "parts": [{"type": "text", "text": "hi"}]}],
+            )
+        )
+
+
+def test_valid_read_file_tool_call_args_pass_through_lm() -> None:
+    _require_dspy()
+    import dspy
+
+    class ReadFileDiffundo(FakeDiffundo):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            return CallResult(
+                provider=self.endpoint,
+                model=model or "fake-model",
+                tier=tier,
+                content="",
+                latency_s=0.01,
+                tool_calls=(
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "README.md", "offset": 5}',
+                        },
+                    },
+                ),
+            )
+
+    lm = CambiumLM(ReadFileDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    response = lm(
+        request=dspy.LMRequest(
+            model="cambium/fast",
+            messages=[{"role": "user", "parts": [{"type": "text", "text": "read a file"}]}],
+        )
+    )
+
+    assert [tool.name for tool in response.tool_calls] == ["read_file"]
+    assert response.tool_calls[0].args == {"path": "README.md", "offset": 5}
+    assert response.tool_calls[0].id == "call_read"
+    assert response.text is None
 
 
 def test_tool_call_content_and_tool_calls_are_both_preserved() -> None:

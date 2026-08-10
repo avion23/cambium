@@ -17,6 +17,7 @@ from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlparse
 
 if sysconfig.get_config_var("Py_GIL_DISABLED") or os.environ.get("Py_GIL_DISABLED") == "1":
     raise RuntimeError(
@@ -594,24 +595,35 @@ class _CambiumLMMixin:
         if not isinstance(diffundo, Diffundo):
             return None
         providers = getattr(diffundo, "_providers", ())
-        serialized_providers = [
-            {
-                "name": provider.name,
-                "tier": provider.tier.value,
-                "base_url": provider.base_url,
-                "api_key_env": provider.api_key_env,
-                "timeout_s": provider.timeout_s,
-                "max_retries": provider.max_retries,
-                "rpm": provider.rpm,
-                "enabled": provider.enabled,
-                "model": provider.model,
-                "priority": provider.priority,
-                "cooldown_s": provider.cooldown_s,
-                "price_per_1m_in": provider.price_per_1m_in,
-                "price_per_1m_out": provider.price_per_1m_out,
-            }
-            for provider in providers
-        ]
+        serialized_providers = []
+        for provider in providers:
+            base_url = provider.base_url
+            if type(base_url) is not str:
+                raise TypeError(
+                    f"provider {provider.name!r} base_url must be an exact builtin string"
+                )
+            if urlparse(base_url).username is not None or urlparse(base_url).password is not None:
+                raise ValueError(
+                    f"provider {provider.name!r} base_url must not contain URL credentials; "
+                    "provider credentials belong in the environment (api_key_env)"
+                )
+            serialized_providers.append(
+                {
+                    "name": provider.name,
+                    "tier": provider.tier.value,
+                    "base_url": base_url,
+                    "api_key_env": provider.api_key_env,
+                    "timeout_s": provider.timeout_s,
+                    "max_retries": provider.max_retries,
+                    "rpm": provider.rpm,
+                    "enabled": provider.enabled,
+                    "model": provider.model,
+                    "priority": provider.priority,
+                    "cooldown_s": provider.cooldown_s,
+                    "price_per_1m_in": provider.price_per_1m_in,
+                    "price_per_1m_out": provider.price_per_1m_out,
+                }
+            )
         return json.dumps(
             {
                 "providers": serialized_providers,
@@ -900,10 +912,13 @@ class _CambiumLMMixin:
             args = dict(raw_arguments)
         if not isinstance(args, dict):
             args = {}
+        name = function.get("name") or tool_call.get("name") or ""
+        if type(name) is not str or not name.strip():
+            raise TypeError("Diffundo tool_calls must carry a non-empty function name")
         return {
             "type": "tool_call",
             "id": tool_call.get("id"),
-            "name": function.get("name") or tool_call.get("name") or "",
+            "name": name,
             "args": args,
         }
 
