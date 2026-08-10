@@ -10,20 +10,22 @@ This revision supersedes the previous M1 plan. The old plan is stale for five re
 2. **The old plan omits mandatory redactor integration.** Redaction (security F-02) is not optional M3 scope; it is a precondition of every event being persisted. It runs first.
 3. **Step 2's test surface was incomplete** — it missed the slice-reader semantics tests in `test_supervisor_hardening.py` and the provider-bridge tests in `test_worker_provider.py` that assert `events.jsonl` absence.
 4. **Step 6 conflicted with the merged canonical results contract.** A `result.json` writing step that writes `TaskResult` fields per task contradicts `cambium.results` / `ROOT_RESULT_KEYS`, which are already on `main`. The result wiring is now phase (d), not an optional step.
-5. **The old plan claimed Steps 4–5 could run in parallel, but both touch `supervisor.py`** (Step 5 serialized against Steps 1–3 on the same file). There is now exactly one serial `supervisor.py` change: phase (b).
+5. **The old plan claimed Steps 4–5 could run in parallel, but both touch `supervisor.py`** (Step 5 serialized against Steps 1–3 on the same file). Phases (a), (b), and (d) all own `supervisor.py`: they are ONE serialized effort executed as ordered commits within a single worktree merge — not one-file commits.
 
 ---
 
 ## 1. Corrected minimal sequence (5 phases)
 
-Phases (a), (b), (c), (d) are strictly ordered; phase (e) is audits and docs only.
+Phases (a), (b), (c), (d) are strictly ordered; phase (e) is audits and docs only. Phases (a), (b), (d) all own `supervisor.py` and are ONE serialized effort — ordered commits within a single worktree merge, not one-file commits; phase (b)'s §3 test migrations land in the same merge.
 
 ### (a) INTEGRATE REDACTION FIRST
+
+**Prerequisite (ordering dependency):** the credential-isolation fix (declared-keys-only worker env) is a PREREQUISITE for the redaction registry to be complete, and its consolidation merge must land BEFORE phase (a). `_worker_environment` (`supervisor.py:824-826`) today admits every canonical `CAMBIUM_PROVIDER_*` variable present in the host env via `is_provider_env_name` (`auth.py:191-193`) even when it is not declared in `provider_env_keys` (codified by `tests/scenarios/test_supervisor_fanout.py:739-764`); a value admitted this way bypasses a registry built from the declared keys alone.
 
 Build **one session `Redactor`** with:
 
 - default patterns (secrets, tokens, API keys — the F-02 pattern set), plus
-- the **exact values** of the explicitly allowed provider env keys for the session.
+- the **exact values of every env var `_worker_environment` can pass a worker** — after the isolation merge that is exactly the session's declared `provider_env_keys` values. The registry is complete only when those two sets coincide.
 
 Redact the **COMPLETE event record** in `_Runtime.emit` (`supervisor.py:1291-1319`) before:
 
@@ -37,9 +39,9 @@ Add belt-and-braces **structured redaction inside `EventStore.append`** before J
 
 Preserve `_redacted_provider_metadata` as a **field allowlist**, not the general boundary: the Redactor does not replace the allowlist; it operates on the full record, and `_redacted_provider_metadata` controls which provider fields may be retained.
 
-### (b) CANONICALIZE `supervisor.py` IN ONE SERIAL CHANGE
+### (b) CANONICALIZE `supervisor.py` (WITHIN THE SERIALIZED (a)/(b)/(d) EFFORT)
 
-One commit, one owner, one file. No coexistence window.
+Phases (a), (b), (d) all own `supervisor.py` and are ONE serialized effort — ordered commits within a single worktree merge, not one-file commits. This phase also includes the §3 test migrations in the same merge. No coexistence window.
 
 1. **Rewrite `run_session`** as a thin one-task adapter over `run_plan`:
    - copy spec,
@@ -53,6 +55,8 @@ One commit, one owner, one file. No coexistence window.
 4. **Built-in default worker = `python -m cambium.worker`** — never `scripts/fake_worker.py`.
 5. **Fold new-repo init** into `_ensure_repo_initialized`.
 6. **Hard imports:** `CRITICAL_KINDS`, `EventStore` from `cambium.store`; `MergeConflictError`, `MergeSequencer`, `NonFastForwardError` from `cambium.merge`. Import failure fails at load (fail-loud).
+
+**REWRITE:** the supervisor module docstring (`supervisor.py:1-24`) still claims it writes `events.jsonl`, uses `git merge --ff-only`, and is "the vertical-slice milestone"; rewrite it to describe the canonical `run_plan` / `EventStore` / `MergeSequencer` runtime (inventory row 17).
 
 **DELETE** (exact file:line inventory in §2):
 
@@ -85,10 +89,14 @@ One commit, one owner, one file. No coexistence window.
 
 ### (d) WIRE CANONICAL RESULT
 
+**Retention boundary (prerequisite):** the worker envelope does not exist at the result-writing point today. `run_plan` keeps it only transiently in `_GenOutcome.envelope` (`supervisor.py:1245-1255`, `:2183-2188`); `_supervise` retains only `TaskResult` (no commits/files/diff/summary; `:1194-1204`, `:1731-1745`); and the persisted result event keeps only status + provider metadata (`:2082-2089`). Phase (d) adds an explicit retention boundary: `_Runtime` must retain the terminal correlated envelope — or its sanitized commits/files/diff/summary — from `_GenOutcome` until AFTER `runtime.shutdown`, e.g. a `_Runtime.last_envelope` field, redacted before retention. Without this, the commits/files assertions cannot match.
+
 After `runtime.shutdown`, construct a `cambium.results.Result`:
 
-- one task → from the **sanitized worker envelope**;
+- one task → the **sanitized envelope fields COMBINED with the authoritative supervisor verdict** (the worker's own status token alone is never authoritative);
 - flat multi-task → an **aggregate status record** (no invented root).
+
+**Verdict override:** the worker envelope is emitted BEFORE gate/merge processing (`supervisor.py:2074-2089`), so a successful worker can later fail its gate or merge and `TaskResult` becomes `failed` (`:1724-1745`) while `status_from_wire` would still map worker `status == "succeeded"` to `"done"` (`results.py:359-399`). The root `Result` must therefore compute its status from the supervisor verdict FIRST: gate exit code, merge outcome (`merge_sha` vs `merge_failed`), and timeout/rejection/cancellation signals OVERRIDE the worker's own status. Worker `"succeeded"` + failing gate → `status == "failed"`, `exit_code == 1`. Graceful cancellation → `status == "cancelled"`, `exit_code 4`. The envelope contributes only sanitized commits/files/diff/summary.
 
 Timing: `started_at` before startup; `ended_at` after shutdown. `session id = str(session_dir.resolve())`.
 
@@ -98,13 +106,14 @@ Call `write_result` via `asyncio.to_thread` **before `run_plan` returns**. On gr
 
 **Acceptance:**
 
-- one file changed,
+- `supervisor.py` changes land within the serialized (a)/(b)/(d) effort, not one-file commits,
 - gate passed,
 - `refs/heads/main` advanced via canonical sequencer,
 - fsynced `merge_committed` in `events.db`,
 - `.cambium/result.json` has exactly `ROOT_RESULT_KEYS`,
-- `status == "done"`, `exit_code == 0`,
-- commits/files match the worker envelope,
+- worker success + failing gate → `result.json` `status == "failed"`, `exit_code == 1`,
+- worker success + passing gate → `status == "done"`, `exit_code == 0`,
+- commits/files match the retained (redacted) terminal envelope,
 - no temp file,
 - worker PID gone,
 - only primary worktree remains + task branch deleted.
@@ -150,6 +159,7 @@ All line numbers reference `main@b709375` and are advisory (see §5).
 | 14 | `_load_task_spec` (slice CLI spec loader) | `:2593-2599` | DELETE |
 | 15 | `_bootstrap_scratch` (slice repo bootstrap) | `:2614-2630` | DELETE (folded into `_ensure_repo_initialized`) |
 | 16 | slice CLI mode (`--session-dir`/`--task-spec` body) | `:2661-2704` | DELETE (one-task plan via `_amain_plan`) |
+| 17 | stale module docstring (claims `events.jsonl`, `git merge --ff-only`, "vertical-slice milestone") | `:1-24` | REWRITE (describe the canonical `run_plan` / `EventStore` / `MergeSequencer` runtime) |
 
 **KEEP:** `EventSink`, `make_request_id`, `SliceResult`, `_cfg_float`, `_write_json`, `_kill_worker`, `_kill_process_group_and_reap`, `_GateOutputOverflow`, `_communicate_gate_bounded`, `_strip_sensitive_env`, `_redacted_provider_metadata`, `_provider_env_keys`, `_worker_environment`, `_sh`, `_ensure_repo_initialized`, `_amain_plan`, `read_events`, `_Runtime`, `run_plan`, `TaskResult`/`PlanResult`, `_merge_task`/`reconcile`/`_flush_sequencer_events`. Preserve all post-0867572 hardening (env stripping, worktree cleanup, quarantine, stdin deadlines).
 
@@ -157,16 +167,18 @@ All line numbers reference `main@b709375` and are advisory (see §5).
 
 | # | Item | Location | Disposition |
 |---|---|---|---|
-| 17 | `Orchestrator.submit` / `_queue` / `_next_task_id` | `orchestrator.py:28-46` | DELETE |
-| 18 | no-work start/finish drain | `orchestrator.py:71-75` | DELETE |
-| 19 | thin `Orchestrator.run(session_dir, plan)` forwarding to `run_plan` | `orchestrator.py` | KEEP |
-| 20 | `events.py` seed dataclasses + envelope | `events.py` (whole file) | DELETE |
+| 18 | `Orchestrator.submit` / `_queue` / `_next_task_id` | `orchestrator.py:28-46` | DELETE |
+| 19 | no-work start/finish drain | `orchestrator.py:71-75` | DELETE |
+| 20 | thin `Orchestrator.run(session_dir, plan)` forwarding to `run_plan` | `orchestrator.py` | KEEP |
+| 21 | `events.py` seed dataclasses + envelope | `events.py` (whole file) | DELETE |
 
 `EventHandler` receives canonical redacted event dicts.
 
 ---
 
 ## 3. Test migration table
+
+Exactly FOUR test files migrate in phase (b), all landing in the same merge as the supervisor rewrite: `test_vertical_slice.py`, `test_supervisor_hardening.py`, `test_worker_provider.py`, `test_conformance.py`. `test_supervisor_fanout.py` and `test_results.py` remain no-change (see "Keep working" below).
 
 | Test file / range | Change |
 |---|---|
@@ -198,9 +210,9 @@ Line numbers reference `main@b709375` (2026-08-10) and are **advisory**; they wi
 The execution **ORDER** is normative:
 
 1. redaction first (phase a),
-2. then one serial `supervisor.py` change (phase b),
+2. then supervisor canonicalization (phase b, including its §3 test migrations),
 3. then `events.py`/orchestrator (phase c),
 4. then result wiring (phase d),
 5. then audits (phase e).
 
-Phases (a)–(d) are strictly ordered and each is one commit; phase (e) is three independent audit agents plus one docs commit on the frozen SHA.
+Phases (a)–(e) are strictly ordered. Phases (a), (b), and (d) all own `supervisor.py` and are ONE serialized effort — ordered commits within a single worktree merge, not one-file commits; phase (c) is its own change; phase (e) is three independent audit agents plus one docs commit on the frozen SHA.
