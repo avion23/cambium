@@ -180,27 +180,34 @@ class _ImmutableCallbacks(list[Any]):
     sort = _reject_mutation
 
 
-def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
-    """Take a recursive immutable snapshot of JSON-shaped configuration."""
+def _freeze(
+    value: Any,
+    memo: dict[int, Any] | None = None,
+    *,
+    json_safe: bool = False,
+) -> Any:
+    """Take a recursive isolated snapshot of JSON-shaped configuration."""
     if memo is None:
         memo = {}
     if isinstance(value, Mapping):
         if id(value) in memo:
             raise ValueError("CambiumLM kwargs must not contain reference cycles")
         memo[id(value)] = None
-        frozen = MappingProxyType(
-            {
-                _freeze(_reject_string_subclass_key(key), memo): _freeze(item, memo)
-                for key, item in value.items()
-            }
-        )
+        snapshot = {
+            _freeze(_reject_string_subclass_key(key), memo, json_safe=json_safe): _freeze(
+                item, memo, json_safe=json_safe
+            )
+            for key, item in value.items()
+        }
+        frozen = snapshot if json_safe else MappingProxyType(snapshot)
         memo.pop(id(value))
         return frozen
     if isinstance(value, list | tuple):
         if id(value) in memo:
             raise ValueError("CambiumLM kwargs must not contain reference cycles")
         memo[id(value)] = None
-        frozen = tuple(_freeze(item, memo) for item in value)
+        snapshot = [_freeze(item, memo, json_safe=json_safe) for item in value]
+        frozen = snapshot if json_safe else tuple(snapshot)
         memo.pop(id(value))
         return frozen
     if isinstance(value, bytearray | memoryview):
@@ -546,12 +553,14 @@ class _CambiumLMMixin:
         return cls(**constructor_state)
 
     @staticmethod
-    def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    def _safe_kwargs(
+        kwargs: Mapping[str, Any], *, json_safe_snapshot: bool = False
+    ) -> dict[str, Any]:
         _require_exact_keyword_keys(kwargs)
         if type(kwargs) is dict and any(key in _FORBIDDEN_FIELDS for key in kwargs):
             forbidden = sorted(key for key in kwargs if key in _FORBIDDEN_FIELDS)
             raise ValueError(f"CambiumLM does not accept {', '.join(forbidden)}")
-        frozen_kwargs = _freeze(kwargs)
+        frozen_kwargs = _freeze(kwargs, json_safe=json_safe_snapshot)
         safe: dict[Any, Any] = {}
         forbidden: list[str] = []
         for key, value in frozen_kwargs.items():
@@ -682,7 +691,9 @@ class _CambiumLMMixin:
         if request.tools:
             prompt["tools"] = [self._tool(tool) for tool in request.tools]
 
-        prompt = self._safe_kwargs(prompt)
+        # Scan and dispatch this one isolated, JSON-safe snapshot. The source request is
+        # never read again, so a post-scan mutation cannot change provider input.
+        prompt = self._safe_kwargs(prompt, json_safe_snapshot=True)
 
         model = self._validate_model(self._provider_model)
         budget_usd = self._validate_budget(self._budget_usd)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -1136,7 +1137,23 @@ def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
                 self._data = {"api_key": "SENSITIVE_CANARY"}
             return items
 
-    diffundo = FakeDiffundo()
+    class SerializingDiffundo(FakeDiffundo):
+        def __init__(self) -> None:
+            super().__init__()
+            self.serialized_prompts: list[str] = []
+
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            self.serialized_prompts.append(json.dumps(prompt))
+            return await super().call(tier, prompt, model=model, budget_usd=budget_usd)
+
+    diffundo = SerializingDiffundo()
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
     response_format = DelayedCredentialMapping()
     request = dspy.LMRequest(
@@ -1151,9 +1168,12 @@ def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
         asyncio.run(lm.acall(request=request))
 
     assert len(diffundo.calls) == 1
-    assert dict(diffundo.calls[0]["prompt"]["response_format"].items()) == {
-        "type": "json_object"
-    }
+    dispatched_prompt = diffundo.calls[0]["prompt"]
+    assert dispatched_prompt["response_format"] == {"type": "json_object"}
+    assert type(dispatched_prompt["response_format"]) is dict
+    assert type(dispatched_prompt["messages"]) is list
+    assert "api_key" not in diffundo.serialized_prompts[0]
+    assert "SENSITIVE_CANARY" not in diffundo.serialized_prompts[0]
     assert response_format.reads == 1
 
 
@@ -1169,7 +1189,7 @@ def test_reasoning_and_tool_choice_reach_diffundo() -> None:
     )
 
     assert diffundo.calls[0]["prompt"] == {
-        "messages": ({"role": "user", "content": "hello"},),
+        "messages": [{"role": "user", "content": "hello"}],
         "reasoning": {"effort": "high"},
         "tool_choice": {"mode": "none"},
     }
