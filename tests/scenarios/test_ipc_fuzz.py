@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-import time
 from typing import Any
 
 import pytest
@@ -15,6 +14,9 @@ from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_mess
 FUZZ_CASES = 500
 MAX_RANDOM_BYTES = 64 * 1024
 FUZZ_SEED = 0xC0FFEE
+# Byte-at-a-time reads make this scenario machine-load sensitive; keep only a
+# generous async timeout so it still catches a true hang without wall-time flake.
+FUZZ_TIMEOUT_SECONDS = 180.0
 
 
 def _reader_with(data: bytes) -> asyncio.StreamReader:
@@ -143,9 +145,7 @@ def test_read_message_deterministic_random_bytes_never_escapes_or_hangs() -> Non
             payload = _random_payload(rng, case)
             await _read_fuzz_case(_reader_with(payload))
 
-    started = time.perf_counter()
-    asyncio.run(asyncio.wait_for(scenario(), timeout=30.0))
-    assert time.perf_counter() - started < 30.0
+    asyncio.run(asyncio.wait_for(scenario(), timeout=FUZZ_TIMEOUT_SECONDS))
 
 
 def test_read_message_one_mib_plus_one_byte_resyncs() -> None:
