@@ -348,6 +348,37 @@ def test_copy_freezes_bytearrays_in_launch_and_train_kwargs() -> None:
     assert copied.train_kwargs["nested"]["value"] == b"train"
 
 
+def test_copy_freezes_mutable_primitive_subclasses() -> None:
+    _require_dspy()
+
+    class MutableInt(int):
+        def __new__(cls, value: int, payload: dict[str, str]) -> MutableInt:
+            instance = super().__new__(cls, value)
+            instance.payload = payload
+            return instance
+
+    payload = {"state": "original"}
+    value = MutableInt(7, payload)
+    lm = CambiumLM(  # type: ignore[arg-type]
+        FakeDiffundo(),
+        ProviderTier.FAST,
+        launch_kwargs={"nested": {"value": value}},
+        train_kwargs={"nested": {"value": value}},
+    )
+    copied = lm.copy()
+
+    payload["state"] = "changed"
+
+    frozen_values = (
+        lm.launch_kwargs["nested"]["value"],
+        lm.train_kwargs["nested"]["value"],
+        copied.launch_kwargs["nested"]["value"],
+        copied.train_kwargs["nested"]["value"],
+    )
+    assert all(type(frozen) is int for frozen in frozen_values)
+    assert frozen_values == (7, 7, 7, 7)
+
+
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -384,6 +415,25 @@ def test_copy_rejects_prompt_observing_callbacks() -> None:
     copied = lm.copy()
     assert _call(copied, "PROMPT-CANARY") == ["completion text"]
     assert copied.callbacks == []
+    assert observed == []
+
+
+def test_post_construction_callback_does_not_observe_prompt() -> None:
+    _require_dspy()
+    import dspy
+
+    observed: list[dict[str, Any]] = []
+
+    class PromptCallback(dspy.utils.callback.BaseCallback):
+        def on_lm_start(self, call_id: str, instance: Any, inputs: dict[str, Any]) -> None:
+            del call_id, instance
+            observed.append(inputs)
+
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="callbacks are immutable"):
+        lm.callbacks.append(PromptCallback())
+
+    assert _call(lm, "PROMPT-CANARY") == ["completion text"]
     assert observed == []
 
 

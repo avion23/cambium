@@ -91,6 +91,27 @@ class _ImmutableDict(dict[Any, Any]):
         return self
 
 
+class _ImmutableCallbacks(list[Any]):
+    """Empty DSPy-compatible callback list that rejects later mutation."""
+
+    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("CambiumLM callbacks are immutable")
+
+    __delitem__ = _reject_mutation
+    __iadd__ = _reject_mutation
+    __imul__ = _reject_mutation
+    __setitem__ = _reject_mutation
+    append = _reject_mutation
+    clear = _reject_mutation
+    extend = _reject_mutation
+    insert = _reject_mutation
+    pop = _reject_mutation
+    remove = _reject_mutation
+    reverse = _reject_mutation
+    sort = _reject_mutation
+
+
 def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
     """Take a recursive immutable snapshot of JSON-shaped configuration."""
     if memo is None:
@@ -113,8 +134,18 @@ def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
         return frozen
     if isinstance(value, bytearray | memoryview):
         return bytes(value)
-    if value is None or isinstance(value, str | bytes | int | float | bool):
+    if value is None or type(value) in (str, bytes, int, float, bool):
         return value
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, bytes):
+        return bytes(value)
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value)
     raise TypeError(
         f"CambiumLM configuration values must be immutable JSON-shaped data, not "
         f"{type(value).__name__}"
@@ -203,6 +234,11 @@ class _CambiumLMMixin:
     """DSPy LM implementation whose only provider edge is Diffundo.call."""
 
     forward_contract = "typed_lm"
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "callbacks":
+            value = _ImmutableCallbacks()
+        super().__setattr__(name, value)
 
     def __init__(
         self,
@@ -313,7 +349,7 @@ class _CambiumLMMixin:
             copied._provider_model = adapter_overrides["model"]
         if "budget_usd" in adapter_overrides:
             copied._budget_usd = adapter_overrides["budget_usd"]
-        copied.callbacks = []
+        copied.callbacks = _ImmutableCallbacks()
         return copied
 
     def dump_state(self) -> dict[str, Any]:
