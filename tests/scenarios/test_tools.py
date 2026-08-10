@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -149,6 +150,63 @@ def test_grep_code_rejects_path_escape(tmp_path: Path) -> None:
 
     assert not result.ok
     assert "escapes worktree" in (result.error or "")
+
+
+def test_get_signature_returns_structured_signature(tmp_path: Path) -> None:
+    (tmp_path / "sample.py").write_text(
+        "def build(\n    value,\n):\n    return value\n",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    assert result.error is None
+    assert json.loads(result.output) == {
+        "body_lines": 1,
+        "col": 0,
+        "kind": "function",
+        "line": 1,
+        "name": "build",
+        "path": "sample.py",
+        "signature": "def build(\n    value,\n):",
+    }
+
+
+def test_get_signature_rejects_escape_and_invalid_symbol(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("def build():\n    pass\n", encoding="utf-8")
+    escaped = _run(
+        "get_signature",
+        {"path": "../outside.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+    assert not escaped.ok
+    assert "escapes worktree" in (escaped.error or "")
+
+    (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
+    invalid = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build.nested"},
+        ToolContext(tmp_path),
+    )
+    assert not invalid.ok
+    assert invalid.error == "get_signature symbol must be a Python identifier"
+
+
+def test_get_signature_reports_missing_symbol(tmp_path: Path) -> None:
+    (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
+    missing = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "missing"},
+        ToolContext(tmp_path),
+    )
+    assert not missing.ok
+    assert "symbol not found" in (missing.error or "")
 
 
 def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:

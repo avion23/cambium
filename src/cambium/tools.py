@@ -8,6 +8,8 @@ approval, linting, and resource controls out of process-global state.
 from __future__ import annotations
 
 import asyncio
+import json
+import keyword
 import os
 import re
 import shlex
@@ -20,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import ast_tools
 from .approval import ApprovalGate
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
@@ -287,6 +290,31 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=True, output=result.stdout)
 
 
+async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    raw_path = args["path"]
+    if not raw_path.strip() or "\x00" in raw_path:
+        raise _ToolFailure("get_signature path must be a non-empty path")
+    path = _confined_path(ctx, raw_path)
+
+    symbol = args["symbol"]
+    if not symbol.isidentifier() or keyword.iskeyword(symbol):
+        raise _ToolFailure("get_signature symbol must be a Python identifier")
+
+    source = _read_text(path)
+    try:
+        signature = ast_tools.extract_signature(source, symbol)
+    except SyntaxError as exc:
+        location = f" at line {exc.lineno}" if exc.lineno is not None else ""
+        raise _ToolFailure(
+            f"could not parse {_display_path(ctx, path)}{location}: {exc.msg}"
+        ) from exc
+    if signature is None:
+        raise _ToolFailure(f"symbol not found: {symbol!r} in {_display_path(ctx, path)}")
+
+    result = {"path": _display_path(ctx, path), **signature}
+    return _Outcome(ok=True, output=json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+
 def _process_output(stdout: Any, stderr: Any) -> str:
     standard_output = (
         stdout.decode("utf-8", errors="replace")
@@ -427,6 +455,7 @@ TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "write_file": _write_file,
     "edit_file": _edit_file,
     "grep_code": _grep_code,
+    "get_signature": _get_signature,
     "git_op": _git_op,
     "run_shell": _run_shell,
 }

@@ -105,6 +105,7 @@ def test_tool_schemas_are_well_formed_and_strict() -> None:
         "write_file",
         "edit_file",
         "grep_code",
+        "get_signature",
         "git_op",
         "run_shell",
     ]
@@ -123,6 +124,11 @@ def test_tool_schemas_are_well_formed_and_strict() -> None:
         "log",
         "stash",
     ]
+
+    signature_schema = _tool("get_signature")
+    assert signature_schema["parameters"]["required"] == ["path", "symbol"]
+    assert signature_schema["parameters"]["properties"]["path"]["minLength"] == 1
+    assert signature_schema["parameters"]["properties"]["symbol"]["minLength"] == 1
 
 
 def _tool(name: str) -> dict[str, Any]:
@@ -160,3 +166,12 @@ def test_validate_tool_call_accepts_valid_arguments() -> None:
         _tool("edit_file"),
         {"path": "src/app.py", "old_string": "old", "new_string": "new"},
     ) == []
+
+
+def test_validate_tool_call_rejects_empty_signature_arguments() -> None:
+    errors = validate_tool_call(_tool("get_signature"), {"path": "", "symbol": ""})
+
+    assert errors == [
+        "validation failed: 'path' must have at least 1 character",
+        "validation failed: 'symbol' must have at least 1 character",
+    ]

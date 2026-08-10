@@ -164,6 +164,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "get_signature",
+        "description": "Extract a Python function or class signature from a worktree file.",
+        "parameters": _parameters(
+            {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Path to the Python source file.",
+                },
+                "symbol": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Function or class name to inspect.",
+                },
+            },
+            ["path", "symbol"],
+        ),
+    },
+    {
         "name": "git_op",
         "description": "Run an allowlisted git operation in the worker worktree.",
         "parameters": _parameters(
@@ -252,6 +271,11 @@ def _validate_object(
             continue
         if not _type_matches(value, property_schema):
             errors.append(f"validation failed: '{label}' must be {_expected_type(property_schema)}")
+            continue
+        min_length = property_schema.get("minLength")
+        if type(value) is str and isinstance(min_length, int) and len(value) < min_length:
+            unit = "character" if min_length == 1 else "characters"
+            errors.append(f"validation failed: '{label}' must have at least {min_length} {unit}")
             continue
         allowed = property_schema.get("enum")
         if allowed is not None and not any(
