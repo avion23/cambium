@@ -37,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -1916,6 +1917,46 @@ class _Runtime:
         return staging_tip
 
 
+def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
+    """Atomically persist the accepted plan as ``<session_dir>/plan.json``.
+
+    Mirrors the ``cambium.results.write_result`` JSON conventions:
+    ``mkstemp`` in the target directory, compact ``ensure_ascii=False`` /
+    ``allow_nan=False`` JSON with a trailing newline, fsync, then
+    ``os.replace`` plus a directory fsync. The caller holds the session
+    lock, so this is the canonical pre-worker boundary artifact.
+    """
+    target = Path(session_dir) / "plan.json"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=Path(session_dir)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                plan,
+                stream,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(Path(session_dir), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return target
+
+
 def _plan_tasks(plan: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
     if isinstance(plan, dict):
         tasks = plan.get("tasks")
@@ -2084,7 +2125,9 @@ async def run_plan(
     verdict alone decides merge eligibility. Publication is ref-only:
     ``refs/heads/main`` advances via atomic ``update-ref`` and no checkout is
     refreshed.
-    Returns a PlanResult; the session's event log is durable in
+    Returns a PlanResult; the exact accepted plan is persisted atomically as
+    ``<session_dir>/plan.json`` at the session boundary before any worker
+    starts, the session's event log is durable in
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
     canonical root result is written atomically to
     ``<session_dir>/.cambium/result.json`` before this coroutine returns.
@@ -2099,6 +2142,7 @@ async def run_plan(
     admission = _SessionAdmission(session_dir)
     admission.acquire()
     try:
+        await asyncio.to_thread(_write_plan, session_dir, {"tasks": specs})
         started_at = time.time()
         redactor = _session_redactor(specs)
         store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
