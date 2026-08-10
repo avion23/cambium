@@ -21,24 +21,25 @@ Trace callers and tests; a failed name search is not proof of absence.
 
 Current code is a deterministic Python harness. `src/cambium/__init__.py` exports only `__version__`; no public `Cambium`/`Session`/`Result` API exists.
 `worker.do_work` is a deterministic marker/commit seed; no DSPy ReAct loop is present.
-There is no example eval harness, smoke module, or example `__main__.py`; those attempted module commands exit 1 and are not checks.
+There is no example eval harness, smoke module, or example `__main__.py`; these are targets, and those attempted module commands exit 1 and are not checks.
 Custos, Opifex, Nuntius, Surculus, and Unio are architecture target names mapped to current supervisor, worker, ipc, worktree, and merge portions and symbols.
 Matching role modules are not proof. No TUI exists.
 
 ## Invariants
 
 - Keep scope tight. Report required file-scope expansion before editing.
-- Work in an isolated worktree. Verify `git rev-parse --show-toplevel` and `git worktree list`; never commit to `main` or a shared integration checkout.
+- Work in an isolated worktree. Verify `git rev-parse --show-toplevel` and `git worktree list`; never work or commit on `main` or in a shared integration checkout.
 - Children never commit to the integration branch. Root may merge verified child commits.
 - Read-only reports state `files changed: none, commit: none`.
 - Do not force-push, rewrite shared history, reset another worktree, or delete work to hide a failure.
-- Reproduce first. Make the smallest causal change; do not hide causes with a fallback, retry, default, or catch-all path.
+- Secrets are environment-only. Never log or send credentials.
+- Reproduce first with a deterministic check. Make the smallest causal change; do not hide causes with a fallback, retry, default, or catch-all path.
 - Preserve protocol, schema, worktree, approval, export, and module boundaries.
 - Worker stdout is NDJSON protocol only. Send diagnostics to logging or stderr.
 - Keep blocking disk and subprocess I/O off the event loop and use existing boundary helpers.
 - Use existing dependencies and vocabulary. Tests are offline and deterministic with fixed fixtures and fake workers.
 - Run the narrowest check, then an affected package or integration check when a change crosses a boundary.
-- Use same-version dataset, canary, schema, and baseline evidence. If the baseline moves, stop and record a new anchor before comparing results.
+- Use same-version dataset, canary, schema, and baseline evidence. If the baseline moves, stop and record a new anchor before comparing results; never silently re-anchor.
 - Report VERIFIED only with command, cwd, exit status, and evidence. Use UNVERIFIED for an unrun claim and BLOCKED for an external blocker.
 - Protocol-order violations fail the worker; malformed advisory lines are logged and skipped; model parsing follows the module's bounded failure policy.
 - Use enums for domain alternatives. Cite only `Decision` in `src/cambium/modules/example/decide.py` and `NodeStatus` in `src/cambium/tasktree.py`.
@@ -96,6 +97,7 @@ Every handoff uses this block:
 - Entry points read:
 - Baseline and reproduction: command, cwd, result
 - Files in scope:
+- Change and preserved boundary:
 - Checks: command, cwd, exit status, evidence
 - Status: VERIFIED | UNVERIFIED | BLOCKED
 - Next action:
