@@ -109,6 +109,30 @@ def test_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
     assert not (bench_root / "should_decompose" / "baseline.json").exists()
 
 
+def test_standalone_cli_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
+    bench_root = tmp_path / "baselines"
+    bench_root.mkdir()
+
+    gate = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cambium.bench",
+            "gate",
+            "--bench-root",
+            str(bench_root),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert gate.returncode == 1, gate.stdout + gate.stderr
+    assert "missing pre-existing anchor" in gate.stdout
+    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+
+
 def test_gate_passes_without_drift(tmp_path) -> None:
     bench_root = tmp_path / "baselines"
     report = run_bench(bench_root, "report")

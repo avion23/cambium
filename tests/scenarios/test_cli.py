@@ -50,6 +50,17 @@ def test_bench_report_honors_bench_root(tmp_path) -> None:
     assert module_baseline.read_bytes() == before
 
 
+def test_bench_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
+    bench_root = tmp_path / "baselines"
+    bench_root.mkdir()
+
+    result = _run("bench", "gate", "--bench-root", str(bench_root))
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "missing pre-existing anchor" in result.stdout
+    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+
+
 def test_unknown_subcommand_exits_two() -> None:
     result = _run("not-a-command")
 
