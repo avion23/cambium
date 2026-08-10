@@ -90,6 +90,18 @@ def _kinds(events: list[dict], kind: str) -> list[dict]:
     return [e for e in events if e["kind"] == kind]
 
 
+def _worktree_paths(repo: Path) -> list[Path]:
+    output = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return [
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # T1: fan-out — three workers, disjoint files, all merged, coherent log.
 # ---------------------------------------------------------------------------
@@ -122,11 +134,62 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
                          ("c.txt", "// cambium-c")):
         assert marker in _show(repo, "main", name)
 
+    assert _worktree_paths(repo) == [repo.resolve()]
     events = read_events(session_dir)
     assert len(_kinds(events, "merge_committed")) == 3
     for tid in ("t-a", "t-b", "t-c"):
         assert _protocol(events, tid) == ["init", "ready", "run_task", "result", "exit"]
     assert events[-1]["kind"] == "session_ended"
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        terminal = connection.execute(
+            "SELECT kind, task_id FROM events "
+            "WHERE kind IN ('result', 'merge_committed', 'session_ended')"
+        ).fetchall()
+    assert sum(kind == "result" for kind, _task_id in terminal) == 3
+    assert sum(kind == "merge_committed" for kind, _task_id in terminal) == 3
+    assert ("session_ended", None) in terminal
+
+
+def test_t1_gate_failure_prunes_worktree_and_persists_terminal_events(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-gate-fail",
+                worktree="wt-gate-fail",
+                branch="wt-gate-fail",
+                target_file="a.txt",
+                marker="// never-written",
+                gate="grep -q '// never-written' a.txt",
+                write_marker=False,
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    (task,) = result.results
+    assert task.status == "failed"
+    assert task.reason == "gate_failed"
+    assert _worktree_paths(repo) == [repo.resolve()]
+
+    events = read_events(session_dir)
+    assert _kinds(events, "gate")[0]["payload"]["exit_code"] != 0
+    assert _kinds(events, "result")[0]["payload"]["status"] == "failed"
+    assert events[-1]["kind"] == "session_ended"
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        terminal = connection.execute(
+            "SELECT kind, task_id FROM events "
+            "WHERE task_id = ? AND kind IN ('result', 'gate')",
+            ("t-gate-fail",),
+        ).fetchall()
+    assert {kind for kind, _task_id in terminal} == {"result", "gate"}
 
 
 # ---------------------------------------------------------------------------
