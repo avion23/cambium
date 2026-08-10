@@ -17,10 +17,12 @@ semantics. Canary records add ``canary: true`` and ``canary_info``.
 Run: python3.12 scripts/generate_should_decompose_v1.py
 """
 
+# Candidate task prose intentionally includes long lines to preserve its source wording.
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -31,7 +33,7 @@ from cambium.modules.example.decide import should_decompose  # noqa: E402
 
 ADDED_AT = "2026-08-09"
 ADDED_BY = "agent:data-builder-v1"
-DATASET_VERSION = "1.0.0"
+DATASET_VERSION = "1.1.0"
 SCHEMA_VERSION = 1
 
 T = True

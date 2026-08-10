@@ -2,8 +2,8 @@
 
 Covers the v1 three-file splits (train/eval/canaries), canary exclusion
 from train/eval, backward-compat fallback to ``example_pairs.jsonl``,
-the ``meta.json`` dataset version, and engine consistency over all 260
-records (the check_dataset_v1.py methodology, inlined).
+the ``meta.json`` versions, and engine consistency over all 260 records
+(the check_dataset_v1.py methodology, inlined).
 """
 
 from __future__ import annotations
@@ -117,6 +117,28 @@ def test_legacy_load_still_returns_all_examples() -> None:
 def test_dataset_version_read_from_meta(tmp_path) -> None:
     loader = ExampleDatasetLoader(_fresh_copy(tmp_path))
     assert loader.dataset_version == "1.1.0"
+
+
+def test_split_record_versions_match_meta() -> None:
+    meta = json.loads((DATASETS_DIR / "meta.json").read_text(encoding="utf-8"))
+    expected_schema_version = meta["schema_version"]
+    expected_dataset_version = meta["dataset_version"]
+    assert isinstance(expected_schema_version, int)
+    assert not isinstance(expected_schema_version, bool)
+    assert isinstance(expected_dataset_version, str)
+
+    for split in ("train", "eval", "canaries"):
+        path = DATASETS_DIR / f"{split}.jsonl"
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            record = json.loads(line)
+            assert isinstance(record["schema_version"], int)
+            assert not isinstance(record["schema_version"], bool)
+            assert record["schema_version"] == expected_schema_version, (
+                f"{path.name}:{line_no}: schema_version drifted from meta.json"
+            )
+            assert record["dataset_version"] == expected_dataset_version, (
+                f"{path.name}:{line_no}: dataset_version drifted from meta.json"
+            )
 
 
 def test_dataset_version_defaults_when_meta_missing(tmp_path) -> None:
