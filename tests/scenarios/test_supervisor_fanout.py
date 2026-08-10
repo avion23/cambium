@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -337,9 +338,32 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
          "--plan", str(plan_path), "--session-dir", str(session_dir)],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    time.sleep(1.2)
-    proc.send_signal(signal.SIGTERM)
-    out, err = proc.communicate(timeout=30)
+    try:
+        events_db = session_dir / ".cambium" / "events.db"
+        deadline = time.monotonic() + 30
+        while True:
+            init_seen = False
+            if events_db.is_file():
+                try:
+                    with sqlite3.connect(events_db) as connection:
+                        init_seen = connection.execute(
+                            "SELECT 1 FROM events WHERE kind = ? AND task_id = ? LIMIT 1",
+                            ("init", "t-slow"),
+                        ).fetchone() is not None
+                except sqlite3.OperationalError:
+                    pass
+            if init_seen:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("supervisor did not emit init event before timeout")
+            time.sleep(0.01)
+
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=30)
 
     assert proc.returncode == 130, f"returncode={proc.returncode} out={out} err={err}"
 
