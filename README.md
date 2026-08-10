@@ -19,20 +19,22 @@ What exists now:
   wire format remains unchanged.
 - **Integrated deterministic runtime** — the multi-worker supervisor plan path,
   SQLite WAL event store, atomic merge sequencer, Nuntius NDJSON framing,
-  worker runtime, task-tree validation, and doctor diagnostics.
+  worker runtime, task-tree validation, Architectus scheduling core, and
+  doctor diagnostics.
 - **Runtime controls and tooling** — approval gates, generation fencing,
   compile-gate resource budgets, a bounded dead-letter queue, conversation
-  storage, provider configuration validation, JSON tool schemas, host health
-  probes, Ruff diagnostics, AST search, the benchmark plugin, and the unified
-  `cambium` CLI. These modules are not all wired into one production runtime.
+  storage, Diffundo provider routing, anchored edits, executable tools,
+  provider configuration validation, JSON tool schemas, host health probes,
+  Ruff diagnostics, AST search, the benchmark plugin, and the unified `cambium`
+  CLI. These modules are not all wired into one production runtime.
 - **Vertical-slice proof** — a real supervisor subprocess-spawns a real fake
   worker, runs the task gate, and merges the worker branch. The multi-worker
   plan path also has end-to-end scenario coverage.
-- **Scenario and module coverage** — the refreshed baseline records 205 timed
-  test items. The latest full run reports 202 passed and 4 skipped; the source
+- **Scenario and module coverage** — the refreshed baseline records 301 timed
+  test items. The latest full run reports 299 passed and 2 skipped; the source
   Ruff gate is clean.
-- **Still unmerged** — `diffundo.py` and `redact.py` are not in this main
-  snapshot. Real provider execution and DSPy optimization are not verified.
+- **Still unmerged** — `redact.py` is not in this main snapshot. Real provider
+  execution and DSPy optimization are not verified.
 
 Next:
 
@@ -48,21 +50,25 @@ Next:
   controls landed; GateRunner extraction, deep turn/process deadlines, and
   bounded store backpressure remain open.
 - **M5 — Architectus/task-tree execution and conversations: in progress.** The
-  task tree, plan runtime, and conversation store exist; LLM decomposition,
-  routing, aggregation, and recursive completion are not complete.
-- **M6 — First real LLM task: not started.** Diffundo and a real provider path
-  are not present on current main.
-- **M7 — Persistent worker pool: not started.** No reusable worker pool is
-  present.
+  task tree, scheduling core, plan runtime, and conversation store exist; full
+  Custos integration and recursive completion are not complete.
+- **M6 — First real LLM task: in progress.** Diffundo, provider configuration,
+  and provider-environment coverage are merged. The fake-provider staging test
+  remains on `wt-luna-m6` and is not in current main; the real-provider path is
+  pending.
+- **M7 — Persistent worker pool: blocked.** No reusable worker pool is present,
+  and its M2–M6 prerequisites are not accepted.
 - **M8 — DSPy `should_decompose` refinement: in progress.** The Decision enum
   migration and dataset bump to `1.1.0` are merged; the package rename and
   DSPy SIMBA refinement gates remain open.
-- **M9 — Tree-sitter context compression: research only.** AST tooling and
-  feasibility research exist, but the M6-dependent paired provider trials
-  have not run.
+- **M9 — Tree-sitter context compression: research done; runtime deferred.**
+  The feasibility research is merged, but the M6-dependent paired provider
+  trials remain unverified.
 
-No v2.1 milestone meets all of its acceptance criteria in this snapshot. The
-full roadmap is in `docs/research/v2-1-review.md`.
+M9's research deliverable is complete; no production/runtime v2.1 milestone
+meets all acceptance criteria in this snapshot. The full roadmap is in
+`docs/research/v2-1-review.md` and the current tracker is
+`docs/research/v2-1-status.md`.
 
 ## Quickstart
 
@@ -101,7 +107,7 @@ Available subcommands are `supervisor`, `doctor`, `bench report|gate`,
   - `system-design.md` — the v0.1 design draft (superseded; kept as the origin record).
   - `module-template/` — the per-module pattern: `architecture.md`, `dataset-format.md`, `example-spec.md`.
   - `reviews/` — the three adversarial reviews that shaped v2.
-- `docs/research/` — 42 research docs plus a tiered README index (historical,
+- `docs/research/` — 44 research docs plus a tiered README index (historical,
   never pruned). Key reads:
   `python-3.14.md`, `tui-best-practices.md`, `sqlite-wal-durability.md`,
   `worktree-concurrency.md`, `design-deltas.md`.
@@ -127,14 +133,15 @@ cambium/
 ├── agents.md                  orientation for agents
 ├── docs/
 │   ├── architecture/          architecture.md, system-design.md (v0.1), module-template/, reviews/
-│   └── research/              42 research docs + README index
+│   └── research/              44 research docs + README index
 ├── scripts/                   dataset tooling + the fake worker
-├── src/cambium/               approval.py, ast_tools.py, bench.py, cli.py,
-│                              conversations.py, dlq.py, doctor.py, eval_cache.py,
-│                              events.py, fencing.py, ipc.py, lint_diag.py, merge.py,
+├── src/cambium/               approval.py, architectus.py, ast_tools.py, bench.py,
+│                              cli.py, conversations.py, diffundo.py, dlq.py,
+│                              doctor.py, edits.py, eval_cache.py, events.py,
+│                              fencing.py, ipc.py, lint_diag.py, merge.py,
 │                              orchestrator.py, provider_config.py, resources.py,
 │                              schemas.py, store.py, supervisor.py, system_health.py,
-│                              tasktree.py, worker.py, modules/
+│                              tasktree.py, tools.py, worker.py, modules/
 │   └── modules/example/       should_decompose decision module, datasets, tests, baseline
 ├── tests/scenarios/           runtime, tooling, and integration scenarios
 └── pyproject.toml
