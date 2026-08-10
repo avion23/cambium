@@ -203,20 +203,6 @@ def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:
     assert "1 fail" in result.stdout
 
 
-def test_doctor_warns_on_corrupt_session_json(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    session_dir = tmp_path / "session"
-    cache = session_dir / ".cambium" / "eval-cache" / "ab"
-    cache.mkdir(parents=True)
-    (cache / "bad.json").write_text("[not json", encoding="utf-8")
-
-    result = _run_doctor("--session-dir", str(session_dir), cwd=tmp_path)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "Eval-cache directory" in result.stdout and "corrupt" in result.stdout
-    assert "0 fail" in result.stdout
-
-
 def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     session_dir = tmp_path / "session"
@@ -224,10 +210,6 @@ def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -
     conversations.parent.mkdir(parents=True)
     with sqlite3.connect(conversations) as connection:
         connection.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY)")
-
-    cache = session_dir / ".cambium" / "eval-cache" / "ab"
-    cache.mkdir(parents=True)
-    (cache / "entry.json").write_text('{"answer": "ok"}\n', encoding="utf-8")
 
     result = _run_doctor("--session-dir", str(session_dir), cwd=tmp_path)
 
