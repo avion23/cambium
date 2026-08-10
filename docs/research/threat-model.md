@@ -8,8 +8,9 @@ source/tests, and [`v2-1-status.md`](v2-1-status.md).
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; provider cascade is source-defined and honors
 `Retry-After`; worker stdout/event admission is bounded; there is no per-worker OS
-sandbox or production approval service. `ToolContext` accepts an optional
-`ApprovalGate`, but the run-plan worker path does not inject one. DLQ and eval cache
+sandbox or production approval service. `approval.py:ApprovalGate` is a standalone
+primitive; `run_shell`/`git_op` execute without approval and approval gates were
+removed by product decision. DLQ and eval cache
 are absent.
 
 Sources: superseded `system-design.md` (only concrete Septum mount list), authoritative
@@ -32,8 +33,8 @@ The historical boundary was worker↔host: subprocess + NDJSON, worktree isolati
 generation fencing, and (then-proposed) Septum. Decision 10 removed sandboxing; the
 historical analysis listed worktree isolation, permission allowlists, and approval gates.
 The current source has no per-worker OS sandbox or production approval service.
-`tools.ToolContext` accepts an optional `ApprovalGate`, but the worker `run_plan`
-path does not inject one.
+`approval.py:ApprovalGate` is a standalone primitive; `run_shell`/`git_op` execute
+without approval and approval gates were removed by product decision.
 
 ## 2. Threat actors
 
@@ -132,8 +133,8 @@ network-off mode would unshare the network; process-group kill would contain
 grandchildren. The v2 architecture later described Septum as pass-through without a
 normative mount set, so the analysis could not prove symlink confinement or worktree
 `.git` reachability. After decision 10, neither Linux nor macOS has an in-harness kernel
-boundary. Shell remains intentional, but permission allowlists, approval gates,
-worktree isolation, redaction, and generation fencing are the only claimed controls.
+boundary. Shell remains intentional, but worktree isolation, redaction, and
+generation fencing are the only claimed controls (approval gates removed).
 
 `write_file`/`edit_file` are more dangerous than `read_file`: architecture specified read
 confinement but only atomic write, leaving path resolution unspecified. The historical

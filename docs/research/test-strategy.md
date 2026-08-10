@@ -66,7 +66,8 @@ stale administrative entries.
 
 Concurrent distinct-file merges serialize under `asyncio.Lock`, verify in a throwaway
 worktree, atomically `update-ref`, and leave `git fsck` clean. Same-file race produces
-one `NonFastForward`, then remerge. A nonzero gate exit prevents publication. A crash
+one `NonFastForward`, then remerge. Publication follows the worker envelope's
+`succeeded` status; no gate exit exists. A crash
 between ref update and event emits `merge_reconciled`.
 
 ## 3. LLM-adjacent tests (offline)
@@ -82,7 +83,7 @@ with sibling pinning for LLM-C4 and canaries for LLM-C5/LLM-M1/LLM-M3.
 
 | ID | Scenario and invariant |
 |---|---|
-| **S01** | One real worker/merge smoke; readiness, gate, canonical result, no credentials. |
+| **S01** | One real worker/merge smoke; readiness, canonical result, no credentials. |
 | **S02** | Crash recovery: checkpoint, locks, quarantine, fresh worktree. |
 | **S03** | Hang/heartbeat watchdog, per-tool heartbeat, bounded kill/restart (DS-C3, IMPL-M10). |
 | **S04** | EOF/grandchild/garbage four-layer liveness (DS-C2). |

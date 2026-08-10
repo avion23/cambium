@@ -12,8 +12,8 @@ event/IPC/durability/worktree research drafts.
 SHAs are historical anchors, not current-main claims. Read current behavior from
 `docs/architecture/architecture.md`, `src/cambium/`, and `docs/research/v2-1-status.md`.
 Current notes: provider loop, Diffundo, EventStore, and root `Result` exist; DLQ, eval cache,
-ResourceBudget, `worker_pool`, and `events` are absent; there is no per-worker sandbox or
-production shell approval, and no dynamic hierarchy.
+ResourceBudget, `worker_pool`, and `events` are absent; per-worker sandbox and shell approval
+were removed by product decision, and no dynamic hierarchy exists.
 
 ## 0. Executive finding
 

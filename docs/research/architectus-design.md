@@ -10,8 +10,8 @@ and [`v2-1-status.md`](v2-1-status.md).
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; provider cascade is source-defined and honors
 `Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
-production approval service. `ToolContext` accepts an optional `ApprovalGate`, but the
-run-plan worker path does not inject one. DLQ and eval cache are absent. Historical DAG scheduling, blackboard,
+production approval service. Approval was removed by product decision;
+`run_shell`/`git_op` execute without it. DLQ and eval cache are absent. Historical DAG scheduling, blackboard,
 steering, and decomposition below remain proposals.
 
 The explicit-tree direction is part of this historical boundary: harness-owned

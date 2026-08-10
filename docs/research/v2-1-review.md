@@ -16,8 +16,9 @@ audits were `wt-audit-security@6a137fb`, `wt-audit-conformance@30832d1`, and
 
 For current behavior use `docs/architecture/architecture.md`, `src/cambium/`, and
 `docs/research/v2-1-status.md`. Current notes: provider loop, Diffundo, EventStore, and root
-`Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent; there is
-no per-worker sandbox or production shell approval, and no dynamic hierarchy.
+`Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent;
+per-worker sandbox and shell approval were removed by product decision; there is no dynamic
+hierarchy.
 
 ## 1. State assessment
 

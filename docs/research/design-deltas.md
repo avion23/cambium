@@ -9,8 +9,9 @@ and `docs/research/v2-1-status.md`.
 
 **Historical snapshot / current pointer:** the branch-local claims below preserve their dates,
 branches, SHAs, and evidence. Current notes: provider loop, Diffundo, EventStore, and root
-`Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent; no
-per-worker sandbox or production shell approval exists, and dynamic hierarchy is absent.
+`Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent;
+per-worker sandbox and shell approval were removed by product decision, and dynamic hierarchy
+is absent.
 
 ## 0. Reading and provenance
 

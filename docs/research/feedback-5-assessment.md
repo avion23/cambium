@@ -11,8 +11,7 @@ feedback-4, research, and source modules. Current readers use `docs/architecture
 **Historical snapshot / current pointer:** provider loop, Diffundo, EventStore, and root
 `Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent; no
 per-worker OS sandbox or production approval service exists, and dynamic hierarchy is absent.
-`ToolContext` accepts an optional `ApprovalGate`, but the run-plan worker path does not inject
-one. The old branch module/commit claims below are evidence, not current-main status.
+Approval was removed by product decision; `run_shell`/`git_op` execute without it. The old branch module/commit claims below are evidence, not current-main status.
 
 ## 0. Evidence convention
 
@@ -34,7 +33,7 @@ v0.1 reviews, and `implementation-plan.md`.
 | 6 | Trim generation/monotonic/ts from worker envelope | **PARTIAL** | Supervisor stamps authoritative `ts`/`monotonic_ms`, store reserves `seq`; generation remains fencing data and request ID remains correlation (`supervisor.py` emit; `store.py` append; `worker.py`; architecture §§1–2). |
 | 7 | Use `graphlib.TopologicalSorter` | **REJECT** | Hand Kahn provides deterministic order/message control and is covered by 29 tests; correction retained: Python 3.14.7 `CycleError.args[1]` does expose a path (`tasktree.py`; `test_tasktree.py`; DS-M6/I2.2). |
 | 8 | Sandbox is theater; containers at deployment | **ALREADY-IMPLEMENTED (historical disposition; current boundary: PARTIAL)** | D7 removed Septum. An optional `ApprovalGate` primitive exists, but no production approval callback or per-worker OS sandbox exists; worktrees/allowlists are harness controls and containers/microVMs are host-owned D8e (`architecture`, “Per-worker containment and approval”; feedback-2 D8e). |
-| 9 | cgroups + `wait_for_resources` | **ADOPT-LITE** | `resources.py:CompileGate` and `system_health.py:can_run_heavy` are agent-side gates; `systemd-run` is a deployment note (`v2-1-review` §4 M4; architecture §3, per-worker containment and approval). |
+| 9 | cgroups + `wait_for_resources` | **ADOPT-LITE** | `system_health.py:can_run_heavy` is the host-health check; `CompileGate` was removed by product decision. |
 | 10 | Global PID pacing | **ADOPT-LITE** | D8f token buckets/pause already exist in the snapshot Diffundo; PID reset-window pacing is a v2.1 enhancement (`diffundo.py`; architecture §1, worker and providers; D8f). Addendum later supersedes PID with GCRA F6-04. |
 | 11 | ≤200-token root Core Directive | **ADOPT** | Static prefix segment in Architectus context, before dynamic content (architectus-design §3; D8c); wiring was a separate task. |
 | 12 | Three gate failures → reset/retry; `evaluate_goal` | **ADOPT-LITE** | Existing reset/clean before respawn and bounded `gate_max_retries`; codify reset once then abort and treat `evaluate_goal` as the existing gate (supervisor `_recover_worktree_locked`; architecture §§1 and 4; architectus-design §6). |
