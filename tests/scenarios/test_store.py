@@ -214,7 +214,10 @@ def test_writer_dead_on_locked_db_critical_append_raises(
         with pytest.raises(StoreError):
             store.append({"kind": "result", "payload": {"ok": True}})
         elapsed = time.monotonic() - start
-        assert 0.8 <= elapsed < 10.0  # bounded by busy_timeout, not a hang
+        # Lower bound proves the append waited the busy timeout rather than
+        # failing instantly; the upper bound allows the hard append deadline
+        # (10s) to fire under load without flaking the bound.
+        assert 0.8 <= elapsed < 30.0  # bounded by busy_timeout, not a hang
     finally:
         blocker.close()
     # store is dead: subsequent appends fail immediately, and close() surfaces

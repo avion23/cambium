@@ -53,9 +53,9 @@ MARKER = "// cambium-ipc"
 DIFF_CAP_BYTES = 64 * 1024
 # Worker tasks wait for the heartbeat loop to observe the stop flag before
 # emitting the result envelope. The default 1s interval makes every happy-path
-# run cost ~1s of pure drain time; a short interval exercises the
-# cancel-during-drain race MORE often (more sends per run) while keeping the
-# drain negligible.
+# run cost ~1s of pure drain time; a short interval keeps the repeated
+# stress-loop signal of the 20x regression test while making the drain
+# negligible.
 TEST_HEARTBEAT_INTERVAL_S = 0.02
 
 
