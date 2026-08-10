@@ -517,6 +517,56 @@ def test_bench_failure_stderr_never_contains_provider_credential(
     assert secret not in captured.err
 
 
+def test_bench_stderr_never_leaks_multiline_provider_credential_raw_or_escaped(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A credential containing an internal newline must not leak from a module.
+
+    A module reports the credential inside a JSON error object on stdout;
+    JSON serialization (and the harness's ``str()`` of the parsed error) rewrites
+    the newline into the two-character ``\\n`` escape, so the raw value no longer
+    matches the registered secret.  Both the exit-0 error-object path and the
+    exit-1 diagnostic path must redact the escaped form as well.
+    """
+    import cambium.bench as bench
+
+    secret = "opaque-provider-line-one\nline-two"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    for exit_code in (0, 1):
+        modules_dir = _write_fixture_module(
+            tmp_path / f"mod-{exit_code}",
+            manifest={
+                "contract_version": 1,
+                "module_name": "fixture_module",
+                "cli_module": "cambium.modules.fixture",
+                "protocol": "json-v1",
+                "dataset_schema_version": 1,
+            },
+        )
+        (modules_dir / "fixture" / "__main__.py").write_text(
+            textwrap.dedent(
+                """
+                import json
+                import sys
+
+                print(json.dumps({"error": {"message": __SECRET__}}))
+                raise SystemExit(__EXIT_CODE__)
+                """
+            ).replace("__SECRET__", repr(secret))
+            .replace("__EXIT_CODE__", repr(exit_code))
+        )
+        monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+        bench_root = tmp_path / f"baselines-{exit_code}"
+
+        assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+        captured = capsys.readouterr().err
+        assert "ERROR ModuleCLIError" in captured
+        assert secret not in captured
+        assert json.dumps(secret)[1:-1] not in captured
+        assert repr(secret)[1:-1] not in captured
+
+
 def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 

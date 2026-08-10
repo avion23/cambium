@@ -97,20 +97,47 @@ def _module_env(source_root: str | Path | None) -> dict[str, str]:
     return env
 
 
+def _escaped_secret_forms(value: str) -> tuple[str, ...]:
+    """Return the exact-string forms *value* can take inside module output.
+
+    A module crosses the boundary as one JSON object on stdout and its
+    diagnostics embedded as text.  Both JSON serialization and Python ``repr``
+    rewrite control characters (newline, tab, quote, backslash, non-ASCII)
+    before redaction sees the output, so an exact registered value must be
+    expanded to the escaped forms it can appear in.  ``json.dumps`` covers the
+    JSON wire text on stdout (with both ASCII and non-ASCII encodings) and
+    ``repr`` covers ``str()`` of a deserialized error object.
+    """
+    forms = {value}
+    for render in (
+        lambda text: json.dumps(text, ensure_ascii=False),
+        lambda text: json.dumps(text, ensure_ascii=True),
+        repr,
+    ):
+        try:
+            rendered = render(value)
+        except (TypeError, ValueError, UnicodeError):
+            continue
+        if len(rendered) >= 2 and rendered[0] == rendered[-1]:
+            forms.add(rendered[1:-1])
+    return tuple(forms)
+
+
 def _module_redactor() -> Redactor:
     """Return a redactor registered with credential values in the parent env.
 
     Defense in depth for diagnostics: even if a module echoes a credential it
     obtained from outside the harness, its exact value is redacted before the
-    output is embedded in an exception message.
+    output is embedded in an exception message.  Every registered value is
+    expanded to the escaped forms JSON serialization or ``repr`` can rewrite
+    it into, so a credential containing newlines, quotes, backslashes, or
+    other control characters cannot leak through the module error boundary.
     """
-    return Redactor(
-        secret_values={
-            value
-            for name, value in os.environ.items()
-            if value and (is_provider_env_name(name) or is_secret_name(name))
-        }
-    )
+    secret_values: set[str] = set()
+    for name, value in os.environ.items():
+        if value and (is_provider_env_name(name) or is_secret_name(name)):
+            secret_values.update(form for form in _escaped_secret_forms(value) if form)
+    return Redactor(secret_values=secret_values)
 
 
 class ModuleBoundaryError(ValueError):
