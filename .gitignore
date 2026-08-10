@@ -16,5 +16,9 @@ htmlcov/
 # uv
 .venv/
 
-# Cambium runtime (worktrees, event logs, checkpoints)
+# Cambium runtime (session state, worktrees, databases, queues, mock
+# environments, logs, checkpoints, and generated baselines)
 .cambium/
+
+# Committed module baselines stay tracked. Runtime benchmark copies belong
+# under .cambium/ and are covered by the rule above.
