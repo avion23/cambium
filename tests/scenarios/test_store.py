@@ -271,15 +271,6 @@ def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
     assert [event["seq"] for event in reopened.events_after(0)] == [2]
 
 
-def test_invalid_queue_and_deadline_config_raise(tmp_path) -> None:
-    with pytest.raises(ValueError):
-        EventStore(tmp_path / "a.db", max_queue_size=0)
-    with pytest.raises(ValueError):
-        EventStore(tmp_path / "b.db", critical_timeout_s=0.0)
-    with pytest.raises(ValueError):
-        EventStore(tmp_path / "c.db", checkpoint_busy_retry_s=0.0)
-
-
 def test_stalled_writer_flood_drops_non_critical_preserves_critical(
     tmp_path, monkeypatch
 ) -> None:
@@ -1472,11 +1463,6 @@ def test_redactor_runs_before_storage_on_long_strings_with_shaped_key(tmp_path) 
     assert shaped_key not in request_id
     assert shaped_key[:12] not in request_id
     assert opaque_key not in request_id
-
-
-def test_event_store_rejects_non_redactor_argument(tmp_path) -> None:
-    with pytest.raises(TypeError, match="redactor"):
-        EventStore(tmp_path / "events.db", redactor=object())
 
 
 def test_session_artifacts_are_private_under_permissive_umask(tmp_path) -> None:

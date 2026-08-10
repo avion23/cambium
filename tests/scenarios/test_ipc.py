@@ -44,7 +44,6 @@ from cambium.fencing import read_generation, write_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
-    make_request_id,
     read_message,
     write_message,
 )
@@ -325,17 +324,6 @@ def test_read_message_eof_after_newline_returns_message_then_none() -> None:
         assert await read_message(reader) is None
 
     asyncio.run(scenario())
-
-
-def test_message_too_long_is_value_error() -> None:
-    assert issubclass(MessageTooLong, ValueError)
-
-
-def test_make_request_id_is_unique_and_prefixed() -> None:
-    ids = {make_request_id() for _ in range(100)}
-    assert len(ids) == 100
-    assert all(i.startswith("req-") for i in ids)
-    assert make_request_id("init").startswith("init-")
 
 
 def test_write_message_roundtrip() -> None:

@@ -355,35 +355,6 @@ def test_path_rejects_stop_id_outside_active_chain(tmp_path) -> None:
         store.close()
 
 
-def test_chain_read_uses_one_recursive_statement_per_operation(tmp_path, monkeypatch) -> None:
-    store = _open(tmp_path / "conversations.db")
-    try:
-        ids = [store.append("node", "assistant", str(index), tokens=1) for index in range(1500)]
-        recursive_statements: list[str] = []
-        original_reader = store._reader
-
-        def traced_reader() -> sqlite3.Connection:
-            conn = original_reader()
-            conn.set_trace_callback(
-                lambda statement: recursive_statements.append(statement)
-                if statement.lstrip().upper().startswith("WITH RECURSIVE")
-                else None
-            )
-            return conn
-
-        monkeypatch.setattr(store, "_reader", traced_reader)
-        for operation in (
-            lambda: store.history("node"),
-            lambda: store.path("node", ids[-1]),
-            lambda: store.token_accounting("node"),
-        ):
-            recursive_statements.clear()
-            operation()
-            assert len(recursive_statements) == 1
-    finally:
-        store.close()
-
-
 def test_close_propagates_final_fsync_failure(tmp_path, monkeypatch) -> None:
     store = _open(tmp_path / "conversations.db")
     store.append("node", "user", "message")

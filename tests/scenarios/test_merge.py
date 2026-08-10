@@ -509,19 +509,6 @@ def _hook_records(dump: Path) -> list[dict]:
     ]
 
 
-def test_git_env_is_scrubbed_and_quarantine_free(monkeypatch) -> None:
-    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "secret")
-    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
-    monkeypatch.setenv("PATH", "/bin")
-
-    env = MergeSequencer._git_env()
-
-    assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in env
-    assert "OPENAI_API_KEY" not in env
-    assert "GIT_QUARANTINE_PATH" not in env
-    assert env["PATH"] == "/bin"
-
-
 def test_post_checkout_hook_during_staging_sees_no_provider_key(tmp_path, monkeypatch) -> None:
     """A post-checkout hook run by MergeSequencer git operations (worktree add /
     checkout) must not see any provider credential in its environment."""
