@@ -935,6 +935,50 @@ def test_standalone_cli_gate_fails_closed_without_pre_existing_anchor(tmp_path) 
     assert not (bench_root / "should_decompose" / "baseline.json").exists()
 
 
+def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
+    """The standalone CLI report must populate real wall timings, not empty ones."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+
+    baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
+    assert baseline["tests"]["count"] == 57
+    assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
+    assert baseline["tests"]["wall_seconds"]["p90"] > 0
+    assert all(
+        nodeid.startswith("src/cambium/modules/example/tests/")
+        for nodeid in baseline["tests"]["by_nodeid"]
+    )
+
+
+def test_standalone_cli_gate_detects_wall_time_regression(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The standalone gate must compare live wall p90 against the anchor.
+
+    Empty live timings (the previous CLI behavior) would silently disable the
+    wall-time comparison; this asserts an injected wall regression fails.
+    """
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    nodeid = (
+        "src/cambium/modules/example/tests/"
+        "test_example_cli.py::test_cli_evaluate_operation_returns_scores"
+    )
+
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: {nodeid: 0.01})
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    anchor = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
+    assert anchor["tests"]["count"] == 1
+    assert anchor["tests"]["wall_seconds"]["p90"] > 0
+
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: {nodeid: 100.0})
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+    assert "DRIFT should_decompose: tests.wall_seconds.p90" in capsys.readouterr().out
+
+
 def test_gate_passes_without_drift(tmp_path) -> None:
     bench_root = tmp_path / "baselines"
     report = run_bench(bench_root, "report")

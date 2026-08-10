@@ -36,6 +36,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -809,6 +810,70 @@ def _write_drift_report(
     return path
 
 
+def _measure_module_timings(pkg_name: str) -> dict[str, float]:
+    """Run one module's colocated tests once and return per-nodeid wall times.
+
+    The standalone CLI has no pytest report objects to time, so it re-runs the
+    module's ``tests/`` with the bench plugin into a throwaway ``--bench-root``
+    and reads the recorded ``tests.by_nodeid`` back. The wall-time gate is
+    therefore populated in the CLI report/gate path instead of silently
+    comparing ``0.0`` against the anchor.
+
+    Empty timings are returned only when the module has no tests directory or
+    the run cannot produce a baseline (its own tests fail to collect or pass);
+    the metric/dataset/canary checks still run, and the wall-time comparison
+    stays disabled for that module.
+    """
+    tests_dir = MODULES_DIR / pkg_name / "tests"
+    if not tests_dir.is_dir() or tests_dir.is_symlink():
+        return {}
+    try:
+        manifest = _module_manifest(pkg_name)
+    except (ModuleBoundaryError, DatasetError):
+        return {}
+    with tempfile.TemporaryDirectory(prefix="cambium-bench-timings-") as root:
+        env = dict(os.environ)
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        env.pop("PYTEST_ADDOPTS", None)
+        env.pop("PYTEST_PLUGINS", None)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "-p",
+                    "cambium.bench",
+                    "--bench=report",
+                    f"--bench-root={root}",
+                    str(tests_dir),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                check=False,
+                timeout=600,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        baseline_path = Path(root) / manifest.module_name / "baseline.json"
+        if result.returncode != 0 or not baseline_path.is_file():
+            return {}
+        try:
+            baseline = json.loads(baseline_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        timings = (baseline.get("tests") or {}).get("by_nodeid")
+        if not isinstance(timings, dict):
+            return {}
+        return {
+            str(nodeid): float(duration)
+            for nodeid, duration in timings.items()
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool)
+        }
+
+
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m cambium.bench",
@@ -872,7 +937,11 @@ def main(argv: list[str] | None = None) -> int:
             pending.append(
                 (
                     pkg_name,
-                    _assemble_baseline(build_module_report(pkg_name), {}, thresholds),
+                    _assemble_baseline(
+                        build_module_report(pkg_name),
+                        _measure_module_timings(pkg_name),
+                        thresholds,
+                    ),
                 )
             )
     except (ModuleBoundaryError, DatasetError) as exc:

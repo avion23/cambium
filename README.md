@@ -30,10 +30,12 @@ What exists now:
 - **Vertical-slice proof** — a real supervisor subprocess-spawns a real fake
   worker, runs the task gate, and merges the worker branch. The multi-worker
   plan path also has end-to-end scenario coverage.
-- **Scenario and module coverage** — the committed module baseline records 307
-  timed node IDs (not yet module-scoped; the module-test gate is blocked on 278
-  foreign scenario IDs). The verified full run on `b709375` reports **647 passed
-  and 4 skipped**; the source Ruff gate is clean.
+- **Scenario and module coverage** — the committed module baseline is
+  module-scoped and records **57 timed node IDs (0 foreign)** owned by the
+  example module's tests; `cambium module-test example` passes 57/0/0 and the
+  standalone bench gate compares live wall times against that anchor. The
+  verified full run reports **695 passed and 1 skipped**; the source Ruff gate
+  is clean.
 - **Still unmerged** — `CambiumLM` (the real-provider LM adapter) is branch-local
   in `wt-dspy-cambiumlm`. Real provider execution and DSPy optimization are not
   verified.
