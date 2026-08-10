@@ -115,6 +115,17 @@ def test_env_report_is_boolean_presence_only(
     assert leaked_names == [], f"env_report exposed a value for {leaked_names!r}"
 
 
+def test_env_report_treats_empty_key_as_unconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_name = derived_env_name("opencode-go")
+    monkeypatch.setenv(env_name, "")
+
+    providers = load_providers(_write_config(tmp_path / "providers.json", _landscape_config()))
+
+    assert env_report(providers)["opencode-go"] is False
+
+
 def test_missing_api_key_env_loads_but_reports_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
