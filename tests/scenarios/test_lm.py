@@ -7,6 +7,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -313,6 +314,22 @@ def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> No
     assert not state_path.exists()
 
 
+def test_predict_failed_json_save_preserves_existing_state(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    predict = dspy.Predict("question -> answer")
+    predict.lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    predict.dump_state = lambda: {"not_json": object()}
+    state_path = tmp_path / "state.json"
+    state_path.write_text("existing state")
+
+    with pytest.raises(RuntimeError, match="Failed to save state"):
+        predict.save(state_path)
+
+    assert state_path.read_text() == "existing state"
+
+
 def test_copy_does_not_share_mutable_launch_kwargs() -> None:
     _require_dspy()
     lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
@@ -457,6 +474,78 @@ def test_copy_rejects_mutable_primitive_subclasses() -> None:
         )
 
 
+def test_copy_revalidates_post_construction_hostile_snapshots() -> None:
+    _require_dspy()
+
+    class HostileStr(str):
+        pass
+
+    class HostileBytes(bytes):
+        pass
+
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    launch = {"value": HostileStr("launch")}
+    train = {"value": HostileBytes(b"train")}
+    lm.launch_kwargs = launch
+    lm.train_kwargs = train
+
+    with pytest.raises(TypeError, match="exact builtin primitive"):
+        lm.copy()
+
+    launch["value"] = "original unaffected"
+    train["value"] = b"original unaffected"
+    assert lm.launch_kwargs["value"] == "original unaffected"
+    assert lm.train_kwargs["value"] == b"original unaffected"
+
+
+@pytest.mark.parametrize("field", ["launch_kwargs", "train_kwargs"])
+def test_toctou_mapping_credentials_cannot_be_retained(field: str) -> None:
+    _require_dspy()
+
+    class ChangingMapping(Mapping[str, str]):
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def __getitem__(self, key: str) -> str:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 1
+
+        def items(self) -> Any:
+            self.reads += 1
+            if self.reads == 1:
+                return (("benign", "value"),)
+            return (("api_key", "SENSITIVE_CANARY"),)
+
+    changing = ChangingMapping()
+    lm = CambiumLM(  # type: ignore[arg-type]
+        FakeDiffundo(), ProviderTier.FAST, **{field: changing}
+    )
+
+    assert changing.reads == 1
+    assert getattr(lm, field) == {"benign": "value"}
+    assert "SENSITIVE_CANARY" not in repr(lm.dump_state())
+    assert "api_key" not in repr(lm.dump_state())
+
+
+def test_construction_registers_diffundo_once() -> None:
+    _require_dspy()
+    import cambium.lm as lm_module
+
+    diffundos = [FakeDiffundo() for _ in range(100)]
+    with lm_module._DIFFUNDO_REGISTRY_LOCK:
+        lm_module._DIFFUNDO_REGISTRY.clear()
+
+    instances = [CambiumLM(diffundo, ProviderTier.FAST) for diffundo in diffundos]  # type: ignore[arg-type]
+
+    assert len(instances) == 100
+    assert len(lm_module._DIFFUNDO_REGISTRY) == 100
+
+
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -550,6 +639,24 @@ def test_predict_json_save_and_load_round_trip_routes_through_diffundo(tmp_path:
 
     assert _call(predict.lm, "JSON round-trip prompt") == ["completion text"]
     assert diffundo.calls[0]["prompt"]["messages"][0]["content"] == "JSON round-trip prompt"
+
+
+def test_predict_json_round_trip_preserves_bytearray_snapshot(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    predict = dspy.Predict("question -> answer")
+    predict.lm = CambiumLM(  # type: ignore[arg-type]
+        FakeDiffundo(),
+        ProviderTier.FAST,
+        launch_kwargs={"value": bytearray(b"x")},
+    )
+    state_path = tmp_path / "state.json"
+
+    predict.save(state_path)
+    predict.load(state_path, allow_unsafe_lm_state=True)
+
+    assert predict.lm.launch_kwargs["value"] == b"x"
 
 
 def test_copied_budget_round_trip_routes_with_override(tmp_path: Path) -> None:

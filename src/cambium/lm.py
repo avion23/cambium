@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sysconfig
@@ -11,6 +12,8 @@ import threading
 import uuid
 import weakref
 from collections.abc import Mapping
+from functools import wraps
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -158,6 +161,44 @@ def _resolve_diffundo(reference: str) -> Any:
     return diffundo
 
 
+def _install_atomic_dspy_save(dspy: Any) -> None:
+    """Make DSPy state-file replacement atomic for adapters loaded by Cambium."""
+    original_save = dspy.Module.save
+    if getattr(original_save, "_cambium_atomic_save", False):
+        return
+
+    @wraps(original_save)
+    def atomic_save(
+        module: Any,
+        path: Any,
+        save_program: bool = False,
+        modules_to_serialize: Any = None,
+    ) -> None:
+        target = Path(path)
+        if save_program or target.suffix not in {".json", ".pkl"}:
+            original_save(module, path, save_program, modules_to_serialize)
+            return
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=target.parent,
+                prefix=f".{target.stem}-",
+                suffix=target.suffix,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+            original_save(module, temporary_path, False, modules_to_serialize)
+            os.replace(temporary_path, target)
+        except BaseException:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+
+    atomic_save._cambium_atomic_save = True  # type: ignore[attr-defined]
+    dspy.Module.save = atomic_save
+
+
 def _load_dspy() -> Any:
     """Load DSPy on first use without enabling its process-wide disk cache.
 
@@ -203,6 +244,7 @@ def _load_dspy() -> Any:
                 close_disk_cache = getattr(getattr(cache, "disk_cache", None), "close", None)
                 if callable(close_disk_cache):
                     close_disk_cache()
+            _install_atomic_dspy_save(dspy)
         _DSPY = dspy
         return _DSPY
 
@@ -213,7 +255,8 @@ class CambiumLM:
     def __new__(cls, *args: Any, **kwargs: Any) -> CambiumLM:
         if cls is not CambiumLM:
             return super().__new__(cls)
-        return _implementation_class()(*args, **kwargs)
+        del args, kwargs
+        return object.__new__(_implementation_class())
 
 
 class _CambiumLMMixin:
@@ -322,6 +365,10 @@ class _CambiumLMMixin:
         """Copy this LM without bypassing the Diffundo credential boundary."""
         self._validate_model(self._provider_model)
         self._validate_budget(self._budget_usd)
+        launch_kwargs = self._safe_kwargs({"launch_kwargs": self.launch_kwargs})[
+            "launch_kwargs"
+        ]
+        train_kwargs = self._safe_kwargs({"train_kwargs": self.train_kwargs})["train_kwargs"]
         adapter_overrides = {
             key: kwargs[key]
             for key in ("diffundo", "tier", "model", "budget_usd")
@@ -335,6 +382,8 @@ class _CambiumLMMixin:
             {key: value for key, value in kwargs.items() if key not in adapter_overrides}
         )
         copied = super().copy(**safe_kwargs)
+        copied.launch_kwargs = safe_kwargs.get("launch_kwargs", launch_kwargs)
+        copied.train_kwargs = safe_kwargs.get("train_kwargs", train_kwargs)
         if "diffundo" in adapter_overrides:
             diffundo = adapter_overrides["diffundo"]
             if not isinstance(diffundo, Diffundo) and not callable(getattr(diffundo, "call", None)):
@@ -381,18 +430,22 @@ class _CambiumLMMixin:
         constructor_state.pop("_dspy_lm_class", None)
         reference = constructor_state.pop("diffundo_reference")
         constructor_state["diffundo"] = _resolve_diffundo(reference)
+        constructor_state = cls._restore_json_snapshot(constructor_state)
         return cls(**constructor_state)
 
     @staticmethod
     def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        if type(kwargs) is dict and any(key in _FORBIDDEN_FIELDS for key in kwargs):
+            forbidden = sorted(key for key in kwargs if key in _FORBIDDEN_FIELDS)
+            raise ValueError(f"CambiumLM does not accept {', '.join(forbidden)}")
+        frozen_kwargs = _freeze(kwargs)
         safe: dict[Any, Any] = {}
         forbidden: list[str] = []
-        for key, value in kwargs.items():
-            normalized_key = _normalize_key(key)
-            if normalized_key in _FORBIDDEN_FIELDS:
-                forbidden.append(normalized_key)
-            elif normalized_key not in _CACHE_FIELDS:
-                safe[normalized_key] = value
+        for key, value in frozen_kwargs.items():
+            if key in _FORBIDDEN_FIELDS:
+                forbidden.append(key)
+            elif key not in _CACHE_FIELDS:
+                safe[key] = value
         if forbidden:
             raise ValueError(f"CambiumLM does not accept {', '.join(sorted(forbidden))}")
         pending: list[Any] = [safe]
@@ -404,11 +457,10 @@ class _CambiumLMMixin:
                     continue
                 visited.add(id(value))
                 for key, nested_value in value.items():
-                    normalized_key = _normalize_key(key)
-                    if type(normalized_key) is str and normalized_key not in _GENERATION_FIELDS:
+                    if type(key) is str and key not in _GENERATION_FIELDS:
                         normalized = "".join(
                             character
-                            for character in str.lower(normalized_key)
+                            for character in str.lower(key)
                             if str.isalnum(character)
                         )
                         if any(marker in normalized for marker in _SECRET_MARKERS):
@@ -423,10 +475,12 @@ class _CambiumLMMixin:
                     continue
                 visited.add(id(value))
                 pending.extend(value)
-        return {key: _freeze(value) for key, value in safe.items()}
+        return safe
 
     @staticmethod
     def _json_snapshot(value: Any) -> Any:
+        if type(value) is bytes:
+            return {"__cambium_bytes_base64__": base64.b64encode(value).decode("ascii")}
         if isinstance(value, Mapping):
             return {
                 _CambiumLMMixin._json_snapshot(key): _CambiumLMMixin._json_snapshot(item)
@@ -434,6 +488,22 @@ class _CambiumLMMixin:
             }
         if isinstance(value, tuple):
             return tuple(_CambiumLMMixin._json_snapshot(item) for item in value)
+        return value
+
+    @staticmethod
+    def _restore_json_snapshot(value: Any) -> Any:
+        if type(value) is dict and set(value) == {"__cambium_bytes_base64__"}:
+            encoded = value["__cambium_bytes_base64__"]
+            if type(encoded) is not str:
+                raise TypeError("CambiumLM byte snapshot must contain an exact builtin string")
+            return base64.b64decode(encoded, validate=True)
+        if type(value) is dict:
+            return {
+                key: _CambiumLMMixin._restore_json_snapshot(item)
+                for key, item in value.items()
+            }
+        if type(value) is list:
+            return [_CambiumLMMixin._restore_json_snapshot(item) for item in value]
         return value
 
     @classmethod
