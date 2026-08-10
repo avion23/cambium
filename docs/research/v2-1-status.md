@@ -4,22 +4,22 @@
 > is blocked, or changes evidence. Do not treat a branch-local green test as a
 > merged milestone.
 >
-> **Baseline:** `main@4bbc7cf` on 2026-08-10. A commit counts as merged only when
+> **Baseline:** `main@b709375` on 2026-08-10. A commit counts as merged only when
 > it is reachable from that baseline. Branch names and branch-local SHAs below
 > are in-flight evidence only.
 
 ## Status summary
 
-| Scope | Definition | STATUS | Evidence at `main@4bbc7cf` |
+| Scope | Definition | STATUS | Evidence at `main@b709375` |
 |---|---|---|---|
 | **v2 base** | The complete v2 stack is one authoritative, integrated runtime from deterministic substrate through provider execution and release evidence. | **IN-FLIGHT** | The deterministic substrate and Custos seed are merged, but the canonical runtime still has slice/fallback paths and no real provider-to-merge run is evidenced. |
 | **M1** | Canonical runtime and audit baseline. | **IN-FLIGHT** | Store, merge, IPC, worker, task-tree, doctor, and a Custos seed are merged; canonicalization, redaction wiring, and post-integration audits are not complete. |
-| **M2** | Protocol and pipe hardening. | **IN-FLIGHT** | IPC/worker and DLQ parts are merged; FD 3, bounded runtime queues, write deadlines, and overflow death are not integrated. |
-| **M3** | Security boundary and fencing. | **IN-FLIGHT** | Approval and fencing modules are merged; redaction, strict spawn policy, durable approval, ref validation, and runtime fencing are incomplete. |
+| **M2** | Protocol and pipe hardening. | **IN-FLIGHT** | IPC/worker and DLQ parts are merged, and write deadlines are now in the supervisor; FD 3, bounded runtime queues, and overflow death are not integrated. |
+| **M3** | Security boundary and fencing. | **IN-FLIGHT** | Approval, fencing, redaction, and env-keyed provider modules are merged; strict spawn policy, durable approval, ref validation, and runtime fencing are incomplete. |
 | **M4** | Gate, resource, and deep-budget hardening. | **IN-FLIGHT** | Resource and health helpers are merged; GateRunner, budget enforcement, and bounded store durability are not wired. |
-| **M5** | Architectus task-tree execution and conversations. | **IN-FLIGHT** | Conversation storage and Architectus design are merged; the executable orchestrator remains a skeleton. |
-| **M6** | First real LLM end-to-end task. | **IN-FLIGHT** | Provider configuration is merged; Diffundo is branch-local and the real provider-to-gate-to-Unio proof is not complete. |
-| **M7** | Persistent worker pool. | **BLOCKED** | No pool implementation is identified; acceptance is gated by incomplete M2-M6. |
+| **M5** | Architectus task-tree execution and conversations. | **IN-FLIGHT** | Conversation storage, Architectus design, and an Architectus execution core are merged; the core is not wired into the supervisor and the orchestrator remains a skeleton. |
+| **M6** | First real LLM end-to-end task. | **IN-FLIGHT** | Provider configuration and Diffundo routing are merged; CambiumLM is branch-local and the real provider-to-gate-to-Unio proof is not complete. |
+| **M7** | Persistent worker pool. | **BLOCKED** | A worker-pool state-machine seed is merged (explicitly not M7 acceptance); acceptance is gated by incomplete M2-M6. |
 | **M8** | DSPy `should_decompose` refinement. | **IN-FLIGHT** | Bench, eval-cache, and the `Decision` enum migration are merged; package rename and SIMBA evidence are absent. |
 | **M9** | Tree-sitter context-compression research and falsifiable adoption trial. | **DONE** for the research deliverable | The tree-sitter feasibility/prototype report is merged. Runtime adoption remains explicitly deferred because the compile-success trial is unverified. |
 
@@ -27,8 +27,8 @@
 
 - **Definition:** One authoritative v2 stack must connect the deterministic substrate, orchestration, provider path, gates, atomic merge, and release evidence.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** `3d27ba3` merged `EventStore`; `c7e19b0` merged `MergeSequencer`; `38e1d43` merged Nuntius/Opifex IPC and worker; `06ce0dc` merged Task Tree validation; `2822139` merged doctor; and `0867572` merged the Custos multi-worker seed. Later v2.1 parts are also present through `4bbc7cf`.
-- **Blocker:** `src/cambium/supervisor.py` still contains the old slice `EventLog`, `_FallbackEventStore`, and `_FallbackSequencer`, while `src/cambium/redact.py` and `src/cambium/diffundo.py` are not on the baseline. The review's full-stack warning still applies: there is no aggregate release test or post-integration audit proving the whole stack.
+- **Evidence:** `3d27ba3` merged `EventStore`; `c7e19b0` merged `MergeSequencer`; `38e1d43` merged Nuntius/Opifex IPC and worker; `06ce0dc` merged Task Tree validation; `2822139` merged doctor; and `0867572` merged the Custos multi-worker seed. Later v2.1 parts are also present through `b709375`.
+- **Blocker:** `src/cambium/supervisor.py` still contains the old slice `EventLog`, `_FallbackEventStore`, and `_FallbackSequencer`. The review's full-stack warning still applies: there is no aggregate release test or post-integration audit proving the whole stack.
 
 ## M1 — Canonical runtime and audit baseline
 
@@ -39,7 +39,7 @@
   3. The full scenario suite passes on Python 3.14; scenario count and commit SHA are recorded.
   4. Fresh security, conformance, and constitution audits contain no N-A caused by unmerged modules.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** The M1 substrate is merged in `3d27ba3` (`store`), `c7e19b0` (`merge`), `38e1d43` (`ipc`/`worker`), `06ce0dc` (`tasktree`), and `2822139` (`doctor`). Custos is present through `0867572`; the pipeline proof was merged by `c219edd`. The current supervisor still exposes `EventLog`, both fallback classes, and the slice `run_session`. The redactor remains branch-local in `wt-redact` (branch tip `1b449df`; its `redact.py` and scenario are uncommitted there). `docs/research/m1-canonicalization-plan.md` records the canonicalization steps and explicitly marks execution of those steps as unverified. No fresh three-audit result exists for this baseline.
+- **Evidence:** The M1 substrate is merged in `3d27ba3` (`store`), `c7e19b0` (`merge`), `38e1d43` (`ipc`/`worker`), `06ce0dc` (`tasktree`), and `2822139` (`doctor`). Custos is present through `0867572`; the pipeline proof was merged by `c219edd`. The redactor is merged in `39005fa` (`src/cambium/redact.py` and `tests/scenarios/test_redact.py`) but is not wired into the supervisor: `_redacted_provider_metadata` only scrubs `provider_metadata` in the event payload, with no enqueue/INSERT redaction. The current supervisor still exposes `EventLog`, both fallback classes, and the slice `run_session`. `docs/research/m1-canonicalization-plan.md` records the canonicalization steps and explicitly marks execution of those steps as unverified. No fresh three-audit result exists for this baseline.
 
 ## M2 — Protocol and pipe hardening
 
@@ -50,7 +50,7 @@
   3. Output exceeding either 256 queued messages or 8 MiB decoded bytes causes one `protocol_overflow` event and process-group death; supervisor RSS stays below a fixed 16 MiB delta in the flood test.
   4. Unknown/out-of-order/stale-generation messages enter a 1,000-row bounded DLQ with reason, task, generation, request ID, digest, and redacted preview; they are never retried.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** Nuntius/Opifex framing is merged in `38e1d43`; the pipe integration test is in `c219edd`/`8779d28`; and the durable DLQ is merged in `be8261b`/`ef15a95` from `e4cd771`. The current `src/cambium/ipc.py` is explicitly stdio-based and only caps individual lines. The current supervisor reads stdout, uses an unbounded `asyncio.Queue`, and calls `proc.stdin.drain()` without a deadline. The DLQ is not connected to those runtime paths, and no FD-3 implementation or overflow-event proof is on the baseline.
+- **Evidence:** Nuntius/Opifex framing is merged in `38e1d43`; the pipe integration test is in `c219edd`/`8779d28`; and the durable DLQ is merged in `be8261b`/`ef15a95` from `e4cd771`. Write deadlines are now present in the supervisor: `_stdin_deadline` (`supervisor.py:86-88`) and `await asyncio.wait_for(proc.stdin.drain(), remaining)` at `supervisor.py:172` (from `b709375`). Still open: the supervisor reads stdout into an unbounded `asyncio.Queue` (`supervisor.py:448`), no FD-3 transport exists (`pass_fds=()` at every spawn), and the DLQ is not connected to those runtime paths; no overflow-event proof is on the baseline.
 
 ## M3 — Security boundary and fencing
 
@@ -61,7 +61,7 @@
   3. External-path write and non-allowlisted network requests block on a durable approval ID; approve resumes once, deny fails, timeout denies, and replay never asks twice for the same `(generation, operation_digest)`.
   4. An unknown registered worktree path and a branch containing a refspec are rejected before any destructive git command.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** The generation-file helper was merged in `407ce7c`/`bc77e5c` from `5d91ec9`; the fail-closed approval helper was merged in `0903d66` from `bcf5014`; and env-keyed provider configuration was merged in `228a4e1` from `edd0e60`. `src/cambium/fencing.py` and `src/cambium/approval.py` are standalone modules, but the current supervisor does not enforce their protocol at worker git/checkpoint boundaries. `src/cambium/redact.py` is absent from the baseline; the implementation is branch-local and uncommitted in `wt-redact` (tip `1b449df`). The approval helper has no durable approval ID/replay protocol, and strict spawn-time environment allowlisting is not complete.
+- **Evidence:** The generation-file helper was merged in `407ce7c`/`bc77e5c` from `5d91ec9`; the fail-closed approval helper was merged in `0903d66` from `bcf5014`; env-keyed provider configuration was merged in `228a4e1` from `edd0e60`; and the deterministic redactor was merged in `39005fa`. `src/cambium/fencing.py`, `src/cambium/approval.py`, and `src/cambium/redact.py` are standalone modules, but the current supervisor does not enforce the fencing/approval protocol at worker git/checkpoint boundaries and only uses `redact.py` for `provider_metadata` scrubbing. The approval helper has no durable approval ID/replay protocol, and strict spawn-time environment allowlisting is not complete — `_worker_environment` (`supervisor.py:824-826`) forwards every `CAMBIUM_PROVIDER_*_API_KEY` env var regardless of `provider_env_keys`.
 
 ## M4 — Gate/resource hardening and deep budgets
 
@@ -83,7 +83,7 @@
   3. Parent LLM context contains own bounded turns + parent summary + child envelopes only; a canary scratchpad string in a child conversation never appears in parent context.
   4. `conversations.db` answers `last_turns`, `cost_by_node`, and `context_for` with indexed query plans and reconstructs from durable protocol events after projection deletion.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** The branchable SQLite conversation store was merged in `548be1e` from `ee944b1`; Task Tree validation is in `06ce0dc`; and the Architectus design was merged in `3b0b6b6` from `5b20605` and is marked **DRAFT — nothing here is merged code**. `src/cambium/orchestrator.py` still keeps the submit/drain placeholder and only forwards a prebuilt plan to `run_plan`; it does not implement decomposition, ready-node scheduling, context composition, steering, aggregation, or evaluation. The active `wt-luna-arch` worktree has no distinct executable Architectus commit to count as merged.
+- **Evidence:** The branchable SQLite conversation store was merged in `548be1e` from `ee944b1`; Task Tree validation is in `06ce0dc`; the Architectus design was merged in `3b0b6b6` from `5b20605`; and an Architectus execution core is merged (`src/cambium/architectus.py` implements `decide`/`step`/`compose_context`/`aggregate`). The core is not wired: nothing in `src/cambium/` imports `architectus`, and `src/cambium/orchestrator.py` still keeps the submit/drain placeholder and only forwards a prebuilt plan to `run_plan`; it does not implement decomposition, ready-node scheduling, context composition, steering, aggregation, or evaluation beyond the architectus module's standalone logic.
 
 ## M6 — First real LLM end-to-end task
 
@@ -94,7 +94,7 @@
   3. A forced 429 falls through to a second `FAST` provider; total exhaustion pauses and then resumes after recovery without worker restart.
   4. The same task with a failing gate cannot publish to main. This is the first release evidence that joins LLM, Diffundo, Opifex, Custos, GateRunner, store, and Unio.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** Strict provider configuration is merged in `228a4e1` from `edd0e60`, with the guarded import fix in `ed0c51a`. Diffundo is not on the baseline; its implementation is branch-local at `wt-impl-diffundo@f5ae0d3`. The staging fake-provider test is branch-local at `wt-luna-m6@a9cda37`. There is no current-baseline `src/cambium/diffundo.py`, `CambiumLM` real-provider run, or provider-to-worker-to-gate-to-Unio acceptance proof. M2-M5 are hard predecessors.
+- **Evidence:** Strict provider configuration is merged in `228a4e1` from `edd0e60`, with the guarded import fix in `ed0c51a`. Diffundo is merged in `77f3d52` (worker-provider): `src/cambium/diffundo.py` is on the baseline and `worker.py` builds the provider router at `worker.py:48,239-258`. The M6-hygiene staging path and quota/publish-scope assertions are merged (`test_m6_staging.py` drives `run_plan` against a loopback fake provider). `CambiumLM` is still branch-local (`wt-dspy-cambiumlm`; no `src/cambium/lm.py` on the baseline). There is no `CambiumLM` real-provider run (`cambium auth run supervisor` with a real key), and no provider-to-worker-to-gate-to-Unio acceptance proof. M2-M5 are hard predecessors.
 
 ## M7 — Persistent worker pool
 
@@ -105,7 +105,7 @@
   3. Pool disabled and pool enabled produce byte-equivalent protocol/event semantics except worker PID and timing fields.
   4. Production config rejects `max_width >= 4` when the pool is disabled unless an explicit development override is set.
 - **STATUS: BLOCKED**
-- **Evidence:** No persistent-pool module, pool test, or pool worktree is identified on the baseline. The merged Custos work is per-task subprocess supervision, not reusable-worker reset. The review makes the pool a release gate for configured `max_width >= 4`, but M2-M6 are not accepted; therefore M7 cannot be accepted even if implementation starts in parallel.
+- **Evidence:** A persistent-pool state-machine seed is merged (`src/cambium/worker_pool.py`, `tests/scenarios/test_worker_pool.py`); its module docstring self-declares it is "a seed for the pool boundary, not M7 acceptance evidence." No pool subprocess supervision, admission/retirement I/O, or leak checks are on the baseline. The merged Custos work is per-task subprocess supervision, not reusable-worker reset. The review makes the pool a release gate for configured `max_width >= 4`, but M2-M6 are not accepted; therefore M7 cannot be accepted even if implementation starts in parallel.
 
 ## M8 — DSPy `should_decompose` refinement
 
@@ -116,7 +116,7 @@
   3. SIMBA candidate improves frozen eval over the rule baseline, passes 100% canaries, records train/eval/canary deltas and pinned model, and can roll back by refinement ID.
   4. If no candidate meets all gates within the declared call/cost budget, the experiment is falsified and the rule engine remains production. “DSPy used” is not acceptance.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** The benchmark plugin was merged from `a7a54be` through `624e27c`; the bounded eval-only cache was merged in `ea4a3ad` from `d8f9408`; and the `Decision` enum migration is merged in `c43d5fa`/`4bbc7cf`. The current package is still `src/cambium/modules/example/`, and no SIMBA candidate, frozen-eval promotion, pinned-model artifact, or refinement rollback is evidenced. `wt-impl-bench@21257b3` contains a branch-local baseline refresh, not M8 acceptance. M5 and M6 remain predecessors.
+- **Evidence:** The benchmark plugin was merged from `a7a54be` through `624e27c`; the bounded eval-only cache was merged in `ea4a3ad` from `d8f9408`; the `Decision` enum migration is merged in `c43d5fa`/`4bbc7cf`; and the baseline refresh is merged in `38d46a7` (307 IDs, still not module-scoped). The current package is still `src/cambium/modules/example/`, and no SIMBA candidate, frozen-eval promotion, pinned-model artifact, or refinement rollback is evidenced. M5 and M6 remain predecessors.
 
 ## M9 — Proposal 1: tree-sitter context compression
 
@@ -131,8 +131,10 @@
 
 ## Next actions — merge order
 
-1. **M1 first:** finish the canonical Custos integration on one SHA. Wire the real store, sequencer, worker, doctor, and redactor; remove the slice, `EventLog`, and fallbacks; then run the full scenario suite and fresh security, conformance, and constitution audits. `wt-impl-super` and `wt-redact` are branch-local evidence, not acceptance.
-2. **M2 and M3 next:** after M1, finish FD-3, queue byte/message caps, write deadlines, DLQ runtime routing, redaction, env allowlists, ref validation, durable approval, and generation fencing. These can be developed in parallel; M3 must pass before M4, and both must pass before real-LLM acceptance.
-3. **M4 after M3:** wire GateRunner, compile permits, complete gate keys, supervisor-owned turn/token budgets, subprocess deadlines, bounded store backpressure, and SQLite `busy` handling.
-4. **M5 after M4:** replace the orchestrator skeleton with Architectus execution and integrate the shared conversation projection, indexed queries, context isolation, steering, aggregation, and recursive completion.
-5. **M6, then M7/M8, then M9 adoption:** merge and exercise `wt-impl-diffundo` plus the key-gated `wt-luna-m6` provider path only after M2-M5; then implement the pool before production multi-worker claims, run M8 SIMBA evidence, and finally run M9's paired 30-task trial before any tree-sitter runtime adoption.
+1. **Merge the supervisor consolidation wave:** credential isolation (fix the `_worker_environment` provider-key leak at `supervisor.py:824-826`), provider default, plan validation, and the `cambium.worker` default.
+2. **Merge module baseline regeneration and the offline-test fix:** re-scope `baseline.json` to module-local node IDs (the 278 foreign scenario node IDs fail the module-test gate) and fix `test_subprocess_network_client_is_denied`, which raises `PermissionError` under the offline environment.
+3. **Merge the worker tool-loop:** replace the single marker-append decision with the real tool dispatch loop.
+4. **Supervisor serial wave (after the consolidation wave):** publish-integrity guards, redaction wiring at enqueue/INSERT, `result.json` production wiring, and the M1 deletion (`EventLog`, fallbacks, `events.py`, slice `run_session`).
+5. **M6 real-provider E2E:** exercise Diffundo + `CambiumLM` through `cambium auth run supervisor` with one real provider key.
+6. **M5 integration, then M7/M8, then M9 adoption:** wire the merged Architectus execution core into the supervisor; implement the pool before production multi-worker claims; run M8 SIMBA evidence and the `example`→`should_decompose` rename; finally run M9's paired 30-task trial before any tree-sitter runtime adoption.
+7. **Final:** re-baseline module-scoped, verify the full suite, clean up worktrees, and close the tracker.
