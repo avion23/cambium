@@ -29,6 +29,7 @@ Orientation: docs/research/README.md (tiered index) → docs/architecture/archit
 11. Compaction prep: this file + v2-1-status.md + glossary + tiered research index are the self-sufficient context map.
 12. Critiques 1-4 dispositions: docs/research/feedback-4-assessment.md (21 claims: 6 reject/3 adopt/6 lite/6 already).
 13. Feedback-5/6 dispositions: accepted actions are registered below (F6-01..F6-18). Provenance note: the F6 register was recovered from a stale status-refresh branch; no feedback-6 source assessment document exists in the repository, so rows are plan entries rechecked against current main, NOT "VERIFIED" claims.
+14. Feedback-7 dispositions: external "brutal teardown" feedback (TOCTOU races, database crimes, static constraints); 17 adversarial audits + reviews; accepted actions registered below (F7-01..F7-09 + constitution review). Provenance note: like F6, rows are plan entries rechecked against current main, NOT "VERIFIED" claims.
 
 ## Feedback-6 accepted-action register
 Plan entries, not completion claims. Owner branch may be merged (evidence on main) or in flight; state reflects current main as of the last tracker refresh.
@@ -54,6 +55,23 @@ Plan entries, not completion claims. Owner branch may be merged (evidence on mai
 | F6-17 DSPy metrics | ADOPT-SCOPED: M8 binary-classification metric sufficient; non-inferiority criterion; SIMBA adapter accepts `(Example, prediction)`; canaries inert until wired. | M8 — `wt-luna-baseline` / `wt-dspy-cambiumlm` | PARTIAL. baseline merged; DSPy branch in flight; M8 criterion correction remains. |
 | F6-18 module isolation | ADOPT: sibling-import ban, JSON CLI probe, layout/removability, freeze/version integrity (meta.json + split digests + content anchor), offline guards, per-module proof, `cambium module-test NAME`; decouple bench reverse-imports and scripts/tooling. | M8 — `wt-module-conformance` / `wt-module-cli` / `wt-bench-decouple` | DONE. `cambium module-test example` passes 57/0/0 on main; committed baseline is module-scoped (57 node IDs, 0 foreign); bench-decouple merged. |
 
+## Feedback-7 accepted-action register
+Plan entries, not completion claims. Provenance note: like F6, rows are plan entries rechecked against current main, NOT "VERIFIED" claims. External "brutal teardown" feedback (TOCTOU races, database crimes, static constraints) reviewed by root via 17 adversarial audits + reviews.
+
+| Item | Disposition | Milestone / owner | Current state |
+|---|---|---|---|
+| F7-01 dynamic tree growth blocked by static DAG validation | ALREADY PLANNED: `build_tree`/`topological_order` are re-invocable pure functions; validation does not block expansion. Real blockers: immutable ArchitectusCore tree (`architectus.py:308`) with no revision path, no runtime wiring, `run_plan` bypasses DAG (flat fan-out). Home = F6-01/M5. Use existing vocabulary `replan(plan_revision, added_tasks[])` + `task_decomposed`. REJECTED: "Saga/continuation checkpoint" jargon. | M5 (F6-01 home) | OPEN. M5 executor seam. |
+| F7-02 conversations.py N+1 query problem | TRUE (proven: D+1 round-trips). ADOPT: guarded `WITH RECURSIVE` rewrite with `_MAX_CHAIN_DEPTH` + cycle/missing-link post-checks; single-statement atomic snapshot. REJECTED: naive unbounded CTE (hangs on cycles). | `wt-conversations-cte` | IN FLIGHT. |
+| F7-03 DLQ filesystem abuse | TRUE bounded cost (`summarize` O(n)); durability parity already holds. ADOPT: SQLite-backed DLQ at `.cambium/dlq.db` (separate DB per architecture.md:456), single writer, keep-newest prune, SQL summarize, two-layer redaction; remove optional-redactor compat path. | `wt-dlq-sqlite` | IN FLIGHT. |
+| F7-04 system_health TOCTOU; delete system_health.py | PARTLY TRUE / REJECT deletion. `can_run_heavy` has no production callers today; TOCTOU is a hazard in the unwired admission path. ADOPT-LITE: wire existing `CompileGate` semaphore into both gate runners + `can_run_heavy` fail-closed pre-flight. `doctor.py` depends on `health`/`format_health` — do not delete. | `wt-resource-admission` | IN FLIGHT. |
+| F7-05 Diffundo waterfall; use RR/LRU | REJECT algorithm change. Priority-ascending is the normative adopted contract (arch §9.2, cascade-design); RR cursor adds first cross-provider shared mutable state (violates D1 + no-hidden-global + `test_no_local_cache_instance_has_no_mutable_mapping_attribute`). ADOPT-LITE: add missing priority-order + equal-priority determinism regression tests. | M6 — Diffundo | OPEN. Regression tests to add. |
+| F7-06 pluggable execution wrapper argv | ADOPT-LITE. Add list-form argv override for worker launch (task-spec `worker` field or future `Config.worker`), NO sandboxing claim (D7), list-form only (no shell), env allowlist unchanged. | DEFERRED — `supervisor.py` contested | DEFERRED. |
+| F7-07 strip threading.Lock; pure actor/mailboxes | REJECT stripping locks (`asyncio.Queue` not thread-safe across threads; locks protect real invariants). ADOPT three PROVEN defects: (a) observer deadlock under `_merge_lock`/`_worktree_lock`, (b) mutable event dict crossing observer/writer boundary, (c) two `run_plan` calls owning one session. Plus `ConversationStore.close()` final-fsync propagation + bounded waits (folded into `wt-conversations-cte`). | `wt-supervisor-races` | IN FLIGHT. |
+| F7-08 AST-assert evaluation; DSPy offline | PARTLY TRUE / ADOPT-SCOPED (M8). `extract_signature`/`get_signature` tool exists; AST-assert gate, locked-file diff, no-op rejection, static prompt artifact loader all MISSING (DRAFT). DSPy stays an optimization-time dependency; production loads static exports. | M8 | OPEN. DRAFT scope. |
+| F7-09 split modules into workspaces | REJECT split (JSON subprocess boundary + structural gates are correct). ADOPT three P1 gate gaps: module-test must validate `module.json`; import scanner must cover `__import__`/dynamic importlib/CLI-subprocess siblings; removability must be enforced. | `wt-module-isolation` | IN FLIGHT. |
+
+Constitution review (agents.md replacement): REJECT wholesale replacement (it is Cambium-specific, not Rust/HFT); ADOPT stale facts + three concurrency invariants. Owner: `wt-agents-facts`.
+
 ## Merged state (main, clean)
 - Test suite: verified full run = **695 passed, 1 skipped** (`uv run --python 3.14.7 --extra test pytest -q`, 2026-08-10, after module-baseline + offline-test + tasktree merges).
 - Module isolation: `cambium module-test example` PASSES (57 passed, 0 failed, 0 skipped); committed baseline is module-scoped (57 node IDs, 0 foreign) with `split_digests` from `meta.json` 1.1.0, and the standalone bench CLI populates real test wall timings so the gate compares live p90 against the anchor.
@@ -70,7 +88,8 @@ Plan entries, not completion claims. Owner branch may be merged (evidence on mai
 - M1 deletion set still present: slice `EventLog`, `_FallbackEventStore`, `_FallbackSequencer`, `events.py`, slice `run_session` body — M1 executor queued behind the tool-loop merge.
 
 ## In flight (worktrees, from `git worktree list` 2026-08-10)
-- wt-dspy-cambiumlm (CambiumLM branch-local, dirty), wt-eval-cache-fix (import-boundary scanner, dirty), wt-packaging-bench, wt-worker-tool-loop, wt-status-refresh (stale, F6 content folded here), wt-module-cli (source superseded on main; test port in progress), wt-batch-read-parked (deferred until tool-loop lands), plus two dirty detached scratch worktrees under audit.
+- Merged since last refresh: plan-refresh (`b94e277`), bench-reanchor (`b131904`), DSPy/CambiumLM (`c69ec92`), bench-creds (`7a32b86`), strict result contract (`1275011`), baseline-57 (`27691b2`).
+- Active: wt-conversations-cte, wt-dlq-sqlite, wt-supervisor-races, wt-module-isolation, wt-resource-admission, wt-agents-facts, wt-plan-f7; wt-eval-cache-fix (import-boundary scanner, dirty), wt-worker-tool-loop, wt-batch-read-parked (deferred until tool-loop lands), plus two dirty detached scratch worktrees under audit.
 
 ## Next actions (dependency order)
 1. Merge worker tool-loop (marker-append → real tool loop) — unlocks E2E and M1.
