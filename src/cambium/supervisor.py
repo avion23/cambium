@@ -799,7 +799,7 @@ class _Runtime:
 
     async def emit(
         self, kind: str, *, task_id: str | None = None, generation: int | None = None,
-        request_id: str | None = None, _observer_failure_is_fatal: bool = True,
+        request_id: str | None = None, _observer_failure_is_fatal: bool | None = None,
         **payload: Any,
     ) -> None:
         record = {
@@ -817,12 +817,17 @@ class _Runtime:
         else:
             self._queue.put_nowait(record)
         if self._on_event is not None:
+            observer_failure_is_fatal = (
+                _observer_failure_is_fatal
+                if _observer_failure_is_fatal is not None
+                else kind not in CRITICAL_KINDS
+            )
             try:
                 result = self._on_event(record)
                 if asyncio.iscoroutine(result):
                     await result
             except BaseException:
-                if _observer_failure_is_fatal:
+                if observer_failure_is_fatal:
                     raise
 
     async def _writer_loop(self) -> None:

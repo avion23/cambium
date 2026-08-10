@@ -133,6 +133,43 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert events[-1]["kind"] == "session_ended"
 
 
+def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-observer-cancel"
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-observer-cancel",
+                branch="wt-observer-cancel", target_file="a.txt",
+                marker="// observer-cancel", gate="grep -q '// observer-cancel' a.txt",
+            )
+        ]
+    }
+
+    async def cancel_merge_committed(event: dict) -> None:
+        if event["kind"] == "merge_committed":
+            raise asyncio.CancelledError
+
+    result = asyncio.run(run_plan(session_dir, plan, on_event=cancel_merge_committed))
+    events = read_events(session_dir)
+    main_tip = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert result.exit_code == 0
+    assert len(result.results) == 1
+    assert result.results[0].task_id == task_id
+    assert result.results[0].status == "succeeded"
+    assert main_tip != base
+    assert len(_kinds(events, "spawned")) == 1
+    committed = _kinds(events, "merge_committed")
+    assert len(committed) == 1
+    assert committed[0]["payload"]["new"] == main_tip
+
+
 # ---------------------------------------------------------------------------
 # T2: hang — a worker that never sends ready is killed and restarted, then the
 # task fails on the restart cap with no merge.
