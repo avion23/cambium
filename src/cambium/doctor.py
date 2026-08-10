@@ -358,6 +358,50 @@ def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, st
     return Status.PASS, f"{source}: auth coverage complete"
 
 
+def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status, str]:
+    """Distinguish configured providers from providers the one-shot CLI can run.
+
+    A provider is runnable when the one-shot CLI can resolve its key without
+    reading a value: the ``api_key_env`` variable is set to a non-empty value,
+    or the auth store holds the provider name (the fixed ``cambium auth run``
+    profile injects stored keys into the launch environment). A configured
+    provider that is not runnable is reported as a WARN; the ``required`` flag
+    decides FAIL in the provider-env check. The report uses provider metadata
+    and auth-store names only and never exposes a key value.
+    """
+    target = _auth_path(path)
+    try:
+        source, raw_specs = _doctor_provider_specs(cwd)
+    except (OSError, ValueError) as exc:
+        return Status.SKIP, (
+            f"provider runnable skipped: provider config validation failed: {exc}"
+        )
+    specs = tuple(raw_specs)
+    if not specs:
+        return Status.PASS, f"{source}: no configured providers"
+
+    try:
+        stored = set(AuthStore(target).read().provider_names())
+    except AuthError:
+        stored = set()  # Insecure or unreadable store metadata is check 9-11's finding.
+
+    presence = env_report(specs)
+    runnable = [
+        spec.name for spec in specs if presence[spec.name] or spec.name in stored
+    ]
+    not_runnable = [
+        spec.name
+        for spec in specs
+        if not (presence[spec.name] or spec.name in stored)
+    ]
+    if not_runnable:
+        detail = f"{source}: configured but not runnable: {', '.join(not_runnable)}"
+        if runnable:
+            detail += f"; runnable: {', '.join(runnable)}"
+        return Status.WARN, detail
+    return Status.PASS, f"{source}: all configured providers runnable: {', '.join(runnable)}"
+
+
 def _sqlite_integrity(db: Path) -> list[str]:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
@@ -521,8 +565,9 @@ def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
         (9, "Auth metadata", check_auth_metadata()),
         (10, "Auth schema", check_auth_schema()),
         (11, "Auth coverage", check_auth_coverage(cwd)),
-        (12, "Conversation store", check_conversation_store(session_dir)),
-        (13, "System health", check_system_health(cwd)),
+        (12, "Provider runnable", check_provider_runnable(cwd)),
+        (13, "Conversation store", check_conversation_store(session_dir)),
+        (14, "System health", check_system_health(cwd)),
     ]
     return [
         Check(number=number, name=name, status=status, detail=detail)
