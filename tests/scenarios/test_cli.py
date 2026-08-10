@@ -3,21 +3,51 @@
 from __future__ import annotations
 
 import json
+import os
+import pty
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_DIR = str(REPO_ROOT / "src")
 CLI = [sys.executable, "-m", "cambium.cli"]
 
 
+def _installed_cambium() -> str:
+    executable = shutil.which("cambium")
+    if executable is not None:
+        return executable
+    venv_executable = Path(sys.executable).with_name("cambium")
+    assert venv_executable.is_file(), "installed cambium executable not found"
+    return str(venv_executable)
+
+
 def _run(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return subprocess.run(
         [*CLI, *args],
         cwd=REPO_ROOT,
         input=input_text,
         capture_output=True,
         text=True,
+        env=env,
+        timeout=300,
+    )
+
+
+def _run_installed(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
+    return subprocess.run(
+        [_installed_cambium(), *args],
+        cwd=REPO_ROOT,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        env=env,
         timeout=300,
     )
 
@@ -82,3 +112,140 @@ def test_tasktree_cyclic_plan_exits_one() -> None:
     assert result.returncode == 1
     assert "cycle" in result.stderr
     assert result.stdout == ""
+
+
+def test_tasktree_reads_plan_from_file(tmp_path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {"task_id": "root", "kind": "FEATURE", "depends_on": []},
+                    {"task_id": "leaf", "kind": "TEST", "depends_on": ["root"]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run("tasktree", str(plan_path))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == '"root"\n"leaf"\n'
+    assert result.stderr == ""
+
+
+def test_tasktree_reads_plan_from_stdin() -> None:
+    plan = {
+        "tasks": [
+            {"task_id": "root", "kind": "FEATURE", "depends_on": []},
+            {"task_id": "leaf", "kind": "TEST", "depends_on": ["root"]},
+        ]
+    }
+
+    result = _run("tasktree", input_text=json.dumps(plan))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == '"root"\n"leaf"\n'
+    assert result.stderr == ""
+
+
+def test_installed_console_launcher_runs_tasktree() -> None:
+    plan = {
+        "tasks": [
+            {"task_id": "root", "kind": "FEATURE", "depends_on": []},
+            {"task_id": "leaf", "kind": "TEST", "depends_on": ["root"]},
+        ]
+    }
+
+    result = _run_installed("tasktree", input_text=json.dumps(plan))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == '"root"\n"leaf"\n'
+    assert result.stderr == ""
+
+
+def test_tasktree_reads_explicit_stdin_plan() -> None:
+    plan = {
+        "tasks": [{"task_id": "root", "kind": "FEATURE", "depends_on": []}]
+    }
+
+    result = _run("tasktree", "-", input_text=json.dumps(plan))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == '"root"\n'
+    assert result.stderr == ""
+
+
+def test_tasktree_no_args_prints_help() -> None:
+    result = _run("tasktree", input_text="")
+
+    assert result.returncode == 0
+    assert result.stdout.startswith("usage: python -m cambium.tasktree")
+    assert "PLAN" in result.stdout
+    assert result.stderr == ""
+
+
+def test_installed_console_launcher_tasktree_no_args_prints_help_without_waiting_on_tty() -> None:
+    master_fd, slave_fd = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            [_installed_cambium(), "tasktree"],
+            stdin=slave_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    filter(None, [SRC_DIR, os.environ.get("PYTHONPATH")])
+                ),
+            },
+            cwd=REPO_ROOT,
+        )
+    finally:
+        os.close(slave_fd)
+
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise AssertionError("installed cambium tasktree blocked on TTY stdin") from None
+    finally:
+        os.close(master_fd)
+
+    assert process.returncode == 0
+    assert stdout.startswith("usage: python -m cambium.tasktree")
+    assert "PLAN" in stdout
+    assert stderr == ""
+
+
+def test_tasktree_bad_arguments_exit_two() -> None:
+    result = _run("tasktree", "plan.json", "extra")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage: python -m cambium.tasktree" in result.stderr
+    assert "unrecognized arguments: extra" in result.stderr
+
+
+def test_tasktree_missing_file_exits_two(tmp_path) -> None:
+    missing = tmp_path / "missing-plan.json"
+
+    result = _run("tasktree", str(missing))
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage: python -m cambium.tasktree" in result.stderr
+    assert "cannot read plan file" in result.stderr
+    assert str(missing) in result.stderr
+
+
+def test_tasktree_invalid_json_exits_one() -> None:
+    result = _run("tasktree", input_text="{")
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "tasktree: invalid JSON in stdin" in result.stderr
