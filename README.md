@@ -19,6 +19,10 @@ the worker worktree, and successful commits publish to `refs/heads/main`.
 - `tasktree` validates and snapshots dependency specs, but `run_plan` does not
   schedule that tree. Architectus, dynamic decomposition, and the conversation
   store are not wired into `run_plan`.
+- Target scheduling starts with a harness-owned validated tree and static
+  ready-node waves. Each child gets a fresh bounded context and returns only a
+  strict envelope; dynamic child admission follows that slice. Prompt-prefix
+  stability and provider cache-hit metrics are acceptance requirements.
 - The package exports only `__version__`; use the CLI or module-level functions.
   The example module includes deterministic `decide` and `evaluate` operations.
 

@@ -32,6 +32,11 @@ that a module is present or wired.
   evidence; recheck claims against source.
 - [`coding-constitution.md`](coding-constitution.md) — coding-principles pointer.
 
+The accepted target shape is defined in the architecture and plan: a
+harness-owned validated tree, static ready-node scheduling before dynamic child
+admission, fresh bounded child contexts, strict upward envelopes, and
+prompt-prefix/cache-hit metrics. These are targets, not current runtime proof.
+
 ## Historical drafts
 
 Protocol, event, orchestration, cascade, canonicalization, replay, and

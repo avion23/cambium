@@ -59,6 +59,15 @@ distinguishes the diagnosis from alternatives.
   example module has deterministic `decide` and `evaluate` CLI operations and
   split evaluators in `metric.py`.
 
+### Accepted target boundary
+
+The first production hierarchy slice is harness-owned: it validates one
+explicit tree, schedules static ready-node waves, gives each child a fresh
+bounded context, and accepts only the strict upward envelope. Dynamic child
+admission is a later validated revision step. Prompt-prefix stability and
+provider cache-hit metrics are required acceptance evidence. These are targets,
+not current `run_plan` behavior.
+
 ## Module and hazard map
 
 Generate inventories with `git ls-files`; the current package is under

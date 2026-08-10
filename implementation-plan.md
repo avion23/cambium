@@ -3,20 +3,30 @@
 Ordered work only. Source and tests decide when a step is complete; this file
 is not a branch ledger or merge log.
 
-## 1. Production hierarchy and dynamic admission
+## 1. Smallest production hierarchy slice: static waves
 
-- Integrate `tasktree.build_tree`, `ready_tasks`, and `topological_order` with
-  `supervisor.run_plan` so only validated, dependency-ready nodes are admitted.
-- Define the production hierarchy boundary: root ownership, depth/width and
-  session admission, envelope-only child results, durable revision records, and
-  failure propagation.
+- Make the harness own one explicit validated `TaskTree`. Integrate
+  `build_tree`, `ready_tasks`, and `topological_order` with `run_plan` so static
+  ready-node waves, dependency order, and width limits control admission.
+- Give every admitted child a fresh bounded context derived from its own task
+  and allowed parent envelope. Permit upward data only through the strict
+  envelope key set; do not expose sibling context or an unbounded transcript.
+- Acceptance measures: a fixed fixture proves exact ready waves, no unready
+  dispatch, width enforcement, bounded child context, and exact envelope keys;
+  failed children stop dependent admission.
+
+## 2. Validated dynamic child admission
+
+- After the static slice is reproducible, let a parent propose a child only as a
+  typed tree revision. The harness validates and durably records each revision
+  before admission; a provider response cannot mutate the live tree directly.
 - Connect the injected Architectus decision port and conversation persistence
-  only after their callers, schemas, and failure paths are explicit. A provider
-  response may propose a revision, but cannot mutate the live tree directly.
-- Add deterministic checks for unready dispatch, duplicate/cyclic revisions,
-  width limits, parent isolation, and cancellation.
+  only at this boundary, with explicit schemas and failure paths.
+- Acceptance measures: duplicate, cyclic, multi-parent, over-depth, and
+  over-width revisions spawn nothing; a valid child is admitted only at a ready
+  wave and its envelope is visible only to its parent.
 
-## 2. Per-worker OS containment and approval
+## 3. Per-worker OS containment and approval
 
 - Select and implement the host boundary for each worker's process, filesystem,
   CPU/memory/task limits, network policy, and teardown. Worktree/process-group
@@ -26,12 +36,17 @@ is not a branch ledger or merge log.
   `fail_open` as development configuration only.
 - Add focused checks for containment setup/teardown, resource exhaustion,
   denied and unavailable approval, and no publication after control failure.
+- Acceptance measures: a denied or unavailable approval cannot run the command;
+  a containment setup or teardown failure cannot publish a worker result.
 
-## 3. Provider usage and quota contract
+## 4. Provider usage, prompt stability, and quota contract
 
 - Specify redacted durable usage events: provider, model, request/turn,
   token fields, cost, latency, Retry-After, request-rate status, account-quota
   owner, and failure reason.
+- Measure prompt-prefix stability and provider-reported cache-hit metrics for
+  the same fixed prompt fixtures. These metrics are requirements for routing
+  decisions, not evidence that a local response cache exists.
 - Connect accounting at the supervisor/event boundary and define behavior when
   rate-limit, token, cost, or account-quota state is unavailable. Preserve
   environment-only secrets.
@@ -39,8 +54,10 @@ is not a branch ledger or merge log.
   provider fallback against the contract. Do not introduce weighted routing
   until the usage and quota evidence is stable; configured priority remains the
   current policy.
+- Acceptance measures: fixed prompts report stable prefix and cache-hit fields;
+  rate-limit and accounting failures are visible without exposing credentials.
 
-## 4. External-provider smoke
+## 5. External-provider smoke
 
 - When credentials exist, run one disposable provider configuration through the
   custom worker loop, tool/checkpoint events, deterministic gate, and ref-only
@@ -48,12 +65,15 @@ is not a branch ledger or merge log.
 - Keep the run opt-in and networked only by explicit command. Record request
   count, usage events, commit, gate result, merge ref, and the failure case that
   leaves `main` unchanged without recording secrets.
+- Acceptance measures: the credentialed run has a recorded provider response,
+  usage record, passing gate, one expected ref update, and an unchanged `main`
+  on the failure fixture.
 - Local fake-provider fixtures can support regression tests, but they do not
   substitute for an external-provider run or prove per-worker OS isolation.
 
-## 5. Follow-on evaluation
+## 6. Follow-on evaluation
 
-After steps 1–4 are reproducible, measure worker reuse, provider routing,
+After steps 1–5 are reproducible, measure worker reuse, provider routing,
 context compression, and the example module's DSPy seam with fixed datasets,
 baselines, and failure criteria. Adopt, defer, or reject each experiment from
 its evidence; do not change the runtime contract silently.

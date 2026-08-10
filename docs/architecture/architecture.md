@@ -111,12 +111,19 @@ These are open contracts, not current interfaces:
 
 ### Production hierarchy and admission
 
-Integrate a validated `TaskTree` with the supervisor. A production
-hierarchy must admit only ready nodes, enforce dependency and width limits, and
-carry envelope-only child results. Dynamic decomposition may propose revisions,
-but the supervisor must validate and durably admit each revision; a provider
-response must not mutate the live tree in place. Wire the Architectus decision
-port and conversation persistence only with callers and failure tests.
+The smallest production slice is harness-owned: it receives one explicit,
+validated `TaskTree`, computes static ready-node waves, and admits only nodes
+whose dependencies and width limits are satisfied. Each child receives a fresh
+bounded context derived from its task and allowed parent envelope. Upward flow
+uses the strict envelope key set; sibling context and unbounded transcripts do
+not cross the boundary.
+
+Dynamic child admission follows the static slice. A parent may propose a typed
+tree revision, but the supervisor must validate and durably admit it before
+dispatch; a provider response cannot mutate the live tree in place. Wire the
+Architectus decision port and conversation persistence only with callers and
+failure tests. Prompt-prefix stability and provider cache-hit metrics are
+required acceptance measures for the provider path.
 
 ### Per-worker containment and approval
 
@@ -131,8 +138,9 @@ for that wrapper, not proof that every production worker is contained.
 Define durable usage events, provider and model identity, token/cost fields,
 request-rate status, account-quota ownership, and privacy/redaction rules. Test
 Retry-After, `RATE_LIMITED`, token/cost accounting, and accounting failure
-first. Only then evaluate weighted routing; priority ordering remains the
-current policy.
+first. Measure prompt-prefix stability and provider-reported cache-hit metrics
+on fixed prompt fixtures. Only then evaluate weighted routing; priority
+ordering remains the current policy.
 
 ### External-provider acceptance
 
