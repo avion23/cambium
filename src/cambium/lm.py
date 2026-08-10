@@ -24,7 +24,7 @@ if sysconfig.get_config_var("Py_GIL_DISABLED") or os.environ.get("Py_GIL_DISABLE
     )
 
 # isort: off
-from .diffundo import CallResult, Diffundo, ProviderTier
+from .diffundo import CallResult, Diffundo, ProviderConfig, ProviderTier
 
 # isort: on
 
@@ -118,6 +118,7 @@ _IMPLEMENTATION_LOCK = threading.Lock()
 _DIFFUNDO_REGISTRY_LOCK = threading.Lock()
 _DIFFUNDO_REGISTRY: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _DSPY: Any | None = None
+_DSPY_CACHE_DIR: tempfile.TemporaryDirectory[str] | None = None
 _JSON_SNAPSHOT_SENTINEL = "__cambium_json_snapshot_v1__"
 _JSON_MAPPING_MARKER = 0
 _JSON_BYTES_MARKER = 1
@@ -193,6 +194,8 @@ def _freeze(
         if id(value) in memo:
             raise ValueError("CambiumLM kwargs must not contain reference cycles")
         memo[id(value)] = None
+        if json_safe and any(type(key) is not str for key in value):
+            raise TypeError("CambiumLM request mapping keys must be exact builtin strings")
         snapshot = {
             _freeze(_reject_string_subclass_key(key), memo, json_safe=json_safe): _freeze(
                 item, memo, json_safe=json_safe
@@ -226,6 +229,8 @@ def _freeze(
             raise TypeError(
                 "CambiumLM request values must be JSON-serializable; bytes are not supported"
             )
+        if json_safe and type(value) is float and not math.isfinite(value):
+            raise ValueError("CambiumLM request values must be finite floats")
         return value
     if isinstance(value, str | bytes | int | float | bool):
         raise TypeError(
@@ -248,9 +253,15 @@ def _register_diffundo(diffundo: Any) -> str:
     return reference
 
 
-def _resolve_diffundo(reference: str) -> Any:
+def _lookup_diffundo(reference: str | None) -> Any | None:
+    if reference is None:
+        return None
     with _DIFFUNDO_REGISTRY_LOCK:
-        diffundo = _DIFFUNDO_REGISTRY.get(reference)
+        return _DIFFUNDO_REGISTRY.get(reference)
+
+
+def _resolve_diffundo(reference: str) -> Any:
+    diffundo = _lookup_diffundo(reference)
     if diffundo is None:
         raise RuntimeError(f"Diffundo reference {reference!r} is not available in this process")
     return diffundo
@@ -295,10 +306,19 @@ def _install_atomic_dspy_save(dspy: Any) -> None:
 
 
 def _load_dspy() -> Any:
-    """Load DSPy on first use without enabling its process-wide disk cache.
+    """Load DSPy on first use without touching its process-wide cache config.
 
     Packaging has no GIL ABI environment marker, so uv can resolve DSPy for
     cp314t. CambiumLM rejects that build when this module is imported instead.
+
+    DSPy constructs its disk cache during import and FanoutCache creates the
+    cache directory and its SQLite shards immediately, so a plain import would
+    write ``~/.dspy_cache`` into the user's home. The import therefore runs
+    with ``DSPY_CACHEDIR`` pointing at a process-lifetime temporary directory
+    (kept alive until interpreter shutdown); the global ``dspy.cache`` stays
+    enabled exactly as a normal import left it, and only the CambiumLM
+    instance disables caching for itself. No process-global cache setting is
+    mutated here.
     """
     global _DSPY
     if _DSPY is not None:
@@ -308,38 +328,22 @@ def _load_dspy() -> Any:
         if _DSPY is not None:
             return _DSPY
 
-        # DSPy 3.3 constructs its default disk cache during import. When the
-        # variable is absent, a valid non-HOME directory avoids its /dev/null
-        # fallback warning; the cache is disabled before this function returns.
-        with tempfile.TemporaryDirectory(prefix="cambium-dspy-cache-") as cache_dir:
-            previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
-            os.environ.setdefault("DSPY_CACHEDIR", cache_dir)
+        global _DSPY_CACHE_DIR
+        if _DSPY_CACHE_DIR is None:
+            _DSPY_CACHE_DIR = tempfile.TemporaryDirectory(prefix="cambium-dspy-cache-")
+        cache_dir = _DSPY_CACHE_DIR.name
+        previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
+        os.environ.setdefault("DSPY_CACHEDIR", cache_dir)
+        try:
             try:
-                try:
-                    import dspy
-                except ImportError as exc:
-                    raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
-            finally:
-                if previous_cache_dir is None and os.environ.get("DSPY_CACHEDIR") == cache_dir:
-                    os.environ.pop("DSPY_CACHEDIR", None)
+                import dspy
+            except ImportError as exc:
+                raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
+        finally:
+            if previous_cache_dir is None and os.environ.get("DSPY_CACHEDIR") == cache_dir:
+                os.environ.pop("DSPY_CACHEDIR", None)
 
-            configure_cache = getattr(dspy, "configure_cache", None)
-            if not callable(configure_cache):
-                raise RuntimeError("CambiumLM requires a DSPy version with cache configuration")
-            cache = getattr(dspy, "cache", None)
-            if (
-                getattr(cache, "enable_disk_cache", True)
-                or getattr(cache, "enable_memory_cache", True)
-            ):
-                configure_cache(
-                    enable_disk_cache=False,
-                    enable_memory_cache=False,
-                    disk_cache_dir=None,
-                )
-                close_disk_cache = getattr(getattr(cache, "disk_cache", None), "close", None)
-                if callable(close_disk_cache):
-                    close_disk_cache()
-            _install_atomic_dspy_save(dspy)
+        _install_atomic_dspy_save(dspy)
         _DSPY = dspy
         return _DSPY
 
@@ -534,6 +538,7 @@ class _CambiumLMMixin:
         state.pop("num_retries", None)
         model = self._validate_model(self._provider_model)
         budget_usd = self._validate_budget(self._budget_usd)
+        serialized_diffundo = self._serialize_diffundo(self._diffundo)
         state.update(
             {
                 "diffundo_reference": self._diffundo_reference,
@@ -542,6 +547,13 @@ class _CambiumLMMixin:
                 "budget_usd": budget_usd,
             }
         )
+        if serialized_diffundo is not None:
+            # A fresh process cannot resolve the weak-registry reference, so the
+            # saved file also carries a JSON reconstruction plan for a real
+            # Diffundo. It is stored as a JSON string so provider field names
+            # (e.g. the api_key_env env-var NAME, never a key value) do not
+            # trip the credential scan.
+            state["diffundo"] = serialized_diffundo
         return self._json_snapshot(self._safe_kwargs(state))
 
     @classmethod
@@ -551,14 +563,109 @@ class _CambiumLMMixin:
         *,
         allow_custom_lm_class: bool = False,
     ) -> Any:
-        """Reconstruct a trusted adapter state through its Diffundo reference."""
+        """Reconstruct a trusted adapter state through its Diffundo reference.
+
+        The live-process registry wins so an in-process round trip keeps the
+        original Diffundo instance (including non-Diffundo test doubles);
+        a fresh process falls back to the serialized Diffundo reconstruction
+        stored in the state file.
+        """
         del allow_custom_lm_class
-        constructor_state = dict(state)
+        constructor_state = cls._restore_json_snapshot(dict(state))
         constructor_state.pop("_dspy_lm_class", None)
-        reference = constructor_state.pop("diffundo_reference")
-        constructor_state["diffundo"] = _resolve_diffundo(reference)
-        constructor_state = cls._restore_json_snapshot(constructor_state)
+        reference = constructor_state.pop("diffundo_reference", None)
+        diffundo = _lookup_diffundo(reference)
+        if diffundo is None:
+            serialized = constructor_state.pop("diffundo", None)
+            diffundo = (
+                cls._deserialize_diffundo(serialized) if isinstance(serialized, str) else None
+            )
+        if diffundo is None:
+            raise RuntimeError(
+                "diffundo is not available in this process and cannot be reconstructed "
+                "from the saved state"
+            )
+        constructor_state["diffundo"] = diffundo
         return cls(**constructor_state)
+
+    @staticmethod
+    def _serialize_diffundo(diffundo: Any) -> str | None:
+        """Return a JSON reconstruction plan for a real Diffundo, else None."""
+        if not isinstance(diffundo, Diffundo):
+            return None
+        providers = getattr(diffundo, "_providers", ())
+        serialized_providers = [
+            {
+                "name": provider.name,
+                "tier": provider.tier.value,
+                "base_url": provider.base_url,
+                "api_key_env": provider.api_key_env,
+                "timeout_s": provider.timeout_s,
+                "max_retries": provider.max_retries,
+                "rpm": provider.rpm,
+                "enabled": provider.enabled,
+                "model": provider.model,
+                "priority": provider.priority,
+                "cooldown_s": provider.cooldown_s,
+                "price_per_1m_in": provider.price_per_1m_in,
+                "price_per_1m_out": provider.price_per_1m_out,
+            }
+            for provider in providers
+        ]
+        return json.dumps(
+            {
+                "providers": serialized_providers,
+                "call_budget_s": diffundo._call_budget_s,
+                "pause_timeout_s": diffundo._pause_timeout_s,
+                "breaker_window_size": diffundo._breaker_window,
+                "breaker_failure_threshold": diffundo._breaker_threshold,
+                "open_backoff_base": diffundo._open_backoff_base,
+                "retry_base_delay_s": diffundo._retry_base_delay_s,
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def _deserialize_diffundo(cls, payload: str) -> Any | None:
+        """Rebuild a Diffundo from a :meth:`_serialize_diffundo` payload."""
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("invalid serialized Diffundo state") from exc
+        raw_providers = data.get("providers")
+        if not isinstance(raw_providers, list):
+            raise RuntimeError("invalid serialized Diffundo state: providers missing")
+        try:
+            providers = [
+                ProviderConfig(
+                    name=provider["name"],
+                    tier=ProviderTier(provider["tier"]),
+                    base_url=provider["base_url"],
+                    api_key_env=provider["api_key_env"],
+                    timeout_s=provider["timeout_s"],
+                    max_retries=provider["max_retries"],
+                    rpm=provider["rpm"],
+                    enabled=provider["enabled"],
+                    model=provider["model"],
+                    priority=provider["priority"],
+                    cooldown_s=provider["cooldown_s"],
+                    price_per_1m_in=provider["price_per_1m_in"],
+                    price_per_1m_out=provider["price_per_1m_out"],
+                )
+                for provider in raw_providers
+            ]
+            diffundo = Diffundo(
+                providers,
+                call_budget_s=data.get("call_budget_s", 60.0),
+                pause_timeout_s=data.get("pause_timeout_s", 0.5),
+                breaker_window_size=data.get("breaker_window_size", 20),
+                breaker_failure_threshold=data.get("breaker_failure_threshold", 0.5),
+                open_backoff_base=data.get("open_backoff_base", 2.0),
+                retry_base_delay_s=data.get("retry_base_delay_s", 0.05),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid serialized Diffundo state") from exc
+        return diffundo
 
     @staticmethod
     def _safe_kwargs(
@@ -755,9 +862,16 @@ class _CambiumLMMixin:
     @staticmethod
     def _response(result: CallResult) -> Any:
         dspy = _load_dspy()
-        return dspy.LMResponse.from_text(
-            result.content,
+        parts: list[Any] = []
+        if result.content:
+            parts.append({"type": "text", "text": result.content})
+        for tool_call in result.tool_calls or ():
+            parts.append(_CambiumLMMixin._tool_call_part(tool_call))
+        if not parts:
+            parts.append({"type": "text", "text": ""})
+        return dspy.LMResponse(
             model=result.model,
+            outputs=[{"parts": parts}],
             usage=result.usage,
             cost=result.estimated_cost_usd,
             cache_hit=False,
@@ -767,6 +881,31 @@ class _CambiumLMMixin:
                 "latency_s": result.latency_s,
             },
         )
+
+    @staticmethod
+    def _tool_call_part(tool_call: Any) -> dict[str, Any]:
+        """Convert an OpenAI-shaped tool call into an ``LMToolCallPart`` dict."""
+        if not isinstance(tool_call, Mapping):
+            raise TypeError("Diffundo tool_calls must be OpenAI-shaped mappings")
+        function = tool_call.get("function", {})
+        function = function if isinstance(function, Mapping) else {}
+        raw_arguments = function.get("arguments", tool_call.get("arguments", "{}"))
+        args: Any = {}
+        if isinstance(raw_arguments, str):
+            try:
+                args = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(raw_arguments, Mapping):
+            args = dict(raw_arguments)
+        if not isinstance(args, dict):
+            args = {}
+        return {
+            "type": "tool_call",
+            "id": tool_call.get("id"),
+            "name": function.get("name") or tool_call.get("name") or "",
+            "args": args,
+        }
 
 
 def _implementation_class() -> type[Any]:

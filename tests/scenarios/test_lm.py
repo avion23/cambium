@@ -91,8 +91,8 @@ from cambium.lm import CambiumLM
 fake_diffundo = type("FakeDiffundo", (), {"call": lambda *args, **kwargs: None})()
 CambiumLM(fake_diffundo, ProviderTier.FAST)
 import dspy
-assert dspy.cache.enable_disk_cache is False
-assert dspy.cache.enable_memory_cache is False
+assert dspy.cache.enable_disk_cache is True
+assert dspy.cache.enable_memory_cache is True
 """
     env = os.environ.copy()
     env.pop("DSPY_CACHEDIR", None)
@@ -172,7 +172,16 @@ def test_architectus_real_decide_port_uses_cambium_lm() -> None:
     diffundo = FakeDiffundo()
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
     tree = build_tree(
-        {"tasks": [{"task_id": "root", "kind": "FEATURE", "depends_on": [], "spec": {}}]}
+        {
+            "tasks": [
+                {
+                    "task_id": "root",
+                    "kind": "FEATURE",
+                    "depends_on": [],
+                    "spec": {"goal": "deliver the feature"},
+                }
+            ]
+        }
     )
     actions = asyncio.run(ArchitectusCore(ArchitectusLM(lm), tree=tree).step([{"kind": "tick"}]))
     assert actions == [{"action": "spawn", "task_id": "root"}]
@@ -1201,6 +1210,110 @@ def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
     assert response_format.reads == 1
 
 
+@pytest.mark.parametrize("entry_point", ["call", "acall"])
+def test_request_snapshot_rejects_non_string_mapping_keys(entry_point: str) -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"response_format": {1: "coerced", "type": "json_object"}},
+    )
+
+    with pytest.raises(TypeError, match="exact builtin strings"):
+        if entry_point == "call":
+            lm(request=request)
+        else:
+            asyncio.run(lm.acall(request=request))
+
+    assert diffundo.calls == []
+
+
+@pytest.mark.parametrize(
+    ("value", "entry_point"),
+    [
+        (float("nan"), "call"),
+        (float("inf"), "call"),
+        (float("-inf"), "acall"),
+    ],
+)
+def test_request_snapshot_rejects_non_finite_floats(value: float, entry_point: str) -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"response_format": {"value": value}},
+    )
+
+    with pytest.raises(ValueError, match="finite floats"):
+        if entry_point == "call":
+            lm(request=request)
+        else:
+            asyncio.run(lm.acall(request=request))
+
+    assert diffundo.calls == []
+
+
+def test_state_round_trip_loads_in_a_fresh_process(tmp_path: Path) -> None:
+    _require_dspy()
+    source = Path(__file__).resolve().parents[2] / "src"
+    save_script = """
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from cambium.diffundo import Diffundo, ProviderConfig, ProviderTier
+from cambium.lm import CambiumLM
+
+diffundo = Diffundo(
+    [ProviderConfig(name="p", tier=ProviderTier.FAST,
+                    base_url="https://fake.invalid", api_key_env="K_FAKE", model="m")]
+)
+lm = CambiumLM(diffundo, ProviderTier.FAST)
+state = lm.dump_state()
+assert "diffundo" in state, "saved state must carry a reconstructable Diffundo"
+with open(sys.argv[2], "w") as fh:
+    json.dump(state, fh)
+"""
+    load_script = """
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import dspy
+from cambium.diffundo import Diffundo
+
+state = json.load(open(sys.argv[2]))
+loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
+assert isinstance(loaded._diffundo, Diffundo), "fresh-process load must rebuild a real Diffundo"
+assert loaded._tier.value == "fast"
+print("fresh-process load OK")
+"""
+    state_path = tmp_path / "state.json"
+    saved = subprocess.run(
+        [sys.executable, "-c", save_script, str(source), str(state_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert saved.returncode == 0, saved.stderr
+    loaded = subprocess.run(
+        [sys.executable, "-c", load_script, str(source), str(state_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert loaded.returncode == 0, loaded.stderr
+    assert "fresh-process load OK" in loaded.stdout
+
+
 def test_reasoning_and_tool_choice_reach_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -1217,6 +1330,111 @@ def test_reasoning_and_tool_choice_reach_diffundo() -> None:
         "reasoning": {"effort": "high"},
         "tool_choice": {"mode": "none"},
     }
+
+
+def test_tool_call_completion_reaches_dspy_outputs() -> None:
+    _require_dspy()
+    import dspy
+    from dspy.core.types import LMToolSpec
+
+    class ToolCallDiffundo(FakeDiffundo):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            self.calls.append(
+                {"tier": tier, "prompt": prompt, "model": model, "budget_usd": budget_usd}
+            )
+            return CallResult(
+                provider=self.endpoint,
+                model=model or "fake-model",
+                tier=tier,
+                content="",
+                latency_s=0.01,
+                usage={"prompt_tokens": 2, "completion_tokens": 2},
+                tool_calls=(
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": '{"query": "dspy"}',
+                        },
+                    },
+                ),
+            )
+
+    diffundo = ToolCallDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="cambium/fast",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "use a tool"}]}],
+        tools=[
+            LMToolSpec(
+                name="search",
+                description="search the web",
+                parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+            )
+        ],
+    )
+
+    response = lm(request=request)
+
+    assert [tool.name for tool in response.tool_calls] == ["search"]
+    assert response.tool_calls[0].args == {"query": "dspy"}
+    assert response.tool_calls[0].id == "call_1"
+    assert response.text is None
+    assert len(diffundo.calls) == 1
+    assert diffundo.calls[0]["prompt"]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "search the web",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }
+    ]
+
+
+def test_tool_call_content_and_tool_calls_are_both_preserved() -> None:
+    _require_dspy()
+    import dspy
+
+    class MixedDiffundo(FakeDiffundo):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            return CallResult(
+                provider=self.endpoint,
+                model=model or "fake-model",
+                tier=tier,
+                content="explaining the call",
+                latency_s=0.01,
+                tool_calls=(
+                    {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ),
+            )
+
+    lm = CambiumLM(MixedDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    response = lm(
+        request=dspy.LMRequest(
+            model="cambium/fast",
+            messages=[{"role": "user", "parts": [{"type": "text", "text": "hi"}]}],
+        )
+    )
+
+    assert response.text == "explaining the call"
+    assert [call.name for call in response.tool_calls] == ["f"]
 
 
 def test_concurrent_dspy_loads_preserve_cache_environment() -> None:

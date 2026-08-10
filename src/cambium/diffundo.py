@@ -150,7 +150,11 @@ class ProviderConfig:
 
 @dataclass(frozen=True, slots=True)
 class CallResult:
-    """A successful completion plus provenance."""
+    """A successful completion plus provenance.
+
+    ``tool_calls`` carries the raw OpenAI-shaped tool-call dicts when the
+    provider returned them; a text completion leaves it ``None``.
+    """
 
     provider: str
     model: str
@@ -159,6 +163,7 @@ class CallResult:
     latency_s: float
     usage: dict[str, Any] | None = None
     estimated_cost_usd: float = 0.0
+    tool_calls: tuple[dict[str, Any], ...] | None = None
 
 
 class DiffundoError(Exception):
@@ -352,10 +357,18 @@ class _RawResponse:
                 provider.name, ProviderOutcome.REFUSAL, "model refusal marker in response"
             )
         content = message.get("content")
+        raw_tool_calls = message.get("tool_calls")
+        tool_calls = (
+            tuple(tool_call for tool_call in raw_tool_calls if isinstance(tool_call, dict))
+            if isinstance(raw_tool_calls, list) and raw_tool_calls
+            else None
+        ) or None
         if not isinstance(content, str):
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
-            )
+            if tool_calls is None:
+                raise ProviderError(
+                    provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
+                )
+            content = ""
         if _CONTENT_REFUSAL_RE.search(content):
             # A 200 completion whose text is a model refusal: fall through to the
             # next provider (documented heuristic, see module docstring). Like any
@@ -376,6 +389,7 @@ class _RawResponse:
             latency_s=self.latency_s,
             usage=usage,
             estimated_cost_usd=_estimate_cost(provider, usage),
+            tool_calls=tool_calls,
         )
 
 
@@ -391,11 +405,11 @@ def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> fl
 
 
 def _default_quality_gate(result: CallResult) -> bool:
-    return bool(result.content.strip())
+    return bool((result.content or "").strip() or result.tool_calls)
 
 
 def _default_score(result: CallResult) -> float:
-    return float(len(result.content))
+    return float(len(result.content or "") + len(result.tool_calls or ()))
 
 
 def _redact_error_text(message: str, api_key: str) -> str:

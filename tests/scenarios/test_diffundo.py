@@ -421,6 +421,77 @@ def test_provider_request_uses_stable_cambium_user_agent_and_keeps_authorization
                 "Authorization": "Bearer sk-test-K_UA",
             }
         ]
+def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) -> None:
+    # A normal OpenAI tool-call completion carries content:null plus tool_calls;
+    # it is a success, not a "content missing" malformed response.
+    tool_payload = {
+        "id": "chatcmpl-tool",
+        "object": "chat.completion",
+        "model": "m-tool",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "search", "arguments": '{"query": "x"}'},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+    }
+    server = FakeServer([(200, tool_payload, 0.0)])
+    _set_keys(monkeypatch, "K_TOOL")
+    router = Diffundo((_config("p_tool", server, "K_TOOL"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == ""
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["function"]["name"] == "search"
+        assert router.health("p_tool") is HealthState.HEALTHY
+    finally:
+        server.close()
+
+
+def test_tool_call_response_with_text_content_keeps_both(tmp_path, monkeypatch) -> None:
+    tool_payload = {
+        "id": "chatcmpl-tool2",
+        "object": "chat.completion",
+        "model": "m-tool2",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "explaining the call",
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+    }
+    server = FakeServer([(200, tool_payload, 0.0)])
+    _set_keys(monkeypatch, "K_TOOL2")
+    router = Diffundo((_config("p_tool2", server, "K_TOOL2"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "explaining the call"
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["id"] == "call_2"
     finally:
         server.close()
 
