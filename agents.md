@@ -21,7 +21,7 @@ Trace callers and tests; a failed name search is not proof of absence.
 
 Current code is a deterministic Python harness. `src/cambium/__init__.py` exports only `__version__`; no public `Cambium`/`Session`/`Result` API exists.
 `worker.do_work` is a deterministic marker/commit seed; no DSPy ReAct loop is present.
-There is no example eval harness, smoke module, or example `__main__.py`; these are targets, and those attempted module commands exit 1 and are not checks.
+There is no example eval harness, smoke module, or example `__main__.py` on `main`; these are targets only.
 Custos, Opifex, Nuntius, Surculus, and Unio are architecture target names mapped to current supervisor, worker, ipc, worktree, and merge portions and symbols.
 Matching role modules are not proof. No TUI exists.
 
@@ -29,7 +29,7 @@ Matching role modules are not proof. No TUI exists.
 
 - Keep scope tight. Report required file-scope expansion before editing.
 - Work in an isolated worktree. Verify `git rev-parse --show-toplevel` and `git worktree list`; never work or commit on `main` or in a shared integration checkout.
-- Children never commit to the integration branch. Root may merge verified child commits.
+- Children never merge; the root supervisor owns verified, serialized merges.
 - Read-only reports state `files changed: none, commit: none`.
 - Do not force-push, rewrite shared history, reset another worktree, or delete work to hide a failure.
 - Secrets are environment-only. Never log or send credentials.
@@ -44,11 +44,10 @@ Matching role modules are not proof. No TUI exists.
 - Protocol-order violations fail the worker; malformed advisory lines are logged and skipped; model parsing follows the module's bounded failure policy.
 - Use enums for domain alternatives. Cite only `Decision` in `src/cambium/modules/example/decide.py` and `NodeStatus` in `src/cambium/tasktree.py`.
 
-Fail-open warnings are REQUIRED: DLQ writes records unchanged (no redaction); supervisor passes near-full host env after name filtering; no strict spawn allowlist is integrated.
-redaction and strict env allowlisting are NOT integrated; never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
+Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a deny-by-name regex, not a strict environment allowlist. Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
 
-`supervisor.run_plan` starts supplied tasks concurrently in one `asyncio.TaskGroup`.
-`tasktree.py` validates but does not schedule the DAG. The architecture DAG is target only.
+`supervisor.run_plan` concurrently fans out supplied tasks under one `asyncio.TaskGroup`; `tasktree.py` validates but does not schedule. The architecture DAG is target only.
+Boundary failure policy: task-tree validation rejects malformed/cyclic plans; IPC protocol violations, missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged and skipped; a nonzero/timeout gate fails before merge; merge conflict or non-fast-forward emits `merge_failed` and publishes nothing; approval defaults deny and schema validation reports errors for malformed tool calls.
 
 ## Module map
 
@@ -57,30 +56,32 @@ Current source is under `src/cambium/`; current tests are under `tests/` and `sr
 CLI: `src/cambium/cli.py:main`; version: `src/cambium/__init__.py`.
 Runtime: `src/cambium/ipc.py`, `src/cambium/worker.py`, `src/cambium/supervisor.py`, `src/cambium/tasktree.py`, and `src/cambium/worker_pool.py`.
 State and control: `src/cambium/store.py`, `src/cambium/merge.py`, `src/cambium/dlq.py`, `src/cambium/events.py`, `src/cambium/conversations.py`, `src/cambium/approval.py`, and `src/cambium/provider_config.py`.
-Tool changes cover `src/cambium/schemas.py`, `src/cambium/tools.py` (`TOOL_DISPATCH`), and `src/cambium/approval.py` together.
+Tools: `src/cambium/schemas.py`, `src/cambium/tools.py` (`TOOL_DISPATCH`), and `src/cambium/approval.py`; keep the map complete across all three.
 Decision module: `src/cambium/modules/example/`; harness scenarios are in `tests/scenarios/`.
-Current data is `{train,eval,canaries}.jsonl`; `example_pairs.jsonl` is legacy fallback only.
+Current data is the split `{train,eval,canaries}.jsonl`; combined `example_pairs.jsonl` is legacy fallback only.
 Fallback references: `src/cambium/modules/example/dataset.py:59-77` and `src/cambium/bench.py:215-255`.
 `pyproject.toml` has `dependencies = []` and no `[dspy]` extra yet; `requires-python` is `>=3.14` with no packaging upper bound.
 Architecture's `>=3.14,<3.15` claim is open packaging work, not a fact.
 The docs tree is `docs/architecture/...` and `docs/research/...`.
-`implementation-plan.md` and `docs/research/v2-1-status.md` are stale-baseline snapshots, not current truth.
+Milestone status lives in `docs/research/v2-1-status.md`; re-check it against `main` before relying on it.
 Coding principles pointer: `docs/research/coding-constitution.md`.
 
 ## Commands
 
-Run from `/home/ubuntu/cambium-wt-agents-condense`. Use only real checks:
+Run from the repository root. The full suite is not verified-green: the IPC fuzz timing test flakes under load; the flake exists and is under repair. Use only real checks:
 
-- `uv run --python 3.14.7 --extra test pytest -q`
-- `uv run --python 3.14.7 --extra test pytest --collect-only -q`
-- Focused scenarios: `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_tasktree.py tests/scenarios/test_supervisor_fanout.py`
-- `uv run --python 3.14.7 --extra dev ruff check src tests`
-- `python -m compileall src/cambium`
-- `cambium --help`
-- `cambium version`
-- `git diff --check`
+| Check | Command |
+|---|---|
+| Full suite (not verified-green) | `uv run --python 3.14.7 --extra test pytest -q` |
+| Collect tests | `uv run --python 3.14.7 --extra test pytest --collect-only -q` |
+| Focused scenario | `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_supervisor_fanout.py` |
+| Lint | `uv run --python 3.14.7 --extra dev ruff check src tests` |
+| Syntax | `uv run --python 3.14.7 python -m compileall src tests` |
+| CLI help | `uv run --python 3.14.7 cambium --help` |
+| CLI version | `uv run --python 3.14.7 cambium version` |
+| Patch check | `git diff --check` |
 
-A module CLI is allowed only when its `__main__.py` exists. None exists for the example package now.
+A module CLI is allowed only when its `__main__.py` exists. None exists on `main` for the example package.
 
 ## Workflow
 
