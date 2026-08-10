@@ -53,6 +53,7 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_DIR = REPO_ROOT / "src" / "cambium" / "modules"
+RUNTIME_BASELINE_DIR = REPO_ROOT / ".cambium" / "baselines"
 
 SPLITS = ("train", "eval", "canaries")
 
@@ -64,7 +65,12 @@ def _baseline_path(
     module_name: str,
     baseline_root: Path | None = None,
 ) -> Path:
-    """Return a module-local baseline path, or an explicit root override."""
+    """Return a baseline path under an explicit root, or the committed one.
+
+    ``baseline_root / <module>/baseline.json`` when a root is given; without
+    one, the module-local committed baseline
+    (``src/cambium/modules/<name>/tests/baselines/baseline.json``).
+    """
     if baseline_root is not None:
         return baseline_root / module_name / "baseline.json"
     return MODULES_DIR / package_name / "tests" / "baselines" / "baseline.json"
@@ -307,20 +313,38 @@ def _assemble_baseline(
     return baseline
 
 
-def compare_against_anchor(report: dict[str, Any], anchor: dict[str, Any]) -> list[tuple[str, str]]:
+def compare_against_anchor(
+    report: dict[str, Any],
+    anchor: dict[str, Any],
+    thresholds: dict[str, Any] | None = None,
+) -> list[tuple[str, str]] | None:
     """Return ``[(field, detail)]`` regressions of ``report`` vs ``anchor``.
+
+    Returns ``None`` when the anchor is stale — its ``dataset_version``
+    differs from the report's, so the two are not comparable and the caller
+    must record a new anchor instead of failing (design §3: "the drift check
+    compares only against the last baseline with the same dataset_version").
+
+    Threshold precedence: run-level ``thresholds`` (e.g. from
+    ``--bench-metric-delta``) override the anchor's stored
+    ``drift_thresholds``, which override the defaults.
 
     Metric means only fail when they fall by more than ``metric_mean_delta``;
     wall p90 fails when it exceeds ``anchor * wall_p90_ratio``; duplicate ids
     or cross-split leaks of any size and missing canaries always fail; a
-    canary failure is a regression when it exceeds the anchor's count.
-    Thresholds come from the anchor's own ``drift_thresholds``.
+    canary failure is a regression when it exceeds the anchor's count by more
+    than ``canary_failed_delta``.
     """
-    thresholds = dict(DEFAULT_THRESHOLDS)
-    thresholds.update(anchor.get("drift_thresholds") or {})
+    if report.get("dataset_version") != anchor.get("dataset_version"):
+        return None  # stale anchor — re-anchor instead of comparing
+
+    merged = dict(DEFAULT_THRESHOLDS)
+    merged.update(anchor.get("drift_thresholds") or {})
+    if thresholds:
+        merged.update(thresholds)
     regressions: list[tuple[str, str]] = []
 
-    metric_delta = thresholds["metric_mean_delta"]
+    metric_delta = merged["metric_mean_delta"]
     for split in SPLITS:
         r_metric = (report.get("metric") or {}).get(split)
         a_metric = (anchor.get("metric") or {}).get(split)
@@ -339,7 +363,7 @@ def compare_against_anchor(report: dict[str, Any], anchor: dict[str, Any]) -> li
     r_wall = (report.get("tests") or {}).get("wall_seconds") or {}
     a_wall = (anchor.get("tests") or {}).get("wall_seconds") or {}
     if a_wall.get("p90") and r_wall.get("p90"):
-        wall_ratio = thresholds["wall_p90_ratio"]
+        wall_ratio = merged["wall_p90_ratio"]
         if r_wall["p90"] > a_wall["p90"] * wall_ratio:
             regressions.append(
                 (
@@ -349,7 +373,7 @@ def compare_against_anchor(report: dict[str, Any], anchor: dict[str, Any]) -> li
             )
 
     dataset = report.get("dataset") or {}
-    dataset_thresholds = thresholds.get("dataset") or {}
+    dataset_thresholds = merged.get("dataset") or {}
     if dataset.get("duplicate_ids", 0) > dataset_thresholds.get("duplicate_ids", 0):
         regressions.append(("dataset.duplicate_ids", str(dataset["duplicate_ids"])))
     if dataset.get("cross_split_leaks", 0) > dataset_thresholds.get("cross_split_leaks", 0):
@@ -357,13 +381,15 @@ def compare_against_anchor(report: dict[str, Any], anchor: dict[str, Any]) -> li
 
     r_canaries = report.get("canaries") or {}
     a_canaries = anchor.get("canaries") or {}
+    canary_delta = merged["canary_failed_delta"]
     if r_canaries.get("total", 0) == 0:
         regressions.append(("canaries.total", "dataset has no canaries"))
-    if r_canaries.get("failed", 0) > a_canaries.get("failed", 0):
+    if r_canaries.get("failed", 0) > a_canaries.get("failed", 0) + canary_delta:
         regressions.append(
             (
                 "canaries.failed",
-                f"{a_canaries.get('failed', 0)} -> {r_canaries.get('failed', 0)}",
+                f"{a_canaries.get('failed', 0)} + {canary_delta} -> "
+                f"{r_canaries.get('failed', 0)}",
             )
         )
 
@@ -388,6 +414,7 @@ class BenchPlugin:
         self.times: dict[str, float] = {}
         self.module_reports: dict[str, dict[str, Any]] = {}
         self.regressions: dict[str, list[tuple[str, str]]] = {}
+        self.reanchored: dict[str, str] = {}
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_makereport(self, item: Any, call: Any) -> None:
@@ -408,9 +435,15 @@ class BenchPlugin:
                 _write_baseline(report, anchor_path)  # first run anchors + passes
             else:
                 anchor = json.loads(anchor_path.read_text())
-                regressions = compare_against_anchor(report, anchor)
-                self.regressions[report["module"]] = regressions
-                if regressions:
+                regressions = compare_against_anchor(report, anchor, self.thresholds)
+                if regressions is None:
+                    # dataset_version changed: record a new anchor, do not fail
+                    self.reanchored[report["module"]] = (
+                        f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
+                    )
+                    _write_baseline(report, anchor_path)
+                elif regressions:
+                    self.regressions[report["module"]] = regressions
                     session.exitstatus = 1
 
     def pytest_terminal_summary(
@@ -433,6 +466,8 @@ class BenchPlugin:
             )
             for field, detail in self.regressions.get(module, []):
                 terminalreporter.write_line(f"  DRIFT {field}: {detail}", red=True)
+        for module, detail in sorted(self.reanchored.items()):
+            terminalreporter.write_line(f"  RE-ANCHOR {module}: {detail}")
 
 
 def _write_baseline(report: dict[str, Any], path: Path) -> None:
@@ -502,7 +537,7 @@ def _cli_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="DIR",
-        help="baseline root override (default: next to each module)",
+        help="baseline root override (default: .cambium/baselines/, gitignored)",
     )
     parser.add_argument(
         "--bench-metric-delta",
@@ -532,10 +567,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.bench_wall_ratio is not None:
         thresholds["wall_p90_ratio"] = args.bench_wall_ratio
     failures = 0
+    root = args.bench_root or RUNTIME_BASELINE_DIR
     for pkg_name in discover_modules():
         body = build_module_report(pkg_name)
         report = _assemble_baseline(body, {}, thresholds)
-        path = _baseline_path(pkg_name, report["module"], args.bench_root)
+        path = _baseline_path(pkg_name, report["module"], root)
         if mode == "report":
             _write_baseline(report, path)
             print(f"cambium bench: wrote {path}")
@@ -544,8 +580,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cambium bench: first run wrote {path}")
         else:
             anchor = json.loads(path.read_text())
-            regressions = compare_against_anchor(report, anchor)
-            if regressions:
+            regressions = compare_against_anchor(report, anchor, thresholds)
+            if regressions is None:
+                _write_baseline(report, path)
+                print(
+                    f"cambium bench: re-anchored {report['module']}: "
+                    f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
+                )
+            elif regressions:
                 failures += 1
                 for field, detail in regressions:
                     print(f"cambium bench: DRIFT {report['module']}: {field}: {detail}")
