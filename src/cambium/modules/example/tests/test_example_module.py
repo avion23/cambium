@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
@@ -152,6 +153,8 @@ def test_subprocess_network_client_is_denied() -> None:
     """The module gate must protect subprocesses, not only this pytest process."""
     if os.environ.get("CAMBIUM_MODULE_OFFLINE") != "1":
         pytest.skip("requires the isolated module-test environment")
+    if shutil.which("curl") is None:
+        pytest.skip("curl is not installed; cannot probe network-client denial")
 
     try:
         result = subprocess.run(
@@ -161,9 +164,9 @@ def test_subprocess_network_client_is_denied() -> None:
             check=False,
             timeout=5,
         )
-    except PermissionError:
-        result = None
-    if result is not None:
+    except PermissionError as exc:
+        assert "network client denied" in str(exc)
+    else:
         assert result.returncode != 0
         assert "network client denied" in result.stderr
 
