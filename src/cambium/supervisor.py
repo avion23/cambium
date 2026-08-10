@@ -50,6 +50,7 @@ from cambium.resources import DEFAULT_ACQUIRE_TIMEOUT_S, CompileGate
 from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
+from .ipc import MAX_LINE_BYTES
 from .merge import MergeSequencer
 from .modules.base import _is_secret_shaped
 from .redact import Redactor, build_session_redactor
@@ -57,7 +58,10 @@ from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
 
 PROTO = 1
-WORKER_STDIN_LIMIT = 1_048_576
+WORKER_STDIN_LIMIT = MAX_LINE_BYTES
+# Four full-cap messages bound each worker's decoded stdout backlog.
+WORKER_STDOUT_QUEUE_MAXSIZE = max(1, MAX_LINE_BYTES // (256 * 1024))
+OUTBOUND_MESSAGE_TOO_LONG = "outbound_message_too_long"
 STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
 PROCESS_REAP_TIMEOUT_S = 5.0
@@ -150,6 +154,13 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     return float(os.environ.get(env, default))
 
 
+def _encode_json_frame(msg: dict[str, Any]) -> bytes | None:
+    content = json.dumps(msg).encode("utf-8")
+    if len(content) > MAX_LINE_BYTES:
+        return None
+    return content + b"\n"
+
+
 async def _write_json(
     proc: asyncio.subprocess.Process,
     msg: dict[str, Any],
@@ -158,6 +169,10 @@ async def _write_json(
 ) -> bool:
     """Write one wire message before ``deadline`` or kill its process group."""
     if proc.stdin is None or proc.stdin.is_closing():
+        return False
+    frame = _encode_json_frame(msg)
+    if frame is None:
+        await _kill_worker(proc)
         return False
     loop = asyncio.get_running_loop()
     write_deadline = deadline
@@ -168,7 +183,7 @@ async def _write_json(
         await _kill_worker(proc)
         return False
     try:
-        proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        proc.stdin.write(frame)
         await asyncio.wait_for(proc.stdin.drain(), remaining)
         return True
     except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
@@ -669,8 +684,7 @@ class _Runtime:
             max_concurrent=compile_gate_max_concurrent,
             timeout_s=compile_gate_acquire_timeout_s,
         )
-        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        self._writer_task: asyncio.Task[None] | None = None
+        self._event_append_lock = asyncio.Lock()
         self._handles: dict[str, WorkerHandle] = {}
         self._results: dict[str, TaskResult] = {}
         self._gates: dict[str, dict[str, int]] = {}
@@ -721,10 +735,13 @@ class _Runtime:
             record = self._redactor.redact_mapping(record)
             kind = record["kind"]
         durable_record = self._copy_event(record)
-        if kind in CRITICAL_KINDS:
-            await asyncio.to_thread(self._store.append, durable_record)
-        else:
-            self._queue.put_nowait(durable_record)
+        try:
+            async with self._event_append_lock:
+                await asyncio.to_thread(self._store.append, durable_record)
+        except Exception as exc:
+            if kind in CRITICAL_KINDS:
+                raise
+            print(f"cambium: event store error: {exc}", file=sys.stderr)
         if self._on_event is None:
             return
         observer_failure_is_fatal = (
@@ -771,18 +788,8 @@ class _Runtime:
         for record, observer_failure_is_fatal in deferred:
             await self._notify_observer(record, observer_failure_is_fatal)
 
-    async def _writer_loop(self) -> None:
-        while True:
-            record = await self._queue.get()
-            if record is None:
-                return
-            try:
-                await asyncio.to_thread(self._store.append, record)
-            except Exception as exc:  # pragma: no cover - storage must not kill the session
-                print(f"cambium: event store error: {exc}", file=sys.stderr)
-
     async def start(self) -> None:
-        self._writer_task = asyncio.create_task(self._writer_loop())
+        return
 
     async def shutdown(self, session_status: str = "ended") -> None:
         """Steps 2-8 of the custos shutdown sequence (design §4)."""
@@ -821,12 +828,6 @@ class _Runtime:
             )
         except BaseException:
             pass
-        if self._writer_task is not None:
-            self._queue.put_nowait(None)
-            try:
-                await asyncio.wait_for(self._writer_task, 10.0)
-            except BaseException:
-                pass
         await asyncio.to_thread(self._store.close)
 
     def plan_result(self) -> PlanResult:
@@ -1291,6 +1292,35 @@ class _Runtime:
         cmd = self._worker_command(spec)
         env = self._worker_env(spec, generation)
 
+        async def _report_outbound_message_too_long() -> None:
+            await self.emit(
+                "protocol", task_id=task_id, generation=generation,
+                error_type="OUTBOUND_MESSAGE_TOO_LONG",
+                note="outbound message exceeds MAX_LINE_BYTES",
+            )
+
+        init_rid = self._next_rid()
+        init_msg = {
+            "type": "init", "request_id": init_rid, "task_id": task_id,
+            "proto": PROTO, "generation": generation,
+            "worktree": str(worktree), "base_commit": spec["base_commit"],
+            "spec": spec.get("task", ""),
+            "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
+            "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
+            "heartbeat": {"interval_s": heartbeat_interval, "timeout_s": heartbeat_timeout},
+            "budget": {"max_wall_s": wall_budget, "max_restarts": DEFAULT_MAX_RESTARTS},
+            "permissions": {"shell": True, "network": False},
+            "provider_env_keys": list(spec.get("provider_env_keys", ())),
+        }
+        if spec.get("fanout_config"):
+            init_msg["fanout_config"] = spec["fanout_config"]
+            init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
+        if _encode_json_frame(init_msg) is None:
+            await _report_outbound_message_too_long()
+            return _GenOutcome(
+                clean=False, fatal=True, reason=OUTBOUND_MESSAGE_TOO_LONG,
+            )
+
         await self.emit("spawned", task_id=task_id, generation=generation, worker=" ".join(cmd))
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1310,7 +1340,9 @@ class _Runtime:
         handle.proc = proc
         handle.state = "SPAWNING"
 
-        messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+            maxsize=WORKER_STDOUT_QUEUE_MAXSIZE
+        )
         parse_errors = 0
         message_too_long = False
 
@@ -1344,7 +1376,9 @@ class _Runtime:
                 )
                 await _kill_worker(proc)
             finally:
-                await messages.put(None)
+                current = asyncio.current_task()
+                if current is None or not current.cancelling():
+                    await messages.put(None)
 
         async def _read_stderr() -> None:
             async for raw in proc.stderr:
@@ -1362,22 +1396,6 @@ class _Runtime:
         loop = asyncio.get_running_loop()
         wall_deadline = loop.time() + wall_budget
 
-        init_rid = self._next_rid()
-        init_msg = {
-            "type": "init", "request_id": init_rid, "task_id": task_id,
-            "proto": PROTO, "generation": generation,
-            "worktree": str(worktree), "base_commit": spec["base_commit"],
-            "spec": spec.get("task", ""),
-            "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
-            "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
-            "heartbeat": {"interval_s": heartbeat_interval, "timeout_s": heartbeat_timeout},
-            "budget": {"max_wall_s": wall_budget, "max_restarts": DEFAULT_MAX_RESTARTS},
-            "permissions": {"shell": True, "network": False},
-            "provider_env_keys": list(spec.get("provider_env_keys", ())),
-        }
-        if spec.get("fanout_config"):
-            init_msg["fanout_config"] = spec["fanout_config"]
-            init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
         await self.emit("init", task_id=task_id, request_id=init_rid, generation=generation)
         init_written = await _write_json(
             proc,
@@ -1397,16 +1415,18 @@ class _Runtime:
         timeout_phase: str | None = "stdin" if not init_written else None
 
         async def _cancel_and_kill() -> None:
+            cancel_msg = {
+                "type": "cancel",
+                "request_id": self._next_rid(),
+                "reason": timeout_phase or "timeout",
+            }
             try:
-                await _write_json(
-                    proc,
-                    {
-                        "type": "cancel",
-                        "request_id": self._next_rid(),
-                        "reason": timeout_phase or "timeout",
-                    },
-                    deadline=_stdin_deadline(wall_deadline),
-                )
+                if _encode_json_frame(cancel_msg) is None:
+                    await _report_outbound_message_too_long()
+                else:
+                    await _write_json(
+                        proc, cancel_msg, deadline=_stdin_deadline(wall_deadline)
+                    )
             except Exception:
                 pass
             await _kill_worker(proc)
@@ -1418,13 +1438,20 @@ class _Runtime:
                 return False
             pong_rid = self._next_rid()
             pong_deadline = min(wall_deadline, loop.time() + PONG_DEADLINE_S)
+            ping_msg = {
+                "type": "ping", "request_id": pong_rid, "task_id": task_id,
+                "generation": generation,
+            }
             await self.emit(
                 "ping", task_id=task_id, generation=generation, request_id=pong_rid
             )
+            if _encode_json_frame(ping_msg) is None:
+                protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
+                await _report_outbound_message_too_long()
+                await _kill_worker(proc)
+                return False
             if not await _write_json(
-                proc,
-                {"type": "ping", "request_id": pong_rid, "task_id": task_id,
-                 "generation": generation},
+                proc, ping_msg,
                 deadline=pong_deadline,
             ):
                 timeout_phase = "pong"
@@ -1562,10 +1589,17 @@ class _Runtime:
                     )
                     run_rid = self._next_rid()
                     payload = self._run_payload(spec, run_rid, wall_budget, generation)
+                    run_msg = {
+                        "type": "run_task", "request_id": run_rid,
+                        "task_id": task_id, **payload,
+                    }
+                    if _encode_json_frame(run_msg) is None:
+                        protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
+                        await _report_outbound_message_too_long()
+                        await _kill_worker(proc)
+                        break
                     if not await _write_json(
-                        proc,
-                        {"type": "run_task", "request_id": run_rid,
-                         "task_id": task_id, **payload},
+                        proc, run_msg,
                         deadline=_stdin_deadline(wall_deadline),
                     ):
                         timeout_phase = "stdin"
