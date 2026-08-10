@@ -567,6 +567,232 @@ def test_bench_stderr_never_leaks_multiline_provider_credential_raw_or_escaped(
         assert repr(secret)[1:-1] not in captured
 
 
+def test_bench_stderr_never_leaks_unicode_escaped_provider_credential(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A credential emitted as literal ``\\uXXXX`` escapes must not leak.
+
+    A module may serialize a credential inside a JSON error object using
+    ``\\uXXXX`` escapes for a newline, quote, or backslash, in either hex case.
+    The harness decodes the wire output and redacts the decoded value, so no
+    valid JSON encoding can carry the credential past the error boundary.
+    """
+    import cambium.bench as bench
+
+    secret = "opaque\nquote\"slash\\end"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    for exit_code in (0, 1):
+        modules_dir = _write_fixture_module(
+            tmp_path / f"mod-{exit_code}",
+            manifest={
+                "contract_version": 1,
+                "module_name": "fixture_module",
+                "cli_module": "cambium.modules.fixture",
+                "protocol": "json-v1",
+                "dataset_schema_version": 1,
+            },
+        )
+        # Double backslashes make the module print the literal six-character
+        # ``\\uXXXX`` sequences (mixed hex case), which is still valid JSON.
+        (modules_dir / "fixture" / "__main__.py").write_text(
+            textwrap.dedent(
+                r"""
+                import json
+                import sys
+
+                print('{"error": {"message": "opaque\\u000aquote\\u0022slash\\u005Cend"}}')
+                raise SystemExit(__EXIT__)
+                """
+            ).replace("__EXIT__", repr(exit_code))
+        )
+        monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+        bench_root = tmp_path / f"baselines-{exit_code}"
+
+        assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+        captured = capsys.readouterr().err
+        assert "ERROR ModuleCLIError" in captured
+        for escaped in ("\\u000a", "\\u000A", "\\u0022", "\\u005c", "\\u005C"):
+            assert escaped not in captured
+        assert secret not in captured
+
+
+def test_bench_stderr_never_leaks_escaped_secret_in_free_form_text(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Escape-aware matching covers free-form stderr, not only JSON stdout."""
+    import cambium.bench as bench
+
+    secret = 'sk-proj-A"B\\C'
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    (modules_dir / "fixture" / "__main__.py").write_text(
+        textwrap.dedent(
+            r"""
+            import sys
+
+            print('the wire shows "sk-proj-A\\u0022B\\u005cC" here', file=sys.stderr)
+            raise SystemExit(1)
+            """
+        )
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    captured = capsys.readouterr().err
+    assert "ERROR ModuleCLIError" in captured
+    assert "\\u0022" not in captured
+    assert "\\u005c" not in captured
+    assert secret not in captured
+
+
+def test_module_redactor_snapshots_credentials_before_child_start(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Credential values are snapshotted before the module subprocess spawns.
+
+    If the parent environment is mutated while the child runs, the values in
+    effect at spawn must still be registered; otherwise an echoed credential
+    would survive into the bench diagnostic.
+    """
+    import cambium.bench as bench
+    import cambium.modules.base as base
+
+    secret = "opaque-race-credential-77"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    (modules_dir / "fixture" / "__main__.py").write_text(
+        textwrap.dedent(
+            f"""
+            import sys
+
+            print("echo:", {secret!r}, file=sys.stderr)
+            raise SystemExit(1)
+            """
+        )
+    )
+
+    real_run = subprocess.run
+
+    def mutate_after_child(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        os.environ.pop("CAMBIUM_PROVIDER_TEST_API_KEY", None)
+        return result
+
+    monkeypatch.setattr(base.subprocess, "run", mutate_after_child)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    captured = capsys.readouterr().err
+    assert "ERROR ModuleCLIError" in captured
+    assert secret not in captured
+
+
+def test_bench_prose_credential_preserves_equal_benign_diagnostic(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A prose-like credential must not over-redact a benign diagnostic.
+
+    A value such as "ordinary benign message" is only redacted when a whole
+    string equals it; a larger diagnostic that merely contains the same text
+    is preserved.
+    """
+    import cambium.bench as bench
+
+    secret = "ordinary benign message"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    (modules_dir / "fixture" / "__main__.py").write_text(
+        textwrap.dedent(
+            """
+            import sys
+
+            print("check produced: ordinary benign message", file=sys.stderr)
+            raise SystemExit(1)
+            """
+        )
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    captured = capsys.readouterr().err
+    assert "ERROR ModuleCLIError" in captured
+    assert "check produced: ordinary benign message" in captured
+
+
+def test_bench_prose_credential_whole_value_is_still_redacted(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A prose-like credential is still redacted when a whole value equals it."""
+    import cambium.bench as bench
+
+    secret = "ordinary benign message"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    (modules_dir / "fixture" / "__main__.py").write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+
+            print(json.dumps({"error": {"message": "ordinary benign message"}}))
+            raise SystemExit(1)
+            """
+        )
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    captured = capsys.readouterr().err
+    assert "ERROR ModuleCLIError" in captured
+    assert secret not in captured
+    assert "***" in captured
+
+
 def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 

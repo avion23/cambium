@@ -97,47 +97,47 @@ def _module_env(source_root: str | Path | None) -> dict[str, str]:
     return env
 
 
-def _escaped_secret_forms(value: str) -> tuple[str, ...]:
-    """Return the exact-string forms *value* can take inside module output.
+def _is_secret_shaped(value: str) -> bool:
+    """Return whether *value* is a compact machine token.
 
-    A module crosses the boundary as one JSON object on stdout and its
-    diagnostics embedded as text.  Both JSON serialization and Python ``repr``
-    rewrite control characters (newline, tab, quote, backslash, non-ASCII)
-    before redaction sees the output, so an exact registered value must be
-    expanded to the escaped forms it can appear in.  ``json.dumps`` covers the
-    JSON wire text on stdout (with both ASCII and non-ASCII encodings) and
-    ``repr`` covers ``str()`` of a deserialized error object.
+    Prose-like values contain a space (natural-language phrases such as a
+    benign status string); they are only redacted as a whole string so equal
+    benign diagnostics are preserved.  Everything else is treated as a compact
+    token and redacted wherever it appears, including control characters,
+    quotes, and backslashes that JSON serialization rewrites.
     """
-    forms = {value}
-    for render in (
-        lambda text: json.dumps(text, ensure_ascii=False),
-        lambda text: json.dumps(text, ensure_ascii=True),
-        repr,
-    ):
-        try:
-            rendered = render(value)
-        except (TypeError, ValueError, UnicodeError):
-            continue
-        if len(rendered) >= 2 and rendered[0] == rendered[-1]:
-            forms.add(rendered[1:-1])
-    return tuple(forms)
+    if " " in value:
+        return False
+    if len(value) >= 16:
+        return True
+    return any(
+        character.isdigit()
+        or character.isupper()
+        or character in "-_./+=:"
+        for character in value
+    )
 
 
 def _module_redactor() -> Redactor:
     """Return a redactor registered with credential values in the parent env.
 
     Defense in depth for diagnostics: even if a module echoes a credential it
-    obtained from outside the harness, its exact value is redacted before the
-    output is embedded in an exception message.  Every registered value is
-    expanded to the escaped forms JSON serialization or ``repr`` can rewrite
-    it into, so a credential containing newlines, quotes, backslashes, or
-    other control characters cannot leak through the module error boundary.
+    obtained from outside the harness, its value is redacted before the output
+    is embedded in an exception message.  Secret-shaped values are registered
+    for substring redaction; prose-like values are registered as whole strings
+    so equal benign text is not destroyed.  Callers must build this before
+    spawning the module subprocess so a concurrent environment mutation cannot
+    change the registered values mid-run.
     """
     secret_values: set[str] = set()
+    whole_values: set[str] = set()
     for name, value in os.environ.items():
         if value and (is_provider_env_name(name) or is_secret_name(name)):
-            secret_values.update(form for form in _escaped_secret_forms(value) if form)
-    return Redactor(secret_values=secret_values)
+            if _is_secret_shaped(value):
+                secret_values.add(value)
+            else:
+                whole_values.add(value)
+    return Redactor(secret_values=secret_values, whole_values=whole_values)
 
 
 class ModuleBoundaryError(ValueError):
@@ -260,9 +260,36 @@ def load_module_manifest(
     )
 
 
+def _redact_structured(value: object, redactor: Redactor) -> str:
+    """Re-serialize a decoded JSON value with credential values redacted.
+
+    Redaction runs on the decoded values, so the re-serialized text cannot
+    carry a credential in any JSON escape encoding: short escapes, ``\\uXXXX``
+    with either hex case, or a per-character mix are all rewritten before
+    matching.  ``json.dumps`` chooses the wire escapes, not the module.
+    """
+    redacted = redactor.redact_mapping(value)
+    return json.dumps(redacted, ensure_ascii=False)
+
+
+def _redact_wire_output(text: str, redactor: Redactor) -> str:
+    """Redact credential values from raw module wire output.
+
+    Valid JSON is decoded to the object level and re-serialized after
+    structured redaction; free-form text is redacted with escape-aware
+    matching.  In both cases the decoded value is matched, never the
+    escape-encoded wire form.
+    """
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        return redactor.redact_escaped(text)
+    return _redact_structured(decoded, redactor)
+
+
 def _cli_detail(stdout: str, stderr: str, redactor: Redactor) -> str:
     detail = stderr.strip() or stdout.strip() or "no diagnostic output"
-    detail = redactor.redact(detail)
+    detail = _redact_wire_output(detail, redactor)
     return detail if len(detail) <= 500 else f"{detail[:497]}..."
 
 
@@ -310,6 +337,9 @@ def run_module_cli(
         raise ModuleCLIError(f"module {cli_module!r}: request is not JSON: {exc}") from exc
 
     env = _module_env(source_root)
+    # Snapshot the parent credential values BEFORE spawning: the child must
+    # not run while the registered values can still change under it.
+    redactor = _module_redactor()
 
     try:
         result = subprocess.run(
@@ -329,7 +359,6 @@ def run_module_cli(
     except (OSError, subprocess.SubprocessError) as exc:
         raise ModuleCLIError(f"module {cli_module!r}: CLI could not run: {exc}") from exc
 
-    redactor = _module_redactor()
     if result.returncode != 0:
         try:
             output = json.loads(result.stdout)
@@ -365,7 +394,7 @@ def run_module_cli(
             )
         raise ModuleCLIError(
             f"module {cli_module!r}: CLI returned an error object: "
-            f"{redactor.redact(str(output['error']))}"
+            f"{_redact_structured(output, redactor)}"
         )
     return output
 
