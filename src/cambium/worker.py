@@ -54,6 +54,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -153,27 +154,35 @@ def _write_worktree_state(
     path.write_text(content)
 
 
-def _rollback_owned_state(worktree: Path, generation: int, rollback_base: str) -> bool:
+def _rollback_owned_state(
+    worktree: Path,
+    generation: int,
+    rollback_base: str,
+    worker_identity: str,
+) -> bool:
     """Discard only this stale generation's state without moving newer work."""
     if validate_worker_generation(worktree, generation):
         return False
     rc, current_head, _err = git("rev-parse", "HEAD", cwd=worktree)
+    if rc != 0 or current_head == rollback_base:
+        return False
+    rc, parent, _err = git("rev-parse", f"{current_head}^", cwd=worktree)
+    if rc != 0 or parent != rollback_base:
+        return False
+    rc, message, _err = git("show", "-s", "--format=%B", current_head, cwd=worktree)
+    ownership_markers = {
+        f"Cambium-Worker-Generation: {generation}",
+        f"Cambium-Worker-Identity: {worker_identity}",
+    }
+    if rc != 0 or not ownership_markers.issubset(message.splitlines()):
+        return False
+    if validate_worker_generation(worktree, generation):
+        return False
+    rc, _out, _err = git(
+        "update-ref", "HEAD", rollback_base, current_head, cwd=worktree
+    )
     if rc != 0:
         return False
-    if current_head != rollback_base:
-        rc, commit_count, _err = git(
-            "rev-list", "--first-parent", "--count", f"{rollback_base}..{current_head}",
-            cwd=worktree,
-        )
-        if rc != 0 or commit_count != "1":
-            return False
-        if validate_worker_generation(worktree, generation):
-            return False
-        rc, _out, _err = git(
-            "update-ref", "HEAD", rollback_base, current_head, cwd=worktree
-        )
-        if rc != 0:
-            return False
     if validate_worker_generation(worktree, generation):
         return False
     rc, _out, _err = git("reset", "--hard", "HEAD", cwd=worktree)
@@ -217,6 +226,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         "summary": "",
     }
     rollback_base: str | None = None
+    worker_identity: str | None = None
     try:
         scratch = Path(run["scratch_repo"]).resolve()
         worktree = Path(run["worktree_path"]).resolve()
@@ -262,6 +272,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         if rc != 0:
             outcome["failure_reason"] = f"cannot resolve worktree HEAD: {err}"
             return outcome
+        worker_identity = secrets.token_hex(16)
 
         # Optional work_delay_s pauses before the edit (testing hook); the
         # pause polls ``stop`` so cancellation stays responsive.
@@ -300,7 +311,13 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
 
         guarded_git("add", target_file, cwd=worktree)
         rc, _out, err = guarded_git(
-            "commit", "-m", f"cambium-ipc: {run['task_id']}", cwd=worktree
+            "commit",
+            "-m",
+            f"cambium-ipc: {run['task_id']}",
+            "-m",
+            f"Cambium-Worker-Generation: {generation}\n"
+            f"Cambium-Worker-Identity: {worker_identity}",
+            cwd=worktree,
         )
         if rc != 0:
             outcome["failure_reason"] = f"commit failed: {err}"
@@ -322,7 +339,10 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
     except GenerationFenceError as exc:
         rolled_back = (
             rollback_base is not None
-            and _rollback_owned_state(worktree, generation, rollback_base)
+            and worker_identity is not None
+            and _rollback_owned_state(
+                worktree, generation, rollback_base, worker_identity
+            )
         )
         outcome["failure_reason"] = str(exc)
         if rollback_base is not None and not rolled_back:

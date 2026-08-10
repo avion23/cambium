@@ -234,11 +234,18 @@ async def _communicate_gate_bounded(
         asyncio.create_task(drain("stdout", proc.stdout)),
         asyncio.create_task(drain("stderr", proc.stderr)),
     ]
+
+    async def wait_for_readers() -> None:
+        await asyncio.gather(*readers)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    readers_done = asyncio.create_task(wait_for_readers())
     process_done = asyncio.create_task(proc.wait())
     output_full = asyncio.create_task(overflow.wait())
     try:
         done, _pending = await asyncio.wait(
-            {process_done, output_full}, timeout=timeout,
+            {readers_done, output_full}, timeout=max(0.0, deadline - loop.time()),
             return_when=asyncio.FIRST_COMPLETED,
         )
         if not done:
@@ -247,20 +254,27 @@ async def _communicate_gate_bounded(
             raise TimeoutError
         if output_full in done and overflow.is_set():
             await _kill_process_group_and_reap(proc)
-        await asyncio.gather(*readers, return_exceptions=True)
-        if overflow.is_set():
+            await asyncio.gather(*readers, return_exceptions=True)
             raise _GateOutputOverflow(bytes(captured["stdout"]), bytes(captured["stderr"]))
-        await process_done
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            await _kill_process_group_and_reap(proc)
+            raise TimeoutError
+        try:
+            await asyncio.wait_for(process_done, remaining)
+        except TimeoutError:
+            await _kill_process_group_and_reap(proc)
+            raise
         return bytes(captured["stdout"]), bytes(captured["stderr"])
     except asyncio.CancelledError:
         await _kill_process_group_and_reap(proc)
         await asyncio.gather(*readers, return_exceptions=True)
         raise
     finally:
-        for task in (*readers, process_done, output_full):
+        for task in (*readers, readers_done, process_done, output_full):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(process_done, output_full, return_exceptions=True)
+        await asyncio.gather(readers_done, process_done, output_full, return_exceptions=True)
 
 
 async def _next_message(

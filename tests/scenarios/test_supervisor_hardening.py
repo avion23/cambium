@@ -274,6 +274,43 @@ def test_gate_output_overflow_is_bounded_and_kills_process_group(tmp_path: Path)
     assert any(event["payload"].get("output_overflow") for event in gate_events)
 
 
+def test_gate_overflow_after_leader_exit_is_bounded_and_kills_process_group(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    pid_file = tmp_path / "background-noisy-gate.pid"
+    program = (
+        "import os,sys; "
+        f"open({str(pid_file)!r},'w').write(str(os.getpid())); "
+        "chunk='x'*4096; "
+        "exec(\"while True:\\n sys.stdout.write(chunk)\\n sys.stdout.flush()\")"
+    )
+    gate = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)} &"
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-gate-background-overflow",
+        worker=FAKE_WORKER,
+        gate=gate,
+        gate_timeout_s=2.0,
+        max_wall_s=5.0,
+    )
+
+    started = time.monotonic()
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    assert time.monotonic() - started < 1.5
+    assert result.results[0].status == "failed"
+    assert result.results[0].reason == "gate_failed"
+    assert result.results[0].gate_exit_code == 125
+    _wait_pid_gone(int(pid_file.read_text(encoding="ascii")))
+    gate_events = _kinds(read_events(session_dir), "gate")
+    assert any(event["payload"].get("output_overflow") for event in gate_events)
+
+
 def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
