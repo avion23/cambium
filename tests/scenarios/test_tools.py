@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from cambium import tools
@@ -207,6 +208,93 @@ def test_get_signature_reports_missing_symbol(tmp_path: Path) -> None:
     )
     assert not missing.ok
     assert "symbol not found" in (missing.error or "")
+
+
+def test_get_signature_does_not_follow_replaced_validated_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sample = tmp_path / "sample.py"
+    outside = tmp_path.parent / "outside.py"
+    sample.write_text("def build():\n    return 'inside'\n", encoding="utf-8")
+    outside.write_text("def build():\n    return 'outside'\n", encoding="utf-8")
+    original_confined_path = tools._confined_path
+
+    def replace_after_validation(ctx: ToolContext, raw_path: str) -> Path:
+        path = original_confined_path(ctx, raw_path)
+        path.unlink()
+        path.symlink_to(outside)
+        return path
+
+    monkeypatch.setattr(tools, "_confined_path", replace_after_validation)
+    result = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert "could not read sample.py" in (result.error or "")
+
+
+def test_get_signature_rejects_oversized_source(tmp_path: Path) -> None:
+    (tmp_path / "large.py").write_bytes(b"x" * (MAX_READ_BYTES + 1))
+
+    result = _run(
+        "get_signature",
+        {"path": "large.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert "MAX_READ_BYTES" in (result.error or "")
+
+
+def test_get_signature_read_and_parse_do_not_block_dispatcher(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
+    original_extract_signature = tools.ast_tools.extract_signature
+
+    def slow_extract_signature(source: str, symbol: str):
+        time.sleep(0.1)
+        return original_extract_signature(source, symbol)
+
+    monkeypatch.setattr(tools.ast_tools, "extract_signature", slow_extract_signature)
+
+    async def invoke():
+        task = asyncio.create_task(
+            run_tool(
+                "get_signature",
+                {"path": "sample.py", "symbol": "build"},
+                ToolContext(tmp_path),
+            )
+        )
+        await asyncio.sleep(0.01)
+        yielded_before_completion = not task.done()
+        result = await task
+        return result, yielded_before_completion
+
+    result, yielded_before_completion = asyncio.run(invoke())
+
+    assert yielded_before_completion
+    assert result.ok
+
+
+def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
+    arguments = ", ".join(f"value_{index}" for index in range(7_000))
+    source = f"def build({arguments}):\n    pass\n"
+    assert len(source.encode("utf-8")) <= MAX_READ_BYTES
+    (tmp_path / "large_signature.py").write_text(source, encoding="utf-8")
+
+    result = _run(
+        "get_signature",
+        {"path": "large_signature.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    assert "[output truncated]" in result.output
+    assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
 
 
 def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:

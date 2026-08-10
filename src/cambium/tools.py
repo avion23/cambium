@@ -102,6 +102,33 @@ def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
     return candidate
 
 
+def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
+    """Open a resolved worktree path without following a replacement symlink."""
+    root = Path(ctx.cwd).resolve()
+    try:
+        components = path.relative_to(root).parts
+    except ValueError as exc:
+        raise _ToolFailure(f"path escapes worktree: {path!r}") from exc
+    if not components:
+        raise IsADirectoryError(path)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_flags = os.O_RDONLY | nofollow | directory | close_on_exec
+    file_flags = os.O_RDONLY | nofollow | close_on_exec
+
+    directory_fd = os.open(root, directory_flags)
+    try:
+        for component in components[:-1]:
+            next_directory_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_directory_fd
+        return os.open(components[-1], file_flags, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _display_path(ctx: ToolContext, path: Path) -> str:
     relative = path.relative_to(Path(ctx.cwd).resolve())
     return relative.as_posix() or "."
@@ -290,6 +317,37 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=True, output=result.stdout)
 
 
+def _read_and_extract_signature(
+    ctx: ToolContext, path: Path, display_path: str, symbol: str
+) -> dict[str, Any] | None:
+    descriptor: int | None = None
+    try:
+        descriptor = _open_confined_read_fd(ctx, path)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_READ_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise _ToolFailure(f"file not found: {display_path}") from exc
+    except IsADirectoryError as exc:
+        raise _ToolFailure(f"path is a directory: {display_path}") from exc
+    except OSError as exc:
+        raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if len(raw) > MAX_READ_BYTES:
+        raise _ToolFailure(
+            f"get_signature source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): "
+            f"{display_path}"
+        )
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ToolFailure(f"file is not valid UTF-8: {display_path}") from exc
+    return ast_tools.extract_signature(source, symbol)
+
+
 async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     raw_path = args["path"]
     if not raw_path.strip() or "\x00" in raw_path:
@@ -300,19 +358,25 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     if not symbol.isidentifier() or keyword.iskeyword(symbol):
         raise _ToolFailure("get_signature symbol must be a Python identifier")
 
-    source = _read_text(path)
+    display_path = _display_path(ctx, path)
     try:
-        signature = ast_tools.extract_signature(source, symbol)
+        signature = await asyncio.to_thread(
+            _read_and_extract_signature, ctx, path, display_path, symbol
+        )
     except SyntaxError as exc:
         location = f" at line {exc.lineno}" if exc.lineno is not None else ""
         raise _ToolFailure(
-            f"could not parse {_display_path(ctx, path)}{location}: {exc.msg}"
+            f"could not parse {display_path}{location}: {exc.msg}"
         ) from exc
     if signature is None:
-        raise _ToolFailure(f"symbol not found: {symbol!r} in {_display_path(ctx, path)}")
+        raise _ToolFailure(f"symbol not found: {symbol!r} in {display_path}")
 
-    result = {"path": _display_path(ctx, path), **signature}
-    return _Outcome(ok=True, output=json.dumps(result, ensure_ascii=False, sort_keys=True))
+    result = {"path": display_path, **signature}
+    output = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    return _Outcome(
+        ok=True,
+        output=_truncate_text(output, MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER),
+    )
 
 
 def _process_output(stdout: Any, stderr: Any) -> str:
