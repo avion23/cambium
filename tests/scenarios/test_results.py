@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from cambium.events import Event
 from cambium.results import (
     CHILD_RESULT_KEYS,
     EXIT_CODES,
@@ -211,7 +210,7 @@ def test_result_writer_uses_atomic_replace_and_leaves_no_temp(tmp_path: Path, mo
 def test_writer_rejects_taskresult_wire_and_event_wrappers(tmp_path: Path) -> None:
     task_result = TaskResult(task_id="task-1", status="succeeded", exit_code=0)
     wire = _wire()
-    event = Event(type="result")
+    event = {"type": "result", "timestamp": 0.0}
     for value in (task_result, wire, event):
         with pytest.raises(TypeError):
             result_to_dict(value)  # type: ignore[arg-type]
