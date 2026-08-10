@@ -194,13 +194,18 @@ async def run_session(
 ) -> SliceResult:
     """Run one worker end to end and return the slice outcome.
 
-    task_spec keys: task_id, worker (script path), scratch_repo,
+    task_spec keys: task_id, task, worker (script path), scratch_repo,
     worktree_path, branch, target_file, marker, write_marker, gate
-    (shell command run in the worker's worktree), spec (optional),
+    (shell command run in the worker's worktree), spec (optional), fanout_config
+    (provider mode; requires a non-empty task),
     ready_timeout_s / gate_timeout_s / wall_budget_s (optional; else env
     CAMBIUM_READY_TIMEOUT_S / CAMBIUM_GATE_TIMEOUT_S / CAMBIUM_WALL_BUDGET_S).
     """
     session_dir = Path(session_dir)
+    if task_spec.get("fanout_config"):
+        task = task_spec.get("task")
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("run_session provider mode requires a non-empty task")
     log = EventLog(session_dir / ".cambium" / "events.jsonl", on_event)
     task_id = task_spec["task_id"]
     worker_script = str(task_spec["worker"])
@@ -266,6 +271,8 @@ async def run_session(
         "worktree_path": str(worktree_path),
         "branch": task_spec["branch"],
     }
+    if task_spec.get("fanout_config"):
+        run_payload["task"] = task_spec["task"]
     if not task_spec.get("fanout_config"):
         run_payload.update(
             target_file=task_spec["target_file"],

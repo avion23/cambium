@@ -245,10 +245,12 @@ def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
     }
 
 
-def _provider_metadata(result: CallResult) -> dict[str, Any]:
+def _provider_metadata(result: CallResult, requested_model: str) -> dict[str, Any]:
     return {
         "provider": result.provider,
-        "model": result.model,
+        # The requested model is host-authored. Never copy the provider's
+        # response model into the result envelope or durable event payload.
+        "model": requested_model,
         "usage": _usage_counts(result.usage),
         "latency_s": max(0.0, float(result.latency_s)),
     }
@@ -262,8 +264,10 @@ def _provider_edit(run: dict[str, Any], config: dict[str, Any]) -> tuple[str, st
         # Provider errors may contain response text or request details. Only the
         # exception class is safe to carry into the result envelope.
         raise RuntimeError(f"provider completion failed: {exc.__class__.__name__}") from None
+    if result.model != model:
+        raise ValueError("provider response model mismatch")
     target_file, marker = _parse_provider_completion(result.content)
-    return target_file, marker, _provider_metadata(result)
+    return target_file, marker, _provider_metadata(result, model)
 
 
 def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:

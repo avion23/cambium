@@ -12,7 +12,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-from cambium.supervisor import read_events, run_plan
+import pytest
+
+from cambium.supervisor import read_events, run_plan, run_session
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = "cambium.worker"
@@ -168,23 +170,36 @@ def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[s
 
 
 def _run_case(
-    root: Path, server: _FakeOpenAIServer, config_path: Path, completion: str
+    root: Path,
+    server: _FakeOpenAIServer,
+    config_path: Path,
+    completion: str,
+    *,
+    response_model: str | None = None,
+    max_restarts: int | None = None,
 ) -> tuple[Any, list[dict[str, Any]], str]:
+    original_model = SCRIPTED_COMPLETION["model"]
     SCRIPTED_COMPLETION["choices"][0]["message"]["content"] = completion
-    session_dir = root / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo)
-    result = asyncio.run(
-        run_plan(session_dir, {"tasks": [_task(session_dir, repo, base, config_path)]})
-    )
-    events = read_events(session_dir)
-    merged = subprocess.run(
-        ["git", "-C", str(repo), "show", "refs/heads/main:target.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return result, events, merged
+    if response_model is not None:
+        SCRIPTED_COMPLETION["model"] = response_model
+    try:
+        session_dir = root / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        if max_restarts is not None:
+            task["max_restarts"] = max_restarts
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
+        merged = subprocess.run(
+            ["git", "-C", str(repo), "show", "refs/heads/main:target.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        return result, events, merged
+    finally:
+        SCRIPTED_COMPLETION["model"] = original_model
 
 
 def test_worker_provider_completion_drives_one_gated_merge_and_canary(
@@ -242,6 +257,7 @@ def test_worker_provider_completion_drives_one_gated_merge_and_canary(
         with REQUEST_LOCK:
             assert len(REQUESTS) == 2
             assert len(REQUEST_AUTHORIZATION) == 2
+            assert REQUESTS[0] == REQUESTS[1]
             assert all(value == f"Bearer {PROVIDER_SECRET}" for value in REQUEST_AUTHORIZATION)
             assert all(request["model"] == "loopback-model" for request in REQUESTS)
             assert all(request["messages"][0]["content"] == STATIC_PREFIX for request in REQUESTS)
@@ -251,3 +267,92 @@ def test_worker_provider_completion_drives_one_gated_merge_and_canary(
         assert "reasoning" not in event_text.lower()
     finally:
         server.close()
+
+
+def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch) -> None:
+    with REQUEST_LOCK:
+        REQUESTS.clear()
+        REQUEST_AUTHORIZATION.clear()
+    server = _FakeOpenAIServer()
+    sentinel = "provider-key prompt reasoning sentinel"
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
+        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+        monkeypatch.setenv(
+            "PYTHONPATH",
+            os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
+        )
+
+        result, events, _merged = _run_case(
+            tmp_path / "untrusted-model",
+            server,
+            config_path,
+            "append marker line to file target.txt: // provider-alpha",
+            response_model=sentinel,
+            max_restarts=0,
+        )
+
+        assert result.exit_code != 0
+        assert result.results[0].status == "failed"
+        result_events = [event for event in events if event["kind"] == "result"]
+        assert len(result_events) == 1
+        assert "provider_metadata" not in result_events[0]["payload"]
+        assert sentinel not in json.dumps(events)
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 1
+    finally:
+        server.close()
+
+
+def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -> None:
+    with REQUEST_LOCK:
+        REQUESTS.clear()
+        REQUEST_AUTHORIZATION.clear()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
+        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+        monkeypatch.setenv(
+            "PYTHONPATH",
+            os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
+        )
+
+        session_dir = tmp_path / "slice-provider"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        spec = _task(session_dir, repo, base, config_path)
+        spec["scratch_repo"] = str(repo)
+        spec["worker"] = str(ROOT / "src" / "cambium" / "worker.py")
+        result = asyncio.run(run_session(session_dir, spec))
+
+        assert result.status == "succeeded"
+        assert result.exit_code == 0
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 1
+            assert REQUESTS[0]["model"] == "loopback-model"
+            assert REQUESTS[0]["messages"][1]["content"] == (
+                f"task={spec['task']}\nReturn one decision now."
+            )
+    finally:
+        server.close()
+
+
+def test_run_session_provider_mode_missing_task_fails_before_spawn(tmp_path) -> None:
+    session_dir = tmp_path / "missing-task"
+    with pytest.raises(ValueError, match="provider mode requires a non-empty task"):
+        asyncio.run(
+            run_session(
+                session_dir,
+                {
+                    "task_id": "missing-task",
+                    "fanout_config": {"tier": "fast", "model": "loopback-model"},
+                },
+            )
+        )
+    assert not (session_dir / ".cambium" / "events.jsonl").exists()

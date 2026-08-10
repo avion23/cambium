@@ -185,6 +185,14 @@ Each step is one commit on `main`. Steps 1–3 mutate `supervisor.py` serially (
      - `merge_sha = task.merge_sha`
      - `timed_out`/`timeout_phase` via substring on `task.reason`: the runtime always fails timeout crashes through the restart-cap branch, so the reason is prefixed (`"max_restarts (0): ready"`). Map `timed_out = any(p in (task.reason or "") for p in ("ready", "wall", "heartbeat"))`; `timeout_phase` = the matching phase, else `None`. A **gate** timeout surfaces as reason `"gate_failed"` in canonical semantics (the runtime emits `gate ... timed_out=True` but records `gate_failed`), so gate is not a timeout phase in the adapter.
      - Preserved reason vocabulary from `_GenOutcome` (`wt-impl-super:1366-1377`): `worker_exit_N`, `missing_exit_message`, `missing_result_envelope`, `result_request_id_mismatch`, plus `gate_failed`/`merge_failed`/`max_restarts (N): …`.
+- **Provider fan-out porting note:** the legacy slice currently has a temporary
+  `run_session` bridge for `fanout_config`. Until this step lands, that bridge
+  must carry the non-empty `task`, `fanout_config`, and `provider_env_keys` into
+  the one-task plan/run payload. The canonical `_Runtime` path already carries
+  `task` in `_run_payload` and the provider configuration in `init`; retain the
+  provider response-model validation at the worker/provider boundary when the
+  slice body is removed. Do not copy the slice's `EventLog` or `git merge
+  --ff-only` behavior into the M1 `run_plan` path.
 - Delete from `supervisor.py`: `EventLog` (row 9), `_merge_branch` (19), module-level `_run_gate` (34), `_next_message` (24a), `_validate_paths` (32), slice run-loop bodies, slice `_default_spec` (6), `_bootstrap_scratch` (7 → fold into `_ensure_repo_initialized`). Keep `SliceResult` (35), `_cfg_float` (31), `_write_json`/`_kill_worker` (24b/33), `_strip_sensitive_env` (37).
 - CLI (`main`, `wt-impl-super:1652-1690`): the `--session-dir`/`--task-spec` single-task mode now builds a 1-task plan (default worker `"cambium.worker"`) and calls the plan path; the `--plan` mode is unchanged.
 - Migrate `test_vertical_slice.py` (8 scenarios, same names/guarantees, canonical assertions):
