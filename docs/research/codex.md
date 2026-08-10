@@ -1,133 +1,103 @@
 # Competitive Analysis: OpenAI Codex CLI
 
-Research date: 2026-08-09. Purpose: inform the Cambium harness design (see `docs/architecture/system-design.md`).
-
----
+**Research date:** 2026-08-09. **Purpose:** Cambium harness design input (`docs/architecture/system-design.md`). This snapshot records the installed Codex 0.146.1 and the upstream sources inspected; it is not runtime authority.
 
 ## What it is / stack
 
-OpenAI Codex is OpenAI's coding agent. "Codex CLI is a coding agent from OpenAI that runs locally on your computer" (source: local npm package README at `~/.local/npm-global/lib/node_modules/@openai/codex/README.md`; also github.com/openai/codex).
+OpenAI describes Codex CLI as a coding agent that runs locally. The open-source monorepo is a Rust/Bazel workspace (`codex-rs`, roughly 100 crates: CLI/TUI, sandboxing, providers, state, MCP, skills, hooks, telemetry). GitHub’s languages API reported Rust 46,874,883 bytes versus roughly 2 MB Python/TypeScript. Distribution is a native platform binary via curl, GitHub Releases, Homebrew, or npm `@openai/codex`; the npm `bin/codex.js` launches the platform binary.
 
-Stack (from the open-source monorepo, github.com/openai/codex):
+- **Surfaces:** interactive TUI; `codex exec`, `review`, `resume`, `fork`, `archive`; MCP client/server; sandbox; plugins/skills; experimental app-server/TypeScript SDK; desktop and IDE integrations. Sources: `codex --help`, https://github.com/openai/codex, https://developers.openai.com/codex/cli
+- **Backend:** Responses API (`wire_api = "responses"`) with websocket streaming where supported; ChatGPT device-code OAuth is first-class and API keys are secondary. `model_providers` supports base URL, environment-key, headers, retry/timeouts, but only the Responses wire protocol; built-ins include OpenAI, Ollama, and LM Studio. Sources: local `codex doctor`; https://developers.openai.com/codex/config-file/config-reference
+- **Loop/state:** shell, file-edit, web, subagent, and MCP tools; spawned commands run inside a sandbox; approvals pause execution. Append-only `history.jsonl` plus SQLite state (`state_N.sqlite`, `_sqlx_migrations`) persist sessions.
+- **Safety:** Linux/WSL2 user namespaces, macOS Seatbelt, and Windows sandbox; sandbox wraps spawned commands. `approval_policy` supports `untrusted`, `on-request`, `never` (and granular rules); `approvals_reviewer = auto_review` can delegate review. Source: https://developers.openai.com/codex/sandboxing ; https://developers.openai.com/codex/config-file/config-reference
+- **Git and agents:** CLI guidance is checkpoints before/after tasks. Desktop adds detached per-chat worktrees under `$CODEX_HOME/worktrees`, `.worktreeinclude`, snapshots, and roughly 15-worktree GC. `[features.multi_agent]` provides spawn/resume/wait/close; `[agents.<name>]` points to role TOMLs with model, reasoning, and sandbox settings. Source: https://developers.openai.com/codex/environments/git-worktrees and local config.
 
-- **Rust workspace `codex-rs`** is the core. GitHub languages API reports Rust as the dominant language (46,874,883 bytes vs ~2 MB Python/TypeScript/etc). The repo is built with Bazel (root `MODULE.bazel`, `.bazelrc`, `defs.bzl`) and ships per-platform statically linked musl binaries (`codex-aarch64-unknown-linux-musl`, `codex-x86_64-unknown-linux-musl`, etc). The workspace contains ~100 crates: `cli`, `tui`, `linux-sandbox`, `windows-sandbox-rs`, `network-proxy`, `sandboxing`, `process-hardening`, `model-provider`, `models-manager`, `ollama`, `lmstudio`, `chatgpt`, `codex-api`, `codex-client`, `backend-client`, `state`, `thread-store`, `thread-manager-sample`, `git-utils`, `hooks`, `mcp-server`, `skills`, `memories`, `rollout-trace`, `otel`, `analytics` (source: GitHub contents API on `codex-rs/`).
-- **Distribution**: the primary artifact is a single native binary. It is distributed via a curl installer, GitHub Releases, Homebrew (`brew install --cask codex`), and an npm meta-package `@openai/codex` whose `bin/codex.js` is a thin Node launcher that spawns the real platform binary (`@openai/codex-linux-<arch>` etc) (source: github.com/openai/codex README; local `codex.js` inspected).
-- **Client surfaces**: interactive TUI, non-interactive `codex exec`, `codex review`, `codex resume`/`fork`/`archive`, `codex mcp` (MCP client *and* server), `codex sandbox`, plugins/skills, plus a ChatGPT desktop app, IDE extension, and an experimental app-server + TypeScript SDK (source: `codex --help` output; developers.openai.com/codex/cli).
-- **Backend**: talks to OpenAI via the **Responses API** (`wire_api: "responses"` is the only supported wire protocol for providers), with websocket streaming when the provider supports it. ChatGPT-plan auth (device-code OAuth to auth.openai.com) is the first-class auth path; API-key auth is secondary. Source: developers.openai.com/codex/config-file/config-reference (`model_providers.<id>.wire_api`, `auth`); local `codex doctor` ("wire API responses", "auth mode chatgpt", "endpoint wss://chatgpt.com/backend-api/").
-- **Agent loop**: a turn-based loop in the `cli`/`tui` crates. The model gets tools (shell, file edit via `apply-patch`, web search, subagent spawn, MCP tools). Spawned commands run inside the sandbox. Approvals pause the loop when the agent hits a boundary. Sessions persist to an append-only `history.jsonl` plus SQLite state DBs (`state_N.sqlite` with `_sqlx_migrations`). Source: local `~/.codex/` layout; config-reference (`history.persistence`, `sqlite_home`, `sandbox_mode`, `approval_policy`).
-- **Sandboxing**: OS-native. Linux/WSL2 use a user-namespace sandbox; macOS uses Seatbelt; native Windows uses a Windows sandbox. Sandbox applies to spawned commands, not just built-in file ops. Source: developers.openai.com/codex/sandboxing.
-- **Approval modes**: `approval_policy = untrusted | on-request | never` (plus a `granular` mode) and `approvals_reviewer = user | auto_review` (a reviewer subagent can field approval prompts). Source: developers.openai.com/codex/config-file/config-reference.
-- **Git-based rollback**: official best practice is "Create Git checkpoints before and after a task so you can revert changes" (developers.openai.com/codex/cli). The desktop app adds per-chat **git worktrees** (`$CODEX_HOME/worktrees`, detached HEAD, snapshot-before-delete, ~15 worktree GC) and a "Handoff" flow between local checkout and worktree (developers.openai.com/codex/environments/git-worktrees). The CLI itself does not auto-create worktrees.
-- **Multi-agent**: `[features.multi_agent]` (default on) with `spawn_agent`/`send_input`/`resume_agent`/`wait_agent`/`close_agent` tools; roles declared as `[agents.<name>]` pointing at per-role TOML config files with their own model/reasoning/sandbox (source: local `config.toml`; config-reference `agents` section).
-- **Provider flexibility**: `model_providers.<id>` lets you define custom providers (base_url, env_key for the API key, headers, retries/timeouts) — but only the `responses` wire protocol; built-in providers `openai`, `ollama`, `lmstudio`; `--oss` flag for local models. No first-party Anthropic/Google adapters. Source: config-reference; local `codex --help`.
+## Local install evidence (commands run 2026-08-09; exit 0 unless noted)
 
-### Local install evidence (all commands run 2026-08-09, exit status 0 unless noted)
-
-```
+```text
 $ file /home/ubuntu/.local/bin/codex
-/home/ubuntu/.local/bin/codex: symbolic link to ../npm-global/bin/codex
-
+symbolic link to ../npm-global/bin/codex
 $ readlink -f /home/ubuntu/.local/bin/codex
 /home/ubuntu/.local/npm-global/lib/node_modules/@openai/codex/bin/codex.js
-
 $ /home/ubuntu/.local/bin/codex --version
 codex-cli 0.146.1
-
 $ file /home/ubuntu/.local/npm-global/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex
-ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped
+ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
-- Installed via npm into `/home/ubuntu/.local/npm-global/lib/node_modules/@openai/codex`; `package.json` says `"version": "0.146.1"`, `"license": "Apache-2.0"`, platform binaries via optional deps `@openai/codex-linux-x64/arm64` etc.
-- Host is `aarch64` (`uname -m`), so the launcher picked the arm64 musl binary.
-- `codex doctor` (v0.146.1 · linux-aarch64): `16 ok · 1 idle · 2 notes · 1 warn · 0 fail`. Notes: `0.147.0 available (current 0.146.1)`. Warn: **"state DB rows point at missing or unusable rollout files"** (threads). Environment: Ubuntu 24.4.0 (noble), install method npm, `auth mode chatgpt`, `sandbox: restricted fs + restricted network · approval OnRequest`, linux helper `~/.codex/tmp/arg0/…/codex-linux-sandbox`, websocket to `wss://chatgpt.com/backend-api/` handshake HTTP 101 OK, ChatGPT base URL reachable (HTTP 403 = auth required, expected).
-- A user-namespace sandbox utility (version 0.9.0) is installed and on PATH (verified via `which`).
+Install path is `/home/ubuntu/.local/npm-global/lib/node_modules/@openai/codex`; package version is `0.146.1`, Apache-2.0, with an arm64 optional dependency on this `aarch64` host. `codex doctor` reported `16 ok · 1 idle · 2 notes · 1 warn · 0 fail`, current 0.146.1 with 0.147.0 available, Ubuntu 24.04, ChatGPT auth, restricted filesystem/network and on-request approval, sandbox helper present, websocket handshake 101, and the warning “state DB rows point at missing or unusable rollout files.”
 
-#### Config: `~/.codex/config.toml` (2,536 bytes)
+`~/.codex/config.toml` (2,536 bytes) sets `gpt-5.6-sol`, medium reasoning, multi-agent v2, 12 concurrent threads, and role TOMLs under `~/.codex/agents/` (worker = gpt-5.6-luna/xhigh; explorer/reviewer read-only). `~/.codex/AGENTS.md` (8.0 KB) contains the operator’s orchestrator/worker playbook. `~/.codex` is a git repo; latest inspected commits are `0c32870`, `d83e658`, `b8c92f9`.
 
-- `model = "gpt-5.6-sol"`, `personality = "none"`, `model_reasoning_effort = "medium"`, `model_catalog_json = "/home/ubuntu/.codex/model_catalog.json"`.
-- `[features.multi_agent] = true`; `[features.multi_agent_v2]` enabled with `max_concurrent_threads_per_session = 12`.
-- Per-role agents: `[agents.default|explorer|luna|reviewer|worker]` each with a `config_file` under `~/.codex/agents/*.toml`. The agent TOMLs set per-role models/effort/sandbox, e.g. `worker.toml` → `model = "gpt-5.6-luna"`, `model_reasoning_effort = "xhigh"`; `explorer.toml` → `sandbox_mode = "read-only"`.
-- Model migration notices map `gpt-5.2-codex`/`gpt-5.3`/… → `gpt-5.6-sol` (schema/version churn handled via config notices).
-- `[projects."/home/ubuntu"]` and `[projects."/home/ubuntu/polymarket-arbitrage"]` are `trusted`.
-- `~/.codex/AGENTS.md` (8.0 KB) holds the user's own agent-role playbook (orchestrator/worker routing, worktree rules, verification policy) — evidence that Codex is *used as* a harness substrate with custom agent config.
+State measurements: `state_5.sqlite` 42,598,400 bytes with 44 migrations; `plugins/` 28 MB; cache 9.7 MB; `history.jsonl` 1,183,605 bytes, 1,387 lines, 174 sessions, max 97 messages, median 4; `model_catalog.json` 314,817 bytes fetched 2026-07-31. `sessions/` and `archived_sessions/` were empty despite history, matching the doctor warning. Auth contents were inspected only for structure and are not reproduced.
 
-#### Data/session state (`~/.codex`, `du -sh`)
-
-| path | size |
-|---|---|
-| `state_5.sqlite` | 41 MB (42,598,400 B; 44 `_sqlx_migrations`) |
-| `plugins/` | 28 MB |
-| `cache/` | 9.7 MB (`codex_apps_server_info`, `codex_apps_tools`, `remote_plugin_catalog`) |
-| `history.jsonl` | 1.2 MB (1,183,605 B; **1,387 lines, 174 sessions, 97 msgs max, median 4 msgs/session**) |
-| `model_catalog.json` | 314,817 B (fetched 2026-07-31, client_version 0.146.0) |
-| `log/` | `codex-login.log` only (device-code OAuth to auth.openai.com, 2026-07-09, succeeded) |
-
-- `~/.codex/sessions/` and `~/.codex/archived_sessions/` are **empty**, even though history.jsonl spans 174 sessions — transcript storage has moved to SQLite/rollout files, and some of those rows are now broken (matches the doctor warning).
-- `auth.json`: `auth_mode: chatgpt` (ChatGPT Pro account, tokens present; contents redacted here — do not reproduce tokens).
-- `~/.codex` is itself a git repo. `git log --oneline -3`: `0c32870 Enable i-have-adhd plugin` / `d83e658 shorten root agent usage hint` / `b8c92f9 tune Codex agent configuration` (last commit dated 2026-07-20).
-
-#### What it was recently working on (from `history.jsonl`, 174 sessions 2026-02-06 → 2026-08-06 UTC)
-
-- Session message keyword counts: worktree 287, review 250, adversarial 141, polymarket 138, trade 118, deploy 105, fit 93, risk 72, arbitrage 62, quoter 56, memory 48, markout 31, feedback 29, claude 20, futurecast 18.
-- Most recent 8 sessions (first user message, date UTC):
-  - 2026-08-06 "check this thread, is this install broken as well?" (2 msgs)
-  - 2026-08-02 "check this feedback, implement the correct parts: ## Severe Bugs and Mathematical Errors * Speculative Transaction Leak …" (25 msgs)
-  - 2026-08-02 "check the software architecture vs the agents.md. the pricing models should have no knowledge about the risk manager or the quoter …" (3 msgs)
-  - 2026-08-02 "check /home/ubuntu/.claude/projects/…/memory/ should we remove / consolidate?" (4 msgs)
-  - 2026-08-02 "check these: venue_mid_markout_mean_curve.png …" (3 msgs)
-  - 2026-08-01 "check claude code. we have tuned it with tweakcc and lobotimized claude code. update all …" (9 msgs)
-  - 2026-08-01 "Not ready to trade. dev-a is healthy, but three defects between it and live money …" (10 msgs)
-  - 2026-08-01 "You are the fit-operations engineer for the OU/futurecast production fit. Read plan.md …" (22 msgs)
-
-Summary of recent work: the agent has been doing **adversarial code review and parallel worktree-based implementation on the user's Polymarket arbitrage trading system** (fit/markout analytics, quoter/risk-manager refactors, deploy readiness checks), used as a subagent-executor driven by a shared AGENTS.md playbook — i.e., exactly the orchestrator/worker pattern Cambium formalizes. One recent session questions install health, consistent with the doctor warning.
+History spans 2026-02-06–08-06 UTC. Keyword counts included worktree 287, review 250, adversarial 141, polymarket 138, trade 118, deploy 105, and risk 72. Recent sessions were adversarial reviews, deployment/readiness work, and install-health questions in the operator’s Polymarket repository; this demonstrates orchestration use, not a general performance claim.
 
 ## What it does well
 
-1. **Single static Rust binary, zero-runtime-dependency deployment.** Statically linked musl builds on Linux (verified locally: aarch64 ELF, statically linked, stripped). Start-up and execution are fast; the npm wrapper is only a distribution convenience (local `codex.js` spawns the binary and forwards signals).
-2. **Best-in-class OS-native sandbox + approval model.** A kernel-namespace sandbox (Linux), Seatbelt (macOS), native Windows sandbox; the sandbox wraps *spawned commands* (git, package managers, test runners), not just file edits. `approval_policy` (untrusted/on-request/never) + `sandbox_mode` (read-only/workspace-write/danger-full-access) + per-command `rules` give a fine-grained autonomy dial, and `approvals_reviewer: auto_review` delegates approval to a reviewer subagent. This is the mechanism that makes low-approval-friction autonomy safe. Source: developers.openai.com/codex/sandboxing, config-reference.
-3. **Tight, first-party model integration.** ChatGPT-plan auth (device-code OAuth), Responses API over websocket streaming, server-side prompt caching/predicted outputs, model catalog with per-model reasoning levels (`low`…`ultra`), service tiers, model-migration notices. This is the best possible experience *if you standardize on OpenAI models*.
-4. **Real multi-agent / subagent system.** `[agents.<name>]` role configs with per-role model, reasoning effort, and sandbox mode (verified locally: worker= gpt-5.6-luna/xhigh, explorer= read-only); spawn/resume/wait/close tools; concurrency cap (12/session locally). Extensible via AGENTS.md hierarchy and custom agent TOMLs — the user already drives Codex as an orchestrator/worker harness.
-5. **Robust session persistence and resume ergonomics.** Append-only `history.jsonl` + sqlx-migrated SQLite state, `codex resume`/`fork`/`archive`/`delete`, compaction with a configurable prompt, MCP servers, skills, plugins and a marketplace. Very forgiving to long-running and interrupted work.
-6. **Extensible surface for automation.** `codex exec` (non-interactive), `codex review`, `codex mcp-server`, an experimental app-server and TypeScript SDK, lifecycle hooks (`PreToolUse`/`PostToolUse`/`SessionStart`/…), and `--config key=value` overrides make it scriptable and embeddable — the properties a harness like Cambium needs from its workers.
-7. **Git-worktree isolation (desktop app).** Per-chat worktrees under `$CODEX_HOME/worktrees`, detached HEAD (no branch pollution), `.worktreeinclude` for ignored files (`.env` etc), snapshot-before-delete, GC at ~15 worktrees. Source: developers.openai.com/codex/environments/git-worktrees.
+1. Static musl binary with fast, dependency-light deployment (verified by `file` above).
+2. OS-native sandbox plus approval policies, command-prefix rules, and optional auto-review: a strong autonomy/safety dial when platform setup works.
+3. First-party OpenAI integration: OAuth, Responses/websocket streaming, server prompt caching, model reasoning levels, service tiers, and migration notices.
+4. Real role-configured subagents, concurrency cap 12, AGENTS.md hierarchy, skills/MCP/plugins, and durable history/resume/fork/archive.
+5. Automation surfaces (`exec`, `review`, MCP server, app-server/SDK, lifecycle hooks, `--config`) and desktop worktree snapshots provide useful harness patterns.
 
 ## What it does poorly / limitations
 
-1. **OpenAI-first provider model.** Custom providers are constrained to the `responses` wire protocol; auth is ChatGPT-centric (`auth_mode: chatgpt`, OAuth tokens) with API-key as a secondary path; local models only via `ollama`/`lmstudio` + `--oss`. There is no multi-provider failover/load-balancing inside one session — if OpenAI is degraded, the agent stops. Cambium's FanOut cascade is a genuine differentiator here (system-design.md §6).
-2. **Local install shows state drift / degradation.** `codex doctor` reports `1 warn: state DB rows point at missing or unusable rollout files`, `sessions/` and `archived_sessions/` are empty despite 174 history sessions, and the 42 MB state DB has 44 migrations. The user's own latest session ("is this install broken as well?") corroborates. Fast release churn (0.146.1 installed, 0.147.0 already available; model migration notices from gpt-5.2→gpt-5.6) adds operational noise.
-3. **Sandbox has real-world setup friction on Linux.** Requires a user-namespace sandbox tool + working unprivileged user namespaces; on Ubuntu 24.04 an extra AppArmor profile or a sysctl override is often needed, and the bundled fallback helper only works where unprivileged userns are permitted (developers.openai.com/codex/sandboxing). This is exactly the portability trap Cambium's M8 Septum must design around (reviews/review-implementation.md M4 flags the sandbox backend being Linux-only).
-4. **Isolation is sandbox-only; no process supervisor.** Subagents run inside the main process's session context; there is no orchestrator-level process isolation, heartbeat/kill/restart, or per-worker stdin/stdout pipe protocol. A stuck subagent or a corrupt state row affects the whole session (evidenced locally by the broken rollout rows). Cambium's Supervisor (M4) is the stronger design and should stay.
-5. **Git-worktree isolation and auto-rollback are desktop-app features, not CLI.** The CLI's only rollback guidance is "create Git checkpoints before and after a task" (developers.openai.com/codex/cli). Multi-agent threads in the CLI share one working tree; there is no automatic commit/rollback cycle per task. Cambium's Surculus + Unio merge/rollback loop is more automated than anything the CLI ships.
-6. **Config/feature surface is enormous and fast-moving.** The config-reference documents hundreds of keys (permissions profiles, network proxy, otel, memories, goals, hooks, MCP per-server allowlists, apps). Fine-grained power, but a lot of it is experimental/under-development (`features.*` flags, `app-server` marked `[experimental]` in `--help`), which makes reproducible harness behavior harder.
-7. **No harness-level caching or optimization feedback loop.** Prompt caching is server-side OpenAI magic; there is no client-side prompt-hash cache and no per-node optimization trajectory store like Cambium's M9 Ascensus flywheel (system-design.md §6 "What We Do Differently": "Cache: None").
+1. **OpenAI-first.** Custom providers must speak Responses; there is no first-party Anthropic/Google adapter or in-session multi-provider failover. Cambium’s Diffundo cascade remains a differentiator.
+2. **Observed state drift.** Doctor’s missing-rollout warning, empty session directories, 42 MB database, and rapid 0.146.1→0.147.0 churn show operational risk.
+3. **Linux sandbox friction.** User namespaces and often AppArmor/sysctl setup are required on Ubuntu 24.04; portability is not uniform. Source: https://developers.openai.com/codex/sandboxing
+4. **No process supervisor in the CLI.** Subagents share the session process/context; there is no orchestrator heartbeat, restart, or per-worker pipe protocol. Desktop worktrees are not CLI behavior; CLI guidance only recommends checkpoints.
+5. **Large experimental config surface.** Hundreds of feature/permission/MCP/hook keys and fast model migration make reproducibility harder.
+6. **No harness-level optimization store.** Prompt caching is provider-side; no client prompt-hash cache or per-node optimization trajectory was observed.
 
 ## Relevant lessons for Cambium
 
-- **Sandbox is the autonomy enabler.** Codex's pattern — OS-native sandbox for *all spawned commands* + an approval-policy dial (untrusted/on-request/never) + command-prefix rules + an auto-reviewer agent — is what lets an agent run unmoderated. Cambium M8 (Septum) should copy the mechanism, but budget for the platform friction: a user-namespace sandbox + unprivileged userns + AppArmor on Ubuntu 24.04, Seatbelt on macOS, and no clean Windows story. Make the sandbox a pluggable backend with a documented fallback, not a hard Linux dependency.
-- **Per-role worker config is right; isolation level is the differentiator.** Codex's `[agents.<name>]` → per-role TOML (model, reasoning effort, sandbox mode) matches Cambium's worker configs exactly and validates the design. But Codex's subagents share the parent's context tree and process; Cambium's process-isolated Supervisor/Worker with stdin/stdout pipes (M4/M5) and per-worker worktrees is the defensible upgrade.
-- **Provider adapter surface: keep FanOut, steal the details.** Codex's `model_providers` shows the minimum viable adapter surface (base_url, env_key auth, headers, request/stream retry counts, stream idle timeout, wire protocol tag). Cambium M2 (FanOut) should adopt those fields per provider for its cascade, while keeping multi-provider failover and prompt-hash caching that Codex lacks.
-- **Worktree lifecycle engineering.** Adopt Codex's desktop-app worktree rules wholesale: per-task worktree, detached HEAD, copy `.worktreeinclude`-listed ignored files (`.env`, secrets) into fresh worktrees, snapshot before deletion, GC cap (~15). These are exactly the edge cases Cambium M3 (Surculus) and the review notes (stale locks, shared object DB, `.git/index.lock`) must handle.
-- **Make git checkpoint/rollback implicit.** Codex only *recommends* checkpoints before/after tasks. Cambium should bake checkpoint-before / rollback-on-failure into the Supervisor so workers can never leave the repo unrecoverable.
-- **Persistence = append-only log + migrated SQLite, plus a diagnostics command.** Codex's `history.jsonl` + sqlx-migrated `state_N.sqlite` is a proven shape — but this local install proves the drift failure mode (migrations ahead of data, rows pointing at missing rollout files, `sessions/` emptied). Cambium's event log should version with real migrations and ship a `doctor`-style diagnostic that validates log↔state consistency. Adopt `codex doctor` as a template for a harness health command.
-- **Version your config and model migrations.** Codex ships model-migration notices (`gpt-5.2-codex` → `gpt-5.6-sol`) in config because OpenAI's model names churn monthly. Cambium's config schema should carry a version + migration path from day one.
-- **Headless exec is the harness surface.** `codex exec`/`review`/`mcp-server` are the right integration points; the TUI is irrelevant to a harness. Cambium's worker interface should mirror a non-interactive exec contract (prompt in, transcript + diff + exit status out), which matches M1 Nuntius's stdin/stdout pipe design.
-- **Don't chase Codex's config sprawl.** Hundreds of `features.*` toggles (many experimental) hurt reproducibility. Cambium should keep a small, versioned config core and expose per-node tuning through its optimization harness (M9) instead of configuration flags.
+- Copy the mechanism, not the platform assumptions: sandbox every spawned command, expose approval/prefix rules, and make the sandbox backend pluggable (user namespaces/AppArmor on Linux, Seatbelt on macOS, documented Windows limits).
+- Keep per-role model/reasoning/sandbox configuration, but retain Cambium’s process-isolated Supervisor/Worker, pipe protocol, worktrees, heartbeats, and restart policy as the stronger boundary.
+- Adopt the provider adapter fields shown by `model_providers` (base URL, env-key, headers, retry/stream timeouts, wire protocol), while keeping Diffundo multi-provider failover and correctness-aware caching.
+- Use desktop worktree rules: detached per-task worktree, `.worktreeinclude` for ignored files, snapshot before deletion, and bounded GC. Make checkpoints/rollback implicit on failure rather than advice.
+- Combine append-only event history with migrated SQLite and a `doctor` consistency check; the local broken rollout rows are concrete drift evidence. Version config and model migrations.
+- Treat `exec`/`review`/`mcp-server` as the worker contract: prompt in, transcript/diff/exit status out. Keep the config core small instead of reproducing Codex’s experimental toggle sprawl.
+
+## Additional inspected findings
+
+The local `codex doctor` environment was Ubuntu 24.04 (noble), npm install, ChatGPT auth, restricted filesystem and network, on-request approvals, and the Linux helper under `~/.codex/tmp/arg0/`. The websocket endpoint was `wss://chatgpt.com/backend-api/`; handshake HTTP 101 succeeded and an unauthenticated base URL check returned expected HTTP 403. A user-namespace sandbox utility version 0.9.0 was on PATH. These checks establish local setup, not cross-platform support.
+
+The role files under `~/.codex/agents/` are concrete examples of per-role policy: `worker.toml` selected `gpt-5.6-luna` with xhigh reasoning, while `explorer.toml` selected read-only sandboxing. The config enabled multi-agent v2 with 12 concurrent threads. Model migration notices in the local catalog map gpt-5.2-codex/gpt-5.3/gpt-5.4/gpt-5.5 to gpt-5.6-sol and 5.3-codex-spark/5.4-mini to Luna. This churn is why a versioned config schema matters.
+
+The history scan found 174 sessions, with message keyword counts of worktree 287, review 250, adversarial 141, polymarket 138, trade 118, deploy 105, fit 93, risk 72, arbitrage 62, quoter 56, memory 48, markout 31, feedback 29, claude 20, and futurecast 18. The newest session asked whether the install was broken; other recent sessions performed code-review, architecture, deployment, and data-analysis work. This supports the “used as an orchestrator” finding while remaining one operator’s corpus.
+
+The local state layout is itself a caution: `history.jsonl` remains populated while `sessions/` and `archived_sessions/` are empty, and SQLite rows point to missing rollout files. The doctor warning and the user’s health-check session are consistent observations; neither proves data loss for every installation. Any Cambium doctor command should validate event-log/state/rollout references explicitly.
+
+The npm wrapper forwards signals to the platform binary, so the install has a small JavaScript distribution layer but a static runtime payload. The local `file` result confirms the aarch64 musl artifact rather than a dynamically linked Node process. Codex’s model catalog was fetched 2026-07-31 and the local version was already behind the available 0.147.0 release on 2026-08-09; version-sensitive claims should retain both dates.
+
+The safety model has two separate axes: sandbox mode (`read-only`, `workspace-write`, `danger-full-access`) and approval policy (`untrusted`, `on-request`, `never`, with granular prefix rules). `approvals_reviewer = auto_review` delegates a user decision to another agent, but it does not replace the sandbox. Cambium should keep these as independent fields and fail closed when either is unspecified.
+
+The provider catalog also carries context windows, reasoning levels, service tiers, and migration notices, while `config.toml` carries project trust entries for `/home/ubuntu` and the Polymarket repository. This makes trust, model selection, and approval orthogonal in the inspected layout. The local config’s `sqlite_home`, history persistence, MCP per-server options, and experimental feature flags demonstrate power but also explain why a smaller versioned Cambium schema is easier to reproduce.
+
+The local package’s optional platform dependencies explain why `file` on the launcher and `file` on the payload differ. Distribution convenience is not runtime architecture: npm, Homebrew, and curl all lead to the same native binary. That distinction matters when comparing Codex to Bun-compiled competitors whose executable remains a large language-runtime bundle.
+
+Codex’s desktop worktree behavior is more extensive than the CLI: detached HEADs under `$CODEX_HOME/worktrees`, `.worktreeinclude` for ignored files such as `.env`, snapshot-before-delete, and GC around 15. The CLI only recommends Git checkpoints. This distinction must remain explicit when adopting the lifecycle pattern.
 
 ## Sources
 
-- Local install (all paths under `/home/ubuntu/.local/`, `/home/ubuntu/.codex/`): `codex --version`, `codex doctor`, `codex --help`, `file`/`readlink` on binary, `~/.codex/config.toml`, `~/.codex/agents/*.toml`, `~/.codex/history.jsonl` (Python parsing), `~/.codex/state_5.sqlite` (sqlite3), `~/.codex/version.json`, `~/.codex/log/codex-login.log`, `~/.codex/model_catalog.json`, npm package `package.json` and `bin/codex.js` — all inspected 2026-08-09.
-- https://github.com/openai/codex (README: "Lightweight coding agent that runs in your terminal"; stars 104,943, forks 15,886, 9,052 commits, Apache-2.0, created 2025-04-13, last push 2026-08-09).
-- https://api.github.com/repos/openai/codex/languages (Rust 46,874,883 bytes dominant) and https://api.github.com/repos/openai/codex/contents/codex-rs (crate listing).
-- https://developers.openai.com/codex/cli (CLI features, checkpoint best practice)
-- https://developers.openai.com/codex/sandboxing (OS-native sandbox, kernel-namespace/Seatbelt, approval policies)
-- https://developers.openai.com/codex/config-file/config-reference (config keys: sandbox_mode, approval_policy, model_providers, agents, multi_agent, sqlite_home, history.persistence)
-- https://developers.openai.com/codex/environments/git-worktrees (desktop-app worktree behavior: detached HEAD, snapshots, GC, .worktreeinclude)
+- Local paths/commands inspected 2026-08-09: `/home/ubuntu/.local/bin/codex`, npm package `@openai/codex`, `codex --version`, `doctor`, `--help`, `file`, `readlink`, `~/.codex/config.toml`, `~/.codex/agents/*.toml`, `~/.codex/history.jsonl`, `~/.codex/state_5.sqlite`, `~/.codex/model_catalog.json`, `~/.codex/version.json`, `~/.codex/log/codex-login.log` (auth values not reproduced).
+- https://github.com/openai/codex
+- https://api.github.com/repos/openai/codex/languages
+- https://api.github.com/repos/openai/codex/contents/codex-rs
+- https://developers.openai.com/codex/cli
+- https://developers.openai.com/codex/sandboxing
+- https://developers.openai.com/codex/config-file/config-reference
+- https://developers.openai.com/codex/environments/git-worktrees
 
-### Objectively verifiable stats (re-check on demand)
+### Objectively verifiable stats
 
-1. `codex --version` → `codex-cli 0.146.1`; `codex doctor` shows latest available `0.147.0`.
-2. `history.jsonl` = 1,387 lines / 174 sessions, span 2026-02-06 → 2026-08-06 UTC (parsed from file timestamps).
-3. `state_5.sqlite` = 42,598,400 bytes with 44 `_sqlx_migrations` rows.
-4. `file` on platform binary → "ELF 64-bit LSB executable, ARM aarch64 … statically linked, stripped".
-5. GitHub: 104,943 stars, 15,886 forks, 9,052 commits (via GitHub API, 2026-08-09).
-6. `codex doctor` summary line: `16 ok · 1 idle · 2 notes · 1 warn · 0 fail`.
+1. `codex-cli 0.146.1`; doctor says 0.147.0 available.
+2. `history.jsonl`: 1,387 lines / 174 sessions, 2026-02-06 → 2026-08-06 UTC.
+3. `state_5.sqlite`: 42,598,400 bytes / 44 migrations.
+4. Platform binary: aarch64, statically linked, stripped.
+5. GitHub snapshot: 104,943 stars, 15,886 forks, 9,052 commits (2026-08-09).
+6. Doctor summary: `16 ok · 1 idle · 2 notes · 1 warn · 0 fail`.
+Codex’s local history and SQLite state are separate persistence layers, and the doctor warning links them explicitly through rollout references. The useful design lesson is not “use SQLite” alone: it is to version the relation between append-only events, durable rows, and transcript files, then make the diagnostic command check all three.
+The local install’s 42 MB state database is a measured size, not a recommended allocation; its value here is the observed drift warning and migration count.
+Future snapshots should keep CLI behavior separate from desktop-app worktree behavior, because the inspected docs assign automatic snapshots and GC only to the desktop surface.

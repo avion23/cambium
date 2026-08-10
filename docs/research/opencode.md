@@ -1,134 +1,94 @@
 # OpenCode (anomalyco/opencode) — Competitive Analysis for Cambium
 
-**Date:** 2026-08-09
-**Author:** research subagent (opencode's own `general` agent, running inside the tool under study)
-**Verification policy:** every local-install claim cites the exact command run; every web claim cites the URL; anything unverified is marked **UNVERIFIED**.
-
----
+**Date:** 2026-08-09. **Author:** research subagent running inside OpenCode. **Verification:** local claims cite commands; web claims cite URLs; unsupported items are **UNVERIFIED**. Snapshot versions: local `0.0.0-dev-202608071959`; upstream `dev` package 1.18.15.
 
 ## 1. What it is / stack
 
-OpenCode is an open-source AI coding agent with a terminal UI, desktop app, web UI, and headless server. It is the tool this very document was produced with. Project home moved from `sst/opencode` to `anomalyco/opencode` (GitHub page headers and docs footer now say "Anomaly"; `sst` URL redirects).
+OpenCode is an open-source coding agent with TUI, desktop, web, and headless server surfaces. The project moved from `sst/opencode` to `anomalyco/opencode`.
 
 | Concern | Finding | Source |
 |---|---|---|
-| Repo health | 195k stars, 25.1k forks, 15,366 commits on `dev`, 3.8k open issues, 1.2k PRs (fetched 2026-08-09) | https://github.com/anomalyco/opencode |
-| Language / package manager | TypeScript monorepo, Bun (`"packageManager": "bun@1.3.14"`), turbo, workspaces under `packages/*` | https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json |
-| Runtime model | Bun-compiled single-file binary; server/client split. Local binary is a 140 MB ELF aarch64 executable (see §5) | local + https://github.com/anomalyco/opencode |
-| TUI framework | **OpenTUI** (`@opentui/core`, `@opentui/solid`, `@opentui/keymap` 0.4.5) + **Solid.js** 1.9.10. NOT Ink/React on the current dev branch. | https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/tui/package.json |
-| Core runtime | **Effect** 4.0.0-beta.83 (effectful session runtime); storage via **Drizzle ORM + SQLite** (`drizzle-orm` 1.0.0-rc.2, `effect-drizzle-sqlite`, `effect-sqlite-node`) | https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json |
-| HTTP layer | **Hono** 4.10.7 server; `@opencode-ai/client` + `sdk` generated from a single authoritative `HttpApi` via `httpapi-codegen` (Promise and Effect emitters, "SDK Contract IR") | https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md |
-| Provider abstraction | **AI SDK** (`ai` 6.0.168) with 17+ `@ai-sdk/*` adapters (openai, anthropic, google, google-vertex, groq, mistral, amazon-bedrock, azure, cerebras, cohere, deepinfra, xai, togetherai, perplexity, etc.), plus OpenRouter, OpenCode Zen, and arbitrary OpenAI-compatible providers | https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/package.json |
-| Protocol integrations | MCP client (`@modelcontextprotocol/sdk` 1.29.0), ACP server (`@agentclientprotocol/sdk`), LSP via `vscode-jsonrpc` + tree-sitter (bash, powershell) | https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/package.json |
+| Repo snapshot | 195k stars, 25.1k forks, 15,366 commits, 3.8k open issues, 1.2k PRs | https://github.com/anomalyco/opencode |
+| Build/runtime | TypeScript monorepo, Bun 1.3.14, Turbo/workspaces; Bun-compiled binary | https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json |
+| TUI | OpenTUI 0.4.5 + Solid.js 1.9.10; current branch is not Ink/React | https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/tui/package.json |
+| Core/storage | Effect 4.0.0-beta.83; Drizzle + SQLite | https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json |
+| API | Hono; generated Promise/Effect clients from one `HttpApi`/SDK Contract IR | https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md |
+| Providers/protocols | AI SDK with 17+ adapters, OpenAI-compatible providers, MCP, ACP, LSP/tree-sitter | https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/package.json |
 
-**How the agent loop works (from `CONTEXT.md`, a spec doc in-repo):**
-- A session is durable history (SQLite). Each model request is a **Provider Turn**; the model-visible context is **Session History** plus an immutable **Baseline System Context** that stays fixed for a **Context Epoch** — deliberately structured so the provider's prompt cache has a stable prefix. Context changes arrive as **Mid-Conversation System Messages** admitted only at a **Safe Provider-Turn Boundary**.
-- System context is assembled from ordered, keyed **Context Sources** (e.g., `AGENTS.md` instruction files, current date, selected-agent available-skill guidance) via a **System Context Registry**.
-- Tools are registered in a **Tool Registry**; each tool result is bounded to a configurable max lines/bytes, and oversized output spills to **Managed Tool Output Files** under a shared directory, keeping the durable transcript small.
-- Agents come in two kinds: **primary** (build/plan, user-selectable via Tab) and **subagents** (invoked by the model through a `task` tool or by `@mention`). Subagents run as child sessions. Nesting is capped by `subagent_depth` (default 1).
-
----
+`CONTEXT.md` describes durable SQLite session history, Provider Turns, immutable Baseline System Context per Context Epoch (stable provider-cache prefix), keyed Context Sources, bounded tool results with spill-to-file, and primary/subagent sessions (default depth 1). Subagents are invoked by `task` or `@mention`.
 
 ## 2. What it does well
 
-1. **Provider/model breadth.** 17+ AI-SDK adapters plus arbitrary OpenAI-compatible proxies and OpenCode Zen make it trivial to run any model. The local install defines 11 providers and 28 explicitly-named custom models in JSON (counting rule: `provider.<id>.models` entries in `opencode.json` only; see §5). Cached model catalog at `~/.cache/opencode/models.json` (3.6 MB).
-2. **Granular, glob-based permission system.** Every tool can be `allow`/`ask`/`deny`, per agent and per command pattern, with last-matching-rule-wins semantics (e.g. `bash: { "*": "ask", "git diff": "allow" }`). Permissions also gate external directories, the `task` tool, and skill loading. — https://opencode.ai/docs/permissions/, https://opencode.ai/docs/agents/
-3. **Extensibility without code.** Custom agents (JSON or Markdown frontmatter), skills (`SKILL.md`, discovered from `.opencode/skills`, `.claude/skills`, `.agents/skills`, Claude-compatible), MCP servers, custom tools, commands, and npm plugins — all config-driven. — https://opencode.ai/docs/agents/, https://opencode.ai/docs/skills/, https://opencode.ai/docs/plugins/
-4. **Durable session UX.** Everything persists to SQLite: sessions, messages, parts, todos, permissions, share URLs, and per-session token/cost counters. Undo/redo is backed by internal git snapshots; sessions can be resumed (`-c`/`--session`), forked, exported, and shared as URLs. — local DB schema (§5), https://opencode.ai/docs/
-5. **Deliberate context-epoch caching design.** The immutable Baseline System Context per epoch is an explicit scheme to keep the provider prompt-cache prefix stable across turns and restarts — a more sophisticated answer to "caching" than an app-level prompt hash. — https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md
-6. **One API, many frontends.** A single `HttpApi` generates both the network client and the embedded in-process host (`sdk-next`); TUI, CLI (`opencode run`), web, desktop, and the GitHub/GitLab integrations all speak the same server. — https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md
-
----
+1. Broad provider/model support. The local config defines 11 providers and 28 explicitly named custom models; catalog entries in `~/.cache/opencode/models.json` are separate.
+2. Per-agent/per-command `allow`/`ask`/`deny` glob permissions with last-match-wins, external-directory gating, task and skill controls. https://opencode.ai/docs/permissions/ ; https://opencode.ai/docs/agents/
+3. Config-driven agents, `SKILL.md` discovery across `.opencode`, `.claude`, and `.agents`, MCP, custom tools/commands, and plugins. https://opencode.ai/docs/skills/ ; https://opencode.ai/docs/plugins/
+4. Durable sessions, resume/fork/export/share, todos, token/cost counters, and internal git snapshots for undo/redo. https://opencode.ai/docs/
+5. Context Epoch caching and managed tool-output files bound the model-visible transcript. https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md
+6. One `HttpApi` serves TUI, CLI, web, desktop, and integrations; this is a useful boundary pattern for Janus. https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md
 
 ## 3. What it does poorly / limitations
 
-1. **Subagents run sequentially.** Confirmed by the maintainers themselves: issue #29638 "Subagents dispatched sequentially instead of in parallel" (closed **as not planned**), reporting that the session loop `tasks.pop()` → `handleSubtask(...)` blocks until each subagent finishes; the reporter suggested `Effect.forEach(..., { concurrency: "unbounded" })`. Parallel fan-out is not a supported pattern. — https://github.com/anomalyco/opencode/issues/29638
-2. **Heavy resource footprint.** The binary is 140 MB; the global SQLite DB was 299 MB at measurement time (104 sessions / 5,362 messages / 22,754 parts, as of 2026-08-09T21:04:47Z — see §5); individual managed tool-output files reach ~1 MB each; the package/cache dir is 91 MB (see §5). This is a JS/Bun + Effect + SQLite stack — far heavier than Cambium's zero-runtime-dependency Python plan.
-3. **Snapshot/undo indexing cost.** The docs themselves warn that snapshots "can cause slow indexing and significant disk usage as it tracks all changes using an internal git repository," and undo/redo only works inside a git repo. — https://opencode.ai/docs/config/ (Snapshot)
-4. **Provider-package churn.** OpenCode "dynamically installs provider packages as needed and caches them locally"; the troubleshooting page's standard fix for API errors is `rm -rf ~/.cache/opencode`. Config carries a long legacy/deprecation tail (`maxSteps` → `steps`, `tools` → `permission`, `theme`/`keybinds` moved from `opencode.json` to `tui.json`). — https://opencode.ai/docs/troubleshooting/, https://opencode.ai/docs/agents/
-5. **Compaction is a lossy LLM pass.** When context is full, a hidden `compaction` agent summarizes the session (auto-compaction, optional pruning). It burns an extra model call and can lose detail; the docs expose only coarse knobs (`reserved`, `prune`). There is no replay-based durable checkpoint as Cambium plans. — https://opencode.ai/docs/config/ (Compaction), https://opencode.ai/docs/agents/ (Built-in)
-6. **App-level caching is essentially absent.** Cost/context management is delegated to provider-side prompt caching (a `setCacheKey` per-provider option), not an application cache. Cambium's own review process flagged that an app-level `(model, temp, prompt)` hash cache is a correctness hazard for a coding harness; OpenCode sidesteps it by not having one. — https://opencode.ai/docs/config/ (Models), cf. `docs/architecture/reviews/review-llm-design.md` in this worktree
-
-**Secondhand limitations (UNVERIFIED against primary sources):** Cambium's `docs/architecture/system-design.md` cites two more OpenCode failures — "subagent without timeout hangs 20-30 min silently (OpenCode #11865)" and "bidirectional agent-to-agent messaging degenerates into ACK loops (OpenCode community)". Issue numbers were not re-verified; #29638 above IS verified.
-
----
+1. **Subagents are sequential.** Issue #29638 reports `tasks.pop()` → `handleSubtask(...)` blocking each child; maintainers closed it **not planned**. https://github.com/anomalyco/opencode/issues/29638
+2. **Heavy footprint:** local binary 140 MB, SQLite DB 299 MB at measurement, cache/package 91 MB, and managed outputs near 1 MB. The JS/Bun/Effect stack is materially heavier than Cambium’s Python target.
+3. **Snapshot cost:** docs warn internal-git snapshots can slow indexing and consume significant disk; undo requires a git repository. https://opencode.ai/docs/config/
+4. **Provider/config churn:** providers install dynamically and cache locally; troubleshooting suggests clearing `~/.cache/opencode`; config has `maxSteps`→`steps`, `tools`→`permission`, and TUI-key migration. https://opencode.ai/docs/troubleshooting/ ; https://opencode.ai/docs/agents/
+5. **Compaction is lossy:** hidden `compaction` agent makes another model call; `reserved`/`prune` are coarse and do not provide replay durability. https://opencode.ai/docs/config/ ; https://opencode.ai/docs/agents/
+6. App-level prompt caching was not observed; cost management uses provider-side cache keys. Cambium review `docs/architecture/reviews/review-llm-design.md` treats a naive prompt hash as a correctness hazard. **UNVERIFIED secondhand reports:** system-design cites issue #11865 timeout hangs and community ACK loops; those were not rechecked.
 
 ## 4. Relevant lessons for Cambium
 
-1. **Orchestrator/worker model.** OpenCode proves a single-process, event-loop orchestrator with cheap child "subagent sessions" is workable and gives excellent UX (parent/child session navigation, `@mention`, resume/fork). But its subagents are **sequential by design** (#29638, closed not-planned). Cambium's process-isolated workers with parallel fan-out are a genuine differentiator — keep them, but copy the cheap `@mention`/child-session ergonomics and the model-driven decomposition via a `task`-like tool.
-2. **One authoritative API, many interfaces.** OpenCode's `HttpApi` → codegen IR → Promise/Effect clients → TUI/web/desktop/headless is the pattern Cambium's Janus (M10) should follow: define the wire protocol once (Cambium's Nuntius JSON-lines IPC is the analog) and build every interface against it, including an embedded in-process client for tests.
-3. **TUI.** OpenCode moved to a real reactive component framework (OpenTUI + Solid.js) rather than hand-rolled rendering, with a separate `tui.json`, themes, keybinds, mouse, diff view, and attention/notifications. Cambium should pick an equivalent mature Python TUI stack (the current design leaves Janus unspecified) rather than building one.
-4. **Permission model.** The allow/ask/deny + glob-pattern + last-match-wins scheme, applied per agent and even per bash command, is proven and should be copied for per-worker sandbox policies in Septum (M8). Note the do-loop guard (`doom_loop` permission) and external-directory gating — both relevant to Cambium's supervisor.
-5. **Caching.** Do NOT ship a naive app-level prompt cache. OpenCode's correct instinct is: keep the model-visible context prefix stable across an epoch so the *provider's* cache hits, and bound per-turn tool output. Cambium's FanOut cache (flagged as a correctness hole in its own reviews) should either be keyed by worktree+HEAD, backed by a shared store, or dropped in favor of provider-side caching.
-6. **Tool output management.** OpenCode's bounded model-visible preview + spill-to-file (Managed Tool Output Files) exactly solves the problem Cambium's event log will face with chatty workers. Adopt it: cap tool output in the durable log, keep full output in a managed directory, and log the path.
-7. **Skills.** The `SKILL.md` format (frontmatter `name`+`description`, loaded on-demand via a `skill` tool, Claude/agent-compatible discovery) is a proven standard. Cambium workers should consume the same format so existing skills are portable into the harness.
-8. **Compaction/checkpointing.** OpenCode's compaction is a lossy extra LLM call. Cambium's checkpoint-per-tool-call ReAct recovery is strictly better for crash recovery; use compaction only as a last-resort context reducer, not as the durability mechanism.
-
----
+1. Keep process-isolated parallel workers: OpenCode’s cheap child-session UX is useful, but sequential dispatch is a limitation. Borrow `@mention`/resume/fork ergonomics and a task-like decomposition tool.
+2. Define one authoritative wire API and generate clients/frontends from it; Nuntius JSON-lines is Cambium’s analog.
+3. Use mature TUI components rather than hand-rolled rendering; keep TUI optional and separate (`tui.json` is a useful precedent).
+4. Copy allow/ask/deny glob permissions, last-match-wins, external-directory gates, and `doom_loop` protection for Septum.
+5. Keep a stable context prefix per epoch and bound tool output with full output in managed files. Do not ship a naive app-level cache; bind any cache to worktree/HEAD or use provider caching.
+6. Adopt portable `SKILL.md` discovery and checkpoint-based recovery; use compaction only as context reduction, not durability.
 
 ## 5. Local install evidence
 
-Binary and version:
-
-```
+```text
 $ file /home/ubuntu/.local/bin/opencode
-ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, ... not stripped
+ELF 64-bit LSB executable, ARM aarch64, dynamically linked, not stripped
 $ /home/ubuntu/.local/bin/opencode --version
 0.0.0-dev-202608071959
 $ ls -la /home/ubuntu/.local/bin/opencode
--rwxr-xr-x 1 ubuntu ubuntu 146909328 Aug  7 20:00 opencode   # 140 MB
+146909328 bytes (140 MB), Aug 7 20:00
 ```
 
-Config locations (both present, JSONC-capable per docs):
+`~/.opencode/` contains 15 skill dirs, dependencies, lockfile, and `.env`; effective config is `~/.config/opencode/opencode.json` (809 lines), with `tui.json`, 12 config commits, and `openai-compact/checkpoints.db` (1.8 MB WAL). `opencode agent list` showed built-ins build/compaction/explore/general/plan/summary/title plus deepseek/glm/kimi/luna/reviewer/sol; config defines 10 agents, 11 providers, and 28 named models. Default is build on `opencode-go/deepseek-v4-flash`.
 
-```
-~/.opencode/           # 15 skill dirs, node_modules (plugin deps), bun.lock, .env (API keys for openai/openrouter/google/groq/z.ai/kimi/moltbook/websearch)
-~/.config/opencode/    # opencode.json (809 lines, `wc -l`), tui.json, opencode.json.bak-*, skills/i-have-adhd, openai-compact/checkpoints.db (1.8MB WAL), .git (12 commits, `git log --oneline | wc -l`), patch-models-cache.py
-```
+Database command (point-in-time, live and growing):
 
-Effective agents (`opencode agent list`): build, compaction, explore, general, plan, summary, title (built-ins) + deepseek, glm, kimi, luna, reviewer, sol (custom subagents). Config file (`~/.config/opencode/opencode.json`) defines 10 agents, 11 providers, and 28 explicitly-named custom models (counting rule: entries under `provider.<id>.models` in `opencode.json` only — catalog entries from `~/.cache/opencode/models.json` are not counted; `opencode models` would list far more). Style: pure-JSON, per-agent `model: "provider/model-id"` + `variant` + `mode` (`all`/`primary`/`subagent`) + `steps` + `permission`, with provider blocks declaring custom model names/limits/reasoning variants (e.g. `openai/gpt-5.6-sol`, `zai-coding-plan/glm-5.2`, `opencode-go/deepseek-v4-flash`). Default agent is `build` on `opencode-go/deepseek-v4-flash`.
-
-Data store (single global SQLite DB; live and growing — all counts are a point-in-time snapshot as of the measurement moment, not stable truth):
-
-```
-$ sqlite3 ~/.local/share/opencode/opencode-dev.db "SELECT (SELECT count(*) FROM session), (SELECT count(*) FROM message), (SELECT count(*) FROM part);"
-104|5362|22754        # as of 2026-08-09T21:04:47Z
-$ stat -c %s ~/.local/share/opencode/opencode-dev.db   # 313,778,176 bytes (299 MB) as of 2026-08-09T21:04:47Z
-$ du -sh ~/.cache/opencode                           # 91 M (incl. models.json 3.6 MB)
-$ ls -la ~/.local/share/opencode/log/opencode.log    # 8,066,508 bytes, first entry 2026-08-08T14:21Z
+```text
+sqlite3 ~/.local/share/opencode/opencode-dev.db "SELECT (SELECT count(*) FROM session), (SELECT count(*) FROM message), (SELECT count(*) FROM part);"
+104|5362|22754   # 2026-08-09T21:04:47Z
+stat .../opencode-dev.db → 313,778,176 bytes (299 MB)
+du -sh ~/.cache/opencode → 91 M
 ```
 
-The DB grew from the first draft of this doc (87/5,004/21,054; 292,880,384 B) to 104/5,362/22,754; 313,778,176 B within ~30 minutes because the research sessions themselves are writing to it.
+The DB had grown from 87/5,004/21,054 and 292,880,384 bytes within roughly 30 minutes because research sessions were writing to it. Logs began 2026-08-08T14:21Z. Recent sessions were the 2026-08-09 Cambium design/research sprint and prior Polymarket/bench-harness work; config git history shows active model-routing edits through 2026-08-09.
 
-Recent activity (all timestamps UTC, `sqlite3 ... SELECT title, datetime(time_updated/1000,'unixepoch'), agent FROM session ORDER BY time_updated DESC`): the immediately-preceding work is a **Cambium design/research sprint on 2026-08-09 20:38–20:52** in `/home/ubuntu/cambium`: "Designing Python coding agent with subagents" (build), "Design Cambium architecture (@sol subagent)" (GPT-5.6 Sol), and nine parallel `@general` research subagent sessions (Python 3.14, TUI best practices, Cloud Code, py.dev assistant, Prime Agent, OMP, Pi, Codex, and "Research OpenCode agent" — the session running this task), each costing $0.001–0.005. Prior to that: `polymarket-arbitrage` build work throughout 2026-08-09 (age-knob, tip-gate, telemetry, reviews via `@glm`), and `bench-harness` sessions on 2026-08-08. Log confirms `version=0.0.0-dev-202608071959` on every created session.
+The local config’s 10 agents use per-agent `model`, `variant`, `mode`, `steps`, and `permission` fields; this is a concrete schema pattern, not an endorsement of all 11 configured providers. The 28 named custom models are counted only under `provider.<id>.models` in `opencode.json`; `opencode models` would include many more catalog entries. Managed tool-output files are separate from the durable SQLite parts, so their disk footprint and the database footprint should be measured independently.
 
-Git history of the config repo (`git -C ~/.config/opencode log --oneline -5`): `6a34b2c fix(config): use sol for planning` (2026-08-09 15:45), `9cb6ca3 fix(config): unify sol subagents`, `c3ec47f fix(config): switch deepseek agent to opencode-go, drop blocked zen free` (2026-08-07), `112d8ab feat(config): switch primary agents to opencode-go deepseek, disable openai+llama`, `13ee470 chore: set build/plan/explore/general to all mode` — shows active iteration on agent/model routing over the last week.
+OpenCode’s context design deliberately keeps the Baseline System Context immutable during a Context Epoch and admits changes only at a Safe Provider-Turn Boundary. That is different from lossy compaction: the former stabilizes provider cache prefixes; the latter summarizes history when full. Cambium should retain the distinction when designing checkpoint and context-budget behavior.
 
----
+The sequential-subagent issue is concrete: the reporter identified `tasks.pop()` followed by blocking `handleSubtask(...)`, and maintainers closed #29638 as not planned. The report supports a parallel-worker differentiator, but does not establish that every OpenCode workload is slow. The unverified #11865 timeout and ACK-loop notes remain secondhand.
+
+The storage measurements also show why “durable” does not mean “bounded.” The SQLite database holds sessions, messages, and parts, while managed tool-output files and provider/model caches live elsewhere. A Cambium event log should define retention and spill paths up front; otherwise a successful long session can become a disk-pressure failure. OpenCode’s troubleshooting advice to remove `~/.cache/opencode` is a recovery operation, not a consistency check.
+
+The permission system is finer-grained than a single approval boolean: a rule can allow `git diff`, ask for other bash commands, deny a tool, gate external directories, and control `task`/skill loading. The docs’ last-match-wins behavior should be copied only with tests for rule ordering. The local OpenCode configuration’s active model edits show that permission and model routing drift can happen independently.
+
+The TUI configuration is intentionally separate (`~/.config/opencode/tui.json`), while `opencode run --format json` and `serve` keep automation available. This separation supports Janus’ future adapter split: a renderer can evolve without changing the worker/session protocol. It also means a TUI-only feature claim should not be treated as evidence of headless behavior.
+
+The local binary is dynamically linked (`/lib/ld-linux-aarch64.so.1`) and not stripped, unlike the Codex musl payload. The 140 MB size, 299 MB database, 91 MB cache, and 8 MB log are measured artifacts from one date; they should not be presented as fixed product limits. They do, however, make storage budgeting a concrete Cambium concern.
 
 ## 6. Sources
 
-Web:
-- https://github.com/anomalyco/opencode (repo, stars/forks/commits, README)
-- https://opencode.ai/docs/ (intro, install, usage)
-- https://opencode.ai/docs/agents/ (agent types, config, permissions)
-- https://opencode.ai/docs/tools/ (built-in tool list, permissions)
-- https://opencode.ai/docs/skills/ (SKILL.md format, discovery)
-- https://opencode.ai/docs/config/ (schema: providers, compaction, snapshot, plugins, precedence)
-- https://opencode.ai/docs/tui/ (TUI commands, tui.json)
-- https://opencode.ai/docs/troubleshooting/ (logs, storage, provider-package cache)
-- https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json (root: bun, turbo, catalog versions)
-- https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/package.json (AI-SDK adapters, deps)
-- https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/tui/package.json (OpenTUI + Solid)
-- https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md (session runtime spec: Context Epoch, System Context, Provider Turn, tool-output bounding)
-- https://github.com/anomalyco/opencode/issues/29638 (sequential subagent dispatch, verified)
+Web: https://github.com/anomalyco/opencode ; https://opencode.ai/docs/ ; https://opencode.ai/docs/agents/ ; https://opencode.ai/docs/tools/ ; https://opencode.ai/docs/skills/ ; https://opencode.ai/docs/config/ ; https://opencode.ai/docs/tui/ ; https://opencode.ai/docs/troubleshooting/ ; https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json ; https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/package.json ; https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/tui/package.json ; https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md ; https://github.com/anomalyco/opencode/issues/29638
 
-Local:
-- `file` / `--version` / `ls -la` on `/home/ubuntu/.local/bin/opencode`
-- `sqlite3` queries on `~/.local/share/opencode/opencode-dev.db`
-- `ls -laR` of `~/.opencode`, `~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode`
-- `opencode agent list`, `opencode --help`
-- `git -C ~/.config/opencode log --oneline -10`
-- `tail` of `~/.local/share/opencode/log/opencode.log`
+Local: `file`, `--version`, `ls -la` on `/home/ubuntu/.local/bin/opencode`; `sqlite3` on `~/.local/share/opencode/opencode-dev.db`; directory listings under `~/.opencode`, `~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode`; `opencode agent list`, `opencode --help`; `git -C ~/.config/opencode log --oneline -10`; log tail. All inspected 2026-08-09.
 
-**Version pin:** this analysis reflects OpenCode `0.0.0-dev-202608071959` (locally installed) and upstream `dev` branch at package version 1.18.15, both fetched 2026-08-09.
+Direct configuration references: https://opencode.ai/docs/permissions/ ; https://opencode.ai/docs/agents/ ; https://opencode.ai/docs/skills/ ; https://opencode.ai/docs/plugins/ ; https://opencode.ai/docs/troubleshooting/ ; https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md ; https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/tui/package.json
+OpenCode’s `task` subagent mechanism and `@mention` UX are useful interaction patterns even though dispatch is sequential. The Cambium analogue can preserve named child sessions and resume/fork navigation while dispatching independent workers concurrently under Custos.
+The local DB counts are point-in-time because the research process itself wrote sessions while measuring them; keep that caveat with every repeated count.
+Future snapshots should record database size, session counts, cache size, and binary version together, because each measurement changed during the research run.
