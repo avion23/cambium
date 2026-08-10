@@ -80,7 +80,7 @@ Plan entries, not completion claims. Owner branch may be merged (evidence on mai
 - `wt-bench-creds` — scrub provider credentials from module subprocess environments + redact JSON/repr-escaped credentials at the module error boundary (tip `aa0517a`, dirty).
 - `wt-bench-reanchor` — bench gate fails closed on dataset_version change, no silent re-anchor (tip `a9ae2f9`, clean).
 - `wt-baseline-57` — 57-node module baseline refresh + standalone CLI wall-timing gate + timing-subprocess env scrub (tip `cbbe35d`, dirty; NOT merged).
-- `wt-dspy-cambiumlm` — CambiumLM real-provider adapter, DSPy fixes; merge-blocker commits committed (tip `bf7f7da`, dirty `diffundo.py`/`lm.py`).
+- `wt-dspy-cambiumlm` — CambiumLM real-provider adapter, DSPy fixes; merge-blocker commits committed (tip `bf7f7da`).
 - `wt-eval-cache-fix` — eval-cache request/score identity separation + static import-boundary scanner (tip `2017be7`, dirty `eval_cache.py`; previous WIP diagnosis: separated identities and import-boundary enforcement, scanner rounds through seventeen).
 - Parked/backup branches: `wt-batch-read-parked` (superseded), `wt-worker-tool-loop-backup-709a1d9`. DLQ-routing and empty scratch worktrees were removed during cleanup; no live `wt-dlq-routing` worktree remains.
 
