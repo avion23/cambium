@@ -30,8 +30,8 @@ What exists now:
 - **Vertical-slice proof** — a real supervisor subprocess-spawns a real fake
   worker, runs the task gate, and merges the worker branch. The multi-worker
   plan path also has end-to-end scenario coverage.
-- **Scenario and module coverage** — the refreshed baseline records 301 timed
-  test items. The latest full run reports 299 passed and 2 skipped; the source
+- **Scenario and module coverage** — the refreshed baseline records 302 timed
+  test items. The latest full run reports 300 passed and 2 skipped; the source
   Ruff gate is clean.
 - **Still unmerged** — `redact.py` is not in this main snapshot. Real provider
   execution and DSPy optimization are not verified.
@@ -53,9 +53,9 @@ Next:
   task tree, scheduling core, plan runtime, and conversation store exist; full
   Custos integration and recursive completion are not complete.
 - **M6 — First real LLM task: in progress.** Diffundo, provider configuration,
-  and provider-environment coverage are merged. The fake-provider staging test
-  remains on `wt-luna-m6` and is not in current main; the real-provider path is
-  pending.
+  provider-environment coverage, and the fake-provider staging test are merged.
+  The staging path is verified with a loopback fake provider; real-provider
+  execution and M6 acceptance remain unverified.
 - **M7 — Persistent worker pool: blocked.** No reusable worker pool is present,
   and its M2–M6 prerequisites are not accepted.
 - **M8 — DSPy `should_decompose` refinement: in progress.** The Decision enum

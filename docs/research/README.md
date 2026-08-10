@@ -44,6 +44,7 @@ point-in-time audits, not prerequisites for every code edit.
 - [`constitution-compliance.md`](constitution-compliance.md) — Point-in-time implementation audit against the translated coding constitution and agent norms.
 - [`dspy-python-314.md`](dspy-python-314.md) — Verified DSPy compatibility on CPython 3.14 GIL builds and the free-threaded build blocker.
 - [`example-datasets-v1.md`](example-datasets-v1.md) — Verified generation and validation method for the example module's train/eval/canary datasets.
+- [`glossary.md`](glossary.md) — Current architecture vocabulary and implementation-surface names.
 - [`logging-design.md`](logging-design.md) — Non-blocking structured logging, redaction, rotation, and writer-thread design.
 - [`m1-canonicalization-plan.md`](m1-canonicalization-plan.md) — Plan for one Custos runtime, one store, one sequencer, and removal of slice/fallback paths.
 - [`metric-design.md`](metric-design.md) — Automatic coding-diff metric, calibration, canary, and promotion-gate design.
@@ -76,16 +77,18 @@ the implementation.
 - [`threat-model.md`](threat-model.md) — Design-era security risk assessment, including sandbox-dependent analysis retained for history. **Evidence only; not normative.**
 - [`feedback-2-deltas.md`](feedback-2-deltas.md) — Second external-critique assessment and D8a–D8g residue. **Evidence only; not normative.**
 - [`feedback-4-assessment.md`](feedback-4-assessment.md) — Fourth external-critique assessment and disposition record. **Evidence only; not normative.**
+- [`feedback-5-assessment.md`](feedback-5-assessment.md) — Fifth external-critique assessment and disposition record. **Evidence only; not normative.**
 - [`v2-1-review.md`](v2-1-review.md) — v2.1 architecture review and roadmap with branch-state and integration findings. **Evidence only; not normative.**
+- [`v2-1-status.md`](v2-1-status.md) — Current v2.1 milestone and integration status tracker. **Evidence only; not normative.**
 
 ## Coverage
 
 - TIER 1: **8 tracked research documents**.
-- TIER 2: **20 tracked research documents**.
-- TIER 3: **13 tracked research documents**.
-- Total: **41 research documents**, each listed exactly once above. The index
+- TIER 2: **22 tracked research documents**.
+- TIER 3: **14 tracked research documents**.
+- Total: **44 research documents**, each listed exactly once above. The index
   itself is not a tier item.
 
-**This index lists 41 files; run `git ls-files docs/research | wc -l` to verify.**
-After this README is tracked, that command reports 42 because it includes the
-index itself; the 41 tier entries are the research-document count.
+**This index lists 44 files; run `git ls-files docs/research | wc -l` to verify.**
+After this README is tracked, that command reports 45 because it includes the
+index itself; the 44 tier entries are the research-document count.

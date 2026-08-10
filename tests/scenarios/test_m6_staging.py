@@ -18,7 +18,6 @@ import pytest
 pytest.importorskip("cambium.diffundo")
 
 from cambium.diffundo import Diffundo, ProviderTier  # noqa: E402
-
 from cambium.provider_config import load_providers  # noqa: E402
 from cambium.supervisor import read_events, run_plan  # noqa: E402
 
