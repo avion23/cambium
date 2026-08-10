@@ -41,8 +41,9 @@ docs/architecture.md):
   marks the store dead: pending appends raise ``StoreError``, pending events are
   lost, and the supervisor must treat store death as fatal.
 
-All write-connection use (including ``busy_timeout`` and ``_fsync_now``) happens
-on the writer thread; readers use their own short-lived connections.
+Event rows and WAL checkpoints use the writer thread's connection; eviction
+reservations use a short-lived, full-synchronous metadata connection before a
+replacement can enter the queue. Readers use their own short-lived connections.
 """
 
 from __future__ import annotations
@@ -79,6 +80,11 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS events (
     request_id   TEXT
 )"""
 
+_SEQUENCE_SCHEMA = """CREATE TABLE IF NOT EXISTS event_store_state (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    next_seq INTEGER NOT NULL
+)"""
+
 _INSERT = (
     "INSERT INTO events(seq, kind, payload, ts, monotonic_ms, task_id, "
     "worker_id, generation, request_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -87,6 +93,11 @@ _INSERT = (
 _SELECT_AFTER = (
     "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
     "generation, request_id FROM events WHERE seq > ? ORDER BY seq"
+)
+_SELECT_NEXT_SEQ = "SELECT next_seq FROM event_store_state WHERE id = 1"
+_INSERT_NEXT_SEQ = "INSERT INTO event_store_state(id, next_seq) VALUES(1, ?)"
+_UPDATE_NEXT_SEQ = (
+    "UPDATE event_store_state SET next_seq = MAX(next_seq, ?) WHERE id = 1"
 )
 
 _WRITER_BUSY_TIMEOUT_MS = 5000
@@ -136,8 +147,10 @@ class _BoundedEventQueue:
     then ``queue.Full`` is raised. A non-critical item against a full queue is
     dropped (the incoming one). ``put`` returns the number of dropped items.
 
-    ``on_admit`` runs only after there is space. This lets the caller reserve a
-    sequence only for an item that is actually accepted by the queue.
+    ``on_evict`` runs after an accepted non-critical item is removed and before
+    the replacement is admitted. ``on_admit`` runs only after there is space.
+    This lets the caller persist an evicted sequence before reserving the next
+    one.
     """
 
     __slots__ = ("_items", "_maxsize", "_cond")
@@ -155,6 +168,7 @@ class _BoundedEventQueue:
         timeout: float,
         evict_noncritical: bool = True,
         on_admit: Callable[[], Any] | None = None,
+        on_evict: Callable[[Any], None] | None = None,
         cancel: threading.Event | None = None,
         check: Callable[[], None] | None = None,
         dropped_holder: list[int] | None = None,
@@ -180,10 +194,17 @@ class _BoundedEventQueue:
             dropped = 0
             while len(self._items) >= self._maxsize:
                 check_state()
-                if evict_noncritical and self._evict_oldest_noncritical():
+                evicted = (
+                    self._evict_oldest_noncritical()
+                    if evict_noncritical
+                    else None
+                )
+                if evicted is not None:
                     dropped += 1
                     if dropped_holder is not None:
                         dropped_holder[0] = dropped
+                    if on_evict is not None:
+                        on_evict(evicted)
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -225,16 +246,16 @@ class _BoundedEventQueue:
             self._cond.notify_all()
             return items
 
-    def _evict_oldest_noncritical(self) -> bool:
+    def _evict_oldest_noncritical(self) -> Any | None:
         for i, item in enumerate(self._items):
             if isinstance(item, tuple) and item[1] not in CRITICAL_KINDS:
                 del self._items[i]
-                return True
-        return False
+                return item
+        return None
 
 
 class EventStore:
-    """Append-only SQLite WAL event log; the writer thread is the sole write connection."""
+    """Append-only SQLite WAL event log with a sole event-row writer thread."""
 
     def __init__(
         self,
@@ -331,6 +352,7 @@ class EventStore:
                 critical=critical,
                 timeout=remaining,
                 on_admit=admit,
+                on_evict=self._reserve_evicted_sequence,
                 cancel=self._close_requested,
                 check=self._check_writer_alive,
                 dropped_holder=dropped_holder,
@@ -400,6 +422,21 @@ class EventStore:
             return
         with self._lock:
             self._dropped += count
+
+    def _reserve_evicted_sequence(self, item: Any) -> None:
+        evicted_seq = item[0]
+        with self._lock:
+            next_seq = max(self._next_seq, evicted_seq + 1)
+        conn = sqlite3.connect(self._path, isolation_level=None)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_WRITER_BUSY_TIMEOUT_MS}").fetchall()
+            conn.execute("PRAGMA synchronous=FULL").fetchall()
+            cursor = conn.execute(_UPDATE_NEXT_SEQ, (next_seq,))
+            if cursor.rowcount != 1:
+                raise StoreError("event store sequence counter is missing")
+            cursor.close()
+        finally:
+            conn.close()
 
     def _check_writer_alive(self) -> None:
         with self._lock:
@@ -534,15 +571,24 @@ class EventStore:
             conn.execute("PRAGMA synchronous=NORMAL").fetchall()
             conn.execute("PRAGMA wal_autocheckpoint=0").fetchall()
             conn.execute(_SCHEMA)
+            conn.execute(_SEQUENCE_SCHEMA)
             db_fd = os.open(self._path, os.O_RDWR)
             wal_fd = os.open(f"{self._path}-wal", os.O_RDWR)
             self._conn = conn
             self._db_fd = db_fd
             self._wal_fd = wal_fd
             with self._lock:
-                self._next_seq = conn.execute(
+                derived_next_seq = conn.execute(
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM events"
                 ).fetchone()[0]
+                row = conn.execute(_SELECT_NEXT_SEQ).fetchone()
+                if row is None:
+                    self._next_seq = derived_next_seq
+                    conn.execute(_INSERT_NEXT_SEQ, (self._next_seq,))
+                else:
+                    self._next_seq = max(int(row[0]), derived_next_seq)
+                    if self._next_seq != row[0]:
+                        conn.execute(_UPDATE_NEXT_SEQ, (self._next_seq,))
                 self._started.set()
         except BaseException as exc:
             with self._lock:

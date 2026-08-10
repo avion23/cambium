@@ -533,6 +533,92 @@ def test_writer_death_after_eviction_counts_dropped_event(tmp_path, monkeypatch)
             store._thread.join(2.0)
 
 
+def test_restart_after_evicted_event_writer_death_does_not_reuse_sequence(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=2.0)
+    fsync_started = threading.Event()
+    release = threading.Event()
+    eviction_seen = threading.Event()
+    append_errors: list[tuple[str, BaseException]] = []
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("writer failed after eviction")
+
+    def append_event(name: str, kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append((name, exc))
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    first = threading.Thread(target=append_event, args=("first", "result", 0))
+    first.start()
+    try:
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        real_check = store._check_writer_alive
+        death_triggered = False
+
+        def check_after_eviction() -> None:
+            nonlocal death_triggered
+            if not death_triggered and not store._queue._items:
+                death_triggered = True
+                eviction_seen.set()
+                release.set()
+                deadline = time.monotonic() + 1.0
+                while True:
+                    with store._lock:
+                        dead = store._dead
+                    if dead is not None:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("writer did not die after eviction")
+                    time.sleep(0.001)
+            real_check()
+
+        monkeypatch.setattr(store, "_check_writer_alive", check_after_eviction)
+        critical = threading.Thread(target=append_event, args=("critical", "result", 1))
+        critical.start()
+        assert eviction_seen.wait(1.0)
+        critical.join(2.0)
+        first.join(2.0)
+        store._thread.join(2.0)
+
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert not store._thread.is_alive()
+        assert len(append_errors) == 2
+        assert all(isinstance(error, StoreError) for _, error in append_errors)
+        assert store.dropped == 1
+        assert [event["seq"] for event in store.events_after(0)] == [1]
+        with pytest.raises(StoreError):
+            store.close()
+    finally:
+        release.set()
+        first.join(2.0)
+        if "critical" in locals():
+            critical.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+    monkeypatch.undo()
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        new_seq = reopened.append({"kind": "log", "payload": {"i": 2}})
+        assert new_seq == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
+
+
 def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
     tmp_path, monkeypatch
 ) -> None:
