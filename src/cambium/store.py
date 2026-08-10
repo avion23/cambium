@@ -42,6 +42,8 @@ from typing import Any
 CRITICAL_KINDS = frozenset({
     "result", "checkpoint", "worker_exit", "task_failed",
     "merge_progress", "task_assigned", "merge_committed",
+    "merge_staging_quarantined", "merge_staging_cleanup_failed",
+    "merge_staging_prune_started", "merge_staging_pruned",
 })
 
 _SCHEMA = """CREATE TABLE IF NOT EXISTS events (

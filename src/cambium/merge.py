@@ -38,11 +38,21 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
+import shutil
+import stat
 import subprocess
+import time
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 MAIN_REF = "refs/heads/main"
 STAGING_REF_PREFIX = "refs/cambium/staging"
+DEFAULT_QUARANTINE_MAX_ENTRIES = 15
+DEFAULT_QUARANTINE_MAX_BYTES = 1 << 30
+DEFAULT_QUARANTINE_RETENTION_NS = 7 * 24 * 60 * 60 * 1_000_000_000
+DEFAULT_QUARANTINE_MIN_FREE_BYTES = 1 << 30
 
 # git reads an all-zero old-value (like the empty string) as "the ref must not
 # exist" — an empty/zero expected_old would silently CREATE refs/heads/main.
@@ -106,6 +116,10 @@ class QuarantineError(RuntimeError):
     """
 
 
+class StagingCleanupError(RuntimeError):
+    """A staging tree could not be removed or quarantined safely."""
+
+
 class GitError(RuntimeError):
     """A git invocation failed to run. Carries the command and output.
 
@@ -163,11 +177,251 @@ class MergeSequencer:
     can later remove exactly what this instance created.
     """
 
-    def __init__(self, task_id: str | None = None) -> None:
+    def __init__(
+        self,
+        task_id: str | None = None,
+        *,
+        session_dir: Path | None = None,
+        quarantine_max_entries: int = DEFAULT_QUARANTINE_MAX_ENTRIES,
+        quarantine_max_bytes: int = DEFAULT_QUARANTINE_MAX_BYTES,
+        quarantine_retention_ns: int = DEFAULT_QUARANTINE_RETENTION_NS,
+        quarantine_min_free_bytes: int = DEFAULT_QUARANTINE_MIN_FREE_BYTES,
+    ) -> None:
         self._task_id = task_id
+        self._task_key = sha256((task_id or "unknown").encode()).hexdigest()[:16]
+        self._session_dir = Path(session_dir).resolve() if session_dir is not None else None
+        self._quarantine_max_entries = quarantine_max_entries
+        self._quarantine_max_bytes = quarantine_max_bytes
+        self._quarantine_retention_ns = quarantine_retention_ns
+        self._quarantine_min_free_bytes = quarantine_min_free_bytes
         self._worktree_path: Path | None = None
         self._staging_branch: str | None = None
         self._staging_ref: str | None = None
+        self._events: list[tuple[str, dict[str, Any]]] = []
+
+    def drain_events(self) -> list[tuple[str, dict[str, Any]]]:
+        """Return and clear events produced by synchronous git operations."""
+        events, self._events = self._events, []
+        return events
+
+    @property
+    def staging_ref(self) -> str | None:
+        return self._staging_ref
+
+    @property
+    def staging_branch(self) -> str | None:
+        return self._staging_branch
+
+    def _event(self, kind: str, **payload: Any) -> None:
+        self._events.append((kind, payload))
+
+    def _quarantine_root(self) -> Path:
+        if self._session_dir is None:
+            raise StagingCleanupError("dirty staging requires a session quarantine directory")
+        root = self._session_dir / ".cambium" / "quarantine" / "merge"
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        current = root
+        stop = self._session_dir / ".cambium"
+        while current.is_relative_to(stop):
+            os.chmod(current, 0o700)
+            if current == stop:
+                break
+            current = current.parent
+        return root
+
+    @staticmethod
+    def _allocated_bytes(path: Path) -> int:
+        """Allocated bytes below path, without following symlinks."""
+        total = 0
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            info = current.lstat()
+            total += info.st_blocks * 512
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                continue
+            with os.scandir(current) as entries:
+                pending.extend(Path(entry.path) for entry in entries)
+        return total
+
+    def _artifact_bytes(self, repo: Path, path: Path) -> int:
+        total = self._allocated_bytes(path)
+        git_dir = self._run(path, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+        admin = Path(git_dir)
+        if admin.exists() and not admin.is_relative_to(path):
+            total += self._allocated_bytes(admin)
+        return total
+
+    def _in_progress(self, worktree_path: Path) -> bool:
+        markers = (
+            "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+            "REVERT_HEAD", "BISECT_LOG", "sequencer",
+        )
+        for marker in markers:
+            result = self._run(worktree_path, "rev-parse", "--git-path", marker, check=False)
+            if result.returncode == 0 and Path(result.stdout.strip()).exists():
+                return True
+        return False
+
+    def _dirty_reasons(self, worktree_path: Path) -> list[str]:
+        status_result = self._run(
+            worktree_path, "status", "--porcelain=v1", "--untracked-files=all",
+            "--ignored=matching", "-z", check=False,
+        )
+        if status_result.returncode != 0:
+            raise StagingCleanupError("cannot inspect staging worktree state")
+        reasons: set[str] = set()
+        for record in status_result.stdout.split("\0"):
+            if len(record) < 2:
+                continue
+            pair = record[:2]
+            if pair == "??":
+                reasons.add("untracked")
+            elif pair == "!!":
+                reasons.add("ignored")
+            else:
+                if pair[0] != " ":
+                    reasons.add("indexed")
+                if pair[1] != " ":
+                    reasons.add("tracked")
+        if self._in_progress(worktree_path):
+            reasons.add("in-progress")
+        return sorted(reasons)
+
+    @staticmethod
+    def _quarantine_entries(root: Path) -> list[Path]:
+        if not root.exists():
+            return []
+        entries: list[Path] = []
+        for task_dir in root.glob("task-[0-9a-f]" + "[0-9a-f]" * 15):
+            if not task_dir.is_dir() or task_dir.is_symlink():
+                continue
+            entries.extend(
+                entry for entry in task_dir.iterdir()
+                if entry.is_dir() and not entry.is_symlink()
+            )
+        return entries
+
+    def _registered_paths(self, repo: Path) -> set[Path]:
+        result = self._run_repo(repo, "worktree", "list", "--porcelain")
+        return {
+            Path(line[9:]).resolve()
+            for line in result.stdout.splitlines()
+            if line.startswith("worktree ")
+        }
+
+    def _delete_quarantine_entry(self, repo: Path, entry: Path) -> None:
+        registered = entry.resolve() in self._registered_paths(repo)
+        branch = ""
+        if registered:
+            branch = self._run(
+                entry, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+            ).stdout.strip()
+        if registered:
+            result = self._run_repo(
+                repo, "worktree", "remove", "--force", str(entry), check=False
+            )
+            if result.returncode != 0:
+                raise StagingCleanupError("cannot prune registered quarantine worktree")
+        elif entry.exists():
+            raise StagingCleanupError("quarantine worktree is not registered in this repository")
+        if branch.startswith("cambium-merge/"):
+            suffix = branch.removeprefix("cambium-merge/")
+            self._run_repo(repo, "branch", "-D", branch, check=False)
+            self._run_repo(repo, "update-ref", "-d", f"{STAGING_REF_PREFIX}/{suffix}", check=False)
+
+    def _prune_quarantine(self, repo: Path, *, newest: Path | None = None) -> None:
+        root = self._quarantine_root()
+        entries = self._quarantine_entries(root)
+        if not entries:
+            return
+        self._event("merge_staging_prune_started", entries=len(entries))
+        now = time.time_ns()
+
+        def details(entry: Path) -> tuple[int, int]:
+            return entry.stat().st_mtime_ns, self._artifact_bytes(repo, entry)
+
+        measured = {entry: details(entry) for entry in entries}
+        newest_bytes = measured.get(newest, (0, 0))[1] if newest is not None else 0
+        if newest is not None and newest_bytes > self._quarantine_max_bytes:
+            raise StagingCleanupError("newest quarantine artifact exceeds the byte cap")
+
+        expired = sorted(
+            (
+                entry
+                for entry in entries
+                if now - measured[entry][0] >= self._quarantine_retention_ns
+            ),
+            key=lambda entry: measured[entry][0],
+        )
+        oldest = sorted(
+            (entry for entry in entries if entry not in expired),
+            key=lambda entry: measured[entry][0],
+        )
+        removed = 0
+        removed_bytes = 0
+        for entry in [*expired, *oldest]:
+            current_entries = [item for item in entries if item.exists()]
+            aggregate = sum(measured[item][1] for item in current_entries)
+            free = shutil.disk_usage(root).free
+            is_expired = entry in expired
+            over = (
+                len(current_entries) > self._quarantine_max_entries
+                or aggregate > self._quarantine_max_bytes
+                or free < self._quarantine_min_free_bytes
+            )
+            if not is_expired and not over:
+                break
+            if newest is not None and entry == newest:
+                continue
+            size = measured[entry][1]
+            self._delete_quarantine_entry(repo, entry)
+            removed += 1
+            removed_bytes += size
+        remaining = [item for item in entries if item.exists()]
+        remaining_bytes = sum(measured[item][1] for item in remaining)
+        if removed:
+            self._event(
+                "merge_staging_pruned", entries=removed, allocated_bytes=removed_bytes
+            )
+        if (
+            len(remaining) > self._quarantine_max_entries
+            or remaining_bytes > self._quarantine_max_bytes
+            or shutil.disk_usage(root).free < self._quarantine_min_free_bytes
+        ):
+            raise StagingCleanupError("quarantine bounds cannot be satisfied")
+
+    def _quarantine_staging(
+        self, repo: Path, worktree_path: Path, reasons: list[str]
+    ) -> Path:
+        root = self._quarantine_root()
+        task_dir = root / f"task-{self._task_key}"
+        task_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(task_dir, 0o700)
+        destination = task_dir / f"{time.time_ns()}-{secrets.token_hex(8)}"
+        staging_sha = self._rev_parse(worktree_path, "HEAD")
+        result = self._run_repo(
+            repo, "worktree", "move", str(worktree_path), str(destination), check=False
+        )
+        if result.returncode != 0:
+            self._event(
+                "merge_staging_cleanup_failed", task=self._task_id,
+                staging_sha=staging_sha, reason="worktree-move-failed",
+            )
+            raise StagingCleanupError("cannot move dirty staging worktree to quarantine")
+        allocated = self._artifact_bytes(repo, destination)
+        relative_id = destination.relative_to(self._session_dir / ".cambium" / "quarantine")
+        self._event(
+            "merge_staging_quarantined", task=self._task_id, staging_sha=staging_sha,
+            quarantine_id=relative_id.as_posix(), allocated_bytes=allocated,
+            reason=",".join(reasons),
+            expiry=time.time_ns() + self._quarantine_retention_ns,
+        )
+        self._worktree_path = None
+        self._staging_branch = None
+        self._staging_ref = None
+        self._prune_quarantine(repo, newest=destination)
+        return destination
 
     # -- git plumbing -------------------------------------------------------
 
@@ -295,7 +549,7 @@ class MergeSequencer:
         if worktree_path == repo.resolve():
             raise ValueError(f"throwaway worktree must not be the repo itself: {worktree_path}")
 
-        ident = self._task_id or branch
+        ident = f"{self._task_key}-{secrets.token_hex(6)}"
         staging_ref = f"{STAGING_REF_PREFIX}/{ident}"
         staging_branch = f"cambium-merge/{ident}"
 
@@ -303,24 +557,29 @@ class MergeSequencer:
         worker_tip = self._ensure_worker_tip(repo, branch)
 
         if self._is_registered_worktree(repo, worktree_path):
-            # Reuse our own throwaway worktree: clear any in-progress git state
-            # (crash leftovers), then pin it to the worker tip on the staging
-            # branch. This is a sequencer-owned worktree; --force discards only
-            # its own previous staging state.
-            self._run(worktree_path, "rebase", "--abort", check=False)
-            self._run(worktree_path, "merge", "--abort", check=False)
-            self._run(worktree_path, "cherry-pick", "--abort", check=False)
-            self._run(
-                worktree_path, "checkout", "--force", "-B", staging_branch, worker_tip, check=True
-            )
-        else:
+            reasons = self._dirty_reasons(worktree_path)
+            if reasons:
+                self._quarantine_staging(repo, worktree_path, reasons)
+            else:
+                self._remove_clean_staging(repo, worktree_path)
+                self._drop_staging_refs(repo)
+            self._worktree_path = None
+            self._staging_branch = None
+            self._staging_ref = None
+
+        if not self._is_registered_worktree(repo, worktree_path):
             # Fresh throwaway worktree on a new staging branch at the worker tip.
             # The worker branch itself stays checked out in the worker's own
             # worktree (finding F18: it cannot be rebased in place).
-            self._run_repo(
-                repo, "worktree", "add", "-B", staging_branch, str(worktree_path), worker_tip,
-                check=True,
-            )
+            self._run_repo(repo, "update-ref", staging_ref, worker_tip, check=True)
+            try:
+                self._run_repo(
+                    repo, "worktree", "add", "-B", staging_branch, str(worktree_path),
+                    worker_tip, check=True,
+                )
+            except Exception:
+                self._run_repo(repo, "update-ref", "-d", staging_ref, check=False)
+                raise
 
         self._worktree_path = worktree_path
         self._staging_branch = staging_branch
@@ -331,7 +590,6 @@ class MergeSequencer:
         )
         if rebase.returncode != 0:
             conflicts = self._conflicted_paths(worktree_path, rebase.stdout + rebase.stderr)
-            self._run(worktree_path, "rebase", "--abort", check=False)
             raise MergeConflictError(
                 f"rebase of {branch} onto {base_tip} failed; "
                 f"conflicted paths: {conflicts or '(none detected)'}",
@@ -354,6 +612,16 @@ class MergeSequencer:
                 f"{_QUARANTINE_ENV} is set; git update-ref forbids ref updates inside a "
                 "quarantine environment. The caller must unset it before publishing."
             )
+
+    def ensure_staging_clean(self, repo: Path) -> None:
+        """Fail closed before publish if staging gained uncommitted state."""
+        if self._worktree_path is None:
+            raise StagingCleanupError("no staging worktree is prepared")
+        reasons = self._dirty_reasons(self._worktree_path)
+        if not reasons:
+            return
+        self._quarantine_staging(Path(repo), self._worktree_path, reasons)
+        raise StagingCleanupError("dirty staging was quarantined before publish")
 
     def _main_exists(self, repo: Path) -> bool:
         result = self._run_repo(repo, "rev-parse", "--verify", MAIN_REF, check=False)
@@ -481,53 +749,107 @@ class MergeSequencer:
             )
         raise RuntimeError(f"git update-ref {MAIN_REF} failed: {detail[:512]}")
 
-    def reconcile(self, repo: Path) -> str | None:
+    def reconcile(
+        self, repo: Path, worktree_path: Path | None = None, *, scan_quarantine: bool = True
+    ) -> str | None:
         """Return the current ``refs/heads/main`` SHA, or None if absent.
 
         Recovery hook: the caller compares the returned SHA to its last durable
         ``merge_committed`` event and appends a ``merge_reconciled`` event when
         the ref advanced without one (architecture §7.8 crash gap).
         """
+        repo = Path(repo)
+        if self._session_dir is not None and scan_quarantine:
+            root = self._quarantine_root()
+            for entry in self._quarantine_entries(root):
+                relative_id = entry.relative_to(self._session_dir / ".cambium" / "quarantine")
+                task_key = entry.parent.name.removeprefix("task-")
+                self._event(
+                    "merge_staging_quarantined",
+                    task=self._task_id if task_key == self._task_key else None,
+                    staging_sha=self._rev_parse(entry, "HEAD"),
+                    quarantine_id=relative_id.as_posix(),
+                    allocated_bytes=self._artifact_bytes(repo, entry),
+                    reason="startup-reconciled",
+                    expiry=entry.stat().st_mtime_ns + self._quarantine_retention_ns,
+                )
+            self._prune_quarantine(repo)
+        if worktree_path is not None and self._is_registered_worktree(repo, worktree_path):
+            worktree_path = Path(worktree_path).resolve()
+            self._worktree_path = worktree_path
+            branch = self._run(
+                worktree_path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+            ).stdout.strip()
+            self._staging_branch = branch or None
+            suffix = branch.removeprefix("cambium-merge/") if branch else ""
+            self._staging_ref = f"{STAGING_REF_PREFIX}/{suffix}" if suffix else None
+            reasons = self._dirty_reasons(worktree_path)
+            if reasons:
+                self._quarantine_staging(repo, worktree_path, reasons)
+            else:
+                self._remove_clean_staging(repo, worktree_path)
+                self._drop_staging_refs(repo)
+                self._worktree_path = None
+                self._staging_branch = None
+                self._staging_ref = None
         try:
             return self._rev_parse(repo, MAIN_REF)
         except GitError:
             return None
 
+    def _remove_clean_staging(self, repo: Path, worktree_path: Path) -> None:
+        if self._dirty_reasons(worktree_path):
+            raise StagingCleanupError("refusing to remove dirty staging worktree")
+        removed = self._run_repo(repo, "worktree", "remove", str(worktree_path), check=False)
+        if removed.returncode != 0:
+            raise StagingCleanupError("cannot remove clean staging worktree")
+
+    def _drop_staging_refs(self, repo: Path) -> None:
+        failures: list[str] = []
+        if self._staging_branch is not None:
+            result = self._run_repo(repo, "branch", "-D", self._staging_branch, check=False)
+            if result.returncode != 0:
+                failures.append("branch")
+        if self._staging_ref is not None:
+            result = self._run_repo(repo, "update-ref", "-d", self._staging_ref, check=False)
+            if result.returncode != 0:
+                failures.append("ref")
+        if failures:
+            raise StagingCleanupError("cannot remove staging " + " and ".join(failures))
+
     def cleanup_staging(self, repo: Path) -> None:
         """Remove this instance's throwaway worktree, staging branch, and staging ref.
 
-        Only removes the worktree path recorded by this instance's last
-        ``prepare_staging``. The throwaway worktree is sequencer-owned, so its
-        leftovers are reset/cleaned before removal — but an unknown path is
-        never touched, and ``--force`` is never used.
+        Clean trees are removed. Dirty trees are moved intact to the bounded
+        session quarantine. No reset, clean, checkout, or abort runs first.
         """
         repo = Path(repo)
         worktree_path = self._worktree_path
-        staging_branch = self._staging_branch
-        staging_ref = self._staging_ref
         if worktree_path is None:
             return
 
-        removal_error: str | None = None
-        if self._is_registered_worktree(repo, worktree_path):
-            self._run(worktree_path, "rebase", "--abort", check=False)
-            self._run(worktree_path, "merge", "--abort", check=False)
-            self._run(worktree_path, "reset", "--hard", "HEAD", check=False)
-            self._run(worktree_path, "clean", "-fd", check=False)
-            removed = self._run_repo(repo, "worktree", "remove", str(worktree_path), check=False)
-            if removed.returncode != 0:
-                removal_error = (
-                    f"could not remove throwaway worktree {worktree_path}: "
-                    f"{(removed.stderr + removed.stdout).strip()[:512]}"
+        try:
+            if self._is_registered_worktree(repo, worktree_path):
+                reasons = self._dirty_reasons(worktree_path)
+                if reasons:
+                    self._quarantine_staging(repo, worktree_path, reasons)
+                    return
+                self._remove_clean_staging(repo, worktree_path)
+            self._drop_staging_refs(repo)
+        except Exception as exc:
+            if not any(kind == "merge_staging_cleanup_failed" for kind, _ in self._events):
+                staging_sha = "unknown"
+                if worktree_path.exists():
+                    try:
+                        staging_sha = self._rev_parse(worktree_path, "HEAD")
+                    except GitError:
+                        pass
+                self._event(
+                    "merge_staging_cleanup_failed", task=self._task_id,
+                    staging_sha=staging_sha, reason=exc.__class__.__name__,
                 )
-
-        if staging_branch is not None:
-            self._run_repo(repo, "branch", "-D", staging_branch, check=False)
-        if staging_ref is not None:
-            self._run_repo(repo, "update-ref", "-d", staging_ref, check=False)
-        self._worktree_path = None
-        self._staging_branch = None
-        self._staging_ref = None
-
-        if removal_error is not None:
-            raise RuntimeError(removal_error)
+            raise
+        finally:
+            self._worktree_path = None
+            self._staging_branch = None
+            self._staging_ref = None

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -392,10 +393,7 @@ async def run_session(
 # backoff with a per-task cap; worktrees are hard-reset before every
 # respawn; results are gated and merged atomically onto refs/heads/main.
 #
-# cambium.store / cambium.merge / cambium.worker are dependency contracts
-# that may live in sibling worktrees (import-guarded below). When absent,
-# this module provides minimal drop-in stand-ins (_FallbackEventStore /
-# _FallbackSequencer) so the runtime is fully exercisable.
+# cambium.store and cambium.merge are runtime dependency contracts.
 # =====================================================================
 
 DEFAULT_READY_TIMEOUT_S = 10.0
@@ -416,6 +414,8 @@ MAX_PARSE_ERRORS = 500
 CRITICAL_KINDS = frozenset({
     "result", "checkpoint", "worker_exit", "task_failed",
     "merge_progress", "task_assigned", "merge_committed",
+    "merge_staging_quarantined", "merge_staging_cleanup_failed",
+    "merge_staging_prune_started", "merge_staging_pruned",
 })
 
 _API_KEY_RE = re.compile(
@@ -556,6 +556,11 @@ class _FallbackSequencer:
 
     _UNMERGED = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
 
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        """Delegate to the canonical sequencer so fallback behavior cannot drift."""
+        mod = importlib.import_module("cambium.merge")
+        return mod.MergeSequencer(*args, **kwargs)
+
     def __init__(self, task_id: str | None = None) -> None:
         self._task_id = task_id
         self._worktree_path: Path | None = None
@@ -600,8 +605,7 @@ class _FallbackSequencer:
         self._staging_ref = f"refs/cambium/staging/{ident}"
         self._worktree_path = worktree_path
         if self._is_registered(repo, worktree_path):
-            self._run(worktree_path, "rebase", "--abort", check=False)
-            self._run(repo, "worktree", "remove", "--force", str(worktree_path), check=False)
+            raise RuntimeError("canonical merge sequencer required for existing staging")
         base_tip = self._run(repo, "rev-parse", f"{base}^{{commit}}").stdout.strip()
         worker_tip = self._run(
             repo, "rev-parse", f"refs/heads/{branch}^{{commit}}"
@@ -646,10 +650,7 @@ class _FallbackSequencer:
         repo = Path(repo)
         if self._worktree_path is not None:
             if self._is_registered(repo, self._worktree_path):
-                self._run(self._worktree_path, "rebase", "--abort", check=False)
-                self._run(
-                    repo, "worktree", "remove", "--force", str(self._worktree_path), check=False
-                )
+                raise RuntimeError("canonical merge sequencer required for staging cleanup")
             self._worktree_path = None
         if self._staging_branch is not None:
             self._run(repo, "branch", "-D", self._staging_branch, check=False)
@@ -810,7 +811,10 @@ class _Runtime:
             "monotonic_ms": time.monotonic_ns() // 1_000_000,
             "payload": dict(payload),
         }
-        self._queue.put_nowait(record)
+        if kind in CRITICAL_KINDS:
+            await asyncio.to_thread(self._store.append, record)
+        else:
+            self._queue.put_nowait(record)
         if self._on_event is not None:
             result = self._on_event(record)
             if asyncio.iscoroutine(result):
@@ -1442,9 +1446,79 @@ class _Runtime:
     # -- merge ---------------------------------------------------------------
 
     def _make_sequencer(self, task_id: str) -> Any:
-        if self._merge_cls is not None:
-            return self._merge_cls(task_id=task_id)
-        return _FallbackSequencer(task_id=task_id)
+        if self._merge_cls is None:
+            raise RuntimeError("cambium.merge.MergeSequencer is unavailable")
+        return self._merge_cls(task_id=task_id, session_dir=self._session_dir)
+
+    async def _flush_sequencer_events(
+        self, seq: Any, task_keys: dict[str, str] | None = None
+    ) -> set[str]:
+        if not hasattr(seq, "drain_events"):
+            return set()
+        prior = {
+            event["payload"].get("quarantine_id")
+            for event in await asyncio.to_thread(self._store.events_after, 0)
+            if event["kind"] == "merge_staging_quarantined"
+        }
+        emitted: set[str] = set()
+        for kind, payload in seq.drain_events():
+            if kind == "merge_staging_quarantined" and payload.get("quarantine_id") in prior:
+                continue
+            task_id = payload.pop("task", None)
+            if task_id is None and task_keys is not None:
+                quarantine_id = payload.get("quarantine_id", "")
+                match = re.match(r"merge/task-([0-9a-f]{16})/", quarantine_id)
+                if match:
+                    task_id = task_keys.get(match.group(1))
+            await self.emit(kind, task_id=task_id, **payload)
+            emitted.add(kind)
+        return emitted
+
+    async def reconcile(self, specs: list[dict[str, Any]]) -> None:
+        """Reconcile staging moves and the git-ref/event publish gap on startup."""
+        scanned_repos: set[Path] = set()
+        task_keys = {
+            hashlib.sha256(spec["task_id"].encode()).hexdigest()[:16]: spec["task_id"]
+            for spec in specs
+        }
+        for spec in specs:
+            repo = Path(spec["repo"])
+            task_id = spec["task_id"]
+            task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+            throwaway = self._session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+            seq = self._make_sequencer(task_id)
+            current = await asyncio.to_thread(
+                seq.reconcile, repo, throwaway,
+                scan_quarantine=repo not in scanned_repos,
+            )
+            scanned_repos.add(repo)
+            await self._flush_sequencer_events(seq, task_keys)
+            if current is None:
+                continue
+            events = await asyncio.to_thread(self._store.events_after, 0)
+            recorded = {
+                event["payload"].get("new")
+                for event in events
+                if event["kind"] in ("merge_committed", "merge_reconciled")
+            }
+            if current in recorded:
+                continue
+            refs = await self._git_stdout(
+                repo, "for-each-ref", "--format=%(refname:strip=3) %(objectname)",
+                "refs/cambium/staging", check=False,
+            ) or ""
+            owner: str | None = None
+            for line in refs.splitlines():
+                suffix, _, tip = line.partition(" ")
+                key = suffix.split("-", 1)[0]
+                if tip == current and key in task_keys:
+                    owner = task_keys[key]
+                    break
+            if owner is not None:
+                await self.emit(
+                    "merge_reconciled", task_id=owner, new=current, repo=str(repo),
+                    reason="ref-advanced-before-event",
+                )
 
     async def _merge_task(self, spec: dict[str, Any], handle: WorkerHandle) -> str | None:
         """Stage and atomically publish the worker branch onto refs/heads/main.
@@ -1459,8 +1533,11 @@ class _Runtime:
         await self.emit(
             "merge_started", task_id=task_id, branch=branch, generation=handle.generation
         )
-        throwaway = self._session_dir / ".cambium" / "merge-wt" / task_id
+        task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+        throwaway = self._session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
         seq = self._make_sequencer(task_id)
+        published = False
+        cleanup_failed = False
         try:
             async with self._merge_lock:  # Unio single-writer: serialized merges
                 current_main = await self._git_stdout(
@@ -1471,7 +1548,16 @@ class _Runtime:
                 staging_tip = await asyncio.to_thread(
                     seq.prepare_staging, repo, throwaway, branch, current_main
                 )
+                await self._flush_sequencer_events(seq)
+                if hasattr(seq, "ensure_staging_clean"):
+                    await asyncio.to_thread(seq.ensure_staging_clean, repo)
+                    await self._flush_sequencer_events(seq)
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
+                await self.emit(
+                    "merge_committed", task_id=task_id, old=current_main, new=staging_tip,
+                    repo=str(repo), branch=branch, generation=handle.generation,
+                )
+                published = True
         except Exception as exc:
             error_type = exc.__class__.__name__
             if error_type in ("NonFastForwardError", "MergeConflictError"):
@@ -1489,12 +1575,18 @@ class _Runtime:
             try:
                 if hasattr(seq, "cleanup_staging"):
                     await asyncio.to_thread(seq.cleanup_staging, repo)
-            except Exception:
-                pass
-        await self.emit(
-            "merge_committed", task_id=task_id, old=current_main, new=staging_tip,
-            branch=branch, generation=handle.generation,
-        )
+            except Exception as exc:
+                cleanup_failed = True
+                emitted = await self._flush_sequencer_events(seq)
+                if published and "merge_staging_cleanup_failed" not in emitted:
+                    await self.emit(
+                        "merge_staging_cleanup_failed", task_id=task_id,
+                        staging_sha=staging_tip, reason=exc.__class__.__name__,
+                    )
+            else:
+                await self._flush_sequencer_events(seq)
+        if cleanup_failed:
+            return None
         return staging_tip
 
 
@@ -1556,6 +1648,7 @@ async def run_plan(
     await runtime.start()
     cancelled = False
     try:
+        await runtime.reconcile(specs)
         async with asyncio.TaskGroup() as tg:
             for spec in specs:
                 tg.create_task(runtime.supervise_task(spec))

@@ -18,6 +18,7 @@ Scenarios:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -27,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+from cambium.merge import MergeSequencer
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -374,3 +376,51 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
     assert "init" in kinds
     assert "session_ended" in kinds
     assert kinds[-1] == "session_ended"
+
+
+def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-publish-gap"
+    worker_tree = session_dir / "wt-gap"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-gap", str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-gap", "main")
+    secret_name = "secret-kill-window.txt"
+    (staging / secret_name).write_text("secret kill-window content")
+    seq.publish_merge(repo, staged, base)  # simulated kill before merge_committed
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-gap", branch="wt-gap",
+                target_file="a.txt", marker="// after-restart",
+                gate="grep -q '// after-restart' a.txt",
+            )
+        ]
+    }
+    result = asyncio.run(run_plan(session_dir, plan))
+    assert result.exit_code == 0
+    events = read_events(session_dir)
+    reconciled = _kinds(events, "merge_reconciled")
+    quarantined = _kinds(events, "merge_staging_quarantined")
+    assert reconciled and reconciled[0]["payload"]["new"] == staged
+    assert quarantined
+    quarantine_id = quarantined[0]["payload"]["quarantine_id"]
+    artifact = session_dir / ".cambium" / "quarantine" / quarantine_id
+    assert (artifact / secret_name).read_text() == "secret kill-window content"
+    payloads = json.dumps([event["payload"] for event in quarantined])
+    assert secret_name not in payloads
+    assert "secret kill-window content" not in payloads
