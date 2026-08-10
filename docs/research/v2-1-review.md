@@ -1,536 +1,358 @@
 # Cambium v2.1 Architecture Review and Roadmap
 
 **Date:** 2026-08-09
-
 **Review branch:** `wt-sol2` from `main@d67cd5e`
+**Verdict:** v2 has credible deterministic components and a tested vertical slice, but no
+coherent production harness. v2.1 must integrate and harden one runtime before adding optimizer
+breadth.
 
-**Verdict:** v2 has credible deterministic components and a tested vertical slice. It is
-not yet a coherent production harness. v2.1 must integrate and harden the components before
-it adds optimizer breadth.
+**Historical snapshot / current pointer:** this review preserves branch-state evidence. The
+review branch contained store/merge/IPC/worker/task-tree/doctor/slice source and 108 scenario
+functions (29 task tree, 22 IPC, 19 dataset, 14 merge, 8 slice, 7 store, 6 module, 3 tooling).
+Custos `wt-impl-super@9746b96`, Diffundo `wt-impl-diffundo@f5ae0d3`, bench
+`wt-impl-bench@21257b3`, and redaction `wt-redact@1b449df` were branch-local, not ancestors;
+audits were `wt-audit-security@6a137fb`, `wt-audit-conformance@30832d1`, and
+`wt-audit-constitution@cb3dde2`. These counts/SHAs are not release certification.
 
-## Evidence and provenance
-
-This review distinguishes the current review branch from implementation and audit branches.
-That distinction matters:
-
-- The current review branch contains the event store, merge sequencer, IPC/worker seed,
-  task-tree helper, split datasets, doctor, and the original vertical-slice supervisor
-  (`src/cambium/{store,merge,ipc,worker,tasktree,doctor,supervisor}.py`). It has **108
-  scenario test functions**: task tree 29, IPC 22, dataset splits 19, merge 14, vertical
-  slice 8, store 7, example module 6, tooling 3 (`tests/scenarios/test_*.py`, counted by
-  `rg -c '^((async )?def test_)'`).
-- Custos, Diffundo, bench, and redaction were inspected at `wt-impl-super@9746b96`,
-  `wt-impl-diffundo@f5ae0d3`, `wt-impl-bench@21257b3`, and
-  `wt-redact@1b449df`. Their branch-local scenario counts are respectively 21, 53, 41,
-  and 65, but these overlap heavily and **must not be summed**. They are **UNVERIFIED on
-  `wt-sol2`** because those commits are not ancestors of the review branch.
-- The three requested audits are also not present on the review branch. They were inspected
-  at `wt-audit-security@6a137fb`, `wt-audit-conformance@30832d1`, and
-  `wt-audit-constitution@cb3dde2`. All audit `main@3d27ba3`, before IPC, task tree, split
-  datasets, and later architecture folds. Their findings are valid point-in-time evidence,
-  not a post-integration certification. There is **no aggregate full-stack test or audit
-  result**. Any claim that “the full v2 stack is merged and certified” is therefore
-  **UNVERIFIED** in this worktree.
-
-That branch-state discrepancy is not clerical. It is the strongest current evidence for the
-central diagnosis: Cambium has built modules faster than it has established one integrated,
-audited release baseline.
+For current behavior use `docs/architecture/architecture.md`, `src/cambium/`, and
+`docs/research/v2-1-status.md`. Current notes: provider loop, Diffundo, EventStore, and root
+`Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and `events` are absent; there is
+no per-worker sandbox or production shell approval, and no dynamic hierarchy.
 
 ## 1. State assessment
 
-### 1.1 What v2 actually delivers
-
-#### Deterministic substrate
-
-1. **Durable event storage exists and has the correct core mechanics.** `EventStore` uses
-   one writer thread, SQLite WAL, critical-event producer acknowledgement after checkpoint
-   and fsync, and separate reader connections (`src/cambium/store.py:93-158,172-272`). The
-   conformance audit calls fsync-before-ack and single-writer behavior conforming
-   (`wt-audit-conformance@30832d1:docs/research/conformance-report.md` §1.2-§1.3). The
-   folded architecture has already reconciled `recovery_gap` out of the contract in favor
-   of no-gap-by-construction plus a phantom-read caveat
-   (`docs/architecture/architecture.md` §6.3, §6.5).
-2. **The merge primitive is substantially stronger than the slice.** `MergeSequencer`
-   stages in a throwaway worktree, captures a reachable staging ref, rejects quarantine,
-   verifies ancestry, and publishes with `git update-ref <new> <expected-old>`
-   (`src/cambium/merge.py:158-177,281-344,346-482`). The conformance audit verifies every
-   cited worktree-concurrency experiment and the atomic publish mechanics
-   (`conformance-report.md` §3.1-§3.2). This is the right Unio core.
-3. **Nuntius framing and an Opifex seed are real.** The reader enforces a 1 MiB line cap,
-   resynchronizes after oversized lines, skips malformed/non-object JSON, and discards a
-   torn tail at EOF (`src/cambium/ipc.py:28-129`). The worker implements init/ready,
-   request correlation, heartbeats, cancellation, health, result/exit ordering, a 64 KiB
-   diff cap, and idle/init deadlines (`src/cambium/worker.py:66-93,219-317,356-494`). This
-   resolves the conformance audit's old N-A item M3 on the current branch, but not the
-   end-to-end Custos integration that audit could not inspect.
-4. **The Task Tree validator is real and pure.** It enforces unique IDs, one root,
-   no unknown dependencies, no multi-parent nodes, cycle rejection, depth/fan-out bounds,
-   deterministic topological order, subtree isolation, and an exact upward envelope
-   (`src/cambium/tasktree.py:233-478`). The 29 scenario tests are the broadest current
-   module test surface (`tests/scenarios/test_tasktree.py`). It is a validator and scheduler
-   input, not Architectus execution.
-5. **Doctor and dataset mechanics are useful release tooling.** Doctor validates Python,
-   git, event-store integrity, datasets, worktrees, and secret-file hygiene
-   (`src/cambium/doctor.py`, exercised by `tests/scenarios/test_tooling.py`). The reference
-   module now has train/eval/canary splits and loader rules
-   (`src/cambium/modules/example/datasets/`,
-   `src/cambium/modules/example/tests/test_dataset_splits.py`).
-
-#### Orchestration and provider modules available on implementation branches
-
-6. **Custos has a substantive implementation, but it is not the reviewed baseline.** The
-   branch implementation supervises multiple workers, tracks heartbeats and generation,
-   restarts with jitter, recovers worktrees, gates results, serializes merge publication,
-   and writes through the event store (`wt-impl-super@9746b96:src/cambium/supervisor.py`,
-   `_Runtime`, `_drive_generation`, `_run_gate`, `_merge_task`, `run_plan`). It also embeds
-   fallback event-store and sequencer implementations and retains the old slice in the same
-   1,600-line file (`supervisor.py:1-394,455-698`). Those fallbacks undermine the claim
-   that integration failures fail loudly.
-7. **Diffundo is implemented as a router, not a response cache.** It has tier filtering,
-   ordered cascade, per-provider circuit state, token buckets, pause/recovery monitoring,
-   prompt-prefix linting, bounded retries, and an OpenAI-compatible HTTP adapter
-   (`wt-impl-diffundo@f5ae0d3:src/cambium/diffundo.py:57-180,203-224,362-432,514-816`).
-   Its `call_race` method remains even though the folded architecture removes race mode
-   from the default design (`diffundo.py:434-512`; `docs/architecture/architecture.md`
-   §9.2). That is optional surface without a v2.1 requirement.
-8. **Bench and redaction are independently useful.** Bench discovers decision modules,
-   scores all dataset splits, records test timing, and gates metric/canary/dataset drift
-   (`wt-impl-bench@21257b3:src/cambium/bench.py:104-359,367-509`). Redaction handles
-   known provider credentials, authorization headers, JWTs, private keys, secret-named
-   fields, emails, recursive mappings, and worker env construction
-   (`wt-redact@1b449df:src/cambium/redact.py:49-122,170-238,241-275`). Redaction's value is
-   still unrealized until Custos applies it before every event enqueue and log write.
-
-### 1.2 What the audits actually say
-
-- **Security audit:** 22 findings: **1 HIGH, 7 MEDIUM, 4 LOW, 6 PASS, 4 INFO**
-  (`security-audit.md` §7). HIGH F-01 is full host-environment inheritance. MEDIUM F-02
-  is absent redaction, F-04 unsafe reuse of a registered merge worktree, F-05 unvalidated
-  refs/refspecs, F-06 unbounded stdin writes and merge, F-07 unbounded worker-output queue,
-  and F-20 runtime bypass of the hardened store/merge. The audit also flags approval gates
-  and generation-file fencing as absent/UNVERIFIED (`security-audit.md` §6).
-- **Conformance audit:** **5 MEDIUM and 8 LOW** gaps, with IPC/worker and end-to-end
-  store-worker identity marked N-A at its baseline (`conformance-report.md` §7-§8).
-  Current `main` has since resolved the IPC-file N-A and the architecture has resolved M1,
-  L6-L8 at the specification level. The major surviving evidence is M2 (production wiring),
-  M4 (orphaned event model), M5 (`worker_id` derivation), and store DDL/queue details.
-- **Constitution audit:** **11 COMPLIANT, 5 PARTIAL, 0 VIOLATION**
-  (`constitution-compliance.md` §1). The partials are bounded concurrency, enum use,
-  delete-over-add, module CLI shape, and let-it-crash behavior. It specifically identifies
-  `events.py`/the old orchestrator as dead-code drift and the broad worker catch as masking
-  crashes (`constitution-compliance.md` §2(l), §7 Module shape, §8.3).
-
-These verdicts support a narrow conclusion: module engineering quality is generally good;
-release architecture and runtime integration are not yet good enough.
-
-### 1.3 Gaps that block a v2.1 release
-
-#### P0 integration and security gaps
-
-1. **One canonical runtime does not exist on the review branch.** The current
-   `src/cambium/supervisor.py` explicitly says it is “the slice, not Custos,” writes JSONL
-   on the event loop, inherits the full environment, and merges with `git merge --ff-only`
-   (`supervisor.py:1-24,67-87,181-217,321-372`). This is security F-01/F-20 and
-   conformance M2 in executable form. Branch-local Custos is progress, not proof.
-2. **Redaction is not wired into supervisor events.** The redaction module exists only on
-   its branch; branch-local Custos emits raw stderr, worker errors, gate output, commands,
-   and event payloads (`wt-impl-super:supervisor.py:795-823,1168-1175,1315-1325,
-   1419-1425`). Security F-02 remains open until both enqueue and INSERT boundaries apply
-   the same versioned redactor (`security-audit.md` F-02; architecture §6.2 invariant 6,
-   §12.3).
-3. **Approval gates are design text, not a protocol.** The folded architecture names
-   `approve(session_id, op)` for external writes and non-allowlisted network egress
-   (`architecture.md` §7.2), while D7 Q7.2 leaves the exact shape open
-   (`docs/research/design-deltas.md` D7). Security F-18 and §6 explicitly say this control
-   is absent. v2.1 must define request, durable decision, timeout, denial, replay, and host
-   callback semantics.
-4. **Generation fencing is only an in-memory/wire value.** Current worker echoes a
-   generation but does not read `${worktree}/.cambium/generation` before git/state writes
-   (`src/cambium/worker.py:356-383`; no generation-file access). Branch-local Custos bumps
-   the number but `_recover_worktree_locked` does not write the fencing file
-   (`wt-impl-super:supervisor.py:929-950`). This is the audit's UNVERIFIED generation
-   finding and fails architecture §7.3.
-5. **`max_turns` is transported, not deeply enforced.** Branch-local Custos puts it in
-   init/run payloads (`wt-impl-super:supervisor.py:973-990,1182-1193`) but only records
-   heartbeat/checkpoint turns; it does not reject a turn beyond the bound
-   (`supervisor.py:1297-1308`). The current worker's heartbeat counter is not an LLM turn
-   budget (`src/cambium/worker.py:219-241`). Architecture §7.4/§7.9 requires supervisor
-   ownership, so worker self-report alone is insufficient. **UNVERIFIED:** no real ReAct
-   turn source exists yet.
-
-#### P0 liveness and resource gaps
-
-6. **Per-worker pipe buffering is unbounded.** Both slice and branch-local Custos create
-   unbounded asyncio queues for parsed worker output (`src/cambium/supervisor.py:219`;
-   `wt-impl-super:supervisor.py:1140`). Security F-07 requires a per-worker cap and kill on
-   overflow. The cap must cover queued decoded bytes, not only message count; a 1 MiB line
-   cap permits a small-count memory attack.
-7. **Supervisor-to-worker writes have no deadline.** `_write_json` awaits
-   `proc.stdin.drain()` without a timeout (`src/cambium/supervisor.py:114-121`; branch-local
-   code retains the helper). Security F-06 proves this can defeat ready and wall deadlines.
-   Every write needs the active phase deadline; expiry kills the process group.
-8. **No dead-letter queue exists.** Malformed, out-of-order, uncorrelated, stale-generation,
-   and unknown messages are logged or ignored (`src/cambium/ipc.py:100-129`;
-   `wt-impl-super:supervisor.py:1255-1330`). v2.1 needs a bounded, durable DLQ containing
-   redacted envelope metadata and a reason code, never raw prompts/secrets. It is an audit
-   aid, not a retry path.
-9. **CPU-heavy gates can oversubscribe the host.** `run_plan` starts every task in one
-   `TaskGroup` and each may run `make`, `cargo`, or compile-heavy `pytest` concurrently
-   (`wt-impl-super:supervisor.py:1523-1557,1386-1426`). There is no resource semaphore.
-   Add a session-level `BuildResource` semaphore with capacity default 1 for compile-heavy
-   gates, independent of the worker-width limit.
-10. **Store and critical waits need hard bounds.** The store queue is intentionally
-    unbounded and a critical append waits forever (`src/cambium/store.py:20-25,106,
-    145-148`). Security F-16 and conformance L5 also require bounded backpressure and
-    checking SQLite checkpoint `busy` before acknowledging durability
-    (`security-audit.md` F-16; `conformance-report.md` L5).
-
-#### P1 product gaps
-
-11. **There is no conversation store.** The architecture decisively specifies one shared
-    `${session_dir}/.cambium/sessions/conversations.db` with `node_id`-keyed queries
-    (`architecture.md` §6.6, §16.2), but no `ConversationStore` exists in `src/cambium/`.
-12. **Architectus is still a skeleton.** Current `Orchestrator` only enqueues specs and
-    emits start/finish placeholders (`src/cambium/orchestrator.py:1-59`). Branch-local
-    `Orchestrator.run` forwards a prebuilt flat plan to `run_plan`; it does not call
-    `should_decompose`, build/validate a Task Tree, schedule dependencies, aggregate child
-    envelopes, steer children, or evaluate the root (`wt-impl-super:orchestrator.py:48-75`).
-13. **No real LLM end-to-end run is evidenced.** Diffundo has an HTTP adapter, but no test
-    connects provider → worker decision loop → worktree edit → gate → Unio publish.
-    Architecture §9.3's `CambiumLM`/DSPy worker integration does not exist in the inspected
-    code. This is **UNVERIFIED**, not delivered.
-14. **No persistent cross-task pool exists.** The measured cost is 2.22 s per DSPy worker
-    and 7.03 s for ten subprocess workers, versus 5.6 ms/38.9 ms for a warmed-fork
-    experiment (`docs/research/worker-coldstart.md` §Per-operation measurements, §10-worker
-    fan-out, §Conclusion). The benchmark explicitly rejects `os.fork` from Custos and
-    recommends pre-spawned reusable subprocesses over the existing IPC
-    (`worker-coldstart.md` lines 121-131).
-15. **Decision optimization has not crossed the DSPy seam.** `ShouldDecomposeModule` is a
-    deterministic rule engine (`src/cambium/modules/example/decide.py`); architecture §17
-    defines pinned siblings, split datasets, canary gates, and SIMBA, but there is no DSPy
-    implementation or optimizer run. The conformance and constitution audits could not
-    check these orchestration/meta-layer norms.
-
-## 2. Architectural verdicts on the open questions
-
-### A. Custos stays a thin process watcher
-
-**Decision:** Custos owns process lifecycle, IPC transport, hard budgets, generation fencing,
-resource permits, and durable emission. It does **not** own workflow policy.
-
-- **Architectus owns DAG execution:** call decision modules, validate the Task Tree, select
-  ready nodes, route work, aggregate child envelopes, request gates/merges, and decide
-  retries that change task content.
-- **A deterministic `GateRunner` owns gate execution:** command launch, output cap, timeout,
-  resource semaphore, and content-addressed verdict. Architectus requests it; Custos may
-  terminate its process group when a hard session budget expires.
-- **Unio owns the complete merge transaction:** stage, verify/final gate, lock, publish,
-  durable `merge_committed`, and reconcile. Architectus requests a merge and responds to
-  typed outcomes. Custos does not contain merge policy.
-
-This corrects the branch-local `_Runtime`, which currently mixes watching, gate policy,
-gate caching, worktree recovery, merge orchestration, event writing, and result aggregation
-(`wt-impl-super:src/cambium/supervisor.py`, `_Runtime`). The deterministic layer remains
-LLM-free; “thin” means policy-poor, not capability-poor (`architecture.md` §2 invariants).
-
-### B. Adopt FD 3 now
-
-**Decision:** v2.1 uses a dedicated protocol channel on FD 3. stdin remains supervisor
-control input; stdout/stderr become ordinary captured logs. Do it before the first real DSPy
-worker.
-
-The wire schema and JSON-Lines framing do not change: the bytes from `ipc.write_message` and
-`ipc.read_message` stay identical (`src/cambium/ipc.py:48-129`). The compatibility cost is
-transport-level:
-
-- worker launchers, fake workers, container wrappers, and tests must map an inherited pipe
-  to FD 3;
-- Windows needs an equivalent inherited handle adapter behind the same channel abstraction;
-- existing v2 workers that speak protocol on stdout are incompatible unless run through an
-  explicit test-only legacy adapter.
-
-Do not negotiate between stdout and FD 3 at runtime. Negotiation itself depends on a channel
-and preserves the contamination failure. Bump protocol transport version once, update all
-in-repo workers atomically, and reject a worker that does not open FD 3. The cost is bounded
-now; after real DSPy/LiteLLM dependencies emit progress and warnings, the cost and incident
-risk increase. Architecture §5.1's stdout-reservation reshim is deleted after this change.
-
-### C. Use one `conversations.db`
-
-**Decision:** one SQLite WAL database at
-`${session_dir}/.cambium/sessions/conversations.db`, with `node_id` on every row and indexes
-for `(node_id, turn_seq)` and `(node_id, kind, turn_seq)`.
-
-Do not create one database under each `sessions/<node_id>/`. A single database preserves one
-writer discipline, allows bounded cross-node accounting and subtree queries, reduces file/WAL
-churn, and matches the folded normative choice (`architecture.md` §6.6, §16.2). Conversation
-rows are mutable-queryable session state; events remain append-only audit history. Cross-store
-atomicity is not promised: the event is the durable fact, and conversation projection is
-rebuildable from protocol events.
-
-### D. A persistent subprocess pool is mandatory for production fan-out
-
-**Decision:** the pool is not required for the first one-worker real-provider milestone. It
-is a release gate before v2.1 claims production multi-worker operation.
-
-Mandatory trigger: any configured session with `max_width >= 4`, or measured worker-ready
-p90 above 10% of the task wall-time SLO. The existing 2.22 s per-worker/7.03 s ten-worker
-measurement already trips that policy for short coding tasks (`worker-coldstart.md`
-§Conclusion). Implement pre-spawned reusable subprocesses; never `os.fork` a threaded asyncio
-supervisor (`worker-coldstart.md` lines 121-131). A worker returns to the pool only after a
-verified reset: no child processes, no open task FDs, no provider/session state, fresh
-generation, clean cwd/env, and empty conversation binding. Failure retires the process.
-
-### E. Keep the cheap cascade default
-
-**Decision:** eligible `FAST` providers use health-aware round-robin; cascade fall-through
-stays within the requested tier. `REASONING` is reserved by default for the final
-`ResultEvaluator` and approval/gate adjudication, not coding turns or routine decomposition.
-
-This is a correction to fixed-priority concentration, not permission to race requests.
-Round-robin chooses the first candidate; normal sequential fallback handles failure.
-Capability/context filters still precede rotation (`architecture.md` §9.1-§9.2). Explicit
-task policy can request `STRONG`, but there is no silent fast→reasoning escalation. Delete
-`Diffundo.call_race`; it conflicts with the folded default and adds cancellation/cost surface
-without a v2.1 acceptance case (`wt-impl-diffundo:diffundo.py:434-512`).
-
-### F. DSPy stays in `decide.py`; use SIMBA first
-
-**Decision:** DSPy imports and programs live strictly behind each decision module's
-`decide.py` seam. Custos, GateRunner, Unio, stores, IPC, and task-tree validation never import
-DSPy. Construction occurs at the Architectus composition root through an injected
-`LLMProvider` port (`architecture.md` §2, §4 D8d, §17.3).
-
-Use **SIMBA** for the first `should_decompose` optimizer. The module has 200 train, 50 eval,
-and canary examples, a deterministic metric, and no sibling dependency
-(`architecture.md` §17.2). SIMBA matches the architecture's planned refinement loop
-(`architecture.md` §17.4). BootstrapFewShot only selects demonstrations and is too narrow
-for replacing the current rule policy; MIPROv2 adds instruction/search cost before Cambium
-has optimizer telemetry. Promotion requires eval improvement, 100% canaries, a pinned model,
-and a recorded refinement ID. No optimizer code enters supervisor.py.
-
-## 3. v2.1 roadmap
-
-Dependencies are hard gates. A later milestone can be developed in parallel, but it cannot
-be called accepted until its listed predecessors pass.
-
-### M1 — Canonical runtime and audit baseline (**L**, no dependencies)
-
-**Scope:** merge one Custos path with real `EventStore`, `MergeSequencer`, Nuntius, worker,
-redactor, and doctor. Remove slice/fallback runtime paths. Re-run all three audits against
-one SHA.
-
-**Acceptance criteria:**
-
-1. `git grep` finds one event-store implementation, one merge sequencer, and one supervisor
-   entry path; no `_FallbackEventStore`, `_FallbackSequencer`, or slice `EventLog` remains.
-2. One fake worker edits one file, passes its gate, publishes through `git update-ref`, emits
-   fsynced `merge_committed`, writes `result.json`, and leaves no process/worktree.
-3. The full scenario suite passes on Python 3.14; scenario count and commit SHA are recorded.
-4. Fresh security, conformance, and constitution audits contain no N-A caused by unmerged
-   modules.
-
-### M2 — Protocol and pipe hardening (**M**, depends on M1)
-
-**Scope:** FD-3 channel; per-worker decoded-byte and message caps; stdin write deadlines;
-bounded redacted DLQ; fail-fast oversized/read errors; process-group kill.
-
-**Acceptance criteria:**
-
-1. A worker writing arbitrary stdout cannot corrupt protocol; valid FD-3 messages still
-   complete the task.
-2. A worker that stops reading control input is killed by the active phase deadline; test
-   wall time is deadline + at most 1 s.
-3. Output exceeding either 256 queued messages or 8 MiB decoded bytes causes one
-   `protocol_overflow` event and process-group death; supervisor RSS stays below a fixed
-   16 MiB delta in the flood test.
-4. Unknown/out-of-order/stale-generation messages enter a 1,000-row bounded DLQ with reason,
-   task, generation, request ID, digest, and redacted preview; they are never retried.
-
-### M3 — Security boundary and fencing (**M**, depends on M1; precedes real LLM)
-
-**Scope:** wire redaction at enqueue and INSERT; strict worker/gate env allowlists; ref-name
-validation; sequencer-owned worktree markers; D7 approval protocol; generation fencing file.
-
-**Acceptance criteria:**
-
-1. Security audit F-01, F-02, F-04, and F-05 are closed by tests; injected secrets do not
-   occur in events DB, DLQ, stderr logs, or gate output.
-2. A stale worker whose generation file changes cannot perform its next git operation or
-   checkpoint write and exits `fatal`.
-3. External-path write and non-allowlisted network requests block on a durable approval ID;
-   approve resumes once, deny fails, timeout denies, and replay never asks twice for the
-   same `(generation, operation_digest)`.
-4. An unknown registered worktree path and a branch containing a refspec are rejected before
-   any destructive git command.
-
-### M4 — Gate/resource hardening and deep budgets (**M**, depends on M1 and M3)
-
-**Scope:** extract GateRunner; compile-heavy resource semaphore; full gate-verdict key;
-`max_turns`, tokens, and all process deadlines; bounded store backpressure and SQLite busy
-handling.
-
-**Acceptance criteria:**
-
-1. With ten workers requesting `make`/`cargo`/compile-heavy `pytest`, active compile gates
-   never exceed configured capacity (default 1); ordinary non-compile checks can overlap.
-2. Gate key is exactly worktree tree hash + command + base commit + gate input spec; changing
-   any component reruns the gate, changing none reuses the verdict.
-3. A heartbeat/checkpoint/tool/result reporting turn `max_turns + 1` is rejected by Custos;
-   a real ReAct adapter cannot issue another LLM call after the budget closes.
-4. Every subprocess communicate/drain/wait and critical-store wait has a testable deadline.
-   SQLite checkpoint `busy` never produces a durability acknowledgement.
-
-### M5 — Architectus RLM/task-tree execution and conversations (**L**, depends on M1, M3,
-M4)
-
-**Scope:** implement `should_decompose → TaskDecomposer → TaskTree validation → TaskRouter →
-node dispatch → envelope aggregation → ResultEvaluator`; one shared `conversations.db`;
-steering and recursive completion.
-
-**Acceptance criteria:**
-
-1. A three-level fixture runs only dependency-ready nodes, obeys session width/depth, and
-   reaches root completion only after all descendant envelopes and gates succeed.
-2. Cyclic, multi-parent, over-depth, and over-width plans dispatch zero workers and produce
-   typed rejection evidence.
-3. Parent LLM context contains own bounded turns + parent summary + child envelopes only;
-   a canary scratchpad string in a child conversation never appears in parent context.
-4. `conversations.db` answers `last_turns`, `cost_by_node`, and `context_for` with indexed
-   query plans and reconstructs from durable protocol events after projection deletion.
-
-### M6 — First real LLM end-to-end task (**M**, depends on M2-M5)
-
-**Scope:** Diffundo plus one real OpenAI-compatible provider, `CambiumLM`, one atomic coding
-task, one deterministic gate, and Unio publication. Keep it manual/key-gated, not default CI.
-
-**Acceptance criteria:**
-
-1. With one provider key, a worker receives a real completion, edits a fixture repo, passes
-   a predeclared test gate, publishes exactly one fast-forward commit, and returns a durable
-   result envelope.
-2. Provider identity/model/usage/latency/cost metadata are recorded without prompt, key, or
-   chain-of-thought content.
-3. A forced 429 falls through to a second `FAST` provider; total exhaustion pauses and then
-   resumes after recovery without worker restart.
-4. The same task with a failing gate cannot publish to main. This is the first release
-   evidence that joins LLM, Diffundo, Opifex, Custos, GateRunner, store, and Unio.
-
-### M7 — Persistent worker pool (**L**, depends on M2-M6)
-
-**Scope:** pre-spawn reusable subprocesses, pool admission/retirement, NodeSession bind/reset,
-health and leak checks. No warm fork.
-
-**Acceptance criteria:**
-
-1. Ten DSPy-capable workers become task-ready at p50 <100 ms and p90 <250 ms after pool warmup;
-   cold pool startup is reported separately.
-2. Sequential tasks cannot observe the predecessor's cwd, env, conversation, open FDs,
-   subprocesses, generation, or provider state; fault injection retires the contaminated
-   worker.
-3. Pool disabled and pool enabled produce byte-equivalent protocol/event semantics except
-   worker PID and timing fields.
-4. Production config rejects `max_width >= 4` when the pool is disabled unless an explicit
-   development override is set.
-
-### M8 — DSPy `should_decompose` refinement (**M**, depends on M5-M6)
-
-**Scope:** DSPy strategy inside `modules/should_decompose/decide.py`, SIMBA optimizer,
-enum/schema migration, bench/refinement artifacts.
-
-**Acceptance criteria:**
-
-1. Package is renamed from `example` to `should_decompose`; JSON CLI and eval CLI both pass.
-2. `Decision` enum replaces the Python boolean boundary under a dataset schema-version bump;
-   wire JSON remains explicit and versioned.
-3. SIMBA candidate improves frozen eval over the rule baseline, passes 100% canaries, records
-   train/eval/canary deltas and pinned model, and can roll back by refinement ID.
-4. If no candidate meets all gates within the declared call/cost budget, the experiment is
-   falsified and the rule engine remains production. “DSPy used” is not acceptance.
-
-### M9 — Proposal 1: tree-sitter context compression (**M research**, depends on M6;
-integrates only after M8 evidence)
-
-**Scope:** compare raw text context with tree-sitter AST/symbol chunks for the same coding
-tasks. The compressor is a context adapter, never a supervisor concern. Pin grammars and
-fall back by explicit unsupported-language result, not silent text heuristics.
-
-**Acceptance criteria / falsification metric:**
-
-1. Freeze at least 30 tasks across three supported languages and the same provider/model,
-   temperature, gate, and task budget. Run paired raw-context and AST-context trials.
-2. Primary metric is **input tokens per compile-successful task**. Secondary metrics are
-   compile-success rate, gate-pass rate, wall time, and changed-file recall.
-3. Adopt only if median input tokens fall at least 25% while compile-success rate falls no
-   more than 2 percentage points and its paired 95% confidence interval excludes a decline
-   worse than 2 points.
-4. If token savings miss 25% or compile-success degradation exceeds the bound, Proposal 1
-   is falsified and tree-sitter stays out of the runtime. Do not ship it because chunks look
-   cleaner.
-
-## 4. Top five risks
-
-1. **Integration illusion.** Branch-local green tests can hide a broken aggregate runtime.
-   **Mitigation:** M1 creates one SHA, removes fallbacks, reruns all audits, and forbids N-A
-   due to branch state.
-2. **Same-UID compromise leaks credentials or mutates host state.** There is intentionally
-   no sandbox (`architecture.md` §7.2, §19 honest gaps). **Mitigation:** least-privilege env,
-   redaction, path/ref validation, approvals, generation fencing, and host-owned containers
-   for hostile workloads. State clearly that these are containment controls, not a kernel
-   boundary.
-3. **Custos becomes the workflow engine.** Branch-local `_Runtime` already mixes process,
-   gate, merge, recovery, events, and aggregation. **Mitigation:** enforce the A verdict:
-   Custos watches/enforces, GateRunner executes, Unio merges, Architectus schedules.
-4. **Persistent workers leak state across tasks.** The latency win creates a larger isolation
-   lifetime. **Mitigation:** M7's reset proof, generation rebinding, FD/process census, and
-   retire-on-any-doubt policy; never use warm fork from Custos.
-5. **Optimization and compression improve proxy metrics while reducing coding success.**
-   **Mitigation:** pinned model/siblings, frozen eval, 100% canaries, compile/gate floors,
-   paired AST trials, cost budgets, and rollback-by-refinement-ID. A failed experiment keeps
-   the deterministic baseline.
-
-## 5. What to delete or stop
-
-### Delete in M1
-
-1. **Delete the slice runtime inside `src/cambium/supervisor.py`:** `EventLog`,
-   `_merge_branch`, slice `run_session`, CLI bootstrap, and duplicate helpers. They bypass
-   the store and Unio and preserve security F-01/F-20 (`supervisor.py:67-451`). Keep the
-   behavioral scenario, pointed at canonical Custos.
-2. **Delete `_FallbackEventStore` and `_FallbackSequencer` from branch-local Custos.** Missing
-   architecture components must fail import/startup, not silently select weaker durability
-   and merge semantics (`wt-impl-super:supervisor.py:455-698`).
-3. **Delete `src/cambium/events.py` after consumers migrate to one typed canonical event
-   envelope.** Its `type/timestamp` dataclasses disagree with the store's `kind/ts` envelope
-   and only feed the skeleton orchestrator (`src/cambium/events.py`; conformance M4,
-   constitution §2(l)). Do not keep two event models.
-4. **Delete the compatibility submit/drain skeleton from `src/cambium/orchestrator.py`.** A
-   no-op path that emits start/finish without work is more dangerous than a missing API
-   (`orchestrator.py:20-59`). Replace it with Architectus, not another adapter.
-5. **Delete `Diffundo.call_race` and its score/quality helpers.** v2.1 has no accepted race
-   use case, and architecture §9.2 rejects it as a default because cancellation and metered
-   requests bias behavior (`wt-impl-diffundo:diffundo.py:349-355,434-512`).
-
-### Stop maintaining as live specification
-
-- **Stop editing `docs/architecture/system-design.md`.** It is the superseded v0.1 origin
-  record (`architecture.md` §20; `agents.md` §2). Keep it immutable for history.
-- **Stop treating `docs/research/{ipc-protocol-draft,event-schema-draft}.md` as competing
-  normative specs.** Fold accepted changes into architecture and module contracts, then mark
-  the drafts historical. Multiple vocabularies (`result`/`result_envelope`, `exit`/
-  `exit_message`, `done`/`succeeded`) already caused conformance L6.
-- **Stop citing point-in-time audits as release certification.** Keep the three audit files
-  as immutable evidence with their baseline SHA, and issue one post-M1 audit rather than
-  editing old findings.
-- **Keep `scripts/fake_worker.py`, but only as a test fixture.** It must not be a production
-  worker choice or an alternate protocol authority.
-- **Rename `src/cambium/modules/example/` in M8.** “Example” is no longer accurate; it is the
-  production `should_decompose` module and its package name should match architecture §17.
-
-## Final release posture
-
-v2.1 is not “more modules.” It is the release that makes one runtime authoritative, makes
-the trust and liveness boundaries executable, and proves one real provider task through a
-gate and atomic merge. Architectus, the conversation store, and the worker pool follow that
-foundation. DSPy optimization and AST compression remain experiments until their falsifiable
-acceptance gates pass.
+### 1.1 Deterministic substrate delivered in the snapshot
+
+1. **EventStore:** one writer, SQLite WAL, critical append ack after checkpoint/fsync, reader
+   connections (`store.py:93–158,172–272`; `conformance-report.md` §§1 (Check 1), 2 (Store)). `recovery_gap` was folded out
+   in favor of no-gap-by-construction plus phantom-read semantics (architecture §§6.3, 6.5).
+2. **MergeSequencer:** throwaway staging worktree, reachable staging ref, quarantine refusal,
+   ancestry/expected-old `update-ref` publish (`merge.py:158–177,281–482`; `conformance-report.md` §1 Check 3; §2 Merge and runtime boundary).
+3. **Nuntius/Opifex seed:** 1 MiB cap/resync, malformed-object skip/torn-tail handling,
+   request correlation, heartbeat/cancel/health, result/exit ordering, 64 KiB diff and deadlines
+   (`ipc.py:28–129`; `worker.py:66–93,219–317,356–494`; merged `38e1d43`).
+4. **TaskTree validator:** unique IDs, one root, dependencies, no multi-parent/cycles, depth/
+   width, deterministic order, subtree isolation, exact upward envelope (`tasktree.py:233–478`;
+   29 scenario tests). It validates input; it is not Architectus execution.
+5. **Doctor/datasets:** diagnostics and split train/eval/canary loaders (`doctor.py`,
+   `modules/example/datasets/`, tooling tests).
+
+### 1.2 Branch-local implementation evidence (not release proof)
+
+6. Custos branch `wt-impl-super@9746b96` supervises workers, heartbeats/generations, recovery,
+   gates, serialized merge, and store writes, but contains fallback store/sequencer classes and
+   the old slice in one ~1,600-line file.
+7. Diffundo `wt-impl-diffundo@f5ae0d3` has tier filtering, ordered cascade, breaker/buckets,
+   pause/recovery, prefix lint, retries, and HTTP adapter; `call_race` conflicts with folded
+   default and has no v2.1 requirement.
+8. Bench `wt-impl-bench@21257b3` scores splits and gates drift; redaction `wt-redact@1b449df`
+   handles credentials/headers/JWT/private keys and env construction. Value is unrealized until
+   Custos applies redaction at every enqueue/log boundary. These branch states are historical;
+   current DLQ/eval-cache/worker-pool status is the pointer above.
+
+### 1.3 Audit findings
+
+- **Security:** 22 findings (1 HIGH, 7 MEDIUM, 4 LOW, 6 PASS, 4 INFO); F-01 full env,
+  F-02 absent redaction, F-04 worktree reuse, F-05 refs, F-06 writes/merge, F-07 queue, F-20
+  runtime bypass. Approval and generation-file fencing are absent/UNVERIFIED (`security-audit.md` §§1, 3).
+- **Conformance:** 5 MEDIUM + 8 LOW; IPC-file N-A later closed; surviving M2 production wiring,
+  M4 orphan event model, M5 `worker_id`, and DDL/queue L1–L8 (`conformance-report.md` §3).
+- **Constitution snapshot:** 11 COMPLIANT, 5 PARTIAL: bounds/enum/delete-over-add/module CLI/let-it-crash;
+  historical events/orchestrator seed code and broad worker catch (`constitution-compliance.md` §1).
+
+## 2. Release-blocking gaps
+
+### P0 integration/security
+
+1. **One canonical runtime is absent on `wt-sol2`.** Slice supervisor writes JSONL on the loop,
+   inherits host env, and uses plain `git merge --ff-only` (`supervisor.py:1–24,67–87,181–217,321–372`): F-01/F-20 and M2. Branch-local Custos is not proof.
+2. **Redaction is not wired.** Branch Custos emits raw stderr/errors/gate output/commands;
+   F-02 closes only when the same versioned filter runs at enqueue and INSERT (architecture §§6.2,
+   12.3; `redact.py` branch).
+3. **Approval is design only.** D7 names `approve(session_id, op)` for external writes/network;
+   Q7.2 leaves request, durable decision, denial, timeout, replay, and callback semantics open.
+4. **Generation fencing is wire-only.** Worker echoes generation but does not read
+   `.cambium/generation` before git/state writes; Custos bumps but does not write the file
+   (`worker.py:356–383`; `wt-impl-super:929–950`; architecture §7.3).
+5. **`max_turns` is transported, not enforced.** Branch Custos records heartbeat/checkpoint
+   turns; no supervisor rejection at bound; no real ReAct source exists (UNVERIFIED).
+
+### P0 liveness/resources
+
+6. **Unbounded per-worker output queue:** cap decoded bytes and messages; kill on overflow (F-07).
+7. **Unbounded stdin drain:** deadline every write and kill process group on expiry (F-06).
+8. **DLQ absent:** bounded durable redacted metadata/reason for malformed, stale, unknown,
+   out-of-order, and uncorrelated messages; never retry raw prompts (M2).
+9. **Compile gates oversubscribe:** session `BuildResource` semaphore, default capacity 1,
+   independent of worker width (`run_plan` TaskGroup; v2.1 P0 gap 9).
+10. **Store waits unbounded:** queue backpressure, critical wait deadline, and checkpoint-busy
+    handling (F-16, L5; `store.py:20–25,106,145–148`).
+
+### P1 product gaps
+
+11. **ConversationStore absent:** architecture specifies `${session_dir}/.cambium/sessions/conversations.db`, node-indexed queries (§6.6/16.2).
+12. **Architectus skeleton:** no should-decompose→TaskTree→dependency scheduling→aggregation→
+    steering/root evaluation (historical seed `orchestrator.py:1–59`; branch `wt-impl-super`).
+13. **No real provider end-to-end evidence:** no provider→worker decision→edit→gate→Unio run;
+    `CambiumLM`/DSPy integration is UNVERIFIED.
+14. **No persistent cross-task pool:** measured cold 2.22 s/worker and 7.03 s/10 versus warm
+    5.6 ms/38.9 ms; reusable subprocess pool is required before production fan-out
+    (`worker-coldstart.md`; architecture §14).
+15. **No DSPy refinement:** example is rule engine; pinned datasets/canaries/SIMBA are design,
+    no optimizer run (`modules/example/decide.py`; architecture §17).
+
+## 3. Architectural decisions
+
+### A. Custos stays thin
+
+Custos owns process/IPC lifecycle, hard budgets, fencing, permits, and durable emission; it does
+not own workflow policy. Architectus validates/executes the DAG and chooses retries; GateRunner
+owns command/resource/verdict; Unio owns stage/verify/final gate/lock/publish/events/reconcile.
+The branch-local `_Runtime` mixes these concerns; “thin” means policy-poor, not incapable.
+
+### B. Adopt FD 3
+
+Use inherited FD 3 for protocol before the first DSPy worker; stdout/stderr become captured logs.
+JSONL bytes remain unchanged (`ipc.py:48–129`). Update workers, fixtures, wrappers, tests and
+Windows handle adapter once; do not negotiate stdout/FD 3 at runtime. Reject workers that do not
+open FD 3. This is M2 and must be atomic.
+
+### C. One conversations database
+
+Use `${session_dir}/.cambium/sessions/conversations.db`, `node_id` on rows, indexes
+`(node_id, turn_seq)` and `(node_id, kind, turn_seq)`. Events remain append-only durable facts;
+conversation projection is rebuildable, with no cross-store atomicity promise. This resolves
+the D8g separate-DB alternative for the architecture target.
+
+### D. Pool required for production fan-out
+
+Not required for first one-worker provider milestone, but mandatory for `max_width >= 4` or
+ready p90 >10% wall SLO. Pre-spawn reusable subprocesses; never warm `os.fork` from threaded
+Custos. Reuse only after clean cwd/env/Fds/processes/conversation/generation reset; retire on doubt.
+
+### E. Cheap cascade default
+
+Health-aware round-robin within requested tier; sequential fallback, no race mode. `REASONING`
+is for final evaluation/approval by default. Capability filters precede rotation; explicit
+strong policy is allowed, silent fast→reasoning escalation is not. Delete `Diffundo.call_race`.
+
+### F. DSPy behind `decide.py`
+
+DSPy belongs only behind a module `decide.py` and injected `LLMProvider` at the composition root;
+Custos/GateRunner/Unio/stores/IPC/task-tree never import it. Use SIMBA first for
+`should_decompose`; 200/50/canary data, pinned model, eval improvement, 100% canaries, and
+rollback-by-refinement-ID are acceptance gates.
+
+## 4. v2.1 roadmap and acceptance gates
+
+Dependencies are hard gates; a later milestone is not accepted until predecessors pass.
+
+| Milestone | Scope and must-prove criteria |
+|---|---|
+| **M1 — Canonical runtime (L)** | One supervisor/store/sequencer; remove slice/fallback/events/orchestrator paths; one fake worker edits, gates, atomic-publishes and emits fsynced `merge_committed`; full tests and three fresh audits on one SHA. |
+| **M2 — Pipe hardening (M)** | FD 3; decoded-byte/message caps; write deadlines; redacted 1,000-row DLQ; fail-fast oversized/read errors; process-group kill. Flood stays under 16 MiB RSS delta; unknown/stale messages never retry. |
+| **M3 — Security/fencing (M)** | Close F-01/F-02/F-04/F-05; strict worker/gate env; generation file rejects stale writes; durable approval IDs for external paths/network; invalid worktree/ref rejected before destructive git. |
+| **M4 — Gate/resources/budgets (M)** | Compile semaphore default 1; content-addressed gate key (tree hash+command+base+input); reject turn `max_turns+1`; deadlines for all waits; checkpoint busy cannot ack. |
+| **M5 — Architectus/tree/conversations (L)** | Three-level dependency-ready fixture; reject cyclic/multi-parent/depth/width plans; parent context only bounded own/summary/envelopes; query/rebuild `conversations.db`. |
+| **M6 — First real LLM task (M)** | One key-gated provider edits fixture, passes gate, one FF publish, durable result; record model/usage without prompt/key/CoT; forced 429 fallback/pause; failed gate cannot publish. |
+| **M7 — Worker pool (L)** | Warm p50 <100 ms/p90 <250 ms; no predecessor state leak; fault retires worker; pool on/off protocol equivalence; reject `max_width >= 4` without pool. |
+| **M8 — DSPy refinement (M)** | Rename example to should_decompose; schema-versioned `Decision` enum; SIMBA beats frozen eval, 100% canaries, pinned model/refinement rollback; failed budget falsifies experiment. |
+| **M9 — AST compression (research M)** | Paired ≥30-task/3-language trials; primary input tokens per compile-success; adopt only ≥25% median savings with ≤2-point compile-success decline and paired CI; otherwise keep text. |
+
+## 5. Risks and stop list
+
+Top risks: integration illusion; same-UID compromise without a kernel sandbox; Custos becoming
+workflow engine; persistent-worker leakage; proxy-metric optimization. Mitigations are M1
+single-SHA/audits, least-privilege env/redaction/approvals/fencing/host containers, A-boundary
+ownership, M7 reset/retire census, and frozen eval/canaries/gates/rollback.
+
+M1 deletes slice `EventLog`/merge/session/CLI, fallback stores/sequencer, seed `events.py`,
+orchestrator submit/drain skeleton, and unsupported `Diffundo.call_race`; no compatibility
+fallback may hide missing components. Keep `system-design.md` immutable, mark IPC/event drafts
+historical after folding accepted changes, keep `fake_worker.py` as fixture only, and rename
+`modules/example/` to `should_decompose` in M8. These are planned changes, not claims of current
+implementation.
+
+**Final posture:** v2.1 is the release that makes one runtime authoritative, executes trust/
+liveness boundaries, and proves one real provider task through a gate and atomic merge. Architectus,
+conversation storage, worker pool, DSPy refinement, and AST compression follow only after those
+falsifiable gates pass.
+
+## 6. Evidence and causal diagnosis retained
+
+The branch discrepancy is itself the key finding. A green branch-local Custos test cannot certify
+the review branch when `wt-impl-super`, `wt-impl-diffundo`, `wt-impl-bench`, and `wt-redact` are
+not ancestors. That is why this review does not sum their 21/53/41/65 scenario counts. The
+reviewed 108 functions cover deterministic modules, but there is no aggregate provider-to-merge
+test. A post-M1 audit must use one SHA; N-A caused by branch state is not a pass.
+
+The integration diagnosis is testable: `git grep` should find one EventStore, one sequencer, one
+supervisor entry, and no fallback classes; a fake worker must emit a durable `merge_committed`
+before a result; and a fresh security/conformance/constitution audit must not point at unmerged
+modules. If those checks fail, the cause is duplicate runtime paths, not an individual store or
+merge primitive. This is the distinction behind F-20 and conformance M2.
+
+The resource diagnosis is likewise specific. A 1 MiB line cap bounds one frame but not a queue of
+decoded frames; a message-count cap alone permits 1 MiB × N memory growth. M2 therefore requires
+both 256 messages and 8 MiB decoded bytes, one `protocol_overflow`, and process-group death. The
+stdin fix wraps every `drain()` in the active phase deadline. M4 adds compile semaphore capacity
+1, a gate key of tree hash + command + base + input, and checks SQLite checkpoint `busy` before
+critical ack. These acceptance criteria close F-06/F-07/F-16/L5 rather than hiding them behind a
+retry.
+
+The security boundary is intentionally explicit. Without a per-worker sandbox, same-UID workers
+can read host state; D7 accepts that residual and relies on worktree isolation, allowlists,
+least-privilege env, approval, and host-owned containers. Approval must be durable and replay-
+safe: an external write/network operation receives an ID, deny/timeout fails closed, approval
+resumes once, and replay never asks twice for the same `(generation, operation_digest)`. Until
+that protocol and generation file exist, the review remains UNVERIFIED for real LLM use.
+
+## 7. Milestone detail
+
+### M1/M2: one path and one channel
+
+M1 removes the slice and fallback implementations rather than adding a compatibility switch.
+The fake-worker proof edits one file, runs a predeclared gate, publishes through expected-old
+`update-ref`, writes `result.json`, leaves no worktree/process, and records the scenario count/
+SHA. M2 then moves the protocol to FD 3, reserves stdout/stderr for logs, and updates fixtures
+atomically. A worker that writes arbitrary stdout must not corrupt the FD-3 stream; a worker that
+stops reading must die by the phase deadline. Unknown/out-of-order/stale messages become bounded
+DLQ records with task, generation, request ID, digest, redacted preview, and reason.
+
+### M3/M4: trust, gates, and budgets
+
+M3 closes F-01/F-02/F-04/F-05 with injected-secret tests, stale-generation writes, ref/worktree
+validation, and durable approval. M4 separates GateRunner from Custos, keeps compile-heavy work
+under a resource permit, and enforces `max_turns`, tokens, process deadlines, and store waits at
+the supervisor boundary. A worker heartbeat is not an LLM turn count; a real ReAct adapter must
+be unable to issue call `max_turns + 1`.
+
+### M5/M6: tree, provider, and root result
+
+M5 exercises a three-level fixture: only dependency-ready nodes run, siblings never see raw
+session transcripts, and root completion waits for all descendant envelopes/gates. Deleting the
+conversation projection must still permit reconstruction from protocol events. M6 is manual and
+key-gated: one OpenAI-compatible provider, one atomic coding task, one deterministic gate, and
+one Unio publication. A forced 429 must fall through to another FAST provider; total exhaustion
+pauses and resumes without worker restart. No prompt, key, or chain-of-thought enters durable
+metadata.
+
+### M7/M8/M9: scale and experiments
+
+M7's pool acceptance is isolation, not just latency: no predecessor cwd/env/conversation/open FD,
+subprocess, generation, or provider state; any doubt retires the worker. Pool-disabled and
+enabled protocol/event semantics must match except PID/timing. M8 treats DSPy as a falsifiable
+experiment: schema-versioned `Decision` enum, frozen eval/canary, pinned model, refinement ID,
+and rollback; a candidate that misses any gate leaves the deterministic rule engine in place.
+M9 compares raw versus AST context on paired tasks with the same provider/model/gate/budget and
+adopts only with ≥25% input-token reduction and no more than two percentage points compile-success
+loss. “Cleaner chunks” are not acceptance.
+
+## 8. Historical anchors
+
+The review's source references include the original audits (`30832d1`, `cb3dde2`), branch-local
+module evidence (`9746b96`, `f5ae0d3`, `21257b3`, `1b449df`), and architecture fold commits
+`39005fa`, `77f3d52`, and `c31e781` recorded by the conformance status update. They identify
+evidence states only; no SHA in this document is a current-release certificate.
+
+## 9. Later hierarchy feedback — skeptical classification
+
+The later feedback is accepted as a refinement of D2/D8b: the harness owns an explicit
+single-root DAG, validates it before dynamic worker admission, gives each child fresh declared
+context, and permits only strict diff/summary/metrics/status envelopes upward. This is a target
+boundary for M5, not evidence that the current branch has an agent tree. Claims that implicit
+recursion is dead, explicit trees yield a 90% cache discount, “Prime 2026 proves it,” or five
+cheap branches are **UNVERIFIED as broad claims**: primary audit evidence supports Prime explicit
+AgentSession contexts and bounded depth, with descendants sharing one root worker, but not
+process-per-child isolation or a 90% total-request/latency metric. Provider caches are
+org/workspace scoped and can be shared by tasks with an exact prefix. AlphaCodium is staged
+run/fix; LATS is candidate-solution MCTS with test/environment feedback, not universal
+orchestration. Per-node gates/tests are required by M5; MCTS stays open until a falsifiable
+comparison beats the explicit DAG baseline. Static prefix placement remains D8c guidance and
+does not guarantee cache savings. Recursion evidence is task-dependent; no implicit-recursion
+dead-end consensus is adopted.
+
+## 10. Stop-list rationale
+
+The M1 delete list is causal, not stylistic. The historical slice `EventLog`, `_merge_branch`, `run_session`,
+CLI bootstrap, and duplicate helpers bypass the durable store and Unio (F-20). Fallback stores
+and sequencers are more dangerous than an import failure because they silently weaken durability
+and expected-old publication. The historical seed `events.py`/orchestrator submit-drain path has no caller
+and disagrees with the canonical envelope; keeping it would preserve two event models. `call_race`
+has no accepted v2.1 use case and cancellation/metered-provider behavior biases its result.
+
+The stop-maintaining list is equally strict: `system-design.md` is immutable history; IPC/event
+drafts become historical after accepted vocabulary is folded into architecture; point-in-time
+audits are evidence, not release certification; `fake_worker.py` remains a fixture only; and the
+example package is renamed only when M8's schema/eval gates are ready. No fallback or compatibility
+path should be added to make an incomplete milestone appear green.
+
+The later hierarchy feedback fits the roadmap only as M5 structure: an explicit parent-owned DAG,
+fresh child context, strict upward envelopes, and static validation before admission. It does not
+alter M7 pool economics or D8c cache guidance. Claims of a 90% discount, Prime 2026 proof, five
+cheap branches, or universal AlphaCodium/LATS MCTS remain unverified and require a primary source
+and paired metrics before they can change a milestone gate.
+
+## 11. Measurement discipline for hierarchy and caching
+
+The review accepts the architectural shape of explicit hierarchy but requires metrics before
+calling it efficient. For a fixed task corpus, record node count, depth/width, child-context
+bytes, envelope bytes, provider input/output tokens, cache-hit/read tokens, wall-clock, retries,
+cost, gate pass rate, and root success. Compare static-DAG admission with a baseline using the
+same provider/model, prompt content, and task budget. A provider cached-token rate near 0.1× input
+pricing can lower input cost while leaving output, orchestration, and latency unchanged; it
+cannot support a 90% total-request claim. Exact prefixes may be shared by tasks in an org/workspace
+cache, so the metric must include cross-task hit behavior.
+
+Prime's explicit `AgentSession` evidence supports fresh contexts and bounded depth, but descendants
+share one root-session worker. That is a context boundary, not process isolation. LATS's
+candidate-solution MCTS and AlphaCodium's staged run/fix flow are useful algorithm descriptions;
+neither makes MCTS mandatory at every node. M5 should test strict envelopes and
+static-DAG-before-admission first, then compare search strategies on task-dependent success/cost.
+Recursion can be useful or harmful by task; no universal dead-end rule is assumed.
+
+Static-DAG validation is also a resource boundary. Rejecting a malformed plan before admission
+avoids spawning workers, spending provider tokens, or asking for approval on work that cannot
+complete. Dynamic steering may change a node's context and retry content, but it cannot create a
+new sibling or second root. A future M5 scenario should assert this invariant with a plan that
+tries to mutate topology after admission, then check bounded failure evidence and no extra
+workers.
+
+The hierarchy target is implementable without choosing a search algorithm: M5 can validate a
+static flat plan, admit ready nodes, compose bounded contexts, and aggregate strict envelopes
+using deterministic code. M6 can then compare provider/cache behavior on one atomic task. This
+ordering prevents a speculative 90% discount or universal MCTS claim from becoming a hidden
+release dependency.
+
+The primary-source correction is especially important for M7: Prime's shared root-session worker
+does not prove a process-per-child isolation model, so pool reset/retire tests cannot be skipped.
+Likewise, provider cached-token reads may be cheap while output and orchestration costs remain;
+M6 must report total request cost and latency. These are independent acceptance axes, not one
+headline cache number.
+
+The milestone order is therefore deliberate: M5 proves graph/context/envelope structure with a
+fake provider, M6 measures provider and cache behavior on one task, and M7 proves shared-worker
+reset. A result that passes one axis cannot be reported as proof of the others.
+
+The review's final claim is intentionally modest: explicit hierarchy and information hiding are
+good structural targets, but efficiency and search strategy are empirical. A future status
+refresh should cite the exact source commit, rerun static-DAG/envelope tests, and report
+provider/cache metrics before changing this roadmap.
+
+The same closure rule applies to each milestone: a branch-local source symbol, a historical test
+count, or an adopted architecture sentence is evidence for planning only. Acceptance requires a
+focused command, one baseline SHA, a reproducible result, and explicit handling of unresolved
+security boundaries.
+
+This evidence standard applies to later external critiques as well: retain the source claim and
+date, classify the inference, and name the metric that could falsify it. It prevents a provider
+pricing observation from becoming a cache contract, a context abstraction from becoming a process
+isolation claim, or a search method from becoming a universal scheduler.
+
+That reporting discipline is the release gate: one SHA, one caller path, one focused test, and a
+clear status for every boundary. Until then, this review remains historical roadmap evidence.
+
+The source pointer is the only current authority; historical SHAs and counts are anchors for
+reproduction, not status labels.
+
+This is why the final handoff reports commands and exit codes separately from historical findings.
