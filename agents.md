@@ -12,10 +12,9 @@ only what the task asks for. Unless the task explicitly requests it:
   sandboxes, retries, fallbacks, readiness checks, or production hardening.
 - Do not add hashes, checksums, signatures, provenance records, attestations,
   evidence artifacts, accounting, or observability systems.
-- Do not add environment, dependency, credential, platform, or configuration
-  validation beyond what the requested path needs to run.
-- Do not add speculative input validation. Validate only what the existing
-  public boundary already requires.
+- Do not add environment, dependency, credential, platform, configuration,
+  input, or schema validation unless the task explicitly requests it. Preserve
+  existing boundary validation.
 - Do not add tests for unrequested behavior. Prefer one scenario test for the
   requested path when a change affects behavior.
 - Do not add abstractions, configuration options, compatibility layers, or new
@@ -60,8 +59,9 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
-`module-test`, and `version`. Worker subprocesses receive an absolute
-`PYTHONPATH` to the source tree, so child imports resolve without an install.
+`module-test`, and `version`; prefer it over the internal supervisor module.
+Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
+child imports resolve without an install.
 
 ## Current entry points and behavior
 
@@ -78,8 +78,9 @@ The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
   present. Provider mode runs the bounded `Diffundo` loop: one provider call
   per turn, strict `tool_call`/`finish` parsing, schema and permission checks,
   tool events, checkpoints, and one fenced commit.
-- `run_shell` and `git_op` execute without an approval gate. `approval.py` and
-  `resources.py` remain standalone reusable primitives with their own tests.
+- Worker-exposed `run_shell` and inspection-only `git_op` run without an
+  `ApprovalGate`; mutating Git operations are not worker-exposed. `approval.py`
+  and `resources.py` remain standalone reusable primitives with their own tests.
 - `tasktree.build_tree` validates dependency specs; `run_plan` does not
   schedule a DAG. Architectus and the conversation store are not wired into
   `run_plan`.
@@ -92,8 +93,8 @@ The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
   lines are logged or skipped; fatal framing, missing correlated results,
   non-zero exits, and deadline failures fail or restart the task according to
   the boundary policy.
-- A merge conflict, non-fast-forward, or stale expected-old ref never
-  publishes `main`.
+- A merge conflict, non-fast-forward, stale expected-old ref, or quarantine
+  violation never publishes `main`.
 - Provider keys are allowlisted environment values. Never put credentials or
   sensitive content in task specs, event payloads, or durable artifacts.
 - Keep blocking disk and subprocess I/O at existing thread/process boundaries.
@@ -113,8 +114,8 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 git diff --check
 ```
 
-Before commit, inspect the diff, stage only intended files, and verify a clean
-worktree. Every handoff states:
+Before commit, inspect status and diff and stage only intended files. Before
+handoff, verify the worktree is clean. Every handoff states:
 
 - Scope and files in scope.
 - Authority and entry points read.
