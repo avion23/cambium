@@ -928,12 +928,18 @@ class _Runtime:
                     "worktree_cleanup_deferred", task_id=task_id, reason="status_failed"
                 )
                 return
-            if status.stdout:
+            if any(
+                not _status_line_is_fence(line)
+                for line in status.stdout.splitlines()
+            ):
                 await self.emit(
                     "worktree_cleanup_deferred", task_id=task_id, reason="dirty"
                 )
                 return
 
+            fence_dir = worktree / ".cambium"
+            if fence_dir.is_dir():
+                shutil.rmtree(fence_dir, ignore_errors=True)
             removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
             if removed.returncode != 0:
                 await self.emit(

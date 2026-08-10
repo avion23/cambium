@@ -467,7 +467,6 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Pat
 
     assert result.results[0].status == "succeeded"
     assert result.results[0].restarts == 1
-    assert read_generation(worktree) == 9
     generations = [
         event["generation"]
         for event in read_events(session_dir)
@@ -475,6 +474,9 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Pat
     ]
     assert generations == [8, 9]
     assert 7 not in generations
+    # The terminal clean worktree is pruned (phase (d) acceptance), so the
+    # fence can no longer be probed after the run.
+    assert not worktree.exists()
 
 
 def test_generation_survives_crash_after_worktree_clean(
@@ -519,10 +521,17 @@ def test_generation_survives_crash_after_worktree_clean(
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
 
-    after_restart = read_generation(worktree)
     assert result.results[0].status == "succeeded"
-    assert [9, after_crash, after_restart] == [9, 10, 12]
-    assert not validate_worker_generation(worktree, 1)
+    assert [9, after_crash] == [9, 10]
+    generations = [
+        event["generation"]
+        for event in read_events(session_dir)
+        if event["kind"] == "init"
+    ]
+    assert generations == [11, 12]  # never rolls back below the crash window
+    # The terminal clean worktree is pruned (phase (d) acceptance), so the
+    # fence can no longer be probed after the run.
+    assert not worktree.exists()
 
 
 def test_worktree_registration_requires_an_exact_path_match(tmp_path: Path) -> None:
