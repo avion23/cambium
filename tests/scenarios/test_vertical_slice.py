@@ -6,11 +6,9 @@ the public ``cambium.supervisor.run_session`` adapter (a one-task
 mocks, no network.
 
 S01-aligned happy path: ready -> run_task -> result_envelope
-(status=succeeded) -> exit_message, gate passes, the canonical sequencer
-publishes the edit onto ``refs/heads/main``, supervisor exits 0.
-
-Negative path: the worker is told not to write the marker; the gate
-fails, the result is failed, and nothing is merged.
+(status=succeeded) -> exit_message, the canonical sequencer publishes
+the edit onto ``refs/heads/main``, supervisor exits 0. There is no
+pre-merge gate; the worker verdict alone decides merge eligibility.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ from cambium.supervisor import read_events, run_session
 
 WORKER = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
 MARKER = "// cambium-slice"
-GATE = "grep -q '// cambium-slice' hello.txt"
 
 
 def _make_scratch(repo: Path) -> str:
@@ -56,7 +53,6 @@ def _spec(session_dir: Path, *, write_marker: bool) -> dict:
         "target_file": "hello.txt",
         "marker": MARKER,
         "write_marker": write_marker,
-        "gate": GATE,
         "spec": "append the cambium-slice marker line to the target file",
         "provider_env_keys": ["FAKE_MODE"],
     }
@@ -96,29 +92,6 @@ def test_vertical_slice_happy_path(tmp_path) -> None:
         "hello from the vertical slice\n"
         "// cambium-slice\n"
     )
-    _assert_no_events_jsonl(session_dir)
-    assert _protocol_sequence(read_events(session_dir)) == [
-        "init", "ready", "run_task", "result", "exit",
-    ]
-
-
-def test_vertical_slice_gate_failure_no_merge(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    scratch = session_dir / "scratch"
-    base = _make_scratch(scratch)
-    spec = _spec(session_dir, write_marker=False)
-
-    result = asyncio.run(run_session(session_dir, spec))
-
-    assert result.status == "failed"
-    assert result.exit_code == 1
-    assert result.gate_exit_code is not None and result.gate_exit_code != 0
-    assert result.merge_sha is None
-    assert MARKER not in (scratch / "hello.txt").read_text()
-    tip = subprocess.run(
-        ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    assert tip == base  # main never advanced; no merge
     _assert_no_events_jsonl(session_dir)
     assert _protocol_sequence(read_events(session_dir)) == [
         "init", "ready", "run_task", "result", "exit",
@@ -257,32 +230,6 @@ def test_result_json_has_exact_root_keys_and_success_verdict(tmp_path) -> None:
     assert record["unified_diff"]
     assert record["parent_task_id"] is None
     assert record["session_id"] == str(session_dir.resolve())
-
-
-def test_result_json_failed_gate_overrides_worker_status(tmp_path) -> None:
-    # The worker envelope says succeeded, but the gate fails: the supervisor
-    # verdict is authoritative and result.json must report failed/1 while the
-    # envelope still contributes its sanitized commits/files.
-    session_dir = tmp_path / "session"
-    scratch = session_dir / "scratch"
-    base = _make_scratch(scratch)
-    spec = _spec(session_dir, write_marker=True)
-    spec["gate"] = "false"
-
-    result = asyncio.run(run_session(session_dir, spec))
-
-    assert result.status == "failed"
-    assert result.exit_code == 1
-    record = json.loads((session_dir / ".cambium" / "result.json").read_text())
-    assert set(record) == set(ROOT_RESULT_KEYS)
-    assert record["status"] == "failed"
-    assert record["exit_code"] == 1
-    assert record["commits"], "terminal envelope commits must be retained"
-    assert record["failure_reason"] == "gate_failed"
-    tip = subprocess.run(
-        ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    assert tip == base  # no merge
 
 
 def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:

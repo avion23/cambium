@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 from cambium import tools
-from cambium.approval import ApprovalGate, ApprovalPolicy
 from cambium.tools import (
     MAX_OUTPUT_BYTES,
     MAX_READ_BYTES,
@@ -610,20 +609,11 @@ def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:
     assert result.error is None
 
 
-def test_run_shell_is_list_form_and_approval_gated(tmp_path: Path) -> None:
+def test_run_shell_is_list_form(tmp_path: Path) -> None:
     command = [sys.executable, "-c", "print('shell-ok')"]
     result = _run("run_shell", {"cmd": command}, ToolContext(tmp_path))
     assert result.ok
     assert result.output == "shell-ok\n"
-
-    gate = ApprovalGate(ApprovalPolicy({"allowlist": [[sys.executable, "-c"]]}))
-    denied = _run(
-        "run_shell",
-        {"cmd": ["not-allowlisted", "argument"]},
-        ToolContext(tmp_path, approval=gate),
-    )
-    assert not denied.ok
-    assert denied.error == "DENIED: run_shell command is not approved"
 
 
 def test_run_shell_output_is_capped(tmp_path: Path) -> None:

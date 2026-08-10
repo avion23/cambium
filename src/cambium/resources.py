@@ -1,4 +1,4 @@
-"""Supervisor-owned controls for CPU-heavy gates.
+"""Standalone reusable primitive for bounding concurrent CPU-heavy commands.
 
 ``CompileGate`` limits only commands whose token prefix is in
 :data:`HEAVY_PATTERNS`.  The heuristic is deliberately lexical: a pattern is
@@ -8,9 +8,10 @@ classify a command by its arguments.  For example, ``["cargo", "build"]`` is
 heavy, while ``["python", "-m", "pytest"]`` is not because it does not start
 with the ``pytest`` token prefix.
 
-The gate is an instance-owned dependency.  A supervisor constructs one gate
-for its session and passes it to the code that runs gates; this module keeps no
-mutable process-wide state.
+The gate is an instance-owned dependency with no runtime caller in
+``cambium.supervisor.run_plan``: the supervisor gate runner was removed, so a
+caller that needs the bound constructs the gate itself and pairs each heavy
+acquisition with ``release``.  This module keeps no mutable process-wide state.
 """
 
 from __future__ import annotations
@@ -55,15 +56,16 @@ def _matches_prefix(command: list[str], pattern: str) -> bool:
 
 
 class CompileGate:
-    """Bound concurrent CPU-heavy gate commands for one supervisor session.
+    """Bound concurrent CPU-heavy commands as a standalone reusable primitive.
 
     Non-heavy commands bypass the semaphore.  A successful heavy acquisition
     must be paired with ``release`` by the caller.  ``timeout_s`` is optional
-    to keep timeout tests and supervisor configuration short; its production
-    default is 60 seconds.
+    to keep timeout tests short; its default is 60 seconds.
 
-    The instance is intended to be used by one asyncio supervisor loop.  Its
-    counters are loop-affine and therefore need no shared-state lock.
+    There is no runtime caller in ``run_plan``; callers that use the bound
+    construct their own instance.  The instance is intended to be used by one
+    asyncio loop.  Its counters are loop-affine and therefore need no
+    shared-state lock.
     """
 
     __slots__ = (

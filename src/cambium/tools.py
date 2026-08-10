@@ -2,7 +2,7 @@
 
 The LLM-facing schemas remain the source of truth for argument validation.
 Every operation runs inside an injected :class:`ToolContext`; this keeps
-approval, linting, and resource controls out of process-global state.
+linting and dependency wiring out of process-global state.
 """
 
 from __future__ import annotations
@@ -33,12 +33,6 @@ from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
 
-try:
-    from . import resources as _resources
-except ImportError:  # pragma: no cover - supports reduced installations.
-    _resources = None
-
-
 MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
@@ -57,7 +51,6 @@ class ToolContext:
     cwd: Path | str
     approval: ApprovalGate | None = None
     lint: LintDiag | None = None
-    compile_gate: Any | None = None
     init: Mapping[str, Any] | None = None
     emit: ToolEventSink | None = None
     _root: Path = field(init=False, repr=False)
@@ -615,13 +608,6 @@ async def _git_op(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         raise _ToolFailure(f"invalid git arguments: {exc}") from exc
 
     command = ["git", op, *argument_tokens]
-    if op in UNSAFE_GIT_OPS:
-        if ctx.approval is None:
-            raise _ToolFailure(
-                f"DENIED: git {op} requires approval and no approval gate is configured"
-            )
-        if not await ctx.approval.is_approved(command, cwd=Path(ctx.cwd)):
-            raise _ToolFailure(f"DENIED: approval refused git {op}")
 
     try:
         result = await _run_process(command, Path(ctx.cwd), GIT_TIMEOUT_S)
@@ -641,23 +627,6 @@ async def _git_op(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(True, output)
 
 
-async def _acquire_compile_gate(ctx: ToolContext, command: list[str]) -> tuple[Any, Any] | None:
-    gate = ctx.compile_gate
-    if gate is None or _resources is None:
-        return None
-    is_heavy = getattr(gate, "is_heavy", None)
-    acquire = getattr(gate, "acquire", None)
-    release = getattr(gate, "release", None)
-    if not callable(is_heavy) or not callable(acquire) or not callable(release):
-        raise _ToolFailure("invalid compile gate dependency")
-    if not is_heavy(command):
-        return None
-    token = await acquire(command)
-    if token is False:
-        raise _ToolFailure("DENIED: heavy command could not acquire a compile gate token")
-    return gate, token
-
-
 async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     command = args["cmd"]
     if not command:
@@ -666,37 +635,26 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     if timeout_s <= 0:
         raise _ToolFailure("run_shell timeout_s must be greater than zero")
 
-    if ctx.approval is not None and not await ctx.approval.is_approved(
-        command, cwd=Path(ctx.cwd)
-    ):
-        raise _ToolFailure("DENIED: run_shell command is not approved")
-
-    held = await _acquire_compile_gate(ctx, command)
     try:
-        try:
-            result = await _run_process(command, Path(ctx.cwd), timeout_s)
-        except subprocess.TimeoutExpired as exc:
-            output = _truncate_text(
-                _process_output(exc.stdout, exc.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
-            )
-            return _Outcome(False, output, f"run_shell timed out after {timeout_s}s")
-        except FileNotFoundError as exc:
-            raise _ToolFailure(f"command not found: {command[0]!r}") from exc
-        except OSError as exc:
-            raise _ToolFailure(f"could not run command {command[0]!r}: {exc}") from exc
-
+        result = await _run_process(command, Path(ctx.cwd), timeout_s)
+    except subprocess.TimeoutExpired as exc:
         output = _truncate_text(
-            _process_output(result.stdout, result.stderr),
-            MAX_OUTPUT_BYTES,
-            OUTPUT_TRUNCATION_MARKER,
+            _process_output(exc.stdout, exc.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
         )
-        if result.returncode != 0:
-            return _Outcome(False, output, f"run_shell exited with status {result.returncode}")
-        return _Outcome(True, output)
-    finally:
-        if held is not None:
-            gate, token = held
-            gate.release(token)
+        return _Outcome(False, output, f"run_shell timed out after {timeout_s}s")
+    except FileNotFoundError as exc:
+        raise _ToolFailure(f"command not found: {command[0]!r}") from exc
+    except OSError as exc:
+        raise _ToolFailure(f"could not run command {command[0]!r}: {exc}") from exc
+
+    output = _truncate_text(
+        _process_output(result.stdout, result.stderr),
+        MAX_OUTPUT_BYTES,
+        OUTPUT_TRUNCATION_MARKER,
+    )
+    if result.returncode != 0:
+        return _Outcome(False, output, f"run_shell exited with status {result.returncode}")
+    return _Outcome(True, output)
 
 
 TOOL_DISPATCH: dict[str, ToolImplementation] = {

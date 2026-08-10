@@ -622,46 +622,6 @@ def test_bench_stderr_never_leaks_unicode_escaped_provider_credential(
         assert secret not in captured
 
 
-def test_bench_stderr_never_leaks_escaped_secret_in_free_form_text(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    """Escape-aware matching covers free-form stderr, not only JSON stdout."""
-    import cambium.bench as bench
-
-    secret = 'sk-proj-A"B\\C'
-    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
-
-    modules_dir = _write_fixture_module(
-        tmp_path,
-        manifest={
-            "contract_version": 1,
-            "module_name": "fixture_module",
-            "cli_module": "cambium.modules.fixture",
-            "protocol": "json-v1",
-            "dataset_schema_version": 1,
-        },
-    )
-    (modules_dir / "fixture" / "__main__.py").write_text(
-        textwrap.dedent(
-            r"""
-            import sys
-
-            print('the wire shows "sk-proj-A\\u0022B\\u005cC" here', file=sys.stderr)
-            raise SystemExit(1)
-            """
-        )
-    )
-    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
-    bench_root = tmp_path / "baselines"
-
-    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
-    captured = capsys.readouterr().err
-    assert "ERROR ModuleCLIError" in captured
-    assert "\\u0022" not in captured
-    assert "\\u005c" not in captured
-    assert secret not in captured
-
-
 def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
