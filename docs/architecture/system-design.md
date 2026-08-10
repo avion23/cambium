@@ -150,7 +150,8 @@ The worker configured DSPy ReAct with `task, context -> action`, a bounded
 ran tools in its worktree, collected recent commits, and returned a result or
 error. The intended tool contract kept debug output off stdout and let Septum
 restrict network and shell permissions. Reviews recorded missing structured
-edits (F8/LLM-C3), protocol corruption risks, and code defects (IMPL-C3-C9).
+edits (F8/LLM-M2), protocol corruption risks, and code defects
+(IMPL-C3-C9, the implementation review's C3–C9 range).
 
 ### M6 — Architectus (orchestrator)
 
@@ -176,7 +177,8 @@ checkout (IMPL-C1).
 
 The target wrapper applied Linux namespaces and a firejail-like policy, with
 network and shell permissions supplied in `init`; a macOS/Windows fallback was
-not designed. The implementation review marked the Linux-only backend M4/P2.
+not designed. The implementation review marked the Linux-only backend M4; the
+draft assigned the module P2.
 
 ### M9 — Ascensus (optimization)
 
@@ -263,8 +265,9 @@ and `grep_code` searched the worktree. After each action the worker emitted a
 heartbeat and attempted a checkpoint containing ReAct trajectory state. On
 success it ran `collect_commits()` and compared changed names with the base;
 on exception it emitted an error. The sample used `HEAD~5..HEAD`, which later
-became N2, and called `agent.forward()` synchronously inside `async main()`,
-which became N13. No structured patch tool, stdout guard for third-party
+became distributed-review N2, implementation-review N12, and LLM-review N5;
+it called `agent.forward()` synchronously inside `async main()`, which became
+implementation-review N13. No structured patch tool, stdout guard for third-party
 libraries, or resume reader was shown.
 
 **Architectus scheduling.** `TaskDecomposer` returned a list of `SubTask`
@@ -359,8 +362,8 @@ than in-process async or fragile socket IPC; provider cascade rather than one
 vendor; DSPy SIMBA/GEPA rather than static prompts; Python 3.14 rather than
 TypeScript/Go; and Git worktree plus event-log recovery rather than lock files or
 snapshots. The implementation and LLM reviews specifically flagged copied ideas
-that had no module contract (N18/N19) so the provenance is preserved without
-claiming they were implemented.
+that had no module contract (implementation-review N18/N19) so the provenance
+is preserved without claiming they were implemented.
 
 ## 4. Binding and competitor decisions
 
@@ -408,10 +411,10 @@ Three reviews concluded **“Sound bones, not build-ready yet.”** Findings wer
 | **F5** | Model equality guard makes cascade a no-op across providers (LLM-C2). Separate preference from capability/tier. |
 | **F6** | 60-second heartbeat is shorter than 120-second shell timeout and four-provider cascade. Emit tool-progress heartbeats or raise/partition timeouts (DS-C3). |
 | **F7** | About twelve sample syntax/name errors (IMPL-C3-C9). Smoke-test every sample. |
-| **F8** | No structured edit tool (LLM-C3). Add `edit_file` or a patch grammar. |
+| **F8** | No structured edit tool (LLM-M2). Add `edit_file` or a patch grammar. |
 | **F9** | Independent hill-climbing is overstated (LLM-C4). Treat it as a hypothesis; start with worker-only evaluation. |
 | **F10** | No robust coding metric (LLM-C5). Combine tests-as-floor, behavioral checks, quality review, and held-out data. |
-| **F11** | Event append is not crash-safe (DS-C6). Use fsync or SQLite WAL. |
+| **F11** | Event append is not crash-safe (DS-M3). Use fsync or SQLite WAL. |
 | **F12** | Sandbox is Linux-only (IMPL-M4). Add platform backends or document limits. |
 
 Moderate records M1–M8 retained the proposed fixes: add jitter; combine EOF

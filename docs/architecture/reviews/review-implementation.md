@@ -114,12 +114,13 @@ single-provider route and makes cooldown/failover counters misleading.
 
 ### C11. `shutdown()` kills asyncio Tasks, not Process objects
 
-`asyncio.wait([h.proc.wait()])` returns tasks; calling `.kill()` on those tasks
-raises `AttributeError`. Bare coroutines are also deprecated in `asyncio.wait`.
-
-The intended fix is to retain `Process` objects, create wait tasks explicitly,
-await them, and kill the underlying process for each pending handle. Shutdown
-must also close pipes and remove worktrees, which N7 and M9 cover.
+The sample passes bare `h.proc.wait()` coroutines to `asyncio.wait`. Python 3.14
+rejects those bare coroutines with `TypeError` before `asyncio.wait` returns
+anything. The correction is to retain each `Process` in its handle,
+create explicit wait tasks with `asyncio.create_task(h.proc.wait())`, await the
+tasks, and call `handle.proc.kill()` for pending processes. Do not call `kill()`
+on wait tasks. Shutdown must also close pipes and remove worktrees, which the
+distributed review's N7 and local M9 cover.
 
 ### C12. Worker bypasses FanOut
 
@@ -213,8 +214,10 @@ advisory records may be dropped.
 ### M8. No harness test strategy
 
 No unit, supervisor/worker handshake, fake-LLM, merge-conflict, property, chaos,
-or soak plan was specified. Add M0/M11 test work: deterministic fake workers and
-providers, restart-intensity properties, and a CI gate before P0 completion.
+or soak plan was specified. Add a test-and-evaluation workstream (called
+“Test & Eval” in the historical review, not an M-numbered module): deterministic
+fake workers and providers, restart-intensity properties, and a CI gate before
+P0 completion.
 
 The minimum requested smoke test was one fake worker, one fake LLM, one worktree,
 one IPC handshake, and one merge. Property tests should cover restart windows and
@@ -239,7 +242,7 @@ configurable and gate large follow-up messages on readiness.
 
 Sending a large context record before readiness can block `stdin.drain()` while
 the worker is still importing DSPy. That blocks the supervisor's event loop and
-recreates the same pipe-stall mechanism as distributed finding C1.
+recreates the same pipe-stall mechanism as distributed-review C1.
 
 ## MINOR NOTES
 
@@ -278,6 +281,6 @@ supervision, Kahn-process IPC, Temporal durability, and DSPy optimization—was
 coherent, but the samples did not meet an interpreter. The recommended sequence
 was: make every sample import; run a one-worker fake-LLM → IPC → merge smoke test;
 serialize merge in a throwaway worktree; wire or narrow FanOut; add sandbox,
-secrets, logging, and M0/M11 tests; default to CPython 3.12/3.13; then repeat
+secrets, logging, and test-and-evaluation work; default to CPython 3.12/3.13; then repeat
 adversarial review. The date, source path, branch references in Git examples,
 and v0.1.0-draft label are historical provenance.
