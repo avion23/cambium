@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cambium.fencing import next_generation, write_generation
+from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
 
 PROTO = 1
@@ -59,6 +59,23 @@ EventSink = Callable[[dict[str, Any]], None]
 def make_request_id(seq: int) -> str:
     """Monotonic-ish request id. Not a ULID (no deps in the slice)."""
     return f"{time.time_ns():x}-{seq:04x}"
+
+
+def _stdin_write_timeout_s() -> float:
+    """Return the bounded stdin-drain budget without inheriting child env."""
+    value = os.environ.get("CAMBIUM_WRITE_TIMEOUT_S")
+    if value is None:
+        return STDIN_WRITE_TIMEOUT_S
+    try:
+        timeout = float(value)
+    except ValueError:
+        return STDIN_WRITE_TIMEOUT_S
+    return max(0.0, timeout)
+
+
+def _stdin_deadline(wall_deadline: float) -> float:
+    loop = asyncio.get_running_loop()
+    return min(wall_deadline, loop.time() + _stdin_write_timeout_s())
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +151,7 @@ async def _write_json(
     loop = asyncio.get_running_loop()
     write_deadline = deadline
     if write_deadline is None:
-        write_deadline = loop.time() + STDIN_WRITE_TIMEOUT_S
+        write_deadline = loop.time() + _stdin_write_timeout_s()
     remaining = write_deadline - loop.time()
     if remaining <= 0:
         await _kill_worker(proc)
@@ -318,19 +335,29 @@ async def run_session(
     )
 
     messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    message_too_long = False
 
     async def _read_stdout() -> None:
-        async for raw in proc.stdout:
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-            if not line.strip():
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError as exc:
-                log.emit("parse_error", task_id=task_id, message=str(exc))
-                continue
-            await messages.put(msg)
-        await messages.put(None)  # EOF sentinel; not death by itself
+        nonlocal message_too_long
+        try:
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    log.emit("parse_error", task_id=task_id, message=str(exc))
+                    continue
+                await messages.put(msg)
+        except (ValueError, asyncio.LimitOverrunError) as exc:
+            message_too_long = True
+            log.emit(
+                "protocol", task_id=task_id, note="MessageTooLong", message=str(exc)[:256]
+            )
+            await _kill_worker(proc)
+        finally:
+            await messages.put(None)  # EOF sentinel; not death by itself
 
     async def _read_stderr() -> None:
         async for raw in proc.stderr:
@@ -342,7 +369,7 @@ async def run_session(
     stderr_task = asyncio.create_task(_read_stderr())
 
     init_rid = make_request_id(1)
-    init_deadline = min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S)
+    init_deadline = _stdin_deadline(wall_deadline)
     init_written = await _write_json(
         proc,
         {
@@ -391,7 +418,7 @@ async def run_session(
             log.emit("ready", task_id=task_id, request_id=msg.get("request_id"),
                      pid=msg.get("pid"))
             run_rid = make_request_id(2)
-            run_deadline = min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S)
+            run_deadline = _stdin_deadline(wall_deadline)
             if not await _write_json(
                 proc,
                 {"type": "run_task", "request_id": run_rid,
@@ -492,8 +519,12 @@ async def run_session(
     missing_exit = exit_reason is None
     missing_result = result_envelope is None or not result_correlated
 
+    if message_too_long:
+        log.emit("protocol", task_id=task_id, note="message too long; worker failed")
     if timed_out:
         status, exit_code = "failed", 3
+    elif message_too_long:
+        status, exit_code = "failed", 1
     elif worker_bad:
         status, exit_code = "failed", worker_exit_code if worker_exit_code > 0 else 1
     elif missing_exit:
@@ -1114,6 +1145,9 @@ class _Runtime:
         listing = await self._git_stdout(repo, "worktree", "list", "--porcelain") or ""
         if str(worktree) in listing:
             return await self._recover_worktree_locked(spec, generation)
+        stale_generation = 0
+        if worktree.exists():
+            stale_generation = await asyncio.to_thread(read_generation, worktree)
         if worktree.exists():
             # stale unregistered directory; it is session-owned, so drop it
             shutil.rmtree(worktree, ignore_errors=True)
@@ -1125,7 +1159,7 @@ class _Runtime:
             raise RuntimeError(
                 f"worktree add for {branch} failed: {(result.stderr + result.stdout).strip()[:512]}"
             )
-        initial_generation = max(generation or 1, 1)
+        initial_generation = max(generation or 1, stale_generation + 1, 1)
         await asyncio.to_thread(write_generation, worktree, initial_generation)
         return initial_generation
 
@@ -1366,9 +1400,10 @@ class _Runtime:
 
         messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         parse_errors = 0
+        message_too_long = False
 
         async def _read_stdout() -> None:
-            nonlocal parse_errors
+            nonlocal parse_errors, message_too_long
             try:
                 async for raw in proc.stdout:
                     line = raw.decode("utf-8", "replace").rstrip("\n")
@@ -1389,6 +1424,13 @@ class _Runtime:
                                 pass
                         continue
                     await messages.put(msg)
+            except (ValueError, asyncio.LimitOverrunError) as exc:
+                message_too_long = True
+                await self.emit(
+                    "protocol", task_id=task_id, generation=generation,
+                    note="MessageTooLong", message=str(exc)[:256],
+                )
+                await _kill_worker(proc)
             finally:
                 await messages.put(None)
 
@@ -1423,7 +1465,7 @@ class _Runtime:
         init_written = await _write_json(
             proc,
             init_msg,
-            deadline=min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S),
+            deadline=_stdin_deadline(wall_deadline),
         )
 
         phase = "ready"  # "ready" | "run"
@@ -1444,7 +1486,7 @@ class _Runtime:
                         "request_id": self._next_rid(),
                         "reason": timeout_phase or "timeout",
                     },
-                    deadline=min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S),
+                    deadline=_stdin_deadline(wall_deadline),
                 )
             except Exception:
                 pass
@@ -1584,10 +1626,12 @@ class _Runtime:
                         proc,
                         {"type": "run_task", "request_id": run_rid,
                          "task_id": task_id, **payload},
-                        deadline=min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S),
+                        deadline=_stdin_deadline(wall_deadline),
                     ):
                         timeout_phase = "stdin"
                         await self.emit("protocol", task_id=task_id, note="run_task write failed")
+                        await _kill_worker(proc)
+                        break
                     await self.emit(
                         "run_task", task_id=task_id, request_id=run_rid, generation=generation
                     )
@@ -1679,7 +1723,10 @@ class _Runtime:
             and envelope is not None
             and correlated
         )
-        if clean:
+        if message_too_long:
+            clean = False
+            reason: str | None = "message_too_long"
+        elif clean:
             reason: str | None = None
         elif timeout_phase is not None:
             reason = timeout_phase

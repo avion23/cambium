@@ -111,6 +111,14 @@ def _require_generation(worktree: Path, generation: int) -> None:
         )
 
 
+def _write_worktree_state(
+    worktree: Path, generation: int, path: Path, content: str
+) -> None:
+    """Write worker state only while this process owns the current fence."""
+    _require_generation(worktree, generation)
+    path.write_text(content)
+
+
 def cap_diff(diff: str) -> tuple[str, bool]:
     """Cap ``diff`` to ``MAX_DIFF_BYTES`` UTF-8 bytes, never splitting a
     codepoint; returns ``(diff, truncated)``."""
@@ -208,7 +216,12 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
             outcome["failure_reason"] = f"target file missing: {target_file}"
             return outcome
         _require_generation(worktree, generation)
-        target.write_text(target.read_text().rstrip("\n") + "\n" + marker + "\n")
+        _write_worktree_state(
+            worktree,
+            generation,
+            target,
+            target.read_text().rstrip("\n") + "\n" + marker + "\n",
+        )
         _require_generation(worktree, generation)
         if marker not in target.read_text():
             outcome["failure_reason"] = "edit missing: marker not present after write"
