@@ -566,13 +566,13 @@ def test_cli_entry_points_share_help_and_extra_argument_errors() -> None:
     assert unified_help.stdout == module_help.stdout
     assert unified_help.stderr == module_help.stderr == ""
 
-    module_extra = _run_cli("", "plan.json", "extra")
-    unified_extra = _run_unified_cli("", "plan.json", "extra")
+    module_extra = _run_cli("", "plan.json", "TOP_SECRET_123")
+    unified_extra = _run_unified_cli("", "plan.json", "TOP_SECRET_123")
 
     assert unified_extra.returncode == module_extra.returncode == 2
     assert unified_extra.stdout == module_extra.stdout == ""
     assert unified_extra.stderr == module_extra.stderr
-    assert "unrecognized arguments: extra" in unified_extra.stderr
+    assert "TOP_SECRET_123" not in unified_extra.stderr
 
 
 def test_cli_rejects_invalid_json_from_stdin() -> None:

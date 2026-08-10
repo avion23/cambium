@@ -40,6 +40,8 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
+from .cli import _SafeArgumentParser
+
 # Build-time per-parent fan-out bound (I2.3). This is NOT the session-wide
 # parallel-worker cap of the same name: per architecture §3.7 I2.3 that cap
 # is "enforced by the supervisor at dispatch" and is the supervisor's job.
@@ -497,7 +499,7 @@ def upward_result(node: TaskNode) -> dict[str, Any]:
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     """Build the standalone tasktree argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         prog="python -m cambium.tasktree",
         description=(
             "Read a task plan JSON object from PLAN or stdin and print its "
