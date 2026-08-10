@@ -61,6 +61,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cambium.fencing import validate_worker_generation
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
 
 PROTO = 1
@@ -72,6 +73,10 @@ MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
 
 logger = logging.getLogger(__name__)
+
+
+class GenerationFenceError(RuntimeError):
+    """The worker no longer owns the persisted worktree generation."""
 
 
 def _monotonic_ms() -> int:
@@ -96,6 +101,14 @@ async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _require_generation(worktree: Path, generation: int) -> None:
+    if not validate_worker_generation(worktree, generation):
+        raise GenerationFenceError(
+            f"generation mismatch for {worktree}: worker={generation}, "
+            "persisted generation is different or missing"
+        )
 
 
 def cap_diff(diff: str) -> tuple[str, bool]:
@@ -137,7 +150,14 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
     try:
         scratch = Path(run["scratch_repo"]).resolve()
         worktree = Path(run["worktree_path"]).resolve()
-        branch = run["branch"]
+        generation = run.get("generation")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation <= 0
+        ):
+            outcome["failure_reason"] = "invalid worker generation"
+            return outcome
         target_file = run["target_file"]
         marker = run["marker"]
         write_marker = bool(run.get("write_marker", True))
@@ -152,18 +172,19 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
             outcome["failure_reason"] = f"target_file {target_file!r} escapes the worktree"
             return outcome
 
-        rc, _out, err = git("rev-parse", "main", cwd=scratch)
+        def guarded_git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
+            _require_generation(worktree, generation)
+            return git(*args, cwd=cwd)
+
+        _require_generation(worktree, generation)
+        rc, _out, err = guarded_git("rev-parse", "main", cwd=scratch)
         if rc != 0:
             outcome["failure_reason"] = f"no main branch in scratch repo: {err}"
             return outcome
         base_commit = _out
 
-        if worktree.exists():
-            git("worktree", "remove", "--force", str(worktree), cwd=scratch)
-        git("branch", "-D", branch, cwd=scratch)
-        rc, _out, err = git("worktree", "add", "-b", branch, str(worktree), "main", cwd=scratch)
-        if rc != 0:
-            outcome["failure_reason"] = f"worktree add failed: {err}"
+        if not worktree.exists():
+            outcome["failure_reason"] = f"worker worktree is missing: {worktree}"
             return outcome
 
         # Optional work_delay_s pauses before the edit (testing hook); the
@@ -179,13 +200,16 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         if stop.is_set():
             outcome["status"] = "cancelled"
             return outcome
+        _require_generation(worktree, generation)
         if not write_marker:
             outcome["failure_reason"] = "marker not written (write_marker=false)"
             return outcome
         if not target.exists():
             outcome["failure_reason"] = f"target file missing: {target_file}"
             return outcome
+        _require_generation(worktree, generation)
         target.write_text(target.read_text().rstrip("\n") + "\n" + marker + "\n")
+        _require_generation(worktree, generation)
         if marker not in target.read_text():
             outcome["failure_reason"] = "edit missing: marker not present after write"
             return outcome
@@ -193,13 +217,15 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
             outcome["status"] = "cancelled"
             return outcome
 
-        git("add", target_file, cwd=worktree)
-        rc, _out, err = git("commit", "-m", f"cambium-ipc: {run['task_id']}", cwd=worktree)
+        guarded_git("add", target_file, cwd=worktree)
+        rc, _out, err = guarded_git(
+            "commit", "-m", f"cambium-ipc: {run['task_id']}", cwd=worktree
+        )
         if rc != 0:
             outcome["failure_reason"] = f"commit failed: {err}"
             return outcome
-        _rc, sha, _err = git("rev-parse", "HEAD", cwd=worktree)
-        _rc, diff, _err = git("diff", f"{base_commit}..HEAD", cwd=worktree)
+        _rc, sha, _err = guarded_git("rev-parse", "HEAD", cwd=worktree)
+        _rc, diff, _err = guarded_git("diff", f"{base_commit}..HEAD", cwd=worktree)
         diff, diff_truncated = cap_diff(diff)
         outcome.update(
             status="succeeded",
@@ -210,6 +236,9 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
             diff_truncated=diff_truncated,
             summary=f"appended marker to {target_file}"[:MAX_SUMMARY_CHARS],
         )
+        return outcome
+    except GenerationFenceError as exc:
+        outcome["failure_reason"] = str(exc)
         return outcome
     except Exception as exc:  # let-it-crash: report as a failure, not a hang
         outcome["failure_reason"] = f"task crashed: {exc}"
@@ -332,6 +361,21 @@ async def _send_ok(
     })
 
 
+async def _send_pong(
+    writer: asyncio.StreamWriter,
+    msg: dict[str, Any],
+    task_id: str,
+    generation: int,
+) -> None:
+    await send(writer, {
+        "type": "pong",
+        "request_id": msg.get("request_id"),
+        "task_id": task_id,
+        "generation": generation,
+        "monotonic_ms": _monotonic_ms(),
+    })
+
+
 async def _fatal(writer: asyncio.StreamWriter, msg: Any, message: str) -> int:
     context = msg if isinstance(msg, dict) else {}
     await send(writer, {
@@ -372,6 +416,8 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
     init_rid = first["request_id"]
     task_id = first.get("task_id", "unknown")
     generation = first.get("generation", 1)
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        return await _fatal(writer, first, "init generation must be a positive integer")
     await send(writer, {
         "type": "ready",
         "request_id": init_rid,
@@ -452,11 +498,17 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 return await _fatal(writer, msg, "run_task while a task is already running")
             if "request_id" not in msg:
                 return await _fatal(writer, msg, "run_task without a request_id")
+            claimed_generation = msg.get("generation", generation)
+            if claimed_generation != generation:
+                return await _fatal(writer, msg, "run_task generation does not match init")
+            msg = {**msg, "generation": generation}
             stop = threading.Event()
             current = asyncio.create_task(
                 _run_task(writer, msg, task_id, generation, stop))
         elif mtype == "check_health":
             await _send_ok(writer, msg, task_id, generation)
+        elif mtype == "ping":
+            await _send_pong(writer, msg, task_id, generation)
         elif mtype == "steer":
             payload = msg.get("payload") or {}
             # Structured parse: only an exact {"action": "cancel"} aborts.
