@@ -837,17 +837,13 @@ def test_default_spec_selects_installed_worker_module() -> None:
 
 def test_worker_command_prefers_installed_module_and_preserves_script_paths() -> None:
     module_cmd = [sys.executable, "-u", "-m", "cambium.worker"]
-    assert (
-        supervisor_module.worker_command({"task_id": "t", "worker": "cambium.worker"})
-        == module_cmd
-    )
-    assert supervisor_module.worker_command({"task_id": "t"}) == module_cmd
     runtime = supervisor_module._Runtime(Path("/tmp/session"), None)
     assert (
         runtime._worker_command({"task_id": "t", "worker": "cambium.worker"}) == module_cmd
     )
+    assert runtime._worker_command({"task_id": "t"}) == module_cmd
     script = "/some/worker/script.py"
-    assert supervisor_module.worker_command({"task_id": "t", "worker": script}) == [
+    assert runtime._worker_command({"task_id": "t", "worker": script}) == [
         sys.executable,
         "-u",
         script,
