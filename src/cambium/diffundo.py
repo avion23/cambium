@@ -2,7 +2,7 @@
 
 Implements the provider-cascade contract of docs/architecture/architecture.md §9
 as normatively extended by docs/research/cascade-design.md (fall-through classes
-§1.2, race semantics §1.3, health state machine §2.4) and
+§1.2, health state machine §2.4) and
 docs/research/design-deltas.md:
 
 - **D1 — no local cache.** ``Diffundo`` is a stateless router; the only state is
@@ -28,8 +28,8 @@ are request-level fall-throughs that never drive health transitions. The
 a half-open probe); the sliding-window failure-rate escalation is a secondary
 safety net that only fires once the window is full.
 
-Every ``call``/``call_race`` is bounded by a wall-clock deadline
-(``call_budget_s`` / ``race_timeout_s``): the per-attempt HTTP timeout is capped
+Every ``call`` is bounded by a wall-clock deadline (``call_budget_s``): the
+per-attempt HTTP timeout is capped
 at the remaining budget, retries are skipped when the backoff no longer fits,
 and the cascade aborts (``AllProvidersFailed``) once the budget is spent — the
 deadline is not just a candidate-waiting bound.
@@ -51,7 +51,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -465,14 +465,6 @@ def _tool_call_arguments(tool_call: Any) -> dict[str, Any] | None:
     return parsed
 
 
-def _default_quality_gate(result: CallResult) -> bool:
-    return bool((result.content or "").strip() or result.tool_calls)
-
-
-def _default_score(result: CallResult) -> float:
-    return float(len(result.content or "") + len(result.tool_calls or ()))
-
-
 def _redact_error_text(message: str, api_key: str) -> str:
     """Remove credentials while retaining safe provider diagnostics."""
     redacted = message.replace(api_key, _REDACTED)
@@ -593,92 +585,6 @@ class Diffundo:
                     )
                 return result
             raise AllProvidersFailed(tried, last_error)
-
-    async def call_race(
-        self,
-        tier: ProviderTier,
-        prompt: dict[str, Any],
-        *,
-        model: str | None = None,
-        budget_usd: float | None = None,
-        n: int = 2,
-        race_timeout_s: float = 30.0,
-        quality_gate: Callable[[CallResult], bool] | None = None,
-        score: Callable[[CallResult], float] | None = None,
-    ) -> CallResult:
-        """Opt-in race over the first ``n`` tier candidates (cascade-design §1.3).
-
-        First-completed wins only if ``quality_gate`` passes; otherwise the race
-        keeps waiting and, if nothing passes by the deadline, returns the
-        best-by-``score`` completed result — a superior result is never
-        discarded. Exceptions are read as values, so a crashed provider can
-        neither win nor kill the race (LLM-M6 hygiene).
-        """
-        validate_prompt_structure(prompt)
-        gate = quality_gate or _default_quality_gate
-        scorer = score or _default_score
-        deadline = time.monotonic() + race_timeout_s
-        candidates = await self._await_candidates(tier, model, deadline)
-        if not candidates:
-            raise AllProvidersFailed([], None)
-        selected = candidates[: max(int(n), 1)]
-        tasks: dict[asyncio.Task[Any], str] = {
-            asyncio.create_task(self._attempt(provider, prompt, deadline=deadline)): provider.name
-            for provider in selected
-        }
-        results: dict[str, BaseException | CallResult] = {}
-        best: tuple[str, CallResult] | None = None
-        gated_winner: tuple[str, CallResult] | None = None
-        budget_exhausted = False
-        last_error: BaseException | None = None
-        try:
-            while tasks:
-                now = time.monotonic()
-                if now >= deadline:
-                    break
-                done, pending = await asyncio.wait(
-                    list(tasks),
-                    timeout=deadline - now,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    provider_name = tasks[task]
-                    try:
-                        value: BaseException | CallResult = task.result()
-                    except asyncio.CancelledError:
-                        continue
-                    except Exception as exc:
-                        value = exc
-                    results[provider_name] = value
-                    last_error = value
-                    if isinstance(value, Exception):
-                        if getattr(value, "budget_exhausted", False):
-                            budget_exhausted = True
-                            break
-                        continue
-                    if gate(value):
-                        gated_winner = (provider_name, value)
-                        break
-                    if best is None or scorer(value) > scorer(best[1]):
-                        best = (provider_name, value)
-                if gated_winner is not None or budget_exhausted:
-                    break
-                tasks = {t: p for t, p in tasks.items() if t in pending}
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-        if budget_exhausted:
-            raise AllProvidersFailed(list(results), last_error)
-        if gated_winner is not None:
-            result = gated_winner[1]
-        elif best is not None:
-            result = best[1]
-        else:
-            raise AllProvidersFailed(list(results), last_error)
-        if budget_usd is not None and result.estimated_cost_usd > budget_usd:
-            raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
-        return result
 
     def health(self, name: str) -> HealthState:
         """Current circuit-breaker health state for a provider."""
