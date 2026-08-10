@@ -761,8 +761,16 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
         write_marker = bool(run.get("write_marker", True))
         provider_metadata: dict[str, Any] | None = None
 
-        target_file = run["target_file"]
-        marker = run["marker"]
+        target_file = run.get("target_file")
+        marker = run.get("marker")
+        if (
+            not isinstance(target_file, str)
+            or not target_file
+            or not isinstance(marker, str)
+            or not marker
+        ):
+            outcome["failure_reason"] = "marker task requires target_file and marker"
+            return outcome
 
         session_root = scratch.parent
         if not worktree.is_relative_to(session_root):
