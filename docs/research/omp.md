@@ -31,13 +31,17 @@ Recent sessions show real Polymarket code/review/deploy work, model smoke tests,
 5. Upstream is fast-moving: 17,506 commits/23.3k stars in the fetched project snapshot, local 17.2.10 versus npm 17.2.12. https://github.com/can1357/oh-my-pi
 6. Local evidence is mostly interactive and one-shot `-p`; configured task fan-out/merge behavior remains **UNVERIFIED**.
 
-## Relevant lessons for Cambium
+## 4. Relevant lessons for Cambium
 
 - Make fallback chains and per-provider concurrency caps first-class; the observed caps were 12 (OpenAI), 2 (Z.AI), 2 (Kimi), 1 (Micu), 2 (OpenRouter), 2 (NVIDIA).
 - Use deterministic hash-anchored edits with pre-apply validation, not free-form string patches.
 - Keep role routing and thinking budgets in config (`smol`, `plan`, `reviewer`, `advisor`), and make context compaction an explicit, observable subsystem.
 - Track config as a git repository, but store only environment references for secrets; fail loudly on missing MCP binaries or stale model IDs.
 - Benchmark edits/token efficiency offline (Ascensus) rather than trusting vendor numbers. Cheap Z.AI/Kimi/Micu gateways show provider-agnostic FanOut is practical.
+
+### 4.5 Benchmark-driven harness
+
+The benchmark recommendation is the fifth lesson in this section: measure edit success and token efficiency offline, and keep vendor-published gains **UNVERIFIED** unless independently reproduced.
 
 ## Local install evidence
 

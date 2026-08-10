@@ -32,17 +32,43 @@ OpenCode is an open-source coding agent with TUI, desktop, web, and headless ser
 2. **Heavy footprint:** local binary 140 MB, SQLite DB 299 MB at measurement, cache/package 91 MB, and managed outputs near 1 MB. The JS/Bun/Effect stack is materially heavier than Cambium’s Python target.
 3. **Snapshot cost:** docs warn internal-git snapshots can slow indexing and consume significant disk; undo requires a git repository. https://opencode.ai/docs/config/
 4. **Provider/config churn:** providers install dynamically and cache locally; troubleshooting suggests clearing `~/.cache/opencode`; config has `maxSteps`→`steps`, `tools`→`permission`, and TUI-key migration. https://opencode.ai/docs/troubleshooting/ ; https://opencode.ai/docs/agents/
+### 3.5 Compaction and context reduction
+
 5. **Compaction is lossy:** hidden `compaction` agent makes another model call; `reserved`/`prune` are coarse and do not provide replay durability. https://opencode.ai/docs/config/ ; https://opencode.ai/docs/agents/
+
+### 3.6 Application-level caching
+
 6. App-level prompt caching was not observed; cost management uses provider-side cache keys. Cambium review `docs/architecture/reviews/review-llm-design.md` treats a naive prompt hash as a correctness hazard. **UNVERIFIED secondhand reports:** system-design cites issue #11865 timeout hangs and community ACK loops; those were not rechecked.
 
 ## 4. Relevant lessons for Cambium
 
+### 4.1 Orchestrator and worker model
+
 1. Keep process-isolated parallel workers: OpenCode’s cheap child-session UX is useful, but sequential dispatch is a limitation. Borrow `@mention`/resume/fork ergonomics and a task-like decomposition tool.
+
+### 4.2 One authoritative API
+
 2. Define one authoritative wire API and generate clients/frontends from it; Nuntius JSON-lines is Cambium’s analog.
+
+### 4.3 Optional TUI adapter
+
 3. Use mature TUI components rather than hand-rolled rendering; keep TUI optional and separate (`tui.json` is a useful precedent).
+
+### 4.4 Permission model
+
 4. Copy allow/ask/deny glob permissions, last-match-wins, external-directory gates, and `doom_loop` protection for Septum.
-5. Keep a stable context prefix per epoch and bound tool output with full output in managed files. Do not ship a naive app-level cache; bind any cache to worktree/HEAD or use provider caching.
-6. Adopt portable `SKILL.md` discovery and checkpoint-based recovery; use compaction only as context reduction, not durability.
+
+### 4.5 Context-epoch caching
+
+5. Keep a stable context prefix per epoch and avoid a naive app-level cache; bind any cache to worktree/HEAD or use provider caching.
+
+### 4.6 Managed tool-output files
+
+Bounded model-visible preview plus spill-to-file (Managed Tool Output Files), with the full output path recorded, directly addresses chatty workers and keeps the durable log bounded.
+
+### 4.8 Compaction and checkpointing
+
+OpenCode’s compaction is a lossy extra LLM call. Cambium’s checkpoint-per-tool-call ReAct recovery is strictly better for crash recovery; use compaction only as a last-resort context reducer, not as the durability mechanism. Adopt portable `SKILL.md` discovery alongside that checkpoint boundary.
 
 ## 5. Local install evidence
 

@@ -68,6 +68,10 @@ Default to inline/streaming; full alternate screen only in explicit `tui`, with 
 
 ### 4.4 Machine interfaces
 
+#### JSON-Lines stdio — event stream is the interface
+
+Nuntius is newline-delimited JSON over pipes; reusing it keeps the event log byte-identical to the client stream, so replay is the interface. Add request/correlation IDs for control messages without changing the event shape.
+
 | interface | role | verdict |
 |---|---|---|
 | JSON-lines stdio | canonical session/telemetry; replayable and `tail`/`jq` friendly | **Primary** |

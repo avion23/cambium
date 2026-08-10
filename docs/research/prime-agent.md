@@ -20,16 +20,35 @@ Local models define `opencode-go` (DeepSeek V4), NVIDIA MiniMax M3, and TokenRou
 ## 2. What it does well
 
 1. Persistent IPython state makes imports, variables, and handles survive turns.
+
+### 2.2 Native subagents
+
 2. `rlm(...)` supplies named parallel/background children with attributed usage and peer messaging.
+
+### 2.3 Daemon-backed continuity
+
 3. Daemon attach supports terminal detach; goals, heartbeats, schedules, and bounded autonomous gates persist.
+
+### 2.4 Continual self-improvement
+
 4. `/refine` records lessons as prompts/memories/skills/subagent specs with rollback; local `harness_state.json` contains a refine workflow and reviewer spec.
-5. Append-only JSONL branching plus compaction summaries carried a local 1,988-message orchestration session.
+### 2.5 Append-only JSONL branching and compaction
+
+5. Append-only JSONL branching plus compaction summaries carrying `goal/constraints/progress/blocked/decisions` kept a local 1,988-message orchestration session coherent.
 6. `prime-agent model list` exposed 399 lines (~398 models) across eight provider groups; local sessions drove parallel worktree reviews.
 
 ## 3. What it does poorly / limitations
 
+### 3.1 Memory scaling failure
+
 1. **Memory scaling failure (local incident).** The daemon holds parent and RLM runtimes in one Node process. `agent.jsonl` has six V8 heap-OOM traces. Session `019fe693-f125` reproduced a 32 GB-cap run reaching 20,145 MiB RSS and earlyoom SIGTERM; `NODE_OPTIONS=12288` self-aborted near 12,291 MB heap/RSS ~12.5 GB. The session attributes pressure to the 1M-token DeepSeek context; exact idle-eviction tuning beyond this evidence is **UNVERIFIED**.
+
+### 3.2 Socket and lock supervision
+
 2. **Socket/lock supervision failures:** local logs contain 26 “Could not adopt worker” (19 hello timeouts, 5 dead workers), 36 “Timed out” lines, and 57 “Unknown active session” attach failures.
+
+### 3.3 Mid-work child failure
+
 3. Children can die mid-work (“completed without sending a reply”); recovery warns that in-flight model/tool/child work was not replayed.
 4. No security sandbox: model-generated Python runs with user permissions. Credentials are plaintext in `models.json`/`auth.json`.
 5. Daemon/log sprawl: 59 worker logs (62 files total) and frequent shutdown/restart lines.
@@ -37,10 +56,24 @@ Local models define `opencode-go` (DeepSeek V4), NVIDIA MiniMax M3, and TokenRou
 
 ## 4. Relevant lessons for Cambium
 
+### 4.1 Process-per-worker isolation
+
 1. Use process-per-worker isolation; the OOM incident validates independent heaps and restart boundaries over one process containing a swarm.
+
+### 4.2 Memory and tool watchdogs
+
 2. Watch memory/heap and per-tool duration, not only process liveness; cap context and evict idle workers.
+
+### 4.3 Pipe IPC and named children
+
 3. Prefer stdin/stdout IPC and PID/pipe identity to Unix sockets plus lock files; retain named, inspectable child tasks and per-child last-activity counts.
-4. Keep JSONL session trees and compaction summaries, but make checkpoints/replay durable. Store secrets as environment references, not plaintext JSON.
+
+### 4.6 JSONL session tree and compaction carry-forward
+
+4. Keep JSONL session trees and compaction summaries carrying `goal/constraints/progress/blocked/decisions`, but make checkpoints/replay durable. Store secrets as environment references, not plaintext JSON.
+
+### 4.7 Self-hosted QA
+
 5. Self-hosted QA with canaries and objective counts is a useful operating pattern.
 
 ## 5. Local install evidence

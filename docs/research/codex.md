@@ -79,7 +79,7 @@ The local package’s optional platform dependencies explain why `file` on the l
 
 Codex’s desktop worktree behavior is more extensive than the CLI: detached HEADs under `$CODEX_HOME/worktrees`, `.worktreeinclude` for ignored files such as `.env`, snapshot-before-delete, and GC around 15. The CLI only recommends Git checkpoints. This distinction must remain explicit when adopting the lifecycle pattern.
 
-## Sources
+## 6. Sources
 
 - Local paths/commands inspected 2026-08-09: `/home/ubuntu/.local/bin/codex`, npm package `@openai/codex`, `codex --version`, `doctor`, `--help`, `file`, `readlink`, `~/.codex/config.toml`, `~/.codex/agents/*.toml`, `~/.codex/history.jsonl`, `~/.codex/state_5.sqlite`, `~/.codex/model_catalog.json`, `~/.codex/version.json`, `~/.codex/log/codex-login.log` (auth values not reproduced).
 - https://github.com/openai/codex
@@ -90,7 +90,7 @@ Codex’s desktop worktree behavior is more extensive than the CLI: detached HEA
 - https://developers.openai.com/codex/config-file/config-reference
 - https://developers.openai.com/codex/environments/git-worktrees
 
-### Objectively verifiable stats
+## 7. Objectively verifiable stats
 
 1. `codex-cli 0.146.1`; doctor says 0.147.0 available.
 2. `history.jsonl`: 1,387 lines / 174 sessions, 2026-02-06 → 2026-08-06 UTC.
