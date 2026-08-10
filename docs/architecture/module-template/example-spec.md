@@ -10,7 +10,7 @@
 
 1. **It closes a critical flaw.** It directly resolves LLM-C6 ("no do-not-decompose path"). Every task in Cambium passes through it. Without it, the v2 architecture is incomplete.
 
-2. **It is small and well-bounded.** A single boolean classification, one decision per call. No subprocess management, no git, no IPC. The v2 implementation is a **rule engine** (~140 LOC) — a DSPy program is a *future seam*, not the v2 primary.
+2. **It is small and well-bounded.** A single `Decision` classification, one decision per call. No subprocess management, no git, no IPC. The v2 implementation is a **rule engine** — a DSPy program is a *future seam*, not the v2 primary.
 
 3. **It has a clean metric.** Exact-match scoring on a labeled dataset, computable without human-in-the-loop scoring on the dataset. No coupled dependencies on worker competence (LLM-C4 does not bite here — `siblings-stub.yaml` is empty).
 
@@ -59,7 +59,7 @@ class TaskInput:
 | Field | Type | Validation |
 |---|---|---|
 | `task` | `str` | non-empty after `strip()`; the dataset loader rejects empty strings as invalid records (the rule engine itself tolerates arbitrary strings, but a real caller must pass a real spec) |
-| `context` | `str` | optional; defaults to `""`. If non-empty, the rule engine searches it for `"subtask"` / `"decompos"` and short-circuits to `decompose=False` (an explicit prior decomposition in the context wins). |
+| `context` | `str` | optional; defaults to `""`. If non-empty, the rule engine searches it for `"subtask"` / `"decompos"` and short-circuits to `Decision.DO_NOT_DECOMPOSE` (an explicit prior decomposition in the context wins). |
 
 > **Note on the absent `task_kind_hint` field.** An earlier draft of this spec proposed `task_kind_hint: str` (an allowlist: feature/bugfix/refactor/test/docs). The scaffold does not carry that field — `TaskInput` has only `task, context`. To comply with the enum-not-string rule in `agents.md` §7 (no allowlist-with-string disguised as a domain type) **and** to stay aligned with the scaffold, the field is **dropped** in v2 rather than re-typed. If a future caller needs task-kind hints, that is a v2.1 extension: add `task_kind: TaskKind` (enum) to `TaskInput`, gated by a schema-version bump in the dataset.
 
@@ -72,20 +72,26 @@ Source: produced by `Architectus.execute` from the host's task spec.
 @dataclass(frozen=True, slots=True)
 class DecomposeOutput:
     """Prediction: whether the task should be decomposed into subtasks."""
-    decompose: bool
+    decision: Decision
     reason: str
     confidence: float = 1.0
+
+    @property
+    def decompose(self) -> bool:
+        """Read-only wire-compatibility view; domain code uses ``decision``."""
+        return self.decision is Decision.DECOMPOSE
 ```
 
 | Field | Type | Notes |
 |---|---|---|
-| `decompose` | `bool` | The decision. `True` → orchestrator dispatches `TaskDecomposer`; `False` → orchestrator dispatches one worker atomically. |
-| `reason` | `str` | Human-readable justification produced by the rule engine (e.g., `"three or more distinct requirement clauses; long task description"`). Recorded in the event log for audit. Not scored by the metric. |
+| `decision` | `Decision` | The domain decision. `Decision.DECOMPOSE` → orchestrator dispatches `TaskDecomposer`; `Decision.DO_NOT_DECOMPOSE` → one worker atomically. |
+| `decompose` | `bool` | Read-only compatibility view. The JSON wire field `expected.decompose` remains a boolean; it is not the domain model. |
+| `reason` | `str` | Human-readable justification produced by the rule engine (e.g., `"three or more distinct requirement clauses; long task description"`). Recorded in the canonical event store for audit. Not scored by the metric. |
 | `confidence` | `float` | In `[0.0, 1.0]`. The v2 rule engine emits one of three fixed values (`0.7`, `0.8`, `0.9`) corresponding to evidence tiers; a future DSPy replacement may emit calibrated probabilities. **Not scored by the v2 metric** (exact-match only); v2.1 may add a calibration signal. |
 
 Consumers:
-- `Architectus.execute` reads `decompose` to choose between the atomic fast path and the decomposition path.
-- The event log records the full `DecomposeOutput` (redacted via §12.3 of `architecture.md`) as a `should_decompose_decision` event for offline analysis.
+- `Architectus.execute` reads `decision` to choose between the atomic fast path and the decomposition path.
+- The canonical event store records the decision (redacted via §12.3 of `architecture.md`) as a `should_decompose_decision` event for offline analysis. M1 removes the slice-only event-log path.
 
 ### 3.3 Module class — the v2 contract
 
@@ -121,7 +127,7 @@ This is the **DSPy seam**: `decide` is the only surface a replacement program mu
 
 ### 3.4 Errors
 
-The v2 rule engine is a pure function and does not raise under normal operation — `should_decompose(task, context)` returns a `DecomposeOutput` for any `str` input (including empty/garbage, which yield `decompose=False` with a low-confidence reason). The dataset loader (`ExampleDatasetLoader`) is the only error source:
+The v2 rule engine is a pure function and does not raise under normal operation — `should_decompose(task, context)` returns a `DecomposeOutput` for any `str` input (including empty/garbage, which yield `Decision.DO_NOT_DECOMPOSE` with a low-confidence reason). The dataset loader (`ExampleDatasetLoader`) is the only error source:
 
 ```python
 class DatasetError(ValueError):
@@ -131,7 +137,7 @@ class DatasetError(ValueError):
 Raised by the loader for: unreadable file, invalid JSON per line, non-object records, missing `input`/`expected` keys, `input.task` not a string, `expected.decompose` not a boolean, `expected.reason` not a string, `canary` not a boolean. A `DatasetError` aborts the eval harness — broken datasets are a hard gate.
 
 A future DSPy-backed `decide` may raise:
-- `ModelUnavailable` — all `Diffundo` providers exhausted. Caller (`Architectus`) falls back to `DecomposeOutput(decompose=False, reason="model unavailable; atomic dispatch is the safe default", confidence=0.0)`. Atomic is the cheaper error.
+- `ModelUnavailable` — all `Diffundo` providers exhausted. Caller (`Architectus`) falls back to `DecomposeOutput(decision=Decision.DO_NOT_DECOMPOSE, reason="model unavailable; atomic dispatch is the safe default", confidence=0.0)`. Atomic is the cheaper error.
 - `MalformedLLMResponse` — unparseable output after `MAX_RETRIES`. Same fallback.
 
 These are **v2.1**; the v2 rule engine does not raise them.
@@ -161,9 +167,9 @@ The primary v2 implementation is a rule engine in `src/cambium/modules/example/d
 | Verb-led workstreams | 3+ clauses starting with an action verb (`add`, `update`, `refactor`, `implement`, `migrate`, `build`, `fix`, `create`, `remove`, `rewrite`, `backfill`, `introduce`, `restructure`, `split`, `port`) | +2 |
 | Verb-led workstreams | exactly 2 such clauses | +1 |
 
-**Short-circuit:** if `context` already mentions `subtask` or `decompos*`, the engine returns `decompose=False` with `reason="context already provides a decomposition"`, `confidence=0.9`. An explicit prior decomposition in the context wins outright.
+**Short-circuit:** if `context` already mentions `subtask` or `decompos*`, the engine returns `Decision.DO_NOT_DECOMPOSE` with `reason="context already provides a decomposition"`, `confidence=0.9`. An explicit prior decomposition in the context wins outright.
 
-**Output:** `evidence >= 2` → `DecomposeOutput(decompose=True, reason="; ".join(reasons) or "evidence threshold met", confidence=0.8)`. Otherwise → `DecomposeOutput(decompose=False, reason="task is atomic or already scoped", confidence=0.7)`.
+**Output:** `evidence >= 2` → `DecomposeOutput(decision=Decision.DECOMPOSE, reason="; ".join(reasons) or "evidence threshold met", confidence=0.8)`. Otherwise → `DecomposeOutput(decision=Decision.DO_NOT_DECOMPOSE, reason="task is atomic or already scoped", confidence=0.7)`. The wire mapping remains `true`/`false` in `expected.decompose`.
 
 ### 5.1 The DSPy seam (v2.1+)
 
@@ -188,12 +194,14 @@ The primary v2 implementation is a rule engine in `src/cambium/modules/example/d
           pred = self._clf(task=input.task, context=input.context)
           # attribute access on dspy.Prediction (NOT pred.dict(), which does not exist)
           return DecomposeOutput(
-              decompose=bool(pred.decompose),
+              decision=(Decision.DECOMPOSE
+                        if bool(pred.decompose)
+                        else Decision.DO_NOT_DECOMPOSE),
               reason=str(pred.reason),
               confidence=0.9,   # placeholder until calibration is added
           )
   ```
-- Preserve the dataset, loader, and metric unchanged. `should_decompose_metric` keeps scoring exact match on `decompose`.
+- Preserve the dataset, loader, and metric unchanged. `should_decompose_metric` keeps scoring exact match on the domain `Decision`; the wire boolean remains unchanged.
 - Be optimized via `Ascensus` against the v2.1 split (`train.jsonl` / `eval.jsonl` / `canaries.jsonl`).
 
 This is **not implemented in v2**. The seam is documented here so the rule-engine choice is explicit and the future swap is mechanical.
@@ -208,25 +216,27 @@ def should_decompose_metric(example: Example) -> float:
     """Score one example in [0, 1]; exact match on the decision wins.
 
     Returns 0.0 for unprocessed examples (no prediction) and for records
-    whose expected value is not a boolean. The `reason` field is not
-    scored; the decision is what matters.
+    whose expected value is not a `Decision`. The `reason` field is not
+    scored; the domain decision is what matters.
     """
     prediction = example.prediction
     if prediction is None:
         return 0.0
+    from .decide import Decision
+
     expected = example.expected.get("decompose")
-    if not isinstance(expected, bool):
+    if not isinstance(expected, Decision) or not isinstance(prediction.decision, Decision):
         return 0.0
-    return 1.0 if prediction.decompose == expected else 0.0
+    return 1.0 if prediction.decision == expected else 0.0
 ```
 
-The v2 metric is **exact match on `decompose`**, full stop. This is deliberately simple:
+The v2 metric is **exact match on the domain `Decision`**, full stop. This is deliberately simple:
 
 - It is **computable without an LLM judge**, which is the right floor for a v2 reference module.
 - It is **not gameable by a keyword-greedy replacement**: the canaries are deliberately misaligned with the rule engine's surface heuristics (see §7), so a program that memorizes the rules' keyword set still gets the canaries wrong.
-- It is **non-zero only when a prediction is attached**. The eval harness attaches predictions by running `decide()` over each `Example`, then scores with `metric()`.
+- It is **non-zero only when a prediction is attached**. The eval harness attaches predictions by running `decide()` over each `Example`, then scores the `Decision` with `metric()`.
 
-**v2.1 extension (labeled, opt-in).** Once a DSPy replacement exists, the metric may be extended to a multi-signal composite (accuracy + calibration + reason-keyword coverage), matching the shape of `architecture.md` §10. The exact-match floor stays; additional signals layer on top. Changes require a dataset `schema_version` bump and a re-eval against the frozen held-out set.
+**v2.1 extension (labeled, opt-in).** Once a DSPy replacement exists, the metric may be extended to a multi-signal composite (accuracy + calibration + reason-keyword coverage), matching the shape of `architecture.md` §10. The exact-match floor stays; additional signals layer on top. Changes to the JSON record shape require a `schema_version` bump; changes that affect evaluation require a `dataset_version` bump and a re-eval against the frozen held-out set.
 
 ---
 
@@ -234,11 +244,12 @@ The v2 metric is **exact match on `decompose`**, full stop. This is deliberately
 
 | Item | Value |
 |---|---|
-| File | `src/cambium/modules/example/datasets/example_pairs.jsonl` |
-| Records | 9 in the seed dataset (2 are canaries) |
+| Current files | `src/cambium/modules/example/datasets/train.jsonl`, `src/cambium/modules/example/datasets/eval.jsonl`, and `src/cambium/modules/example/datasets/canaries.jsonl` |
+| Current records | 200 train, 50 eval, 10 canaries; `meta.json` records dataset version `1.1.0` |
+| Legacy file | `src/cambium/modules/example/datasets/example_pairs.jsonl` (9 records, 2 canaries; loader fallback) |
 | Loader | `ExampleDatasetLoader` (`src/cambium/modules/example/dataset.py`) |
 | Format | JSONL, one record per line, UTF-8, no BOM, trailing newline |
-| Provenance | Hand-authored; canary entries deliberately misaligned with surface heuristics |
+| Provenance | Hand-authored; split canaries deliberately misaligned with surface heuristics |
 | Sibling pinning | None (`siblings-stub.yaml` is empty / absent — `should_decompose` is the first module) |
 
 **Schema** (authoritative; matches the loader's `_validate`):
@@ -258,7 +269,10 @@ The loader (in `dataset.py`) enforces:
 - `expected.reason` must be a string.
 - `canary` (if present) must be a boolean.
 
-Anything else raises `DatasetError` at load time.
+After validation, the loader maps the wire boolean in `expected.decompose` to
+`Decision.DECOMPOSE` or `Decision.DO_NOT_DECOMPOSE` in the domain `Example`.
+The `schema_version` remains `1`; the current dataset release is
+`dataset_version` `1.1.0`. Anything else raises `DatasetError` at load time.
 
 **Reference record (non-canary):**
 
@@ -282,11 +296,23 @@ This canary hits four `HIGH_SIGNAL` keywords (`multiple`, `several`, `both`, `se
 
 This canary has zero `HIGH_SIGNAL` keyword hits — a keyword-greedy replacement would say `decompose=False`. The gold label is `True` because of four verb-led workstreams. The rule engine's verb-clause signal catches it; a DSPy replacement that drops verb-clause analysis fails this canary.
 
-### 7.1 v2 dataset policy (single-file; split deferred)
+### 7.1 Current split-aware dataset policy
 
-v2 uses a single combined `example_pairs.jsonl` with inline `canary: true` markers. The eval harness selects canaries by the `canary` flag. The frozen `train.jsonl` / `eval.jsonl` / `canaries.jsonl` split described in `docs/architecture/module-template/dataset-format.md` is the **v2.1 target** — until the dataset grows past ~50 records, the single file is simpler and the loader already supports it.
+The current reference module uses the frozen `train.jsonl`, `eval.jsonl`, and
+`canaries.jsonl` files under `src/cambium/modules/example/datasets/`, with
+`meta.json` carrying the schema and dataset versions. The loader excludes
+canaries from train/eval and rejects duplicate IDs and cross-split collisions.
 
-**Dataset-format compliance.** The single-file layout complies with `dataset-format.md` §1 (JSONL container), §2 (record envelope — `input`/`expected`/`canary`), and §6 (canary taxonomy: `trivially_atomic` and `must_decompose` kinds, with the `canary: true` marker). The full envelope (`id`, `schema_version`, `dataset_version`, `split`, `added_at`, `added_by`, `source`, `license`, `redacted`, `data`) is the v2.1 target; the v2 records use the minimal subset the loader validates today.
+`example_pairs.jsonl` remains a legacy combined-file fallback for compatibility
+with the original v2 records. It is not the current source of the train/eval
+metrics. All formats retain the same JSON wire field:
+`expected.decompose: true|false`; the in-memory domain value is `Decision`.
+
+**Dataset-format compliance.** The split files use the full envelope (`id`,
+`schema_version`, `dataset_version`, `split`, `added_at`, `added_by`, `source`,
+`license`, `redacted`, `input`, `expected`, and optional canary metadata). The
+legacy combined file uses the loader's minimal `{input, expected, canary?}`
+shape and remains covered by the compatibility tests.
 
 ### 7.2 Refresh policy
 
@@ -304,10 +330,10 @@ v2 uses a single combined `example_pairs.jsonl` with inline `canary: true` marke
 | Over-decomposition (keyword greed) | A rule/DSPy program over-weights `HIGH_SIGNAL` keywords | Atomic-but-keyword-dense task is split | Canary `keyword-heavy but atomic: run tests, commit` (decompose=false) | If rule engine: tune evidence weights; if DSPy: reject optimized variant at promotion gate |
 | Under-decomposition (surface-blind) | A rule/DSPy program under-weights verb-clauses | Multi-workstream task with no surface keywords stays whole | Canary `four verb-led workstreams with no surface keywords` (decompose=true) | Same |
 | Garbage input (structurally invalid record) | Hand-edit error, bad mining | Loader fails mid-record | `DatasetError` from `ExampleDatasetLoader._validate` | Hard gate — fix the record, do not catch |
-| Garbage input (string content) | Caller passes weird/garbage `task` string | Rule engine returns `decompose=False, confidence=0.7` for nonsense | Caller-side validation (rule engine tolerates any string by design) | Caller decides whether to escalate |
+| Garbage input (string content) | Caller passes weird/garbage `task` string | Rule engine returns `Decision.DO_NOT_DECOMPOSE, confidence=0.7` for nonsense | Caller-side validation (rule engine tolerates any string by design) | Caller decides whether to escalate |
 | Reward hacking (future DSPy eval) | Optimizer memorizes surface heuristics | High train metric, canary failures | Canary suite (the two `canary: true` records) | Reject optimized prompt; promote previous version |
-| Context already decomposed | Caller passes `context` with "subtask"/"decompos*" | Engine short-circuits to `decompose=False, confidence=0.9` | Intentional; no recovery needed | None — by design |
-| Empty task | `TaskInput(task="")` | Engine returns `decompose=False` | Caller-side validation | Caller should reject empty tasks upstream |
+| Context already decomposed | Caller passes `context` with "subtask"/"decompos*" | Engine short-circuits to `Decision.DO_NOT_DECOMPOSE, confidence=0.9` | Intentional; no recovery needed | None — by design |
+| Empty task | `TaskInput(task="")` | Engine returns `Decision.DO_NOT_DECOMPOSE` | Caller-side validation | Caller should reject empty tasks upstream |
 
 A future DSPy `decide` adds two more (see §3.4): `ModelUnavailable` and `MalformedLLMResponse`, both with the atomic-dispatch fallback.
 
@@ -315,27 +341,40 @@ A future DSPy `decide` adds two more (see §3.4): `ModelUnavailable` and `Malfor
 
 ## 9. Test Strategy
 
-### 9.1 Scenario test (`src/cambium/modules/example/tests/test_example_module.py`)
+### 9.1 Colocated module tests
 
-One scenario test, no mocking, no network:
+The module suite is colocated under `src/cambium/modules/example/tests/` and
+has no mocking or network access:
 
-1. **Load and validate.** Load the real dataset; assert it loads and every record is schema-valid. Include a negative case: a malformed record raises `DatasetError`.
-2. **Aggregate metric.** Run `decide()` over every pair; attach predictions; score with `metric()`; assert the aggregate score is **1.0** (the rule engine perfectly fits its own dataset).
-3. **Canary coverage.** Assert the canary entries are present in the loaded dataset (`canary_count >= 2`) and were processed (a prediction was attached to each). This catches the "drop canaries to inflate metric" reward-hacking path.
+- `test_example_module.py` loads the legacy combined dataset, verifies the
+  `Decision` mapping and compatibility view, runs `decide()` over every pair,
+  and asserts a perfect metric including canaries.
+- `test_dataset_splits.py` loads the current 200/50/10 split files, checks the
+  `meta.json` dataset version, rejects duplicate and cross-split records, and
+  verifies the full 260-record metric.
 
-This is the **smoke test** that proves the per-module pattern is wired correctly end-to-end.
+Malformed records raise `DatasetError`; the colocated suite is the module's
+scenario and integration gate.
 
 ### 9.2 Eval harness (v2.1)
 
-A standalone eval entry point `python -m cambium.modules.example.eval` is the v2.1 target. In v2 the scenario test above subsumes the role of the eval harness — same coverage, integrated with the rest of the test suite. The v2.1 eval harness will separate "run module over dataset" from "score and report" and add per-signal breakdown.
+A standalone eval entry point remains a future optimization-harness surface.
+The current split-aware loader and colocated tests already separate train,
+eval, and canary data and score each split through the module metric.
 
 ### 9.3 Canary suite (v2.1)
 
-Today the canaries are scored inline with the rest of the dataset (the scenario test asserts 1.0 over **all** records including canaries). The v2.1 `--suite canaries` mode will exit non-zero on the first canary failure; today, the same effect is achieved by the 1.0 aggregate-score assertion (any canary miss drops the score below 1.0).
+Canaries are loaded from `src/cambium/modules/example/datasets/canaries.jsonl`
+and scored inline with the module metric. A canary miss drops the aggregate
+score below 1.0 and fails the colocated gate.
 
 ### 9.4 Integration
 
-The Cambium smoke test (`cambium.tests.smoke`) will exercise `should_decompose` once `Architectus.execute` is wired: a fake task spec is submitted, the orchestrator calls `ShouldDecomposeModule.decide`, the chosen path (atomic or decomposed) is taken, the result is asserted. Until then, the scenario test (§9.1) is the integration gate.
+Shared supervisor, store, merge, IPC, worker, and CLI scenarios live in
+`tests/scenarios/`. The M1 deletion set removes the slice-only event-log and fallback paths;
+those scenarios must target the canonical runtime surfaces. Until
+`Architectus.execute` is wired, the colocated module suite (§9.1) is the
+integration gate for `should_decompose`.
 
 ### 9.5 Sibling pinning
 
@@ -345,7 +384,7 @@ N/A. `should_decompose` is the first module; no siblings to pin. The `siblings-s
 
 ```
 # Run from repo root, on a Python 3.14 interpreter:
-uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests/test_example_module.py -v
+uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests -v
 uv run --python 3.14.7 --extra test pytest -q          # whole suite
 ```
 
@@ -358,13 +397,13 @@ A passing run is the gate. The reference scaffold on `main` runs green against t
 Not in v2 scope. Documented here as the v2.1 target so the seam is clear:
 
 - **Optimizer:** `dspy.SIMBA(metric=should_decompose_metric, max_steps=12, max_demos=8, num_threads=4)`.
-- **Train set:** the v2.1 `datasets/train.jsonl` (target ≥ 200 records).
-- **Eval gate:** mean metric on `datasets/eval.jsonl` ≥ 0.85 (exact match on `decompose`).
-- **Canary gate:** 100% pass on `datasets/canaries.jsonl`.
+- **Train set:** `src/cambium/modules/example/datasets/train.jsonl` (200 records).
+- **Eval gate:** mean metric on `src/cambium/modules/example/datasets/eval.jsonl` ≥ 0.85 (exact match on the domain `Decision`).
+- **Canary gate:** 100% pass on `src/cambium/modules/example/datasets/canaries.jsonl`.
 - **Human gate:** an optimized prompt is promoted only after a diff of the prompt change is reviewed in the optimization PR.
 - **Rollback:** promotion is a symlink swap under `optimized/should_decompose/`; the previous version is retained at `optimized/should_decompose/v<N-1>/` and the production pointer can be reverted atomically.
 - **Model pinning:** optimization runs against a single named model (declared in the optimization run manifest) at `temperature=0.0` — not against the cascade. This avoids the cross-model prompt-transfer problem (LLM-C3) during optimization. Production serves via cascade as usual.
-- **Baseline:** the rule engine's exact-match score on the v2.1 train split is the baseline a DSPy replacement must beat. If the DSPy variant does not beat the rule engine on the held-out eval set, the rule engine stays in production.
+- **Baseline:** the rule engine's exact-match score on the train split is the baseline a DSPy replacement must beat. If the DSPy variant does not beat the rule engine on the held-out eval set, the rule engine stays in production.
 
 ---
 
@@ -384,23 +423,31 @@ The reference implementation already exists at `src/cambium/modules/example/`:
 ```
 src/cambium/modules/example/
 ├── __init__.py                # exports: ShouldDecomposeModule, TaskInput,
-│                              #          DecomposeOutput, should_decompose,
+│                              #          Decision, DecomposeOutput,
+│                              #          should_decompose,
 │                              #          should_decompose_metric,
 │                              #          ExampleDatasetLoader
 ├── architecture.md            # the in-tree per-module architecture doc
 │                              #   (this spec is the canonical version; the
 │                              #   in-tree doc is a shorter reference)
-├── decide.py                  # rule engine + ShouldDecomposeModule + dataclasses
+├── decide.py                  # Decision enum, rule engine, module + dataclasses
 ├── metric.py                  # should_decompose_metric (exact match)
-├── dataset.py                 # ExampleDatasetLoader
+├── dataset.py                 # ExampleDatasetLoader and split handling
+├── tests/
+│   ├── test_example_module.py
+│   ├── test_dataset_splits.py
+│   └── baselines/baseline.json
 └── datasets/
-    └── example_pairs.jsonl    # 9 records (2 canaries)
+    ├── train.jsonl            # 200 records
+    ├── eval.jsonl              # 50 frozen records
+    ├── canaries.jsonl          # 10 canaries
+    ├── meta.json               # schema_version 1, dataset_version 1.1.0
+    └── example_pairs.jsonl     # legacy 9-record fallback
 ```
 
 **Extensions that align with this spec but are NOT yet in the scaffold** (label as v2.1, do not implement in v2):
 
-- `eval.py` — standalone eval entry point (`python -m cambium.modules.example.eval`).
-- `train.jsonl` / `eval.jsonl` / `canaries.jsonl` — the three-file split per `docs/architecture/module-template/dataset-format.md`. v2 uses the single combined file.
+- A standalone eval entry point — split loading and metric scoring already exist; only the dedicated CLI/report surface is future work.
 - `decide.py` DSPy subclass — `ShouldDecomposeModuleDSPy`, behind a config flag.
 - `siblings-stub.yaml` — empty placeholder; added when this module becomes siblings with another.
 - `optimized/should_decompose/v<N>/` — promoted-prompt artifacts, written by `Ascensus`.
@@ -408,11 +455,11 @@ src/cambium/modules/example/
 **Acceptance gate (per `agents.md` §9) — already met by the merged scaffold:**
 
 1. ✅ `architecture.md` committed (in-tree).
-2. ✅ Dataset committed (`datasets/example_pairs.jsonl`, 9 records, 2 canaries).
-3. ✅ Loader runs green on the dataset; `DatasetError` raised on malformed records.
-4. ✅ Rule-engine `decide()` scores 1.0 over the full dataset (including canaries).
-5. ✅ Scenario test passes: `uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests/test_example_module.py -v` exits 0.
-6. ⏳ End-to-end smoke test (`cambium.tests.smoke`) — pending `Architectus.execute` wiring.
+2. ✅ Split dataset committed (`datasets/train.jsonl`, `datasets/eval.jsonl`, `datasets/canaries.jsonl`, and `datasets/meta.json`); legacy combined data remains as a fallback.
+3. ✅ Loader maps the stable wire boolean to `Decision`; `DatasetError` is raised on malformed records.
+4. ✅ Rule-engine `decide()` scores 1.0 over all 260 split records, including canaries.
+5. ✅ Colocated suite passes: `uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests -v` exits 0.
+6. ⏳ End-to-end orchestrator exercise — pending `Architectus.execute` wiring.
 7. ⏳ Adversarial review of this module — this spec is the reviewed artifact; re-review on any contract change.
 8. ✅ All verifiable items above marked VERIFIED with the cited command from §9.6.
 
@@ -424,3 +471,4 @@ src/cambium/modules/example/
 |---|---|---|
 | 0.1.0 | 2026-08-09 | Initial spec; described a custom `ShouldDecompose` DSPy module. |
 | 1.0.0 | 2026-08-09 | Aligned to the merged scaffold: `ShouldDecomposeModule(Module)` ABC, `TaskInput`/`DecomposeOutput` dataclasses, `should_decompose_metric` exact-match, single-file dataset with inline canaries, rule-engine primary with DSPy as a documented v2.1 seam. |
+| 1.1.0 | 2026-08-10 | Aligned to the colocated split-aware tests, `Decision` domain enum, stable boolean wire format, and current module dataset. |
