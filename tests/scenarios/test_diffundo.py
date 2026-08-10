@@ -821,3 +821,27 @@ def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> 
         assert len(server.calls) == 2
     finally:
         server.close()
+
+
+def test_remote_http_provider_without_config_validation_is_rejected_at_call(
+    tmp_path, monkeypatch
+) -> None:
+    # A ProviderConfig constructed directly (bypassing the config loader) must
+    # still never send the Authorization header over plaintext http to a remote
+    # host: _post_sync re-checks the resolved base_url scheme before sending.
+    unvalidated = ProviderConfig(
+        name="p_insecure",
+        tier=ProviderTier.FAST,
+        base_url="http://api.example.test/v1",
+        api_key_env="K_INSECURE",
+    )
+    monkeypatch.setenv("K_INSECURE", "sk-test-K_INSECURE")
+    router = Diffundo((unvalidated,), pause_timeout_s=0.01)
+
+    with pytest.raises(AllProvidersFailed) as exc:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+    assert exc.value.last_error is not None
+    assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
+    assert "http transport is allowed only for loopback hosts" in exc.value.last_error.message
+    assert "sk-test-K_INSECURE" not in str(exc.value)
+    assert router.health("p_insecure") is HealthState.DISABLED

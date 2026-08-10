@@ -55,8 +55,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 from . import __version__
+from .provider_config import is_loopback_host
 
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
@@ -829,6 +831,17 @@ class Diffundo:
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
+        # Defensive transport guard: a ProviderConfig constructed without going
+        # through the config loader must still never send the Authorization
+        # header over plaintext http to a non-loopback host (security audit).
+        parsed = urlparse(provider.base_url)
+        if parsed.scheme.lower() == "http" and not is_loopback_host(parsed.hostname or ""):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "http transport is allowed only for loopback hosts; "
+                "remote providers require https",
+            )
         api_key = os.environ.get(provider.api_key_env)
         if not api_key:
             raise ProviderError(
