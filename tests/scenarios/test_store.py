@@ -24,6 +24,7 @@ import time
 
 import pytest
 
+from cambium.redact import Redactor
 from cambium.store import (
     CRITICAL_KINDS,
     EventStore,
@@ -1380,3 +1381,84 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
     assert not second.is_alive()
     assert not third.is_alive()
     assert append_errors == []
+
+
+def test_redactor_scrubs_opaque_secret_from_durable_rows(tmp_path) -> None:
+    opaque_key = "opaque-worker-controlled-secret-1234567890"
+    event = {
+        "kind": "result",
+        "payload": {"message": f"provider returned {opaque_key}", "status": "ok"},
+        "task_id": opaque_key,
+        "request_id": opaque_key,
+    }
+
+    redacting = EventStore(
+        tmp_path / "redacted.db",
+        fsync_interval_s=5.0,
+        redactor=Redactor(secret_values={opaque_key}),
+    )
+    plain = EventStore(tmp_path / "plain.db", fsync_interval_s=5.0)
+    try:
+        redacting.append(event)
+        plain.append(event)
+    finally:
+        redacting.close()
+        plain.close()
+
+    def durable_rows(path):
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute(
+                "SELECT payload, task_id, request_id FROM events ORDER BY seq"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    (payload, task_id, request_id) = durable_rows(tmp_path / "redacted.db")[0]
+    assert opaque_key not in payload
+    assert opaque_key not in task_id
+    assert opaque_key not in request_id
+    assert "***" in payload
+
+    (payload, task_id, request_id) = durable_rows(tmp_path / "plain.db")[0]
+    assert opaque_key in payload
+    assert task_id == opaque_key
+    assert request_id == opaque_key
+
+
+def test_redactor_runs_before_storage_on_long_strings_with_shaped_key(tmp_path) -> None:
+    opaque_key = "opaque-worker-key-" + "B" * 24
+    shaped_key = "sk-proj-" + "A" * 40
+    store = EventStore(
+        tmp_path / "events.db",
+        fsync_interval_s=5.0,
+        redactor=Redactor(secret_values={opaque_key}),
+    )
+    try:
+        store.append({
+            "kind": "result",
+            "payload": {"message": "x" * 500 + " " + shaped_key, "stderr": opaque_key},
+            "request_id": "x" * 500 + " " + shaped_key,
+        })
+    finally:
+        store.close()
+
+    conn = sqlite3.connect(tmp_path / "events.db")
+    try:
+        payload, request_id = conn.execute(
+            "SELECT payload, request_id FROM events WHERE seq = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert shaped_key not in payload
+    assert shaped_key[:12] not in payload
+    assert opaque_key not in payload
+    assert shaped_key not in request_id
+    assert shaped_key[:12] not in request_id
+    assert opaque_key not in request_id
+
+
+def test_event_store_rejects_non_redactor_argument(tmp_path) -> None:
+    with pytest.raises(TypeError, match="redactor"):
+        EventStore(tmp_path / "events.db", redactor=object())

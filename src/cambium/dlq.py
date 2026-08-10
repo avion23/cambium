@@ -52,7 +52,13 @@ class DeadLetterQueue:
     what supervisor action to take after inspection.
     """
 
-    def __init__(self, dir: Path, *, max_entries: int = 1000) -> None:
+    def __init__(
+        self,
+        dir: Path,
+        *,
+        max_entries: int = 1000,
+        redactor: Redactor | None = None,
+    ) -> None:
         if isinstance(max_entries, bool) or not isinstance(max_entries, int):
             raise TypeError("max_entries must be an integer")
         if max_entries < 1:
@@ -62,7 +68,10 @@ class DeadLetterQueue:
         self._directory.mkdir(parents=True, exist_ok=True)
         self._max_entries = max_entries
         self._lock = threading.RLock()
-        self._redactor = Redactor() if Redactor is not None else None
+        if redactor is not None:
+            self._redactor = redactor
+        else:
+            self._redactor = Redactor() if Redactor is not None else None
         if self._redactor is None:
             logger.warning(
                 "cambium.redact is unavailable; dead-letter records are written without redaction"

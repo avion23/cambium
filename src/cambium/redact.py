@@ -29,6 +29,7 @@ __all__ = [
     "REDACT_KEYS",
     "REDACT_VALUES",
     "Redactor",
+    "build_session_redactor",
     "build_worker_env",
     "is_secret_name",
 ]
@@ -1102,6 +1103,17 @@ class Redactor:
         """Convenience wrapper around :func:`is_secret_name`."""
 
         return is_secret_name(name)
+
+
+def build_session_redactor(secret_values: Iterable[str] | None = None) -> Redactor:
+    """Build one immutable, session-scoped Redactor from a secret-value snapshot.
+
+    The snapshot is captured at construction and can never change afterwards.
+    A session builds a single instance here and hands it to its EventStore and
+    DeadLetterQueue so every durable writer redacts the same exact values.
+    """
+
+    return Redactor(secret_values=secret_values)
 
 
 # Explicitly safe runtime variable names.  Their values are constructed by
