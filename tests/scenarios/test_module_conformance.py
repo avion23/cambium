@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import http.server
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -157,6 +159,50 @@ def test_offline_subprocess_environment_strips_credentials_and_denies_network(
     assert "network access is forbidden" in socket_probe.stderr
 
 
+def test_offline_child_denies_absolute_network_client_path() -> None:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/"
+    probe = (
+        "import subprocess, sys; "
+        f"subprocess.run(['/usr/bin/curl', '--fail', {url!r}], check=False); "
+        "sys.exit('absolute curl unexpectedly started')"
+    )
+    try:
+        with module_conformance.module_offline_environment() as env:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                env=env,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.returncode != 0
+    assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
+
+
+def test_offline_child_inherits_provider_import_blocker() -> None:
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", "import cambium.provider_config"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    assert "provider import blocked by module conformance: cambium.provider_config" in result.stderr
+
+
 def test_provider_finder_rejects_every_provider_root() -> None:
     finder = module_conformance.ProviderImportBlocker()
 
@@ -181,3 +227,109 @@ def test_module_tests_path_is_inside_module_package() -> None:
     relative = spec.tests_dir.relative_to(module_conformance.MODULES_DIR)
 
     assert relative == Path(spec.name) / "tests"
+
+
+def _validate_with_baseline_change(monkeypatch, change) -> str:
+    original_load_json = module_conformance._load_json
+
+    def changed_load_json(path: Path):
+        value = original_load_json(path)
+        if path.name == "baseline.json" and isinstance(value, dict):
+            value = json.loads(json.dumps(value))
+            change(value)
+        return value
+
+    monkeypatch.setattr(module_conformance, "_load_json", changed_load_json)
+    with pytest.raises(module_conformance.ModuleConformanceError) as raised:
+        module_conformance.validate_module(_one_discovered_module())
+    return str(raised.value)
+
+
+@pytest.mark.parametrize("field", ["git_sha", "date", "python", "pytest"])
+def test_baseline_rejects_null_provenance(monkeypatch, field: str) -> None:
+    message = _validate_with_baseline_change(
+        monkeypatch, lambda baseline: baseline.__setitem__(field, None)
+    )
+
+    assert f":{field}: must contain plausible non-null provenance" in message
+
+
+@pytest.mark.parametrize("value", [None, -0.1, "0.1"])
+def test_baseline_rejects_invalid_wall_times(monkeypatch, value: object) -> None:
+    def change(baseline: dict) -> None:
+        baseline["tests"]["wall_seconds"]["p90"] = value
+
+    message = _validate_with_baseline_change(monkeypatch, change)
+
+    assert "tests.wall_seconds.p90: must be a finite non-negative number" in message
+
+
+def test_baseline_rejects_empty_drift_thresholds(monkeypatch) -> None:
+    message = _validate_with_baseline_change(
+        monkeypatch, lambda baseline: baseline.__setitem__("drift_thresholds", {})
+    )
+
+    assert "drift_thresholds: missing required thresholds" in message
+
+
+def test_baseline_rejects_foreign_test_nodeid(monkeypatch) -> None:
+    def change(baseline: dict) -> None:
+        baseline["tests"]["by_nodeid"] = {"tests/scenarios/test_harness.py::test_foreign": 0.1}
+        baseline["tests"]["count"] = 1
+
+    message = _validate_with_baseline_change(monkeypatch, change)
+
+    assert "test nodeid does not belong to this module's tests" in message
+
+
+def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch) -> None:
+    module_path = tmp_path / "src" / "cambium" / "modules" / "example"
+    datasets = module_path / "datasets"
+    baselines = module_path / "tests" / "baselines"
+    datasets.mkdir(parents=True)
+    baselines.mkdir(parents=True)
+    eval_path = datasets / "eval.jsonl"
+    meta_path = datasets / "meta.json"
+    baseline_path = baselines / "baseline.json"
+    eval_path.write_text('{"id":"before"}\n', encoding="utf-8")
+    meta = {"dataset_version": "1.0.0"}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=Cambium Test", "-c", "user.email=test@example.invalid", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    git("add", ".")
+    git("commit", "-qm", "base datasets")
+    baseline_path.write_text("{}\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "baseline")
+    eval_path.write_text('{"id":"after"}\n', encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "change frozen eval without bump")
+    (tmp_path / "unrelated.txt").write_text("tip\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "unrelated tip")
+
+    relative_baseline = baseline_path.relative_to(tmp_path)
+    spec = module_conformance.ModuleSpec(
+        name="example",
+        path=module_path,
+        tracked_files=(),
+        python_files=(),
+        test_files=(),
+        baseline_files=(relative_baseline,),
+        dataset_files=(),
+    )
+    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
+
+    findings = module_conformance._frozen_content_findings(spec, meta)
+
+    assert len(findings) == 1
+    assert findings[0].symbol == "eval"
+    assert "without dataset_version bump (1.0.0)" in findings[0].detail

@@ -81,6 +81,8 @@ SEMVER_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+VERSION_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$")
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SENSITIVE_ENV_RE = re.compile(
     r"(?:api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
@@ -348,6 +350,32 @@ def _git_file(revision: str, relative: Path) -> bytes | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def _baseline_parent(spec: ModuleSpec) -> str | None:
+    """Return the parent of the last commit that updated a module baseline."""
+    if not spec.baseline_files:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "log",
+                "-1",
+                "--format=%H^",
+                "--",
+                *(path.as_posix() for path in spec.baseline_files),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and revision else None
+
+
 def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[AuditFinding]:
     """Reject eval/canary edits without a dataset-version bump."""
     if not _repository_available():
@@ -366,7 +394,7 @@ def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[Aud
         )
     except (OSError, subprocess.SubprocessError):
         status = None
-    revisions = ["HEAD^"]
+    revisions = [revision for revision in (_baseline_parent(spec),) if revision is not None]
     if status is not None and status.stdout:
         revisions.insert(0, "HEAD")
     findings: list[AuditFinding] = []
@@ -399,6 +427,143 @@ def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[Aud
                     )
                 )
                 break
+    return findings
+
+
+def _valid_baseline_date(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _finite_non_negative(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _baseline_fact_findings(
+    baseline: dict[str, Any], baseline_file: Path, spec: ModuleSpec
+) -> list[AuditFinding]:
+    findings: list[AuditFinding] = []
+    provenance = {
+        "git_sha": lambda value: isinstance(value, str) and GIT_SHA_RE.fullmatch(value) is not None,
+        "date": _valid_baseline_date,
+        "python": lambda value: isinstance(value, str) and VERSION_RE.fullmatch(value) is not None,
+        "pytest": lambda value: isinstance(value, str) and VERSION_RE.fullmatch(value) is not None,
+    }
+    for field, valid in provenance.items():
+        if not valid(baseline.get(field)):
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    field,
+                    "must contain plausible non-null provenance",
+                )
+            )
+
+    tests = baseline.get("tests")
+    if isinstance(tests, dict):
+        nodeids = tests.get("by_nodeid")
+        module_test_paths = {path.as_posix() for path in spec.test_files}
+        if isinstance(nodeids, dict):
+            for nodeid in nodeids:
+                test_path = nodeid.split("::", 1)[0] if isinstance(nodeid, str) else ""
+                if test_path and test_path not in module_test_paths:
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            nodeid,
+                            "test nodeid does not belong to this module's tests",
+                        )
+                    )
+        wall_seconds = tests.get("wall_seconds")
+        if isinstance(wall_seconds, dict) and set(wall_seconds) == {"p50", "p90", "max"}:
+            for field, value in wall_seconds.items():
+                if not _finite_non_negative(value):
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            f"tests.wall_seconds.{field}",
+                            "must be a finite non-negative number",
+                        )
+                    )
+
+    thresholds = baseline.get("drift_thresholds")
+    required = {"metric_mean_delta", "wall_p90_ratio", "canary_failed_delta", "dataset"}
+    if isinstance(thresholds, dict):
+        missing = required - set(thresholds)
+        if missing:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "drift_thresholds",
+                    "missing required thresholds: " + ", ".join(sorted(missing)),
+                )
+            )
+        for field in ("metric_mean_delta", "wall_p90_ratio"):
+            value = thresholds.get(field)
+            if not _finite_non_negative(value) or (field == "wall_p90_ratio" and value == 0):
+                qualifier = "positive" if field == "wall_p90_ratio" else "non-negative"
+                findings.append(
+                    AuditFinding(
+                        "baseline-integrity",
+                        baseline_file,
+                        0,
+                        f"drift_thresholds.{field}",
+                        f"must be a finite {qualifier} number",
+                    )
+                )
+        canary_delta = thresholds.get("canary_failed_delta")
+        if isinstance(canary_delta, bool) or not isinstance(canary_delta, int) or canary_delta < 0:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "drift_thresholds.canary_failed_delta",
+                    "must be a non-negative integer",
+                )
+            )
+        dataset = thresholds.get("dataset")
+        dataset_fields = {"duplicate_ids", "cross_split_leaks"}
+        if not isinstance(dataset, dict) or set(dataset) != dataset_fields:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "drift_thresholds.dataset",
+                    "must contain duplicate_ids and cross_split_leaks",
+                )
+            )
+        else:
+            for field, value in dataset.items():
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            f"drift_thresholds.dataset.{field}",
+                            "must be a non-negative integer",
+                        )
+                    )
     return findings
 
 
@@ -716,6 +881,8 @@ def _validate_dataset_integrity(spec: ModuleSpec) -> None:
                 )
             )
             continue
+
+        findings.extend(_baseline_fact_findings(baseline, baseline_file, spec))
 
         missing = sorted(baseline_required - set(baseline))
         if missing:
@@ -1120,12 +1287,51 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
     """
     with tempfile.TemporaryDirectory(prefix="cambium-module-offline-") as root:
         offline_root = Path(root)
+        provider_imports = repr(PROVIDER_IMPORTS)
         (offline_root / "sitecustomize.py").write_text(
+            "import importlib.abc\n"
+            "import os\n"
+            "import shutil\n"
             "import socket\n"
+            "import subprocess\n"
+            "import sys\n"
+            "\n"
+            f"_PROVIDERS = {provider_imports}\n"
+            "_NETWORK_CLIENTS = frozenset(('curl', 'wget', 'http', 'https'))\n"
+            "\n"
+            "class _ProviderBlocker(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, fullname, path=None, target=None):\n"
+            "        if any(fullname == root or fullname.startswith(root + '.') "
+            "for root in _PROVIDERS):\n"
+            "            raise ModuleNotFoundError(\n"
+            "                'provider import blocked by module conformance: ' + fullname\n"
+            "            )\n"
+            "        return None\n"
             "\n"
             "def _deny_network(*args, **kwargs):\n"
             "    raise PermissionError('network access is forbidden during module conformance')\n"
             "\n"
+            "def _resolved_executable(args, executable=None):\n"
+            "    command = executable\n"
+            "    if command is None and isinstance(args, (list, tuple)) and args:\n"
+            "        command = args[0]\n"
+            "    if not isinstance(command, (str, bytes, os.PathLike)):\n"
+            "        return None\n"
+            "    command = os.fsdecode(command)\n"
+            "    located = command if os.path.dirname(command) else shutil.which(command)\n"
+            "    return os.path.realpath(located) if located else None\n"
+            "\n"
+            "_popen_init = subprocess.Popen.__init__\n"
+            "def _offline_popen(self, args, *pargs, **kwargs):\n"
+            "    executable = _resolved_executable(args, kwargs.get('executable'))\n"
+            "    if executable and os.path.basename(executable) in _NETWORK_CLIENTS:\n"
+            "        raise PermissionError(\n"
+            "            'network client denied during module conformance: ' + executable\n"
+            "        )\n"
+            "    return _popen_init(self, args, *pargs, **kwargs)\n"
+            "\n"
+            "sys.meta_path.insert(0, _ProviderBlocker())\n"
+            "subprocess.Popen.__init__ = _offline_popen\n"
             "socket.socket.connect = _deny_network\n"
             "socket.socket.connect_ex = _deny_network\n"
             "socket.socket.sendto = _deny_network\n"
