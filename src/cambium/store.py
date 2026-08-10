@@ -161,7 +161,7 @@ class _BoundedEventQueue:
         self._items: deque[Any] = collections.deque()
         self._maxsize = maxsize
         self._cond = threading.Condition()
-        self._pending_evictions = 0
+        self._pending_evictions: deque[Any] = deque()
 
     def put(
         self,
@@ -186,7 +186,7 @@ class _BoundedEventQueue:
                 check()
 
         def full() -> bool:
-            return len(self._items) + self._pending_evictions >= self._maxsize
+            return len(self._items) + len(self._pending_evictions) >= self._maxsize
 
         with self._cond:
             check_state()
@@ -220,20 +220,23 @@ class _BoundedEventQueue:
                         raise queue.Full
                     self._cond.wait(remaining)
                     continue
-                self._pending_evictions += 1
+                self._pending_evictions.append(evicted)
 
             try:
                 if on_evict is not None:
                     on_evict(evicted, deadline)
             except BaseException:
                 with self._cond:
-                    self._pending_evictions -= 1
-                    self._restore_evicted(evicted)
+                    if self._remove_pending_eviction(evicted):
+                        self._restore_evicted(evicted)
                     self._cond.notify_all()
                 raise
 
             with self._cond:
-                self._pending_evictions -= 1
+                if not self._remove_pending_eviction(evicted):
+                    self._cond.notify_all()
+                    check_state()
+                    raise StoreError("event store eviction was drained")
                 dropped += 1
                 if dropped_holder is not None:
                     dropped_holder[0] = dropped
@@ -273,7 +276,9 @@ class _BoundedEventQueue:
     def drain(self) -> list[Any]:
         with self._cond:
             items = list(self._items)
+            items.extend(self._pending_evictions)
             self._items.clear()
+            self._pending_evictions.clear()
             self._cond.notify_all()
             return items
 
@@ -293,6 +298,13 @@ class _BoundedEventQueue:
                 self._items.insert(i, item)
                 return
         self._items.append(item)
+
+    def _remove_pending_eviction(self, item: Any) -> bool:
+        for i, pending in enumerate(self._pending_evictions):
+            if pending is item:
+                del self._pending_evictions[i]
+                return True
+        return False
 
 
 class EventStore:
@@ -330,6 +342,7 @@ class EventStore:
         self._dead: BaseException | None = None
         self._close_error: BaseException | None = None
         self._dropped = 0
+        self._pending_sequence_high_water: int | None = None
         self._next_seq = 0
         self._started = threading.Event()
         self._thread = threading.Thread(
@@ -465,6 +478,43 @@ class EventStore:
         with self._lock:
             self._dropped += count
 
+    def _remember_sequence_high_water(self, next_seq: int) -> None:
+        with self._lock:
+            if (
+                self._pending_sequence_high_water is None
+                or next_seq > self._pending_sequence_high_water
+            ):
+                self._pending_sequence_high_water = next_seq
+
+    def _persist_pending_sequence_high_water(self) -> None:
+        with self._lock:
+            next_seq = self._pending_sequence_high_water
+        if next_seq is None:
+            return
+
+        conn = sqlite3.connect(self._path, isolation_level=None, timeout=0.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=0").fetchall()
+            conn.execute("PRAGMA synchronous=FULL").fetchall()
+            cursor = conn.execute(_UPDATE_NEXT_SEQ, (next_seq,))
+            if cursor.rowcount != 1:
+                raise StoreError("event store sequence counter is missing")
+            cursor.close()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            return
+        finally:
+            conn.close()
+
+        with self._lock:
+            if (
+                self._pending_sequence_high_water is not None
+                and self._pending_sequence_high_water <= next_seq
+            ):
+                self._pending_sequence_high_water = None
+
     def _reserve_evicted_sequence(self, item: Any, deadline: float) -> None:
         evicted_seq = item[0]
         with self._lock:
@@ -533,11 +583,13 @@ class EventStore:
 
         if already_closed:
             if failure is not None:
+                self._request_stop(failure)
                 self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
                 self._raise_close_failure(failure)
             return
 
         if failure is not None:
+            self._request_stop(failure)
             self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
             self._raise_close_failure(failure)
 
@@ -576,9 +628,11 @@ class EventStore:
             self._request_stop(failure)
             self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
             if self._thread.is_alive():
-                failure = self._set_writer_stop_failure(failure)
                 self._request_stop(failure)
                 self._thread.join(_CLOSE_STOP_JOIN_TIMEOUT_S)
+                if self._thread.is_alive():
+                    failure = self._set_writer_stop_failure(failure)
+                    self._request_stop(failure)
             self._raise_close_failure(self._close_failure())
 
         self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
@@ -620,6 +674,7 @@ class EventStore:
         self._stop_requested.set()
         self._queue.wake()
         self._fail_pending(exc)
+        self._persist_pending_sequence_high_water()
 
     def _raise_close_failure(self, exc: BaseException | None) -> None:
         if exc is None:
@@ -758,18 +813,18 @@ class EventStore:
 
     def _fail_pending(self, exc: BaseException) -> None:
         dropped = 0
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                break
+        next_seq = 0
+        for item in self._queue.drain():
             if item is _SENTINEL or item is _TIMER:
                 continue
             seq, kind, row, pending = item
+            next_seq = max(next_seq, seq + 1)
             if kind not in CRITICAL_KINDS:
                 dropped += 1
             pending.exc = exc
             pending.event.set()
+        if next_seq:
+            self._remember_sequence_high_water(next_seq)
         if dropped:
             self._record_dropped(dropped)
             logger.warning(
