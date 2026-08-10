@@ -23,7 +23,16 @@ first success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN
 (probe) -> OPEN on probe failure; OPEN -> HALF_OPEN after the open interval;
 HALF_OPEN -> HEALTHY on probe success / OPEN on probe failure; any state ->
 DISABLED on a non-retryable auth/config error, first call included. Refusals
-are request-level fall-throughs that never drive health transitions.
+are request-level fall-throughs that never drive health transitions. The
+**probe path is the primary OPEN trip** (a failed probe after a cooldown or on
+a half-open probe); the sliding-window failure-rate escalation is a secondary
+safety net that only fires once the window is full.
+
+Every ``call``/``call_race`` is bounded by a wall-clock deadline
+(``call_budget_s`` / ``race_timeout_s``): the per-attempt HTTP timeout is capped
+at the remaining budget, retries are skipped when the backoff no longer fits,
+and the cascade aborts (``AllProvidersFailed``) once the budget is spent — the
+deadline is not just a candidate-waiting bound.
 
 Stdlib only. HTTP calls use urllib against an OpenAI-compatible
 ``/chat/completions`` endpoint; the API key is read from the environment (name
@@ -52,6 +61,14 @@ _TIMESTAMP_RE = re.compile(
 )
 _VOLATILE_MARKERS = ("request_id", "request-id")
 _REFUSAL_MARKERS = re.compile(r"content.?filter|refus|moderat|safety", re.IGNORECASE)
+# Light content scan for model refusals returned as a 200 completion (issue 4).
+# Documented heuristic: exact refusal phrases in the completion text are treated
+# as a REFUSAL fall-through so a refusing model never wins the cascade.
+_CONTENT_REFUSAL_RE = re.compile(
+    r"\b(?:i can'?t|cannot|can'?t)\s+(?:assist|help|comply|complete|answer)\b"
+    r"|\b(?:refus(?:e|es|ed|ing|al)|sorry)\b",
+    re.IGNORECASE,
+)
 
 
 class ProviderTier(Enum):
@@ -157,12 +174,15 @@ class ProviderError(DiffundoError):
         outcome: ProviderOutcome,
         message: str = "",
         cause: BaseException | None = None,
+        *,
+        budget_exhausted: bool = False,
     ) -> None:
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
         self.outcome = outcome
         self.message = message
         self.cause = cause
+        self.budget_exhausted = budget_exhausted
 
 
 class CostBudgetExceeded(DiffundoError):
@@ -321,6 +341,15 @@ class _RawResponse:
             raise ProviderError(
                 provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
             )
+        if _CONTENT_REFUSAL_RE.search(content):
+            # A 200 completion whose text is a model refusal: fall through to the
+            # next provider (documented heuristic, see module docstring). Like any
+            # refusal it never drives a health transition.
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.REFUSAL,
+                f"completion content carries refusal markers: {content[:80]!r}",
+            )
         usage = self.payload.get("usage")
         if not isinstance(usage, dict):
             usage = None
@@ -419,10 +448,12 @@ class Diffundo:
                 raise AllProvidersFailed(tried, last_error)
             for provider in candidates:
                 try:
-                    result = await self._attempt(provider, prompt)
+                    result = await self._attempt(provider, prompt, deadline=deadline)
                 except ProviderError as exc:
                     tried.append(provider.name)
                     last_error = exc
+                    if exc.budget_exhausted:
+                        raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(
@@ -460,12 +491,13 @@ class Diffundo:
             raise AllProvidersFailed([], None)
         selected = candidates[: max(int(n), 1)]
         tasks: dict[asyncio.Task[Any], str] = {
-            asyncio.create_task(self._attempt(provider, prompt)): provider.name
+            asyncio.create_task(self._attempt(provider, prompt, deadline=deadline)): provider.name
             for provider in selected
         }
         results: dict[str, BaseException | CallResult] = {}
         best: tuple[str, CallResult] | None = None
         gated_winner: tuple[str, CallResult] | None = None
+        budget_exhausted = False
         last_error: BaseException | None = None
         try:
             while tasks:
@@ -488,19 +520,24 @@ class Diffundo:
                     results[provider_name] = value
                     last_error = value
                     if isinstance(value, Exception):
+                        if getattr(value, "budget_exhausted", False):
+                            budget_exhausted = True
+                            break
                         continue
                     if gate(value):
                         gated_winner = (provider_name, value)
                         break
                     if best is None or scorer(value) > scorer(best[1]):
                         best = (provider_name, value)
-                if gated_winner is not None:
+                if gated_winner is not None or budget_exhausted:
                     break
                 tasks = {t: p for t, p in tasks.items() if t in pending}
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+        if budget_exhausted:
+            raise AllProvidersFailed(list(results), last_error)
         if gated_winner is not None:
             result = gated_winner[1]
         elif best is not None:
@@ -613,17 +650,23 @@ class Diffundo:
         return list(ProviderTier).index(tier)
 
     async def _pause_for(self, tier: ProviderTier, max_wait: float) -> float:
-        """Set the dispatch-pause event for ``tier``, arm the recovery monitor,
-        and wait up to ``max_wait`` for a provider to recover. Returns the time
-        actually spent paused."""
+        """Arm the recovery monitor and block up to ``max_wait`` for a provider
+        to recover. Returns the time actually spent paused.
+
+        Waiters block on the tracker's ``asyncio.Event``; the event is set ONLY
+        by the recovery monitor (a provider recovered). A stale wake signal from
+        an earlier recovery is consumed by ``clear()`` before each wait, so a
+        waiter that wakes to an already-consumed recovery re-blocks instead of
+        busy-spinning.
+        """
         start = time.monotonic()
         tracker = self._pauses[self._tier_index(tier)]
         tracker.waiters += 1
         try:
-            tracker.event.set()
             if tracker.monitor is None or tracker.monitor.done():
                 tracker.monitor = asyncio.create_task(self._recovery_monitor(tier))
             try:
+                tracker.event.clear()
                 await asyncio.wait_for(tracker.event.wait(), timeout=max(0.0, max_wait))
             except TimeoutError:
                 pass
@@ -654,13 +697,24 @@ class Diffundo:
 
     # -- provider attempt ---------------------------------------------------- #
 
-    async def _attempt(self, provider: ProviderConfig, prompt: dict[str, Any]) -> CallResult:
+    async def _attempt(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> CallResult:
         """One provider attempt: the full retry sequence, then health bookkeeping.
 
         Returns a ``CallResult`` on success; raises ``ProviderError`` otherwise.
         Health transitions follow cascade-design §2.4: retryable exhaustion moves
         the provider to COOLDOWN (or OPEN for a failed probe), auth/config errors
         disable it, refusals leave it untouched.
+
+        When ``deadline`` is given it bounds the whole attempt: the per-attempt
+        HTTP timeout is capped at the remaining budget, retry backoff is skipped
+        when it no longer fits, and a spent budget raises a ``budget_exhausted``
+        ``ProviderError`` so the cascade aborts (cascade-design §2.2).
         """
         runtime = self._runtime(provider.name)
         async with runtime.lock:
@@ -674,8 +728,20 @@ class Diffundo:
             try:
                 last_exc: ProviderError | None = None
                 for attempt_no in range(provider.max_retries + 1):
+                    remaining = self._remaining(deadline)
+                    if remaining is not None and remaining <= 0:
+                        raise ProviderError(
+                            provider.name,
+                            ProviderOutcome.TIMEOUT,
+                            "call budget exhausted",
+                            budget_exhausted=True,
+                        )
+                    timeout_s = provider.timeout_s
+                    if remaining is not None:
+                        timeout_s = min(timeout_s, remaining)
                     try:
-                        raw = await self._post(provider, prompt)
+                        raw = await self._post(provider, prompt, timeout_s=timeout_s)
+                        result = raw.to_result(provider)
                     except ProviderError as exc:
                         last_exc = exc
                         if exc.outcome is ProviderOutcome.REFUSAL:
@@ -685,18 +751,30 @@ class Diffundo:
                             break
                         if attempt_no >= provider.max_retries:
                             break
-                        await asyncio.sleep(self._retry_delay(attempt_no))
+                        delay = self._retry_delay(attempt_no)
+                        remaining = self._remaining(deadline)
+                        if remaining is not None and remaining <= delay:
+                            break
+                        await asyncio.sleep(delay)
                         continue
                     self._record_success(provider)
-                    return raw.to_result(provider)
+                    return result
                 assert last_exc is not None
                 if last_exc.outcome in (ProviderOutcome.REFUSAL, ProviderOutcome.AUTH_ERROR):
                     raise ProviderError(
-                        provider.name, last_exc.outcome, last_exc.message, last_exc.cause
+                        provider.name,
+                        last_exc.outcome,
+                        last_exc.message,
+                        last_exc.cause,
+                        budget_exhausted=last_exc.budget_exhausted,
                     ) from last_exc
                 self._record_failure(provider)
                 raise ProviderError(
-                    provider.name, last_exc.outcome, last_exc.message, last_exc.cause
+                    provider.name,
+                    last_exc.outcome,
+                    last_exc.message,
+                    last_exc.cause,
+                    budget_exhausted=last_exc.budget_exhausted,
                 ) from last_exc
             finally:
                 runtime.probe_in_flight = False
@@ -705,10 +783,25 @@ class Diffundo:
         # Full jitter (mirrors arch §7.4): uniform(0, base * backoff ** n).
         return random.uniform(0.0, self._retry_base_delay_s * (2.0 ** attempt_no))
 
-    async def _post(self, provider: ProviderConfig, prompt: dict[str, Any]) -> _RawResponse:
-        return await asyncio.to_thread(self._post_sync, provider, prompt)
+    @staticmethod
+    def _remaining(deadline: float | None) -> float | None:
+        """Seconds left before ``deadline`` (None when unbounded)."""
+        if deadline is None:
+            return None
+        return deadline - time.monotonic()
 
-    def _post_sync(self, provider: ProviderConfig, prompt: dict[str, Any]) -> _RawResponse:
+    async def _post(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+    ) -> _RawResponse:
+        return await asyncio.to_thread(self._post_sync, provider, prompt, timeout_s)
+
+    def _post_sync(
+        self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
+    ) -> _RawResponse:
         api_key = os.environ.get(provider.api_key_env)
         if not api_key:
             raise ProviderError(
@@ -730,7 +823,7 @@ class Diffundo:
         )
         start = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=provider.timeout_s) as response:
+            with urllib.request.urlopen(request, timeout=timeout_s) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             status = exc.code
@@ -752,7 +845,7 @@ class Diffundo:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.TIMEOUT,
-                f"timeout after {provider.timeout_s}s",
+                f"timeout after {timeout_s}s",
                 exc,
             ) from exc
         except (OSError, ValueError) as exc:
@@ -792,9 +885,16 @@ class Diffundo:
             runtime.health = HealthState.COOLDOWN
             runtime.cooldown_until = now + provider.cooldown_s
         elif runtime.health in (HealthState.COOLDOWN, HealthState.HALF_OPEN):
-            # A failure while probing (cooldown elapsed) or on a half-open probe.
+            # PRIMARY OPEN trip: a failed probe. A provider in COOLDOWN is only
+            # ever dispatched as one probe once its cooldown elapsed; HALF_OPEN
+            # is itself a probe state. A failure here means persistence -> OPEN.
             runtime.health = HealthState.OPEN
             runtime.open_until = now + provider.cooldown_s * self._open_backoff_base
+        # SECONDARY safety net (cascade-design §2.3): the sliding-window failure
+        # rate can escalate COOLDOWN -> OPEN before the probe fires. It is almost
+        # unreachable in practice — a full window of failures implies probes that
+        # already tripped OPEN via the branch above — but it bounds the case
+        # where probes never get admitted.
         if (
             runtime.health is HealthState.COOLDOWN
             and len(runtime.outcomes) == runtime.outcomes.maxlen

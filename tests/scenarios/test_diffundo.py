@@ -38,6 +38,7 @@ from cambium.diffundo import (
     HealthState,
     PromptStructureError,
     ProviderConfig,
+    ProviderOutcome,
     ProviderStatus,
     ProviderTier,
     validate_prompt_structure,
@@ -61,7 +62,11 @@ class FakeServer:
         self._lock = threading.Lock()
         self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
         self._httpd.fake = self
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
         self._thread.start()
         self.base_url = f"http://127.0.0.1:{self._httpd.server_port}"
 
@@ -97,11 +102,14 @@ class _Handler(BaseHTTPRequestHandler):
         if delay:
             time.sleep(delay)
         encoded = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except OSError:
+            pass  # the client timed out (budget-capped attempt) and closed first
 
     def log_message(self, *args: object) -> None:
         pass
@@ -287,6 +295,49 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
         good.close()
 
 
+def test_200_refusal_content_cascades_to_next_provider(tmp_path, monkeypatch) -> None:
+    # Issue 4: a 200 completion whose TEXT is a refusal must fall through like
+    # any other refusal — it must not win the cascade as a "success".
+    refusing = FakeServer([(200, _ok_payload("I can't assist with that."), 0.0)])
+    ok = FakeServer([(200, _ok_payload("real answer"), 0.0)])
+    _set_keys(monkeypatch, "K_REFUSE", "K_OK")
+    router = Diffundo(
+        (
+            _config("p_refuse", refusing, "K_REFUSE"),
+            _config("p_ok", ok, "K_OK"),
+        )
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_ok"
+        assert result.content == "real answer"
+        # refusal is a request-level fall-through: never marks a provider down
+        assert router.health("p_refuse") is HealthState.UNKNOWN
+        assert len(refusing.calls) == 1 and len(ok.calls) == 1
+    finally:
+        refusing.close()
+        ok.close()
+
+
+def test_all_providers_refuse_raises_refusal_outcome(tmp_path, monkeypatch) -> None:
+    # All-refused is distinct from all-down: the last error carries the REFUSAL
+    # outcome and no provider is marked unhealthy (cascade-design §1.2).
+    a = FakeServer([(200, _ok_payload("Sorry, I can't complete this request."), 0.0)])
+    b = FakeServer([(200, _ok_payload("I cannot assist with that."), 0.0)])
+    _set_keys(monkeypatch, "K_A", "K_B")
+    router = Diffundo((_config("p_a", a, "K_A"), _config("p_b", b, "K_B")))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.outcome is ProviderOutcome.REFUSAL
+        assert router.health("p_a") is HealthState.UNKNOWN
+        assert router.health("p_b") is HealthState.UNKNOWN
+    finally:
+        a.close()
+        b.close()
+
+
 # --------------------------------------------------------------------------- #
 # 4. token bucket
 # --------------------------------------------------------------------------- #
@@ -372,6 +423,115 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
         assert len(server.calls) == 2
     finally:
         server.close()
+
+
+def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> None:
+    # D8f: a tier outage must BLOCK on the pause event, not spin the candidate
+    # loop. The reviewer measured ~26k pause iterations in 0.6s before the fix;
+    # a blocked call must keep the loop iteration count low.
+    down = FakeServer([(500, _error_payload("down"), 0.0)])
+    ok = FakeServer([(200, _ok_payload("ok"), 0.0)])
+    _set_keys(monkeypatch, "K_DOWN", "K_OK")
+    router = Diffundo(
+        (
+            _config("p_down", down, "K_DOWN", rpm=1, cooldown_s=60.0),
+            _config("p_ok", ok, "K_OK", rpm=1),
+        ),
+        pause_timeout_s=0.2,
+    )
+    try:
+        # consume both buckets so the next call finds an empty tier
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_ok"
+
+        calls = {"n": 0}
+        original = Diffundo._pause_for
+
+        async def counting(self, tier, max_wait):
+            calls["n"] += 1
+            return await original(self, tier, max_wait)
+
+        monkeypatch.setattr(Diffundo, "_pause_for", counting)
+        start = time.monotonic()
+        with pytest.raises(AllProvidersFailed):
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        elapsed = time.monotonic() - start
+        # the 200ms pause actually blocked on the event ...
+        assert elapsed >= 0.15
+        # ... instead of spinning the loop thousands of times
+        assert calls["n"] < 100
+    finally:
+        down.close()
+        ok.close()
+
+
+# --------------------------------------------------------------------------- #
+# 5b. wall-clock budget (cascade-design §2.2)
+# --------------------------------------------------------------------------- #
+
+
+def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
+    # call_budget_s is a hard deadline over the WHOLE cascade, not just
+    # candidate waiting. Two 1.0s-timeout providers with a retry would naively
+    # take ~4s; a 0.5s budget caps it to budget + one in-flight attempt.
+    slow1 = FakeServer([(200, _ok_payload("slow1"), 0.8)])
+    slow2 = FakeServer([(200, _ok_payload("slow2"), 0.8)])
+    _set_keys(monkeypatch, "K_S1", "K_S2")
+    router = Diffundo(
+        (
+            _config("p_s1", slow1, "K_S1", timeout_s=1.0, max_retries=1),
+            _config("p_s2", slow2, "K_S2", timeout_s=1.0, max_retries=1),
+        ),
+        call_budget_s=0.5,
+    )
+    try:
+        start = time.monotonic()
+        with pytest.raises(AllProvidersFailed):
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        elapsed = time.monotonic() - start
+        # budget (0.5) + one budget-capped in-flight attempt, far under the
+        # naive 2 providers x (1+1 retries) x 1.0s = ~4.1s product
+        assert elapsed <= 1.5
+        # the first attempt really was capped by the budget (not instant)
+        assert elapsed >= 0.4
+    finally:
+        slow1.close()
+        slow2.close()
+
+
+def test_call_budget_still_allows_success_within_budget(tmp_path, monkeypatch) -> None:
+    fast = FakeServer([(200, _ok_payload("fast"), 0.0)])
+    _set_keys(monkeypatch, "K_F")
+    router = Diffundo((_config("p_f", fast, "K_F"),), call_budget_s=0.5)
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_f"
+        assert result.content == "fast"
+    finally:
+        fast.close()
+
+
+def test_race_bounded_by_timeout_with_slow_providers(tmp_path, monkeypatch) -> None:
+    slow1 = FakeServer([(200, _ok_payload("slow1"), 0.8)])
+    slow2 = FakeServer([(200, _ok_payload("slow2"), 0.8)])
+    _set_keys(monkeypatch, "K_S1", "K_S2")
+    router = Diffundo(
+        (
+            _config("p_s1", slow1, "K_S1", timeout_s=1.0, max_retries=1),
+            _config("p_s2", slow2, "K_S2", timeout_s=1.0, max_retries=1),
+        ),
+    )
+    try:
+        start = time.monotonic()
+        with pytest.raises(AllProvidersFailed):
+            asyncio.run(
+                router.call_race(ProviderTier.FAST, PROMPT, race_timeout_s=0.5)
+            )
+        # both attempts are deadline-capped; the race cannot outlive the budget
+        assert time.monotonic() - start <= 1.5
+    finally:
+        slow1.close()
+        slow2.close()
 
 
 # --------------------------------------------------------------------------- #
