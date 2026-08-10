@@ -821,7 +821,7 @@ class _Runtime:
                 result = self._on_event(record)
                 if asyncio.iscoroutine(result):
                     await result
-            except Exception:
+            except BaseException:
                 if _observer_failure_is_fatal:
                     raise
 
@@ -1479,13 +1479,15 @@ class _Runtime:
         if not hasattr(seq, "drain_events"):
             return set()
         prior = {
-            event["payload"].get("quarantine_id")
+            (event["kind"], event["payload"].get("quarantine_id"))
             for event in await asyncio.to_thread(self._store.events_after, 0)
-            if event["kind"] == "merge_staging_quarantined"
+            if event["kind"] in ("merge_staging_quarantined", "merge_staging_pruned")
+            and event["payload"].get("quarantine_id") is not None
         }
         emitted: set[str] = set()
         for kind, payload in seq.drain_events():
-            if kind == "merge_staging_quarantined" and payload.get("quarantine_id") in prior:
+            artifact = (kind, payload.get("quarantine_id"))
+            if artifact in prior:
                 continue
             task_id = payload.pop("task", None)
             if task_id is None and task_keys is not None:
@@ -1508,11 +1510,16 @@ class _Runtime:
     async def reconcile(self, specs: list[dict[str, Any]]) -> None:
         """Reconcile staging moves and the git-ref/event publish gap on startup."""
         scanned_repos: set[Path] = set()
-        durable_quarantines = [
-            event["payload"]
-            for event in await asyncio.to_thread(self._store.events_after, 0)
-            if event["kind"] == "merge_staging_quarantined"
-        ]
+        durable_quarantines_by_id: dict[str, dict[str, Any]] = {}
+        for event in await asyncio.to_thread(self._store.events_after, 0):
+            quarantine_id = event["payload"].get("quarantine_id")
+            if not isinstance(quarantine_id, str):
+                continue
+            if event["kind"] == "merge_staging_quarantined":
+                durable_quarantines_by_id[quarantine_id] = event["payload"]
+            elif event["kind"] == "merge_staging_pruned":
+                durable_quarantines_by_id.pop(quarantine_id, None)
+        durable_quarantines = list(durable_quarantines_by_id.values())
         task_keys = {
             hashlib.sha256(spec["task_id"].encode()).hexdigest()[:16]: spec["task_id"]
             for spec in specs

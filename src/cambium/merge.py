@@ -422,8 +422,6 @@ class MergeSequencer:
             (entry for entry in entries if entry not in expired),
             key=lambda entry: measured[entry][0],
         )
-        removed = 0
-        removed_bytes = 0
         for entry in [*expired, *oldest]:
             current_entries = [item for item in entries if item.exists()]
             aggregate = sum(measured[item][1] for item in current_entries)
@@ -439,15 +437,23 @@ class MergeSequencer:
             if newest_entry is not None and entry == newest_entry:
                 continue
             size = measured[entry][1]
+            relative_id = Path("merge") / entry.relative_to(root)
+            prune_payload = {
+                "task": (
+                    self._task_id
+                    if entry.parent.name.removeprefix("task-") == self._task_key
+                    else None
+                ),
+                "quarantine_id": relative_id.as_posix(),
+                "entries": 1,
+                "allocated_bytes": size,
+            }
+            self._event("merge_staging_pruned", **prune_payload)
+            if self._durable_event is not None:
+                self._durable_event("merge_staging_pruned", dict(prune_payload))
             self._delete_quarantine_entry(entry)
-            removed += 1
-            removed_bytes += size
         remaining = [item for item in entries if item.exists()]
         remaining_bytes = sum(measured[item][1] for item in remaining)
-        if removed:
-            self._event(
-                "merge_staging_pruned", entries=removed, allocated_bytes=removed_bytes
-            )
         if (
             len(remaining) > self._quarantine_max_entries
             or remaining_bytes > self._quarantine_max_bytes

@@ -799,6 +799,39 @@ def test_observer_failure_after_durable_append_does_not_restore_staging(tmp_path
     assert (destination / "evidence.bin").read_bytes() == b"observer cannot strand evidence"
 
 
+def test_observer_cancellation_after_durable_append_does_not_restore_staging(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    store = EventStore(tmp_path / ".cambium" / "events.db")
+
+    async def cancel_observer(_event: dict) -> None:
+        raise asyncio.CancelledError
+
+    async def quarantine() -> None:
+        runtime = _Runtime(tmp_path, store, on_event=cancel_observer)
+        seq = runtime._make_sequencer("observer-cancellation")
+        seq.prepare_staging(repo, staging, "worker", "main")
+        (staging / "evidence.bin").write_bytes(b"cancellation cannot strand evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+
+    try:
+        asyncio.run(quarantine())
+        events = [
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        ]
+    finally:
+        store.close()
+
+    assert len(events) == 1
+    destination = tmp_path / ".cambium" / "quarantine" / events[0]["payload"]["quarantine_id"]
+    assert destination.is_dir()
+    assert not staging.exists()
+    assert (destination / "evidence.bin").read_bytes() == b"cancellation cannot strand evidence"
+
+
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)

@@ -553,6 +553,65 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     ).stdout.strip() == commits_after_recovery
 
 
+def test_next_startup_ignores_durably_pruned_quarantine_and_spawns_worker(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-after-prune"
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-after-prune",
+                branch="wt-after-prune", target_file="a.txt", marker="// after-prune",
+                gate="grep -q '// after-prune' a.txt",
+            )
+        ]
+    }
+
+    async def quarantine() -> Path:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        await runtime.start()
+        seq = runtime._make_sequencer("expired-evidence")
+        staging = session_dir / "expired-staging"
+        seq.prepare_staging(repo, staging, "main", "main")
+        (staging / "evidence.bin").write_bytes(b"expired evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+        event = next(
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        )
+        artifact = session_dir / ".cambium" / "quarantine" / event["payload"]["quarantine_id"]
+        await runtime.shutdown()
+        return artifact
+
+    artifact = asyncio.run(quarantine())
+    expired = time.time_ns() - 8 * 24 * 60 * 60 * 1_000_000_000
+    os.utime(artifact, ns=(expired, expired))
+
+    async def prune_on_startup() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        await runtime.start()
+        await runtime.reconcile(plan["tasks"])
+        await runtime.shutdown()
+
+    asyncio.run(prune_on_startup())
+    assert not artifact.exists()
+    quarantine_id = artifact.relative_to(session_dir / ".cambium" / "quarantine").as_posix()
+    assert any(
+        event["payload"].get("quarantine_id") == quarantine_id
+        for event in _kinds(read_events(session_dir), "merge_staging_pruned")
+    )
+
+    result = asyncio.run(run_plan(session_dir, plan))
+    events = read_events(session_dir)
+
+    assert result.exit_code == 0
+    assert result.results[0].status == "succeeded"
+    assert _kinds(events, "spawned")
+
+
 def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypatch) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
