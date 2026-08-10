@@ -293,7 +293,10 @@ def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
     )
 
     assert result.ok
-    assert "[output truncated]" in result.output
+    parsed = json.loads(result.output)
+    assert isinstance(parsed, dict)
+    assert parsed["truncated"] is True
+    assert "[output truncated]" in parsed["signature"]
     assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
 
 

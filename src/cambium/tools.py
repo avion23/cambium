@@ -94,6 +94,36 @@ def _truncate_text(text: str, limit: int, marker: str) -> str:
     return _truncate_bytes(text.encode("utf-8"), limit, marker)
 
 
+def _serialize_signature_result(result: dict[str, Any]) -> str:
+    def serialize(value: dict[str, Any]) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    output = serialize(result)
+    if len(output.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return output
+
+    envelope = {**result, "signature": "", "truncated": True}
+    if len(serialize(envelope).encode("utf-8")) > MAX_OUTPUT_BYTES:
+        return serialize({"truncated": True})
+
+    signature = result["signature"]
+    low = 0
+    high = len(signature)
+    best_signature = ""
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = signature[:midpoint] + OUTPUT_TRUNCATION_MARKER
+        envelope["signature"] = candidate
+        if len(serialize(envelope).encode("utf-8")) <= MAX_OUTPUT_BYTES:
+            best_signature = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+
+    envelope["signature"] = best_signature
+    return serialize(envelope)
+
+
 def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
     root = Path(ctx.cwd).resolve()
     candidate = (root / raw_path).resolve()
@@ -372,11 +402,7 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         raise _ToolFailure(f"symbol not found: {symbol!r} in {display_path}")
 
     result = {"path": display_path, **signature}
-    output = json.dumps(result, ensure_ascii=False, sort_keys=True)
-    return _Outcome(
-        ok=True,
-        output=_truncate_text(output, MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER),
-    )
+    return _Outcome(ok=True, output=_serialize_signature_result(result))
 
 
 def _process_output(stdout: Any, stderr: Any) -> str:
