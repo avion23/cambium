@@ -84,7 +84,7 @@ def test_report_writes_valid_baseline(tmp_path) -> None:
     baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
     assert SCHEMA_KEYS <= set(baseline)
     assert baseline["module"] == "should_decompose"
-    assert baseline["dataset_version"] == "1.0.0"
+    assert baseline["dataset_version"] == "1.1.0"
     assert baseline["metric"]["train"] == {"mean": 1.0, "std": 0.0, "count": 200}
     assert baseline["metric"]["eval"]["count"] == 50
     assert baseline["metric"]["canaries"]["count"] == 10
