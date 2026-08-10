@@ -45,7 +45,6 @@ MIN_PYTHON = (3, 14)
 MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
 CONVERSATIONS_DB_REL = ".cambium/sessions/conversations.db"
-EVAL_CACHE_REL = ".cambium/eval-cache"
 MODULES_ROOT = Path(__file__).resolve().parent / "modules"
 OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
 
@@ -382,53 +381,6 @@ def check_conversation_store(session_dir: Path | None) -> tuple[Status, str]:
     return Status.PASS, f"{db}: integrity ok"
 
 
-def _json_files(directory: Path, *, recursive: bool) -> list[Path]:
-    candidates = directory.rglob("*.json") if recursive else directory.iterdir()
-    return sorted(path for path in candidates if path.is_file() and path.suffix == ".json")
-
-
-def check_json_directory(
-    session_dir: Path | None, relative: str, label: str, *, recursive: bool
-) -> tuple[Status, str]:
-    if session_dir is None:
-        return Status.SKIP, "no --session-dir given"
-    directory = session_dir / relative
-    if not directory.exists():
-        return Status.SKIP, f"{directory} does not exist"
-    if not directory.is_dir():
-        return Status.FAIL, f"{directory}: {label} path is not a directory"
-
-    try:
-        paths = _json_files(directory, recursive=recursive)
-    except OSError as exc:
-        return Status.FAIL, f"{directory}: cannot read {label} directory: {exc}"
-
-    corrupt: list[str] = []
-    for path in paths:
-        try:
-            with path.open(encoding="utf-8") as stream:
-                value = json.load(stream)
-        except (OSError, UnicodeError, ValueError):
-            corrupt.append(path.name)
-            continue
-        if not isinstance(value, dict):
-            corrupt.append(path.name)
-
-    if corrupt:
-        shown = ", ".join(corrupt[:3])
-        suffix = "" if len(corrupt) <= 3 else f", +{len(corrupt) - 3} more"
-        return Status.WARN, (
-            f"{directory}: readable, {len(paths)} JSON entr{'y' if len(paths) == 1 else 'ies'}; "
-            f"{len(corrupt)} corrupt ({shown}{suffix})"
-        )
-    entry_word = "entry" if len(paths) == 1 else "entries"
-    return Status.PASS, f"{directory}: readable, {len(paths)} JSON {entry_word}"
-
-
-def check_eval_cache(session_dir: Path | None) -> tuple[Status, str]:
-    return check_json_directory(session_dir, EVAL_CACHE_REL, "eval-cache", recursive=True)
-
-
 def check_system_health(path: Path) -> tuple[Status, str]:
     """Return advisory host health; resource-probe failures never fail doctor."""
 
@@ -570,8 +522,7 @@ def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
         (10, "Auth schema", check_auth_schema()),
         (11, "Auth coverage", check_auth_coverage(cwd)),
         (12, "Conversation store", check_conversation_store(session_dir)),
-        (13, "Eval-cache directory", check_eval_cache(session_dir)),
-        (14, "System health", check_system_health(cwd)),
+        (13, "System health", check_system_health(cwd)),
     ]
     return [
         Check(number=number, name=name, status=status, detail=detail)
