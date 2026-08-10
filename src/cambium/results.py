@@ -199,16 +199,25 @@ def _signal_failed(value: Any) -> bool:
 
 
 def _signal_rejected(value: Any) -> bool:
+    """Return whether an evaluator verdict explicitly rejects."""
     if isinstance(value, Mapping):
-        value = _first_wire_value(value, ("status", "verdict", "rejected", "ok"))
-        if value is _MISSING:
-            return False
+        verdict = _first_wire_value(value, ("status", "verdict"))
+        if verdict is not _MISSING:
+            value = verdict
+        else:
+            rejected = _first_wire_value(value, ("rejected",))
+            if rejected is not _MISSING:
+                return _flag(rejected) is True
+            ok = _first_wire_value(value, ("ok", "passed"))
+            if ok is _MISSING:
+                return False
+            return _flag(ok) is False
     token = _token(value)
     if token in _REJECT_TOKENS or _has_marker(
         token, ("evaluator_reject", "review_reject")
     ):
         return True
-    return isinstance(value, bool) and value
+    return isinstance(value, bool) and not value
 
 
 def _status_mapping(value: Mapping[str, Any] | str) -> Mapping[str, Any]:
@@ -282,12 +291,12 @@ def status_from_wire(
             "termination_reason",
         ),
     )
+    cancellation_flag = _first_wire_value(
+        wire, ("cancelled", "canceled", "cancellation")
+    )
     cancellation_value = _first_wire_value(
         wire,
         (
-            "cancelled",
-            "canceled",
-            "cancellation",
             "cancel_reason",
             "termination_reason",
             "failure_reason",
@@ -299,7 +308,9 @@ def status_from_wire(
         or _token(wire_type) in _CANCEL_TOKENS
         or _has_marker(raw_status, ("cancel", "shutdown"))
         or _has_marker(wire_type, ("cancel", "shutdown"))
-        or _flag(cancellation_value) is True
+        or _flag(cancellation_flag) is True
+        or _token(cancellation_flag) in _CANCEL_TOKENS
+        or _has_marker(cancellation_flag, ("cancel", "shutdown"))
         or _token(cancellation_value) in _CANCEL_TOKENS
         or _has_marker(cancellation_value, ("cancel", "shutdown"))
     ):

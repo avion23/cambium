@@ -12,6 +12,7 @@ import pytest
 from cambium.events import Event
 from cambium.results import (
     CHILD_RESULT_KEYS,
+    EXIT_CODES,
     ROOT_RESULT_KEYS,
     Result,
     result_to_dict,
@@ -129,6 +130,35 @@ def test_child_mapper_always_emits_empty_diff_when_omitted() -> None:
 def test_status_conversion_table(wire: dict[str, object], expected: str) -> None:
     assert status_from_wire(wire) == expected
     assert wire_to_child_result(wire)["status"] == expected
+
+
+def test_successful_evaluator_verdict_maps_to_done() -> None:
+    status = status_from_wire({"status": "succeeded", "evaluator": {"ok": True}})
+
+    assert status == "done"
+    assert EXIT_CODES[status] == 0
+    assert status_from_wire({"status": "succeeded", "evaluator": {"ok": False}}) == (
+        "rejected"
+    )
+
+
+def test_success_reason_is_advisory_not_cancellation(tmp_path: Path) -> None:
+    result = root_result_from_wire(
+        {
+            "status": "succeeded",
+            "gate_exit_code": 0,
+            "merge_status": "ok",
+            "reason": "success",
+        },
+        tmp_path,
+        session_id="session-1",
+        started_at=10.0,
+        ended_at=11.0,
+    )
+
+    assert result.status == "done"
+    assert result.exit_code == 0
+    assert result.failure_reason is None
 
 
 def test_result_has_exact_fifteen_root_fields_and_finalized_values(tmp_path: Path) -> None:
