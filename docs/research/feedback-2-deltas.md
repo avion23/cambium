@@ -2,385 +2,365 @@
 
 **Version:** 1.0.0
 **Date:** 2026-08-09
-**Branch:** `wt-fb2` (`/tmp/opencode/cambium-fb2`)
-**Status:** Assessment of the second external critique against the current state (architecture v2.0.0 + design-deltas D1–D7 + merged research). New residue is captured as **D8a–D8g** in the same format as `docs/research/design-deltas.md`. This document supplements `docs/architecture/architecture.md` and `design-deltas.md` and supersedes them wherever a delta is marked **adopt**.
+**Branch:** `wt-fb2` (`/tmp/opencode/cambium-fb2`), based `96da568`
+**Status:** Historical assessment of critique claims against architecture v2.0.0, D1–D7,
+and merged research. D8a–D8g are adopted amendments; current readers use
+`docs/architecture/architecture.md`, `src/cambium/`, and `docs/research/v2-1-status.md`.
 
-**Current-main note (2026-08-09):** the branch and count details below are the
-historical assessment snapshot. Current main is at `6109a6a`, with 80 tracked
-files, 33 research documents, and 108 collected tests. The canonical paths are
-`docs/architecture/architecture.md`, `docs/architecture/module-template/`,
-and `docs/architecture/reviews/`.
+**Historical snapshot / current pointer:** the old 30/66-file counts, `main@3621fd9`, and
+branch provenance are retained as evidence only. Current notes: provider loop, Diffundo,
+EventStore, and root `Result` exist; DLQ, eval cache, ResourceBudget, `worker_pool`, and
+`events` are absent; no per-worker sandbox or production shell approval exists, and dynamic
+hierarchy is absent.
 
-**Sources incorporated:** (1) the second external critique of the v2 architecture — 14 claims reproduced in §1; (2) current state, read from the branches listed in §0.3.
+## 0. Evidence convention and provenance
 
----
+The critique text was not committed; claim numbers below reproduce the orchestrator disposition.
+Repository paths/sections were checked or marked **UNVERIFIED**. Architecture/template were read
+from `wt-arch@17ef25f`; D1–D7 from `wt-deltas2@905fc1b`; merged research from `main@3621fd9`;
+branch-local `cascade-design.md` `wt-cascade@73093e7`, `sqlite-wal-durability.md`
+`wt-sqlite@7f6ac8d`, and `repo-structure-plan.md` `wt-hygiene@660f930`.
 
-## 0. Reading this document
+## 1. Fourteen critique claims
 
-### 0.1 Verification convention
-
-- **Every citation is a real file/section or a branch tree.** Files are cited by stable repository-relative path so coherence is auditable when branches merge (the same convention as `architecture.md` §20 and `design-deltas.md` §0.1).
-- **Branch provenance is stated.** At the time of writing, `wt-fb2` is based at `96da568`; research docs merged onto `main` after that commit (`custos-asyncio-design.md`, `example-datasets-v1.md`, `logging-design.md`, `replay-restart-design.md`, `sandbox-options.md`, `test-strategy.md`, `threat-model.md`, `worktree-concurrency.md`) and the branch-local drafts (`cascade-design.md`, `sqlite-wal-durability.md`, `repo-structure-plan.md`) were read read-only from their named branches / `main`. All are real, verified trees.
-- Anything that could not be verified is marked **UNVERIFIED** (§4).
-
-### 0.2 "As of" note
-
-- `docs/architecture/architecture.md` v2.0.0 — **as of commit `17ef25f` on branch `wt-arch`**. The D1–D7 deltas (`design-deltas.md` v1.0.0, branch `wt-deltas2`) are authoritative amendments to that document and are treated as current state here.
-- Decision record: `implementation-plan.md` Decisions 8 (no local LLM cache), 9 (task tree), 10 (no sandboxing in the harness) — directive-sourced, adopted.
-- Merged research: `main` tip `3621fd9` at the time of writing.
-
-### 0.3 Files read for this assessment (provenance)
-
-| Path | Where it lives now | Read from |
-|---|---|---|
-| `docs/architecture/architecture.md`, `agents.md`, `docs/architecture/module-template/*` | `wt-arch` @ `17ef25f` | `wt-arch` |
-| `docs/research/design-deltas.md` (D1–D7) | `wt-deltas2` @ `905fc1b` | `wt-deltas2` |
-| `docs/research/example-datasets-v1.md`, `custos-asyncio-design.md`, `threat-model.md`, `sandbox-options.md`, `ipc-protocol-draft.md` | `main` | `main` (read-only) |
-| `docs/research/cascade-design.md`, `sqlite-wal-durability.md`, `repo-structure-plan.md` | `wt-cascade` @ `73093e7`, `wt-sqlite` @ `7f6ac8d`, `wt-hygiene` @ `660f930` | branches (read-only) |
-| `docs/architecture/reviews/review-distributed-systems.md`, `review-llm-design.md`, `review-implementation.md` | `main` | `main` |
-| `src/cambium/**` (scaffold) | `wt-fb2` (= main @ `96da568`) | `wt-fb2`; tests re-run here |
-| `implementation-plan.md` | `main` / `wt-fb2` | `wt-fb2` |
-
-### 0.4 Summary
-
-| Claim | Verdict | Action |
-|---|---|---|
-| 1. Directory mess / duplicates | **REJECT** (with evidence; one real hygiene residue) | Layout proposal in §3 |
-| 2. Independent hill-climbing delusion | **STALE — already handled** | None (residue already in design) |
-| 3. `should_decompose` regex = toy | **ACKNOWLEDGED — roadmap** | None |
-| 4. Async I/O deadlock (`with open` in loop) | **STALE — already fixed + validated** | None |
-| 5. Actor model / SoC / Kahn / "Custos dumb" | **CONFIRMED — aligned** | None |
-| 6. Let it crash / event sourcing / saga | **CONFIRMED — aligned** | None |
-| 7. Unix-philosophy pure JSON modules + CLI | **ADOPT** | **D8a** |
-| 8. RLM tree information hiding | **ADOPT** | **D8b** |
-| 9. Provider prefix caching (static top / dynamic bottom) | **ADOPT** | **D8c** |
-| 10. Hexagonal architecture / ports / DI | **ADOPT** (formalize) | **D8d** |
-| 11. Sandbox → container/microVM | **ADOPT residue** (decision 10 already drops sandbox) | **D8e** |
-| 12. Parallelism (LLM plan → N workers → queue → Unio) | **CONFIRMED — matches design** | None |
-| 13. Token bucket + circuit breaker + pause-on-exhaustion | **ADOPT residue** (breaker/tiers already drafted) | **D8f** |
-| 14. SQLite WAL conversation store; JSONL for IPC | **ADOPT residue** (event log already WAL) | **D8g** |
-
----
-
-## 1. Point-by-point verdict table
-
-| # | Critique claim | Status | Evidence |
+| # | Claim | Disposition | Retained reason/evidence |
 |---|---|---|---|
-| 1 | "Directory mess: cambium/cambium, duplicate files everywhere" | **REJECT** (claim false against the tracked tree); one genuine hygiene residue: **docs proliferation + template/instance doc overlap**, addressed by the layout proposal (§3) | **Verified here and in the hygiene audit.** `git ls-files` on `wt-fb2` (== main @ `96da568`): **30 tracked files**, the only `cambium` directory is `src/cambium/` (`src/cambium/cambium/` count = **0**); duplicate basenames = `__init__.py` only (intentional Python package markers). `docs/research/repo-structure-plan.md` (wt-hygiene) §1 re-ran the same checks: "0 matches", "only duplicate basename among the 30 tracked files: `__init__.py`", "No tracked junk: zero tracked files under `.pytest_cache/`, `.venv/`, `__pycache__/`". The duplicates the critique saw exist **only inside gitignored `.venv/` / `__pycache__/`** (confirmed present on the live tree in `/home/ubuntu/cambium`). **Real residue:** 31 research/design docs post-merge (§3) and the intended-but-overlapping pair `docs/module-template/architecture.md` (normative template) vs `src/cambium/modules/example/architecture.md` (filled-in instance; `example-spec.md` §12 already marks the in-tree doc "a shorter reference"). Both are intentional per `repo-structure-plan.md` §2 (doc taxonomy) and §3 (rule c); the layout proposal makes the taxonomy normative. |
-| 2 | "Independent hill-climbing delusion, nodes coupled" | **STALE — already handled; the golden-dataset residue is already the design** | `docs/architecture.md` §17 restates the claim: §17.1 "They are not [independent]"; §17.2 "Each module is optimized against **frozen references** of its siblings, not their live co-adapted versions" (stub-worker / stub-decomposer pins, frozen held-out eval per module); §17.5 "per-module optimizable against frozen references… **not** jointly optimized"; resolution **LLM-C4** (§18.2): "Claim restated: per-module optimizable against pinned siblings." **Golden dataset already exists as the design:** `docs/research/example-datasets-v1.md` §1 — `train.jsonl` **200**, `eval.jsonl` **50**, `canaries.jsonl` **10**; `docs/module-template/dataset-format.md` §4 targets train 200 / eval 50 / canary 15 (v1 deviates to 10 canaries — recorded as a deviation in `example-datasets-v1.md` §5 item 4). |
-| 3 | "`should_decompose` regex = toy" | **TRUE and acknowledged — roadmap, no change** | `example-spec.md` §0.2: "The v2 implementation is a **rule engine** (~140 LOC) — a DSPy program is a *future seam*, not the v2 primary." The DSPy seam is documented as **v2.1**: `example-spec.md` §5.1 ("The DSPy seam (v2.1+)"), §10 "Optimization Plan (v2.1)" (`dspy.SIMBA`, train ≥ 200, eval ≥ 0.85, canary 100%, model-pinned). `architecture.md` §17.1: "v2 rule engine today, DSPy seam documented in `docs/module-template/example-spec.md` §5.1." The toy-ness is the deliberate v2 trade; the replacement path is specced, not built. |
-| 4 | "Async I/O deadlock (`with open` in event loop)" | **STALE — already fixed in the arch and empirically validated** | The flaw is **DS-C1** in `docs/reviews/review-distributed-systems.md` §C1 (blocking `open()`/`write()` in `_log_event`). Resolved in `architecture.md` §6.2 — "dedicated writer thread … the supervisor never performs disk I/O on the event-loop thread"; §6.5 fsync cadence; §18.1 row DS-C1. **Validated empirically:** `docs/research/sqlite-wal-durability.md` (wt-sqlite) — WAL read-while-write (Q1), crash-loss = 0 committed events (Q2), fsync target (Q3), power-loss ≤ 1 s window (Q4), conclusion "The durability contract holds"; `docs/research/custos-asyncio-design.md` (main) — "The event loop never calls `open()`, `write()`, `fsync()`, `sqlite3`, or blocking `git` directly. **DS-C1 is structurally impossible**." |
-| 5 | "Actor model, SoC, Kahn networks, Custos dumber than a bag of hammers" | **CONFIRMED — aligned with the design** | Actor/OTP supervision: `architecture.md` §0 "Primary patterns kept: Erlang/OTP one-for-one transient supervision". SoC: §2 layering (Deterministic / Orchestration / Worker / Upper system; "The Deterministic Layer never calls an LLM and never crashes"). "Custos dumber than a bag of hammers" is exactly the intent: `§2` invariant + `§4` M4 (Custos is pure deterministic supervision) — a deliberately dumb, crash-proof core. Kahn: `§8.2` "This is the Kahn-process-network property… a true pass-through channel" — retained only for `Nuntius` where structurally true (resolution **DS-N6** dropped the CSP name-dropping elsewhere). No new delta. |
-| 6 | "Let it crash, event sourcing, saga" | **CONFIRMED — aligned** | Let-it-crash: `§5.3` four-layer liveness + `§7.1` state machine (CRASHED → restart, bounded) + `§7.4` restart policy. Event sourcing: `§6.1`–`§6.3` SQLite WAL append-only event log (gap-free `seq`, replay from snapshots) — the durable feedback channel. Saga-style compensation: `§7.5` worktree recovery (`Surculus.recover` reset/clean/cherry-pick, quarantine on failure) + `§7.3` generation fencing + `§7.8` atomic `update-ref` publish with crash reconciliation (`Unio.reconcile`). Confirmed; no new delta. |
-| 7 | "Modules as pure JSON-in/JSON-out functions; CLI pipe; strict JSON schemas; module knows only TaskInput→DecomposeOutput" | **ADOPT** (normative rule; the scaffold's `Module` ABC is compatible — `decide()` is the pure function; add the CLI wrapper) | Partially present: `base.py` `Module.decide` + typed `TaskInput`/`DecomposeOutput` dataclasses (strict schemas already enforced by `ExampleDatasetLoader._validate`), and `module-template/architecture.md` §3 ("Untyped `dict` inputs are not permitted"; outputs "must be JSON-serializable for the event log"). **Missing:** any CLI/pipe surface — the only module entry points are the scenario test and the *v2.1* eval stub `python -m cambium.modules.<name>.eval` (`module-template/architecture.md` §9.2, `example-spec.md` §12). **→ NEW DELTA D8a.** |
-| 8 | "RLM tree: parent NEVER reads child scratchpad/reasoning; child returns unified diff + 3-sentence summary" | **ADOPT** (task tree already designed in D2; add the info-hiding rule explicitly) | D2 (`design-deltas.md`) formalizes the Task Tree: nodes, DAG validation, upward result envelopes, `parent_task_id` in the event log, I2.4 "a node never reads a sibling's raw session", I2.5 tree-level completion. `§3.4`/`§5.2` already carry `summary` (≤2k chars) + `metric_breakdown` upward. **Missing:** (a) the explicit rule that the *parent* never receives the child's scratchpad/chain-of-thought; (b) `unified_diff` as a normative upward field (only the `wt-slice` vertical slice carries `diff` in its `result_envelope`; the arch `result` message does not). **→ NEW DELTA D8b.** |
-| 9 | "Provider prefix caching: static prefix at TOP, dynamic at BOTTOM; never timestamps/request IDs at top" | **ADOPT** (works with decision 8 — upstream caching) | Decision 8 (no local LLM cache) makes provider-side caching the only cache (`implementation-plan.md` Decisions #8; D1). D1's WHY already notes the residue: "hit rate degrades if the prompt prefix churns … managed by prompt structuring (**stable prefix first**)". The critique turns that guidance into a normative, testable prompt-layout convention. **→ NEW DELTA D8c.** |
-| 10 | "Hexagonal architecture, ports and adapters, typing.Protocol, DI at root" | **ADOPT** (mostly aligned; formalize in the module template) | `base.py` already declares `Output` and `Metric` as `typing.Protocol`; workers receive `DiffundoConfig` and construct their own `Diffundo` client (`§9.3` `CambiumLM(diffundo, ...)` — injection, not import); `§2` layering keeps the Deterministic Layer type-independent of providers. **Missing:** the template does not name the ports/adapters boundary or a composition root; module wiring is implicit. **→ NEW DELTA D8d.** |
-| 11 | "Sandbox: rip out of harness; worker in disposable Docker/Firecracker" | **ADOPT residue** (the rip-out is already decision 10; the residue is naming the deployment isolation vehicle) | Decision 10 (2026-08-09): "NO SANDBOXING IN THE HARNESS" (`implementation-plan.md`); D7 "No sandboxing in the harness; Septum removed from v2 scope", containment = worktree isolation + allowlists + approval gates, least-privilege worker env (R4 fix); `docs/research/sandbox-options.md` retained as evidence (bwrap blocked by AppArmor `apparmor_restrict_unprivileged_userns=1`); threat-model R3 re-rated "accepted — out of scope". **Missing:** the deployment-side statement that containers/microVMs are the *host's* isolation vehicle and that the worker is a plain stdio process whether local or in a container. **→ NEW DELTA D8e.** |
-| 12 | "LLM plans (JSON array of sub-tasks); deterministic supervisor spawns N workers in N worktrees; results to queue; Unio merges; orchestrator wakes" | **CONFIRMED — matches the design exactly** | `§2` layering: Architectus (`TaskDecomposer` → `TaskRouter`) produces the subtask plan; `Custos` (Deterministic) spawns N `Opifex` workers, each in its own worktree (`§7.2`, `§7.5`); results flow up as envelopes (D3 "child→parent result messages"; `§5.2` `result`); `Unio` serializes merges (`§7.8`, `§4` M7); the orchestrator wakes on envelopes / tree-level completion (D2 I2.5). The `wt-slice` vertical slice is the working proof (spawn → worktree → gate → `git merge --ff-only`). |
-| 13 | "Token bucket + circuit breaker in Diffundo; capability tiers; all-providers-exhausted → async queue pauses, workers await" | **ADOPT residue** (circuit breaker + tiers already drafted; token bucket + pause-on-exhaustion are new) | Circuit breaker + capability tiers: `docs/research/cascade-design.md` §1.1 (ordered per-tier fallback), §2.3 (sliding-window circuit breaker: HEALTHY/COOLDOWN/OPEN/HALF_OPEN, `failure_threshold`); `architecture.md` §9.1 (`tier`, `supports_tools`, `context_window`) and §9.2 (tier primary key — resolution LLM-C2). `AllProvidersFailed` is a real class (`§9.2`, IMPL-M5). **Missing:** a token-bucket rate limiter (cooldown bounds failures, not throughput) and explicit **pause-on-exhaustion** at the dispatch queue (arch §7.4 today bounds provider outage inside the worker with `provider_patience_s` backoff; the critique wants the queue to pause and workers to await recovery). **→ NEW DELTA D8f.** |
-| 14 | "SQLite WAL for conversation storage (queryable context extraction); JSONL only for low-level IPC" | **ADOPT residue** (event log already SQLite WAL; the per-node conversation store is new) | Event log = SQLite WAL: `§6.1`–`§6.3` + validated by `docs/research/sqlite-wal-durability.md`. IPC = JSON-Lines: `§5.1`. **Missing:** per-node conversation/session history as a *queryable* store. D2 item 2 currently places each node's session log under `${session_dir}/cambium/sessions/<node_id>/` append-only (file-based, not queryable). **→ NEW DELTA D8g.** |
+| 1 | Directory mess/duplicates | **REJECT** (one hygiene residue) | `git ls-files` found no tracked nested `cambium`, only intentional `__init__.py`; the real residue is research-doc volume and template/instance overlap. `repo-structure-plan.md` §2/§3 is the taxonomy. |
+| 2 | Independent hill-climbing delusion | **STALE** | Architecture §17.2 already pins frozen siblings; dataset v1 is 200 train/50 eval/10 canary (`example-datasets-v1.md` §1, deviation §5). |
+| 3 | `should_decompose` regex is toy | **ACKNOWLEDGED / roadmap** | v2 deliberately uses a ~140 LOC rule engine; DSPy/SIMBA is the v2.1 seam (`example-spec.md` §§0.2, 5.1, 10). |
+| 4 | Async I/O deadlock | **STALE / fixed** | DS-C1 was fixed by dedicated writer thread (`architecture.md` §6.2); WAL and Custos research empirically validate it (`sqlite-wal-durability.md`, `custos-asyncio-design.md`). |
+| 5 | Actor/SoC/Kahn/Custos separation | **CONFIRMED** | Architecture §§0, 2, 8.2 retain OTP supervision, deterministic LLM-free Custos, and Kahn only where valid (DS-N6). |
+| 6 | Let-it-crash/event sourcing/saga | **CONFIRMED** | §§5.3, 6.1–6.3, 7.1, 7.3, 7.5, 7.8 provide liveness, WAL replay, fencing, recovery, and atomic publish. |
+| 7 | Pure JSON module + CLI | **ADOPT — D8a** | Typed `Module.decide`/dataclasses exist; no module pipe entry exists (`base.py`, template §3, example-spec §12). |
+| 8 | RLM information hiding | **ADOPT — D8b** | D2 has upward envelopes and sibling isolation, but no explicit no-scratchpad rule or normative diff field. |
+| 9 | Provider prefix caching | **ADOPT — D8c** | D1 removes local cache; static prompt prefix must precede dynamic content. |
+| 10 | Hexagonal ports/DI | **ADOPT — D8d** | `Output`/`Metric` Protocols and `CambiumLM` injection are precedents; the template did not name provider/event/dataset ports. |
+| 11 | Sandbox/container boundary | **ADOPT — D8e** | D7 removed in-harness sandbox; host containers/microVMs are the deployment boundary. |
+| 12 | LLM plan → N workers → queue → Unio | **CONFIRMED** | Architecture §§2, 5–7 and D2/D3 match; no delta. |
+| 13 | Token bucket/circuit breaker/pause | **ADOPT — D8f residue** | Tiers/breaker existed in `cascade-design.md`; rate limiter and queue pause were missing. |
+| 14 | SQLite conversation store; JSONL IPC | **ADOPT — D8g residue** | Event WAL and JSONL IPC already exist; per-node queryable conversation history was missing. |
 
----
+## D8a — Pure JSON module CLI
 
-## 2. NEW DELTAS D8a–D8g
+**Source:** external critique claim 7. **Status:** **adopt**. **Amends:** module-template
+architecture §§3, 9; architecture §4; example-spec §12.
 
-### D8a — Unix-philosophy module contract: pure JSON-in/JSON-out CLI + strict schemas
+Every module ships `python -m cambium.modules.<name>`: one JSON object on stdin, one JSON object
+on stdout, exit 0 on success, structured error/non-zero on failure, stderr for diagnostics.
+Typed dataclasses are strict schemas; the wrapper is thin and leaves `Module.decide`/DSPy seam
+unchanged. It is distinct from the v2.1 eval entry point. The rule makes modules pipeable and
+independently testable; no CLI existed in the snapshot.
 
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 7).
-**Status:** **adopt** (normative rule).
-**Amends:** `docs/module-template/architecture.md` §3 (Interfaces — add CLI contract) and §9 (test strategy — add CLI test); `docs/architecture.md` §4 (module catalog — each module ships a CLI entry); `docs/module-template/example-spec.md` §12 (scaffold alignment — add the CLI wrapper to the "extensions" list).
+**Open questions:** Q8a.1 single object versus JSONL batch; Q8a.2 async `decide` confirmation;
+Q8a.3 error envelope/schema version; Q8a.4 `__main__.py` versus per-module `cli.py`.
 
-#### WHAT changes
+## D8b — Task Tree information hiding
 
-1. **Every module MUST ship a CLI entry `python -m cambium.modules.<name>`** — `<name>` is the **package directory** per `module-template/architecture.md` §9.2 (e.g. the scaffold's reference module lives at `cambium.modules.example`; its logical name is `should_decompose`, its package path is `example`). Contract: read **one JSON object from stdin** (module input), write **one JSON object to stdout** (module output), exit `0` on success; non-zero exit with a JSON `{"error": {…}}` object on failure. stderr is reserved for human diagnostics (mirrors `§5.1` stdout-reserved-for-protocol discipline). The module must be pipe-able: `echo '<json>' | python -m cambium.modules.example` is a supported, tested invocation.
-2. **Strict JSON schemas are the module's typed dataclasses.** The input/output schemas (e.g., `TaskInput` / `DecomposeOutput`) are the CLI's schema; the wrapper validates the stdin object against them and rejects unknown/invalid fields (reuse the loader-validation pattern from `ExampleDatasetLoader._validate`).
-3. **The scaffold's `Module` ABC is unchanged and compatible.** `decide()` **is** the pure function; the CLI is a thin adapter (~30 LOC: `json.loads(sys.stdin.buffer.read())` → construct input → `asyncio.run(decide(input))` → `json.dumps(output)`, `sort_keys=True`). This keeps the DSPy seam intact (a DSPy replacement implements the same `decide`, the CLI is untouched).
-4. **Distinct from the eval entry point.** `python -m cambium.modules.<name>.eval` (v2.1, `module-template/architecture.md` §9.2) scores the dataset; the new CLI *is* the module. Both can coexist (`__main__.py` for the module CLI; `eval.py` for scoring).
+**Source:** claim 8. **Status:** **adopt**. **Amends:** architecture §§3.4, 5.2, 6.3 and D2
+invariant I2.7.
 
-#### WHY
+Child→parent carries exactly `unified_diff` (64 KiB cap, `diff_truncated`), summary (≤2,000
+chars), metric breakdown, commits, files changed, and terminal status. It never carries
+scratchpad, chain-of-thought, reasoning, or trajectory. Those remain in the node store for the
+node, Ascensus, or explicitly authorized host. Nuntius/Custos rejects unknown envelope fields;
+the rule is structural. The parent context remains D2 I2.4 (own bounded log + parent summary +
+subtree envelopes).
 
-- The critique's Unix-philosophy point is sound and cheap: a pure JSON-in/JSON-out module is independently testable, composable in shell pipelines, drivable from datasets ("pipe a dataset into decomposer.py from CLI"), and decoupled from the harness's event loop. It also gives the vertical-slice and smoke tests a stable seam (`agents.md` §9 item 4/5).
-- It matches what the design already asserts — `module-template/architecture.md` §3.2 "outputs … must be JSON-serializable for the event log", `§3.1` "Untyped `dict` inputs are not permitted" — by adding the missing transport.
-- It closes the only real gap in claim 7: today the module has no executable face other than the scenario test.
+**Open questions:** Q8b.1 truncation flag versus content-addressed diff; Q8b.2 worker-authored
+three-sentence summary versus deterministic fallback; Q8b.3 absolute envelope-only visibility
+for parent LLMs versus audit-only tool events.
 
-#### Open questions
+## D8c — Provider prefix caching: static top, dynamic bottom
 
-- **Q8a.1** Batch mode: single-object-in/single-object-out (proposed, minimal) vs JSONL-stream-in/JSONL-stream-out for dataset piping? (Owner: module-template owner.)
-- **Q8a.2** The CLI is async (`asyncio.run(decide(...))`) so a DSPy-backed `decide` works unchanged — confirmed? (Owner: `Architectus` author.)
-- **Q8a.3** Error envelope shape: include a `schema_version` field for forward-compat? (Owner: `Nuntius` schema owner.)
-- **Q8a.4** Where the wrapper lives: `__main__.py` in the module dir (proposed) vs `cli.py` per module? (Owner: build agent.)
+**Source:** claim 9. **Status:** **adopt**. **Amends:** architecture §9.3, D1, module-template §5.
 
----
+System/AGENTS/tool/module instructions and stable few-shot context are the byte-stable prefix;
+task spec, repo context, observations, and tool results are the dynamic suffix. Timestamps,
+request IDs, monotonic values, and nonces never enter the prefix. This enables provider exact-
+prefix caching but is not a correctness cache. A pure prompt lint checks the ordering.
 
-### D8b — Task Tree information hiding: child→parent envelope = diff + summary + metrics ONLY
+**Open questions:** Q8c.1 helper versus convention; Q8c.2 DeepSeek ~64-token alignment (UNVERIFIED);
+Q8c.3 ReAct observations remain dynamic at the bottom.
 
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 8).
-**Status:** **adopt**.
-**Amends:** `docs/architecture.md` §3.4 (`Result` envelope — add `unified_diff`), §5.2 (`result` message — add `diff`), §6.3 (event log — `parent_task_id` per D2); `docs/research/design-deltas.md` D2 (add normative invariant **I2.7**).
+## D8d — Hexagonal modules: ports/adapters + DI
 
-#### WHAT changes
+**Source:** claim 10. **Status:** **adopt**. **Amends:** module-template §§3, 5.4; architecture
+§§2, 4.
 
-1. **Normative rule (new invariant I2.7): a child node NEVER sends its scratchpad, chain-of-thought, reasoning trace, or trajectory upward.** The child→parent result envelope carries **exactly**: `unified_diff` (per-file diff body), `summary` (≤2k chars, worker-authored), `metric_breakdown` (§10), `commits`, `files_changed`, terminal `status`. Nothing else. This is the critique's "parent never reads child scratchpad; child returns unified diff + 3-sentence summary" made normative.
-2. **`unified_diff` becomes a first-class upward field.** The `wt-slice` vertical slice already ships `diff` in its `result_envelope` (`vertical-slice-report.md`, `scripts/fake_worker.py`); this delta promotes that shape into `§3.4`/`§5.2`. **Cap: 64 KiB**, adopted from the merged IPC draft — `docs/research/ipc-protocol-draft.md` §3 (`result_envelope` message: `"diff": "…", // draft, capped 64 KiB`; field table: "`git diff base_commit..worktree`, capped at 64 KiB"). This supersedes the 256 KiB figure in this document's first draft: the IPC draft is the merged, reconciled artifact for the `result_envelope` shape (it also caps `summary` at 2k chars per `arch §3.4`), and D8b deliberately shares its envelope with it. Overflow truncates with a `diff_truncated: true` flag.
-3. **Scratchpad/reasoning stays in the node's own session store** (D2 item 2, I2.6 append-only) and is read only by: the node itself (resume), `Ascensus` (offline optimization reads the session store directly — never upward messages), and a host that explicitly queries the session store. It is never forwarded by `Custos`.
-4. **Enforcement is deterministic.** `Nuntius`/`Custos` validates upward messages against the envelope schema (rejecting unknown top-level fields like `scratchpad`/`reasoning`), so the rule is structural, not a prompt convention.
+Name typed ports: `LLMProvider.call`, `EventSink`, and `DatasetStore`; adapters (for example
+`DiffundoAdapter`) implement them. Construct modules at one composition root from `Config`; do
+not import/construct concrete providers inside a module. The v2 rule engine is pure, so the
+scaffold needs no fake LLM; a future DSPy `decide` receives an injected port. This preserves
+the deterministic layer's no-LLM invariant.
 
-#### WHY
+**Open questions:** Q8d.1 `container.py` versus orchestrator composition root; Q8d.2 add a
+test-injected `Clock`; Q8d.3 whether `CambiumLM` already satisfies `LLMProvider`.
 
-- Information hiding is the point of the RLM tree (D2): the parent's context is already bounded (`I2.4` node context = own log + parent summary + subtree envelopes). Letting raw child reasoning up would (a) pollute the parent's context window, (b) let the parent over-fit on child transcripts instead of artifacts, and (c) leak private reasoning across trust levels (`threat-model.md` R1 — injected-content steering). The precedent is opencode's subagent model, which returns results, not transcripts (`docs/research/opencode.md` §1).
-- D2 already forbids sibling→sibling raw-session reads; I2.7 closes the parent direction, making the tree a strict envelope-passing structure.
+## D8e — Deployment isolation outside the harness
 
-#### Open questions
+**Source:** claim 11. **Status:** **adopt** (D7 residue). **Amends:** architecture §§2, 4, 7.2;
+D7.
 
-- **Q8b.1** Diff cap confirmed at 64 KiB (IPC draft §3); truncation flag `diff_truncated: true` on overflow, or content-addressed dedup across children (a child whose diff is empty sends `diff: null`)? (Owner: `Nuntius` schema owner.)
-- **Q8b.2** Does the 3-sentence summary stay worker-authored (proposed) or get a deterministic parent-side fallback when empty? (Owner: `Architectus` author.)
-- **Q8b.3** Should `checkpoint`/tool-event streams remain upward-visible to the *parent* for audit, or is "envelope only" absolute? Proposed: absolute for LLM-facing upward messages; tool events stay in the node's store and the event log, not in upward messages. (Owner: orchestrator owner.)
+No in-harness sandbox is restored. A local or containerized worker speaks the same JSON-Lines
+stdio contract; Docker/Firecracker are host-owned, optional, and transport-agnostic. Cambium
+does not build/manage containers. `sandbox-options.md` records the AppArmor block that caused
+the D7 decision.
 
----
+**Open questions:** Q8e.1 reference image; Q8e.2 composing container env with D7's scrubbed env;
+Q8e.3 Docker versus Firecracker (UNVERIFIED; no container run).
 
-### D8c — Provider prefix caching: static prefix at TOP, dynamic at BOTTOM
+## D8f — Token bucket and pause on provider exhaustion
 
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 9).
-**Status:** **adopt** (works with decision 8 — upstream caching only).
-**Amends:** `docs/architecture.md` §9.3 (`CambiumLM` — prompt-construction contract); `docs/research/design-deltas.md` D1 (add the prompt-structure convention to the D1 WHY/WHAT residue); `docs/module-template/architecture.md` §5 (prompt-structure convention).
+**Source:** claim 13. **Status:** **adopt**. **Amends:** architecture §§7.4, 9.1–9.2.
 
-#### WHAT changes
+`Diffundo.call` checks a per-provider (optionally per-tier) token bucket before each cascade
+attempt; empty buckets mark `RATE_LIMITED` and are skipped with cooldown/breaker filtering.
+When all providers fail, dispatch pauses and in-flight workers await a recovery monitor rather
+than crash-looping. Existing tier ordering and circuit breaker remain from `cascade-design.md`.
 
-1. **Normative prompt-layout convention for every `CambiumLM`/`Diffundo.call` caller:** static, byte-stable content goes **at the TOP** — system prompt, AGENTS.md-derived guidelines, tool definitions, module instructions, task-independent few-shot context; dynamic content goes **at the BOTTOM** — task spec, repo context, observations, tool results.
-2. **Never place timestamps, `request_id`s, monotonic values, or per-call nonces at the top of a prompt.** They churn the exact-prefix key and destroy provider-side cache hits (OpenAI / Anthropic / DeepSeek prefix KV caching — citations in D1).
-3. **This is guidance that enables upstream caching, not a correctness mechanism** — consistent with D1 ("the worker and orchestrator code do not manage any cache; they may only place stable prefixes so the provider's cache hits (guidance, not a correctness mechanism)"). Decision 8 stands: no local cache.
-4. **Testable:** a prompt-lint check in the module test suite asserts static-before-dynamic ordering and no volatile tokens in the static prefix (small pure helper, e.g., `build_prompt(static: tuple[str, ...], dynamic: str) -> str`).
+**Open questions:** Q8f.1 per-provider `rpm` defaults (UNVERIFIED); Q8f.2 Custos versus
+orchestrator recovery monitor; Q8f.3 gate behavior during a provider pause.
 
-#### WHY
+## D8g — Per-node conversation history in SQLite WAL
 
-- With the local cache deleted (decision 8/D1), the only caching in the system is the provider's, and provider caches are exact-prefix content-addressed (D1's three cited provider docs). Prefix churn at the top is the one way hit rate collapses; the convention is cheap and structural.
-- The critique's "never timestamps/request IDs at top" is exactly D1's "stable prefix first" made testable.
+**Source:** claim 14. **Status:** **adopt**. **Amends:** architecture §6.1 and D2 item 2.
 
-#### Open questions
-
-- **Q8c.1** Helper `build_prompt` in `cambium.diffundo` (proposed) vs convention-only? (Owner: `Diffundo` author.)
-- **Q8c.2** DeepSeek cache-prefix-units are ~64-token aligned; does the static prefix need alignment padding for max hit rate? (UNVERIFIED — no provider instrumentation yet; D1 Q1.2's `cached_tokens` telemetry is the prerequisite.) (Owner: `Diffundo`.)
-- **Q8c.3** Do worker ReAct prompts violate the rule inherently (each turn appends observations)? No — observations are dynamic and belong at the bottom; the static prefix is the invariant head. Confirm in the lint. (Owner: `Opifex` author.)
-
----
-
-### D8d — Hexagonal modules: ports/adapters + DI at the composition root
-
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 10).
-**Status:** **adopt** (formalization; the scaffold already has the raw material).
-**Amends:** `docs/module-template/architecture.md` §3 (Interfaces — add a "ports and adapters" subsection), §5.4 (LLM access — constructor injection of the port); `docs/architecture.md` §4 (module catalog — note the composition root), §2 (layering — module instantiation boundary).
-
-#### WHAT changes
-
-1. **A module's boundary is defined by typed ports (`typing.Protocol`), not concrete imports.** v1 port set: `LLMProvider` (`call(prompt, tier, temperature) -> response`), `EventSink` (emit the module's decision events), `DatasetStore` (load examples). Adapters implement the ports: `DiffundoAdapter(LLMProvider)` wrapping `Diffundo`. The ports pattern is the **target for the DSPy seam, not an existing fake**: the scaffold's `example-spec.md` §9.1 runs `decide()` with "no mocking, no network" simply because the v2 rule engine is a **pure function** — there is no LLM call and no fake-LLM harness in the scaffold today. When a DSPy-backed `decide` replaces the engine (v2.1), it will need an injected `LLMProvider`, and tests can then implement a fake adapter against the same port.
-2. **Constructor injection at a composition root.** Module instances are built in one place (proposed: `cambium.orchestrator` wiring or a dedicated `cambium.container`) from `Config`, with ports injected; a module never constructs `Diffundo`/a provider itself (except the worker-side `CambiumLM` construction, which is already config-injected via `init.fanout_config` — `§9.3`).
-3. **The scaffold's `Output`/`Metric` Protocols (`base.py`) and `Module` ABC stay; the delta adds the explicit port list to the template** so every future module's architecture.md names its ports and the adapters that implement them.
-
-#### WHY
-
-- The critique's point is mostly already true (`Output`/`Metric` Protocols; `CambiumLM(diffundo, ...)` injection; `§2` "Workers depend only on Nuntius and Diffundo"). The gap is that the module template never *names* the boundary, so a future module can silently import a concrete provider. Naming ports + a composition root makes testability (fake ports in scenario tests) and the DSPy seam mechanical.
-- It preserves the layering invariant (`§2`: Deterministic Layer never imports an LLM type).
-
-#### Open questions
-
-- **Q8d.1** Composition root: `cambium/container.py` (new) vs wiring inside `cambium/orchestrator.py` (proposed elsewhere for `Architectus`)? (Owner: orchestrator owner.)
-- **Q8d.2** Port granularity: is `LLMProvider` + `EventSink` + `DatasetStore` sufficient for v2, or add `Clock` (for deterministic timing in tests)? (Owner: module-template owner.)
-- **Q8d.3** Does `CambiumLM` (`§9.3`) already satisfy `LLMProvider`, or does the adapter wrap it? (Owner: `Diffundo` author.)
-
----
-
-### D8e — Deployment isolation: containers/microVMs live OUTSIDE the harness
-
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 11).
-**Status:** **adopt** (residue of decision 10 — the sandbox removal is already done).
-**Amends:** `docs/architecture.md` §7.2 (spawn — worker is a stdio subprocess regardless of container), §4 (M8 row — "removed"; add deployment note), §2 (upper system owns isolation); `docs/research/design-deltas.md` D7 (add deployment note).
-
-#### WHAT changes
-
-1. **Decision 10 (no sandboxing in the harness) is unchanged.** This delta documents the *deployment* boundary the critique asks for: **containers (Docker) / microVMs (Firecracker) are the isolation vehicle, and they live OUTSIDE the harness** — owned by the upper system (`§2`), not by Cambium.
-2. **The worker is a stdio process whether local or in a container.** The worker contract is `python -m cambium.opifex` speaking JSON-Lines on stdin/stdout (`§5.1`). A host that wants isolation wraps that process in a container/microVM and connects the pipes; Cambium code, IPC, and semantics are byte-identical. No harness change is required — the IPC contract is transport-agnostic.
-3. **Cambium does not build, manage, or assume containers.** Document the boundary so operators know the removed Septum is replaced by a host-side vehicle, not by nothing. `docs/research/sandbox-options.md` remains as the evidence record of why in-harness sandboxing was dropped (AppArmor block).
-
-#### WHY
-
-- The critique's "rip the sandbox out of the harness" is already executed (decision 10 / D7). Its residue — "run the worker in a disposable Docker container / Firecracker" — is correct as a *deployment* story and currently unnamed in the docs. Naming it costs nothing (it is a documentation delta) and answers the operational question "what replaces the sandbox?" with: host-side containers/microVMs, plus the D7 containment stack (worktrees + allowlists + approval gates + least-privilege env).
-
-#### Open questions
-
-- **Q8e.1** Reference container image layout (Python 3.14, `uv`, no provider keys baked)? Proposed as a deployment example doc, not a Cambium artifact. (Owner: ops / host.)
-- **Q8e.2** Does the least-privilege worker env (D7/R4 fix) compose with container env injection (env passthrough)? Proposed: yes — container env is a superset channel; the harness still constructs the scrubbed dict at spawn. (Owner: `Custos` author.)
-- **Q8e.3** Firecracker vs Docker guidance, or leave the vehicle un-pinned? Proposed: un-pinned (host's choice). **UNVERIFIED:** no container was run in this worktree.
-
----
-
-### D8f — Diffundo token-bucket rate limiting + all-providers-exhausted pause
-
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 13).
-**Status:** **adopt** (residue — circuit breaker + tiers already drafted).
-**Amends:** `docs/architecture.md` §9.1 (`ProviderConfig` — add token-bucket params), §9.2 (cascade steps 4–5 — bucket check before attempt; `AllProvidersFailed` → queue pause), §7.4 (provider-outage handling — add queue-level pause); `docs/research/cascade-design.md` §2.3 (breaker already there — no change).
-
-#### WHAT changes
-
-1. **Token-bucket rate limiter per provider** (and optionally per tier): before each cascade attempt, `Diffundo.call` checks the provider's bucket; an empty bucket marks the provider `RATE_LIMITED` and the cascade skips it (same selection-filter path as cooldown — `§9.2` step 2). Bucket refills at `rpm` tokens/min (`ProviderConfig.rpm`, default per provider; tier budget is the cascade-design cost-budget concept, unchanged).
-2. **Pause-on-exhaustion.** When the cascade exhausts every provider (`AllProvidersFailed`), the **dispatch queue pauses**: the orchestrator stops dispatching new tasks (already the IMPL-M5 "park dispatch" posture) and — new — the supervisor does not respawn/retry-loop workers awaiting LLM; a **recovery monitor** wakes dispatch when any provider's bucket/cooldown/breaker recovers. Workers in-flight await, they do not crash-loop (extends `§7.4`'s in-worker `provider_patience_s` backoff to the queue level).
-3. **Circuit breaker and capability tiers are NOT new** — `cascade-design.md` §2.3 (sliding-window breaker, OPEN/HALF_OPEN) and `§1.1` (per-tier ordered fallback) already cover them; `§9.1` tier/capability metadata already exists. D8f layers the missing rate limiter + queue pause on top.
-
-#### WHY
-
-- Cooldown (`§9.1` `cooldown_s`) bounds *failures*; it does not bound *throughput* — a healthy provider can still be hammered at a rate the provider's API rejects, and each rejection resets cooldown. A token bucket is the standard fix and composes with the existing selection filter.
-- The critique's "all-providers-exhausted → async queue pauses, workers await" is stronger than the current `provider_patience_s` (which keeps the worker alive but retrying inside its loop). An explicit queue pause + wake-on-recovery prevents both worker thrash and provider re-hammering after a total outage.
-
-#### Open questions
-
-- **Q8f.1** Bucket params: per-provider `rpm` defaults (UNVERIFIED — no provider-landscape rate data; `docs/research/provider-landscape.md` may inform them). (Owner: `Diffundo`.)
-- **Q8f.2** Who owns the recovery monitor — `Custos` (Deterministic, no LLM) watching provider health events, or the orchestrator? Proposed: `Custos` timer + `provider_health_change` events (cascade-design §5.2). (Owner: `Custos` author.)
-- **Q8f.3** Interaction with D4 gate retries: a gate run that needs LLM during a pause — does the gate wait (proposed) or fail fast? (Owner: orchestrator owner.)
-
----
-
-### D8g — Per-node conversation/session history in SQLite WAL (queryable)
-
-**Source:** EXTERNAL CRITIQUE (feedback-2, claim 14).
-**Status:** **adopt** (residue — the event log is already SQLite WAL; the per-node store is new).
-**Amends:** `docs/architecture.md` §6.1 (event store — add the conversation store); `docs/research/design-deltas.md` **D2 item 2** (node session log — storage engine). **Attribution note:** the `sessions/<node_id>/` subtree is introduced by **D2**, not by `architecture.md` §16.2 — §16.2's session layout lists only `events.db`, `events.jsonl`, `cambium.log`, `result.json`, `status.json`, `worktrees/`, `checkpoints/`, `quarantine/`, `optimized/`. D8g rewrites D2 item 2's "append-only files" into a SQLite-backed store; §16.2 is affected only insofar as the post-merge layout gains the D2 `sessions/` subtree.
-
-#### WHAT changes
-
-1. **The event log stays SQLite WAL (`§6.1`–`§6.3`) — no change.** New: **per-node conversation/session history is stored in SQLite WAL, queryable.** D2 item 2 currently places each node's full conversation under `${session_dir}/cambium/sessions/<node_id>/` as append-only files; D8g makes that store SQLite WAL (same writer-thread discipline as `§6.2`) so the orchestrator can run **bounded queries** for context-window composition (D2 I2.4: node context = own session log (bounded) + parent summary + subtree envelopes) — e.g., "last N turns", "cost by node", "turns since last checkpoint" — without reading raw files.
-2. **Layout proposal:** a `conversations.db` (SQLite WAL) under `sessions/` owning per-node `node_sessions` tables, OR new tables in the existing `events.db`. Proposal: separate `conversations.db` (the event log is append-only history; conversations are mutable-queryable state) — open question Q8g.1.
-3. **JSONL is retained exactly where the design already uses it:** the IPC transport is JSON-Lines (`§5.1`), and the optional event mirror is JSON-Lines (`§6.1`). The critique's "JSONL only for low-level IPC" is already true; the conversation store is not IPC.
-4. **Growth bounds mirror the event log:** per-node snapshot/compaction (like `§6.1` snapshots), bounded retention; a node's store is pruned with its session dir (`§16.2`).
-
-#### WHY
-
-- The event log answers "what happened system-wide"; the conversation store answers "what did *this node* see and decide" — the queryable substrate the RLM tree (D2) and the D8b envelope rule need for context composition without forwarding scratchpads.
-- SQLite WAL is already the validated durability engine in this project (`sqlite-wal-durability.md` Q1 read-while-write: "reader never blocks, never sees uncommitted, sees commits immediately"); extending it to conversations reuses proven machinery instead of inventing a second store.
-
-#### Open questions
-
-- **Q8g.1** Separate `conversations.db` (proposed) vs tables in `events.db`? Trade: one writer thread per DB vs cross-table consistency; events.db is append-only, conversations are read-query-heavy. (Owner: `Custos` + `Nuntius` schema owners.)
-- **Q8g.2** Query API: a `ConversationStore` port (adheres to D8d ports) with `last_turns(node_id, n)`, `context_for(node_id)` returning the bounded D2 I2.4 context? (Owner: `Custos` author.)
-- **Q8g.3** What exactly is in the conversation vs the event log — full message payloads (steering, tool events, checkpoints, results) in `conversations.db`, with `events.db` keeping the same facts for audit? Risk of double-write. Proposed: conversation = the node's protocol transcript (init/steer/tool/checkpoint/result), event log = the cross-cutting durable record with `parent_task_id` (D2). (Owner: event-schema owner.)
-
----
-
-## 3. Repo-layout proposal (final tree after wave-2 merges)
-
-**Verified baseline:** union of all 17 branch trees (`wt-*` + `main`) = **65 tracked files** (counted via `git ls-tree` across all refs). This commit adds `docs/research/feedback-2-deltas.md` → **66**. `docs/research/repo-structure-plan.md` (wt-hygiene) is the canonical audit; this section reconciles it with the two delta docs and this file. **No structural moves are required** — every file already lands in a rule-compliant location; the "reorg" is verification + transient removal + README polish (repo-structure-plan §5).
-
-```
-cambium/
-├── .gitignore
-├── README.md                        # pointers: architecture.md canonical; system-design.md superseded
-├── agents.md                        # (wt-arch) agent orientation
-├── implementation-plan.md           # TRANSIENT — removed at reorg end (repo-structure-plan §5 step 2)
-├── pyproject.toml
-├── uv.lock                          # intentional, tracked
-├── docs/
-│   ├── architecture.md              # canonical v2 (wt-arch @ 17ef25f); amended by design-deltas D1–D7 + this doc D8a–D8g
-│   ├── system-design.md             # v0.1 draft, superseded, kept as origin record
-│   ├── module-template/             # normative (wt-arch)
-│   │   ├── architecture.md          # amended by D8a (CLI), D8d (ports/DI)
-│   │   ├── dataset-format.md
-│   │   └── example-spec.md          # amended by D8a (CLI wrapper)
-│   ├── research/                    # 31 evidence + design-record docs — no pruning (rule b)
-│   │   ├── bench-harness-design.md
-│   │   ├── cascade-design.md        # circuit breaker + tiers (D8f reference)
-│   │   ├── cloud-code.md
-│   │   ├── codex.md
-│   │   ├── custos-asyncio-design.md
-│   │   ├── design-deltas.md         # D1–D7 (wt-deltas2)
-│   │   ├── dspy-python-314.md
-│   │   ├── event-schema-draft.md
-│   │   ├── example-datasets-v1.md   # golden dataset 200/50/10
-│   │   ├── feedback-2-deltas.md     # this document (wt-fb2)
-│   │   ├── ipc-protocol-draft.md
-│   │   ├── logging-design.md
-│   │   ├── metric-design.md
-│   │   ├── omp.md
-│   │   ├── onboarding-checklist-draft.md
-│   │   ├── opencode.md
-│   │   ├── pi.md
-│   │   ├── prime-agent.md
-│   │   ├── provider-landscape.md
-│   │   ├── pydev.md
-│   │   ├── python-3.14.md
-│   │   ├── replay-restart-design.md
-│   │   ├── repo-structure-plan.md   # hygiene audit + reorg checklist (wt-hygiene)
-│   │   ├── sandbox-options.md       # evidence record for decision 10 / D7
-│   │   ├── sqlite-wal-durability.md # empirical validation (D8g basis)
-│   │   ├── test-strategy.md
-│   │   ├── threat-model.md
-│   │   ├── tui-best-practices.md
-│   │   ├── vertical-slice-report.md # worker→worktree→gate→merge proof
-│   │   ├── worker-coldstart.md
-│   │   └── worktree-concurrency.md
-│   └── reviews/                     # 3 adversarial reviews, kept
-│       ├── review-distributed-systems.md
-│       ├── review-implementation.md
-│       └── review-llm-design.md
-├── scripts/                         # repo tooling
-│   ├── check_dataset_v1.py
-│   ├── fake_worker.py               # (wt-slice) JSON-Lines worker proof
-│   └── generate_should_decompose_v1.py
-├── src/cambium/
-│   ├── __init__.py
-│   ├── events.py
-│   ├── orchestrator.py
-│   ├── supervisor.py                # (wt-slice) minimal asyncio supervisor
-│   └── modules/
-│       ├── __init__.py
-│       ├── base.py                  # Module ABC + Output/Metric Protocols (D8a, D8d)
-│       └── example/
-│           ├── __init__.py
-│           ├── architecture.md      # per-module instance doc — "shorter reference" (example-spec §12)
-│           ├── dataset.py
-│           ├── datasets/
-│           │   ├── canaries.jsonl   # 10 (dataset v1)
-│           │   ├── eval.jsonl       # 50
-│           │   ├── example_pairs.jsonl
-│           │   ├── meta.json
-│           │   └── train.jsonl      # 200
-│           ├── decide.py
-│           └── metric.py
-└── tests/
-    └── scenarios/
-        ├── test_example_module.py
-        └── test_vertical_slice.py
-```
-
-**Doc taxonomy (normative, from repo-structure-plan §2 + D8 deltas):**
-
-| Category | Location | Role | Post-merge count | Action |
-|---|---|---|---|---|
-| Research (evidence) | `docs/research/` | Competitive analysis + design drafts + decision records (`*-design.md`, `*-draft.md`, `*-deltas.md`, competitor names) | 31 | No pruning — historical evidence |
-| Reviews | `docs/reviews/` | Adversarial reviews (flaw→fix evidence) | 3 | No |
-| Canonical architecture | `docs/architecture.md` | v2 authoritative spec (+ delta docs amend it) | 1 | No |
-| Templates | `docs/module-template/` | Normative template + reference spec | 3 | No (D8a/D8d amend) |
-| Design draft | `docs/system-design.md` | v0.1 origin record, superseded | 1 | No (mark superseded in README) |
-| Per-module docs | `src/cambium/modules/<name>/architecture.md` | Filled instance of the template, co-located with code | grows with modules | No (the "overlap" is intended: template = normative, instance = concrete) |
-| Agent orientation | `agents.md` (root) | Onboarding | 1 | No |
-| Transient | `implementation-plan.md` (root) | Orchestrator tracker | 1 | **Remove at reorg end** |
-
-**The critique's claim-1 residue is therefore resolved as:** (a) the "duplicates" it saw were in gitignored `.venv/`/`__pycache__/` — nothing tracked, nothing to delete; (b) the docs proliferation is real and *by design* (evidence-docs policy), now bounded by the taxonomy above; (c) the template-vs-instance doc overlap is intentional and now explicitly labelled. Execution is repo-structure-plan §5's reorg checklist (post-merge), unchanged except the two added delta docs.
-
----
-
-## 4. UNVERIFIED flags
-
-1. **Branch-state divergence.** `wt-fb2` is based at `96da568`; `main` has advanced to `3621fd9` (merged providers/ipc and other research). Files cited from `main`/other branches were read read-only from their branches — the final merged `main` was **not** the worktree base for this document. The citations are by stable path and should resolve post-merge; re-verify after the merge lands.
-2. **D8a CLI is a spec, not code.** The `python -m cambium.modules.<name>` wrapper does not exist yet anywhere; the scaffold test run (`uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests/test_example_module.py -q` → **6 passed**, worktree `/tmp/opencode/cambium-fb2`, exit 0) exercises `decide()`/`metric()` only, not a CLI.
-3. **D8f rate-limit defaults.** Token-bucket `rpm` values are UNVERIFIED — no provider rate-limit data was measured in this worktree (`cascade-design.md` §2.3's breaker defaults are likewise un-calibrated). `docs/research/provider-landscape.md` may inform the defaults at implementation time.
-4. **D8e container claims.** No Docker/Firecracker container was run in this worktree; the claim that "the worker runs unchanged in a container" rests on the stdio IPC contract (`§5.1`) and the `wt-slice` stdio proof, not on a container execution.
-5. **D8g conversation-store layout.** Whether `conversations.db` is separate from `events.db` is an open question (Q8g.1); the SQLite WAL durability claims are validated by `docs/research/sqlite-wal-durability.md` (a branch-local document at the wt-fb2 baseline, read read-only).
-6. **`should_decompose` "regex = toy".** The critique's characterization is accepted as the design's deliberate v2 state (rule engine, DSPy seam at v2.1) — it is **not** a defect claim that needs fixing, so no verification was run beyond the scaffold tests above.
-7. **Claim-1 counts.** The "30 tracked files / 66 post-merge" numbers are computed from `git ls-tree` unions in this worktree at commit time; re-run repo-structure-plan §5 step 1's `git ls-files | wc -l` on the real merged `main` and trust that number.
-
----
-
-## 5. Changelog
+The event log remains SQLite WAL and IPC/optional mirrors remain JSONL. New per-node
+conversation history is queryable WAL state for bounded context composition (`last N turns`,
+cost, turns since checkpoint), with bounded retention/compaction. Proposed layout is
+`sessions/conversations.db` with `node_sessions` tables; using tables in `events.db` is the
+alternative. D8g changes D2's append-only files, not architecture §16.2's pre-existing layout.
+
+**Open questions:** Q8g.1 separate DB versus `events.db`; Q8g.2 `ConversationStore` API
+(`last_turns`, `context_for`); Q8g.3 transcript versus cross-cutting event duplication.
+
+## 2. Unverified flags and disposition
+
+Branch-state divergence, D8a CLI implementation, D8f rate defaults, D8e container execution,
+D8g DB layout, and the “regex = toy” characterization were not re-run in this snapshot. Claim-1
+file counts were `git ls-tree` calculations (30 baseline; 66 after this document) and must be
+recomputed on current main. The design deltas are historical evidence; no repo-layout tree is
+repeated here.
 
 | Version | Date | Change |
 |---|---|---|
-| 1.0.0 | 2026-08-09 | Initial: point-by-point assessment of the second external critique (14 claims); deltas D8a–D8g; repo-layout proposal (66-file post-merge tree); UNVERIFIED flags. |
+| 1.0.0 | 2026-08-09 | Claims 1–14; D8a–D8g; original layout proposal. |
+
+## 3. Rationale retained from the critique assessment
+
+### Claims 1–6: what was already in the design
+
+The “directory mess” claim was checked against tracked files, not a live virtual environment:
+the only `cambium` directory was `src/cambium/`, duplicate basenames were intentional Python
+package markers, and no `.venv`, `.pytest_cache`, or `__pycache__` file was tracked. The real
+residue was documentation volume and the deliberate template/instance pair. `repo-structure-
+plan.md` classified research evidence, reviews, canonical architecture, templates, per-module
+docs, and transient plans; no file move was required. This rejects the critique without deleting
+historical evidence.
+
+The independent-optimization claim was already handled by architecture §17.2: each module uses
+frozen sibling references, not live co-adapted modules. The dataset v1 deviation is 10 canaries
+against the template's 15 target, and remains recorded rather than silently re-anchored. The
+regex criticism is accepted as a deliberate v2 rule-engine trade: DSPy/SIMBA remains a v2.1 seam,
+not a claim that the rule engine is production-quality LLM reasoning.
+
+DS-C1 (blocking `open`/`write` on the event loop) was fixed in the architecture before this
+assessment. SQLite WAL experiments cover read-while-write, crash loss, fsync target, and a ≤1 s
+non-critical window; Custos design states that the event loop never calls `open`, `write`,
+`fsync`, sqlite, or blocking git. Actor/OTP, separation of concerns, and Kahn language are kept
+only where structurally true (`DS-N4` tool boundary and `DS-N6` Kahn pass-through distinction).
+The “let it crash”/event-sourcing/saga claim is likewise already represented by §5.3/§7.1
+liveness, §6 WAL replay, §7.3 generation fencing, §7.5 worktree recovery, and §7.8 atomic
+publish/reconcile. These rows create no new delta.
+
+### D8a: executable module boundary
+
+The CLI contract is intentionally one object in/one object out, not an undocumented JSONL
+stream. `<name>` is the package directory (`example`), while the logical decision is
+`should_decompose`; the two names must not be conflated. Unknown/invalid fields are rejected by
+the same validation pattern as `ExampleDatasetLoader._validate`, and errors use a JSON `error`
+object with nonzero exit. A thin `__main__.py` keeps `decide()` pure and leaves a future DSPy
+replacement compatible. The eval entry point remains separate (`python -m ...eval`) so scoring
+does not become the production module surface. Q8a.1–Q8a.4 cover batching, async execution,
+error versioning, and wrapper placement.
+
+### D8b: strict information hiding
+
+D2's parent context rule was insufficiently explicit: it forbade sibling raw-session reads but
+did not say that a parent must not receive child chain-of-thought. D8b makes the upward envelope
+an allow-list: `unified_diff`, bounded summary, `metric_breakdown`, commits, files changed, and
+terminal status. `diff` is capped at 64 KiB by the merged IPC draft; overflow sets
+`diff_truncated`. Unknown top-level fields such as `scratchpad` and `reasoning` are rejected by
+schema validation. Ascensus may inspect a node store offline, but Custos never forwards the
+transcript. The rule protects context budget and prevents repository text from steering an
+ancestor as if it were trusted reasoning (threat-model R1). Q8b.1–Q8b.3 keep truncation,
+summary authorship, and audit visibility open.
+
+### D8c: prompt layout is performance-only
+
+With D1's local cache gone, provider exact-prefix caching is the only caching concern. Static
+system/AGENTS/tool/module instructions and stable few-shots go first; task spec, repository
+context, observations, and tool output go last. A timestamp, request ID, monotonic value, or
+nonce at the head invalidates a prefix but cannot change correctness. The proposed lint is a
+pure helper over `(static, dynamic)` segments, so it can run without a provider. DeepSeek's
+prefix unit alignment is **UNVERIFIED** and requires the telemetry in D1 Q1.2. Q8c.1–Q8c.3
+retain helper, alignment, and ReAct-turn questions.
+
+### D8d: ports are a future-provider boundary
+
+The scaffold already has `Output`/`Metric` Protocols and `CambiumLM` constructor injection, but
+the module template did not name an `LLMProvider`, `EventSink`, or `DatasetStore` boundary. D8d
+records those ports so a future DSPy module cannot import a concrete provider accidentally. The
+pure v2 rule engine needs no fake provider and no network; a DSPy implementation will. A
+composition root (proposed `container.py` or orchestrator) builds adapters from `Config` and
+injects them. The deterministic layer still never imports an LLM type. Q8d.1–Q8d.3 cover root,
+port granularity/clock, and `CambiumLM` adapter shape.
+
+### D8e: deployment vehicle is outside Cambium
+
+D7 already removed Septum. D8e names what an operator may use instead: wrap the same
+`python -m cambium.opifex` stdio process in Docker or Firecracker and connect its pipes. The
+protocol bytes and harness semantics do not change, and Cambium neither builds nor assumes the
+vehicle. The AppArmor evidence in `sandbox-options.md` remains the reason the in-harness option
+was dropped. Q8e.1–Q8e.3 leave image layout, env composition, and vehicle choice to operations;
+no container execution was performed.
+
+### D8f: rate and outage behavior
+
+Cooldown bounds failure repetition but does not bound a healthy provider's throughput. The token
+bucket therefore refills at provider/tier `rpm`; an empty bucket yields `RATE_LIMITED` and uses
+the same selection filter as cooldown. When every provider is unavailable, dispatch pauses and a
+recovery monitor wakes it; workers do not restart-loop while waiting. Existing tier fallback and
+sliding-window breaker in `cascade-design.md` are retained, not duplicated. Q8f.1 leaves defaults
+UNVERIFIED; Q8f.2 chooses the monitor owner; Q8f.3 specifies gate behavior during pause.
+
+### D8g: event log versus conversation projection
+
+The event log answers “what happened system-wide”; a node conversation store answers “what did
+this node see and decide?” D8g therefore uses SQLite WAL for bounded queries (`last_turns`, cost,
+turns since checkpoint) and keeps JSONL only for IPC/optional mirror. Per-node append-only files
+from D2 become a WAL-backed projection with bounded retention/compaction. The proposal is a
+single `conversations.db` under `sessions/`, but Q8g.1 leaves separate DB versus events tables
+open; D8g's attribution note prevents readers from mistaking the new `sessions/<node_id>` tree
+for architecture §16.2's older layout. Q8g.2 defines the future `ConversationStore` port;
+Q8g.3 separates protocol transcript from cross-cutting audit facts and calls out double-write
+risk.
+
+## 4. Historical source anchors
+
+The original hygiene and review references `IMPL-M2`, `IMPL-M5`, `LLM-C4`, and `LLM-M3` remain
+part of the decision corpus. Claim-1 counts (30 tracked files at `96da568`, 66 after the
+document) were `git ls-tree` calculations over branch unions; they are not current-main counts.
+The full source-map/tree block was removed because architecture and `v2-1-status` now own those
+pointers.
+
+## 5. Later hierarchy feedback — skeptical classification
+
+The later “explicit agent tree” feedback is consistent with D2/D8b only at the structural
+boundary. It does not change the historical D8 dispositions:
+
+- **Accept as target:** the harness owns an explicit TaskTree/DAG; admission follows static
+  validation; each child gets fresh declared context; upward messages are strict diff/summary/
+  metrics/status envelopes; raw scratchpads and reasoning stay in the child store.
+- **Static-before-dynamic admission:** accept as an M5 invariant. Validate IDs, dependencies,
+  cycles, depth, width, and envelope shape before any worker is admitted. A worker may return an
+  outcome, but may not add a sibling or alter the topology implicitly.
+- **Implicit recursion is “dead”:** not a verified fact. The design rejects implicit topology,
+  but no source comparison or runtime measurement proves a universal claim about recursion.
+- **90% cache discount, “Prime 2026 proves it,” and “five cheap branches”** are **UNVERIFIED as
+  broad claims**: the primary audit supports Prime explicit `AgentSession`/runtime contexts and
+  bounded depth, with descendants sharing one root worker, but no process-per-child isolation or
+  90% total-request/latency metric. Provider caches are org/workspace scoped; exact prefixes can
+  be shared by tasks. D1/D8c keep static-prefix guidance and require measured token/latency/cost.
+- **AlphaCodium/LATS require MCTS/tests at every node:** the primary descriptions are a staged
+  run/fix flow (AlphaCodium) and candidate-solution MCTS with test/environment feedback (LATS),
+  not universal task orchestration. M5 requires per-node deterministic gates; MCTS needs a
+  falsifiable comparison against the explicit DAG baseline.
+
+This classification accepts information hiding and explicit hierarchy as a target while keeping
+consensus, cache economics, and algorithm universality out of the current-runtime record. Recursion
+evidence remains task-dependent; no implicit-recursion dead-end consensus is adopted.
+
+## 6. Implementation boundary notes
+
+The D8 set is deliberately additive except where it closes an ambiguity. D8a adds a transport
+wrapper without changing the `Module` ABC. D8b promotes an existing slice `diff` field and
+existing architecture summary limit into a schema allow-list. D8c adds a prompt-order lint but
+does not add a cache or provider dependency. D8d names ports around existing Protocols and
+constructor injection rather than introducing a framework. D8e documents a host deployment
+vehicle without adding Docker/Firecracker code. D8f layers a bucket and queue pause on existing
+cooldown/breaker filtering. D8g changes only D2's node-session storage engine; IPC JSONL and the
+cross-cutting event log remain unchanged.
+
+The test obligations are equally narrow. D8a must exercise a one-object pipe and error envelope;
+D8b must inject a scratchpad field and prove schema rejection plus a 64 KiB truncation flag;
+D8c must lint volatile tokens at the static-prefix head; D8d must run a fake `LLMProvider` without
+network; D8e can use a stdio fixture rather than a real container; D8f must pause a queue on
+synthetic total outage and wake it on recovery; D8g must delete/rebuild a conversation projection
+from protocol events. None of these checks existed in the snapshot, so “adopt” is a decision
+status, not an implementation status.
+
+## 7. Scope of adopted status
+
+The D8 table is a decision register, not a release checklist. “ADOPT” means the architecture or
+template should carry the rule; “CONFIRMED” means an existing contract was found; “STALE” means
+the critique targeted an earlier version; “UNVERIFIED” means source or metric evidence was not
+available. A branch module, a copied directory tree, or a source symbol with no caller cannot
+upgrade an adopted delta to delivered runtime.
+
+The later hierarchy feedback sharpens this distinction. The target is a static DAG validated
+before admission, with fresh child context and strict parent envelopes. Dynamic admission may
+select ready nodes from that DAG, but it may not create topology. This makes information hiding
+testable without claiming that a current worker tree, provider cache hit, or MCTS scheduler exists.
+
+## 8. Required falsification evidence
+
+Before a future document changes these dispositions, it must provide: a primary source for any
+external consensus claim; a fixed task set and provider/model; measured prompt tokens, latency,
+cost, and success; a schema/test proving scratchpad exclusion and DAG-before-admission; and a
+rollback or failure case. In particular, “90% cache discount,” “Prime 2026 proves it,” “cheap
+five branches,” and “MCTS at every AlphaCodium/LATS node” remain outside the normative corpus
+until those conditions are met.
+
+The later primary-source correction also changes how D8e's Prime precedent is described. Prime's
+explicit child `AgentSession`/runtime objects support independent context and bounded-depth
+hierarchy, while descendants share one root-session worker; that is not process-per-child
+isolation. This distinction matters for D8e deployment and M7 pool: a host container boundary is
+optional, while a shared worker runtime has different contamination/reset requirements. Any
+future benchmark must report worker lifetime, context isolation, prefix hit rate, total cost,
+latency, and task success separately.
+
+The current-status pointer is intentionally repeated only at file header and here: implementation
+claims must be checked in source. In particular, a matching `Diffundo` name does not prove the
+provider loop, a `store.py` file does not prove runtime EventStore wiring, and a planned DLQ does
+not make malformed messages durable today.
+
+Prime's shared root-session worker is relevant to D8e: a host container is an optional deployment
+boundary, while context isolation must still be enforced inside the worker runtime. Exact-prefix
+matching is compatible with shared org/workspace caches; it prevents wrong-prefix reuse but does
+not promise per-conversation privacy or a fixed discount. Measure context bytes and provider
+billing separately from hierarchy correctness.
+
+Static plan validation is also a safety and cost gate: reject cycles, unknown dependencies,
+depth/width overflow, and envelope violations before admission. Steering can revise a node's
+task content but cannot add a sibling or second root. A future scenario should inject a topology
+mutation after admission and prove it becomes bounded typed evidence with no extra worker or
+provider call.
+
+This order keeps the structural and performance questions independent: M5 can prove graph and
+context boundaries with a fake provider; M6 can measure exact-prefix hits and cached-token billing
+on a fixed task; M7 can test shared-worker reset. No Prime, AlphaCodium, LATS, cache, or branch-
+count slogan is needed to pass the structural test.
+
+This also keeps source terms precise: “AgentSession” denotes a runtime/context abstraction, not
+a process; “cached-token read price” denotes an input billing rate, not total latency; “MCTS”
+denotes LATS's candidate search, not a universal TaskTree scheduler; and “run/fix” denotes
+AlphaCodium's staged flow. The historical D8 IDs remain unchanged.
+
+No adopted delta therefore implies current provider admission, pool isolation, or cache telemetry;
+those remain milestone tests.
+
+The structural gate is the first falsifiable result.
+
+The record distinguishes accepted structure from unverified economics and keeps current-runtime
+claims out of this historical assessment.
