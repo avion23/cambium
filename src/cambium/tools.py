@@ -1,0 +1,486 @@
+"""Executable implementations for the worker tool catalogue.
+
+The LLM-facing schemas remain the source of truth for argument validation.
+Every operation runs inside an injected :class:`ToolContext`; this keeps
+approval, linting, and resource controls out of process-global state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .approval import ApprovalGate
+from .lint_diag import LintDiag
+from .schemas import TOOL_SCHEMAS, validate_tool_call
+
+try:
+    from . import resources as _resources
+except ImportError:  # pragma: no cover - supports reduced installations.
+    _resources = None
+
+
+MAX_READ_BYTES = 100 * 1024
+MAX_OUTPUT_BYTES = 64 * 1024
+GIT_TIMEOUT_S = 30
+READ_TRUNCATION_MARKER = "\n... [file truncated]"
+OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
+
+
+@dataclass(slots=True)
+class ToolContext:
+    """Dependencies needed by one tool invocation."""
+
+    cwd: Path | str
+    approval: ApprovalGate | None = None
+    lint: LintDiag | None = None
+    compile_gate: Any | None = None
+
+    def __post_init__(self) -> None:
+        self.cwd = Path(self.cwd).resolve()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    """The bounded, LLM-facing result of one tool invocation."""
+
+    ok: bool
+    output: str = ""
+    error: str | None = None
+    duration_ms: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    ok: bool
+    output: str = ""
+    error: str | None = None
+
+
+class _ToolFailure(Exception):
+    """An expected tool-level failure that belongs in ``ToolResult.error``."""
+
+
+ToolImplementation = Callable[[dict[str, Any], ToolContext], Awaitable[_Outcome]]
+
+
+def _duration_ms(started_ns: int) -> int:
+    return max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
+
+
+def _truncate_bytes(raw: bytes, limit: int, marker: str) -> str:
+    marker_bytes = marker.encode("utf-8")
+    if len(raw) <= limit:
+        return raw.decode("utf-8")
+    prefix_limit = max(0, limit - len(marker_bytes))
+    prefix = raw[:prefix_limit].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
+def _truncate_text(text: str, limit: int, marker: str) -> str:
+    return _truncate_bytes(text.encode("utf-8"), limit, marker)
+
+
+def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
+    root = Path(ctx.cwd).resolve()
+    candidate = (root / raw_path).resolve()
+    if not candidate.is_relative_to(root):
+        raise _ToolFailure(f"path escapes worktree: {raw_path!r}")
+    return candidate
+
+
+def _display_path(ctx: ToolContext, path: Path) -> str:
+    relative = path.relative_to(Path(ctx.cwd).resolve())
+    return relative.as_posix() or "."
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise _ToolFailure(f"file not found: {path}") from exc
+    except IsADirectoryError as exc:
+        raise _ToolFailure(f"path is a directory: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise _ToolFailure(f"file is not valid UTF-8: {path}") from exc
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    path = _confined_path(ctx, args["path"])
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_READ_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise _ToolFailure(f"file not found: {_display_path(ctx, path)}") from exc
+    except IsADirectoryError as exc:
+        raise _ToolFailure(f"path is a directory: {_display_path(ctx, path)}") from exc
+    except OSError as exc:
+        raise _ToolFailure(f"could not read {_display_path(ctx, path)}: {exc}") from exc
+
+    if len(raw) > MAX_READ_BYTES:
+        output = _truncate_bytes(raw, MAX_READ_BYTES, READ_TRUNCATION_MARKER)
+    else:
+        try:
+            output = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _ToolFailure(f"file is not valid UTF-8: {_display_path(ctx, path)}") from exc
+    return _Outcome(ok=True, output=output)
+
+
+def _lint_feedback(ctx: ToolContext, path: Path) -> str:
+    if ctx.lint is None:
+        return ""
+    diagnostics = ctx.lint.lint_file(path)
+    feedback = ctx.lint.format_diags(diagnostics)
+    return feedback if isinstance(feedback, str) else str(feedback)
+
+
+async def _write_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    path = _confined_path(ctx, args["path"])
+    try:
+        _atomic_write(path, args["content"])
+    except OSError as exc:
+        raise _ToolFailure(f"could not write {_display_path(ctx, path)}: {exc}") from exc
+
+    output = f"wrote {_display_path(ctx, path)}"
+    feedback = _lint_feedback(ctx, path)
+    if feedback:
+        output += f"\nLint diagnostics:\n{feedback}"
+    return _Outcome(ok=True, output=output)
+
+
+def _edit_context(content: str, old_string: str) -> str:
+    if old_string:
+        position = content.find(old_string)
+        if position >= 0:
+            start = max(0, position - 80)
+            end = min(len(content), position + len(old_string) + 80)
+            return repr(content[start:end])
+    return repr(content[:160]) if content else "<empty file>"
+
+
+async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    path = _confined_path(ctx, args["path"])
+    content = _read_text(path)
+    old_string = args["old_string"]
+    occurrences = content.count(old_string)
+    if occurrences != 1:
+        context = _edit_context(content, old_string)
+        raise _ToolFailure(
+            "edit_file requires exactly one occurrence of old_string; "
+            f"found {occurrences}. Context: {context}"
+        )
+
+    replacement = content.replace(old_string, args["new_string"], 1)
+    try:
+        _atomic_write(path, replacement)
+    except OSError as exc:
+        raise _ToolFailure(f"could not edit {_display_path(ctx, path)}: {exc}") from exc
+    return _Outcome(ok=True, output=f"edited {_display_path(ctx, path)}")
+
+
+def _search_files(root: Path) -> list[Path]:
+    if root.is_file():
+        return [root]
+    if not root.is_dir():
+        raise _ToolFailure(f"search path is not a file or directory: {root}")
+
+    files: list[Path] = []
+    for directory, directories, names in os.walk(root, followlinks=False):
+        directories[:] = sorted(name for name in directories if name != ".git")
+        for name in sorted(names):
+            path = Path(directory) / name
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved.is_relative_to(Path(root).resolve()) and resolved.is_file():
+                files.append(resolved)
+    return files
+
+
+def _grep_fallback(pattern: str, root: Path, worktree: Path) -> str:
+    try:
+        expression = re.compile(pattern)
+    except re.error as exc:
+        raise _ToolFailure(f"invalid regular expression: {exc}") from exc
+
+    matches: list[str] = []
+    for path in _search_files(root):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "\x00" in text:
+            continue
+        display = path.relative_to(worktree).as_posix()
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if expression.search(line):
+                matches.append(f"{display}:{line_number}:{line}")
+    return "\n".join(matches)
+
+
+async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    raw_path = args.get("path")
+    root = _confined_path(ctx, raw_path if raw_path is not None else ".")
+    if not root.exists():
+        raise _ToolFailure(f"search path not found: {raw_path!r}")
+
+    rg = shutil.which("rg")
+    if rg is None:
+        output = await asyncio.to_thread(_grep_fallback, args["pattern"], root, Path(ctx.cwd))
+        return _Outcome(ok=True, output=output)
+
+    command = [rg, "-n", "--no-heading", args["pattern"]]
+    if raw_path is not None:
+        command.append(_display_path(ctx, root))
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            command,
+            cwd=ctx.cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        output = await asyncio.to_thread(_grep_fallback, args["pattern"], root, Path(ctx.cwd))
+        return _Outcome(ok=True, output=output)
+    except OSError as exc:
+        raise _ToolFailure(f"could not run ripgrep: {exc}") from exc
+
+    if result.returncode not in (0, 1):
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        raise _ToolFailure(f"ripgrep failed: {detail}")
+    return _Outcome(ok=True, output=result.stdout)
+
+
+def _process_output(stdout: Any, stderr: Any) -> str:
+    standard_output = (
+        stdout.decode("utf-8", errors="replace")
+        if isinstance(stdout, bytes)
+        else str(stdout or "")
+    )
+    standard_error = (
+        stderr.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes)
+        else str(stderr or "")
+    )
+    if standard_output and standard_error:
+        separator = "" if standard_output.endswith("\n") else "\n"
+        return standard_output + separator + standard_error
+    return standard_output or standard_error
+
+
+async def _run_process(
+    command: list[str], cwd: Path, timeout_s: int
+) -> subprocess.CompletedProcess[str]:
+    return await asyncio.to_thread(
+        subprocess.run,
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_s,
+    )
+
+
+def _git_schema_ops() -> frozenset[str]:
+    schema = next(schema for schema in TOOL_SCHEMAS if schema["name"] == "git_op")
+    values = schema["parameters"]["properties"]["op"]["enum"]
+    return frozenset(value for value in values if isinstance(value, str))
+
+
+GIT_OPS = _git_schema_ops()
+UNSAFE_GIT_OPS = frozenset({"checkout", "reset"})
+
+
+async def _git_op(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    op = args["op"]
+    if op not in GIT_OPS and op not in UNSAFE_GIT_OPS:
+        raise _ToolFailure(f"git operation is not allowlisted: {op!r}")
+    try:
+        argument_tokens = shlex.split(args["args"])
+    except ValueError as exc:
+        raise _ToolFailure(f"invalid git arguments: {exc}") from exc
+
+    command = ["git", op, *argument_tokens]
+    if op in UNSAFE_GIT_OPS:
+        if ctx.approval is None:
+            raise _ToolFailure(
+                f"DENIED: git {op} requires approval and no approval gate is configured"
+            )
+        if not await ctx.approval.is_approved(command, cwd=Path(ctx.cwd)):
+            raise _ToolFailure(f"DENIED: approval refused git {op}")
+
+    try:
+        result = await _run_process(command, Path(ctx.cwd), GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        output = _truncate_text(
+            _process_output(exc.stdout, exc.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
+        )
+        return _Outcome(False, output, f"git {op} timed out after {GIT_TIMEOUT_S}s")
+    except OSError as exc:
+        raise _ToolFailure(f"could not run git {op}: {exc}") from exc
+
+    output = _truncate_text(
+        _process_output(result.stdout, result.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
+    )
+    if result.returncode != 0:
+        return _Outcome(False, output, f"git {op} exited with status {result.returncode}")
+    return _Outcome(True, output)
+
+
+async def _acquire_compile_gate(ctx: ToolContext, command: list[str]) -> tuple[Any, Any] | None:
+    gate = ctx.compile_gate
+    if gate is None or _resources is None:
+        return None
+    is_heavy = getattr(gate, "is_heavy", None)
+    acquire = getattr(gate, "acquire", None)
+    release = getattr(gate, "release", None)
+    if not callable(is_heavy) or not callable(acquire) or not callable(release):
+        raise _ToolFailure("invalid compile gate dependency")
+    if not is_heavy(command):
+        return None
+    token = await acquire(command)
+    if token is False:
+        raise _ToolFailure("DENIED: heavy command could not acquire a compile gate token")
+    return gate, token
+
+
+async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    command = args["cmd"]
+    if not command:
+        raise _ToolFailure("run_shell command must contain at least one token")
+    timeout_s = args.get("timeout_s", 120)
+    if timeout_s <= 0:
+        raise _ToolFailure("run_shell timeout_s must be greater than zero")
+
+    if ctx.approval is not None and not await ctx.approval.is_approved(
+        command, cwd=Path(ctx.cwd)
+    ):
+        raise _ToolFailure("DENIED: run_shell command is not approved")
+
+    held = await _acquire_compile_gate(ctx, command)
+    try:
+        try:
+            result = await _run_process(command, Path(ctx.cwd), timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            output = _truncate_text(
+                _process_output(exc.stdout, exc.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
+            )
+            return _Outcome(False, output, f"run_shell timed out after {timeout_s}s")
+        except FileNotFoundError as exc:
+            raise _ToolFailure(f"command not found: {command[0]!r}") from exc
+        except OSError as exc:
+            raise _ToolFailure(f"could not run command {command[0]!r}: {exc}") from exc
+
+        output = _truncate_text(
+            _process_output(result.stdout, result.stderr),
+            MAX_OUTPUT_BYTES,
+            OUTPUT_TRUNCATION_MARKER,
+        )
+        if result.returncode != 0:
+            return _Outcome(False, output, f"run_shell exited with status {result.returncode}")
+        return _Outcome(True, output)
+    finally:
+        if held is not None:
+            gate, token = held
+            gate.release(token)
+
+
+TOOL_DISPATCH: dict[str, ToolImplementation] = {
+    "read_file": _read_file,
+    "write_file": _write_file,
+    "edit_file": _edit_file,
+    "grep_code": _grep_code,
+    "git_op": _git_op,
+    "run_shell": _run_shell,
+}
+
+
+async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Validate and execute one named worker tool."""
+    started_ns = time.monotonic_ns()
+    schema_by_name = {schema["name"]: schema for schema in TOOL_SCHEMAS}
+    schema = schema_by_name.get(name) if isinstance(name, str) else None
+    if schema is None:
+        return ToolResult(
+            ok=False,
+            error=f"unknown tool: {name!r}",
+            duration_ms=_duration_ms(started_ns),
+        )
+
+    validation_errors = validate_tool_call(schema, args)
+    if validation_errors:
+        return ToolResult(
+            ok=False,
+            error="\n".join(validation_errors),
+            duration_ms=_duration_ms(started_ns),
+        )
+
+    implementation = TOOL_DISPATCH[name]
+    try:
+        outcome = await implementation(args, ctx)
+    except _ToolFailure as exc:
+        return ToolResult(
+            ok=False,
+            error=str(exc),
+            duration_ms=_duration_ms(started_ns),
+        )
+    except Exception as exc:
+        return ToolResult(
+            ok=False,
+            error=f"{name} failed: {exc}",
+            duration_ms=_duration_ms(started_ns),
+        )
+    return ToolResult(
+        ok=outcome.ok,
+        output=outcome.output,
+        error=outcome.error,
+        duration_ms=_duration_ms(started_ns),
+    )
+
+
+__all__ = [
+    "MAX_OUTPUT_BYTES",
+    "MAX_READ_BYTES",
+    "TOOL_DISPATCH",
+    "TOOL_SCHEMAS",
+    "ToolContext",
+    "ToolResult",
+    "run_tool",
+]

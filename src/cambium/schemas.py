@@ -155,9 +155,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "parameters": _parameters(
             {
                 "pattern": {"type": "string", "description": "Pattern to search for."},
-                "path": {"type": "string", "description": "File or directory to search."},
+                "path": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "File or directory to search; null searches the worktree.",
+                },
             },
-            ["pattern", "path"],
+            ["pattern"],
         ),
     },
     {
@@ -177,11 +180,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "run_shell",
-        "description": "Run a shell command when shell permission is enabled.",
+        "description": "Run an argv command when shell permission is enabled.",
         "parameters": _parameters(
             {
-                "cmd": {"type": "string", "description": "Command to execute."},
-                "timeout": {
+                "cmd": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command argv to execute without a shell.",
+                },
+                "timeout_s": {
                     "type": "integer",
                     "default": 120,
                     "description": "Timeout in seconds.",
