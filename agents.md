@@ -39,12 +39,21 @@ If a directory or file referenced here does not exist yet, it is planned (see `d
 Trace from entry points, not from filenames. Concrete starting points:
 
 - **Public API surface:** `src/cambium/__init__.py` — `Cambium`, `Session`, `Result`, `Instance`, `Event`, `Config`.
-- **IPC protocol:** `src/cambium/nuntius/` — message types and framing. Schema is normative in `docs/architecture/architecture.md` §5.2.
-- **Supervisor:** `src/cambium/custos/` — lifecycle, restart, watchdog. Semantics normative in `docs/architecture/architecture.md` §7.
-- **Worker entry:** `src/cambium/opifex/__main__.py` — read-init → ready → loop → result/exit.
-- **Decision modules:** `src/cambium/modules/<name>/` — each module is self-contained (rule engine primary + DSPy seam in `decide.py`).
+- **IPC protocol:** `src/cambium/ipc.py` — message framing. Schema is normative in `docs/architecture/architecture.md` §5.
+- **Supervisor:** `src/cambium/supervisor.py` — lifecycle, restart, and watchdog behavior. Semantics are normative in `docs/architecture/architecture.md` §7.
+- **Worker entry:** `src/cambium/worker.py` — read-init → ready → loop → result/exit.
+- **Decision modules:** `src/cambium/modules/example/` — the current decision module and its rule-engine seam.
 
-`nuntius`, `custos`, and `opifex` are **planned** directories — they do not exist in `src/cambium/` yet (only `supervisor.py`, `orchestrator.py`, `events.py`, and `modules/` are present). Read the architecture sections above for their intended shape; see the §2 note for what a missing path means.
+The implementation is currently flat under `src/cambium/`. The module inventory is:
+
+- `src/cambium/store.py`, `src/cambium/merge.py`, `src/cambium/ipc.py`, `src/cambium/worker.py`, `src/cambium/supervisor.py`, `src/cambium/orchestrator.py`, `src/cambium/tasktree.py`.
+- `src/cambium/bench.py`, `src/cambium/doctor.py`, `src/cambium/cli.py`, `src/cambium/conversations.py`, `src/cambium/dlq.py`, `src/cambium/resources.py`, `src/cambium/approval.py`, `src/cambium/fencing.py`.
+- `src/cambium/system_health.py`, `src/cambium/lint_diag.py`, `src/cambium/ast_tools.py`, `src/cambium/schemas.py`, `src/cambium/eval_cache.py`, `src/cambium/provider_config.py`.
+- `src/cambium/events.py` *(to be deleted per M1)*.
+- `diffundo` *(in review; not merged on this branch)*.
+- Decision module: `src/cambium/modules/example/`.
+
+Redaction is not in this branch's inventory.
 
 When a `grep`/`rg` search fails to find what you expect, follow the execution path: read the import graph, the route registration, the message dispatcher. Don't conclude "doesn't exist" from a single miss.
 
@@ -201,9 +210,12 @@ Do not say "done" when you mean UNVERIFIED. Do not say "tests pass" without citi
 | Understand an adopted design decision (delta over architecture v2) | `docs/research/design-deltas.md` (D1–D7) |
 | Add or change a decision module | `docs/architecture/module-template/architecture.md`, then `docs/architecture/module-template/example-spec.md` |
 | Add or change a dataset | `docs/architecture/module-template/dataset-format.md` |
-| Add a new protocol message | `docs/architecture/architecture.md` §5.2, then `src/cambium/nuntius/` |
-| Debug a worker crash / restart loop | `docs/architecture/architecture.md` §7 (Lifecycle), esp. §7.4–7.6 |
-| Debug a merge failure | `docs/architecture/architecture.md` §4 (Unio), §7.8 |
+| Add a new protocol message | `docs/architecture/architecture.md` §5 + `src/cambium/ipc.py` |
+| Debug a worker crash / restart loop | `src/cambium/supervisor.py` + `src/cambium/worker.py` + `docs/architecture/architecture.md` §7.4–7.6 |
+| Debug a merge failure | `src/cambium/merge.py` + `docs/architecture/architecture.md` §7.8 |
+| Add a tool or change tool validation | `src/cambium/schemas.py` |
+| Run diagnostics | `python -m cambium.doctor` (`src/cambium/doctor.py`) |
+| Understand CLI dispatch | `src/cambium/cli.py` |
 | Understand an old design choice | `docs/architecture/system-design.md` (v0.1) + the three `docs/architecture/reviews/` |
 
 ---

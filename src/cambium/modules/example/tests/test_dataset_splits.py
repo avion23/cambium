@@ -48,7 +48,7 @@ def test_load_all_bundle() -> None:
     assert len(bundle.train) == EXPECTED_COUNTS[Split.TRAIN]
     assert len(bundle.eval) == EXPECTED_COUNTS[Split.EVAL]
     assert len(bundle.canaries) == EXPECTED_COUNTS[Split.CANARIES]
-    assert bundle.dataset_version == "1.0.0"
+    assert bundle.dataset_version == "1.1.0"
 
 
 def test_split_loader_accepts_split_file_path() -> None:
@@ -116,7 +116,7 @@ def test_legacy_load_still_returns_all_examples() -> None:
 
 def test_dataset_version_read_from_meta(tmp_path) -> None:
     loader = ExampleDatasetLoader(_fresh_copy(tmp_path))
-    assert loader.dataset_version == "1.0.0"
+    assert loader.dataset_version == "1.1.0"
 
 
 def test_dataset_version_defaults_when_meta_missing(tmp_path) -> None:

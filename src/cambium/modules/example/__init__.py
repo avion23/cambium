@@ -22,11 +22,18 @@ canaries included — they are scored like any other entry.
 """
 
 from .dataset import DatasetBundle, ExampleDatasetLoader, Split
-from .decide import DecomposeOutput, ShouldDecomposeModule, TaskInput, should_decompose
+from .decide import (
+    Decision,
+    DecomposeOutput,
+    ShouldDecomposeModule,
+    TaskInput,
+    should_decompose,
+)
 from .metric import evaluate_split, evaluate_split_async, should_decompose_metric
 
 __all__ = [
     "DatasetBundle",
+    "Decision",
     "DecomposeOutput",
     "ExampleDatasetLoader",
     "ShouldDecomposeModule",

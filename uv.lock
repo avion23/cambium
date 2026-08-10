@@ -15,9 +15,13 @@ ast = [
 dev = [
     { name = "pytest" },
     { name = "ruff" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-python" },
 ]
 test = [
     { name = "pytest" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-python" },
 ]
 
 [package.metadata]
@@ -26,9 +30,13 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "tree-sitter", marker = "extra == 'ast'", specifier = ">=0.26" },
+    { name = "tree-sitter", marker = "extra == 'dev'", specifier = ">=0.26" },
+    { name = "tree-sitter", marker = "extra == 'test'", specifier = ">=0.26" },
     { name = "tree-sitter-python", marker = "extra == 'ast'", specifier = ">=0.25" },
+    { name = "tree-sitter-python", marker = "extra == 'dev'", specifier = ">=0.25" },
+    { name = "tree-sitter-python", marker = "extra == 'test'", specifier = ">=0.25" },
 ]
-provides-extras = ["test", "ast", "dev"]
+provides-extras = ["ast", "test", "dev"]
 
 [[package]]
 name = "colorama"
