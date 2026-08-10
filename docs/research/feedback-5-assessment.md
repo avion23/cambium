@@ -176,3 +176,109 @@ upward diff.
 - Reviews cite the v0.1 record: `review-distributed-systems.md:5`,
   `review-implementation.md:5`, `review-llm-design.md:4` (`SYSTEM_DESIGN.md`
   v0.1.0-draft). Supports claim 4.
+
+---
+
+## 4. Addendum — current-`main` re-check (2026-08-10)
+
+This addendum re-checks the dispositions above against current `main` (HEAD
+`17dfcd3`, "merge: packaging fixes …"; verified 2026-08-10 in worktree
+`/home/ubuntu/wt-f5-addendum`). The historical assessment text (§§1–3) is
+preserved unchanged; this section only supersedes the specific claims listed.
+
+### 4.1 F5-10 (claim 10): PID pacing superseded/rejected by F6-04 GCRA
+
+The claim-10 PID-pacing half ("PID token pacing as a global scheduler … recorded as
+an open v2.1 enhancement") is **superseded/rejected** by the feedback-6 accepted-
+action register. Provenance (`implementation-plan.md` line 31): the F6 register was
+recovered from a stale status-refresh branch and **no feedback-6 source assessment
+document exists in the repository**, so the F6 rows are plan entries rechecked
+against current `main`, not "VERIFIED" claims.
+
+- `implementation-plan.md` F6-04 (line 41): "ADOPT: session-global GCRA-style
+  pacer, injected clock, `max_in_flight`, 60/rpm, per-retry permits; honor
+  Retry-After only when verified. **REJECTED: knapsack/PID. Supersedes F5-10.**"
+  Current state: `OPEN` — "Worker→Diffundo is now the gated seam; pacer not yet
+  implemented." So claim 10's PID proposal is rejected at the plan level and the
+  adopted replacement is a GCRA-style session-global pacer on the M6 seam
+  (`wt-worker-provider`).
+- The claim-10 §3 UNVERIFIED flag asserted the "PID pacing as a documented v2.1
+  enhancement" claim was orchestrator-provided; F6-04 now supplies the disposition
+  that supersedes it. The verified token-bucket half (D8f, `diffundo.py`) remains
+  as cited in claim 10.
+- `rg -rn "GCRA" docs/ src/` → `implementation-plan.md:41` only (no source hit;
+  pacer not yet implemented).
+
+### 4.2 F5-17 (claim 17): `get_signature` wired into `TOOL_SCHEMAS` + `TOOL_DISPATCH`
+
+The claim-17 remaining task ("expose `extract_signature` in `TOOL_SCHEMAS`", §2
+item 9) is **DONE**. Current `main` symbols:
+
+- `src/cambium/schemas.py` `TOOL_SCHEMAS` (list at line 120) carries a
+  `get_signature` entry (lines 166–184; `"name": "get_signature"` at line 167) with
+  required `path`/`symbol` parameters.
+- `src/cambium/tools.py` `TOOL_DISPATCH` (line 680) maps
+  `"get_signature": _get_signature` (line 685); `_get_signature` (line 505) runs via
+  `_read_and_extract_signature` (line 469) → `ast_tools.extract_signature` (line
+  502); `ast_tools.py` `extract_signature` at line 393.
+- `run_tool` (`tools.py:691`) validates against `TOOL_SCHEMAS` via
+  `validate_tool_call` (line 703) and dispatches through `TOOL_DISPATCH`.
+- Wiring commits `6ff9c42` ("feat(tools): expose get_signature AST tool") and the
+  hardening series through `b941c81` ("merge: get-signature (root-pinned
+  confinement, bounded threaded reads, valid capped JSON)") are ancestors of current
+  HEAD (verified `git merge-base --is-ancestor 6ff9c42 HEAD`).
+- F6-12 (`implementation-plan.md` line 49): "PARTIAL. get_signature merged; edit
+  seam remains." `find_definitions`/`find_references` remain library functions in
+  `ast_tools.py` (no separate `TOOL_SCHEMAS` entries); the claim-17 wiring for
+  `get_signature` is complete.
+
+### 4.3 F5-18 (claim 18): `include_diff` arch note landed
+
+The §3 UNVERIFIED flag on claim 18 is **resolved**. `docs/architecture/
+architecture.md` §3.4 (line 190) now carries the normative note: "A per-task config
+flag `include_diff: false` omits the field for higher orchestrator tiers where the
+merge-conflict context is not needed (token savings); the diff remains available on
+demand when `merge_failed` resolution requires it (§7.8)."
+
+- Commit `16e61cf` ("docs(architecture): include_diff envelope flag") is now an
+  ancestor of current HEAD (verified `git merge-base --is-ancestor 16e61cf HEAD`;
+  merged via `66e5a16` "merge: doc-difflag").
+- `docs/research/glossary.md` line 43 also documents the flag.
+- `rg -n "include_diff" docs/architecture/architecture.md` → line 190 (previously
+  "no hit on main" in §3.1).
+
+### 4.4 Optional follow-up marks
+
+- **Core Directive (claim 11, ADOPT; §2 item 2): DONE at design/codification.**
+  `architectus-design.md` §3.1 (lines 285–293) codifies the Core Directive as the
+  first static-prefix segment with a concrete hard cap `CORE_DIRECTIVE_MAX = 200`;
+  `src/cambium/architectus.py` enforces it (`CORE_DIRECTIVE_MAX = 200` line 34;
+  constructor requires a root directive, `ValueError("root directive is required")`
+  line 317; `_normalise_core_directive` line 870; `_static_prefix` line 826).
+  Merged via `8dd1aee` ("merge: luna-directive (immutable core directive,
+  deterministic reset/replan state machine)"). F6-11 (`implementation-plan.md` line
+  48): "PARTIAL. core directive in architectus; wiring verification remains." — the
+  supervisor wiring is still OPEN.
+- **Reset/retry failure-table row (claim 12, ADOPT-LITE; §2 item 3): DONE.**
+  `architectus-design.md` §7 scenario 5 (line 737) codifies "Gate fail → steering
+  retries → exhausted → reset/retry once → abort" and scenario 14 (line 746) the
+  "Directive and reset boundary/replay checks". `src/cambium/architectus.py`
+  implements the reset/retry state machine (`FailureDecision.RESET_RETRY` line 64,
+  `ActionKind.RESET_RETRY` line 52, `_reset_retry_attempted` lines 191–204,
+  `reset_retry_tasks` line 353, `_consume_fresh_reset` line 689,
+  `_restore_reset_retry_tasks` line 522). Same luna-directive merge (`8dd1aee`).
+
+### 4.5 Checks run for this addendum
+
+- `git rev-parse --short HEAD` (worktree `/home/ubuntu/wt-f5-addendum`) → `17dfcd3`.
+- `git merge-base --is-ancestor 16e61cf HEAD` → exit 0 (include_diff note on main).
+- `git merge-base --is-ancestor 6ff9c42 HEAD` → exit 0; `git merge-base
+  --is-ancestor b941c81 HEAD` → exit 0 (get_signature wiring on main).
+- `git merge-base --is-ancestor 8dd1aee HEAD` → exit 0 (luna-directive: core
+  directive + reset/retry state machine on main).
+- `rg -n '"name": "get_signature"' src/cambium/schemas.py` → line 167.
+- `rg -n 'get_signature' src/cambium/tools.py` → lines 469–527, 685 (TOOL_DISPATCH
+  entry).
+- `rg -n "include_diff" docs/architecture/architecture.md` → line 190.
+- `rg -rn "GCRA" docs/ src/` → `implementation-plan.md:41` only.
+- `git diff --check` → clean (before commit).
