@@ -58,6 +58,13 @@ def _plan(tasks: list[tuple[str, str, list[str]]]) -> dict:
     }
 
 
+def _chain_plan(length: int = 1200) -> dict:
+    return _plan([
+        (f"task-{index}", "TEST", [] if index == 0 else [f"task-{index - 1}"])
+        for index in range(length)
+    ])
+
+
 def _node(tree: TaskTree, task_id: str) -> TaskNode:
     by_id = {node.task_id: node for node in tree.nodes}
     return by_id[task_id]
@@ -124,6 +131,18 @@ def test_build_tree_enforces_depth_bound() -> None:
         build_tree(plan)
     assert "max_depth" in str(exc.value)
     assert "d" in str(exc.value)
+
+
+def test_build_tree_deep_chain_raises_depth_bound_without_recursion_error() -> None:
+    with pytest.raises(DepthBoundError) as exc:
+        build_tree(_chain_plan())
+    assert "max_depth" in str(exc.value)
+    assert "task-4" in str(exc.value)
+
+
+def test_build_tree_large_chain_cycle_analysis_is_iterative() -> None:
+    tree = build_tree(_chain_plan(), max_depth=1199)
+    assert len(tree.nodes) == 1200
 
 
 def test_build_tree_max_width_fanout_is_allowed() -> None:
@@ -587,6 +606,23 @@ def test_cli_cyclic_plan_exits_one_with_stderr() -> None:
     assert result.returncode == 1
     assert "cycle" in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [_run_cli, _run_unified_cli],
+    ids=["module-entry-point", "unified-entry-point"],
+)
+def test_cli_deep_chain_exits_one_with_clean_depth_error(runner) -> None:
+    result = runner(json.dumps(_chain_plan()))
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.startswith("tasktree: ")
+    assert "max_depth" in result.stderr
+    assert "DepthBoundError" not in result.stderr
+    assert "RecursionError" not in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 # -- 8. plan validation errors ------------------------------------------------

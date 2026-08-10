@@ -186,27 +186,33 @@ def _find_cycle(task_ids: list[str], edges: list[tuple[str, str]]) -> list[str] 
     white, gray, black = 0, 1, 2
     color: dict[str, int] = {tid: white for tid in task_ids}
     trace: list[str] = []
-
-    def visit(tid: str) -> list[str] | None:
-        color[tid] = gray
-        trace.append(tid)
-        for child in sorted(children.get(tid, [])):
-            if color.get(child, white) == gray:
-                start = trace.index(child)
-                return trace[start:] + [child]
-            if color.get(child, white) == white:
-                found = visit(child)
-                if found is not None:
-                    return found
-        trace.pop()
-        color[tid] = black
-        return None
+    sorted_children = {tid: sorted(kids) for tid, kids in children.items()}
 
     for tid in sorted(task_ids):
-        if color[tid] == white:
-            found = visit(tid)
-            if found is not None:
-                return found
+        if color[tid] != white:
+            continue
+        color[tid] = gray
+        trace.append(tid)
+        stack: list[tuple[str, int]] = [(tid, 0)]
+        while stack:
+            current, child_index = stack[-1]
+            current_children = sorted_children.get(current, [])
+            if child_index == len(current_children):
+                stack.pop()
+                trace.pop()
+                color[current] = black
+                continue
+
+            child = current_children[child_index]
+            stack[-1] = (current, child_index + 1)
+            child_color = color.get(child, white)
+            if child_color == gray:
+                start = trace.index(child)
+                return trace[start:] + [child]
+            if child_color == white:
+                color[child] = gray
+                trace.append(child)
+                stack.append((child, 0))
     return None
 
 
@@ -251,10 +257,11 @@ def build_tree(
     2. every ``depends_on`` reference exists,
     3. exactly one root (I2.1),
     4. no multi-parent (I2.2),
-    5. no cycles (I2.2) — raises :class:`CycleError` naming the cycle,
-    6. ``depth <= max_depth`` and per-parent fan-out ``<= max_width``.
+    5. ``depth <= max_depth`` (before cycle analysis),
+    6. no cycles (I2.2) — raises :class:`CycleError` naming the cycle,
+    7. per-parent fan-out ``<= max_width``.
 
-    Both bounds in (6) are build-time structural checks. The session-wide
+    Both bounds in (5) and (7) are build-time structural checks. The session-wide
     ``max_width`` parallel-worker cap named in architecture §3.7 I2.3
     ("``max_width`` (per-session parallel worker cap, config) are enforced by
     the supervisor at dispatch") is the supervisor's job, not this module's.
@@ -319,16 +326,22 @@ def build_tree(
             children[dep].append(tid)
             edges.append((dep, tid))
 
+    depth, width_idx = _assign_layout(children, root)
+    # The rooted traversal is iterative. Check its depth before cycle analysis
+    # so an oversized valid tree raises the documented bound error directly.
+    for tid in order:
+        if tid not in depth:
+            continue
+        task_depth = depth[tid]
+        if task_depth > max_depth:
+            raise DepthBoundError(
+                f"task {tid!r} has depth {task_depth}, exceeding max_depth {max_depth}"
+            )
+
     cycle = _find_cycle(order, edges)
     if cycle is not None:
         raise CycleError(f"cycle in task DAG: {' -> '.join(cycle)}")
 
-    depth, width_idx = _assign_layout(children, root)
-    for tid in order:
-        if depth[tid] > max_depth:
-            raise DepthBoundError(
-                f"task {tid!r} has depth {depth[tid]}, exceeding max_depth {max_depth}"
-            )
     for parent, kids in children.items():
         if len(kids) > max_width:
             raise WidthBoundError(
