@@ -39,6 +39,9 @@ _GENERATION_FIELDS = (
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
 _FORBIDDEN_FIELDS = frozenset({"callbacks"})
+_ADAPTER_PRIVATE_FIELDS = frozenset(
+    {"_diffundo", "_tier", "_provider_model", "_budget_usd", "_diffundo_reference"}
+)
 _SECRET_MARKERS = frozenset(
     {
         "apikey",
@@ -379,6 +382,16 @@ class _CambiumLMMixin:
             for key in ("diffundo", "tier", "model", "budget_usd")
             if key in kwargs
         }
+        private_overrides = {
+            key: kwargs[key] for key in _ADAPTER_PRIVATE_FIELDS if key in kwargs
+        }
+        if private_overrides:
+            if "_budget_usd" in private_overrides:
+                self._validate_budget(private_overrides["_budget_usd"])
+            raise ValueError(
+                "CambiumLM does not accept adapter-private copy overrides: "
+                f"{', '.join(sorted(private_overrides))}"
+            )
         if "model" in adapter_overrides:
             self._validate_model(adapter_overrides["model"])
         if "budget_usd" in adapter_overrides:
@@ -583,8 +596,8 @@ class _CambiumLMMixin:
         if request.tools:
             prompt["tools"] = [self._tool(tool) for tool in request.tools]
 
-        model = self._provider_model
-        budget_usd = self._budget_usd
+        model = self._validate_model(self._provider_model)
+        budget_usd = self._validate_budget(self._budget_usd)
         if isinstance(extensions, Mapping):
             requested_model = extensions.get("model")
             if requested_model is not None:

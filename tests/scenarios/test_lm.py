@@ -586,6 +586,21 @@ def test_budget_rejects_nan() -> None:
         CambiumLM(FakeDiffundo(), ProviderTier.FAST, budget_usd=float("nan"))  # type: ignore[arg-type]
 
 
+def test_request_rejects_private_copy_and_direct_nan_budget_before_diffundo() -> None:
+    _require_dspy()
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST, budget_usd=1.0)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="finite"):
+        lm.copy(_budget_usd=float("nan"))
+
+    lm._budget_usd = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        _call(lm, "budget bypass canary")
+
+    assert diffundo.calls == []
+
+
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
