@@ -12,9 +12,8 @@ Record scope, entry points, baseline, reproduction, and the check that
 distinguishes the diagnosis from alternatives.
 
 - Keep the requested file scope. Report any required expansion before editing.
-- Work in an isolated worktree. Verify `git rev-parse --show-toplevel`, branch,
-  and `git worktree list`. Children do not merge branches; the root integrates,
-  verifies, and cleans up.
+- Work in an isolated worktree. Children do not merge branches; the root
+  integrates, verifies, and cleans up.
 - Reproduce before changing code. Remove the cause; do not mask it with a
   fallback, retry, default, or catch-all. Preserve protocol, schema, worktree,
   approval, export, and module boundaries.
@@ -25,78 +24,10 @@ distinguishes the diagnosis from alternatives.
   work to hide a failure. Secrets stay in the environment and never in task
   specs, events, logs, gate output, or commits.
 
-## Current entry points and behavior
+## Current state
 
-- `pyproject.toml` registers `cambium = "cambium.cli:main"`. The CLI exposes
-  `auth`, `supervisor`, `doctor`, `bench`, `tasktree`, `module-test`, and
-  `version`.
-- `supervisor.run_plan` validates a flat list of supplied tasks, starts one
-  runtime, and fans tasks out under an `asyncio.TaskGroup`. There is no
-  worker-count semaphore: an 11-task canary observed 11 concurrent
-  supervisions. `resource_thresholds` checks host health; `CompileGate` limits
-  only classified heavy gate commands. It creates
-  `store.EventStore`, writes `.cambium/result.json`, runs gates, and publishes
-  successful merges by an expected-old update of `refs/heads/main`. Publication
-  is ref-only; it does not refresh a checkout.
-- Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
-  diagnostics use stderr/logging. The supervisor bounds each worker's decoded
-  stdout queue and routes emitted records through `EventStore`, whose writer
-  queue is bounded. Non-critical store records may be dropped by its policy.
-- `worker.do_work` selects deterministic marker mode unless `fanout_config` is
-  present. Provider mode runs the custom bounded `Diffundo` loop: one provider
-  call per turn, strict `tool_call`/`finish` parsing, schema and permission
-  checks, tool events, checkpoints, and one fenced commit.
-- `Diffundo` sorts eligible providers by configured priority and tracks health
-  plus each provider's configured RPM request-rate bucket. A depleted bucket
-  reports `RATE_LIMITED`; HTTP 429 `Retry-After` is honored before retrying. It
-  has no local response cache. Provider token, cost, and account-quota usage
-  remains a production observability contract gap.
-- `tasktree.build_tree` validates roots, dependencies, cycles, and bounds, and
-  deep-copies each input spec into its node as a snapshot. `topological_order` and
-  `ready_tasks` are pure helpers; `run_plan` does not call them to schedule a
-  DAG. `ArchitectusCore`, dynamic decomposition, and the conversation store are
-  not wired into `run_plan`.
-- `doctor` reports Python/Git/uv, worktree, provider environment and auth,
-  optional event/conversation stores, dataset integrity, and advisory host
-  health. `module_conformance` supplies the isolated `module-test` gate. The
-  example module has deterministic `decide` and `evaluate` CLI operations and
-  split evaluators in `metric.py`.
-- The redaction canary
-  `tests/scenarios/test_bench.py::test_bench_stderr_never_leaks_escaped_secret_in_free_form_text`
-  fails: mixed raw/Unicode-escaped stderr retains `\u005c` through the
-  `modules/base.py` → `redact.py` boundary. Fix it before live use.
-
-### Accepted target boundary
-
-The first production hierarchy slice is harness-owned: it validates one
-explicit tree, schedules static ready-node waves, gives each child a fresh
-bounded context, and accepts only the strict upward envelope. Dynamic child
-admission is a later validated revision step. Prompt-prefix stability and
-provider cache-hit metrics are required acceptance evidence. These are targets,
-not current `run_plan` behavior.
-
-## Module and hazard map
-
-Generate inventories with `git ls-files`; the current package is under
-`src/cambium/` and tests are the example module data-in/data-out pairs under
-`src/cambium/modules/example/tests/`.
-
-| Concern | Current source |
-| --- | --- |
-| CLI and version | `cli.py`, `__init__.py`, `pyproject.toml` |
-| Supervisor, worker, IPC | `supervisor.py`, `worker.py`, `ipc.py` |
-| Plan tree and orchestration target | `tasktree.py`, `architectus.py`, `orchestrator.py` |
-| Store, merge, fencing, results | `store.py`, `merge.py`, `fencing.py`, `results.py` |
-| Providers and adapters | `diffundo.py`, `provider_config.py`, `lm.py` |
-| Tools and controls | `tools.py`, `schemas.py`, `approval.py`, `resources.py`, `process_env.py`, `redact.py` |
-| Diagnostics and modules | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` |
-
-Do not cite `worker_pool.py`, `events.py`, `dlq.py`, `eval_cache.py`, or
-`ResourceBudget` as current code: none is tracked at this revision. There is
-no per-worker OS sandbox and no production approval gate in the `run_plan`
-worker context. `approval.py:ApprovalGate` is a reusable command-policy primitive;
-`fail_open` is an explicit dangerous option. Worktree/process-group isolation
-is not OS containment.
+- The redaction canary fails: mixed raw/Unicode-escaped stderr retains `\u005c`
+  through the module wire → redaction boundary. Fix it before live use.
 
 ## Boundary invariants
 
@@ -115,9 +46,9 @@ is not OS containment.
 ## Checks and handoff
 
 Tests are example data-in/data-out pairs: deterministic module input produces
-the expected module output. Run the narrowest real check, then the affected
-package check when a boundary changes. Useful system commands from the
-repository root:
+the expected module output. Use `uv` (not pip) for environments and commands.
+Run the narrowest real check, then the affected package check when a boundary
+changes. Useful system commands from the repository root:
 
 ```sh
 python3.14 -m pytest -q src/cambium/modules/example/tests/
