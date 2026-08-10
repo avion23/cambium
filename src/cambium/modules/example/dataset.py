@@ -46,14 +46,16 @@ class ExampleDatasetLoader(DatasetLoader):
 
     The v1 split files are loaded under the dataset-format.md §9
     contract: every record must carry a non-empty string ``id``, ids are
-    unique within a file, ``meta.json``'s ``schema_version`` must match
-    the loader's, and :meth:`load_all` rejects a record present in more
-    than one split (canonical ``(task, context)`` hash).
+    unique within a file, versioned records must match ``meta.json``'s
+    ``schema_version`` and ``dataset_version``, and :meth:`load_all`
+    rejects a record present in more than one split (canonical
+    ``(task, context)`` hash).
     """
 
     supported_schema_version = 1
 
     def load(self) -> list[Example]:
+        self._check_schema_version()
         return self._load_path(self.path)
 
     def load_split(self, split: Split) -> list[Example]:
@@ -143,9 +145,18 @@ class ExampleDatasetLoader(DatasetLoader):
 
     def _load_path(self, path: Path, require_envelope: bool = False) -> list[Example]:
         records = load_jsonl(path)
+        meta = self._read_meta()
+        require_versions = (
+            (require_envelope or path.stem in {split.value for split in Split})
+            and bool(
+                meta.get("schema_version") is not None
+                or meta.get("dataset_version") is not None
+            )
+        )
         examples: list[Example] = []
         seen_ids: dict[str, int] = {}
         for line_no, record in enumerate(records, start=1):
+            self._validate_record_versions(record, line_no, path, meta, require_versions)
             self._validate(record, line_no, path)
             record_id = record.get("id")
             if require_envelope:
@@ -180,6 +191,55 @@ class ExampleDatasetLoader(DatasetLoader):
                 )
             )
         return examples
+
+    def _validate_record_versions(
+        self,
+        record: dict,
+        line_no: int,
+        path: Path,
+        meta: dict,
+        require_versions: bool,
+    ) -> None:
+        expected_schema_version = meta.get("schema_version")
+        expected_dataset_version = meta.get("dataset_version")
+        if expected_schema_version is None and expected_dataset_version is None:
+            return
+
+        has_versions = "schema_version" in record or "dataset_version" in record
+        if not has_versions:
+            if require_versions:
+                raise DatasetError(
+                    f"{path}:{line_no}: record must have schema_version and "
+                    "dataset_version matching meta.json"
+                )
+            return
+
+        mismatches: list[str] = []
+        record_schema_version = record.get("schema_version")
+        if expected_schema_version is not None:
+            if (
+                not isinstance(record_schema_version, int)
+                or isinstance(record_schema_version, bool)
+                or record_schema_version != expected_schema_version
+            ):
+                mismatches.append(
+                    f"schema_version {record_schema_version!r} != "
+                    f"meta.json {expected_schema_version!r}"
+                )
+
+        record_dataset_version = record.get("dataset_version")
+        if expected_dataset_version is not None:
+            if (
+                not isinstance(record_dataset_version, str)
+                or record_dataset_version != expected_dataset_version
+            ):
+                mismatches.append(
+                    f"dataset_version {record_dataset_version!r} != "
+                    f"meta.json {expected_dataset_version!r}"
+                )
+
+        if mismatches:
+            raise DatasetError(f"{path}:{line_no}: version drift: {', '.join(mismatches)}")
 
     def _check_no_cross_split_collisions(
         self, splits: list[tuple[str, list[Example]]]

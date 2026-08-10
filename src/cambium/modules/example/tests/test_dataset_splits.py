@@ -13,6 +13,8 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
+
 from cambium.modules.base import DatasetError
 from cambium.modules.example import (
     DatasetBundle,
@@ -139,6 +141,34 @@ def test_split_record_versions_match_meta() -> None:
             assert record["dataset_version"] == expected_dataset_version, (
                 f"{path.name}:{line_no}: dataset_version drifted from meta.json"
             )
+
+
+def test_split_record_version_drift_rejected_by_loader(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    (src / "meta.json").write_text(
+        json.dumps({"schema_version": 1, "dataset_version": "1.1.0"}) + "\n",
+        encoding="utf-8",
+    )
+    record = {
+        "id": "train-1",
+        "schema_version": 999,
+        "dataset_version": "0.0.0",
+        "input": {"task": "Do a thing.", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    train_path = src / "train.jsonl"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    loader = ExampleDatasetLoader(src)
+    with pytest.raises(DatasetError, match="schema_version.*dataset_version"):
+        loader.load_split(Split.TRAIN)
+
+    record["schema_version"] = 999
+    record["dataset_version"] = "1.1.0"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    with pytest.raises(DatasetError, match="schema_version"):
+        loader.load_split(Split.TRAIN)
 
 
 def test_dataset_version_defaults_when_meta_missing(tmp_path) -> None:
