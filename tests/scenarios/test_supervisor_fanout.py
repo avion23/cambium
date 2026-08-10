@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -90,6 +91,25 @@ def _kinds(events: list[dict], kind: str) -> list[dict]:
     return [e for e in events if e["kind"] == kind]
 
 
+def _worktree_paths(repo: Path) -> list[Path]:
+    output = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return [
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def _branch_exists(repo: Path, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        check=False,
+    ).returncode == 0
+
+
 # ---------------------------------------------------------------------------
 # T1: fan-out — three workers, disjoint files, all merged, coherent log.
 # ---------------------------------------------------------------------------
@@ -122,11 +142,166 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
                          ("c.txt", "// cambium-c")):
         assert marker in _show(repo, "main", name)
 
+    assert _worktree_paths(repo) == [repo.resolve()]
+    for branch in ("wt-a", "wt-b", "wt-c"):
+        assert not _branch_exists(repo, branch)
     events = read_events(session_dir)
     assert len(_kinds(events, "merge_committed")) == 3
+    pruned = _kinds(events, "worktree_pruned")
+    deferred = _kinds(events, "worktree_cleanup_deferred")
+    assert {event["task_id"] for event in pruned} == {"t-a", "t-b", "t-c"}
+    assert not deferred
     for tid in ("t-a", "t-b", "t-c"):
         assert _protocol(events, tid) == ["init", "ready", "run_task", "result", "exit"]
     assert events[-1]["kind"] == "session_ended"
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        terminal = connection.execute(
+            "SELECT kind, task_id FROM events "
+            "WHERE kind IN ('result', 'merge_committed', 'session_ended', "
+            "'worktree_pruned', 'worktree_cleanup_deferred')"
+        ).fetchall()
+    assert sum(kind == "result" for kind, _task_id in terminal) == 3
+    assert sum(kind == "merge_committed" for kind, _task_id in terminal) == 3
+    assert sum(kind == "worktree_pruned" for kind, _task_id in terminal) == 3
+    assert not any(kind == "worktree_cleanup_deferred" for kind, _task_id in terminal)
+    assert ("session_ended", None) in terminal
+
+
+def test_t1_gate_failure_prunes_worktree_and_persists_terminal_events(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-gate-fail",
+                worktree="wt-gate-fail",
+                branch="wt-gate-fail",
+                target_file="a.txt",
+                marker="// never-written",
+                gate="grep -q '// never-written' a.txt",
+                write_marker=False,
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    (task,) = result.results
+    assert task.status == "failed"
+    assert task.reason == "gate_failed"
+    assert _worktree_paths(repo) == [repo.resolve()]
+    assert not _branch_exists(repo, "wt-gate-fail")
+
+    events = read_events(session_dir)
+    assert _kinds(events, "gate")[0]["payload"]["exit_code"] != 0
+    assert _kinds(events, "result")[0]["payload"]["status"] == "failed"
+    assert len(_kinds(events, "worktree_pruned")) == 1
+    assert not _kinds(events, "worktree_cleanup_deferred")
+    assert events[-1]["kind"] == "session_ended"
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        terminal = connection.execute(
+            "SELECT kind, task_id FROM events "
+            "WHERE task_id = ? AND kind IN ('result', 'gate', 'worktree_pruned', "
+            "'worktree_cleanup_deferred')",
+            ("t-gate-fail",),
+        ).fetchall()
+    assert {kind for kind, _task_id in terminal} == {"result", "gate", "worktree_pruned"}
+
+
+def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    branch = "wt-branch-lock"
+    lock = repo / ".git" / "refs" / "heads" / f"{branch}.lock"
+    lock_gate = (
+        f"printf 'concurrent ref lock\\n' > {shlex.quote(str(lock))} "
+        "&& grep -q '// cambium-locked' a.txt"
+    )
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, "t-branch-lock", worktree="wt-branch-lock",
+                branch=branch, target_file="a.txt", marker="// cambium-locked",
+                gate=lock_gate,
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    (task,) = result.results
+    assert task.status == "succeeded"
+    assert (session_dir / "wt-branch-lock").exists()
+    assert _worktree_paths(repo) == [repo.resolve(), (session_dir / "wt-branch-lock").resolve()]
+    assert _branch_exists(repo, branch)
+
+    events = read_events(session_dir)
+    deferred = _kinds(events, "worktree_cleanup_deferred")
+    assert len(deferred) == 1
+    assert deferred[0]["payload"]["reason"] == "branch_delete_failed"
+    assert deferred[0]["payload"]["restored"] is True
+    assert not _kinds(events, "worktree_pruned")
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        terminal = connection.execute(
+            "SELECT kind, task_id FROM events "
+            "WHERE task_id = ? AND kind IN ('gate', 'result', 'worktree_pruned', "
+            "'worktree_cleanup_deferred')",
+            ("t-branch-lock",),
+        ).fetchall()
+    assert "worktree_cleanup_deferred" in {kind for kind, _task_id in terminal}
+    assert "worktree_pruned" not in {kind for kind, _task_id in terminal}
+
+
+def test_dirty_gate_artifact_defers_cleanup_and_keeps_tree_registered(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    branch = "wt-dirty-gate"
+    worktree = session_dir / branch
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, "t-dirty-gate", worktree=branch, branch=branch,
+                target_file="a.txt", marker="// cambium-dirty",
+                gate=(
+                    "printf 'gate artifact\\n' > gate-artifact.txt "
+                    "&& grep -q '// cambium-dirty' a.txt"
+                ),
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    (task,) = result.results
+    assert task.status == "succeeded"
+    assert worktree.exists()
+    assert (worktree / "gate-artifact.txt").read_text() == "gate artifact\n"
+    assert _worktree_paths(repo) == [repo.resolve(), worktree.resolve()]
+    assert _branch_exists(repo, branch)
+
+    events = read_events(session_dir)
+    deferred = _kinds(events, "worktree_cleanup_deferred")
+    assert len(deferred) == 1
+    assert deferred[0]["payload"]["reason"] == "dirty"
+    assert not _kinds(events, "worktree_pruned")
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        terminal = connection.execute(
+            "SELECT kind, task_id FROM events "
+            "WHERE task_id = ? AND kind IN ('gate', 'result', 'worktree_pruned', "
+            "'worktree_cleanup_deferred')",
+            ("t-dirty-gate",),
+        ).fetchall()
+    assert "worktree_cleanup_deferred" in {kind for kind, _task_id in terminal}
+    assert "worktree_pruned" not in {kind for kind, _task_id in terminal}
 
 
 # ---------------------------------------------------------------------------

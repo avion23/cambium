@@ -1063,6 +1063,100 @@ class _Runtime:
             base_commit=spec["base_commit"],
         )
 
+    async def _prune_worktree(self, spec: dict[str, Any]) -> None:
+        """Remove a terminal task's clean worker worktree and branch.
+
+        A worker tree may contain edits from a crash or an uncommitted result.
+        Without the staging/quarantine contract, those trees are retained and
+        reported instead of being force-removed. This preserves the evidence
+        for the integration point owned by the staging-quarantine work.
+        """
+        task_id = spec["task_id"]
+        repo = Path(spec["repo"]).resolve()
+        worktree = Path(spec["worktree_path"]).resolve()
+        branch = spec["branch"]
+
+        async with self._worktree_lock:
+            await self._git(repo, "worktree", "prune", check=False)
+            listing = await self._git(repo, "worktree", "list", "--porcelain", check=False)
+            if listing.returncode != 0:
+                await self.emit(
+                    "worktree_cleanup_deferred", task_id=task_id, reason="list_failed"
+                )
+                return
+            registered = any(
+                line.startswith("worktree ")
+                and Path(line[len("worktree "):].strip()).resolve() == worktree
+                for line in listing.stdout.splitlines()
+            )
+            if not registered:
+                return
+            if worktree == repo:
+                await self.emit(
+                    "worktree_cleanup_deferred", task_id=task_id, reason="repo_path"
+                )
+                return
+            if branch != "main":
+                branch_ref = f"branch refs/heads/{branch}"
+                for block in listing.stdout.split("\n\n"):
+                    lines = block.splitlines()
+                    path_line = next(
+                        (line for line in lines if line.startswith("worktree ")), None
+                    )
+                    if path_line is None:
+                        continue
+                    registered_path = Path(path_line[len("worktree "):].strip()).resolve()
+                    if registered_path != worktree and branch_ref in lines:
+                        await self.emit(
+                            "worktree_cleanup_deferred", task_id=task_id,
+                            reason="branch_in_use",
+                        )
+                        return
+
+            status = await self._git(
+                worktree,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+                check=False,
+            )
+            if status.returncode != 0:
+                await self.emit(
+                    "worktree_cleanup_deferred", task_id=task_id, reason="status_failed"
+                )
+                return
+            if status.stdout:
+                await self.emit(
+                    "worktree_cleanup_deferred", task_id=task_id, reason="dirty"
+                )
+                return
+
+            removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
+            if removed.returncode != 0:
+                await self.emit(
+                    "worktree_cleanup_deferred", task_id=task_id, reason="remove_failed"
+                )
+                return
+            if branch != "main":
+                deleted = await self._git(repo, "branch", "-D", branch, check=False)
+                if deleted.returncode != 0:
+                    restored = await self._git(
+                        repo, "worktree", "add", str(worktree), branch, check=False
+                    )
+                    if restored.returncode != 0:
+                        restored = await self._git(
+                            repo, "worktree", "add", "--detach", str(worktree), branch,
+                            check=False,
+                        )
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id,
+                        reason="branch_delete_failed", restored=restored.returncode == 0,
+                    )
+                    return
+            await self._git(repo, "worktree", "prune", check=False)
+            await self.emit("worktree_pruned", task_id=task_id, branch=branch)
+
     # -- spawn environment ---------------------------------------------------
 
     def _worker_command(self, spec: dict[str, Any]) -> list[str]:
@@ -1120,6 +1214,9 @@ class _Runtime:
                 task_id=spec["task_id"], status="failed", exit_code=1,
                 reason=f"supervisor error: {exc.__class__.__name__}",
             )
+        finally:
+            if spec["task_id"] in self._results:
+                await self._prune_worktree(spec)
 
     async def _supervise(self, spec: dict[str, Any]) -> None:
         task_id = spec["task_id"]
@@ -1586,6 +1683,13 @@ class _Runtime:
                 staging_tip = await asyncio.to_thread(
                     seq.prepare_staging, repo, throwaway, branch, current_main
                 )
+                # publish_merge is ref-only by contract. If this repository's
+                # primary worktree has ``main`` checked out, advancing the ref
+                # leaves its files and index at the old commit; git status can
+                # therefore report a staged delta even though this operation
+                # did not mutate the main working tree. Do not reset or
+                # checkout here: that would violate ref-only publication and
+                # could destroy caller-owned edits.
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
         except Exception as exc:
             error_type = exc.__class__.__name__
