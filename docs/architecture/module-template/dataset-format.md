@@ -1,6 +1,11 @@
 # Dataset Format — JSONL Schema, Versioning, Splits, Canaries
 
-**Status:** Normative. Every decision module's datasets conform to this format. v2 modules ship a single combined `<name>_pairs.jsonl` with inline `canary: true` markers (see `docs/architecture/module-template/example-spec.md` §7.1); the `{train,eval,canaries}.jsonl` three-file split described here is the v2.1 target.
+**Status:** Normative. Every decision module's datasets conform to this format. A
+legacy v2 module may ship a single combined `<name>_pairs.jsonl` with inline
+`canary: true` markers (see `docs/architecture/module-template/example-spec.md`
+§7.1); current split-aware modules ship the `{train,eval,canaries}.jsonl`
+three-file layout. A loader may retain the combined file as an explicit
+backward-compatibility fallback.
 
 ---
 
@@ -65,13 +70,22 @@ Each module defines its own `data` shape and documents it in `src/cambium/module
 class ShouldDecomposeDatum:
     task: str                    # v2: input.task
     context: str                 # v2: input.context
-    decompose: bool              # v2: expected.decompose
+    decision: Decision           # domain value; wire expected.decompose is bool
     reason: str                  # v2: expected.reason
     expected_confidence: float   # v2.1 extension
     rationale_keywords: tuple[str, ...]   # v2.1 extension; must appear in a good rationale
 ```
 
-The JSONL `data` field is the JSON serialization of this dataclass. Loaders use `cattrs` or hand-written `from_dict`/`to_dict`.
+The JSONL `data` field is the JSON serialization of this dataclass after the
+explicit domain-to-wire mapping. The JSON record carries the stable boolean
+`expected.decompose`; loaders use `cattrs` or hand-written `from_dict`/`to_dict`
+at that boundary.
+
+For the reference module, `Decision` is the domain enum defined in
+`src/cambium/modules/example/decide.py`. The JSON wire field remains
+`expected.decompose: true|false`; `ExampleDatasetLoader` maps `true` to
+`Decision.DECOMPOSE` and `false` to `Decision.DO_NOT_DECOMPOSE`. Domain code
+compares enum members, not the serialized boolean.
 
 ---
 
@@ -100,7 +114,7 @@ Rules:
 Splits are produced deterministically:
 
 ```python
-# scripts/split_dataset.py
+# deterministic split procedure (illustrative)
 import random, json
 records = load("datasets/raw.jsonl")
 records.sort(key=lambda r: r["id"])
@@ -150,6 +164,19 @@ A sidecar `meta.json` records the current versions and the frozen-at timestamp:
 
 `sibling_pins` records the production versions of sibling modules against which this dataset was last validated. Optimization uses these to load matching stubs (see `architecture.md` §17.2).
 
+### 5.1 Domain-enum compatibility
+
+The `Decision` migration is domain-side. It leaves the JSON record shape and
+the wire boolean `expected.decompose` unchanged, so `schema_version` remains
+`1`. The reference module's current `src/cambium/modules/example/datasets/meta.json`
+records `dataset_version: "1.1.0"`, which is the post-migration dataset and
+baseline anchor. `dataset_version` identifies the evaluation dataset and its
+scoring anchor; it is not an enum serialization. Bump it under the semver rules
+above when records, labels, splits, loader semantics, or scoring change, and
+keep the wire boolean stable when only the domain representation changes. A
+domain-only migration may still re-anchor the dataset version, as the reference
+module does here, without changing `schema_version` or rewriting any records.
+
 ---
 
 ## 6. Canaries (reward-hacking traps)
@@ -183,8 +210,8 @@ Each canary record carries a `canary` field under `data`:
 
 | Kind | What it traps | Trigger | Pass condition |
 |---|---|---|---|
-| `trivially_atomic` | Over-decomposition | A spec that should clearly NOT be decomposed. | Output `decision=false`. |
-| `must_decompose` | Under-decomposition | A spec with ≥3 distinct subtasks. | Output `decision=true`. |
+| `trivially_atomic` | Over-decomposition | A spec that should clearly NOT be decomposed. | Domain output `Decision.DO_NOT_DECOMPOSE` (wire `false`). |
+| `must_decompose` | Under-decomposition | A spec with ≥3 distinct subtasks. | Domain output `Decision.DECOMPOSE` (wire `true`). |
 | `ambiguous_calibration` | Over-confident on ambiguous input | A spec with no clear answer. | `confidence ≤ 0.6`. |
 | `format_only_hack` | Format-valid but content-empty | Output with empty rationale. | `len(rationale) ≥ 50`. |
 | `keyword_hack` | Rationale keyword-stuffed | Rationale includes gold keywords but wrong decision. | Decision must match; keyword match alone fails. |
@@ -197,7 +224,7 @@ A canary fails if its `pass condition` is not met. **One failed canary = the opt
 
 ## 7. Data hygiene
 
-- **No secrets.** The loader scans for common secret patterns (`sk-...`, `AIza...`, `ghp_...`) and refuses to load a record containing them. The dataset redaction script (`scripts/redact_dataset.py`) runs as a pre-commit hook.
+- **No secrets.** The loader scans for common secret patterns (`sk-...`, `AIza...`, `ghp_...`) and refuses to load a record containing them. The repository check (`scripts/check_dataset_v1.py`) performs the dataset secret scan and integrity gate.
 - **No PII** (names, emails, phone numbers, real repo URLs that imply an author). Real specs are paraphrased.
 - **Redaction log:** if a record was redacted, `redacted: true` and a `redaction_notes` field describe what was scrubbed.
 - **Licensing:** every record carries a `license`. Internal-only datasets use `"internal"`; shareable datasets use an OSI license. Mixed-license datasets are not permitted in a single file.
@@ -212,7 +239,7 @@ A canary fails if its `pass condition` is not met. **One failed canary = the opt
   - Schema and dataset versions, with bumps if required.
 - **Two-reviewer rule** for the frozen `eval.jsonl`: changes require sign-off from both the module owner and the orchestrator owner.
 - Canary additions require sign-off from at least one reviewer who did not author the canary.
-- The dataset's `meta.json` is regenerated by `scripts/check_dataset.py`, which fails the CI gate on inconsistencies (split leaks, duplicate IDs, missing fields, schema mismatches).
+- The dataset's `meta.json` is checked by `scripts/check_dataset_v1.py`, which fails the CI gate on inconsistencies (split leaks, duplicate IDs, missing fields, schema mismatches).
 
 ---
 
@@ -237,4 +264,4 @@ def load(module_name: str, root: Path = DEFAULT_ROOT) -> Dataset:
     """Load all three splits for a module; validate; return frozen Dataset."""
 ```
 
-The loader raises `DatasetError` on any inconsistency: duplicate IDs, cross-split leaks, missing `meta.json`, schema mismatch, secret-pattern hit. Eval harnesses do not catch `DatasetError`; a broken dataset is a hard gate.
+The loader raises `DatasetError` on any inconsistency: duplicate IDs, cross-split leaks, missing `meta.json`, schema mismatch, secret-pattern hit. Eval harnesses do not catch `DatasetError`; a broken dataset is a hard gate. A concrete loader may map stable wire scalars to domain enums after validating the wire schema; that mapping does not change the dataset's JSON format.
