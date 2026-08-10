@@ -34,7 +34,19 @@ def test_append_read_roundtrip_and_wal_schema(tmp_path) -> None:
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         columns = [row[1] for row in conn.execute("PRAGMA table_info(conversations)")]
-        assert columns == ["id", "node_id", "parent_id", "turn", "role", "content", "ts", "seq"]
+        assert columns == [
+            "id",
+            "node_id",
+            "parent_id",
+            "turn",
+            "role",
+            "content",
+            "ts",
+            "seq",
+            "tokens",
+            "kind",
+            "meta",
+        ]
         indexes = conn.execute("PRAGMA index_list(conversations)").fetchall()
         assert any("node_id" in row[1] for row in indexes)
     finally:
@@ -151,5 +163,113 @@ def test_crash_durability_reopen_keeps_committed_rows(tmp_path) -> None:
     store = _open(path)
     try:
         assert len(store.history("node")) == count
+    finally:
+        store.close()
+
+
+def test_v1_schema_migrates_and_preserves_existing_rows(tmp_path) -> None:
+    path = tmp_path / "conversations.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                parent_id INTEGER NULL REFERENCES conversations(id),
+                turn INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                seq INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+        conn.execute(
+            "INSERT INTO conversations"
+            "(id, node_id, parent_id, turn, role, content, ts, seq)"
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (7, "legacy", None, 1, "user", "old", "2026-01-01T00:00:00+00:00", 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = _open(path)
+    try:
+        record = store.history("legacy")[0]
+        assert record["id"] == 7
+        assert record["content"] == "old"
+        assert record["tokens"] is None
+        assert record["kind"] == "turn"
+        assert record["meta"] is None
+    finally:
+        store.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(conversations)")]
+        assert columns[-3:] == ["tokens", "kind", "meta"]
+    finally:
+        conn.close()
+
+
+def test_tokens_metadata_and_kind_filtering(tmp_path) -> None:
+    store = _open(tmp_path / "conversations.db")
+    try:
+        store.append("node", "user", "turn", tokens=12)
+        store.append("node", "system", "system", tokens=4, kind="system", meta={"source": "test"})
+
+        records = store.history("node")
+        assert records[-1]["tokens"] == 4
+        assert records[-1]["kind"] == "system"
+        assert records[-1]["meta"] == {"source": "test"}
+        assert [record["content"] for record in records if record["kind"] == "turn"] == ["turn"]
+    finally:
+        store.close()
+
+
+def test_summary_and_token_accounting(tmp_path) -> None:
+    store = _open(tmp_path / "conversations.db")
+    try:
+        first = store.append("node", "user", "first", tokens=100)
+        second = store.append("node", "assistant", "second", tokens=80)
+        summary = store.add_summary(
+            "node",
+            "condensed",
+            covers_from=first,
+            covers_to=second,
+            tokens_before=180,
+            tokens_after=25,
+        )
+
+        record = store.history("node")[-1]
+        assert record["id"] == summary
+        assert record["parent_id"] == second
+        assert record["kind"] == "summary"
+        assert record["tokens"] == 25
+        assert record["meta"] == {
+            "covers_from": first,
+            "covers_to": second,
+            "tokens_before": 180,
+            "tokens_after": 25,
+        }
+
+        assert store.token_accounting("node") == {
+            "tokens_by_kind": {"turn": 180, "summary": 25, "system": 0},
+            "reduction": 155,
+            "covered_range": {"from": first, "to": second},
+        }
+
+        following = store.append("node", "assistant", "following", tokens=8)
+        assert store.history("node")[-1]["parent_id"] == summary
+        assert [record["id"] for record in store.path("node", summary)] == [
+            first,
+            second,
+            summary,
+        ]
+        assert store.history("node")[-1]["id"] == following
     finally:
         store.close()
