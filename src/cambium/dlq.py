@@ -103,12 +103,6 @@ class DeadLetterQueue:
                 self._put_redacted(self._redactor.redact_mapping(record))
             self._directory.rename(legacy_target)
 
-    @property
-    def directory(self) -> Path:
-        """Return the legacy queue directory path retained for API compatibility."""
-
-        return self._directory
-
     def put(self, record: dict) -> int:
         """Redact and durably insert *record*, then return its SQLite row id."""
 
