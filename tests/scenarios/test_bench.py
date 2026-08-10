@@ -149,6 +149,30 @@ def _write_fixture_module(
     return modules_dir
 
 
+def _write_env_probe_module(tmp_path: Path) -> Path:
+    """Create one importable module whose CLI dumps its inherited env to stdout."""
+    source_root = tmp_path / "src"
+    modules_dir = source_root / "cambium" / "modules"
+    package_dir = modules_dir / "envprobe"
+    package_dir.mkdir(parents=True)
+    (source_root / "cambium" / "__init__.py").write_text("")
+    (modules_dir / "__init__.py").write_text("")
+    (package_dir / "__init__.py").write_text("")
+    (package_dir / "__main__.py").write_text(
+        textwrap.dedent(
+            """
+            import json
+            import os
+            import sys
+
+            sys.stdin.buffer.read()
+            print(json.dumps(dict(os.environ), sort_keys=True))
+            """
+        )
+    )
+    return modules_dir
+
+
 def run_bench(
     bench_root: Path,
     mode: str,
@@ -429,6 +453,68 @@ def test_invalid_utf8_cli_output_fails_without_combined_fallback_or_baseline(
     assert "ERROR ModuleCLIError" in captured.err
     assert "fell back to the combined file" not in captured.err
     assert not (bench_root / "fixture_module" / "baseline.json").exists()
+
+
+def test_module_subprocess_env_does_not_inherit_provider_credentials(
+    tmp_path, monkeypatch
+) -> None:
+    import cambium.bench as bench
+
+    secret = "opaque-bench-env-probe-value-42"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    modules_dir = _write_env_probe_module(tmp_path)
+
+    output = bench.run_module_cli(
+        "cambium.modules.envprobe",
+        {"operation": "env"},
+        cwd=tmp_path,
+        source_root=modules_dir.parents[1],
+    )
+
+    assert "CAMBIUM_PROVIDER_TEST_API_KEY" not in output
+    assert output.get("PYTHONUNBUFFERED") == "1"
+    assert "PATH" in output
+    assert "HOME" in output
+
+
+def test_bench_failure_stderr_never_contains_provider_credential(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import cambium.bench as bench
+
+    secret = "opaque-bench-credential-value-9f8e"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_API_KEY", secret)
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    (modules_dir / "fixture" / "__main__.py").write_text(
+        textwrap.dedent(
+            """
+            import os
+            import sys
+
+            print("echo:", os.environ.get("CAMBIUM_PROVIDER_TEST_API_KEY"), file=sys.stderr)
+            print("hardcoded:", "opaque-bench-credential-value-9f8e", file=sys.stderr)
+            raise SystemExit(1)
+            """
+        )
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    captured = capsys.readouterr()
+    assert "ERROR ModuleCLIError" in captured.err
+    assert secret not in captured.err
 
 
 def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:

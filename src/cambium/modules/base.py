@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from cambium.auth import is_provider_env_name
+from cambium.redact import Redactor, is_secret_name
+
 MODULE_CONTRACT_VERSION = 1
 MODULE_MANIFEST_FILENAME = "module.json"
 MODULE_PROTOCOL = "json-v1"
@@ -37,6 +40,77 @@ _REQUIRED_MANIFEST_FIELDS = (
     "dataset_schema_version",
 )
 _SAFE_MODULE_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+
+# The only environment names a module subprocess may inherit from the parent.
+# Provider credentials are never on this list; ``LC_*``/``LANG*`` locale
+# controls are inherited by prefix and then rejected individually when their
+# name carries a credential-like token.
+_MODULE_ENV_KEYS = frozenset(
+    {
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_TERMINAL_PROMPT",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "PYTHONPATH",
+        "PYTHONUNBUFFERED",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+    }
+)
+# Mirrors the credential-namespace pattern used by auth.scrub_environment and
+# module_conformance: any name containing one of these tokens is treated as a
+# credential and is never passed across the module boundary.
+_MODULE_ENV_CREDENTIAL_RE = re.compile(
+    r"(?:api|key|token|secret|password|passwd|credential|authorization)",
+    re.IGNORECASE,
+)
+
+
+def _module_env(source_root: str | Path | None) -> dict[str, str]:
+    """Build a credential-free environment for one module subprocess.
+
+    Only a minimal allowlist of runtime controls is inherited from the parent
+    environment; ``os.environ`` is never copied wholesale.  ``LC_*``/``LANG*``
+    locale controls are inherited by prefix, but every candidate name is still
+    dropped when it names a provider key or matches the credential namespace.
+    """
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        allowed = name in _MODULE_ENV_KEYS or name.startswith(("LC_", "LANG"))
+        if not allowed or _MODULE_ENV_CREDENTIAL_RE.search(name):
+            continue
+        env[name] = value
+    env["PYTHONUNBUFFERED"] = "1"
+    if source_root is not None:
+        source = str(Path(source_root).resolve())
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join(part for part in (source, existing) if part)
+    return env
+
+
+def _module_redactor() -> Redactor:
+    """Return a redactor registered with credential values in the parent env.
+
+    Defense in depth for diagnostics: even if a module echoes a credential it
+    obtained from outside the harness, its exact value is redacted before the
+    output is embedded in an exception message.
+    """
+    return Redactor(
+        secret_values={
+            value
+            for name, value in os.environ.items()
+            if value and (is_provider_env_name(name) or is_secret_name(name))
+        }
+    )
 
 
 class ModuleBoundaryError(ValueError):
@@ -159,8 +233,9 @@ def load_module_manifest(
     )
 
 
-def _cli_detail(stdout: str, stderr: str) -> str:
+def _cli_detail(stdout: str, stderr: str, redactor: Redactor) -> str:
     detail = stderr.strip() or stdout.strip() or "no diagnostic output"
+    detail = redactor.redact(detail)
     return detail if len(detail) <= 500 else f"{detail[:497]}..."
 
 
@@ -207,13 +282,7 @@ def run_module_cli(
     except (TypeError, ValueError) as exc:
         raise ModuleCLIError(f"module {cli_module!r}: request is not JSON: {exc}") from exc
 
-    env = os.environ.copy()
-    if source_root is not None:
-        source = str(Path(source_root).resolve())
-        existing = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = os.pathsep.join(
-            part for part in (source, existing) if part
-        )
+    env = _module_env(source_root)
 
     try:
         result = subprocess.run(
@@ -233,6 +302,7 @@ def run_module_cli(
     except (OSError, subprocess.SubprocessError) as exc:
         raise ModuleCLIError(f"module {cli_module!r}: CLI could not run: {exc}") from exc
 
+    redactor = _module_redactor()
     if result.returncode != 0:
         try:
             output = json.loads(result.stdout)
@@ -242,11 +312,11 @@ def run_module_cli(
         if status is not None:
             raise ModuleSplitError(
                 f"module {cli_module!r}: CLI reported split {status}: "
-                f"{_cli_detail(result.stdout, result.stderr)}"
+                f"{_cli_detail(result.stdout, result.stderr, redactor)}"
             )
         raise ModuleCLIError(
             f"module {cli_module!r}: CLI exited {result.returncode}: "
-            f"{_cli_detail(result.stdout, result.stderr)}"
+            f"{_cli_detail(result.stdout, result.stderr, redactor)}"
         )
 
     try:
@@ -264,10 +334,11 @@ def run_module_cli(
         if status is not None:
             raise ModuleSplitError(
                 f"module {cli_module!r}: CLI reported split {status}: "
-                f"{_cli_detail(result.stdout, result.stderr)}"
+                f"{_cli_detail(result.stdout, result.stderr, redactor)}"
             )
         raise ModuleCLIError(
-            f"module {cli_module!r}: CLI returned an error object: {output['error']}"
+            f"module {cli_module!r}: CLI returned an error object: "
+            f"{redactor.redact(str(output['error']))}"
         )
     return output
 
