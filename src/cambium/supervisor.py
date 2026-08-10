@@ -36,6 +36,7 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -50,6 +51,8 @@ from typing import Any
 from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
 from cambium.provider_config import DEFAULT_PROVIDER_PATH
+from cambium.resources import DEFAULT_ACQUIRE_TIMEOUT_S, CompileGate
+from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
 
@@ -330,35 +333,73 @@ async def _next_message(
 
 
 async def _run_gate(
-    command: str, cwd: Path, log: EventLog, task_id: str, timeout: float
+    command: str,
+    cwd: Path,
+    log: EventLog,
+    task_id: str,
+    timeout: float,
+    gate: CompileGate,
 ) -> int:
     """Run the gate command in the worker's worktree. Raises TimeoutError on gate timeout."""
-    proc = await asyncio.create_subprocess_exec(
-        "sh", "-c", command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(scrub_environment(), worktree=cwd),
-        start_new_session=True,
-        pass_fds=(),
-        close_fds=True,
-    )
+    command_tokens = shlex.split(command)
+    is_heavy = gate.is_heavy(command_tokens)
+    token = await gate.acquire(command_tokens) if is_heavy else None
+    if token is False:
+        log.emit(
+            "gate",
+            task_id=task_id,
+            command=command,
+            exit_code=126,
+            timed_out=False,
+            resource_denied=True,
+            heavy=True,
+        )
+        return 126
+    proc = None
     try:
+        proc = await asyncio.create_subprocess_exec(
+            "sh", "-c", command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_strip_sensitive_env(scrub_environment(), worktree=cwd),
+            start_new_session=True,
+            pass_fds=(),
+            close_fds=True,
+        )
         _out, err = await _communicate_gate_bounded(proc, timeout)
     except _GateOutputOverflow as exc:
         log.emit(
             "gate", task_id=task_id, command=command, exit_code=125,
             timed_out=False, output_overflow=True,
             stderr=exc.stderr.decode("utf-8", "replace")[:512],
+            heavy=is_heavy,
         )
         return 125
     except TimeoutError:
-        await _kill_process_group_and_reap(proc)
-        log.emit("gate", task_id=task_id, command=command, exit_code=None, timed_out=True)
+        if proc is not None:
+            await _kill_process_group_and_reap(proc)
+        log.emit(
+            "gate",
+            task_id=task_id,
+            command=command,
+            exit_code=None,
+            timed_out=True,
+            heavy=is_heavy,
+        )
         raise
     except asyncio.CancelledError:
-        await _kill_process_group_and_reap(proc)
+        if proc is not None:
+            await _kill_process_group_and_reap(proc)
         raise
-    log.emit("gate", task_id=task_id, command=command, exit_code=proc.returncode,
-             stderr=err.decode("utf-8", "replace")[:512])
+    finally:
+        gate.release(token)
+    log.emit(
+        "gate",
+        task_id=task_id,
+        command=command,
+        exit_code=proc.returncode,
+        stderr=err.decode("utf-8", "replace")[:512],
+        heavy=is_heavy,
+    )
     return proc.returncode
 
 
@@ -441,6 +482,12 @@ async def run_session(
         if not isinstance(task, str) or not task.strip():
             raise ValueError("run_session provider mode requires a non-empty task")
     log = EventLog(session_dir / ".cambium" / "events.jsonl", on_event)
+    gate = CompileGate(
+        max_concurrent=task_spec.get("compile_gate_max_concurrent"),
+        timeout_s=task_spec.get(
+            "compile_gate_acquire_timeout_s", DEFAULT_ACQUIRE_TIMEOUT_S
+        ),
+    )
     task_id = task_spec["task_id"]
     worker = task_spec.get("worker")
     if worker is None or worker == "cambium.worker":
@@ -740,7 +787,9 @@ async def run_session(
             remaining = wall_deadline - loop.time()
             try:
                 gate_rc = await _run_gate(
-                    task_spec["gate"], worktree, log, task_id, timeout=min(gate_timeout, remaining))
+                    task_spec["gate"], worktree, log, task_id,
+                    timeout=min(gate_timeout, remaining), gate=gate,
+                )
             except TimeoutError:
                 gate_rc = None
                 timed_out = True
@@ -1366,10 +1415,21 @@ class _Runtime:
         session_dir: Path,
         store: Any,
         on_event: EventSink | None = None,
+        *,
+        resource_thresholds: dict[str, Any] | None = None,
+        compile_gate_max_concurrent: int | None = None,
+        compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
         self._on_event = on_event
+        self._resource_thresholds = (
+            None if resource_thresholds is None else dict(resource_thresholds)
+        )
+        self._gate = CompileGate(
+            max_concurrent=compile_gate_max_concurrent,
+            timeout_s=compile_gate_acquire_timeout_s,
+        )
         self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._writer_task: asyncio.Task[None] | None = None
         self._handles: dict[str, WorkerHandle] = {}
@@ -1851,6 +1911,26 @@ class _Runtime:
             "task_assigned", task_id=task_id, repo=str(repo), branch=spec["branch"],
             base_commit=spec["base_commit"], task=spec.get("task", ""),
         )
+        thresholds = (
+            spec["resource_thresholds"]
+            if "resource_thresholds" in spec
+            else self._resource_thresholds
+        )
+        allowed, reasons = await asyncio.to_thread(can_run_heavy, thresholds)
+        if not allowed:
+            await self.emit(
+                "resource_denied",
+                task_id=task_id,
+                resource_denied=True,
+                reasons=reasons,
+            )
+            self._results[task_id] = TaskResult(
+                task_id=task_id,
+                status="failed",
+                exit_code=126,
+                reason="resource_denied",
+            )
+            return
         generation = await self._ensure_worktree(spec)
 
         restarts = 0
@@ -2370,22 +2450,32 @@ class _Runtime:
             rc = gates[tree]
             await self.emit("gate", task_id=task_id, exit_code=rc, skipped=True, tree=tree)
             return rc
-        proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", gate, cwd=str(worktree),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
-            start_new_session=True,
-            pass_fds=(),
-            close_fds=True,
-        )
+        command_tokens = shlex.split(gate)
+        is_heavy = self._gate.is_heavy(command_tokens)
+        token = await self._gate.acquire(command_tokens) if is_heavy else None
+        if token is False:
+            await self.emit(
+                "gate", task_id=task_id, exit_code=126, tree=tree,
+                timed_out=False, resource_denied=True, heavy=is_heavy,
+            )
+            return 126
+        proc = None
         try:
+            proc = await asyncio.create_subprocess_exec(
+                "sh", "-c", gate, cwd=str(worktree),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
+                start_new_session=True,
+                pass_fds=(),
+                close_fds=True,
+            )
             out, err = await _communicate_gate_bounded(proc, timeout)
             rc = proc.returncode if proc.returncode is not None else 1
         except _GateOutputOverflow as exc:
             rc = 125
             await self.emit(
                 "gate", task_id=task_id, exit_code=rc, tree=tree,
-                timed_out=False, output_overflow=True,
+                timed_out=False, output_overflow=True, heavy=is_heavy,
             )
             output = exc.stdout + exc.stderr
             if output:
@@ -2394,22 +2484,32 @@ class _Runtime:
                     message=output.decode("utf-8", "replace")[:2048],
                 )
         except TimeoutError:
-            await _kill_process_group_and_reap(proc)
+            if proc is not None:
+                await _kill_process_group_and_reap(proc)
             rc = 124
-            await self.emit("gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=True)
+            await self.emit(
+                "gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=True,
+                heavy=is_heavy,
+            )
         except asyncio.CancelledError:
-            await _kill_process_group_and_reap(proc)
+            if proc is not None:
+                await _kill_process_group_and_reap(proc)
             raise
         else:
             if tree is not None:
                 gates[tree] = rc
-            await self.emit("gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=False)
+            await self.emit(
+                "gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=False,
+                heavy=is_heavy,
+            )
             output = (out or b"") + (err or b"")
             if output:
                 await self.emit(
                     "log", task_id=task_id, stream="gate",
                     message=output.decode("utf-8", "replace")[:2048],
                 )
+        finally:
+            self._gate.release(token)
         return rc
 
     # -- merge ---------------------------------------------------------------
@@ -2710,6 +2810,10 @@ async def run_plan(
     session_dir: str | Path,
     plan: dict[str, Any] | list[dict[str, Any]],
     on_event: EventSink | None = None,
+    *,
+    resource_thresholds: dict[str, Any] | None = None,
+    compile_gate_max_concurrent: int | None = None,
+    compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -2731,7 +2835,14 @@ async def run_plan(
     admission.acquire()
     try:
         store = _open_store(session_dir)
-        runtime = _Runtime(session_dir, store, on_event=on_event)
+        runtime = _Runtime(
+            session_dir,
+            store,
+            on_event=on_event,
+            resource_thresholds=resource_thresholds,
+            compile_gate_max_concurrent=compile_gate_max_concurrent,
+            compile_gate_acquire_timeout_s=compile_gate_acquire_timeout_s,
+        )
         await runtime.start()
         cancelled = False
         try:

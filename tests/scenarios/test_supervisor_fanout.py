@@ -34,6 +34,7 @@ import pytest
 from cambium import supervisor
 from cambium import supervisor as supervisor_module
 from cambium.merge import MergeSequencer
+from cambium.resources import CompileGate
 from cambium.store import EventStore
 from cambium.supervisor import read_events, run_plan
 
@@ -41,6 +42,11 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKER = str(ROOT / "scripts" / "fake_worker.py")
 CRASH_WORKER = str(ROOT / "tests" / "fixtures" / "crash_worker.py")
 ENV_WORKER = str(ROOT / "tests" / "fixtures" / "env_worker.py")
+TEST_RESOURCE_THRESHOLDS = {
+    "mem_available_frac": 0.0,
+    "load1_per_cpu": 1_000_000.0,
+    "disk_free": 0,
+}
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
@@ -86,6 +92,7 @@ def _task(
         "gate": gate,
         "base_commit": base,
         "provider_env_keys": ["FAKE_MODE"],
+        "resource_thresholds": TEST_RESOURCE_THRESHOLDS,
     }
     spec.update(extra)
     return spec
@@ -721,10 +728,11 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
                 "repo": str(repo),
                 "worktree_path": str(session_dir / "wt-slow"),
                 "branch": "wt-slow",
-                "worker": WORKER,
-                "gate": "true",
-                "provider_env_keys": ["FAKE_MODE"],
-            }
+                    "worker": WORKER,
+                    "gate": "true",
+                    "provider_env_keys": ["FAKE_MODE"],
+                    "resource_thresholds": TEST_RESOURCE_THRESHOLDS,
+                }
         ]
     }
     plan_path = tmp_path / "plan.json"
@@ -1170,3 +1178,322 @@ def test_t8_supervisor_git_sync_post_checkout_hook_sees_no_provider_key(
     for record in records:
         assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in record
         assert "hook-secret" not in json.dumps(record)
+
+
+# ---------------------------------------------------------------------------
+# Resource admission: the session CompileGate bounds concurrent heavy gate
+# commands and refunds its permit on every exit path.
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_make(tmp_path: Path, monkeypatch, body: str) -> None:
+    """Put a fake ``make`` first in os.defpath so the gate child env runs it."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    make = bin_dir / "make"
+    make.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    make.chmod(0o755)
+    monkeypatch.setattr(os, "defpath", f"{bin_dir}{os.pathsep}{os.defpath}")
+
+
+def _gate_spec(
+    session_dir: Path, repo: Path, base: str, task_id: str, *, gate: str, **extra: object,
+) -> dict[str, object]:
+    spec: dict[str, object] = {
+        "task_id": task_id,
+        "task": f"edit {task_id}",
+        "repo": str(repo),
+        "worktree_path": str(session_dir / f"wt-{task_id}"),
+        "branch": f"wt-{task_id}",
+        "base_commit": base,
+        "gate": gate,
+    }
+    spec.update(extra)
+    return spec
+
+
+def test_resource_gate_bounds_ten_concurrent_heavy_gates(tmp_path, monkeypatch) -> None:
+    """Ten concurrent heavy gates never exceed the session's configured bound."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    slots = tmp_path / "make-slots.log"
+    _install_fake_make(
+        tmp_path,
+        monkeypatch,
+        f"echo start >> {shlex.quote(str(slots))}\n"
+        "sleep 0.2\n"
+        f"echo end >> {shlex.quote(str(slots))}",
+    )
+    specs = [_gate_spec(session_dir, repo, base, f"t-{i}", gate="make") for i in range(10)]
+
+    async def scenario() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(
+            session_dir,
+            store,
+            compile_gate_max_concurrent=2,
+            compile_gate_acquire_timeout_s=10.0,
+        )
+        await runtime.start()
+        try:
+            for spec in specs:
+                await runtime._ensure_worktree(spec)
+            worktrees = [Path(spec["worktree_path"]) for spec in specs]
+            rcs = await asyncio.gather(
+                *(runtime._run_gate(spec, worktree)
+                  for spec, worktree in zip(specs, worktrees, strict=True))
+            )
+            assert rcs == [0] * 10
+            stats = runtime._gate.stats()
+            assert stats["heavy"] == 10
+            assert stats["current"] == 0
+            assert stats["timeouts"] == 0
+        finally:
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+    lines = slots.read_text(encoding="utf-8").splitlines()
+    active = 0
+    maximum = 0
+    for line in lines:
+        active += 1 if line == "start" else -1
+        maximum = max(maximum, active)
+        assert active >= 0
+    assert active == 0
+    assert maximum == 2
+
+
+def test_resource_gate_refunds_permit_on_cancellation(tmp_path, monkeypatch) -> None:
+    """Cancelling a task holding a permit lets the next heavy gate acquire."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    _install_fake_make(tmp_path, monkeypatch, "sleep 1.0")
+    spec_hold = _gate_spec(session_dir, repo, base, "t-hold", gate="make")
+    spec_next = _gate_spec(session_dir, repo, base, "t-next", gate="make")
+
+    async def scenario() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        runtime._gate = CompileGate(max_concurrent=1, timeout_s=2.0)
+        await runtime.start()
+        try:
+            await runtime._ensure_worktree(spec_hold)
+            await runtime._ensure_worktree(spec_next)
+            holder = asyncio.create_task(
+                runtime._run_gate(spec_hold, Path(spec_hold["worktree_path"]))
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            while runtime._gate.stats()["current"] == 0 and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            assert runtime._gate.stats()["current"] == 1
+
+            follower = asyncio.create_task(
+                runtime._run_gate(spec_next, Path(spec_next["worktree_path"]))
+            )
+            await asyncio.sleep(0.05)
+            assert runtime._gate.stats()["waits"] >= 1
+
+            holder.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await holder
+
+            rc = await asyncio.wait_for(follower, timeout=5.0)
+            assert rc == 0
+            assert runtime._gate.stats()["current"] == 0
+        finally:
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_resource_gate_acquire_timeout_fails_closed(tmp_path, monkeypatch) -> None:
+    """A saturated heavy gate emits a distinct resource-denied verdict."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    _install_fake_make(tmp_path, monkeypatch, "exit 0")
+    spec = _gate_spec(session_dir, repo, base, "t-denied-gate", gate="make")
+
+    async def scenario() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(
+            session_dir,
+            store,
+            compile_gate_max_concurrent=1,
+            compile_gate_acquire_timeout_s=0.05,
+        )
+        await runtime.start()
+        held = await runtime._gate.acquire(["make"])
+        assert held is not None
+        try:
+            await runtime._ensure_worktree(spec)
+            rc = await runtime._run_gate(spec, Path(spec["worktree_path"]))
+            assert rc == 126
+        finally:
+            runtime._gate.release(held)
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+    events = _kinds(read_events(session_dir), "gate")
+    assert len(events) == 1
+    assert events[0]["payload"]["exit_code"] == 126
+    assert events[0]["payload"]["resource_denied"] is True
+    assert events[0]["payload"]["timed_out"] is False
+
+
+def test_resource_gate_refunds_permit_on_timeout(tmp_path, monkeypatch) -> None:
+    """A gate that expires its gate_timeout_s budget still refunds its permit."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    _install_fake_make(tmp_path, monkeypatch, "sleep 10")
+    spec = _gate_spec(
+        session_dir, repo, base, "t-timeout", gate="make", gate_timeout_s=0.2,
+    )
+
+    async def scenario() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        runtime._gate = CompileGate(max_concurrent=1, timeout_s=5.0)
+        await runtime.start()
+        try:
+            await runtime._ensure_worktree(spec)
+            rc = await runtime._run_gate(spec, Path(spec["worktree_path"]))
+            assert rc == 124
+            stats = runtime._gate.stats()
+            assert stats["current"] == 0
+            assert stats["heavy"] == 1
+        finally:
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_resource_gate_refunds_permit_on_output_overflow(tmp_path, monkeypatch) -> None:
+    """A heavy gate that floods the capture buffer still refunds its permit."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    _install_fake_make(tmp_path, monkeypatch, "yes x | head -c 200000")
+    spec = _gate_spec(session_dir, repo, base, "t-overflow", gate="make")
+
+    async def scenario() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        runtime._gate = CompileGate(max_concurrent=1, timeout_s=5.0)
+        await runtime.start()
+        try:
+            await runtime._ensure_worktree(spec)
+            rc = await runtime._run_gate(spec, Path(spec["worktree_path"]))
+            assert rc == 125
+            stats = runtime._gate.stats()
+            assert stats["current"] == 0
+            assert stats["heavy"] == 1
+        finally:
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_resource_gate_bypasses_non_heavy_gates(tmp_path) -> None:
+    """A grep-style gate takes no permit and leaves the heavy counter untouched."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    spec = _gate_spec(session_dir, repo, base, "t-grep", gate="grep -q 'file a' a.txt")
+
+    async def scenario() -> None:
+        store = EventStore(session_dir / ".cambium" / "events.db")
+        runtime = supervisor_module._Runtime(session_dir, store)
+        await runtime.start()
+        try:
+            await runtime._ensure_worktree(spec)
+            rc = await runtime._run_gate(spec, Path(spec["worktree_path"]))
+            assert rc == 0
+            stats = runtime._gate.stats()
+            assert stats["current"] == 0
+            assert stats["heavy"] == 0
+            assert stats["waits"] == 0
+        finally:
+            await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_session_gates_do_not_share_permits(tmp_path) -> None:
+    """Two sessions with different capacities cannot observe each other's permits."""
+    async def scenario() -> None:
+        runtime1 = supervisor_module._Runtime(
+            tmp_path / "s1",
+            None,
+            compile_gate_max_concurrent=1,
+            compile_gate_acquire_timeout_s=1.0,
+        )
+        runtime2 = supervisor_module._Runtime(
+            tmp_path / "s2",
+            None,
+            compile_gate_max_concurrent=3,
+            compile_gate_acquire_timeout_s=1.0,
+        )
+
+        token = await runtime1._gate.acquire(["make"])
+        assert token is not None
+        tokens = [await runtime2._gate.acquire(["make"]) for _ in range(3)]
+        assert all(t is not None for t in tokens)
+        assert runtime1._gate.stats()["current"] == 1
+        assert runtime2._gate.stats()["current"] == 3
+
+        runtime1._gate.release(token)
+        for other in tokens:
+            runtime2._gate.release(other)
+
+    asyncio.run(scenario())
+
+
+def test_resource_gate_fail_closed_preflight_creates_no_worktree(tmp_path) -> None:
+    """An impossible memory threshold refuses admission before worktree creation."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-denied",
+        worktree="wt-denied",
+        branch="wt-denied",
+        target_file="a.txt",
+        marker="// denied",
+        gate="make --version",
+    )
+    task["resource_thresholds"] = {
+        "mem_available_frac": 1.0,
+        "load1_per_cpu": 1_000_000.0,
+        "disk_free": 0,
+    }
+
+    result = asyncio.run(
+        run_plan(
+            session_dir,
+            {"tasks": [task]},
+            resource_thresholds={
+                "mem_available_frac": 0.0,
+                "load1_per_cpu": 1_000_000.0,
+                "disk_free": 0,
+            },
+        )
+    )
+
+    assert result.exit_code == 1
+    assert result.results[0].exit_code == 126
+    assert result.results[0].reason == "resource_denied"
+    assert not Path(task["worktree_path"]).exists()
+    denied = _kinds(read_events(session_dir), "resource_denied")
+    assert len(denied) == 1
+    assert denied[0]["payload"]["resource_denied"] is True
+    assert any("mem_available_frac" in reason for reason in denied[0]["payload"]["reasons"])
