@@ -1271,8 +1271,8 @@ def build_session_redactor(
     """Build one immutable, session-scoped Redactor from a secret-value snapshot.
 
     The snapshot is captured at construction and can never change afterwards.
-    A session builds a single instance here and hands it to its EventStore and
-    DeadLetterQueue so every durable writer redacts the same exact values.
+    A session builds a single instance here and hands it to its EventStore so
+    persisted event records redact the same exact values.
 
     ``secret_values`` are registered for substring redaction (compact machine
     tokens, wherever they appear); ``whole_values`` are replaced only when a

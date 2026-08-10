@@ -206,19 +206,15 @@ def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:
 def test_doctor_warns_on_corrupt_session_json(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     session_dir = tmp_path / "session"
-    dlq = session_dir / ".cambium" / "dlq.db"
-    dlq.parent.mkdir(parents=True)
-    dlq.write_bytes(b"not sqlite")
     cache = session_dir / ".cambium" / "eval-cache" / "ab"
     cache.mkdir(parents=True)
     (cache / "bad.json").write_text("[not json", encoding="utf-8")
 
     result = _run_doctor("--session-dir", str(session_dir), cwd=tmp_path)
 
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "DLQ store" in result.stdout and "database" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
     assert "Eval-cache directory" in result.stdout and "corrupt" in result.stdout
-    assert "1 fail" in result.stdout
+    assert "0 fail" in result.stdout
 
 
 def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -> None:
@@ -229,10 +225,6 @@ def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -
     with sqlite3.connect(conversations) as connection:
         connection.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY)")
 
-    dlq = session_dir / ".cambium" / "dlq.db"
-    with sqlite3.connect(dlq) as connection:
-        connection.execute("CREATE TABLE dlq_records (id INTEGER PRIMARY KEY)")
-        connection.execute("INSERT INTO dlq_records DEFAULT VALUES")
     cache = session_dir / ".cambium" / "eval-cache" / "ab"
     cache.mkdir(parents=True)
     (cache / "entry.json").write_text('{"answer": "ok"}\n', encoding="utf-8")
@@ -241,7 +233,6 @@ def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "conversations.db: integrity ok" in result.stdout
-    assert "dlq.db: integrity ok, 1 records" in result.stdout
     assert "0 fail" in result.stdout
 
 
