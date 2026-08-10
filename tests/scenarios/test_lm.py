@@ -1263,25 +1263,27 @@ def test_request_snapshot_rejects_non_finite_floats(value: float, entry_point: s
 
 def test_state_round_trip_loads_in_a_fresh_process(tmp_path: Path) -> None:
     _require_dspy()
+    from cambium.diffundo import Diffundo, ProviderConfig, ProviderTier
+    from cambium.lm import CambiumLM
+
+    diffundo = Diffundo(
+        [
+            ProviderConfig(
+                name="p",
+                tier=ProviderTier.FAST,
+                base_url="https://fake.invalid",
+                api_key_env="K_FAKE",
+                model="m",
+            )
+        ]
+    )
+    lm = CambiumLM(diffundo, ProviderTier.FAST)
+    state = lm.dump_state()
+    assert "diffundo" in state, "saved state must carry a reconstructable Diffundo"
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
     source = Path(__file__).resolve().parents[2] / "src"
-    save_script = """
-import json
-import sys
-
-sys.path.insert(0, sys.argv[1])
-from cambium.diffundo import Diffundo, ProviderConfig, ProviderTier
-from cambium.lm import CambiumLM
-
-diffundo = Diffundo(
-    [ProviderConfig(name="p", tier=ProviderTier.FAST,
-                    base_url="https://fake.invalid", api_key_env="K_FAKE", model="m")]
-)
-lm = CambiumLM(diffundo, ProviderTier.FAST)
-state = lm.dump_state()
-assert "diffundo" in state, "saved state must carry a reconstructable Diffundo"
-with open(sys.argv[2], "w") as fh:
-    json.dump(state, fh)
-"""
     load_script = """
 import json
 import sys
@@ -1296,14 +1298,6 @@ assert isinstance(loaded._diffundo, Diffundo), "fresh-process load must rebuild 
 assert loaded._tier.value == "fast"
 print("fresh-process load OK")
 """
-    state_path = tmp_path / "state.json"
-    saved = subprocess.run(
-        [sys.executable, "-c", save_script, str(source), str(state_path)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert saved.returncode == 0, saved.stderr
     loaded = subprocess.run(
         [sys.executable, "-c", load_script, str(source), str(state_path)],
         text=True,
