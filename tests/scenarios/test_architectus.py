@@ -793,6 +793,42 @@ def test_reset_converted_abort_clears_same_wave_descendant_spawn_and_history(
     assert core.in_flight == set()
 
 
+def test_fresh_reset_retry_then_abort_clears_same_wave_descendant_spawn_and_history() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [
+                [
+                    {"action": "spawn", "task_id": "child"},
+                    {"action": "reset_retry", "task_id": "root"},
+                    {"action": "reset_retry", "task_id": "root"},
+                ]
+            ]
+        ),
+        tree=tree,
+    )
+    core.aggregate("root", _envelope(None))
+
+    assert core.reset_retry_tasks == frozenset()
+    actions = asyncio.run(core.step([]))
+    expected = [
+        {"action": "reset_retry", "task_id": "root"},
+        {"action": "abort_subtree", "task_id": "root"},
+    ]
+
+    assert actions == expected
+    assert {"action": "spawn", "task_id": "child"} not in actions
+    assert core.action_history == expected
+    assert {"action": "spawn", "task_id": "child"} not in core.action_history
+
+
 def test_malformed_later_failure_event_does_not_consume_prior_event() -> None:
     tree = build_tree(_plan([("root", "FEATURE", [], None)]))
     core = ArchitectusCore(
