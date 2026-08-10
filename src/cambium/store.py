@@ -148,17 +148,20 @@ class _BoundedEventQueue:
     dropped (the incoming one). ``put`` returns the number of dropped items.
 
     ``on_evict`` runs after an accepted non-critical item is removed and before
-    the replacement is admitted. ``on_admit`` runs only after there is space.
+    the replacement is admitted, without holding the queue condition. The
+    removed item keeps a reserved queue slot until the callback succeeds; a
+    callback failure restores it. ``on_admit`` runs only after there is space.
     This lets the caller persist an evicted sequence before reserving the next
-    one.
+    one without blocking queue consumers or shutdown.
     """
 
-    __slots__ = ("_items", "_maxsize", "_cond")
+    __slots__ = ("_items", "_maxsize", "_cond", "_pending_evictions")
 
     def __init__(self, maxsize: int) -> None:
         self._items: deque[Any] = collections.deque()
         self._maxsize = maxsize
         self._cond = threading.Condition()
+        self._pending_evictions = 0
 
     def put(
         self,
@@ -166,14 +169,15 @@ class _BoundedEventQueue:
         *,
         critical: bool,
         timeout: float,
+        deadline: float | None = None,
         evict_noncritical: bool = True,
         on_admit: Callable[[], Any] | None = None,
-        on_evict: Callable[[Any], None] | None = None,
+        on_evict: Callable[[Any, float], None] | None = None,
         cancel: threading.Event | None = None,
         check: Callable[[], None] | None = None,
         dropped_holder: list[int] | None = None,
     ) -> int:
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if deadline is None else deadline
 
         def check_state() -> None:
             if cancel is not None and cancel.is_set():
@@ -181,39 +185,66 @@ class _BoundedEventQueue:
             if check is not None:
                 check()
 
+        def full() -> bool:
+            return len(self._items) + self._pending_evictions >= self._maxsize
+
         with self._cond:
             check_state()
             if not critical:
-                if len(self._items) >= self._maxsize:
+                if full():
                     check_state()
                     return 1
                 check_state()
                 self._items.append(on_admit() if on_admit is not None else item)
                 self._cond.notify()
                 return 0
-            dropped = 0
-            while len(self._items) >= self._maxsize:
+
+        dropped = 0
+        while True:
+            with self._cond:
                 check_state()
+                if not full():
+                    check_state()
+                    self._items.append(on_admit() if on_admit is not None else item)
+                    self._cond.notify()
+                    return dropped
+
                 evicted = (
                     self._evict_oldest_noncritical()
                     if evict_noncritical
                     else None
                 )
-                if evicted is not None:
-                    dropped += 1
-                    if dropped_holder is not None:
-                        dropped_holder[0] = dropped
-                    if on_evict is not None:
-                        on_evict(evicted)
+                if evicted is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Full
+                    self._cond.wait(remaining)
                     continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise queue.Full
-                self._cond.wait(remaining)
-            check_state()
-            self._items.append(on_admit() if on_admit is not None else item)
-            self._cond.notify()
-            return dropped
+                self._pending_evictions += 1
+
+            try:
+                if on_evict is not None:
+                    on_evict(evicted, deadline)
+            except BaseException:
+                with self._cond:
+                    self._pending_evictions -= 1
+                    self._restore_evicted(evicted)
+                    self._cond.notify_all()
+                raise
+
+            with self._cond:
+                self._pending_evictions -= 1
+                dropped += 1
+                if dropped_holder is not None:
+                    dropped_holder[0] = dropped
+                try:
+                    check_state()
+                    self._items.append(on_admit() if on_admit is not None else item)
+                except BaseException:
+                    self._cond.notify_all()
+                    raise
+                self._cond.notify()
+                return dropped
 
     def get(self, timeout: float, *, stop_event: threading.Event | None = None) -> Any:
         deadline = time.monotonic() + timeout
@@ -252,6 +283,16 @@ class _BoundedEventQueue:
                 del self._items[i]
                 return item
         return None
+
+    def _restore_evicted(self, item: Any) -> None:
+        evicted_seq = item[0]
+        for i, queued in enumerate(self._items):
+            if queued is _SENTINEL or (
+                isinstance(queued, tuple) and queued[0] > evicted_seq
+            ):
+                self._items.insert(i, item)
+                return
+        self._items.append(item)
 
 
 class EventStore:
@@ -351,6 +392,7 @@ class EventStore:
                 None,
                 critical=critical,
                 timeout=remaining,
+                deadline=deadline,
                 on_admit=admit,
                 on_evict=self._reserve_evicted_sequence,
                 cancel=self._close_requested,
@@ -423,18 +465,46 @@ class EventStore:
         with self._lock:
             self._dropped += count
 
-    def _reserve_evicted_sequence(self, item: Any) -> None:
+    def _reserve_evicted_sequence(self, item: Any, deadline: float) -> None:
         evicted_seq = item[0]
         with self._lock:
             next_seq = max(self._next_seq, evicted_seq + 1)
-        conn = sqlite3.connect(self._path, isolation_level=None)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StoreTimeout(
+                "event store could not persist an evicted sequence within the "
+                "critical append deadline"
+            )
+        conn = sqlite3.connect(self._path, isolation_level=None, timeout=0.0)
         try:
-            conn.execute(f"PRAGMA busy_timeout={_WRITER_BUSY_TIMEOUT_MS}").fetchall()
+            timeout_ms = max(int((deadline - time.monotonic()) * 1000), 0)
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}").fetchall()
             conn.execute("PRAGMA synchronous=FULL").fetchall()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StoreTimeout(
+                    "event store could not persist an evicted sequence within the "
+                    "critical append deadline"
+                )
+            timeout_ms = int(remaining * 1000)
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}").fetchall()
             cursor = conn.execute(_UPDATE_NEXT_SEQ, (next_seq,))
             if cursor.rowcount != 1:
                 raise StoreError("event store sequence counter is missing")
             cursor.close()
+            if time.monotonic() > deadline:
+                raise StoreTimeout(
+                    "event store could not persist an evicted sequence within the "
+                    "critical append deadline"
+                )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            raise StoreTimeout(
+                "event store could not persist an evicted sequence within the "
+                "critical append deadline"
+            ) from exc
         finally:
             conn.close()
 

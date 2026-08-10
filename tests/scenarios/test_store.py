@@ -725,6 +725,149 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
     assert [event["seq"] for event in reopened.events_after(2)] == [3]
 
 
+def test_failed_eviction_reservation_restores_event_and_sequence(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(
+        path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    starter_errors: list[BaseException] = []
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def append_starter() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            starter_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    starter = threading.Thread(target=append_starter)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        starter.start()
+        assert stalled.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(StoreTimeout):
+            store.append({"kind": "result", "payload": {"i": 2}})
+
+        assert store.dropped == 0
+        with store._queue._cond:
+            assert [item[0] for item in store._queue._items] == [2]
+    finally:
+        blocker.rollback()
+        blocker.close()
+        release.set()
+        starter.join(2.0)
+        store.close()
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {"i": 3}}) == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 2, 3]
+
+
+def test_eviction_reservation_respects_critical_deadline_and_close_bound(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    reservation_started = threading.Event()
+    append_done = threading.Event()
+    close_done = threading.Event()
+    append_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    starter_errors: list[BaseException] = []
+    append_finished: list[float] = []
+    close_finished: list[float] = []
+    real_fsync = EventStore._fsync_now
+    real_reserve = store._reserve_evicted_sequence
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(30.0)
+        real_fsync(self)
+
+    def reserve_eviction(item, *args) -> None:
+        reservation_started.set()
+        real_reserve(item, *args)
+
+    def append_critical() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 1}})
+        except BaseException as exc:
+            append_errors.append(exc)
+        finally:
+            append_finished.append(time.monotonic())
+            append_done.set()
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_finished.append(time.monotonic())
+            close_done.set()
+
+    def append_starter() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            starter_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    monkeypatch.setattr(store, "_reserve_evicted_sequence", reserve_eviction)
+    starter = threading.Thread(target=append_starter)
+    caller = threading.Thread(target=append_critical)
+    closer = threading.Thread(target=close_store)
+    blocker = sqlite3.connect(store._path, isolation_level=None)
+    try:
+        starter.start()
+        assert stalled.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        append_started = time.monotonic()
+        caller.start()
+        assert reservation_started.wait(1.0)
+        close_started = time.monotonic()
+        closer.start()
+
+        assert append_done.wait(1.0)
+        assert close_done.wait(3.0)
+        assert append_finished[0] - append_started < 1.0
+        assert close_finished[0] - close_started < 3.0
+        assert len(append_errors) == 1
+        assert isinstance(append_errors[0], StoreTimeout)
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], StoreTimeout)
+    finally:
+        blocker.rollback()
+        blocker.close()
+        release.set()
+        starter.join(5.0)
+        caller.join(5.0)
+        closer.join(5.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(5.0)
+
+
 def test_close_full_critical_queue_is_bounded(tmp_path, monkeypatch) -> None:
     store = EventStore(
         tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
