@@ -41,19 +41,19 @@ Matching role modules are not proof. No TUI exists.
 - Run the narrowest check, then an affected package or integration check when a change crosses a boundary.
 - Use same-version dataset, canary, schema, and baseline evidence. If the baseline moves, stop and record a new anchor before comparing results; never silently re-anchor.
 - Report VERIFIED only with command, cwd, exit status, and evidence. Use UNVERIFIED for an unrun claim and BLOCKED for an external blocker.
-- Protocol-order violations fail the worker; malformed advisory lines are logged and skipped; model parsing follows the module's bounded failure policy.
+- Protocol handling is boundary-specific; malformed advisory lines are logged/skipped, while fatal cases are listed under IPC below; model parsing follows the module's bounded failure policy.
 - Use enums for domain alternatives. Cite only `Decision` in `src/cambium/modules/example/decide.py` and `NodeStatus` in `src/cambium/tasktree.py`.
 
 Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a deny-by-name regex, not a strict environment allowlist. Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
 
 `supervisor.run_plan` concurrently fans out supplied tasks under one `asyncio.TaskGroup`; `tasktree.py` validates but does not schedule. The architecture DAG is target only.
 Boundary failure policy:
-- `PLAN`: task-tree validation rejects malformed or cyclic plans.
-- `IPC`: protocol violations, missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged and skipped.
-- `GATE`: the supervisor gate path treats a nonzero exit or timeout as failure before merge.
-- `MERGE`: a conflict or non-fast-forward emits `merge_failed`; nothing is published.
-- `APPROVAL`: missing, rejected, or unavailable approval fails closed (deny).
-- `SCHEMA`: malformed tool calls are rejected with validation errors.
+- `PLAN` (`tasktree.build_tree`): task-tree validation rejects malformed, duplicate, or cyclic plans.
+- `IPC` (`_Runtime._drive_generation`; framing `ipc.read_message`, worker `worker.run`): handling is per-boundary, not universally fail/restart; malformed frames, stale pongs, and oversized lines are fatal at their protocol checks, while duplicate task IDs are rejected by `tasktree.build_tree`. A wrong-request-id `ready` currently only emits a protocol event, so the task may still start. Missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged/skipped.
+- `GATE` (`_Runtime._run_gate`): a nonzero exit or timeout fails before merge.
+- `MERGE` (`_Runtime._merge_task`): a conflict or non-fast-forward emits `merge_failed`; nothing is published.
+- `APPROVAL` (`ApprovalGate.is_approved` in `src/cambium/approval.py`): approval is fail-closed by default; `fail_open` configuration permits execution without a reviewer — verify configuration. With `fail_open=True`, approval returns true without a callback for a command requiring approval.
+- `SCHEMA` (`validate_tool_call` in `src/cambium/schemas.py`): malformed tool calls return validation errors.
 
 ## Module map
 
@@ -74,11 +74,11 @@ Coding principles pointer: `docs/research/coding-constitution.md`.
 
 ## Commands
 
-Run from the repository root. The full suite is deterministic except for the known load-sensitive IPC fuzz timing test under repair; do not report it as unconditionally green. Use only real checks:
+Run from the repository root. The IPC fuzz test is load-sensitive; if it fails, check machine load before treating it as a regression. Use only real checks:
 
 | Check | Command |
 |---|---|
-| Full suite (not verified-green) | `uv run --python 3.14.7 --extra test pytest -q` |
+| Full suite | `uv run --python 3.14.7 --extra test pytest -q` |
 | Collect tests | `uv run --python 3.14.7 --extra test pytest --collect-only -q` |
 | Focused scenario | `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_supervisor_fanout.py` |
 | Lint | `uv run --python 3.14.7 --extra dev ruff check src tests` |
