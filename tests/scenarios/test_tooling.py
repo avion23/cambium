@@ -8,10 +8,14 @@ run ruff over ``src`` with the project's rules.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+
+from cambium import doctor
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
@@ -46,7 +50,45 @@ def test_doctor_exits_zero_on_healthy_repo() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Summary:" in result.stdout
     assert "0 fail" in result.stdout
-    assert "ALL CHECKS PASSED" in result.stdout
+    assert "Dataset integrity" in result.stdout
+    assert "module-owned JSONL" in result.stdout
+
+
+def test_doctor_exits_zero_without_example_module(tmp_path) -> None:
+    package = tmp_path / "cambium"
+    shutil.copytree(
+        REPO_ROOT / "src" / "cambium",
+        package,
+        ignore=shutil.ignore_patterns("example", "__pycache__"),
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(tmp_path)
+
+    result = subprocess.run(
+        DOCTOR,
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no module-owned JSONL datasets" in result.stdout
+    assert "0 fail" in result.stdout
+
+
+def test_doctor_fails_on_invalid_module_dataset(tmp_path, monkeypatch) -> None:
+    dataset = tmp_path / "modules" / "custom" / "datasets" / "records.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text('{"id": "ok"}\nnot-json\n', encoding="utf-8")
+    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "modules")
+
+    status, detail = doctor.check_dataset()
+
+    assert status is doctor.Status.FAIL
+    assert "invalid JSON" in detail
+    assert "records.jsonl:2" in detail
 
 
 def test_doctor_fails_on_corrupt_event_store(tmp_path) -> None:
