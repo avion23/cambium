@@ -32,6 +32,7 @@ no mutable module state.
 from __future__ import annotations
 
 import argparse
+import copy
 import heapq
 import json
 import sys
@@ -300,7 +301,7 @@ def build_tree(
         if not isinstance(spec, dict):
             raise TaskPlanError(f"task {task_id!r} has a non-dict spec")
         deps[task_id] = list(raw_deps)
-        specs[task_id] = spec
+        specs[task_id] = copy.deepcopy(spec)
 
     known = set(order)
     for tid, task_deps in deps.items():
@@ -459,7 +460,7 @@ def subtree_of(tree: TaskTree, task_id: str) -> TaskTree:
             task_id=node.task_id,
             kind=node.kind,
             parent_task_id=None if node.task_id == task_id else node.parent_task_id,
-            spec=node.spec,
+            spec=copy.deepcopy(node.spec),
             depth=depth[node.task_id],
             width_idx=width_idx[node.task_id],
             status=node.status,
@@ -495,7 +496,7 @@ def upward_result(node: TaskNode) -> dict[str, Any]:
         "files_changed": spec.get("files_changed", []),
         "status": node.status,
     }
-    return {key: values[key] for key in _ENVELOPE_KEYS}
+    return {key: copy.deepcopy(values[key]) for key in _ENVELOPE_KEYS}
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:

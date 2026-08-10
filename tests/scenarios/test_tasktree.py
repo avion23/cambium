@@ -102,6 +102,25 @@ def test_build_tree_chain_and_fanout() -> None:
     assert all(node.status is NodeStatus.PENDING for node in tree.nodes)
 
 
+def test_build_tree_snapshots_nested_input_spec() -> None:
+    nested = {"items": ["before"]}
+    plan = {
+        "tasks": [
+            {
+                "task_id": "r",
+                "kind": "FEATURE",
+                "depends_on": [],
+                "spec": {"nested": nested},
+            }
+        ]
+    }
+
+    tree = build_tree(plan)
+    nested["items"].append("after")
+
+    assert _node(tree, "r").spec == {"nested": {"items": ["before"]}}
+
+
 def test_task_kind_is_the_enum_norm() -> None:
     assert {kind.name for kind in TaskKind} == {
         "FEATURE", "BUGFIX", "REFACTOR", "TEST", "DOCS", "INVESTIGATION",
@@ -324,6 +343,33 @@ def test_subtree_of_isolates_child_context() -> None:
     assert len(full.edges) == len(tree.edges)
 
 
+def test_subtree_of_snapshots_nested_specs() -> None:
+    plan = {
+        "tasks": [
+            {
+                "task_id": "r",
+                "kind": "FEATURE",
+                "depends_on": [],
+                "spec": {"nested": {"items": ["root"]}},
+            },
+            {
+                "task_id": "a",
+                "kind": "TEST",
+                "depends_on": ["r"],
+                "spec": {"nested": {"items": ["child"]}},
+            },
+        ]
+    }
+    tree = build_tree(plan)
+
+    sub = subtree_of(tree, "r")
+    _node(tree, "r").spec["nested"]["items"].append("source")
+    _node(sub, "r").spec["nested"]["items"].append("subtree")
+
+    assert _node(tree, "r").spec["nested"]["items"] == ["root", "source"]
+    assert _node(sub, "r").spec["nested"]["items"] == ["root", "subtree"]
+
+
 def test_subtree_of_unknown_task_raises() -> None:
     tree = build_tree(_plan([("r", "FEATURE", [])]))
     with pytest.raises(TaskTreeError):
@@ -391,6 +437,28 @@ def test_upward_result_carries_diff_truncated_flag() -> None:
     assert set(result) == _ENVELOPE_KEYS_EXACT
     assert result["unified_diff"] == "64 KiB overflow"
     assert result["diff_truncated"] is True
+
+
+def test_upward_result_snapshots_nested_values_each_time() -> None:
+    node = TaskNode(
+        "c",
+        TaskKind.TEST,
+        "a",
+        {"metric_breakdown": {"tests": 1.0}, "commits": ["first"]},
+        2,
+        0,
+        NodeStatus.DONE,
+    )
+
+    first = upward_result(node)
+    second = upward_result(node)
+    first["metric_breakdown"]["tests"] = 0.0
+    first["commits"].append("second")
+
+    assert node.spec["metric_breakdown"] == {"tests": 1.0}
+    assert node.spec["commits"] == ["first"]
+    assert second["metric_breakdown"] == {"tests": 1.0}
+    assert second["commits"] == ["first"]
 
 
 def test_upward_result_never_carries_scratchpad() -> None:
