@@ -957,6 +957,14 @@ class DuplicateTaskIDError(ValueError):
     """The plan cannot be dispatched because a task id is repeated."""
 
 
+class InvalidBaseCommitError(ValueError):
+    """A task base does not resolve to a commit in its repository."""
+
+
+class WorktreeRecoveryError(RuntimeError):
+    """A destructive worktree recovery command failed."""
+
+
 @dataclass(slots=True)
 class WorkerHandle:
     """Loop-affine per-generation worker state (custos design §3.1)."""
@@ -1184,8 +1192,17 @@ class _Runtime:
         await asyncio.to_thread(write_generation, worktree, new_generation)
         for op in ("rebase", "merge", "cherry-pick"):
             await self._git(worktree, op, "--abort", check=False)
-        await self._git(worktree, "reset", "--hard", spec["base_commit"], check=False)
-        await self._git(worktree, "clean", "-fd", "-e", ".cambium/", check=False)
+        for args in (
+            ("reset", "--hard", spec["base_commit"]),
+            ("clean", "-fd", "-e", ".cambium/"),
+        ):
+            result = await self._git(worktree, *args, check=False)
+            if result.returncode != 0:
+                detail = (result.stderr + result.stdout).strip()[:512]
+                raise WorktreeRecoveryError(
+                    f"git {args[0]} failed during recovery (rc={result.returncode}) "
+                    f"in {worktree}: {detail}"
+                )
         await self.emit(
             "recover", task_id=spec["task_id"], generation=new_generation,
             base_commit=spec["base_commit"],
@@ -1283,6 +1300,21 @@ class _Runtime:
                     f"task {task_id}: no 'base_commit' in plan and {repo} has no refs/heads/main"
                 )
             spec["base_commit"] = base
+        requested_base = str(spec["base_commit"])
+        resolved_base = await self._git_stdout(
+            repo,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{requested_base}^{{commit}}",
+            check=False,
+        )
+        if not resolved_base:
+            raise InvalidBaseCommitError(
+                f"task {task_id}: base_commit {requested_base!r} does not resolve "
+                f"to a commit in {repo}"
+            )
+        spec["base_commit"] = resolved_base
 
         await self.emit(
             "task_assigned", task_id=task_id, repo=str(repo), branch=spec["branch"],

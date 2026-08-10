@@ -325,6 +325,106 @@ def test_generation_survives_crash_after_worktree_clean(
     assert not validate_worker_generation(worktree, 1)
 
 
+def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "published\n"})
+    worktree = session_dir / "wt-t-invalid-base"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-invalid-base",
+         str(worktree), base],
+        check=True,
+        capture_output=True,
+    )
+    (worktree / "hello.txt").write_text("stale dirty content\n", encoding="utf-8")
+    task = _task(
+        session_dir,
+        repo,
+        "not-a-real-commit",
+        "t-invalid-base",
+        worker=FAKE_WORKER,
+        gate="true",
+    )
+
+    def fail_spawn(*args, **kwargs):
+        raise AssertionError("invalid base spawned a worker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    assert result.results[0].status == "failed"
+    assert not _kinds(read_events(session_dir), "spawned")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == "published\n"
+
+
+@pytest.mark.parametrize("failed_command", ["reset", "clean"])
+def test_recovery_git_failure_fails_task_without_spawn_or_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_command: str
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "published\n"})
+    worktree = session_dir / "wt-t-recovery-failure"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-recovery-failure",
+         str(worktree), base],
+        check=True,
+        capture_output=True,
+    )
+    (worktree / "hello.txt").write_text("stale dirty content\n", encoding="utf-8")
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-recovery-failure",
+        worker=FAKE_WORKER,
+        gate="true",
+    )
+    real_git = supervisor_module._Runtime._git
+
+    async def fail_recovery_git(self, path, *args, check=True):
+        if args and args[0] == failed_command:
+            return subprocess.CompletedProcess(
+                ["git", *args], 23, stdout="", stderr=f"forced {failed_command} failure"
+            )
+        return await real_git(self, path, *args, check=check)
+
+    def fail_spawn(*args, **kwargs):
+        raise AssertionError("failed recovery spawned a worker")
+
+    monkeypatch.setattr(supervisor_module._Runtime, "_git", fail_recovery_git)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    assert result.results[0].status == "failed"
+    assert not _kinds(read_events(session_dir), "spawned")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == "published\n"
+
+
 @pytest.mark.parametrize("worker", [EOF_QUIET_WORKER, EOF_STALE_PONG_WORKER])
 def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     tmp_path: Path, monkeypatch, worker: str

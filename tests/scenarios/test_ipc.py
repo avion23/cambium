@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -651,6 +652,67 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
             await w.stop()
 
     asyncio.run(scenario())
+
+
+def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    hook_started = tmp_path / "hook-started"
+    hook_release = tmp_path / "hook-release"
+    hook = scratch / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    worktree = session_dir / "wt"
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-fence-hook",
+                          "task_id": "ipc-fence-hook", "generation": 2})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-fence-hook", task_id="ipc-fence-hook",
+                generation=2,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while not hook_started.exists():
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            write_generation(worktree, 3)
+            await asyncio.sleep(0.05)
+            hook_release.touch()
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert await w.proc.wait() == 1
+        finally:
+            hook_release.touch()
+            await w.stop()
+
+    asyncio.run(scenario())
+
+    commits_after_fence = subprocess.run(
+        ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert commits_after_fence == "0"
+    assert MARKER not in subprocess.run(
+        ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
 
 
 def test_worker_shutdown_graceful_exit(tmp_path) -> None:

@@ -103,6 +103,40 @@ def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def _fenced_git(
+    worktree: Path,
+    generation: int,
+    *args: str,
+    cwd: str | Path | None = None,
+) -> tuple[int, str, str]:
+    """Run mutating git while continuously enforcing the generation fence."""
+    _require_generation(worktree, generation)
+    proc = subprocess.Popen(
+        ["git", *args],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    while proc.poll() is None:
+        if validate_worker_generation(worktree, generation):
+            time.sleep(0.001)
+            continue
+        try:
+            os.killpg(proc.pid, 9)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        raise GenerationFenceError(
+            f"generation mismatch for {worktree}: worker={generation}, "
+            "persisted generation is different or missing"
+        )
+    stdout, stderr = proc.communicate()
+    _require_generation(worktree, generation)
+    return proc.returncode, stdout.strip(), stderr.strip()
+
+
 def _require_generation(worktree: Path, generation: int) -> None:
     if not validate_worker_generation(worktree, generation):
         raise GenerationFenceError(
@@ -182,6 +216,8 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
 
         def guarded_git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
             _require_generation(worktree, generation)
+            if args and args[0] in {"add", "commit"}:
+                return _fenced_git(worktree, generation, *args, cwd=cwd)
             return git(*args, cwd=cwd)
 
         _require_generation(worktree, generation)
