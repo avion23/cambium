@@ -4,18 +4,33 @@ No mocking libraries: every scenario drives the real EventStore against a temp
 directory, including a crash-durability subprocess that mirrors the methodology
 of docs/research/sqlite-wal-durability.md (os._exit mid-write, reopen, integrity
 check).
+
+M4 probes: bounded-queue overflow under a stalled writer (drop oldest
+non-critical, preserve critical), the critical-append hard deadline, the
+checkpoint-busy rule (never ack while a reader holds the WAL), and close()
+propagating a final fsync failure. Store-hardening probes cover close
+admission, sequence reuse, bounded forced shutdown, writer death, and lock
+ordering under concurrent overflow.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
-from cambium.store import CRITICAL_KINDS, EventStore, StoreError, StoreInitError
+from cambium.store import (
+    CRITICAL_KINDS,
+    EventStore,
+    StoreError,
+    StoreInitError,
+    StoreTimeout,
+)
 
 
 def _open(path):
@@ -193,9 +208,1175 @@ def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
         assert 4.0 <= elapsed < 30.0  # bounded by busy_timeout, not a hang
     finally:
         blocker.close()
-    # store is dead: subsequent appends fail immediately, close() does not hang
+    # store is dead: subsequent appends fail immediately, and close() surfaces
+    # the writer failure instead of reporting success.
     with pytest.raises(StoreError):
         store.append({"kind": "log", "payload": {}})
     with pytest.raises(StoreError):
         store.append({"kind": "result", "payload": {}})
+    with pytest.raises(StoreError):
+        store.close()
+
+
+def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        assert store.append({"kind": "log", "payload": {}}) == 1
+        store._thread.join(7.0)
+        assert not store._thread.is_alive()
+        assert store.dropped == 1
+
+        blocker.rollback()
+        blocker.close()
+        blocker = None
+        assert store.events_after(0) == []
+        with pytest.raises(StoreError):
+            store.close()
+    finally:
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {}}) == 2
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [2]
+
+
+def test_invalid_queue_and_deadline_config_raise(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        EventStore(tmp_path / "a.db", max_queue_size=0)
+    with pytest.raises(ValueError):
+        EventStore(tmp_path / "b.db", critical_timeout_s=0.0)
+    with pytest.raises(ValueError):
+        EventStore(tmp_path / "c.db", checkpoint_busy_retry_s=0.0)
+
+
+def test_stalled_writer_flood_drops_non_critical_preserves_critical(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db",
+        fsync_interval_s=60.0,
+        max_queue_size=8,
+        critical_timeout_s=10.0,
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(30.0)
+        real_fsync(self)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    try:
+        starter = threading.Thread(
+            target=lambda: store.append({"kind": "result", "payload": {"c": 0}})
+        )
+        starter.start()
+        assert stalled.wait(5.0)  # writer is now blocked in C0's fsync
+
+        start = time.monotonic()
+        for i in range(40):
+            store.append({"kind": "log", "payload": {"i": i}})
+        assert time.monotonic() - start < 5.0  # full queue never blocks non-critical
+
+        blocker = threading.Thread(
+            target=lambda: store.append({"kind": "result", "payload": {"c": 1}})
+        )
+        blocker.start()
+        while store.dropped < 33:  # 32 incoming drops + 1 eviction for the critical
+            time.sleep(0.01)
+        release.set()
+        blocker.join(10.0)
+        starter.join(10.0)
+        assert not blocker.is_alive()
+        assert not starter.is_alive()
+    finally:
+        release.set()
+        store.close()
+
+    assert store.dropped == 33
+    events = store.events_after(0)
+    # C0 (1) survives; seq 2 was evicted to admit C1 (10); incoming drops do
+    # not reserve sequence numbers; the remaining 7 flood events (3..9) are
+    # written before the critical.
+    assert [e["seq"] for e in events] == [1, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert [e["kind"] for e in events] == ["result"] + ["log"] * 7 + ["result"]
+
+
+def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatch) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.5
+    )
+    release = threading.Event()
+    real_fsync = EventStore._fsync_now
+
+    def stuck_fsync(self) -> None:
+        release.wait(30.0)
+        real_fsync(self)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stuck_fsync)
+    try:
+        start = time.monotonic()
+        with pytest.raises(StoreTimeout):
+            store.append({"kind": "result", "payload": {"ok": True}})
+        elapsed = time.monotonic() - start
+        assert 0.3 <= elapsed < 5.0  # bounded by the hard deadline, no hang
+        # store stays alive: a non-critical append is unaffected while the
+        # writer is stalled, and a later critical append succeeds on recovery.
+        assert store.append({"kind": "log", "payload": {}}) > 0
+        release.set()
+        seq = store.append({"kind": "result", "payload": {"ok": True}})
+        assert seq > 0
+    finally:
+        release.set()
+        store.close()
+
+    events = store.events_after(0)
+    # the timed-out event was still written once the writer recovered — it was
+    # never acknowledged before fsync, but the pending row is not dropped.
+    assert [e["seq"] for e in events] == [1, 2, 3]
+    assert len([e for e in events if e["kind"] == "result"]) == 2
+
+
+def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=1.0)
+    reader = sqlite3.connect(path)
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT seq FROM events").fetchall()
+        start = time.monotonic()
+        with pytest.raises(StoreError):  # StoreTimeout is a StoreError
+            store.append({"kind": "result", "payload": {"ok": True}})
+        elapsed = time.monotonic() - start
+        assert 0.5 <= elapsed < 10.0  # no ack, no hang
+    finally:
+        reader.rollback()
+        reader.close()
+
+    # once the reader releases, the writer's busy retry succeeds; the store
+    # stays usable and the timed-out event is still written durably.
+    store.append({"kind": "result", "payload": {"ok": True}})
     store.close()
+
+    events = store.events_after(0)
+    assert [e["seq"] for e in events] == [1, 2]
+    assert all(e["kind"] == "result" for e in events)
+
+
+def test_close_propagates_final_fsync_error(tmp_path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
+    store.append({"kind": "log", "payload": {"i": 0}})
+
+    def fail_fsync(self) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    with pytest.raises(OSError, match="No space left on device"):
+        store.close()
+
+
+def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
+    store.append({"kind": "log", "payload": {"i": 0}})
+    fsync_started = threading.Event()
+    release = threading.Event()
+    close_errors: list[tuple[str, BaseException]] = []
+    second_done = threading.Event()
+
+    def fail_final_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError(28, "No space left on device")
+
+    def close_store(name: str, done: threading.Event | None = None) -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append((name, exc))
+        finally:
+            if done is not None:
+                done.set()
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_final_fsync)
+    first = threading.Thread(target=close_store, args=("first",))
+    second = threading.Thread(target=close_store, args=("second", second_done))
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        second.start()
+        assert not second_done.wait(0.1)
+
+        release.set()
+        first.join(2.0)
+        second.join(2.0)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert close_errors
+        assert any(isinstance(error, OSError) for _, error in close_errors)
+        assert isinstance(store._close_error, OSError)
+    finally:
+        release.set()
+        first.join(2.0)
+        second.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+
+def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(
+        path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    append_errors: list[BaseException] = []
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def append_critical() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    starter = threading.Thread(target=append_critical)
+    try:
+        starter.start()
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        with pytest.raises(StoreTimeout, match="writer could not be stopped"):
+            store.close()
+        assert store._thread.is_alive()
+
+        release.set()
+        starter.join(5.0)
+        store._thread.join(5.0)
+        assert not starter.is_alive()
+        assert not store._thread.is_alive()
+        assert len(append_errors) == 1
+        assert isinstance(append_errors[0], StoreError)
+        for fd in (store._db_fd, store._wal_fd):
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        release.set()
+        starter.join(5.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(5.0)
+
+
+def test_close_release_during_stop_join_does_not_report_writer_not_stopped(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    starter_errors: list[BaseException] = []
+    real_fsync = EventStore._fsync_now
+    real_join = store._thread.join
+
+    def stalled_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def join(timeout=None) -> None:
+        if timeout is not None and timeout <= 0.1:
+            release.set()
+        real_join(timeout)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    monkeypatch.setattr(store._thread, "join", join)
+
+    def append_starter() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            starter_errors.append(exc)
+
+    starter = threading.Thread(target=append_starter)
+    try:
+        starter.start()
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        with pytest.raises(StoreTimeout) as error:
+            store.close()
+        writer_alive_at_return = store._thread.is_alive()
+
+        assert not writer_alive_at_return
+        assert "writer could not be stopped" not in str(error.value)
+        assert "sentinel was not admitted" in str(error.value)
+        starter.join(1.0)
+        assert not starter.is_alive()
+        assert len(starter_errors) == 1
+        assert isinstance(starter_errors[0], StoreError)
+    finally:
+        release.set()
+        starter.join(5.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(5.0)
+
+
+def test_writer_death_after_eviction_counts_dropped_event(tmp_path, monkeypatch) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=2.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    eviction_seen = threading.Event()
+    append_errors: list[tuple[str, BaseException]] = []
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("writer failed after eviction")
+
+    def append_event(name: str, kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append((name, exc))
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    first = threading.Thread(target=append_event, args=("first", "result", 0))
+    first.start()
+    try:
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        real_check = store._check_writer_alive
+        death_triggered = False
+
+        def check_after_eviction() -> None:
+            nonlocal death_triggered
+            if not death_triggered and not store._queue._items:
+                death_triggered = True
+                eviction_seen.set()
+                release.set()
+                deadline = time.monotonic() + 1.0
+                while True:
+                    with store._lock:
+                        dead = store._dead
+                    if dead is not None:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("writer did not die after eviction")
+                    time.sleep(0.001)
+            real_check()
+
+        monkeypatch.setattr(store, "_check_writer_alive", check_after_eviction)
+        critical = threading.Thread(target=append_event, args=("critical", "result", 1))
+        critical.start()
+        assert eviction_seen.wait(1.0)
+        critical.join(2.0)
+        first.join(2.0)
+        store._thread.join(2.0)
+
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert not store._thread.is_alive()
+        assert len(append_errors) == 2
+        assert all(isinstance(error, StoreError) for _, error in append_errors)
+        assert store.dropped == 1
+        with store._queue._cond:
+            assert not store._queue._items
+        events = store.events_after(0)
+        assert [event["kind"] for event in events] == ["result"]
+        with pytest.raises(StoreError):
+            store.close()
+    finally:
+        release.set()
+        first.join(2.0)
+        if "critical" in locals():
+            critical.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+
+def test_restart_after_evicted_event_writer_death_does_not_reuse_sequence(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=2.0)
+    fsync_started = threading.Event()
+    release = threading.Event()
+    eviction_seen = threading.Event()
+    append_errors: list[tuple[str, BaseException]] = []
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("writer failed after eviction")
+
+    def append_event(name: str, kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append((name, exc))
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    first = threading.Thread(target=append_event, args=("first", "result", 0))
+    first.start()
+    try:
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        real_check = store._check_writer_alive
+        death_triggered = False
+
+        def check_after_eviction() -> None:
+            nonlocal death_triggered
+            if not death_triggered and not store._queue._items:
+                death_triggered = True
+                eviction_seen.set()
+                release.set()
+                deadline = time.monotonic() + 1.0
+                while True:
+                    with store._lock:
+                        dead = store._dead
+                    if dead is not None:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("writer did not die after eviction")
+                    time.sleep(0.001)
+            real_check()
+
+        monkeypatch.setattr(store, "_check_writer_alive", check_after_eviction)
+        critical = threading.Thread(target=append_event, args=("critical", "result", 1))
+        critical.start()
+        assert eviction_seen.wait(1.0)
+        critical.join(2.0)
+        first.join(2.0)
+        store._thread.join(2.0)
+
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert not store._thread.is_alive()
+        assert len(append_errors) == 2
+        assert all(isinstance(error, StoreError) for _, error in append_errors)
+        assert store.dropped == 1
+        assert [event["seq"] for event in store.events_after(0)] == [1]
+        with pytest.raises(StoreError):
+            store.close()
+    finally:
+        release.set()
+        first.join(2.0)
+        if "critical" in locals():
+            critical.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+    monkeypatch.undo()
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        new_seq = reopened.append({"kind": "log", "payload": {"i": 2}})
+        assert new_seq == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
+
+
+def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=2, critical_timeout_s=0.5)
+    release = threading.Event()
+    stalled = threading.Event()
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    starter = threading.Thread(
+        target=lambda: store.append({"kind": "result", "payload": {"i": 0}})
+    )
+    closer_done = threading.Event()
+    close_errors: list[BaseException] = []
+    closer: threading.Thread | None = None
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            closer_done.set()
+
+    try:
+        starter.start()
+        assert stalled.wait(5.0)
+        accepted = [
+            store.append({"kind": "log", "payload": {"i": 1}}),
+            store.append({"kind": "log", "payload": {"i": 2}}),
+        ]
+        assert accepted == [2, 3]
+        assert store.append({"kind": "log", "payload": {"i": 3}}) is None
+        assert store.dropped == 1
+
+        closer = threading.Thread(target=close_store)
+        closer.start()
+        assert not closer_done.wait(0.05)  # sentinel is waiting, not evicting
+        release.set()
+        assert closer_done.wait(5.0)
+        closer.join(1.0)
+        starter.join(1.0)
+        assert not starter.is_alive()
+        assert close_errors == []
+    finally:
+        release.set()
+        if closer is not None:
+            closer.join(5.0)
+        starter.join(5.0)
+
+    events = store.events_after(0)
+    assert [event["seq"] for event in events] == [1, 2, 3]
+    assert [event["payload"]["i"] for event in events] == [0, 1, 2]
+    assert store.dropped == 1
+
+
+def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.5)
+    release = threading.Event()
+    stalled = threading.Event()
+    real_fsync = EventStore._fsync_now
+    first_result: list[int] = []
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    starter = threading.Thread(
+        target=lambda: first_result.append(
+            store.append({"kind": "result", "payload": {"i": 0}})
+        )
+    )
+    try:
+        starter.start()
+        assert stalled.wait(5.0)
+        accepted = store.append({"kind": "log", "payload": {"i": 1}})
+        dropped = store.append({"kind": "log", "payload": {"i": 2}})
+        assert accepted == 2
+        assert dropped is None
+        release.set()
+        starter.join(5.0)
+        assert first_result == [1]
+        store.close()
+    finally:
+        release.set()
+        starter.join(5.0)
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        new_seq = reopened.append({"kind": "log", "payload": {"i": 3}})
+        assert new_seq == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(2)] == [3]
+
+
+def test_failed_eviction_reservation_restores_event_and_sequence(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(
+        path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    starter_errors: list[BaseException] = []
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def append_starter() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            starter_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    starter = threading.Thread(target=append_starter)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        starter.start()
+        assert stalled.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(StoreTimeout):
+            store.append({"kind": "result", "payload": {"i": 2}})
+
+        assert store.dropped == 0
+        with store._queue._cond:
+            assert [item[0] for item in store._queue._items] == [2]
+    finally:
+        blocker.rollback()
+        blocker.close()
+        release.set()
+        starter.join(2.0)
+        store.close()
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {"i": 3}}) == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 2, 3]
+
+
+def test_writer_death_during_blocked_eviction_persistence_burns_sequence(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.5)
+    fsync_started = threading.Event()
+    release = threading.Event()
+    reservation_started = threading.Event()
+    append_errors: list[BaseException] = []
+    real_reserve = store._reserve_evicted_sequence
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("writer failed during eviction persistence")
+
+    def reserve_eviction(item, deadline) -> None:
+        reservation_started.set()
+        real_reserve(item, deadline)
+
+    def append_event(kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    monkeypatch.setattr(store, "_reserve_evicted_sequence", reserve_eviction)
+    first = threading.Thread(target=append_event, args=("result", 0))
+    critical = threading.Thread(target=append_event, args=("result", 1))
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        critical.start()
+        assert reservation_started.wait(1.0)
+        release.set()
+        store._thread.join(2.0)
+        critical.join(2.0)
+        first.join(2.0)
+        assert not store._thread.is_alive()
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert len(append_errors) == 2
+        assert all(isinstance(error, StoreError) for error in append_errors)
+        assert store.dropped == 1
+        with store._queue._cond:
+            assert not store._queue._items
+    finally:
+        blocker.rollback()
+        blocker.close()
+        release.set()
+        first.join(2.0)
+        critical.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+        if not store._closed:
+            try:
+                store.close()
+            except StoreError:
+                pass
+
+    monkeypatch.undo()
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {"i": 2}}) == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
+
+
+def test_close_retries_pending_sequence_persistence_after_reservation_lock(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.3)
+    fsync_started = threading.Event()
+    fsync_release = threading.Event()
+    reservation_started = threading.Event()
+    persistence_started = threading.Event()
+    append_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    real_reserve = store._reserve_evicted_sequence
+    real_persist = store._persist_pending_sequence_high_water
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        fsync_release.wait(5.0)
+        raise OSError("writer failed during close persistence")
+
+    def reserve_eviction(item, deadline) -> None:
+        reservation_started.set()
+        real_reserve(item, deadline)
+
+    def persist_sequence(*args, **kwargs):
+        persistence_started.set()
+        return real_persist(*args, **kwargs)
+
+    def append_event(kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    monkeypatch.setattr(store, "_reserve_evicted_sequence", reserve_eviction)
+    monkeypatch.setattr(store, "_persist_pending_sequence_high_water", persist_sequence)
+    first = threading.Thread(target=append_event, args=("result", 0))
+    critical = threading.Thread(target=append_event, args=("result", 1))
+    closer = threading.Thread(target=close_store)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        critical.start()
+        assert reservation_started.wait(1.0)
+        fsync_release.set()
+        store._thread.join(2.0)
+        assert not store._thread.is_alive()
+
+        closer.start()
+        assert persistence_started.wait(1.0)
+        time.sleep(0.45)  # let the blocked eviction reservation reach its deadline
+        blocker.rollback()
+        blocker.close()
+        blocker = None
+
+        closer.join(2.0)
+        critical.join(2.0)
+        first.join(2.0)
+        assert not closer.is_alive()
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], StoreError)
+        assert store.dropped == 1
+        assert store._pending_sequence_high_water is None
+    finally:
+        fsync_release.set()
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        closer.join(2.0)
+        critical.join(2.0)
+        first.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+    monkeypatch.undo()
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {"i": 2}}) == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
+
+
+def test_eviction_reservation_respects_critical_deadline_and_close_bound(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    reservation_started = threading.Event()
+    append_done = threading.Event()
+    close_done = threading.Event()
+    append_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    starter_errors: list[BaseException] = []
+    append_finished: list[float] = []
+    close_finished: list[float] = []
+    real_fsync = EventStore._fsync_now
+    real_reserve = store._reserve_evicted_sequence
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(30.0)
+        real_fsync(self)
+
+    def reserve_eviction(item, *args) -> None:
+        reservation_started.set()
+        real_reserve(item, *args)
+
+    def append_critical() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 1}})
+        except BaseException as exc:
+            append_errors.append(exc)
+        finally:
+            append_finished.append(time.monotonic())
+            append_done.set()
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_finished.append(time.monotonic())
+            close_done.set()
+
+    def append_starter() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            starter_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    monkeypatch.setattr(store, "_reserve_evicted_sequence", reserve_eviction)
+    starter = threading.Thread(target=append_starter)
+    caller = threading.Thread(target=append_critical)
+    closer = threading.Thread(target=close_store)
+    blocker = sqlite3.connect(store._path, isolation_level=None)
+    try:
+        starter.start()
+        assert stalled.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        append_started = time.monotonic()
+        caller.start()
+        assert reservation_started.wait(1.0)
+        close_started = time.monotonic()
+        closer.start()
+
+        assert append_done.wait(1.0)
+        assert close_done.wait(3.0)
+        assert append_finished[0] - append_started < 1.0
+        assert close_finished[0] - close_started < 3.0
+        assert len(append_errors) == 1
+        assert isinstance(append_errors[0], StoreTimeout)
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], StoreTimeout)
+    finally:
+        blocker.rollback()
+        blocker.close()
+        release.set()
+        starter.join(5.0)
+        caller.join(5.0)
+        closer.join(5.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(5.0)
+
+
+def test_close_full_critical_queue_is_bounded(tmp_path, monkeypatch) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    real_fsync = EventStore._fsync_now
+    append_errors: list[BaseException] = []
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def append_result(value: int) -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    first = threading.Thread(target=append_result, args=(0,))
+    second = threading.Thread(target=append_result, args=(1,))
+    try:
+        first.start()
+        assert stalled.wait(5.0)
+        second.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with store._queue._cond:
+                full = len(store._queue._items) == 1
+            if full:
+                break
+            time.sleep(0.001)
+        assert full
+
+        start = time.monotonic()
+        with pytest.raises(StoreTimeout):
+            store.close()
+        elapsed = time.monotonic() - start
+        assert elapsed < 3.0
+    finally:
+        release.set()
+        first.join(5.0)
+        second.join(5.0)
+        store._thread.join(5.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not store._thread.is_alive()
+    assert all(isinstance(exc, StoreError) for exc in append_errors)
+
+
+def test_close_raises_after_writer_death(tmp_path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
+
+    def fail_fsync(self) -> None:
+        raise OSError(5, "writer failed")
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    with pytest.raises(StoreError):
+        store.append({"kind": "result", "payload": {}})
+    with pytest.raises(StoreError, match="writer died") as error:
+        store.close()
+    assert isinstance(error.value.__cause__, OSError)
+
+
+def test_uncaught_base_exception_marks_writer_dead_and_wakes_critical_append(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=10.0)
+    fsync_started = threading.Event()
+    release = threading.Event()
+    append_errors: list[BaseException] = []
+
+    def fail_with_system_exit(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise SystemExit("injected writer termination")
+
+    def append_result() -> None:
+        try:
+            store.append({"kind": "result", "payload": {}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_with_system_exit)
+    caller = threading.Thread(target=append_result)
+    try:
+        caller.start()
+        assert fsync_started.wait(1.0)
+        release_at = time.monotonic()
+        release.set()
+        caller.join(1.0)
+        elapsed = time.monotonic() - release_at
+        assert not caller.is_alive()
+        assert elapsed < 0.5
+        assert store._dead is not None
+        assert isinstance(store._dead, SystemExit)
+        assert len(append_errors) == 1
+        assert isinstance(append_errors[0], StoreError)
+        assert isinstance(append_errors[0].__cause__, SystemExit)
+    finally:
+        release.set()
+        caller.join(1.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(1.0)
+
+
+def test_writer_death_rejects_waiting_admission_and_wakes_all_callers(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=10.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    append_errors: list[tuple[int, BaseException]] = []
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("fsync failed")
+
+    def append_result(value: int) -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append((value, exc))
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    first = threading.Thread(target=append_result, args=(0,))
+    queued = threading.Thread(target=append_result, args=(1,))
+    waiting = threading.Thread(target=append_result, args=(2,))
+    admission_waiting = threading.Event()
+    real_wait = store._queue._cond.wait
+
+    def track_wait(timeout=None):
+        admission_waiting.set()
+        return real_wait(timeout)
+
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        queued.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with store._queue._cond:
+                if len(store._queue._items) == 1:
+                    break
+            time.sleep(0.001)
+        else:
+            pytest.fail("queued event was not admitted")
+        monkeypatch.setattr(store._queue._cond, "wait", track_wait)
+        waiting.start()
+        assert admission_waiting.wait(1.0)
+        release_at = time.monotonic()
+        release.set()
+        for caller in (first, queued, waiting):
+            caller.join(1.0)
+        elapsed = time.monotonic() - release_at
+
+        assert elapsed < 0.5
+        assert all(not caller.is_alive() for caller in (first, queued, waiting))
+        assert len(append_errors) == 3
+        assert all(isinstance(error, StoreError) for _, error in append_errors)
+        with store._queue._cond:
+            assert not store._queue._items
+        assert store._dead is not None
+    finally:
+        release.set()
+        for caller in (first, queued, waiting):
+            caller.join(1.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(1.0)
+
+
+def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=2.0
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    real_fsync = EventStore._fsync_now
+    append_errors: list[BaseException] = []
+    second_started = threading.Event()
+    third_started = threading.Event()
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def append_result(value: int, started: threading.Event) -> None:
+        started.set()
+        try:
+            store.append({"kind": "result", "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    first = threading.Thread(target=append_result, args=(0, threading.Event()))
+    second = threading.Thread(target=append_result, args=(1, second_started))
+    third = threading.Thread(target=append_result, args=(2, third_started))
+    try:
+        first.start()
+        assert stalled.wait(5.0)
+        second.start()
+        assert second_started.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with store._queue._cond:
+                full = len(store._queue._items) == 1
+            if full:
+                break
+            time.sleep(0.001)
+        assert full
+        third.start()
+        assert third_started.wait(1.0)
+        time.sleep(0.01)
+
+        start = time.monotonic()
+        assert store.append({"kind": "log", "payload": {"i": 3}}) is None
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.2
+        assert store.dropped == 1
+    finally:
+        release.set()
+        first.join(5.0)
+        second.join(5.0)
+        third.join(5.0)
+        store.close()
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not third.is_alive()
+    assert append_errors == []
