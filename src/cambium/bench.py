@@ -270,13 +270,16 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         canary_scores = [module.metric(ex) for ex in scored if ex.canary]
 
     records = [r for split in SPLITS for r in raw.get(split, [])] or raw.get("combined", [])
+    canary_records = [
+        record
+        for record in (raw.get("canaries") or raw.get("combined", []))
+        if record.get("canary", False)
+    ]
     report: dict[str, Any] = {
         "module": module.name,
         "dataset_version": dataset_version,
         "metric": metric,
-        "canaries": canary_stats(
-            raw.get("canaries") or raw.get("combined", []), canary_scores
-        ),
+        "canaries": canary_stats(canary_records, canary_scores),
         "dataset": dataset_stats(records),
     }
     if note:
@@ -324,6 +327,8 @@ def compare_against_anchor(
     differs from the report's, so the two are not comparable and the caller
     must record a new anchor instead of failing (design §3: "the drift check
     compares only against the last baseline with the same dataset_version").
+    A report with unavailable split metrics still fails closed, even when its
+    dataset version is stale.
 
     Threshold precedence: run-level ``thresholds`` (e.g. from
     ``--bench-metric-delta``) override the anchor's stored
@@ -333,16 +338,27 @@ def compare_against_anchor(
     wall p90 fails when it exceeds ``anchor * wall_p90_ratio``; duplicate ids
     or cross-split leaks of any size and missing canaries always fail; a
     canary failure is a regression when it exceeds the anchor's count by more
-    than ``canary_failed_delta``.
+    than ``canary_failed_delta``; unavailable split metrics are regressions.
     """
+    report_metrics = report.get("metric") or {}
+    missing_split_regressions = [
+        (
+            f"metric.{split}",
+            "split metric unavailable; legacy combined fallback was scored",
+        )
+        for split in SPLITS
+        if not isinstance(report_metrics.get(split), dict)
+    ]
     if report.get("dataset_version") != anchor.get("dataset_version"):
+        if missing_split_regressions:
+            return missing_split_regressions
         return None  # stale anchor — re-anchor instead of comparing
 
     merged = dict(DEFAULT_THRESHOLDS)
     merged.update(anchor.get("drift_thresholds") or {})
     if thresholds:
         merged.update(thresholds)
-    regressions: list[tuple[str, str]] = []
+    regressions: list[tuple[str, str]] = missing_split_regressions
 
     metric_delta = merged["metric_mean_delta"]
     for split in SPLITS:

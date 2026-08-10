@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,26 @@ FAST_TESTS = [
 ]
 
 WALL_RATIO = "--bench-wall-ratio=100"
+
+
+def _copy_example_datasets(tmp_path: Path) -> tuple[Path, Path]:
+    modules_dir = tmp_path / "modules"
+    datasets_dir = modules_dir / "example" / "datasets"
+    datasets_dir.mkdir(parents=True)
+    shutil.copytree(
+        REPO_ROOT / "src" / "cambium" / "modules" / "example" / "datasets",
+        datasets_dir,
+        dirs_exist_ok=True,
+    )
+    return modules_dir, datasets_dir
+
+
+def _make_train_version_drift(datasets_dir: Path) -> None:
+    train_path = datasets_dir / "train.jsonl"
+    record = json.loads(train_path.read_text(encoding="utf-8").splitlines()[0])
+    record["schema_version"] = 999
+    record["dataset_version"] = "0.0.0"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
 
 def run_bench(
@@ -98,6 +119,64 @@ def test_report_writes_valid_baseline(tmp_path) -> None:
     assert baseline["tests"]["count"] == len(FAST_TESTS)
     assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
     assert baseline["tests"]["by_nodeid"].keys() == set(FAST_TESTS)
+
+
+def test_gate_fails_on_split_version_drift_fallback(tmp_path, monkeypatch, capsys) -> None:
+    import cambium.bench as bench
+
+    modules_dir, datasets_dir = _copy_example_datasets(tmp_path)
+    _make_train_version_drift(datasets_dir)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+
+    output = capsys.readouterr().out
+    assert "DRIFT should_decompose: metric.train" in output
+    assert "legacy combined fallback was scored" in output
+
+
+def test_fallback_canary_total_counts_only_flagged_records(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir, datasets_dir = _copy_example_datasets(tmp_path)
+    _make_train_version_drift(datasets_dir)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+
+    report = bench.build_module_report("example")
+
+    assert report["metric"]["combined"]["count"] == 9
+    assert report["canaries"]["total"] == 2
+    assert report["dataset"]["canaries"] == 2
+
+
+def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch, capsys) -> None:
+    import cambium.bench as bench
+
+    modules_dir, datasets_dir = _copy_example_datasets(tmp_path)
+    _make_train_version_drift(datasets_dir)
+    pairs_path = datasets_dir / "example_pairs.jsonl"
+    records = [
+        json.loads(line)
+        for line in pairs_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    pairs_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records if not record.get("canary")),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    baseline = json.loads(
+        (bench_root / "should_decompose" / "baseline.json").read_text(encoding="utf-8")
+    )
+    assert baseline["canaries"]["total"] == 0
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+
+    assert "DRIFT should_decompose: canaries.total" in capsys.readouterr().out
 
 
 def test_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:

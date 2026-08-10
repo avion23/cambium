@@ -211,6 +211,55 @@ def test_invalid_meta_rejected_by_load_and_load_split(tmp_path) -> None:
         ExampleDatasetLoader(src).load_split(Split.TRAIN)
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_meta_json_constants_rejected(tmp_path, constant) -> None:
+    src = _fresh_copy(tmp_path)
+    (src / "meta.json").write_text(
+        f'{{"corrupt": {constant}}}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(DatasetError, match="invalid JSON"):
+        ExampleDatasetLoader(src).load()
+
+
+@pytest.mark.parametrize("entrypoint", ["load", "load_split"])
+def test_metadata_deletion_race_cannot_disable_version_validation(
+    tmp_path, monkeypatch, entrypoint
+) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    meta_path = src / "meta.json"
+    meta = {"schema_version": 1, "dataset_version": "1.1.0"}
+    meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    record = {
+        "id": "train-1",
+        "schema_version": 999,
+        "dataset_version": "0.0.0",
+        "input": {"task": "Do a thing.", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    train_path = src / "train.jsonl"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    loader = ExampleDatasetLoader(train_path if entrypoint == "load" else src)
+    reads = 0
+    real_read_meta = loader._read_meta
+
+    def read_meta_once_then_delete() -> dict:
+        nonlocal reads
+        data = real_read_meta()
+        reads += 1
+        if reads == 1:
+            meta_path.unlink()
+        return data
+
+    monkeypatch.setattr(loader, "_read_meta", read_meta_once_then_delete)
+    action = loader.load if entrypoint == "load" else lambda: loader.load_split(Split.TRAIN)
+    with pytest.raises(DatasetError, match="version drift"):
+        action()
+    assert reads == 1
+
+
 def test_bench_falls_back_after_load_rejects_split_version_drift(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
