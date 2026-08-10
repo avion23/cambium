@@ -9,6 +9,11 @@ audit anchor `96da568`)
 **Evidence source:** read-only `git ls-tree` checks over all 22 `wt-*` branch
 trees. The later `main` anchor `6109a6a` is historical provenance, not a current
 count or baseline.
+**Reproduction boundary:** Those 22 branch refs were later deleted. The
+recorded 63-path union cannot be regenerated from this checkout; the snippets
+below are historical evidence, not runnable current commands. Retained anchors
+are `wt-hygiene` at `96da568`, the `wt-arch` base `a0fc528`, and recorded `main`
+at `6109a6a`.
 
 ---
 
@@ -56,7 +61,9 @@ the checkout being changed.
 **Branch provenance:** `wt-arch` adds the architecture, templates, and
 `agents.md`; `wt-datasets` adds dataset/scripts paths; `wt-slice` adds the
 vertical-slice paths; `wt-deltas2` and `wt-fb2` add no commits beyond `main`.
-The merge risk is recorded in step 0 below.
+These names are retained as the available subset of the historical input; the
+other branch tips from the 22-tree union are no longer addressable. The merge
+risk is recorded in step 0 below.
 
 ### Proposed historical tree
 
@@ -157,16 +164,17 @@ is orientation, not architecture.
 
 ---
 
-## 3. Naming and reorg checklist
+## 3. Historical naming and reorg checklist (not current instructions)
 
 Use kebab-case Markdown names, snake_case Python names, `test_<target>.py` test
 names, and `src/cambium/modules/<name>/architecture.md` for new module docs.
 Branches and worktrees follow the recorded `wt-<name>` convention.
 
-Run this sequence only after all `wt-*` branches merge; the commands are the
-historical plan, not evidence that they ran.
+This records the proposed sequence from the snapshot. It is not a current
+runbook, and no command below proves a present-tree state.
 
-**Step 0 — Merge precondition.** Merge all `wt-*` branches into `main`. `wt-arch`
+**Recorded step 0 — Merge precondition.** The plan called for merging all
+`wt-*` branches into `main`. `wt-arch`
 branched from `a0fc528`; keep `main`'s `.gitignore`, `README.md`, `pyproject.toml`,
 `src/`, `uv.lock`, `implementation-plan.md`, and `docs/research/*`, while taking
 `wt-arch`'s `agents.md`, `docs/architecture.md`, and
@@ -177,9 +185,9 @@ git ls-files docs/ | sort
 git mv docs/foo.md docs/research/foo.md        # only if a file is misplaced
 ```
 
-**Step 1 — Clean-tree and baseline.** On the merged checkout, expect a clean
-status, no `wt-*` branches, and re-measure the tracked-file count; the audit's
-63-path union is only a historical comparison.
+**Recorded step 1 — Clean-tree and baseline.** The plan expected a clean status,
+no `wt-*` branches, and a new tracked-file count; the audit's 63-path union is
+only a historical comparison.
 
 ```sh
 git status --porcelain
@@ -187,54 +195,56 @@ git ls-files | wc -l
 git branch | grep '^wt-'
 ```
 
-**Step 2 — Remove the transient tracker.** Record final status, then remove and
-commit `implementation-plan.md`.
+**Recorded step 2 — Remove the transient tracker.** The plan called for
+recording final status, then removing and committing `implementation-plan.md`.
 
 ```sh
 git rm implementation-plan.md
 git commit -m "chore: remove transient implementation-plan.md (implementation done)"
 ```
 
-**Step 3 — Confirm placement.** Verify research, reviews, canonical architecture,
-templates, and per-module docs with `git ls-files docs/ src/cambium/modules/`;
-move only a genuine straggler.
+**Recorded step 3 — Confirm placement.** The plan called for checking research,
+reviews, canonical architecture, templates, and per-module docs, moving only a
+genuine straggler.
 
-**Step 4 — Harden `.gitignore`.** After checking existing entries, add env,
-editor/OS, and log patterns, then commit the change.
+**Recorded step 4 — Harden `.gitignore`.** The plan called for adding env,
+editor/OS, and log patterns after checking existing entries, then committing.
 
 ```sh
 printf '\n# Secrets\n.env\n.env.*\n\n# Editor / OS\n.DS_Store\n*.swp\n*~\n\n# Logs\n*.log\n' >> .gitignore
 git add .gitignore && git commit -m "chore: harden .gitignore (.env, editor/OS, logs)"
 ```
 
-**Step 5 — Update README pointers.** Keep `docs/architecture.md` authoritative;
-mark `docs/system-design.md` superseded; point to `docs/module-template/`,
-`docs/research/`, `docs/reviews/`, `agents.md`, and the per-module architecture
-doc, then commit.
+**Recorded step 5 — Update README pointers.** The plan kept
+`docs/architecture.md` authoritative, marked `docs/system-design.md`
+superseded, and pointed to the module templates, research, reviews, `agents.md`,
+and per-module architecture doc before committing.
 
 ```sh
 git add README.md && git commit -m "docs: point README at canonical architecture and docs tree"
 ```
 
-**Step 6 — Final sweep.** Check status, duplicate basenames, tracked junk, and
-`.gitignore` coverage (`.venv/x.py`, `__pycache__/y.py`, `.pytest_cache/z.txt`).
-The expected duplicate-basename set is only package `__init__.py` and the
-three intentional `architecture.md` paths.
+**Recorded step 6 — Final sweep.** The plan checked status, duplicate basenames,
+tracked junk, and `.gitignore` coverage (`.venv/x.py`, `__pycache__/y.py`,
+`.pytest_cache/z.txt`). Its expected duplicate-basename set was package
+`__init__.py` and three intentional `architecture.md` paths.
 
-**Step 7 — Integration check.** Run the full suite on the merged `main`:
+**Recorded step 7 — Integration check.** The plan called for the full suite on
+the merged `main`:
 
 ```sh
 uv run --python 3.14.7 --extra test pytest -q
 ```
 
-**Step 8 — Cleanup refs.** Delete only verified merged `wt-*` branches and run
-`git worktree prune`.
+**Recorded step 8 — Cleanup refs.** The plan called for deleting verified merged
+`wt-*` branches and running `git worktree prune`.
 
-**Step 9 — Report.** Record the final `git log --oneline -5`.
+**Recorded step 9 — Report.** The plan called for recording `git log --oneline -5`.
 
-**Step 10 — Deferred dataset check.** After the `wt-datasets` merge, verify
-whether `src/cambium/modules/example/datasets/example_pairs.jsonl` is still
-referenced; remove it only in a separate hygiene change if proven dead.
+**Recorded step 10 — Deferred dataset check.** The plan called for checking
+whether `src/cambium/modules/example/datasets/example_pairs.jsonl` remained
+referenced after `wt-datasets`; removal was a separate change only if proven
+dead.
 
 ---
 
@@ -255,7 +265,10 @@ referenced; remove it only in a separate hygiene change if proven dead.
 
 ---
 
-## Appendix — recorded commands
+## Appendix — recorded historical commands (not reproducible from current refs)
+
+The following snippets are retained as provenance. Commands naming deleted
+`wt-*` refs cannot run against this checkout and do not establish current state.
 
 ```sh
 git ls-files | sort
