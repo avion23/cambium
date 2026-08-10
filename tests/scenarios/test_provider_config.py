@@ -172,3 +172,150 @@ def test_url_credentials_in_base_url_are_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must not contain URL credentials"):
         load_providers(path)
+
+
+def test_non_positive_timeout_s_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(timeout_s=0.0)])
+
+    with pytest.raises(ValueError, match="timeout_s.*must be greater than 0"):
+        load_providers(path)
+
+
+def test_negative_max_retries_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(max_retries=-1)])
+
+    with pytest.raises(ValueError, match="max_retries.*must not be negative"):
+        load_providers(path)
+
+
+def test_non_integer_max_retries_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(max_retries=1.5)])
+
+    with pytest.raises(ValueError, match="max_retries.*must be an integer"):
+        load_providers(path)
+
+
+def test_non_boolean_enabled_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(enabled="yes")])
+
+    with pytest.raises(ValueError, match="enabled.*must be a boolean"):
+        load_providers(path)
+
+
+def test_non_boolean_required_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(required="yes")])
+
+    with pytest.raises(ValueError, match="required.*must be a boolean"):
+        load_providers(path)
+
+
+def test_non_string_model_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(model=123)])
+
+    with pytest.raises(ValueError, match="model.*must be a string"):
+        load_providers(path)
+
+
+def test_non_integer_priority_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(priority=1.5)])
+
+    with pytest.raises(ValueError, match="priority.*must be an integer"):
+        load_providers(path)
+
+
+def test_negative_cooldown_s_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(cooldown_s=-1.0)])
+
+    with pytest.raises(ValueError, match="cooldown_s.*must not be negative"):
+        load_providers(path)
+
+
+def test_negative_price_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(price=-0.01)])
+
+    with pytest.raises(ValueError, match="price.*must not be negative"):
+        load_providers(path)
+
+
+def test_top_level_unknown_field_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "providers.json"
+    path.write_text(
+        json.dumps({"providers": [_provider()], "unexpected": True}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown field.*unexpected"):
+        load_providers(path)
+
+
+def test_duplicate_json_fields_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "providers.json"
+    path.write_text(
+        '{"providers": [{"name": "openai", "name": "openai", "tier": "strong", '
+        '"base_url": "https://api.example.test/v1", '
+        '"api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY"}]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON fields"):
+        load_providers(path)
+
+
+def test_duplicate_api_key_env_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider("a.b"), _provider("a_b")])
+
+    with pytest.raises(ValueError, match="provider mapping collides with provider 'a.b'"):
+        load_providers(path)
+
+
+def test_missing_required_fields_are_rejected(tmp_path: Path) -> None:
+    for field in ("name", "tier", "base_url", "api_key_env"):
+        provider = _provider()
+        del provider[field]
+        path = _write(tmp_path / "providers.json", [provider])
+
+        with pytest.raises(ValueError, match=f"missing required field.*{field}"):
+            load_providers(path)
+
+
+def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [
+            {
+                "name": "openai",
+                "tier": "strong",
+                "base_url": "https://api.example.test/v1",
+                "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
+                "required": True,
+                "timeout_s": 45.5,
+                "max_retries": 3,
+                "rpm": 120,
+                "enabled": True,
+                "model": "example-model",
+                "priority": 5,
+                "cooldown_s": 12.5,
+                "price": 0.25,
+            }
+        ],
+    )
+
+    providers = load_providers(path)
+
+    assert providers == [
+        diffundo.ProviderConfig(
+            name="openai",
+            tier=diffundo.ProviderTier.STRONG,
+            base_url="https://api.example.test/v1",
+            api_key_env="CAMBIUM_PROVIDER_OPENAI_API_KEY",
+            timeout_s=45.5,
+            max_retries=3,
+            rpm=120,
+            enabled=True,
+            model="example-model",
+            priority=5,
+            cooldown_s=12.5,
+            price_per_1m_in=0.25,
+            price_per_1m_out=0.25,
+        )
+    ]
