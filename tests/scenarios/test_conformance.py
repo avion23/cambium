@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from cambium import supervisor
+from cambium.fencing import write_generation
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message
 from cambium.merge import ZERO_SHA, MergeSequencer, NonFastForwardError
 from cambium.store import CRITICAL_KINDS, EventStore
@@ -95,6 +96,9 @@ def test_real_worker_result_correlates_and_exit_has_no_request_id(tmp_path: Path
     scratch = session_dir / "scratch"
     scratch.mkdir(parents=True)
     _init_repo(scratch)
+    worktree = session_dir / "worker-wt"
+    _git(scratch, "worktree", "add", "-b", "wt-conformance-worker", str(worktree), "main")
+    write_generation(worktree, 1)
     task_id = "conformance-worker"
     init_request_id = "conformance-init"
     run_request_id = "conformance-run"
@@ -130,7 +134,7 @@ def test_real_worker_result_correlates_and_exit_has_no_request_id(tmp_path: Path
                 "request_id": run_request_id,
                 "task_id": task_id,
                 "scratch_repo": str(scratch),
-                "worktree_path": str(session_dir / "worker-wt"),
+                "worktree_path": str(worktree),
                 "branch": "wt-conformance-worker",
                 "target_file": "base.txt",
                 "marker": "conformance marker",
