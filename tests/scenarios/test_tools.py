@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -323,6 +324,26 @@ def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
     assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
 
 
+def test_get_signature_caps_exact_oversized_identifier(tmp_path: Path) -> None:
+    identifier = "a" * 65_386
+    source = f"def {identifier}():\n    pass\n"
+    assert identifier.isidentifier()
+    assert len(source.encode("utf-8")) <= tools.MAX_READ_BYTES
+    (tmp_path / "large_signature.py").write_text(source, encoding="utf-8")
+
+    result = _run(
+        "get_signature",
+        {"path": "large_signature.py", "symbol": identifier},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    parsed = json.loads(result.output)
+    assert parsed["truncated"] is True
+    assert "[output truncated]" in parsed["signature"]
+    assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
+
+
 def test_get_signature_caps_when_non_signature_fields_are_oversized() -> None:
     result = tools._serialize_signature_result(
         {
@@ -340,6 +361,49 @@ def test_get_signature_caps_when_non_signature_fields_are_oversized() -> None:
     assert parsed["truncated"] is True
     assert "[output truncated]" in parsed["signature"]
     assert len(result.encode("utf-8")) <= MAX_OUTPUT_BYTES
+
+
+def test_get_signature_rejects_fifo_quickly(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "sample.py")
+
+    started = time.monotonic()
+    result = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert not result.ok
+    assert "not a regular file" in (result.error or "")
+
+
+def test_get_signature_rejects_fifo_replaced_after_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("def build():\n    pass\n", encoding="utf-8")
+    original_confined_path = tools._confined_path
+
+    def replace_after_validation(ctx: ToolContext, raw_path: str) -> Path:
+        path = original_confined_path(ctx, raw_path)
+        path.unlink()
+        os.mkfifo(path)
+        return path
+
+    monkeypatch.setattr(tools, "_confined_path", replace_after_validation)
+    started = time.monotonic()
+    result = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert not result.ok
+    assert "not a regular file" in (result.error or "")
 
 
 def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:

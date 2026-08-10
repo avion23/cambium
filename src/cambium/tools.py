@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - supports reduced installations.
 MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
+GET_SIGNATURE_READ_TIMEOUT_S = 1.0
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
 
@@ -153,6 +155,10 @@ def _serialize_signature_result(result: dict[str, Any]) -> str:
         else:
             high = midpoint - 1
 
+    if not best_signature:
+        return serialize(
+            {"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True}
+        )
     envelope["signature"] = best_signature
     return serialize(envelope)
 
@@ -176,10 +182,11 @@ def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
         raise IsADirectoryError(path)
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblocking = getattr(os, "O_NONBLOCK", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
     directory_flags = os.O_RDONLY | nofollow | directory | close_on_exec
-    file_flags = os.O_RDONLY | nofollow | close_on_exec
+    file_flags = os.O_RDONLY | nofollow | nonblocking | close_on_exec
 
     root_fd = ctx._root_fd
     if root_fd is None:
@@ -389,6 +396,11 @@ def _read_and_extract_signature(
     descriptor: int | None = None
     try:
         descriptor = _open_confined_read_fd(ctx, path)
+        mode = os.fstat(descriptor).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(path)
+        if not stat.S_ISREG(mode):
+            raise _ToolFailure(f"path is not a regular file: {display_path}")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
             raw = handle.read(MAX_READ_BYTES + 1)
@@ -426,9 +438,17 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
     display_path = _display_path(ctx, path)
     try:
-        signature = await asyncio.to_thread(
-            _read_and_extract_signature, ctx, path, display_path, symbol
+        signature = await asyncio.wait_for(
+            asyncio.to_thread(
+                _read_and_extract_signature, ctx, path, display_path, symbol
+            ),
+            timeout=GET_SIGNATURE_READ_TIMEOUT_S,
         )
+    except TimeoutError as exc:
+        raise _ToolFailure(
+            f"get_signature read timed out after {GET_SIGNATURE_READ_TIMEOUT_S}s: "
+            f"{display_path}"
+        ) from exc
     except SyntaxError as exc:
         location = f" at line {exc.lineno}" if exc.lineno is not None else ""
         raise _ToolFailure(
