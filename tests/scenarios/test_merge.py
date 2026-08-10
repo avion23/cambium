@@ -725,6 +725,39 @@ def test_task_directory_rename_before_recording_restores_staging(tmp_path, monke
     assert not list(displaced.iterdir())
 
 
+def test_quarantine_is_durable_before_cleanup_returns(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    persisted: list[tuple[str, dict]] = []
+
+    def persist(kind: str, payload: dict) -> None:
+        destination = (
+            tmp_path / ".cambium" / "quarantine" / payload["quarantine_id"]
+        )
+        assert destination.is_dir()
+        persisted.append((kind, payload))
+
+    seq = MergeSequencer(
+        task_id="durable-before-return", session_dir=tmp_path, durable_event=persist
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "evidence.bin").write_bytes(b"must be recorded before descriptors close")
+
+    seq.cleanup_staging(repo)
+    assert [kind for kind, _ in persisted] == ["merge_staging_quarantined"]
+    destination = (
+        tmp_path / ".cambium" / "quarantine" / persisted[0][1]["quarantine_id"]
+    )
+    displaced = tmp_path / "displaced-after-cleanup"
+    destination.rename(displaced)  # the old supervisor flush happened after this boundary
+
+    assert (displaced / "evidence.bin").read_bytes() == (
+        b"must be recorded before descriptors close"
+    )
+
+
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)

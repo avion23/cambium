@@ -541,16 +541,23 @@ class MergeSequencer:
                 raise error
 
             try:
-                self._event(
-                    "merge_staging_quarantined", task=self._task_id,
-                    staging_sha=staging_sha, quarantine_id=relative_id.as_posix(),
-                    allocated_bytes=allocated, reason=",".join(reasons),
-                    expiry=time.time_ns() + self._quarantine_retention_ns,
-                )
+                quarantine_payload = {
+                    "task": self._task_id,
+                    "staging_sha": staging_sha,
+                    "quarantine_id": relative_id.as_posix(),
+                    "allocated_bytes": allocated,
+                    "reason": ",".join(reasons),
+                    "expiry": time.time_ns() + self._quarantine_retention_ns,
+                }
+                self._event("merge_staging_quarantined", **quarantine_payload)
+                if self._durable_event is not None:
+                    self._durable_event(
+                        "merge_staging_quarantined", dict(quarantine_payload)
+                    )
             except Exception as exc:
                 if not all(self._is_open_child(*link) for link in chain):
                     containment_failure("quarantine path changed during recording", exc)
-                raise
+                containment_failure("cannot durably record quarantined staging", exc)
             if not all(self._is_open_child(*link) for link in chain):
                 containment_failure("quarantine path changed before recording completed")
             try:
