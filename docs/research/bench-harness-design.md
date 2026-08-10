@@ -51,36 +51,57 @@ current-main measurements. The reference module's live split counts are
 
 Committed reference baselines live at
 `src/cambium/modules/<name>/tests/baselines/baseline.json`; ephemeral reports
-belong in gitignored `.cambium/baselines/`. The schema is:
+belong in gitignored `.cambium/baselines/`.
+
+### The schema (complete reference example)
 
 ```jsonc
 {
   "schema_version": 1,
   "module": "should_decompose",
   "dataset_version": "1.1.0",
-  "git_sha": "<run provenance>",
-  "date": "2026-08-09T21:00:00Z",
+  "git_sha": "17dfcd362817fd173cf13d61585752d6d74b18e4",
+  "date": "2026-08-10T13:52:09Z",
   "python": "3.14.7",
   "pytest": "9.1.1",
+  "split_digests": {
+    "train": "e41f1f4ca9e1905122e1faa0955cd2833bf032635ea721d33d36d1b3b7caf136",
+    "eval": "f43cb1501ba4ba10fc27e2333a3794db04d6f5afa95ebfe586f66cf9d486d7ca",
+    "canaries": "54bf2e41663b29d1382fe965cacb553009567287dc722a7710533bfe3e92ff3e"
+  },
   "metric": {
     "train": {"mean": 1.0, "std": 0.0, "count": 200},
     "eval": {"mean": 1.0, "std": 0.0, "count": 50},
     "canaries": {"mean": 1.0, "std": 0.0, "count": 10}
   },
-  "canaries": {"total": 10, "kinds_present": [], "taxonomy_coverage": 1.0, "failed": 0},
+  "canaries": {
+    "total": 10,
+    "kinds_present": [
+      "ambiguous_calibration", "context_suppression", "format_only_hack",
+      "keyword_hack", "must_decompose", "near_duplicate_contradiction",
+      "trivially_atomic"
+    ],
+    "taxonomy_coverage": 1.0,
+    "failed": 0
+  },
   "dataset": {"records": 260, "duplicate_ids": 0, "cross_split_leaks": 0,
                "decompose_true": 128, "decompose_false": 132, "canaries": 10},
-  "tests": {"count": 57, "wall_seconds": {"p50": 0.001504, "p90": 0.123111, "max": 0.162092}},
+  "tests": {
+    "count": 57,
+    "wall_seconds": {"p50": 0.001504, "p90": 0.123111, "max": 0.162092},
+    "by_nodeid": {
+      "src/cambium/modules/example/tests/test_dataset_splits.py::test_all_260_records_score_perfectly": 0.01338
+    }
+  },
   "drift_thresholds": {"metric_mean_delta": 0.05, "wall_p90_ratio": 1.5,
                         "canary_failed_delta": 0,
                         "dataset": {"duplicate_ids": 0, "cross_split_leaks": 0}}
 }
 ```
 
-The measured counts and timings above are the committed example baseline
-snapshot; `git_sha` is deliberately a placeholder here because a stale SHA is
-not evidence about the current tree. The module's actual baseline retains its
-recorded SHA as data provenance.
+The counts, digests, timings, and SHA above are the committed example baseline
+snapshot. The SHA is run provenance, not a claim about the current tree; a new
+run must record its own SHA and date.
 
 `dataset_version` selects the anchor. Compare only with the last baseline of
 the same version. A version change creates a new anchor; a digest change with

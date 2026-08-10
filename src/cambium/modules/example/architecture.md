@@ -62,8 +62,12 @@ Context mentioning `subtask` or `decompos` suppresses decomposition with
 
 Tests in `src/cambium/modules/example/tests/` load both dataset layouts, reject
 malformed records, verify enum/wire mapping, run every record, and assert a
-perfect metric including canaries. The split suite covers 200 train, 50 eval,
-and 10 canaries plus version/digest and cross-split checks. CLI tests cover
+perfect metric including canaries. `test_dataset_splits.py` covers the 200
+train, 50 eval, and 10 canaries counts, record versions, filtering, duplicate
+IDs, and cross-split checks; it does not own exact-byte digest enforcement.
+The shared `module_conformance` gate validates metadata/baseline/content
+digests, while `scripts/check_dataset_v1.py` validates schema/version/count,
+leak, secret, and engine consistency. CLI tests cover
 direct, `decide`, and `evaluate` operations and strict JSON errors. There is no
 production orchestrator integration test.
 

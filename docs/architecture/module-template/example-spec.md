@@ -363,16 +363,27 @@ view, leading-separator tolerance, enum mapping, exact-match metric, malformed
 records, missing reasons, perfect legacy-dataset scoring, canary processing,
 and denied subprocess network clients. `test_dataset_splits.py` checks split
 counts, canary filtering, duplicate/cross-split rejection, metadata defaults
-and errors, digest/version drift, event-loop-safe `evaluate_split` behavior,
+and errors, record-version drift, event-loop-safe `evaluate_split` behavior,
 and perfect scoring over all 260 records. `test_example_cli.py` checks direct,
 decide, and evaluate requests, optional context default, duplicate keys,
 unknown/typed inputs, malformed documents, and strict stdout shape.
 
+Exact-byte split digest ownership is outside `test_dataset_splits.py`: the
+shared `module_conformance` gate anchors metadata, baseline, and current split
+content, while `scripts/check_dataset_v1.py` covers schema/version/count,
+cross-split, secret, and engine-consistency checks.
+
 The conformance gate runs before the module tests and also scans sibling and
 reverse imports. It must be invoked with the package-directory selector
 `example`; arbitrary pytest arguments are rejected. The offline environment
-removes credentials and plugin injection and denies ordinary socket access,
-but is not a hostile same-UID sandbox. Wheel verification runs
+removes credentials and plugin injection and denies ordinary socket access.
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for
+common forms of accidental network use; it is not a security boundary. It
+CANNOT prevent a hostile same-UID module from bypassing the check with
+os.system, posix_spawn, raw sockets, subprocess monkey-patching, or by killing
+a same-UID tracer. The harness does not start such a tracer or provide an
+in-harness sandbox. Real containment is the deployment-layer boundary.**
+Wheel verification runs
 `cambium module-test example` outside the checkout. Complete removal includes
 the package code, CLI, architecture, datasets, tests, baseline, and metadata.
 

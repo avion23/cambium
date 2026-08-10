@@ -196,7 +196,14 @@ uv run --extra test cambium module-test <package_name>
 ```
 
 It checks tracked module layout, manifest, schema/digests, imports, JSON CLI,
-offline subprocess behavior, and colocated tests. The wheel includes code,
+offline subprocess behavior, and colocated tests. This offline guard is a
+**BEST-EFFORT, deterministic lint-style check for common forms of accidental
+network use; it is not a security boundary. It CANNOT prevent a hostile
+same-UID module from bypassing the check with os.system, posix_spawn, raw
+sockets, subprocess monkey-patching, or by killing a same-UID tracer. The
+harness does not start such a tracer or provide an in-harness sandbox. Real
+containment is the deployment-layer boundary.**
+The wheel includes code,
 `__main__.py`, this architecture document, datasets, `meta.json`, tests, and
 baselines. A module is removable by deleting its complete package directory;
 shared harness scenarios remain.

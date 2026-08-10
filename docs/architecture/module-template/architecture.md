@@ -201,8 +201,13 @@ uv run --extra test cambium module-test example
 
 The live `module_conformance` gate validates tracked layout, datasets,
 baselines, imports, JSON CLI, subprocess isolation, and module-scoped tests.
-It is offline and best-effort, not a security boundary. Sibling imports and
-reverse imports from `bench.py`, `scripts/`, and `tools/` are static failures.
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for common forms of
+accidental network use; it is not a security boundary. It CANNOT prevent a hostile
+same-UID module from bypassing the check with os.system, posix_spawn, raw sockets,
+subprocess monkey-patching, or by killing a same-UID tracer. The harness does not start
+such a tracer or provide an in-harness sandbox. Real containment is the deployment-layer
+boundary.**
+Sibling imports and reverse imports from `bench.py`, `scripts/`, and `tools/` are static failures.
 
 ### 9.4 Baseline, wheel, and removal
 
