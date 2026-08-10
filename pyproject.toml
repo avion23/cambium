@@ -13,14 +13,21 @@ cambium = "cambium.cli:main"
 "cambium.bench" = "cambium.bench"
 
 [project.optional-dependencies]
-# test: what CI runs — pytest only.
-test = ["pytest>=9"]
-# ast: optional tree-sitter Python parser; stdlib ast is the core fallback.
+# ast: focused alias for consumers that need only the optional tree-sitter
+# Python parser; the stdlib ast backend remains the core fallback.
 ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
-# dev: superset of test — everything a contributor needs locally.
+# test: what CI runs — pytest plus the AST backend, so AST tests do not skip.
+test = ["pytest>=9", "tree-sitter>=0.26", "tree-sitter-python>=0.25"]
+# dev: superset of test — everything a contributor needs locally. Keep the
+# AST dependencies here as well so `--extra dev` exercises the same backend.
 # ruff>=0.12, not ruff>=0.9: ruff<0.12 rejects `target-version = "py314"`
 # (verified 0.9.10/0.11.0: "unknown variant `py314`"); 0.12.0 accepts it.
-dev = ["pytest>=9", "ruff>=0.12"]
+dev = [
+    "pytest>=9",
+    "ruff>=0.12",
+    "tree-sitter>=0.26",
+    "tree-sitter-python>=0.25",
+]
 
 [build-system]
 requires = ["hatchling"]
