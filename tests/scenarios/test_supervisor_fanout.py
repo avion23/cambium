@@ -180,6 +180,52 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert ("session_ended", None) in terminal
 
 
+def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
+                target_file="a.txt", marker="// cambium-a",
+                gate="grep -q '// cambium-a' a.txt",
+            ),
+            _task(
+                session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
+                target_file="b.txt", marker="// cambium-b",
+                gate="grep -q '// cambium-b' b.txt",
+            ),
+        ]
+    }
+
+    async def canary() -> None:
+        merge_events: set[str] = set()
+        prune_events: set[str] = set()
+        both_merged = asyncio.Event()
+        both_pruned = asyncio.Event()
+
+        async def observer(event: dict) -> None:
+            if event["kind"] == "merge_committed":
+                merge_events.add(event["task_id"])
+                if len(merge_events) == 2:
+                    both_merged.set()
+                await both_merged.wait()
+            if event["kind"] == "worktree_pruned":
+                prune_events.add(event["task_id"])
+                if len(prune_events) == 2:
+                    both_pruned.set()
+                await both_pruned.wait()
+
+        result = await asyncio.wait_for(run_plan(session_dir, plan, observer), timeout=15)
+        assert result.exit_code == 0
+        assert merge_events == {"t-a", "t-b"}
+        assert prune_events == {"t-a", "t-b"}
+
+    asyncio.run(canary())
+    assert len(_kinds(read_events(session_dir), "merge_committed")) == 2
+
+
 def test_t1_gate_failure_prunes_worktree_and_persists_terminal_events(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"

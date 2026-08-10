@@ -15,7 +15,13 @@ import pytest
 
 import cambium.supervisor as supervisor_module
 from cambium.fencing import read_generation, validate_worker_generation, write_generation
-from cambium.supervisor import DuplicateTaskIDError, read_events, run_plan, run_session
+from cambium.supervisor import (
+    DuplicateTaskIDError,
+    SessionAlreadyRunningError,
+    read_events,
+    run_plan,
+    run_session,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 ENV_PROBE_WORKER = str(ROOT / "tests" / "fixtures" / "env_probe_worker.py")
@@ -133,6 +139,62 @@ def _wait_pid_gone(pid: int, timeout_s: float = 2.0) -> None:
             return
         time.sleep(0.02)
     pytest.fail(f"process {pid} survived process-group cleanup")
+
+
+def test_observer_mutation_does_not_change_queued_event_payload(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    store = supervisor_module._open_store(session_dir)
+
+    def observer(event: dict) -> None:
+        if event["kind"] == "log":
+            event["payload"]["message"] = "observer-corruption"
+
+    async def canary() -> None:
+        runtime = supervisor_module._Runtime(session_dir, store, on_event=observer)
+        await runtime.start()
+        await runtime.emit("log", message="durable-original")
+        await runtime.shutdown()
+
+    asyncio.run(canary())
+
+    persisted = _kinds(read_events(session_dir), "log")
+    assert persisted[0]["payload"]["message"] == "durable-original"
+
+
+def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    first = _task(
+        session_dir, repo, base, "first", worker=FAKE_WORKER,
+        gate="grep -q '// first' hello.txt",
+    )
+    second = _task(
+        session_dir, repo, base, "second", worker=FAKE_WORKER,
+        gate="grep -q '// second' hello.txt",
+    )
+
+    async def canary() -> None:
+        admitted = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_first(event: dict) -> None:
+            if event["kind"] == "task_assigned":
+                admitted.set()
+                await release.wait()
+
+        first_run = asyncio.create_task(run_plan(session_dir, [first], hold_first))
+        await asyncio.wait_for(admitted.wait(), timeout=5)
+        try:
+            with pytest.raises(SessionAlreadyRunningError):
+                await run_plan(session_dir, [second])
+            assert not Path(second["worktree_path"]).exists()
+        finally:
+            release.set()
+        result = await asyncio.wait_for(first_run, timeout=15)
+        assert result.exit_code == 0
+
+    asyncio.run(canary())
 
 
 def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
