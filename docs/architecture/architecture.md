@@ -280,6 +280,8 @@ Each row maps to one self-contained module with its own `architecture.md` (see `
 
 **Framing:** every request carries a `request_id` (ULID, monotonic-ish). Every response that completes a request echoes the same `request_id`. This makes the protocol RPC-shaped, supports future multiplexing, and gives the host a correlation key for the event log.
 
+**Decision record (2026-08-10):** the JSON-Lines protocol currently runs over stdout. Per v2.1 roadmap M2 and feedback-5 #1, the protocol moves to a dedicated pipe on file descriptor 3 (pass_fds) — stdout/stderr become exclusively unformatted logging and crash dumps, eliminating C-extension fd-1 writes corrupting the protocol stream. Wire-compatible framing is retained (same NDJSON messages, same caps); the change is transport-only. Tracked as M2.
+
 ### 5.1 Channel invariants
 
 1. **stdin = one writer (supervisor), one reader (worker).** Worker blocks on `readline()` between messages. No polling.
@@ -448,6 +450,9 @@ Invariants:
 1. The supervisor **never** performs disk I/O on the event-loop thread. Every event goes through `queue.Queue.put_nowait()` (non-blocking).
 2. The queue is **bounded** (default 10 000). On overflow, the writer drops the oldest non-critical event, logs a `drop` marker, and increments a counter. Critical events (`result`, `worker_exit`, `task_failed`, `merge_progress`) are **never** dropped — they block the producer for up to 100 ms (acceptable, because these are rare).
 3. The writer thread is the **sole process** that holds the SQLite write connection. There is no concurrency on the write path. The in-memory ring buffer is a `collections.deque(maxlen=10000)` protected by a `threading.Lock`.
+
+**Decision record (2026-08-10):** events.db, conversations.db and shared.db remain SEPARATE databases (each with its own single writer), rather than one combined database. Rationale: separate writers avoid cross-store lock contention; events.db is the source of truth (replay-restart semantics); conversations and the blackboard are derived state and reconstructible; cross-database atomicity is not required (eventual consistency via the event log). feedback-5 #2 proposed a single DB; rejected for these reasons.
+
 4. **fsync cadence:** the writer maintains two modes — *batched* and *critical-immediate*. In batched mode it flushes the SQLite WAL to disk at most once per `fsync_interval_s` (default 1.0) via `PRAGMA wal_checkpoint(TRUNCATE)` followed by `os.fsync(wal_fd)` on the WAL file's fd (not the main DB fd — in WAL mode recent commits live in the `-wal` file, so fsyncing the main DB fd alone is a no-op for durability). In critical-immediate mode (entered when a critical event is dequeued), it runs the same checkpoint+fsync before acking the producer. `PRAGMA synchronous=NORMAL` is set (WAL+NORMAL is crash-safe for the last committed transaction; FULL would add an fsync per commit and is unnecessary with our explicit WAL checkpoint). The default cadence is configurable.
 5. **Subscribers** (`Session.events()` consumers) receive events via an `asyncio.Queue` fed from the writer thread through `loop.call_soon_threadsafe`. Subscribers see events in monotonic order. **Critical events** are guaranteed to be fsync-d before they reach a subscriber; **non-critical events** may reach a subscriber before they are fsync-d, so a supervisor crash within `fsync_interval_s` can drop the most recent non-critical events from a subscriber's view (but the in-memory ring buffer and the at-most-1s checkpoint catch-up close the gap on restart — see §6.5).
 6. **Redaction** is applied at enqueue time, before the event ever reaches disk (§9.3).
