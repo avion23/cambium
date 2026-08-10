@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -236,6 +237,35 @@ def test_offline_child_resolves_network_client_realpath(tmp_path: Path, api: str
     assert denied in result.stderr
 
 
+def test_offline_child_denies_shell_network_client_realpath_with_whitespace_path(
+    tmp_path: Path,
+) -> None:
+    curl = shutil.which("curl")
+    assert curl is not None
+    alias = tmp_path / "ordinary command"
+    alias.symlink_to(curl)
+    command = f"'{alias}' --fail http://127.0.0.1:9/"
+    probe = (
+        "import subprocess, sys; "
+        f"result = subprocess.run([{command!r}], shell=True, check=False); "
+        "sys.exit(result.returncode)"
+    )
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    assert result.returncode != 7
+    denied = f"network client denied during module conformance: {os.path.realpath(curl)}"
+    assert denied in result.stderr
+
+
 def test_offline_guard_does_not_require_strace(monkeypatch) -> None:
     monkeypatch.setenv("PATH", "/nonexistent")
     probe = (
@@ -324,6 +354,44 @@ def test_offline_child_rejects_python_flag_after_option_argument() -> None:
         )
 
     assert result.returncode != 0
+    assert "isolated Python flag denied during module conformance: -I" in result.stderr
+
+
+def test_offline_child_rejects_python_flag_after_option_argument_with_executable() -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        socket_probe = (
+            "import socket; "
+            f"socket.create_connection(('127.0.0.1', {port}), timeout=2).close()"
+        )
+        probe = (
+            "import subprocess, sys; "
+            "subprocess.run(['ordinary-python', '-W', 'ignore', '-I', '-c', "
+            f"{socket_probe!r}], executable=sys.executable, check=True)"
+        )
+        with module_conformance.module_offline_environment() as env:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                env=env,
+            )
+
+        listener.settimeout(0.5)
+        try:
+            connection, _ = listener.accept()
+        except TimeoutError:
+            connected = False
+        else:
+            connection.close()
+            connected = True
+
+    assert result.returncode != 0
+    assert not connected
     assert "isolated Python flag denied during module conformance: -I" in result.stderr
 
 
