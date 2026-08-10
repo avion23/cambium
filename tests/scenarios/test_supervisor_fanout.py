@@ -546,7 +546,8 @@ def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) ->
 
 def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "noready")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "2")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
+    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
@@ -585,7 +586,9 @@ def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_t3_crash_mid_edit_recovered_worktree(tmp_path) -> None:
+def test_t3_crash_mid_edit_recovered_worktree(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
+    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello from the slice\n"})
@@ -685,7 +688,8 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
 
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage_only")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "2")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
+    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
