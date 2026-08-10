@@ -56,8 +56,14 @@ class FakeServer:
     the last behavior repeats for any further request. Requests are recorded.
     """
 
-    def __init__(self, behaviors: list[tuple[int, dict[str, Any], float]]) -> None:
+    def __init__(
+        self,
+        behaviors: list[tuple[int, dict[str, Any], float]],
+        *,
+        echo_authorization_in_body: bool = False,
+    ) -> None:
         self.behaviors = list(behaviors)
+        self.echo_authorization_in_body = echo_authorization_in_body
         self.calls: list[dict[str, Any]] = []
         self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
@@ -109,6 +115,19 @@ class _Handler(BaseHTTPRequestHandler):
         status, payload, delay = server.behavior_at(index)
         if delay:
             time.sleep(delay)
+        if server.echo_authorization_in_body:
+            error = payload.get("error")
+            if isinstance(error, dict):
+                payload = {
+                    **payload,
+                    "error": {
+                        **error,
+                        "message": (
+                            f"{error.get('message', '')}; "
+                            f"{self.headers.get('Authorization')}"
+                        ),
+                    },
+                }
         encoded = json.dumps(payload).encode("utf-8")
         try:
             self.send_response(status)
@@ -301,6 +320,47 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
     finally:
         auth.close()
         good.close()
+
+
+def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monkeypatch) -> None:
+    key = "sk-echoed-in-4xx-body"
+    server = FakeServer(
+        [
+            (
+                401,
+                _error_payload(
+                    "invalid credential; see https://body-user:body-pass@example.test"
+                ),
+                0.0,
+            )
+        ],
+        echo_authorization_in_body=True,
+    )
+    monkeypatch.setenv("K_ECHO", key)
+    router = Diffundo(
+        (_config("p_echo", server, "K_ECHO"),),
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = exc.value.last_error
+        assert error is not None
+        assert error.outcome is ProviderOutcome.AUTH_ERROR
+        assert "HTTP 401" in error.message
+        assert "test_error" in error.message
+        assert "invalid credential" in error.message
+        assert "https://[REDACTED]@example.test" in error.message
+        assert "body-pass" not in error.message
+        assert key not in error.message
+        assert key not in str(error)
+        assert error.cause is not None
+        assert key not in str(error.cause)
+        assert error.__cause__ is not None
+        assert key not in str(error.__cause__)
+        assert key not in str(exc.value)
+    finally:
+        server.close()
 
 
 def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch) -> None:
