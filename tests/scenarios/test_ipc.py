@@ -847,7 +847,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     monkeypatch.setattr(worker_module, "validate_worker_generation", controlled_validate)
     result_holder: list[dict] = []
     worker_thread = threading.Thread(
-        target=lambda: result_holder.append(worker_module.do_work({
+        target=lambda: result_holder.append(asyncio.run(worker_module.do_work({
             "scratch_repo": str(scratch),
             "worktree_path": str(worktree),
             "target_file": "hello.txt",
@@ -855,7 +855,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
             "write_marker": True,
             "task_id": "stale-generation-1",
             "generation": 1,
-        }, threading.Event())),
+        }, threading.Event()))),
         daemon=True,
     )
     worker_thread.start()

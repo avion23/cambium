@@ -1,4 +1,10 @@
-"""Worker-side provider completion drives the edit and publish path."""
+"""Worker-side provider-backed agent loop drives the edit and publish path.
+
+The fake OpenAI server returns a scripted sequence of strict JSON actions
+(``tool_call`` read_file -> tool_call edit_file -> finish). The worker runs
+its bounded agent loop, emits ``tool_event``/``checkpoint`` IPC, makes exactly
+one fenced worker-owned commit, and the supervisor gates and merges it.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +13,11 @@ import copy
 import json
 import os
 import shlex
+import signal
 import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -16,37 +25,59 @@ from typing import Any
 import pytest
 
 from cambium import worker
+from cambium.fencing import write_generation
+from cambium.ipc import MAX_LINE_BYTES, read_message
 from cambium.supervisor import read_events, run_plan, run_session
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = "cambium.worker"
 PROVIDER_KEY = "CAMBIUM_PROVIDER_LOOPBACK_PROVIDER_API_KEY"
 PROVIDER_SECRET = "loopback-provider-secret"
-STATIC_PREFIX = (
-    "You are Cambium's deterministic coding worker.\n"
-    "Return exactly one append-marker decision.\n"
-    "Change only the requested file."
-)
+TASK_TEXT = "Append a single marker line starting with '// provider-' to target.txt."
 
-SCRIPTED_COMPLETION: dict[str, Any] = {
-    "id": "chatcmpl-worker-provider-test",
-    "object": "chat.completion",
-    "model": "loopback-model",
-    "choices": [
-        {
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "append marker line to file target.txt: // provider-alpha",
-            },
-            "finish_reason": "stop",
-        }
-    ],
-    "usage": {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26},
-}
+REQUEST_LOCK = threading.Lock()
 REQUESTS: list[dict[str, Any]] = []
 REQUEST_AUTHORIZATION: list[str] = []
-REQUEST_LOCK = threading.Lock()
+RESPONSES: list[dict[str, Any]] = []
+RESPONSE_DELAY_S = 0.0
+
+DEFAULT_USAGE = {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26}
+
+
+def _reset_server() -> None:
+    global RESPONSE_DELAY_S
+    with REQUEST_LOCK:
+        REQUESTS.clear()
+        REQUEST_AUTHORIZATION.clear()
+        RESPONSES.clear()
+        RESPONSE_DELAY_S = 0.0
+
+
+def _enqueue(
+    content: str,
+    *,
+    model: str | None = None,
+    usage: dict[str, Any] | None = None,
+) -> None:
+    completion = {
+        "id": "chatcmpl-worker-agent-test",
+        "object": "chat.completion",
+        "model": model or "loopback-model",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage or copy.deepcopy(DEFAULT_USAGE),
+    }
+    with REQUEST_LOCK:
+        RESPONSES.append(completion)
+
+
+def _error_payload() -> dict[str, Any]:
+    return {"error": {"message": "no scripted response", "type": "server_error", "code": 500}}
 
 
 class _FakeOpenAIHandler(BaseHTTPRequestHandler):
@@ -65,9 +96,13 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
         with REQUEST_LOCK:
             REQUESTS.append(body)
             REQUEST_AUTHORIZATION.append(self.headers.get("Authorization", ""))
-            response = copy.deepcopy(SCRIPTED_COMPLETION)
+            response = RESPONSES.pop(0) if RESPONSES else _error_payload()
+            delay = RESPONSE_DELAY_S
+        if delay > 0:
+            time.sleep(delay)
         encoded = json.dumps(response).encode("utf-8")
-        self.send_response(200)
+        status = 500 if "error" in response else 200
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Connection", "close")
@@ -105,6 +140,7 @@ def _make_repo(repo: Path) -> str:
     )
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     (repo / "target.txt").write_text("fixture\n", encoding="utf-8")
+    (repo / "notes.txt").write_text("output-sentinel-7x9q\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
@@ -148,7 +184,7 @@ def _provider_config(path: Path, base_url: str) -> Path:
 def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[str, Any]:
     task = {
         "task_id": "worker-provider",
-        "task": "Choose the provider completion and append its marker to target.txt.",
+        "task": TASK_TEXT,
         "repo": str(repo),
         "worktree_path": str(session_dir / "worker-wt"),
         "branch": "worker-provider",
@@ -172,51 +208,153 @@ def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[s
     return task
 
 
-def _run_case(
-    root: Path,
-    server: _FakeOpenAIServer,
-    config_path: Path,
-    completion: str,
+def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
+    monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
+    )
+
+
+def _worker_env(config_path: Path, session_dir: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
+    env[PROVIDER_KEY] = PROVIDER_SECRET
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = "127.0.0.1,localhost"
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])
+    )
+    env["CAMBIUM_SESSION_ID"] = str(session_dir.resolve())
+    return env
+
+
+class _WorkerRunner:
+    """Direct worker spawn for bounded agent-loop scenarios."""
+
+    def __init__(self, env: dict[str, str]) -> None:
+        self.proc: asyncio.subprocess.Process | None = None
+        self.stderr_lines: list[str] = []
+        self._stderr_task: asyncio.Task | None = None
+        self._env = env
+
+    async def start(self) -> None:
+        self.proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", "-m", "cambium.worker",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **self._env},
+            start_new_session=True,
+        )
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self) -> None:
+        assert self.proc is not None
+        while True:
+            raw = await self.proc.stderr.readline()
+            if not raw:
+                break
+            self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
+
+    async def send(self, msg: dict[str, Any]) -> None:
+        assert self.proc is not None
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await self.proc.stdin.drain()
+
+    async def recv(self, timeout: float = 30.0) -> dict[str, Any] | None:
+        assert self.proc is not None
+        return await asyncio.wait_for(
+            read_message(self.proc.stdout, limit=MAX_LINE_BYTES), timeout
+        )
+
+    async def stop(self) -> None:
+        if self.proc is not None and self.proc.returncode is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            await self.proc.wait()
+        if self._stderr_task is not None:
+            try:
+                await asyncio.wait_for(self._stderr_task, 5.0)
+            except (TimeoutError, asyncio.CancelledError):
+                pass
+
+
+async def _drive_worker(
+    session_dir: Path,
+    repo: Path,
+    env: dict[str, str],
     *,
-    response_model: str | None = None,
-    max_restarts: int | None = None,
-) -> tuple[Any, list[dict[str, Any]], str]:
-    original_model = SCRIPTED_COMPLETION["model"]
-    SCRIPTED_COMPLETION["choices"][0]["message"]["content"] = completion
-    if response_model is not None:
-        SCRIPTED_COMPLETION["model"] = response_model
-    try:
-        session_dir = root / "session"
-        repo = session_dir / "repo"
-        base = _make_repo(repo)
-        task = _task(session_dir, repo, base, config_path)
-        if max_restarts is not None:
-            task["max_restarts"] = max_restarts
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
-        events = read_events(session_dir)
-        merged = subprocess.run(
-            ["git", "-C", str(repo), "show", "refs/heads/main:target.txt"],
+    init: dict[str, Any],
+    run: dict[str, Any],
+    branch: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int, list[str]]:
+    """Spawn one worker, drive init -> run_task, collect messages to exit_message."""
+    worktree = session_dir / "wt"
+    generation = int(init.get("generation", 1))
+    if not worktree.exists():
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), "main"],
             check=True,
             capture_output=True,
-            text=True,
-        ).stdout
-        return result, events, merged
+        )
+    write_generation(worktree, generation)
+    runner = _WorkerRunner(env)
+    await runner.start()
+    try:
+        await runner.send({
+            "type": "init", "request_id": "init-1", "task_id": "agent-001",
+            "generation": generation, **init,
+        })
+        ready = await runner.recv()
+        assert ready is not None and ready["type"] == "ready", f"stderr={runner.stderr_lines!r}"
+        await runner.send({
+            "type": "run_task", "request_id": "run-1", "task_id": "agent-001",
+            "scratch_repo": str(repo), "worktree_path": str(worktree),
+            "branch": branch, "generation": generation, **run,
+        })
+        messages: list[dict[str, Any]] = []
+        while True:
+            msg = await runner.recv()
+            if msg is None:
+                raise AssertionError(f"EOF before exit_message; stderr={runner.stderr_lines!r}")
+            messages.append(msg)
+            if msg["type"] == "exit_message":
+                break
+        rc = await runner.proc.wait()
+        result = next(m for m in messages if m["type"] == "result_envelope")
+        return result, messages, rc, runner.stderr_lines
     finally:
-        SCRIPTED_COMPLETION["model"] = original_model
+        await runner.stop()
 
 
-def test_worker_provider_completion_drives_one_gated_merge_and_canary(
+def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
+    return {
+        "fanout_config": {"tier": "fast", "model": "loopback-model"},
+        **extra,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Agent-loop happy path through the full supervisor (run_plan)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
     tmp_path, monkeypatch
 ) -> None:
-    """The worker, not the parent, parses the completion that selects the edit.
+    """read_file -> edit_file -> finish: 3 model calls, one merge, no leaks.
 
     The provider config lives at the default ``.cambium/providers.json`` under
     the supervisor cwd; ``CAMBIUM_PROVIDERS`` is unset so the supervisor
     resolves the default path before the worker spawns.
     """
-    with REQUEST_LOCK:
-        REQUESTS.clear()
-        REQUEST_AUTHORIZATION.clear()
+    _reset_server()
     server = _FakeOpenAIServer()
     try:
         project = tmp_path / "project"
@@ -233,84 +371,117 @@ def test_worker_provider_completion_drives_one_gated_merge_and_canary(
             "PYTHONPATH",
             os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
         )
-
-        first, first_events, first_text = _run_case(
-            tmp_path / "first",
-            server,
-            config_path,
-            "append marker line to file target.txt: // provider-alpha",
+        _enqueue(
+            '{"type":"tool_call","name":"read_file","arguments":{"path":"notes.txt"}}',
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         )
-        second, second_events, second_text = _run_case(
-            tmp_path / "second",
-            server,
-            config_path,
-            "append marker line to file target.txt: // provider-beta",
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-alpha\\n"}}',
+            usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+        )
+        _enqueue(
+            '{"type":"finish","summary":"read target.txt and appended a provider marker"}',
+            usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21},
         )
 
-        assert first.exit_code == second.exit_code == 0
-        assert first.results[0].status == second.results[0].status == "succeeded"
-        assert first.results[0].gate_exit_code == second.results[0].gate_exit_code == 0
-        assert first_text.endswith("// provider-alpha\n")
-        assert second_text.endswith("// provider-beta\n")
-        assert first_text != second_text
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
+        merged = subprocess.run(
+            ["git", "-C", str(repo), "show", "refs/heads/main:target.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
 
-        for events in (first_events, second_events):
-            assert len([event for event in events if event["kind"] == "merge_committed"]) == 1
-            result_events = [event for event in events if event["kind"] == "result"]
-            assert len(result_events) == 1
-            metadata = result_events[0]["payload"]["provider_metadata"]
-            assert metadata == {
-                "provider": "loopback-provider",
-                "model": "loopback-model",
-                "usage": {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26},
-                "latency_s": metadata["latency_s"],
-            }
-            assert isinstance(metadata["latency_s"], float)
+        assert result.exit_code == 0
+        assert result.results[0].status == "succeeded"
+        assert result.results[0].gate_exit_code == 0
+        assert merged.endswith("// provider-alpha\n")
 
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 2
-            assert len(REQUEST_AUTHORIZATION) == 2
-            assert REQUESTS[0] == REQUESTS[1]
+            assert len(REQUESTS) == 3
             assert all(value == f"Bearer {PROVIDER_SECRET}" for value in REQUEST_AUTHORIZATION)
             assert all(request["model"] == "loopback-model" for request in REQUESTS)
-            assert all(request["messages"][0]["content"] == STATIC_PREFIX for request in REQUESTS)
-        event_text = json.dumps(first_events + second_events)
+
+        tool_events = [e for e in events if e["kind"] == "tool_event"]
+        assert [e["payload"]["tool"] for e in tool_events] == ["read_file", "edit_file"]
+        assert all(e["payload"]["ok"] is True for e in tool_events)
+        assert [e["payload"]["turn"] for e in tool_events] == [1, 2]
+        assert all(isinstance(e["payload"]["duration_ms"], int) for e in tool_events)
+
+        checkpoints = [e for e in events if e["kind"] == "checkpoint"]
+        assert [e["payload"]["turn"] for e in checkpoints] == [1, 2, 3]
+        assert checkpoints[0]["payload"]["commits_so_far"] == []
+        assert checkpoints[1]["payload"]["commits_so_far"] == []
+        final_commits = checkpoints[2]["payload"]["commits_so_far"]
+        assert len(final_commits) == 1
+        final_sha = final_commits[0]
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", f"{final_sha}^{{commit}}"],
+                check=False,
+            ).returncode
+            == 0
+        )
+        for checkpoint in checkpoints:
+            state_ref = Path(checkpoint["payload"]["state_ref"])
+            assert state_ref.exists()
+            payload = json.loads(state_ref.read_text(encoding="utf-8"))
+            assert payload["schema"] == 1
+            assert payload["turn"] == checkpoint["payload"]["turn"]
+            assert isinstance(payload["transcript"], list)
+
+        result_events = [e for e in events if e["kind"] == "result"]
+        assert len(result_events) == 1
+        metadata = result_events[0]["payload"]["provider_metadata"]
+        assert metadata == {
+            "provider": "loopback-provider",
+            "model": "loopback-model",
+            "usage": {
+                "prompt_tokens": 36,
+                "completion_tokens": 18,
+                "total_tokens": 54,
+            },
+            "latency_s": metadata["latency_s"],
+        }
+        assert isinstance(metadata["latency_s"], float)
+        assert len([e for e in events if e["kind"] == "merge_committed"]) == 1
+
+        event_text = json.dumps(events)
         assert PROVIDER_SECRET not in event_text
-        assert STATIC_PREFIX not in event_text
-        assert "reasoning" not in event_text.lower()
+        assert "You are Cambium's autonomous coding agent." not in event_text
+        # read_file output must never reach the durable event log
+        assert "output-sentinel-7x9q" not in event_text
     finally:
         server.close()
 
 
 def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch) -> None:
-    with REQUEST_LOCK:
-        REQUESTS.clear()
-        REQUEST_AUTHORIZATION.clear()
+    _reset_server()
     server = _FakeOpenAIServer()
     sentinel = "provider-key prompt reasoning sentinel"
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
-        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
-        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-        monkeypatch.setenv(
-            "PYTHONPATH",
-            os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
-        )
+        _set_provider_env(monkeypatch, config_path)
+        _enqueue('{"type":"finish","summary":"done"}', model=sentinel)
 
-        result, events, _merged = _run_case(
-            tmp_path / "untrusted-model",
-            server,
-            config_path,
-            "append marker line to file target.txt: // provider-alpha",
-            response_model=sentinel,
-            max_restarts=0,
-        )
+        session_dir = tmp_path / "untrusted-model"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        task["max_restarts"] = 0
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
 
         assert result.exit_code != 0
         assert result.results[0].status == "failed"
-        result_events = [event for event in events if event["kind"] == "result"]
+        result_events = [e for e in events if e["kind"] == "result"]
         assert len(result_events) == 1
         assert "provider_metadata" not in result_events[0]["payload"]
         assert sentinel not in json.dumps(events)
@@ -321,20 +492,17 @@ def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch)
 
 
 def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -> None:
-    with REQUEST_LOCK:
-        REQUESTS.clear()
-        REQUEST_AUTHORIZATION.clear()
+    _reset_server()
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
-        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
-        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-        monkeypatch.setenv(
-            "PYTHONPATH",
-            os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
+        _set_provider_env(monkeypatch, config_path)
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
+        _enqueue('{"type":"finish","summary":"edited target.txt"}')
 
         session_dir = tmp_path / "slice-provider"
         repo = session_dir / "repo"
@@ -347,11 +515,12 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
         assert result.status == "succeeded"
         assert result.exit_code == 0
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 1
+            assert len(REQUESTS) == 2
             assert REQUESTS[0]["model"] == "loopback-model"
-            assert REQUESTS[0]["messages"][1]["content"] == (
-                f"task={spec['task']}\nReturn one decision now."
-            )
+            system = REQUESTS[0]["messages"][0]["content"]
+            assert system.startswith("You are Cambium's autonomous coding agent.")
+            assert "Available tools:" in system
+            assert TASK_TEXT in system
     finally:
         server.close()
 
@@ -398,3 +567,286 @@ def test_worker_git_worktree_hook_does_not_receive_provider_key(
     assert record.exists(), "the post-checkout hook never ran"
     hook_environment = record.read_text(encoding="utf-8").splitlines()
     assert not any(line.startswith(f"{provider_name}=") for line in hook_environment)
+
+
+# ---------------------------------------------------------------------------
+# Worker limits: turns, tokens, usage, wall budget
+# ---------------------------------------------------------------------------
+
+
+def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        for _ in range(3):
+            _enqueue(
+                '{"type":"tool_call","name":"read_file","arguments":{"path":"target.txt"}}'
+            )
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(config_path, max_turns=3, spec=TASK_TEXT)
+        result, _messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="limits")
+        )
+
+        assert result["status"] == "failed"
+        assert "max turns exceeded" in result["failure_reason"]
+        assert rc == 1
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 3
+    finally:
+        server.close()
+
+
+def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue(
+            '{"type":"tool_call","name":"read_file","arguments":{"path":"target.txt"}}',
+            usage={"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// token-limit\\n"}}',
+            usage={"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
+        )
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
+        result, _messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="tokens")
+        )
+
+        assert result["status"] == "failed"
+        assert "token budget exceeded" in result["failure_reason"]
+        assert rc == 1
+        # the second action (edit_file) was never executed
+        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 2
+    finally:
+        server.close()
+
+
+def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue('{"type":"finish","summary":"done"}', usage={"weird": 1})
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(config_path, spec=TASK_TEXT)
+        result, _messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="usage")
+        )
+
+        assert result["status"] == "failed"
+        assert "missing usable token counts" in result["failure_reason"]
+        assert rc == 1
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 1
+    finally:
+        server.close()
+
+
+def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue('{"type":"finish","summary":"done"}')
+        with REQUEST_LOCK:
+            global RESPONSE_DELAY_S
+            RESPONSE_DELAY_S = 0.3
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(config_path, budget={"max_wall_s": 0.1}, spec=TASK_TEXT)
+        result, _messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="wall")
+        )
+
+        assert result["status"] == "failed"
+        assert "wall budget exceeded" in result["failure_reason"]
+        assert rc == 1
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 1
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# Permissions and strict action parsing
+# ---------------------------------------------------------------------------
+
+
+def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell",'
+            '"arguments":{"cmd":["touch","should-not-exist"]}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-alpha\\n"}}'
+        )
+        _enqueue('{"type":"finish","summary":"edited target.txt"}')
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(
+            config_path, permissions={"shell": False, "network": False}, spec=TASK_TEXT
+        )
+        result, messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="shell-deny")
+        )
+
+        assert result["status"] == "succeeded"
+        assert rc == 0
+        assert not (session_dir / "wt" / "should-not-exist").exists()
+        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == (
+            "fixture\n// provider-alpha\n"
+        )
+        tool_events = [m for m in messages if m["type"] == "tool_event"]
+        assert [m["tool"] for m in tool_events] == ["edit_file"]
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 3
+    finally:
+        server.close()
+
+
+def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue('{"type":"tool_call","name":"does_not_exist","arguments":{}}')
+        _enqueue("this is not json")
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-alpha\\n"}}'
+        )
+        _enqueue('{"type":"finish","summary":"edited target.txt"}')
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(config_path, spec=TASK_TEXT)
+        result, messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="strict")
+        )
+
+        assert result["status"] == "succeeded"
+        assert rc == 0
+        tool_events = [m for m in messages if m["type"] == "tool_event"]
+        assert [m["tool"] for m in tool_events] == ["edit_file"]
+        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == (
+            "fixture\n// provider-alpha\n"
+        )
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 4
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# IPC observability: tool_event / checkpoint / heartbeat
+# ---------------------------------------------------------------------------
+
+
+def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue(
+            '{"type":"tool_call","name":"read_file","arguments":{"path":"notes.txt"}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-alpha\\n"}}'
+        )
+        _enqueue('{"type":"finish","summary":"read and edited target.txt"}')
+        with REQUEST_LOCK:
+            global RESPONSE_DELAY_S
+            RESPONSE_DELAY_S = 0.15
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(
+            config_path,
+            heartbeat={"interval_s": 0.05},
+            permissions={"shell": False, "network": False},
+            spec=TASK_TEXT,
+        )
+        result, messages, rc, stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="observe")
+        )
+
+        assert result["status"] == "succeeded"
+        assert rc == 0, f"stderr={stderr!r}"
+        assert len(result["commits"]) == 1
+
+        tool_events = [m for m in messages if m["type"] == "tool_event"]
+        assert [m["tool"] for m in tool_events] == ["read_file", "edit_file"]
+        assert [m["turn"] for m in tool_events] == [1, 2]
+        assert all(m["ok"] is True for m in tool_events)
+        assert all(isinstance(m["duration_ms"], int) for m in tool_events)
+        # tool_event carries name/safe-cmd only; never tool output/content
+        assert all("output-sentinel-7x9q" not in m["cmd"] for m in tool_events)
+
+        checkpoints = [m for m in messages if m["type"] == "checkpoint"]
+        assert [m["turn"] for m in checkpoints] == [1, 2, 3]
+        assert checkpoints[0]["commits_so_far"] == []
+        assert checkpoints[1]["commits_so_far"] == []
+        final = checkpoints[2]
+        assert final["commits_so_far"] == result["commits"]
+        for cp in checkpoints:
+            path = Path(cp["state_ref"])
+            assert path.exists()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            assert payload["schema"] == 1
+            assert payload["turn"] == cp["turn"]
+            assert payload["generation"] == 1
+            assert isinstance(payload["transcript"], list)
+            assert isinstance(payload["usage"], dict)
+
+        heartbeats = [m for m in messages if m["type"] == "heartbeat"]
+        assert any(hb.get("turn", 0) >= 1 for hb in heartbeats)
+        assert any(hb.get("tool") == "read_file" for hb in heartbeats)
+    finally:
+        server.close()

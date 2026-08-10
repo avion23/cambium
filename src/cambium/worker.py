@@ -43,13 +43,18 @@ Task spec (the ``run_task`` body) is compatible with
     work_delay_s    optional float; pause before the edit (test hook so
                     cancellation is observable)
 
-When ``init.fanout_config`` is present, the worker ignores ``target_file`` and
-``marker``. It loads the provider file named by the worker's absolute
-``CAMBIUM_PROVIDERS`` environment variable, makes one ``Diffundo.call`` using
-the configured ``tier`` and ``model``, and accepts only this completion
-contract (one line, no reasoning):
+When ``init.fanout_config`` is present, the worker runs the provider-backed
+agent loop instead: it loads the provider file named by the worker's absolute
+``CAMBIUM_PROVIDERS`` environment variable and iterates bounded
+``Diffundo.call`` turns, each accepting exactly one JSON action:
 
-    append marker line to file <target_file>: <marker>
+    {"type": "tool_call", "name": <schema name>, "arguments": {...}}
+    {"type": "finish", "summary": <non-empty summary>}
+
+Tool calls execute inside the worktree (with shell/git permissions from
+``init.permissions``), emit ``tool_event`` messages, and persist
+``checkpoint`` state under ``$CAMBIUM_SESSION_ID/.cambium/checkpoints/``.
+The worker owns exactly one fenced commit of the resulting changes.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -60,6 +65,7 @@ is a graceful supervisor- or worker-initiated close (shutdown, idle).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -67,16 +73,20 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cambium.auth import scrub_environment
-from cambium.diffundo import CallResult, Diffundo, ProviderTier
+from cambium.diffundo import Diffundo, ProviderTier
 from cambium.fencing import validate_worker_generation
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
 from cambium.provider_config import load_providers
+from cambium.schemas import TOOL_SCHEMAS
+from cambium.tools import ToolContext, ToolResult, run_tool
 
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
@@ -85,10 +95,14 @@ IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
-PROVIDER_COMPLETION_PREFIX = "append marker line to file "
-_COMPLETION_CONTRACT = re.compile(
-    rf"\A{re.escape(PROVIDER_COMPLETION_PREFIX)}([^:\n]+): ([^\n]+)\Z"
-)
+DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_TOKENS = 200_000
+DEFAULT_MAX_WALL_S = 3600.0
+CHECKPOINT_SCHEMA = 1
+MAX_ACTION_CONTENT_BYTES = 16 * 1024
+MAX_OBSERVATION_BYTES = 64 * 1024
+MAX_CMD_BYTES = 512
+INSPECTION_GIT_OPS = frozenset({"status", "diff", "log"})
 _USAGE_COUNT_FIELDS = frozenset(
     {
         "prompt_tokens",
@@ -258,39 +272,200 @@ def _provider_router(config: dict[str, Any]) -> tuple[Diffundo, ProviderTier, st
     return Diffundo(providers, **options), tier, model
 
 
-def _provider_prompt(run: dict[str, Any]) -> dict[str, Any]:
-    task = run.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError("provider task requires a non-empty task description")
-    return {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are Cambium's deterministic coding worker.\n"
-                    "Return exactly one append-marker decision.\n"
-                    "Change only the requested file."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"task={task.strip()}\nReturn one decision now.",
-            },
-        ]
-    }
+def _positive_int(value: Any, name: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
-def _parse_provider_completion(content: str) -> tuple[str, str]:
-    match = _COMPLETION_CONTRACT.fullmatch(content.strip())
-    if match is None:
-        raise ValueError("completion does not match the append-marker contract")
-    target_file, marker = match.groups()
-    target_path = Path(target_file)
-    if target_path.is_absolute() or ".." in target_path.parts:
-        raise ValueError("completion target_file escapes the worktree")
-    if not marker.strip():
-        raise ValueError("completion marker is empty")
-    return target_file, marker
+def _positive_float(value: Any, name: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return float(value)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentConfig:
+    """Immutable per-task agent configuration parsed from init (init is authoritative)."""
+
+    task_id: str
+    generation: int
+    task: str
+    worktree: Path | None
+    base_commit: str | None
+    fanout_config: dict[str, Any] | None
+    max_turns: int
+    max_tokens: int
+    shell_permission: bool
+    network_permission: bool
+    heartbeat_interval_s: float
+    max_wall_s: float
+    checkpoint_root: Path | None
+
+    @classmethod
+    def from_init(cls, init: dict[str, Any]) -> AgentConfig:
+        """Parse and validate the init message; raises ``ValueError`` on bad input."""
+        permissions = init.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+        shell_permission = permissions.get("shell", False)
+        network_permission = permissions.get("network", False)
+        if not isinstance(shell_permission, bool) or not isinstance(network_permission, bool):
+            raise ValueError("init permissions.shell/network must be strict booleans")
+        heartbeat = init.get("heartbeat")
+        heartbeat_interval_s = (
+            heartbeat.get("interval_s") if isinstance(heartbeat, dict) else None
+        )
+        budget = init.get("budget")
+        max_wall_s = budget.get("max_wall_s") if isinstance(budget, dict) else None
+        worktree = init.get("worktree")
+        base_commit = init.get("base_commit")
+        task = init.get("spec")
+        session_id = os.environ.get("CAMBIUM_SESSION_ID")
+        checkpoint_root = (
+            Path(session_id).resolve() / ".cambium" / "checkpoints" if session_id else None
+        )
+        return cls(
+            task_id=str(init.get("task_id", "unknown")),
+            generation=_positive_int(init.get("generation"), "init generation", 1),
+            task=task if isinstance(task, str) else "",
+            worktree=Path(worktree) if isinstance(worktree, str) else None,
+            base_commit=base_commit if isinstance(base_commit, str) else None,
+            fanout_config=_provider_fanout_config(init),
+            max_turns=_positive_int(init.get("max_turns"), "init max_turns", DEFAULT_MAX_TURNS),
+            max_tokens=_positive_int(
+                init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS
+            ),
+            shell_permission=shell_permission,
+            network_permission=network_permission,
+            heartbeat_interval_s=_positive_float(
+                heartbeat_interval_s, "init heartbeat.interval_s", HEARTBEAT_INTERVAL_S
+            ),
+            max_wall_s=_positive_float(
+                max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S
+            ),
+            checkpoint_root=checkpoint_root,
+        )
+
+
+def _merge_task_config(
+    config: AgentConfig, init: dict[str, Any], run: dict[str, Any]
+) -> AgentConfig:
+    """Fill execution fields from run_task only when init omitted them (init authoritative)."""
+    max_turns = config.max_turns
+    if "max_turns" not in init:
+        max_turns = _positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS)
+    max_tokens = config.max_tokens
+    if "max_tokens" not in init:
+        max_tokens = _positive_int(
+            run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS
+        )
+    max_wall_s = config.max_wall_s
+    init_budget = init.get("budget")
+    init_provided_wall = isinstance(init_budget, dict) and "max_wall_s" in init_budget
+    if not init_provided_wall:
+        max_wall_s = _positive_float(
+            run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
+        )
+    worktree = config.worktree
+    if worktree is None and isinstance(run.get("worktree_path"), str):
+        worktree = Path(run["worktree_path"])
+    base_commit = config.base_commit or run.get("base_commit")
+    task = config.task if config.task.strip() else str(run.get("task", ""))
+    fanout_config = config.fanout_config or _provider_fanout_config(run)
+    return AgentConfig(
+        task_id=config.task_id,
+        generation=config.generation,
+        task=task,
+        worktree=worktree,
+        base_commit=base_commit if isinstance(base_commit, str) else None,
+        fanout_config=fanout_config,
+        max_turns=max_turns,
+        max_tokens=max_tokens,
+        shell_permission=config.shell_permission,
+        network_permission=config.network_permission,
+        heartbeat_interval_s=config.heartbeat_interval_s,
+        max_wall_s=max_wall_s,
+        checkpoint_root=config.checkpoint_root,
+    )
+
+
+def _config_from_run(run: dict[str, Any]) -> AgentConfig:
+    """Fallback config when do_work is invoked directly (no init message)."""
+    return AgentConfig(
+        task_id=str(run.get("task_id", "unknown")),
+        generation=_positive_int(run.get("generation"), "run_task generation", 1),
+        task=str(run.get("task", "")),
+        worktree=(
+            Path(run["worktree_path"]) if isinstance(run.get("worktree_path"), str) else None
+        ),
+        base_commit=run.get("base_commit"),
+        fanout_config=_provider_fanout_config(run),
+        max_turns=_positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS),
+        max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
+        shell_permission=False,
+        network_permission=False,
+        heartbeat_interval_s=HEARTBEAT_INTERVAL_S,
+        max_wall_s=_positive_float(
+            run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
+        ),
+        checkpoint_root=None,
+    )
+
+
+class AgentProgress:
+    """Current turn/tool/status shared with the heartbeat loop."""
+
+    __slots__ = ("turn", "tool", "status")
+
+    def __init__(self) -> None:
+        self.turn = 0
+        self.tool: str | None = None
+        self.status = "working"
+
+
+def _cap_utf8(text: str, limit: int) -> str:
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit].decode("utf-8", errors="ignore")
+
+
+def _bounded_text(text: str, limit: int) -> str:
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit].decode("utf-8", errors="ignore") + "\n... [truncated]"
+
+
+def _safe_task_id(task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+    return safe or "task"
+
+
+def _atomic_json_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
@@ -305,32 +480,248 @@ def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
     }
 
 
-def _provider_metadata(result: CallResult, requested_model: str) -> dict[str, Any]:
+_ALL_TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)
+
+
+def _exposed_tool_schemas(config: AgentConfig) -> list[dict[str, Any]]:
+    """Schemas offered to the model; shell and mutating git are permission-filtered."""
+    schemas: list[dict[str, Any]] = []
+    for schema in TOOL_SCHEMAS:
+        name = schema["name"]
+        if name == "run_shell":
+            if config.shell_permission:
+                schemas.append(schema)
+            continue
+        if name == "git_op":
+            restricted = copy.deepcopy(schema)
+            op_property = restricted["parameters"]["properties"]["op"]
+            op_property["enum"] = [
+                value for value in op_property.get("enum", ()) if value in INSPECTION_GIT_OPS
+            ]
+            schemas.append(restricted)
+            continue
+        schemas.append(schema)
+    return schemas
+
+
+def _permission_denied(name: str, args: dict[str, Any], config: AgentConfig) -> str | None:
+    if name == "run_shell" and not config.shell_permission:
+        return "run_shell is not permitted by this worker's permissions"
+    if name == "git_op":
+        op = args.get("op")
+        if op not in INSPECTION_GIT_OPS:
+            return f"git_op is restricted to inspection operations {sorted(INSPECTION_GIT_OPS)!r}"
+    return None
+
+
+def _parse_agent_action(content: str) -> dict[str, Any]:
+    """Strictly parse one agent action; raises ``ValueError`` on any deviation.
+
+    Accepted shapes:
+        {"type": "tool_call", "name": <schema name>, "arguments": {...}}
+        {"type": "finish", "summary": <non-empty str>}
+    """
+    text = content.strip()
+    if not text:
+        raise ValueError("empty agent action")
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        raise ValueError(f"action is not valid JSON: {exc}") from None
+    if not isinstance(parsed, dict):
+        raise ValueError("agent action must be exactly one JSON object")
+    action_type = parsed.get("type")
+    if action_type == "tool_call":
+        if set(parsed) != {"type", "name", "arguments"}:
+            raise ValueError("tool_call must carry exactly type/name/arguments")
+        name = parsed.get("name")
+        arguments = parsed.get("arguments")
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_call name must be a non-empty string")
+        if not isinstance(arguments, dict):
+            raise ValueError("tool_call arguments must be an object")
+        if name not in _ALL_TOOL_NAMES:
+            raise ValueError(f"unknown tool: {name!r}")
+        return {"type": "tool_call", "name": name, "arguments": arguments}
+    if action_type == "finish":
+        if set(parsed) != {"type", "summary"}:
+            raise ValueError("finish must carry exactly type/summary")
+        summary = parsed.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("finish summary must be a non-empty string")
+        return {"type": "finish", "summary": summary}
+    raise ValueError(f"unknown agent action type: {action_type!r}")
+
+
+def _usage_total(usage: dict[str, Any] | None) -> int | None:
+    """Return the usable token total for one completion, or ``None`` (fail closed)."""
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, (int, float)) and not isinstance(total, bool):
+        return int(total)
+    inputs = usage.get("input_tokens", usage.get("prompt_tokens"))
+    outputs = usage.get("output_tokens", usage.get("completion_tokens"))
+    if (
+        isinstance(inputs, (int, float))
+        and not isinstance(inputs, bool)
+        and isinstance(outputs, (int, float))
+        and not isinstance(outputs, bool)
+    ):
+        return int(inputs) + int(outputs)
+    return None
+
+
+def _accumulate_usage(cumulative: dict[str, int], usage: dict[str, Any] | None) -> dict[str, int]:
+    for key, value in _usage_counts(usage).items():
+        cumulative[key] = cumulative.get(key, 0) + int(value)
+    return cumulative
+
+
+def _cumulative_total(cumulative: dict[str, int]) -> int:
+    total = cumulative.get("total_tokens")
+    if total is not None:
+        return total
+    return cumulative.get("input_tokens", cumulative.get("prompt_tokens", 0)) + cumulative.get(
+        "output_tokens", cumulative.get("completion_tokens", 0)
+    )
+
+
+def _build_agent_prompt(
+    task: str, tools: list[dict[str, Any]], transcript: list[dict[str, Any]]
+) -> dict[str, Any]:
+    system_lines = [
+        "You are Cambium's autonomous coding agent.",
+        "You act inside a disposable git worktree and must complete the task.",
+        "Return exactly one JSON object per turn: a tool_call or a finish.",
+        'tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
+        'finish: {"type": "finish", "summary": <non-empty summary>}',
+        "No prose, no code fences, no reasoning.",
+        "Available tools:",
+        json.dumps(tools, sort_keys=True),
+        f"Task: {task}",
+    ]
+    messages = [{"role": "system", "content": "\n".join(system_lines)}]
+    messages.extend(transcript)
+    return {"messages": messages}
+
+
+def _tool_observation(name: str, result: ToolResult) -> str:
+    body = result.output if result.ok else (result.error or result.output or "")
+    return _bounded_text(f"tool {name} ok={result.ok}\n{body}", MAX_OBSERVATION_BYTES)
+
+
+def _safe_cmd(name: str, args: dict[str, Any]) -> str:
+    if name == "run_shell":
+        cmd = args.get("cmd")
+        if isinstance(cmd, list):
+            return _cap_utf8(" ".join(str(token) for token in cmd), MAX_CMD_BYTES)
+    return _cap_utf8(f"{name} {json.dumps(args, sort_keys=True)}", MAX_CMD_BYTES)
+
+
+async def _emit_tool_event(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    name: str,
+    args: dict[str, Any],
+    turn: int,
+    tool_result: ToolResult,
+) -> None:
+    await send(writer, {
+        "type": "tool_event",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "tool": name,
+        "cmd": _safe_cmd(name, args),
+        "turn": turn,
+        "ok": bool(tool_result.ok),
+        "duration_ms": int(tool_result.duration_ms),
+    })
+
+
+def _write_checkpoint_file(
+    config: AgentConfig,
+    turn: int,
+    transcript: list[dict[str, Any]],
+    usage: dict[str, int],
+    commits_so_far: list[str],
+) -> Path | None:
+    if config.checkpoint_root is None:
+        return None
+    directory = config.checkpoint_root / _safe_task_id(config.task_id)
+    path = directory / f"turn-{turn:03d}.json"
+    payload = {
+        "schema": CHECKPOINT_SCHEMA,
+        "task": config.task,
+        "generation": config.generation,
+        "turn": turn,
+        "transcript": transcript,
+        "usage": usage,
+        "commits_so_far": commits_so_far,
+    }
+    _atomic_json_write(path, json.dumps(payload, sort_keys=True, indent=2))
+    return path
+
+
+async def _emit_checkpoint(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    turn: int,
+    state_ref: Path,
+    commits_so_far: list[str],
+) -> None:
+    await send(writer, {
+        "type": "checkpoint",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "turn": turn,
+        "state_ref": str(state_ref),
+        "commits_so_far": commits_so_far,
+    })
+
+
+async def _persist_checkpoint(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    turn: int,
+    transcript: list[dict[str, Any]],
+    usage: dict[str, int],
+    commits_so_far: list[str],
+) -> None:
+    path = await asyncio.to_thread(
+        _write_checkpoint_file, config, turn, transcript, usage, commits_so_far
+    )
+    if path is not None:
+        await _emit_checkpoint(writer, config, turn, path, commits_so_far)
+
+
+def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
     return {
-        "provider": result.provider,
-        # The requested model is host-authored. Never copy the provider's
-        # response model into the result envelope or durable event payload.
-        "model": requested_model,
-        "usage": _usage_counts(result.usage),
-        "latency_s": max(0.0, float(result.latency_s)),
+        "status": loop_outcome.get("status", "failed"),
+        "failure_reason": loop_outcome.get("failure_reason"),
+        "commits": [],
+        "files_changed": [],
+        "diff": "",
+        "diff_truncated": False,
+        "summary": loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
     }
 
 
-def _provider_edit(run: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    router, tier, model = _provider_router(config)
-    try:
-        result = asyncio.run(router.call(tier, _provider_prompt(run), model=model))
-    except Exception as exc:
-        # Provider errors may contain response text or request details. Only the
-        # exception class is safe to carry into the result envelope.
-        raise RuntimeError(f"provider completion failed: {exc.__class__.__name__}") from None
-    if result.model != model:
-        raise ValueError("provider response model mismatch")
-    target_file, marker = _parse_provider_completion(result.content)
-    return target_file, marker, _provider_metadata(result, model)
+def _cumulative_provider_metadata(loop_outcome: dict[str, Any]) -> dict[str, Any] | None:
+    provider = loop_outcome.get("provider")
+    model = loop_outcome.get("model")
+    usage = loop_outcome.get("usage")
+    if not isinstance(provider, str) or not isinstance(model, str) or not isinstance(usage, dict):
+        return None
+    return {
+        "provider": provider,
+        "model": model,
+        "usage": usage,
+        "latency_s": max(0.0, float(loop_outcome.get("latency_s", 0.0))),
+    }
 
 
-def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
+def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
     """Execute one task: throwaway worktree, one-file edit, commit.
 
     Returns the outcome dict:
@@ -370,19 +761,8 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         write_marker = bool(run.get("write_marker", True))
         provider_metadata: dict[str, Any] | None = None
 
-        fanout_config = _provider_fanout_config(run)
-        if fanout_config is None:
-            target_file = run["target_file"]
-            marker = run["marker"]
-        else:
-            try:
-                target_file, marker, provider_metadata = _provider_edit(run, fanout_config)
-            except ValueError:
-                outcome["failure_reason"] = "provider completion violated the edit contract"
-                return outcome
-            except RuntimeError as exc:
-                outcome["failure_reason"] = str(exc)
-                return outcome
+        target_file = run["target_file"]
+        marker = run["marker"]
 
         session_root = scratch.parent
         if not worktree.is_relative_to(session_root):
@@ -487,29 +867,393 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         return outcome
 
 
+async def do_work(
+    run: dict[str, Any],
+    stop: threading.Event,
+    *,
+    config: AgentConfig | None = None,
+    writer: asyncio.StreamWriter | None = None,
+    progress: AgentProgress | None = None,
+) -> dict[str, Any]:
+    """Execute one task and return the outcome dict (result-envelope shape).
+
+    With no ``fanout_config`` this is the deterministic marker path
+    (``_do_work_marker``); provider-backed tasks run the bounded agent loop
+    and then ``_finalize_worktree``.
+    """
+    if _provider_fanout_config(run) is None:
+        return await asyncio.to_thread(_do_work_marker, run, stop)
+    if config is None:
+        config = _config_from_run(run)
+    if progress is None:
+        progress = AgentProgress()
+    return await _do_provider_work(run, config, stop, writer, progress)
+
+
+def _fanout_budget_usd(config: dict[str, Any] | None) -> float | None:
+    if not isinstance(config, dict):
+        return None
+    value = config.get("budget_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
+def _loop_result(
+    outcome: dict[str, Any],
+    status: str,
+    failure_reason: str | None,
+    turn: int,
+    cumulative_usage: dict[str, int],
+    transcript: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        **outcome,
+        "status": status,
+        "failure_reason": failure_reason,
+        "turn": max(0, int(turn)),
+        "usage": dict(cumulative_usage),
+        "transcript": transcript,
+    }
+
+
+async def _run_agent_loop(
+    *,
+    config: AgentConfig,
+    router: Diffundo,
+    tier: ProviderTier,
+    model: str,
+    worktree: Path,
+    writer: asyncio.StreamWriter | None,
+    stop: threading.Event,
+    progress: AgentProgress,
+) -> dict[str, Any]:
+    """Bounded provider-backed tool loop: one router call per turn, strict
+    action parsing, permission checks, tool dispatch, tool_event + checkpoint.
+
+    Returns a loop outcome dict: status / failure_reason / summary / turn /
+    cumulative usage / provider / latency_s / bounded transcript.
+    """
+    outcome: dict[str, Any] = {
+        "status": "failed",
+        "failure_reason": None,
+        "summary": "",
+        "turn": 0,
+        "usage": {},
+        "provider": None,
+        "model": model,
+        "latency_s": 0.0,
+        "transcript": [],
+        "commits_so_far": [],
+    }
+    wall_deadline = time.monotonic() + config.max_wall_s
+    cumulative_usage: dict[str, int] = {}
+    transcript: list[dict[str, Any]] = []
+    tools = _exposed_tool_schemas(config)
+    budget_usd = _fanout_budget_usd(config.fanout_config)
+    try:
+        for turn in range(1, config.max_turns + 1):
+            progress.turn = turn
+            progress.status = "working"
+            if stop.is_set():
+                return _loop_result(
+                    outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
+                )
+            if time.monotonic() >= wall_deadline:
+                return _loop_result(
+                    outcome, "failed", "wall budget exceeded", turn - 1,
+                    cumulative_usage, transcript,
+                )
+            _require_generation(worktree, config.generation)
+            prompt = _build_agent_prompt(config.task, tools, transcript)
+            try:
+                result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
+            except Exception as exc:
+                # Provider errors may contain response text or request details.
+                # Only the exception class is safe to carry into the envelope.
+                return _loop_result(
+                    outcome, "failed", f"provider call failed: {exc.__class__.__name__}",
+                    turn - 1, cumulative_usage, transcript,
+                )
+            if time.monotonic() >= wall_deadline:
+                return _loop_result(
+                    outcome, "failed", "wall budget exceeded",
+                    turn, cumulative_usage, transcript,
+                )
+            if result.model != model:
+                return _loop_result(
+                    outcome, "failed", "provider response model mismatch",
+                    turn - 1, cumulative_usage, transcript,
+                )
+            total = _usage_total(result.usage)
+            if total is None:
+                return _loop_result(
+                    outcome, "failed", "provider usage missing usable token counts",
+                    turn - 1, cumulative_usage, transcript,
+                )
+            cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
+            if _cumulative_total(cumulative_usage) > config.max_tokens:
+                return _loop_result(
+                    outcome, "failed", "token budget exceeded",
+                    turn, cumulative_usage, transcript,
+                )
+            action_content = _bounded_text(result.content, MAX_ACTION_CONTENT_BYTES)
+            try:
+                action = _parse_agent_action(result.content)
+            except ValueError as exc:
+                transcript.append({"role": "assistant", "content": action_content})
+                transcript.append({"role": "user", "content": f"invalid action: {exc}"})
+                continue
+            if action["type"] == "finish":
+                transcript.append({"role": "assistant", "content": action_content})
+                return {
+                    **outcome,
+                    "status": "succeeded",
+                    "summary": action["summary"],
+                    "turn": turn,
+                    "usage": cumulative_usage,
+                    "provider": result.provider,
+                    "latency_s": max(0.0, float(result.latency_s)),
+                    "transcript": transcript,
+                }
+            name, arguments = action["name"], action["arguments"]
+            denial = _permission_denied(name, arguments, config)
+            if denial is not None:
+                transcript.append({"role": "assistant", "content": action_content})
+                transcript.append({"role": "user", "content": f"action rejected: {denial}"})
+                progress.tool = name
+                continue
+            if stop.is_set():
+                return _loop_result(
+                    outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
+                )
+            progress.tool = name
+            with ToolContext(worktree) as ctx:
+                tool_result = await run_tool(name, arguments, ctx)
+            transcript.append({"role": "assistant", "content": action_content})
+            transcript.append({"role": "user", "content": _tool_observation(name, tool_result)})
+            if writer is not None:
+                await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
+                await _persist_checkpoint(writer, config, turn, transcript, cumulative_usage, [])
+        return _loop_result(
+            outcome, "failed", f"max turns exceeded ({config.max_turns})",
+            config.max_turns, cumulative_usage, transcript,
+        )
+    except GenerationFenceError as exc:
+        return _loop_result(
+            outcome, "failed", str(exc), progress.turn, cumulative_usage, transcript
+        )
+
+
+async def _do_provider_work(
+    run: dict[str, Any],
+    config: AgentConfig,
+    stop: threading.Event,
+    writer: asyncio.StreamWriter | None,
+    progress: AgentProgress,
+) -> dict[str, Any]:
+    worktree = Path(run["worktree_path"]).resolve()
+    session_root = Path(run["scratch_repo"]).resolve().parent
+    if not worktree.is_relative_to(session_root):
+        return _loop_failure_outcome({
+            "status": "failed",
+            "failure_reason": (
+                f"worktree_path {worktree} outside session scratch root {session_root}"),
+        })
+    if not worktree.exists():
+        return _loop_failure_outcome({
+            "status": "failed",
+            "failure_reason": f"worker worktree is missing: {worktree}",
+        })
+    try:
+        router, tier, model = _provider_router(config.fanout_config)
+    except Exception as exc:
+        return _loop_failure_outcome({
+            "status": "failed",
+            "failure_reason": f"provider routing failed: {exc.__class__.__name__}",
+        })
+    worker_identity = secrets.token_hex(16)
+    loop_outcome = await _run_agent_loop(
+        config=config,
+        router=router,
+        tier=tier,
+        model=model,
+        worktree=worktree,
+        writer=writer,
+        stop=stop,
+        progress=progress,
+    )
+    if loop_outcome["status"] != "succeeded":
+        return _loop_failure_outcome(loop_outcome)
+    outcome = await asyncio.to_thread(
+        _finalize_worktree,
+        run=run,
+        config=config,
+        worktree=worktree,
+        generation=config.generation,
+        worker_identity=worker_identity,
+        stop=stop,
+        loop_outcome=loop_outcome,
+    )
+    final_checkpoint = outcome.pop("_checkpoint_path", None)
+    if writer is not None and final_checkpoint is not None:
+        await _emit_checkpoint(
+            writer, config, loop_outcome.get("turn", 0),
+            Path(final_checkpoint), outcome.get("commits", []),
+        )
+    return outcome
+
+
+def _finalize_worktree(
+    *,
+    run: dict[str, Any],
+    config: AgentConfig,
+    worktree: Path,
+    generation: int,
+    worker_identity: str,
+    stop: threading.Event,
+    loop_outcome: dict[str, Any],
+) -> dict[str, Any]:
+    """Stage the agent's changed files (excluding ``.cambium/``) and make ONE
+    fenced worker-owned commit with generation + identity trailers. Returns the
+    result-envelope shape: model summary + cumulative safe provider metadata.
+
+    The commit message, envelope, state paths, and provider metadata are all
+    worker-authored; no model-controlled value reaches any of them.
+    """
+    outcome: dict[str, Any] = {
+        "status": "failed",
+        "failure_reason": None,
+        "commits": [],
+        "files_changed": [],
+        "diff": "",
+        "diff_truncated": False,
+        "summary": loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
+    }
+    provider_metadata = _cumulative_provider_metadata(loop_outcome)
+    if provider_metadata is not None:
+        outcome["provider_metadata"] = provider_metadata
+    try:
+        if stop.is_set():
+            outcome["status"] = "cancelled"
+            return outcome
+        _require_generation(worktree, generation)
+        scratch = Path(run["scratch_repo"]).resolve()
+        base_commit = config.base_commit
+        if not base_commit:
+            rc, base, err = git("rev-parse", "main", cwd=scratch)
+            if rc != 0:
+                outcome["failure_reason"] = f"no main branch in scratch repo: {err}"
+                return outcome
+            base_commit = base
+        rc, _out, err = git("rev-parse", "HEAD", cwd=worktree)
+        if rc != 0:
+            outcome["failure_reason"] = f"cannot resolve worktree HEAD: {err}"
+            return outcome
+        _require_generation(worktree, generation)
+        status_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            env=scrub_environment(),
+        )
+        if status_proc.returncode != 0:
+            outcome["failure_reason"] = (
+                f"git status failed: {status_proc.stderr.strip()}"
+            )
+            return outcome
+        changed: list[str] = []
+        for line in status_proc.stdout.splitlines():
+            path = line[3:].strip() if len(line) > 3 else line.strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            if not path or path == ".cambium" or path.startswith(".cambium/"):
+                continue
+            changed.append(path)
+        if not changed:
+            outcome["failure_reason"] = "no files changed by the agent"
+            return outcome
+        for path in changed:
+            _require_generation(worktree, generation)
+            rc, _out, err = _fenced_git(worktree, generation, "add", "--", path, cwd=worktree)
+            if rc != 0:
+                outcome["failure_reason"] = f"git add failed for {path}: {err}"
+                return outcome
+        _require_generation(worktree, generation)
+        rc, _out, err = _fenced_git(
+            worktree,
+            generation,
+            "commit",
+            "-m",
+            f"cambium-agent: {config.task_id}",
+            "-m",
+            f"Cambium-Worker-Generation: {generation}\n"
+            f"Cambium-Worker-Identity: {worker_identity}",
+            cwd=worktree,
+        )
+        if rc != 0:
+            outcome["failure_reason"] = f"commit failed: {err}"
+            return outcome
+        _rc, sha, _err = git("rev-parse", "HEAD", cwd=worktree)
+        _rc, diff, _err = git("diff", f"{base_commit}..HEAD", cwd=worktree)
+        diff, diff_truncated = cap_diff(diff)
+        _require_generation(worktree, generation)
+        final_checkpoint = _write_checkpoint_file(
+            config,
+            loop_outcome.get("turn", 0),
+            loop_outcome.get("transcript", []),
+            loop_outcome.get("usage", {}),
+            [sha],
+        )
+        outcome.update(
+            status="succeeded",
+            failure_reason=None,
+            commits=[sha],
+            files_changed=changed,
+            diff=diff,
+            diff_truncated=diff_truncated,
+            summary=(
+                loop_outcome.get("summary") or f"completed {config.task_id}"
+            )[:MAX_SUMMARY_CHARS],
+        )
+        if final_checkpoint is not None:
+            outcome["_checkpoint_path"] = str(final_checkpoint)
+        return outcome
+    except GenerationFenceError as exc:
+        outcome["failure_reason"] = str(exc)
+        return outcome
+    except Exception as exc:  # let-it-crash: report as a failure, not a hang
+        outcome["failure_reason"] = f"task crashed: {exc}"
+        return outcome
+
+
 async def _heartbeat_loop(
     writer: asyncio.StreamWriter,
     task_id: str,
     generation: int,
     stop: threading.Event,
+    progress: AgentProgress | None = None,
+    interval_s: float = HEARTBEAT_INTERVAL_S,
 ) -> None:
-    turn = 0
     while not stop.is_set():
+        turn = progress.turn if progress is not None else 0
+        tool = progress.tool if progress is not None else None
+        status = progress.status if progress is not None else "working"
         await send(writer, {
             "type": "heartbeat",
             "task_id": task_id,
             "generation": generation,
             "turn": turn,
-            "tool": None,
-            "status": "working",
+            "tool": tool,
+            "status": status,
             "monotonic_ms": _monotonic_ms(),
         })
-        turn += 1
         if stop.is_set():
             # Observed the stop flag right after this send: exit at the safe
             # point (between iterations) instead of starting another send.
             break
-        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+        await asyncio.sleep(interval_s)
 
 
 async def _run_task(
@@ -518,14 +1262,20 @@ async def _run_task(
     task_id: str,
     generation: int,
     stop: threading.Event,
+    config: AgentConfig,
 ) -> dict[str, Any]:
     """Run the task body with heartbeats; returns the terminal outcome."""
     started_at = time.time()
     run_rid = run["request_id"]
+    progress = AgentProgress()
 
-    hb = asyncio.create_task(_heartbeat_loop(writer, task_id, generation, stop))
+    hb = asyncio.create_task(
+        _heartbeat_loop(
+            writer, task_id, generation, stop, progress, config.heartbeat_interval_s
+        )
+    )
     try:
-        outcome = await asyncio.to_thread(do_work, run, stop)
+        outcome = await do_work(run, stop, config=config, writer=writer, progress=progress)
     finally:
         stop.set()
         # Heartbeat stop: the write is enqueued synchronously and atomically,
@@ -664,6 +1414,10 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
     init_fanout_config = first.get("fanout_config")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
         return await _fatal(writer, first, "init generation must be a positive integer")
+    try:
+        init_config = AgentConfig.from_init(first)
+    except ValueError as exc:
+        return await _fatal(writer, first, f"invalid init config: {exc}")
     await send(writer, {
         "type": "ready",
         "request_id": init_rid,
@@ -754,8 +1508,9 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 # Provider configuration belongs to init. It is kept in the
                 # worker's local task context and never sent back over IPC.
                 task_run["fanout_config"] = init_fanout_config
+            task_config = _merge_task_config(init_config, first, task_run)
             current = asyncio.create_task(
-                _run_task(writer, task_run, task_id, generation, stop))
+                _run_task(writer, task_run, task_id, generation, stop, task_config))
         elif mtype == "check_health":
             await _send_ok(writer, msg, task_id, generation)
         elif mtype == "ping":

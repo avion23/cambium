@@ -85,7 +85,7 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
     return "proto" in msg and msg["proto"] != PROTO
 
 
-_TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size")
+_TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
 _TOOL_EVENT_DURATION_FIELDS = ("duration_ms",)
 
 
@@ -2164,6 +2164,7 @@ class _Runtime:
                     await self.emit(
                         "checkpoint", task_id=task_id, turn=msg.get("turn"),
                         state_ref=msg.get("state_ref"), generation=generation,
+                        commits_so_far=msg.get("commits_so_far"),
                     )
                 elif mtype in ("tool_event", "pong"):
                     forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
@@ -2177,7 +2178,7 @@ class _Runtime:
                             )
                         else:
                             for field in (
-                                "batch_index", "batch_size", "ok", "duration_ms"
+                                "batch_index", "batch_size", "ok", "duration_ms", "turn"
                             ):
                                 if field in msg:
                                     forwarded[field] = msg[field]
