@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +48,40 @@ class ToolContext:
     approval: ApprovalGate | None = None
     lint: LintDiag | None = None
     compile_gate: Any | None = None
+    _root: Path = field(init=False, repr=False)
+    _root_fd: int | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
-        self.cwd = Path(self.cwd).resolve()
+        root = Path(self.cwd).resolve()
+        self.cwd = root
+        self._root = root
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        self._root_fd = os.open(root, flags)
+
+    def close(self) -> None:
+        root_fd = self._root_fd
+        self._root_fd = None
+        if root_fd is not None:
+            os.close(root_fd)
+
+    def __enter__(self) -> ToolContext:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        root_fd = getattr(self, "_root_fd", None)
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +135,9 @@ def _serialize_signature_result(result: dict[str, Any]) -> str:
 
     envelope = {**result, "signature": "", "truncated": True}
     if len(serialize(envelope).encode("utf-8")) > MAX_OUTPUT_BYTES:
-        return serialize({"truncated": True})
+        return serialize(
+            {"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True}
+        )
 
     signature = result["signature"]
     low = 0
@@ -125,7 +158,7 @@ def _serialize_signature_result(result: dict[str, Any]) -> str:
 
 
 def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
-    root = Path(ctx.cwd).resolve()
+    root = ctx._root
     candidate = (root / raw_path).resolve()
     if not candidate.is_relative_to(root):
         raise _ToolFailure(f"path escapes worktree: {raw_path!r}")
@@ -134,7 +167,7 @@ def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
 
 def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
     """Open a resolved worktree path without following a replacement symlink."""
-    root = Path(ctx.cwd).resolve()
+    root = ctx._root
     try:
         components = path.relative_to(root).parts
     except ValueError as exc:
@@ -148,7 +181,10 @@ def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
     directory_flags = os.O_RDONLY | nofollow | directory | close_on_exec
     file_flags = os.O_RDONLY | nofollow | close_on_exec
 
-    directory_fd = os.open(root, directory_flags)
+    root_fd = ctx._root_fd
+    if root_fd is None:
+        raise _ToolFailure("worktree context is closed")
+    directory_fd = os.dup(root_fd)
     try:
         for component in components[:-1]:
             next_directory_fd = os.open(component, directory_flags, dir_fd=directory_fd)
@@ -160,7 +196,7 @@ def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
 
 
 def _display_path(ctx: ToolContext, path: Path) -> str:
-    relative = path.relative_to(Path(ctx.cwd).resolve())
+    relative = path.relative_to(ctx._root)
     return relative.as_posix() or "."
 
 

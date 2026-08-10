@@ -236,6 +236,29 @@ def test_get_signature_does_not_follow_replaced_validated_file(
     assert "could not read sample.py" in (result.error or "")
 
 
+def test_get_signature_rejects_replaced_worktree_root(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "sample.py").write_text(
+        "def build():\n    return 'outside'\n", encoding="utf-8"
+    )
+    context = ToolContext(root)
+
+    root.rename(tmp_path / "original-worktree")
+    root.symlink_to(outside, target_is_directory=True)
+    result = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build"},
+        context,
+    )
+
+    assert not result.ok
+    assert result.output == ""
+    assert result.error == "path escapes worktree: 'sample.py'"
+
+
 def test_get_signature_rejects_oversized_source(tmp_path: Path) -> None:
     (tmp_path / "large.py").write_bytes(b"x" * (MAX_READ_BYTES + 1))
 
@@ -298,6 +321,25 @@ def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
     assert parsed["truncated"] is True
     assert "[output truncated]" in parsed["signature"]
     assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
+
+
+def test_get_signature_caps_when_non_signature_fields_are_oversized() -> None:
+    result = tools._serialize_signature_result(
+        {
+            "path": "p" * (MAX_OUTPUT_BYTES + 1),
+            "name": "build",
+            "kind": "function",
+            "line": 1,
+            "col": 0,
+            "body_lines": 1,
+            "signature": "def build():",
+        }
+    )
+
+    parsed = json.loads(result)
+    assert parsed["truncated"] is True
+    assert "[output truncated]" in parsed["signature"]
+    assert len(result.encode("utf-8")) <= MAX_OUTPUT_BYTES
 
 
 def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:
