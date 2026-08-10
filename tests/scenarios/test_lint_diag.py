@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -106,3 +108,24 @@ def test_syntax_error_is_returned_as_e999(tmp_path: Path) -> None:
     assert all(isinstance(diagnostic["line"], int) for diagnostic in syntax_errors)
     assert all(isinstance(diagnostic["col"], int) for diagnostic in syntax_errors)
     assert all(diagnostic["message"] for diagnostic in syntax_errors)
+
+
+def test_lint_subprocess_does_not_inherit_provider_credentials(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The linter subprocess gets a scrubbed env: a linter that echoes its
+    environment must not observe any provider credential."""
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "lint-secret")
+    script = (
+        "import json, os, sys\n"
+        "secret = os.environ.get('CAMBIUM_PROVIDER_OPENAI_API_KEY', 'NO-SECRET')\n"
+        "print(json.dumps([{'code': 'E001', 'message': secret, "
+        "'filename': sys.argv[1], 'location': {'row': 1, 'column': 1}}]))\n"
+    )
+    linter = LintDiag(lint_cmd=[sys.executable, "-c", script])
+
+    diagnostics = linter.lint_file(tmp_path / "example.py")
+
+    assert diagnostics
+    assert diagnostics[0]["message"] == "NO-SECRET"
+    assert "lint-secret" not in json.dumps(diagnostics)

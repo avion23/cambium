@@ -1,9 +1,10 @@
 """Conformance pins for the normative Cambium architecture contracts.
 
 These checks intentionally use the shipped modules, SQLite schema, git, and a
-real worker process.  The supervisor environment check is the one exception to
-runtime exercise: it parses the module with :mod:`ast` so every direct
-``create_subprocess_exec`` call is checked without starting a full supervisor.
+real worker process.  The supervisor environment checks are the one exception
+to runtime exercise: they parse the module with :mod:`ast` so every direct
+``create_subprocess_exec`` and ``subprocess.run`` call is checked without
+starting a full supervisor.
 """
 
 from __future__ import annotations
@@ -269,10 +270,70 @@ def test_worker_env_drops_api_key_names_and_keeps_path() -> None:
     assert env["PATH"] == "/usr/bin"
 
 
-def test_supervisor_spawn_sites_use_sensitive_env_stripper() -> None:
-    """Use AST instead of a runtime hook to cover every direct spawn site."""
+def test_supervisor_spawn_sites_use_scrubbed_environment() -> None:
+    """Use AST instead of a runtime hook to cover every direct spawn site.
+
+    Every ``create_subprocess_exec`` spawn must pass an explicit ``env=`` that
+    is either ``_worker_environment(...)`` (the worker spawn, which re-adds
+    only authorized canonical provider keys) or ``scrub_environment()`` (git,
+    gate, and shell spawns, which must carry no provider credentials).
+    """
     source = Path(inspect.getfile(supervisor)).read_text(encoding="utf-8")
     tree = ast.parse(source)
+
+    scrubber_names = {"_worker_environment", "scrub_environment"}
+
+    def calls_scrubber(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id in scrubber_names
+            for child in ast.walk(node)
+        )
+
+    def assignment_uses_scrubber(body: list[ast.stmt], name: str) -> bool:
+        for statement in body:
+            if not isinstance(statement, ast.Assign):
+                continue
+            for target in statement.targets:
+                if not isinstance(target, ast.Name) or target.id != name:
+                    continue
+                if calls_scrubber(statement.value):
+                    return True
+                if (
+                    isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Attribute)
+                    and statement.value.func.attr == "_worker_env"
+                ):
+                    return True
+        return False
+
+    parent_map: dict[ast.AST, ast.AST] = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def enclosing_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        current = node
+        parent = parent_map.get(current)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return parent
+            current = parent
+            parent = parent_map.get(current)
+        return None
+
+    def env_is_scrubbed(env_keyword: ast.keyword, node: ast.AST) -> bool:
+        if calls_scrubber(env_keyword.value):
+            return True
+        if not isinstance(env_keyword.value, ast.Name):
+            return False
+        function = enclosing_function(node)
+        return (
+            function is not None
+            and assignment_uses_scrubber(function.body, env_keyword.value.id)
+        )
 
     spawn_calls = [
         node
@@ -283,31 +344,114 @@ def test_supervisor_spawn_sites_use_sensitive_env_stripper() -> None:
     ]
     assert spawn_calls, "supervisor must have at least one subprocess spawn path"
 
-    if any(
-        (env_keyword := next(
-            (keyword for keyword in call.keywords if keyword.arg == "env"), None
-        )) is None
-        or not any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_strip_sensitive_env"
-            for node in ast.walk(env_keyword.value)
-        )
-        for call in spawn_calls
-    ):
-        pytest.skip("env hardening pending supervisor fix (wt-impl-super)")
-
     assert any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_strip_sensitive_env"
+        and node.name == "_worker_environment"
         for node in ast.walk(tree)
     )
     for call in spawn_calls:
         env_keyword = next((keyword for keyword in call.keywords if keyword.arg == "env"), None)
         assert env_keyword is not None, f"spawn at line {call.lineno} has no env="
-        assert any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_strip_sensitive_env"
-            for node in ast.walk(env_keyword.value)
-        ), f"spawn at line {call.lineno} does not call _strip_sensitive_env"
+        assert env_is_scrubbed(env_keyword, call), (
+            f"spawn at line {call.lineno} does not use a scrubbed environment builder"
+        )
+
+
+def test_supervisor_subprocess_run_git_calls_use_scrubbed_environment() -> None:
+    """Every ``subprocess.run`` in the supervisor must pass an explicit ``env=``
+    built from a scrubber, so no git subprocess or hook inherits provider
+    credentials.
+
+    Regression guard for the CLI convenience paths (``_ensure_repo_initialized``
+    and ``_sh``) that ran git with the inherited ``os.environ``.  Scrubber
+    references are resolved through module builders (``scrub_environment``,
+    ``_worker_environment``), scrubber-derived class methods (``_env``,
+    ``_worker_env``), and locals assigned from any of those.
+    """
+    source = Path(inspect.getfile(supervisor)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    scrubber_names = {"_worker_environment", "scrub_environment"}
+
+    def calls_scrubber(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id in scrubber_names
+            for child in ast.walk(node)
+        )
+
+    scrubber_method_names = {
+        item.name
+        for class_node in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
+        for item in class_node.body
+        if isinstance(item, ast.FunctionDef) and calls_scrubber(item)
+    }
+
+    def references_scrubber(value: ast.AST) -> bool:
+        if calls_scrubber(value):
+            return True
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr in scrubber_method_names
+            for child in ast.walk(value)
+        )
+
+    parent_map: dict[ast.AST, ast.AST] = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def enclosing_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        current = node
+        parent = parent_map.get(current)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return parent
+            current = parent
+            parent = parent_map.get(current)
+        return None
+
+    def assignment_uses_scrubber(body: list[ast.stmt], name: str) -> bool:
+        for statement in body:
+            if not isinstance(statement, ast.Assign):
+                continue
+            for target in statement.targets:
+                if not isinstance(target, ast.Name) or target.id != name:
+                    continue
+                if references_scrubber(statement.value):
+                    return True
+        return False
+
+    def env_is_scrubbed(value: ast.AST, node: ast.AST) -> bool:
+        if references_scrubber(value):
+            return True
+        if isinstance(value, ast.Name):
+            function = enclosing_function(node)
+            return (
+                function is not None
+                and assignment_uses_scrubber(function.body, value.id)
+            )
+        return False
+
+    run_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ]
+    assert run_calls, "supervisor must have at least one subprocess.run git call"
+
+    for call in run_calls:
+        env_keyword = next((keyword for keyword in call.keywords if keyword.arg == "env"), None)
+        assert env_keyword is not None, (
+            f"subprocess.run at line {call.lineno} has no env="
+        )
+        assert env_is_scrubbed(env_keyword.value, call), (
+            f"subprocess.run at line {call.lineno} does not use a scrubbed environment"
+        )

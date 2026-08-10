@@ -152,7 +152,7 @@ async def _run_gate(
     proc = await asyncio.create_subprocess_exec(
         "sh", "-c", command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(dict(os.environ)),
+        env=scrub_environment(),
     )
     try:
         _out, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -170,7 +170,7 @@ async def _merge_branch(scratch_repo: Path, branch: str, log: EventLog, task_id:
     proc = await asyncio.create_subprocess_exec(
         "git", "merge", "--ff-only", branch, cwd=scratch_repo,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(dict(os.environ)),
+        env=scrub_environment(),
     )
     _out, err = await proc.communicate()
     if proc.returncode != 0:
@@ -180,7 +180,7 @@ async def _merge_branch(scratch_repo: Path, branch: str, log: EventLog, task_id:
     tip = await asyncio.create_subprocess_exec(
         "git", "rev-parse", "HEAD", cwd=scratch_repo,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(dict(os.environ)),
+        env=scrub_environment(),
     )
     out, _ = await tip.communicate()
     sha = out.decode("utf-8", "replace").strip()
@@ -221,8 +221,7 @@ async def run_session(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=WORKER_STDIN_LIMIT,
-        env=_strip_sensitive_env({**os.environ, "PYTHONUNBUFFERED": "1",
-                                  "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": "1"}),
+        env=_worker_environment(task_id, 1),
         start_new_session=True,
     )
 
@@ -420,14 +419,22 @@ CRITICAL_KINDS = frozenset({
     "merge_progress", "task_assigned", "merge_committed",
 })
 
-_API_KEY_RE = re.compile(
-    r"(api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
-)
+def _worker_environment(task_id: str, generation: int) -> dict[str, str]:
+    """Build the worker spawn env: scrubbed, with ONLY authorized provider keys.
 
-
-def _strip_sensitive_env(env: dict[str, str]) -> dict[str, str]:
-    """Drop env keys with API-key-ish names; keep everything else (arch §9)."""
-    return {k: v for k, v in env.items() if not _API_KEY_RE.search(k)}
+    The base environment is credential-scrubbed; the only secrets that may
+    survive are the canonical ``CAMBIUM_PROVIDER_*_API_KEY`` names authorized
+    by the auth store.  Any other credential-shaped variable is dropped.
+    """
+    source = dict(os.environ)
+    env = scrub_environment(source)
+    env.update(
+        (name, value) for name, value in source.items() if is_provider_env_name(name)
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    env["CAMBIUM_TASK_ID"] = task_id
+    env["CAMBIUM_GENERATION"] = str(generation)
+    return env
 
 
 class NonFastForwardError(RuntimeError):
@@ -566,7 +573,7 @@ class _FallbackSequencer:
 
     @staticmethod
     def _env() -> dict[str, str]:
-        env = dict(os.environ)
+        env = scrub_environment()
         env.pop("GIT_QUARANTINE_PATH", None)
         return env
 
@@ -888,7 +895,8 @@ class _Runtime:
         self, path: Path, args: tuple[str, ...], check: bool
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            ["git", "-C", str(path), *args], capture_output=True, text=True
+            ["git", "-C", str(path), *args], capture_output=True, text=True,
+            env=scrub_environment(),
         )
         if check and result.returncode != 0:
             raise RuntimeError(
@@ -972,17 +980,7 @@ class _Runtime:
         return [sys.executable, "-u", str(worker)]
 
     def _worker_env(self, spec: dict[str, Any], generation: int) -> dict[str, str]:
-        source = dict(os.environ)
-        env = scrub_environment(source)
-        env.update(
-            (name, value)
-            for name, value in source.items()
-            if is_provider_env_name(name)
-        )
-        env["PYTHONUNBUFFERED"] = "1"
-        env["CAMBIUM_TASK_ID"] = spec["task_id"]
-        env["CAMBIUM_GENERATION"] = str(generation)
-        return env
+        return _worker_environment(spec["task_id"], generation)
 
     def _run_payload(
         self, spec: dict[str, Any], run_rid: str, wall_budget: float
@@ -1145,7 +1143,7 @@ class _Runtime:
                 stderr=asyncio.subprocess.PIPE,
                 limit=WORKER_STDIN_LIMIT,
                 cwd=str(worktree),
-                env=_strip_sensitive_env(env),
+                env=env,
                 start_new_session=True,
                 pass_fds=(),
                 close_fds=True,
@@ -1422,7 +1420,7 @@ class _Runtime:
         proc = await asyncio.create_subprocess_exec(
             "sh", "-c", gate, cwd=str(worktree),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_strip_sensitive_env(dict(os.environ)),
+            env=scrub_environment(),
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -1590,6 +1588,7 @@ def _ensure_repo_initialized(repo: Path) -> None:
     rc = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "refs/heads/main"],
         capture_output=True,
+        env=scrub_environment(),
     )
     if rc.returncode != 0:
         _sh("git", "-C", str(repo), "commit", "--allow-empty", "-m", "cambium initial")
@@ -1621,7 +1620,7 @@ def _load_task_spec(session_dir: Path, spec_path: str | None) -> dict[str, Any]:
 
 
 def _sh(*args: str, cwd: str | Path | None = None) -> None:
-    subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+    subprocess.run(args, cwd=cwd, check=True, capture_output=True, env=scrub_environment())
 
 
 def _bootstrap_scratch(repo: Path, task_spec: dict[str, Any]) -> None:

@@ -184,6 +184,45 @@ def test_foreign_file_owner_is_rejected(
         store.read()
 
 
+def test_auth_directory_creation_rejects_symlinked_local_component(tmp_path: Path) -> None:
+    """A symlinked intermediate (~/.local) in the fixed auth path must be rejected
+    before anything is written through it to the outside target."""
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / ".local").symlink_to(outside, target_is_directory=True)
+    path = home / ".local" / "share" / "cambium" / "auth.json"
+    store = auth.AuthStore(path)
+
+    with pytest.raises(auth.AuthStoreError, match="symlink"):
+        store.set_provider("openai", SECRET)
+
+    assert not (outside / "share").exists()
+    assert not (outside / "share" / "cambium").exists()
+    assert not list(outside.iterdir())
+    assert not (home / ".local" / "share").exists()
+
+
+def test_auth_directory_creation_rejects_symlinked_final_component(tmp_path: Path) -> None:
+    """A symlinked final auth directory is rejected; nothing is written through it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / ".local").mkdir()
+    (home / ".local" / "share").mkdir()
+    (home / ".local" / "share" / "cambium").symlink_to(outside, target_is_directory=True)
+    path = home / ".local" / "share" / "cambium" / "auth.json"
+    store = auth.AuthStore(path)
+
+    with pytest.raises(auth.AuthStoreError, match="symlink"):
+        store.set_provider("openai", SECRET)
+
+    assert not (outside / "auth.json").exists()
+    assert not list(outside.iterdir())
+
+
 def test_launch_environment_scrubs_inherited_credentials() -> None:
     document = auth.AuthDocument(1, (auth.ProviderCredential("foo-bar", SECRET),))
     base = {

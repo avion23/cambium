@@ -331,10 +331,60 @@ def _validate_file_stat(value: os.stat_result) -> None:
 
 
 def _ensure_directory(path: Path) -> None:
+    """Create the fixed auth directory without following any symlink component.
+
+    ``Path.mkdir(parents=True)`` would silently follow a symlinked
+    intermediate (e.g. a ``~/.local`` symlink pointing outside the home), so
+    the fixed path is built component-by-component and each existing or newly
+    created component is verified with a realpath check plus an ``O_NOFOLLOW``
+    open before descending.  A symlink anywhere in the path is rejected with a
+    clear error before anything can be written through it.
+    """
+    target = Path(path)
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    anchor = target.anchor or "."
+    real_parent = os.path.realpath(anchor)
+    current = Path(anchor)
+    names = target.parts[1:] if target.anchor else target.parts
+    for name in names:
+        current = current / name
+        try:
+            os.mkdir(current, AUTH_DIRECTORY_MODE)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise AuthStoreError("could not create the auth store directory") from exc
+        expected = os.path.join(real_parent, name)
+        try:
+            actual = os.path.realpath(current)
+        except OSError as exc:
+            raise AuthStoreError("could not verify the auth store directory path") from exc
+        if actual != expected:
+            raise AuthStoreError(
+                "auth store directory path must not contain a symlink"
+            ) from None
+        real_parent = actual
+        _validate_directory_component(current)
+
+
+def _validate_directory_component(path: Path) -> None:
+    """Verify one auth-path component is a real directory (never a symlink).
+
+    The ``O_DIRECTORY | O_NOFOLLOW`` open is the check: a symlink yields
+    ``ELOOP`` and a non-directory yields ``ENOTDIR``.  Ownership and exact
+    mode of the final auth directory are enforced separately by
+    :func:`_validate_directory_stat` via :func:`_open_directory`.
+    """
     try:
-        path.mkdir(mode=AUTH_DIRECTORY_MODE, parents=True, exist_ok=True)
+        fd = os.open(path, _directory_flags())
     except OSError as exc:
-        raise AuthStoreError("could not create the auth store directory") from exc
+        if exc.errno == errno.ELOOP:
+            raise AuthStoreError(
+                "auth store directory path must not contain a symlink"
+            ) from exc
+        raise AuthStoreError("could not open the auth store directory") from exc
+    os.close(fd)
 
 
 def _open_directory(path: Path, *, create: bool) -> int | None:

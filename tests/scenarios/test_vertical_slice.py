@@ -230,3 +230,33 @@ def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     assert result.merge_sha is None
     events = _load_events(session_dir)
     assert any(e["kind"] == "timeout" for e in events)
+
+
+def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:
+    """The actual spawned worker process sees the authorized provider key and
+    no generic credential-shaped variable (regression: the spawn used to pass
+    the env through a stripper that removed the explicitly authorized key)."""
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "authorized-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_bad_API_KEY", "noncanonical-secret")
+    dump_path = tmp_path / "worker-env.json"
+    monkeypatch.setenv("ENV_DUMP_PATH", str(dump_path))
+
+    env_worker = str(
+        Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "env_worker.py"
+    )
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+    spec["worker"] = env_worker
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "succeeded"
+    assert result.exit_code == 0
+    spawned_env = json.loads(dump_path.read_text(encoding="utf-8"))
+    assert spawned_env["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == "authorized-secret"
+    assert "OPENAI_API_KEY" not in spawned_env
+    assert "CAMBIUM_PROVIDER_bad_API_KEY" not in spawned_env
+    assert spawned_env["CAMBIUM_TASK_ID"] == "slice-001"
