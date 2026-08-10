@@ -988,6 +988,22 @@ class _Runtime:
                     "worktree_cleanup_deferred", task_id=task_id, reason="repo_path"
                 )
                 return
+            if branch != "main":
+                branch_ref = f"branch refs/heads/{branch}"
+                for block in listing.stdout.split("\n\n"):
+                    lines = block.splitlines()
+                    path_line = next(
+                        (line for line in lines if line.startswith("worktree ")), None
+                    )
+                    if path_line is None:
+                        continue
+                    registered_path = Path(path_line[len("worktree "):].strip()).resolve()
+                    if registered_path != worktree and branch_ref in lines:
+                        await self.emit(
+                            "worktree_cleanup_deferred", task_id=task_id,
+                            reason="branch_in_use",
+                        )
+                        return
 
             status = await self._git(
                 worktree,
@@ -1015,7 +1031,21 @@ class _Runtime:
                 )
                 return
             if branch != "main":
-                await self._git(repo, "branch", "-D", branch, check=False)
+                deleted = await self._git(repo, "branch", "-D", branch, check=False)
+                if deleted.returncode != 0:
+                    restored = await self._git(
+                        repo, "worktree", "add", str(worktree), branch, check=False
+                    )
+                    if restored.returncode != 0:
+                        restored = await self._git(
+                            repo, "worktree", "add", "--detach", str(worktree), branch,
+                            check=False,
+                        )
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id,
+                        reason="branch_delete_failed", restored=restored.returncode == 0,
+                    )
+                    return
             await self._git(repo, "worktree", "prune", check=False)
             await self.emit("worktree_pruned", task_id=task_id, branch=branch)
 
