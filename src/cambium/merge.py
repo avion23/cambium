@@ -377,8 +377,15 @@ class MergeSequencer:
                 check=False,
             )
 
-    def _prune_quarantine(self, repo: Path, *, newest: Path | None = None) -> None:
-        root = self._quarantine_root()
+    def _prune_quarantine(
+        self,
+        repo: Path,
+        *,
+        newest: Path | None = None,
+        newest_allocated_bytes: int | None = None,
+        root: Path | None = None,
+    ) -> None:
+        root = self._quarantine_root() if root is None else root
         entries = self._quarantine_entries(root)
         if not entries:
             return
@@ -389,8 +396,18 @@ class MergeSequencer:
             return entry.stat().st_mtime_ns, self._artifact_bytes(repo, entry)
 
         measured = {entry: details(entry) for entry in entries}
-        newest_bytes = measured.get(newest, (0, 0))[1] if newest is not None else 0
-        if newest is not None and newest_bytes > self._quarantine_max_bytes:
+        newest_entry = newest
+        if newest is not None and newest not in measured:
+            newest_stat = newest.stat()
+            newest_entry = next(
+                (entry for entry in entries if os.path.samestat(entry.stat(), newest_stat)), None
+            )
+        if newest_entry is not None and newest_allocated_bytes is not None:
+            measured[newest_entry] = (
+                measured[newest_entry][0], newest_allocated_bytes
+            )
+        newest_bytes = measured.get(newest_entry, (0, 0))[1]
+        if newest_entry is not None and newest_bytes > self._quarantine_max_bytes:
             raise StagingCleanupError("newest quarantine artifact exceeds the byte cap")
 
         expired = sorted(
@@ -419,7 +436,7 @@ class MergeSequencer:
             )
             if not is_expired and not over:
                 break
-            if newest is not None and entry == newest:
+            if newest_entry is not None and entry == newest_entry:
                 continue
             size = measured[entry][1]
             self._delete_quarantine_entry(entry)
@@ -445,9 +462,11 @@ class MergeSequencer:
         task_name = f"task-{self._task_key}"
         destination_name = f"{time.time_ns()}-{secrets.token_hex(8)}"
         staging_sha = self._rev_parse(worktree_path, "HEAD")
-        session_fd = cambium_fd = quarantine_fd = root_fd = task_fd = -1
+        source_parent_fd = session_fd = cambium_fd = quarantine_fd = root_fd = task_fd = -1
+        destination_fd = -1
         try:
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            source_parent_fd = os.open(worktree_path.parent, flags)
             session_fd = os.open(self._session_dir, flags)
             cambium_fd = self._open_directory(session_fd, ".cambium")
             quarantine_fd = self._open_directory(cambium_fd, "quarantine")
@@ -464,10 +483,16 @@ class MergeSequencer:
             anchored_destination = Path(
                 f"/proc/{os.getpid()}/fd/{task_fd}/{destination_name}"
             )
+            anchored_root = Path(f"/proc/{os.getpid()}/fd/{root_fd}")
 
             def restore_staging() -> None:
                 try:
-                    os.rename(destination_name, worktree_path, src_dir_fd=task_fd)
+                    os.rename(
+                        destination_name,
+                        worktree_path.name,
+                        src_dir_fd=task_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
                 except OSError as exc:
                     raise StagingCleanupError(
                         "quarantine containment failed and staging could not be restored"
@@ -490,33 +515,72 @@ class MergeSequencer:
                 restore_staging()
                 raise StagingCleanupError("quarantine path changed during worktree move")
             if result.returncode == 0:
-                allocated = self._artifact_bytes(repo, anchored_destination)
+                destination_fd = os.open(destination_name, flags, dir_fd=task_fd)
+                opened_destination = Path(f"/proc/{os.getpid()}/fd/{destination_fd}")
+                allocated = self._artifact_bytes(repo, opened_destination)
                 if not all(self._is_open_child(*link) for link in chain):
                     restore_staging()
                     raise StagingCleanupError("quarantine path changed during worktree move")
+            if result.returncode != 0:
+                self._event(
+                    "merge_staging_cleanup_failed", task=self._task_id,
+                    staging_sha=staging_sha, reason="worktree-move-failed",
+                )
+                raise StagingCleanupError("cannot move dirty staging worktree to quarantine")
+
+            destination = root / task_name / destination_name
+            relative_id = Path("merge") / task_name / destination_name
+            recording_event_index = len(self._events)
+
+            def containment_failure(message: str, cause: Exception | None = None) -> None:
+                restore_staging()
+                del self._events[recording_event_index:]
+                error = StagingCleanupError(message)
+                if cause is not None:
+                    raise error from cause
+                raise error
+
+            try:
+                self._event(
+                    "merge_staging_quarantined", task=self._task_id,
+                    staging_sha=staging_sha, quarantine_id=relative_id.as_posix(),
+                    allocated_bytes=allocated, reason=",".join(reasons),
+                    expiry=time.time_ns() + self._quarantine_retention_ns,
+                )
+            except Exception as exc:
+                if not all(self._is_open_child(*link) for link in chain):
+                    containment_failure("quarantine path changed during recording", exc)
+                raise
+            if not all(self._is_open_child(*link) for link in chain):
+                containment_failure("quarantine path changed before recording completed")
+            try:
+                self._prune_quarantine(
+                    repo,
+                    newest=anchored_destination,
+                    newest_allocated_bytes=allocated,
+                    root=anchored_root,
+                )
+            except Exception as exc:
+                if not all(self._is_open_child(*link) for link in chain):
+                    containment_failure("quarantine path changed during recording", exc)
+                if isinstance(exc, StagingCleanupError):
+                    self._worktree_path = None
+                    self._staging_branch = None
+                    self._staging_ref = None
+                raise
+            if not all(self._is_open_child(*link) for link in chain):
+                containment_failure("quarantine path changed during recording")
+            self._worktree_path = None
+            self._staging_branch = None
+            self._staging_ref = None
+            return destination
         finally:
-            for fd in (task_fd, root_fd, quarantine_fd, cambium_fd, session_fd):
+            for fd in (
+                destination_fd, task_fd, root_fd, quarantine_fd, cambium_fd, session_fd,
+                source_parent_fd,
+            ):
                 if fd >= 0:
                     os.close(fd)
-        if result.returncode != 0:
-            self._event(
-                "merge_staging_cleanup_failed", task=self._task_id,
-                staging_sha=staging_sha, reason="worktree-move-failed",
-            )
-            raise StagingCleanupError("cannot move dirty staging worktree to quarantine")
-        destination = root / task_name / destination_name
-        relative_id = Path("merge") / task_name / destination_name
-        self._event(
-            "merge_staging_quarantined", task=self._task_id, staging_sha=staging_sha,
-            quarantine_id=relative_id.as_posix(), allocated_bytes=allocated,
-            reason=",".join(reasons),
-            expiry=time.time_ns() + self._quarantine_retention_ns,
-        )
-        self._worktree_path = None
-        self._staging_branch = None
-        self._staging_ref = None
-        self._prune_quarantine(repo, newest=destination)
-        return destination
 
     # -- git plumbing -------------------------------------------------------
 

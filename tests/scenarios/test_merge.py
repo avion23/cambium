@@ -689,6 +689,42 @@ def test_task_directory_swap_after_final_check_restores_staging(tmp_path, monkey
     assert not list(sink.iterdir())
 
 
+def test_task_directory_rename_before_recording_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "rename-before-recording"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    branch = seq.staging_branch
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must not be stranded")
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
+    displaced = tmp_path / "displaced"
+    original = seq._event
+
+    def rename_before_recording(kind, **payload):
+        if kind == "merge_staging_quarantined":
+            task_dir.rename(displaced)
+        original(kind, **payload)
+
+    monkeypatch.setattr(seq, "_event", rename_before_recording)
+
+    with pytest.raises(StagingCleanupError, match="quarantine path changed"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must not be stranded"
+    registered = _run(repo, "worktree", "list", "--porcelain").stdout
+    assert str(staging.resolve()) in registered
+    assert str(displaced.resolve()) not in registered
+    assert branch is not None
+    assert _rev(staging, "HEAD") == _rev(repo, f"refs/heads/{branch}")
+    assert not any(kind == "merge_staging_quarantined" for kind, _ in seq.drain_events())
+    assert not list(displaced.iterdir())
+
+
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
