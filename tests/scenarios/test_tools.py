@@ -13,7 +13,13 @@ from pathlib import Path
 
 from cambium import tools
 from cambium.approval import ApprovalGate, ApprovalPolicy
-from cambium.tools import MAX_OUTPUT_BYTES, MAX_READ_BYTES, ToolContext, run_tool
+from cambium.tools import (
+    MAX_OUTPUT_BYTES,
+    MAX_READ_BYTES,
+    ToolContext,
+    run_read_batch,
+    run_tool,
+)
 
 
 def _run(name: str, args: dict, ctx: ToolContext):
@@ -43,6 +49,246 @@ def test_read_file_rejects_path_escape(tmp_path: Path) -> None:
     assert not result.ok
     assert result.error is not None
     assert "escapes worktree" in result.error
+
+
+def _batch_context(tmp_path: Path, events: list[dict] | None = None) -> ToolContext:
+    return ToolContext(
+        tmp_path,
+        init={"tools": ["read_file"]},
+        emit=events.append if events is not None else None,
+    )
+
+
+def test_read_batch_runs_three_100ms_reads_concurrently(
+    tmp_path: Path, monkeypatch
+) -> None:
+    for name in ("one.txt", "two.txt", "three.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    original = tools._read_file_sync
+
+    def delayed_read(_ctx, path, display_path):
+        time.sleep(0.1)
+        return original(_ctx, path, display_path)
+
+    monkeypatch.setattr(tools, "_read_file_sync", delayed_read)
+    started = time.perf_counter()
+    results = asyncio.run(
+        run_read_batch(
+            [{"path": "one.txt"}, {"path": "two.txt"}, {"path": "three.txt"}],
+            _batch_context(tmp_path),
+        )
+    )
+
+    assert time.perf_counter() - started < 0.2
+    assert [result.output for result in results] == ["one.txt", "two.txt", "three.txt"]
+
+
+def test_read_batch_orders_results_and_events_after_out_of_order_completion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    completion_order: list[int] = []
+    events: list[dict] = []
+    delays = {"zero.txt": 0.03, "one.txt": 0.05, "two.txt": 0.01}
+    indexes = {"zero.txt": 0, "one.txt": 1, "two.txt": 2}
+
+    async def delayed_read(args: dict, _ctx: ToolContext):
+        path = args["path"]
+        await asyncio.sleep(delays[path])
+        completion_order.append(indexes[path])
+        return tools._Outcome(ok=True, output=path)
+
+    monkeypatch.setattr(tools, "_read_file", delayed_read)
+    results = asyncio.run(
+        run_read_batch(
+            [{"path": "zero.txt"}, {"path": "one.txt"}, {"path": "two.txt"}],
+            _batch_context(tmp_path, events),
+        )
+    )
+
+    assert completion_order == [2, 0, 1]
+    assert [result.output for result in results] == ["zero.txt", "one.txt", "two.txt"]
+    assert [event["batch_index"] for event in events] == [0, 1, 2]
+    assert all(set(event) == {
+        "type", "tool", "batch_index", "batch_size", "ok", "duration_ms"
+    } for event in events)
+
+
+def test_read_batch_preserves_input_order(tmp_path: Path) -> None:
+    for name in ("alpha.txt", "beta.txt", "gamma.txt", "delta.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    results = asyncio.run(
+        run_read_batch(
+            [
+                {"path": "alpha.txt"},
+                {"path": "beta.txt"},
+                {"path": "gamma.txt"},
+                {"path": "delta.txt"},
+            ],
+            _batch_context(tmp_path),
+        )
+    )
+
+    assert [result.output for result in results] == [
+        "alpha.txt", "beta.txt", "gamma.txt", "delta.txt"
+    ]
+
+
+def test_read_batch_rejects_mixed_array_atomically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    events: list[dict] = []
+    called = False
+
+    async def unexpected_read(_args: dict, _ctx: ToolContext):
+        nonlocal called
+        called = True
+        raise AssertionError("preflight must run before any read")
+
+    monkeypatch.setattr(tools, "_read_file", unexpected_read)
+    results = asyncio.run(
+        run_read_batch(
+            [{"path": "left.txt"}, {"path": 42}, {"path": "right.txt"}],
+            _batch_context(tmp_path, events),
+        )
+    )
+
+    assert len(results) == 3
+    assert all(not result.ok for result in results)
+    assert all("batch rejected atomically" in (result.error or "") for result in results)
+    assert not called
+    assert events == []
+
+
+def test_read_batch_rejects_path_outside_confined_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "inside.txt").write_text("inside", encoding="utf-8")
+    called = False
+
+    async def unexpected_read(_args: dict, _ctx: ToolContext):
+        nonlocal called
+        called = True
+        raise AssertionError("preflight must reject escaped paths before any read")
+
+    monkeypatch.setattr(tools, "_read_file", unexpected_read)
+    results = asyncio.run(
+        run_read_batch(
+            [{"path": "inside.txt"}, {"path": "../outside.txt"}],
+            _batch_context(tmp_path),
+        )
+    )
+
+    assert len(results) == 2
+    assert all(not result.ok for result in results)
+    assert all("escapes worktree" in (result.error or "") for result in results)
+    assert not called
+
+
+def test_read_batch_missing_middle_file_is_per_call_failure(tmp_path: Path) -> None:
+    (tmp_path / "first.txt").write_text("first", encoding="utf-8")
+    (tmp_path / "last.txt").write_text("last", encoding="utf-8")
+    events: list[dict] = []
+
+    results = asyncio.run(
+        run_read_batch(
+            [
+                {"path": "first.txt"},
+                {"path": "missing.txt"},
+                {"path": "last.txt"},
+            ],
+            _batch_context(tmp_path, events),
+        )
+    )
+
+    assert [result.ok for result in results] == [True, False, True]
+    assert [result.output for result in results] == ["first", "", "last"]
+    assert [event["ok"] for event in events] == [True, False, True]
+
+
+def test_read_batch_concurrency_is_bounded(tmp_path: Path, monkeypatch) -> None:
+    for index in range(8):
+        (tmp_path / f"f{index}.txt").write_text("x", encoding="utf-8")
+    original = tools._read_file_sync
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    def counting_read(_ctx, path, display_path):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        time.sleep(0.05)
+        try:
+            return original(_ctx, path, display_path)
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(tools, "_read_file_sync", counting_read)
+    results = asyncio.run(
+        run_read_batch(
+            [{"path": f"f{index}.txt"} for index in range(8)],
+            _batch_context(tmp_path),
+        )
+    )
+
+    assert all(result.ok for result in results)
+    assert state["peak"] > 1
+    assert state["peak"] <= tools.BATCH_READ_MAX_CONCURRENCY
+
+
+def test_read_batch_rejects_malformed_envelopes_atomically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    events: list[dict] = []
+    called = False
+
+    async def unexpected_read(_args: dict, _ctx: ToolContext):
+        nonlocal called
+        called = True
+        raise AssertionError("preflight must run before any read")
+
+    monkeypatch.setattr(tools, "_read_file", unexpected_read)
+    results = asyncio.run(
+        run_read_batch(
+            [
+                {"arguments": None},
+                None,
+                {"name": "read_file", "arguments": "not-a-dict"},
+                "bare-string-call",
+            ],
+            _batch_context(tmp_path, events),
+        )
+    )
+
+    assert len(results) == 4
+    assert all(not result.ok for result in results)
+    assert all("batch rejected atomically" in (result.error or "") for result in results)
+    assert "batch_index 0: validation failed: 'arguments' must be an object" in (
+        results[0].error or ""
+    )
+    assert "batch_index 1: validation failed: tool call must be an object" in (
+        results[1].error or ""
+    )
+    assert "batch_index 2: validation failed: 'arguments' must be an object" in (
+        results[2].error or ""
+    )
+    assert "batch_index 3: validation failed: tool call must be an object" in (
+        results[3].error or ""
+    )
+    assert not called
+    assert events == []
+
+
+def test_read_batch_requires_read_file_in_init_tools(tmp_path: Path) -> None:
+    results = asyncio.run(
+        run_read_batch([{"path": "anything.txt"}], ToolContext(tmp_path))
+    )
+
+    assert len(results) == 1
+    assert not results[0].ok
+    assert "read_file is not offered in init.tools" in (results[0].error or "")
 
 
 class _LintFeedback:

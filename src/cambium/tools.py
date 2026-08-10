@@ -18,9 +18,10 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, current_thread
@@ -42,8 +43,11 @@ MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
 GET_SIGNATURE_READ_TIMEOUT_S = 1.0
+BATCH_READ_MAX_CONCURRENCY = 4
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
+
+ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 @dataclass(slots=True)
@@ -54,6 +58,8 @@ class ToolContext:
     approval: ApprovalGate | None = None
     lint: LintDiag | None = None
     compile_gate: Any | None = None
+    init: Mapping[str, Any] | None = None
+    emit: ToolEventSink | None = None
     _root: Path = field(init=False, repr=False)
     _root_fd: int | None = field(init=False, default=None, repr=False)
 
@@ -315,17 +321,27 @@ def _atomic_write(path: Path, content: str) -> None:
                 pass
 
 
-async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = _confined_path(ctx, args["path"])
+def _read_file_sync(ctx: ToolContext, path: Path, display_path: str) -> _Outcome:
+    descriptor: int | None = None
     try:
-        with path.open("rb") as handle:
+        descriptor = _open_confined_read_fd(ctx, path)
+        mode = os.fstat(descriptor).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(path)
+        if not stat.S_ISREG(mode):
+            raise _ToolFailure(f"path is not a regular file: {display_path}")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
             raw = handle.read(MAX_READ_BYTES + 1)
     except FileNotFoundError as exc:
-        raise _ToolFailure(f"file not found: {_display_path(ctx, path)}") from exc
+        raise _ToolFailure(f"file not found: {display_path}") from exc
     except IsADirectoryError as exc:
-        raise _ToolFailure(f"path is a directory: {_display_path(ctx, path)}") from exc
+        raise _ToolFailure(f"path is a directory: {display_path}") from exc
     except OSError as exc:
-        raise _ToolFailure(f"could not read {_display_path(ctx, path)}: {exc}") from exc
+        raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
     if len(raw) > MAX_READ_BYTES:
         output = _truncate_bytes(raw, MAX_READ_BYTES, READ_TRUNCATION_MARKER)
@@ -333,8 +349,14 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         try:
             output = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise _ToolFailure(f"file is not valid UTF-8: {_display_path(ctx, path)}") from exc
+            raise _ToolFailure(f"file is not valid UTF-8: {display_path}") from exc
     return _Outcome(ok=True, output=output)
+
+
+async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    path = _confined_path(ctx, args["path"])
+    display_path = _display_path(ctx, path)
+    return await asyncio.to_thread(_read_file_sync, ctx, path, display_path)
 
 
 def _lint_feedback(ctx: ToolContext, path: Path) -> str:
@@ -688,6 +710,140 @@ TOOL_DISPATCH: dict[str, ToolImplementation] = {
 }
 
 
+async def _run_read_result(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    started_ns = time.monotonic_ns()
+    try:
+        outcome = await _read_file(args, ctx)
+    except _ToolFailure as exc:
+        return ToolResult(
+            ok=False,
+            error=str(exc),
+            duration_ms=_duration_ms(started_ns),
+        )
+    except Exception as exc:
+        return ToolResult(
+            ok=False,
+            error=f"read_file failed: {exc}",
+            duration_ms=_duration_ms(started_ns),
+        )
+    return ToolResult(
+        ok=outcome.ok,
+        output=outcome.output,
+        error=outcome.error,
+        duration_ms=_duration_ms(started_ns),
+    )
+
+
+def _read_batch_arguments(call: dict[str, Any]) -> dict[str, Any]:
+    if "arguments" in call:
+        return call["arguments"]
+    if "name" in call:
+        return {key: value for key, value in call.items() if key != "name"}
+    return call
+
+
+def _batch_failure_results(batch_size: int, reason: str) -> tuple[ToolResult, ...]:
+    return tuple(ToolResult(ok=False, error=reason) for _ in range(batch_size))
+
+
+async def _emit_read_batch_event(
+    ctx: ToolContext, batch_index: int, batch_size: int, result: ToolResult
+) -> None:
+    if ctx.emit is None:
+        return
+    event = {
+        "type": "tool_event",
+        "tool": "read_file",
+        "batch_index": batch_index,
+        "batch_size": batch_size,
+        "ok": result.ok,
+        "duration_ms": result.duration_ms,
+    }
+    emitted = ctx.emit(event)
+    if isawaitable(emitted):
+        await emitted
+
+
+async def run_read_batch(
+    calls: Sequence[dict[str, Any]], ctx: ToolContext
+) -> tuple[ToolResult, ...]:
+    """Validate and execute a batch of confined ``read_file`` calls.
+
+    Validation covers the complete input before any file is opened, including
+    every path's containment inside the worktree. Eligible reads run
+    concurrently within a bounded limit, while results and completion events
+    retain input order.
+    """
+    batch = tuple(calls)
+    batch_size = len(batch)
+    if batch_size == 0:
+        return ()
+
+    schema = next(
+        (candidate for candidate in TOOL_SCHEMAS if candidate.get("name") == "read_file"),
+        None,
+    )
+    if schema is None:
+        return _batch_failure_results(
+            batch_size, "read_file batch rejected atomically: read_file schema is unavailable"
+        )
+
+    validation_errors = [validate_tool_call(schema, call) for call in batch]
+    offered_tools = ctx.init.get("tools") if isinstance(ctx.init, Mapping) else None
+    read_offered = isinstance(offered_tools, Sequence) and not isinstance(
+        offered_tools, (str, bytes, bytearray)
+    ) and "read_file" in offered_tools
+
+    preflight_errors: list[str] = []
+    if not read_offered:
+        preflight_errors.append("read_file is not offered in init.tools")
+    for batch_index, errors in enumerate(validation_errors):
+        preflight_errors.extend(
+            f"batch_index {batch_index}: {error}" for error in errors
+        )
+    for batch_index, call in enumerate(batch):
+        if not isinstance(call, dict):
+            continue
+        arguments = _read_batch_arguments(call)
+        if not isinstance(arguments, dict):
+            continue
+        raw_path = arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        try:
+            _confined_path(ctx, raw_path)
+        except _ToolFailure as exc:
+            preflight_errors.append(f"batch_index {batch_index}: {exc}")
+    if preflight_errors:
+        reason = "read_file batch rejected atomically: " + "\n".join(preflight_errors)
+        return _batch_failure_results(batch_size, reason)
+
+    semaphore = asyncio.Semaphore(BATCH_READ_MAX_CONCURRENCY)
+
+    async def _bounded_read(args: dict[str, Any]) -> ToolResult:
+        async with semaphore:
+            return await _run_read_result(args, ctx)
+
+    tasks = [
+        asyncio.create_task(_bounded_read(_read_batch_arguments(call)))
+        for call in batch
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    results: list[ToolResult] = []
+    for gathered_result in gathered:
+        if isinstance(gathered_result, asyncio.CancelledError):
+            raise gathered_result
+        if isinstance(gathered_result, Exception):
+            results.append(ToolResult(ok=False, error=f"read_file failed: {gathered_result}"))
+        else:
+            results.append(gathered_result)
+
+    ordered_results = tuple(results)
+    for batch_index, result in enumerate(ordered_results):
+        await _emit_read_batch_event(ctx, batch_index, batch_size, result)
+    return ordered_results
+
+
 async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     """Validate and execute one named worker tool."""
     started_ns = time.monotonic_ns()
@@ -732,11 +888,13 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
 
 
 __all__ = [
+    "BATCH_READ_MAX_CONCURRENCY",
     "MAX_OUTPUT_BYTES",
     "MAX_READ_BYTES",
     "TOOL_DISPATCH",
     "TOOL_SCHEMAS",
     "ToolContext",
     "ToolResult",
+    "run_read_batch",
     "run_tool",
 ]
