@@ -470,6 +470,28 @@ def test_step_back_reset_rerun_and_replayed_second_failure_abort() -> None:
     assert asyncio.run(core.step([])) == []
 
 
+def test_reset_retry_consumption_survives_reconstruction() -> None:
+    tree = build_tree(_plan([("root", "FEATURE", [], None)]))
+    event = {"kind": "gate_failed", "task_id": "root", "retries_remaining": 0}
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+
+    assert asyncio.run(core.step([event])) == [
+        {"action": "reset_retry", "task_id": "root"}
+    ]
+    durable_state = core.durable_state
+
+    reconstructed = ArchitectusCore(
+        ScriptedLLM([]),
+        tree=tree,
+        durable_state=durable_state,
+    )
+
+    assert reconstructed.reset_retry_tasks == frozenset({"root"})
+    assert asyncio.run(reconstructed.step([event])) == [
+        {"action": "abort_subtree", "task_id": "root"}
+    ]
+
+
 def test_failure_batch_processes_every_exhausted_gate() -> None:
     tree = build_tree(
         _plan(

@@ -39,6 +39,7 @@ _RESET_RETRY_ATTEMPTED_FIELDS = (
     "reset_attempted",
     "step_back_attempted",
 )
+_RESET_RETRY_CONSUMED_KEY = "reset_retry_consumed"
 
 
 class ActionKind(StrEnum):
@@ -294,6 +295,7 @@ class ArchitectusCore:
         store: ConversationStore | None = None,
         max_width: int = 8,
         core_directive: str | None = None,
+        durable_state: Mapping[str, Any] | None = None,
     ) -> None:
         if not isinstance(tree, TaskTree):
             raise TypeError("tree must be a TaskTree")
@@ -324,7 +326,7 @@ class ArchitectusCore:
         self._finished: dict[str, dict[str, Any]] = {}
         self._in_flight: set[str] = set()
         self._failed_subtrees: set[str] = set()
-        self._reset_retry_tasks: set[str] = set()
+        self._reset_retry_tasks = self._restore_reset_retry_tasks(durable_state)
         self._action_history: list[dict[str, Any]] = []
 
     @property
@@ -351,6 +353,11 @@ class ArchitectusCore:
     def reset_retry_tasks(self) -> frozenset[str]:
         """Task ids that have consumed their one architecture-owned reset retry."""
         return frozenset(self._reset_retry_tasks)
+
+    @property
+    def durable_state(self) -> dict[str, Any]:
+        """Return the JSON-friendly state required to reconstruct this core."""
+        return {_RESET_RETRY_CONSUMED_KEY: sorted(self._reset_retry_tasks)}
 
     async def step(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Run one scheduling wave and return actions for the execution edge."""
@@ -496,6 +503,29 @@ class ArchitectusCore:
         """Record an abort and release the failed task's execution slot."""
         self._failed_subtrees.add(task_id)
         self._in_flight.discard(task_id)
+
+    def _restore_reset_retry_tasks(
+        self, durable_state: Mapping[str, Any] | None
+    ) -> set[str]:
+        """Restore reset consumption from the durable construction snapshot."""
+        if durable_state is None:
+            return set()
+        if not isinstance(durable_state, Mapping):
+            raise TypeError("durable_state must be a mapping")
+
+        consumed = durable_state.get(_RESET_RETRY_CONSUMED_KEY, ())
+        if isinstance(consumed, (str, bytes)) or not isinstance(
+            consumed, (list, tuple, set, frozenset)
+        ):
+            raise TypeError("durable_state.reset_retry_consumed must be a sequence")
+
+        restored: set[str] = set()
+        for task_id in consumed:
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("durable_state.reset_retry_consumed must contain task ids")
+            self._node(task_id)
+            restored.add(task_id)
+        return restored
 
     def _admit_actions(
         self,
