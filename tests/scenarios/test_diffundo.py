@@ -25,11 +25,13 @@ import threading
 import time
 import urllib.request
 from collections.abc import MutableMapping
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
 
+import cambium.diffundo as diffundo_module
 from cambium.diffundo import (
     AllProvidersFailed,
     CallResult,
@@ -351,6 +353,133 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
     finally:
         auth.close()
         good.close()
+
+
+def test_retry_after_delta_seconds_controls_same_provider_retry(monkeypatch) -> None:
+    server = FakeServer(
+        [
+            (429, _error_payload("busy"), 0.0, {"Retry-After": "7"}),
+            (200, _ok_payload("recovered"), 0.0),
+        ]
+    )
+    _set_keys(monkeypatch, "K_RETRY")
+    router = Diffundo((_config("p_retry", server, "K_RETRY", max_retries=1),))
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "recovered"
+        assert sleeps == [7.0]
+        assert len(server.calls) == 2
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (("7",), 7.0),
+        (("0",), 0.0),
+        (("+7",), None),
+        (("1e2",), None),
+        (("1_0",), None),
+        (("7.5",), None),
+        (("-1",), None),
+        (("1, 2",), None),
+        (("9" * 4000,), float("inf")),
+        (("1", "2"), None),
+        (("Friday, 15-Jan-27 08:00:11 GMT",), 11.0),
+        (("Fri, 15 Jan 2027 08:00:11 GMT",), 11.0),
+        (("Fri Jan 15 08:00:11 2027",), 11.0),
+        (("Fri, 15 Jan 2027 08:00:11 GMT, 2",), None),
+        (("Fri Jan 15 08:00:11 2027, 2",), None),
+    ],
+)
+def test_retry_after_parser(values: tuple[str, ...], expected: float | None, monkeypatch) -> None:
+    fixed_now = 1_800_000_000.0
+    monkeypatch.setattr(diffundo_module.time, "time", lambda: fixed_now)
+    headers = Message()
+    for value in values:
+        headers.add_header("Retry-After", value)
+    actual = diffundo_module._parse_retry_after(headers)
+    if expected == float("inf"):
+        assert actual == float("inf")
+    elif expected is None:
+        assert actual is None
+    else:
+        assert actual == expected
+
+
+def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> None:
+    server = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
+    _set_keys(monkeypatch, "K_RETRY_LONG")
+    router = Diffundo(
+        (_config("p_retry_long", server, "K_RETRY_LONG", max_retries=1),),
+        call_budget_s=0.1,
+    )
+
+    async def fail_sleep(delay: float) -> None:
+        raise AssertionError("a delay beyond the call budget must not sleep")
+
+    monkeypatch.setattr(asyncio, "sleep", fail_sleep)
+    monkeypatch.setattr(Diffundo, "_retry_delay", lambda self, attempt_no: 0.0)
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert len(server.calls) == 1
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.retry_after_s == 60.0
+    finally:
+        server.close()
+
+
+def test_retry_after_is_provider_local(monkeypatch) -> None:
+    limited = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
+    healthy = FakeServer([(200, _ok_payload("healthy"), 0.0)])
+    _set_keys(monkeypatch, "K_RETRY_LIMITED", "K_RETRY_HEALTHY")
+    router = Diffundo(
+        (
+            _config("p_retry_limited", limited, "K_RETRY_LIMITED"),
+            _config("p_retry_healthy", healthy, "K_RETRY_HEALTHY"),
+        )
+    )
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_retry_healthy"
+        assert sleeps == []
+        assert len(limited.calls) == 1 and len(healthy.calls) == 1
+    finally:
+        limited.close()
+        healthy.close()
+
+
+def test_retry_after_error_keeps_provider_key_private(monkeypatch) -> None:
+    key = "sk-retry-after-private"
+    server = FakeServer(
+        [(429, _error_payload("invalid credential"), 0.0, {"Retry-After": "1"})],
+        echo_authorization_in_body=True,
+    )
+    monkeypatch.setenv("K_RETRY_PRIVATE", key)
+    router = Diffundo((_config("p_retry_private", server, "K_RETRY_PRIVATE"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.retry_after_s == 1.0
+        assert key not in str(exc.value)
+        assert key not in exc.value.last_error.message
+    finally:
+        server.close()
 
 
 def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monkeypatch) -> None:
