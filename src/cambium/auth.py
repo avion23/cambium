@@ -83,11 +83,6 @@ class ProviderCredential:
         validate_provider_id(self.provider)
         _validate_api_key(self.provider, self.api_key)
 
-    @property
-    def provider_id(self) -> str:
-        """Alias used by callers that name the identifier explicitly."""
-        return self.provider
-
 
 @dataclass(frozen=True, slots=True, repr=False)
 class AuthDocument:
@@ -181,11 +176,6 @@ def derived_env_name(provider: str) -> str:
     provider = validate_provider_id(provider)
     normalized = re.sub(r"[._-]+", "_", provider.upper())
     return f"CAMBIUM_PROVIDER_{normalized}_API_KEY"
-
-
-def provider_env_name(provider: str) -> str:
-    """Compatibility spelling for :func:`derived_env_name`."""
-    return derived_env_name(provider)
 
 
 def is_provider_env_name(value: object) -> bool:
@@ -785,7 +775,6 @@ __all__ = [
     "inspect_metadata",
     "is_provider_env_name",
     "parse_document",
-    "provider_env_name",
     "read_stdin_key",
     "serialize_document",
     "scrub_environment",
