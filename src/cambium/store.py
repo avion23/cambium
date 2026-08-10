@@ -95,6 +95,7 @@ _WRITER_BUSY_TIMEOUT_MS = 5000
 _CHECKPOINT_BUSY_TIMEOUT_MS = 20
 _CHECKPOINT_RETRY_SLEEP_S = 0.02
 _CLOSE_JOIN_TIMEOUT_S = 1.0
+_CLOSE_STOP_JOIN_TIMEOUT_S = 0.1
 
 _SENTINEL = object()
 _TIMER = object()
@@ -156,6 +157,7 @@ class _BoundedEventQueue:
         on_admit: Callable[[], Any] | None = None,
         cancel: threading.Event | None = None,
         check: Callable[[], None] | None = None,
+        dropped_holder: list[int] | None = None,
     ) -> int:
         deadline = time.monotonic() + timeout
 
@@ -180,6 +182,8 @@ class _BoundedEventQueue:
                 check_state()
                 if evict_noncritical and self._evict_oldest_noncritical():
                     dropped += 1
+                    if dropped_holder is not None:
+                        dropped_holder[0] = dropped
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -255,6 +259,7 @@ class EventStore:
         self._checkpoint_busy_retry_s = checkpoint_busy_retry_s
         self._queue: _BoundedEventQueue = _BoundedEventQueue(max_queue_size)
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
         self._admission_cond = threading.Condition(self._lock)
         self._active_admissions = 0
         self._closed = False
@@ -299,6 +304,7 @@ class EventStore:
         critical = kind in CRITICAL_KINDS
         deadline = time.monotonic() + self._critical_timeout_s
         seq_holder: list[int] = []
+        dropped_holder = [0]
 
         with self._lock:
             if self._dead is not None:
@@ -327,14 +333,25 @@ class EventStore:
                 on_admit=admit,
                 cancel=self._close_requested,
                 check=self._check_writer_alive,
+                dropped_holder=dropped_holder,
             )
-        except _AdmissionCancelled:
-            raise RuntimeError("EventStore is closed") from None
-        except queue.Full:
-            raise StoreTimeout(
-                f"critical event {kind!r} not enqueued within "
-                f"{self._critical_timeout_s}s (writer stalled)"
-            ) from None
+        except BaseException as exc:
+            if dropped_holder[0]:
+                self._record_dropped(dropped_holder[0])
+                logger.warning(
+                    "event store overflow: dropped %d non-critical event(s) "
+                    "before failed admission kind=%r",
+                    dropped_holder[0],
+                    kind,
+                )
+            if isinstance(exc, _AdmissionCancelled):
+                raise RuntimeError("EventStore is closed") from None
+            if isinstance(exc, queue.Full):
+                raise StoreTimeout(
+                    f"critical event {kind!r} not enqueued within "
+                    f"{self._critical_timeout_s}s (writer stalled)"
+                ) from None
+            raise
         finally:
             with self._lock:
                 self._active_admissions -= 1
@@ -391,6 +408,10 @@ class EventStore:
             raise StoreError("event store is dead") from dead
 
     def close(self) -> None:
+        with self._close_lock:
+            self._close_impl()
+
+    def _close_impl(self) -> None:
         close_deadline = time.monotonic() + _CLOSE_JOIN_TIMEOUT_S
         with self._lock:
             if self._closed:
@@ -447,6 +468,10 @@ class EventStore:
             failure = self._set_close_failure(failure)
             self._request_stop(failure)
             self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+            if self._thread.is_alive():
+                failure = self._set_writer_stop_failure(failure)
+                self._request_stop(failure)
+                self._thread.join(_CLOSE_STOP_JOIN_TIMEOUT_S)
             self._raise_close_failure(self._close_failure())
 
         self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
@@ -455,7 +480,9 @@ class EventStore:
                 StoreTimeout("event store close: writer did not stop within the close deadline")
             )
             self._request_stop(failure)
-            self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+            self._thread.join(_CLOSE_STOP_JOIN_TIMEOUT_S)
+            if self._thread.is_alive():
+                self._set_writer_stop_failure(failure)
 
         failure = self._close_failure()
         if failure is not None:
@@ -471,6 +498,16 @@ class EventStore:
                 self._close_error = exc
                 self._dead = exc
             return self._close_error or self._dead or exc
+
+    def _set_writer_stop_failure(self, cause: BaseException) -> BaseException:
+        failure = StoreTimeout("event store close: writer could not be stopped")
+        failure.__cause__ = cause
+        failure.__suppress_context__ = True
+        with self._lock:
+            self._close_error = failure
+            if self._dead is None:
+                self._dead = failure
+        return failure
 
     def _request_stop(self, exc: BaseException) -> None:
         self._stop_requested.set()

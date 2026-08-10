@@ -15,6 +15,7 @@ ordering under concurrent overflow.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import sys
@@ -352,6 +353,184 @@ def test_close_propagates_final_fsync_error(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
     with pytest.raises(OSError, match="No space left on device"):
         store.close()
+
+
+def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
+    store.append({"kind": "log", "payload": {"i": 0}})
+    fsync_started = threading.Event()
+    release = threading.Event()
+    close_errors: list[tuple[str, BaseException]] = []
+    second_done = threading.Event()
+
+    def fail_final_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError(28, "No space left on device")
+
+    def close_store(name: str, done: threading.Event | None = None) -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append((name, exc))
+        finally:
+            if done is not None:
+                done.set()
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_final_fsync)
+    first = threading.Thread(target=close_store, args=("first",))
+    second = threading.Thread(target=close_store, args=("second", second_done))
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        second.start()
+        assert not second_done.wait(0.1)
+
+        release.set()
+        first.join(2.0)
+        second.join(2.0)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert close_errors
+        assert any(isinstance(error, OSError) for _, error in close_errors)
+        assert isinstance(store._close_error, OSError)
+    finally:
+        release.set()
+        first.join(2.0)
+        second.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+
+def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(
+        path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    append_errors: list[BaseException] = []
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        real_fsync(self)
+
+    def append_critical() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    starter = threading.Thread(target=append_critical)
+    try:
+        starter.start()
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        with pytest.raises(StoreTimeout, match="writer could not be stopped"):
+            store.close()
+        assert store._thread.is_alive()
+
+        release.set()
+        starter.join(5.0)
+        store._thread.join(5.0)
+        assert not starter.is_alive()
+        assert not store._thread.is_alive()
+        assert len(append_errors) == 1
+        assert isinstance(append_errors[0], StoreError)
+        for fd in (store._db_fd, store._wal_fd):
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        release.set()
+        starter.join(5.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(5.0)
+
+
+def test_writer_death_after_eviction_counts_dropped_event(tmp_path, monkeypatch) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=2.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    eviction_seen = threading.Event()
+    append_errors: list[tuple[str, BaseException]] = []
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("writer failed after eviction")
+
+    def append_event(name: str, kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append((name, exc))
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    first = threading.Thread(target=append_event, args=("first", "result", 0))
+    first.start()
+    try:
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+
+        real_check = store._check_writer_alive
+        death_triggered = False
+
+        def check_after_eviction() -> None:
+            nonlocal death_triggered
+            if not death_triggered and not store._queue._items:
+                death_triggered = True
+                eviction_seen.set()
+                release.set()
+                deadline = time.monotonic() + 1.0
+                while True:
+                    with store._lock:
+                        dead = store._dead
+                    if dead is not None:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("writer did not die after eviction")
+                    time.sleep(0.001)
+            real_check()
+
+        monkeypatch.setattr(store, "_check_writer_alive", check_after_eviction)
+        critical = threading.Thread(target=append_event, args=("critical", "result", 1))
+        critical.start()
+        assert eviction_seen.wait(1.0)
+        critical.join(2.0)
+        first.join(2.0)
+        store._thread.join(2.0)
+
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert not store._thread.is_alive()
+        assert len(append_errors) == 2
+        assert all(isinstance(error, StoreError) for _, error in append_errors)
+        assert store.dropped == 1
+        with store._queue._cond:
+            assert not store._queue._items
+        events = store.events_after(0)
+        assert [event["kind"] for event in events] == ["result"]
+        with pytest.raises(StoreError):
+            store.close()
+    finally:
+        release.set()
+        first.join(2.0)
+        if "critical" in locals():
+            critical.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
 
 
 def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
