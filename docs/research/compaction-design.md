@@ -51,7 +51,7 @@ there is no silent background action.
 
 ## 2. Wire message and safe boundary
 
-Add request `compact` to `ipc-protocol-draft.md` §2.2 (the six existing requests are
+Add request `compact` to `ipc-protocol-draft.md` §2.1 (the six existing requests are
 `init`, `context`, `run_task`, `check_health`, `cancel`, `shutdown`; adoption makes
 seven). It is additive within `proto` (§5), carries a ULID `request_id`, and responds
 `ok` with the same ID:
@@ -70,10 +70,11 @@ summary, just as `run_task` completes via `result_envelope` event rather than re
 
 Run only between provider turns: never mid-tool or mid-LLM call. Pause the ReAct loop,
 summarize, write checkpoint, then resume. This mirrors Prime Agent's turn-end
-`compact.run()` and OpenCode's safe-provider-turn boundary. The adopted alternative is
+`compact.run()` in Prime Agent's **4. Relevant lessons for Cambium** section and
+OpenCode's **4.8 Compaction and checkpointing** boundary. The adopted alternative is
 **in-process** compaction; the proposed spawned “GC agent” is rejected: it would copy
 raw history across I2.7, add a process/lifecycle class, and worsen the Prime Agent OOM
-case (`docs/research/prime-agent.md`, **Relevant lessons**). In-process work blocks the worker but stays
+case (`docs/research/prime-agent.md`, **4. Relevant lessons for Cambium**). In-process work blocks the worker but stays
 within `max_summary_tokens` and supervisor wall budget.
 
 ## 3. Summary envelope and canary
@@ -132,7 +133,7 @@ carry-forward `CompactionEntry`), `README.md` (history preserved), and
 the claimed spawned GC agent, a store token column, and absent `ConversationStore`/
 worker wiring at this base.
 
-On adoption, update `ipc-protocol-draft.md` §2.2 and §7, architecture §5.2/§6.4/§6.6,
+On adoption, update `ipc-protocol-draft.md` §2.1 and §5, architecture §5.2/§6.4/§6.6,
 `src/cambium/ipc.py`, worker wire loop, new `conversations.py`, Custos cadence/metering,
 and tests. This list records future work, not a current implementation claim.
 
@@ -181,7 +182,7 @@ The rejected alternative gave a separate GC agent the worker's history. It requi
 second process, a second context copy, a second admission/restart state, and a channel
 for raw scratchpad data that I2.7 explicitly forbids. Prime Agent's evidence showed
 context, rather than fixed process overhead, was its OOM driver (`docs/research/prime-agent.md`,
-**Relevant lessons**), so duplicating the context amplified the risk. In-process summarization blocked
+**4. Relevant lessons for Cambium**), so duplicating the context amplified the risk. In-process summarization blocked
 the worker for one bounded provider call but kept ownership, redaction, generation, and
 checkpoint ordering local.
 
@@ -201,7 +202,7 @@ The snapshot also checked Prime Agent `docs/compaction.md` (formula and defaults
 `docs/session-format.md` (`CompactionEntry` fields), `README.md` (single-file history and
 lossy warning), `skills/compact/src/compact/__init__.py` (`host_request`, no mid-cell),
 OpenCode `CONTEXT.md` safe provider boundary, `feedback-2-deltas.md` D8b/D8g, and
-`test-strategy.md` §8 canary policy. The alleged “spawned GC agent” had no source and
+`test-strategy.md` §5 canary policy. The alleged “spawned GC agent” had no source and
 remained **UNVERIFIED**; it was not rewritten as a fact.
 
 ## Appendix E — trigger and store matrix
@@ -300,9 +301,9 @@ the covered range still appeared. A failed comparison blocked adoption of the su
 format; a provider/model change required a new frozen corpus. This made compaction a
 measured context adapter, not an implicit recursion or universal memory discount.
 
-Source pointers use stable named sections: OpenCode's **Context Epoch / Safe Provider
-Turn Boundary** discussion in `docs/research/opencode.md`, and Prime Agent's **Relevant
-lessons** section plus its compaction format/source
+Source pointers use stable named sections: OpenCode's **4.5 Context-epoch caching** and
+**4.8 Compaction and checkpointing** headings in `docs/research/opencode.md`, and Prime
+Agent's **4. Relevant lessons for Cambium** heading plus its compaction format/source
 notes (rather than an assumed “GC agent” subsection). Those sources support turn-boundary
 and history-preservation observations only; they do not prove a Cambium scheduler,
 provider discount, or process-per-child isolation.

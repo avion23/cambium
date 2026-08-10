@@ -208,7 +208,7 @@ D8c/D8d/D8f/D8g, I2.1–I2.5/I2.7, DS-M6, LLM-C6, M1–M9, and Q3/Q8.
 
 Snapshot claims were checked against `v2-1-review.md` M5 AC1–AC4 and decisions A/C/D/F;
 architecture §§3.4/3.7, 4, 5.2, 6.6, 7.1/7.4/16.2; `tasktree.py` build/topo/ready/
-subtree/upward; IPC draft §§2.2/3/5/7; event draft catalog; design-deltas D2/D3;
+subtree/upward; IPC draft §§2.2/3/5; event draft catalog; design-deltas D2/D3;
 feedback-2 D8a/b/c/d/g; and custos design. `feedback-4-assessment.md` #21,
 `feedback-5-assessment.md`, and critique-4 source were respectively absent/directive
 provided where noted. Canonical `run_plan` (`wt-impl-super@9746b96`), Diffundo
@@ -389,9 +389,9 @@ The design's verification appendix intentionally distinguished facts from propos
 | Review decision D lines 270–282 | `max_width`/pool trigger recorded; pool deferred. |
 | Review decision F lines 296–310 | DSPy stays behind `decide.py`. |
 | `tasktree.py:233-478` | build/topological/ready/subtree/upward contracts read. |
-| `ipc-protocol-draft.md` §§2.2/3/5/7 | steer gap and result/version proposals read. |
+| `ipc-protocol-draft.md` §§2.2/3/5 | steer gap and result/version proposals read. |
 | `event-schema-draft.md` catalog | kind/tier mapping read; new kinds remain draft. |
-| `costos-asyncio-design.md` §§3/5 | loop-affine WorkerHandle and writer handoff read. |
+| `costos-asyncio-design.md` §§1–2 | loop-affine WorkerHandle and writer handoff read. |
 
 Still **UNVERIFIED** at the snapshot: canonical `run_plan` on main, `conversations.py`,
 Diffundo, worker-side steer consumption, `shared.db`, `shared_update`, include-diff
