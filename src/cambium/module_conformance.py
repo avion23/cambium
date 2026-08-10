@@ -31,21 +31,8 @@ import pytest
 def _find_repo_root() -> Path:
     source = Path(__file__).resolve().parent
     for candidate in (source, *source.parents):
-        if (candidate / ".git").exists():
+        if (candidate / ".git").exists() and source == candidate / "src" / "cambium":
             return candidate
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=Path.cwd(),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        result = None
-    if result is not None and result.returncode == 0:
-        return Path(result.stdout.strip()).resolve()
     # A wheel has no repository root.  Keep all resource-relative operations
     # inside the installed package instead of guessing from the caller's cwd.
     return source
@@ -474,11 +461,16 @@ def _baseline_fact_findings(
     tests = baseline.get("tests")
     if isinstance(tests, dict):
         nodeids = tests.get("by_nodeid")
-        module_test_paths = {path.as_posix() for path in spec.test_files}
+        module_test_paths = {
+            relative
+            for path in spec.test_files
+            if (relative := _module_relative_path(path, spec)) is not None
+        }
         if isinstance(nodeids, dict):
             for nodeid in nodeids:
                 test_path = nodeid.split("::", 1)[0] if isinstance(nodeid, str) else ""
-                if test_path and test_path not in module_test_paths:
+                relative = _module_relative_path(Path(test_path), spec) if test_path else None
+                if test_path and relative not in module_test_paths:
                     findings.append(
                         AuditFinding(
                             "baseline-integrity",
@@ -565,6 +557,19 @@ def _baseline_fact_findings(
                         )
                     )
     return findings
+
+
+def _module_relative_path(path: Path, spec: ModuleSpec) -> str | None:
+    """Normalize source and wheel paths relative to one module package."""
+    parts = path.parts
+    for index, part in enumerate(parts[:-1]):
+        if part == "modules" and parts[index + 1] == spec.name:
+            relative = parts[index + 2 :]
+            return Path(*relative).as_posix() if relative else "."
+    try:
+        return _resource_path(path).relative_to(spec.path).as_posix()
+    except ValueError:
+        return None
 
 
 def _validate_dataset_integrity(spec: ModuleSpec) -> None:
@@ -1291,13 +1296,16 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
         (offline_root / "sitecustomize.py").write_text(
             "import importlib.abc\n"
             "import os\n"
+            "import shlex\n"
             "import shutil\n"
             "import socket\n"
             "import subprocess\n"
             "import sys\n"
             "\n"
             f"_PROVIDERS = {provider_imports}\n"
-            "_NETWORK_CLIENTS = frozenset(('curl', 'wget', 'http', 'https'))\n"
+            "_NETWORK_CLIENTS = frozenset((\n"
+            "    'curl', 'wget', 'http', 'https', 'nc', 'netcat', 'ncat', 'ssh'\n"
+            "))\n"
             "\n"
             "class _ProviderBlocker(importlib.abc.MetaPathFinder):\n"
             "    def find_spec(self, fullname, path=None, target=None):\n"
@@ -1311,22 +1319,66 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "def _deny_network(*args, **kwargs):\n"
             "    raise PermissionError('network access is forbidden during module conformance')\n"
             "\n"
-            "def _resolved_executable(args, executable=None):\n"
-            "    command = executable\n"
-            "    if command is None and isinstance(args, (list, tuple)) and args:\n"
-            "        command = args[0]\n"
-            "    if not isinstance(command, (str, bytes, os.PathLike)):\n"
-            "        return None\n"
-            "    command = os.fsdecode(command)\n"
-            "    located = command if os.path.dirname(command) else shutil.which(command)\n"
-            "    return os.path.realpath(located) if located else None\n"
+            "def _command_tokens(args, executable=None):\n"
+            "    values = list(args) if isinstance(args, (list, tuple)) else [args]\n"
+            "    if executable is not None:\n"
+            "        values.insert(0, executable)\n"
+            "    pending = [os.fsdecode(value) for value in values "
+            "if isinstance(value, (str, bytes, os.PathLike))]\n"
+            "    tokens = []\n"
+            "    while pending:\n"
+            "        token = pending.pop(0)\n"
+            "        if any(character.isspace() for character in token):\n"
+            "            try:\n"
+            "                split = shlex.split(token)\n"
+            "            except ValueError:\n"
+            "                split = token.split()\n"
+            "            if split != [token]:\n"
+            "                pending[0:0] = split\n"
+            "                continue\n"
+            "        tokens.append(token.strip('\\\"\\\';&|()'))\n"
+            "    return tokens\n"
+            "\n"
+            "def _resolved_command(token):\n"
+            "    located = token if os.path.dirname(token) else shutil.which(token)\n"
+            "    return os.path.realpath(located) if located else os.path.realpath(token)\n"
+            "\n"
+            "def _network_executable(tokens):\n"
+            "    for token in tokens:\n"
+            "        if os.path.basename(token) in _NETWORK_CLIENTS:\n"
+            "            return _resolved_command(token)\n"
+            "    for index, token in enumerate(tokens):\n"
+            "        if os.path.basename(token).startswith('python') and any(\n"
+            "            'urllib' in argument for argument in tokens[index + 1:]\n"
+            "        ):\n"
+            "            return _resolved_command(token) + ' (urllib)'\n"
+            "    return None\n"
+            "\n"
+            "def _unsafe_python_flag(tokens):\n"
+            "    for index, token in enumerate(tokens):\n"
+            "        if not os.path.basename(token).startswith('python'):\n"
+            "            continue\n"
+            "        for argument in tokens[index + 1:]:\n"
+            "            if argument == '--' or not argument.startswith('-'):\n"
+            "                break\n"
+            "            if not argument.startswith('--') and any(\n"
+            "                flag in argument[1:] for flag in 'ESI'\n"
+            "            ):\n"
+            "                return argument\n"
+            "    return None\n"
             "\n"
             "_popen_init = subprocess.Popen.__init__\n"
             "def _offline_popen(self, args, *pargs, **kwargs):\n"
-            "    executable = _resolved_executable(args, kwargs.get('executable'))\n"
-            "    if executable and os.path.basename(executable) in _NETWORK_CLIENTS:\n"
+            "    tokens = _command_tokens(args, kwargs.get('executable'))\n"
+            "    executable = _network_executable(tokens)\n"
+            "    if executable:\n"
             "        raise PermissionError(\n"
             "            'network client denied during module conformance: ' + executable\n"
+            "        )\n"
+            "    unsafe_flag = _unsafe_python_flag(tokens)\n"
+            "    if unsafe_flag:\n"
+            "        raise PermissionError(\n"
+            "            'isolated Python flag denied during module conformance: ' + unsafe_flag\n"
             "        )\n"
             "    return _popen_init(self, args, *pargs, **kwargs)\n"
             "\n"
@@ -1340,7 +1392,7 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
         )
         command_dir = offline_root / "bin"
         command_dir.mkdir()
-        for command in ("curl", "wget", "http", "https"):
+        for command in ("curl", "wget", "http", "https", "nc", "netcat", "ncat", "ssh"):
             wrapper = command_dir / command
             wrapper.write_text(
                 "#!/bin/sh\n"

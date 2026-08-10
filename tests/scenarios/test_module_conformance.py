@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import http.server
 import json
+import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -188,6 +190,34 @@ def test_offline_child_denies_absolute_network_client_path() -> None:
     assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
 
 
+def test_offline_child_denies_shell_network_client() -> None:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/"
+    probe = (
+        "import subprocess; "
+        f"subprocess.run('/usr/bin/curl --fail {url}', shell=True, check=False)"
+    )
+    try:
+        with module_conformance.module_offline_environment() as env:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                env=env,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.returncode != 0
+    assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
+
+
 def test_offline_child_inherits_provider_import_blocker() -> None:
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
@@ -201,6 +231,27 @@ def test_offline_child_inherits_provider_import_blocker() -> None:
 
     assert result.returncode != 0
     assert "provider import blocked by module conformance: cambium.provider_config" in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["-E", "-S"])
+def test_offline_child_rejects_python_flags_that_bypass_provider_blocker(flag: str) -> None:
+    probe = (
+        "import subprocess, sys; "
+        f"subprocess.run([sys.executable, {flag!r}, '-c', "
+        "'import cambium.provider_config'], check=True)"
+    )
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    assert f"isolated Python flag denied during module conformance: {flag}" in result.stderr
 
 
 def test_provider_finder_rejects_every_provider_root() -> None:
@@ -273,6 +324,39 @@ def test_baseline_rejects_empty_drift_thresholds(monkeypatch) -> None:
 
 
 def test_baseline_rejects_foreign_test_nodeid(monkeypatch) -> None:
+    name = _one_discovered_module()
+    prefix = module_conformance._module_prefix(name)
+    tracked = module_conformance._module_files(name, prefix)
+    test_files = tuple(
+        path
+        for path in tracked
+        if path.suffix == ".py"
+        and path.name.startswith("test_")
+        and path.parent == prefix / "tests"
+    )
+    spec = module_conformance.ModuleSpec(
+        name=name,
+        path=module_conformance.MODULES_DIR / name,
+        tracked_files=tracked,
+        python_files=(),
+        test_files=test_files,
+        baseline_files=(),
+        dataset_files=(),
+    )
+    baseline_path = spec.tests_dir / "baselines" / "baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    committed_findings = module_conformance._baseline_fact_findings(
+        baseline, baseline_path, spec
+    )
+    committed_foreign = [
+        finding
+        for finding in committed_findings
+        if finding.detail == "test nodeid does not belong to this module's tests"
+    ]
+
+    assert len(baseline["tests"]["by_nodeid"]) == 211
+    assert len(committed_foreign) == 182
+
     def change(baseline: dict) -> None:
         baseline["tests"]["by_nodeid"] = {"tests/scenarios/test_harness.py::test_foreign": 0.1}
         baseline["tests"]["count"] = 1
@@ -280,6 +364,86 @@ def test_baseline_rejects_foreign_test_nodeid(monkeypatch) -> None:
     message = _validate_with_baseline_change(monkeypatch, change)
 
     assert "test nodeid does not belong to this module's tests" in message
+
+
+def test_installed_package_ignores_unrelated_git_and_normalizes_nodeids(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "unrelated"
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    site = checkout / ".venv" / "lib" / "python3.14" / "site-packages"
+    package = site / "cambium"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(module_conformance.PACKAGE_ROOT / "module_conformance.py", package)
+    shutil.copy2(module_conformance.PACKAGE_ROOT / "bench.py", package)
+    shutil.copytree(module_conformance.MODULES_DIR, package / "modules")
+    probe = """
+import json
+from cambium import module_conformance as m
+
+name = m.discover_modules()[0]
+prefix = m._module_prefix(name)
+tracked = m._module_files(name, prefix)
+test_files = tuple(
+    path for path in tracked
+    if path.suffix == '.py' and path.name.startswith('test_') and path.parent == prefix / 'tests'
+)
+spec = m.ModuleSpec(
+    name=name,
+    path=m.MODULES_DIR / name,
+    tracked_files=tracked,
+    python_files=(),
+    test_files=test_files,
+    baseline_files=(),
+    dataset_files=(),
+)
+baseline_path = spec.tests_dir / 'baselines' / 'baseline.json'
+baseline = json.loads(baseline_path.read_text(encoding='utf-8'))
+committed_findings = m._baseline_fact_findings(baseline, baseline_path, spec)
+committed_foreign = [
+    finding for finding in committed_findings if 'does not belong' in finding.detail
+]
+owned = {
+    nodeid: duration for nodeid, duration in baseline['tests']['by_nodeid'].items()
+    if nodeid.startswith('src/cambium/modules/example/tests/')
+}
+baseline['tests']['by_nodeid'] = owned
+baseline['tests']['count'] = len(owned)
+findings = m._baseline_fact_findings(baseline, baseline_path, spec)
+foreign = [finding for finding in findings if 'does not belong' in finding.detail]
+reverse = m.scan_reverse_imports()
+print(json.dumps({
+    'repo_root': str(m.REPO_ROOT),
+    'package_root': str(m.PACKAGE_ROOT),
+    'tracked_are_wheel_paths': all(path.parts[:2] == ('modules', name) for path in tracked),
+    'resources_exist': all(m._resource_path(path).is_file() for path in tracked),
+    'committed_foreign_count': len(committed_foreign),
+    'owned_count': len(owned),
+    'owned_foreign_count': len(foreign),
+    'reverse_paths': [finding.path.as_posix() for finding in reverse],
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=checkout,
+        env={**os.environ, "PYTHONPATH": str(site)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["repo_root"] == observed["package_root"]
+    assert observed["tracked_are_wheel_paths"] is True
+    assert observed["resources_exist"] is True
+    assert observed["committed_foreign_count"] == 182
+    assert observed["owned_count"] == 29
+    assert observed["owned_foreign_count"] == 0
+    assert "bench.py" in observed["reverse_paths"]
 
 
 def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch) -> None:
