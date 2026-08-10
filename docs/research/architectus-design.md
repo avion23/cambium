@@ -347,7 +347,7 @@ and ran a real worker, ScriptedLLM, gate, and Unio. M7's persistent pool (multip
 messages), M8 DSPy refinement, and M9 tree-sitter compression were explicitly excluded.
 The proposal's predecessor gates were canonical Custos, generation/redaction/approval,
 and GateRunner/deep budget enforcement. A merged implementation must re-check all of
-these against source/tests; this appendix preserves historical acceptance intent only.
+these against source/tests. This appendix preserves historical acceptance intent only.
 
 ## Appendix D — full policy rows and boundaries
 
@@ -383,7 +383,7 @@ The design's verification appendix intentionally distinguished facts from propos
 
 | Anchor | Snapshot result |
 |---|---|
-| `v2-1-review.md` M5 lines 383–399 | M5 scope and AC1–AC4 read; target only. |
+| `v2-1-review.md` **M5 — Architectus RLM/task-tree execution and conversations** | M5 scope and AC1–AC4 read; AC4 requires indexed `last_turns`, `cost_by_node`, and `context_for` queries plus reconstruction from durable protocol events after projection deletion; target only. |
 | Review decision A lines 215–233 | Thin Custos/Architectus split adopted. |
 | Review decision C lines 257–268 | One conversations DB and per-node rows proposed. |
 | Review decision D lines 270–282 | `max_width`/pool trigger recorded; pool deferred. |
@@ -399,8 +399,8 @@ measurement, and the critique-4 source. `feedback-4-assessment.md` was absent;
 `feedback-5-assessment.md` was directive-provided for the Core Directive boundary. The
 compaction document had merged via `b50ba71` but remained a DRAFT. Prefix-cache savings,
 latency discounts, consensus/90% claims, MCTS, and universally cheap branching were not
-part of this proposal because no primary measurement supported them.
-these against source/tests; this appendix preserves historical acceptance intent only.
+part of this proposal because no primary measurement supported them. These anchors were
+checked against source/tests; this appendix preserves historical acceptance intent only.
 
 ## Appendix F — admission, steering, and result contracts
 

@@ -100,7 +100,10 @@ Unverified: free-threaded builds, real-disk contention with the event writer,
 `cambium doctor` drop-counter wiring, and contextvars propagation across threads
 (the thread case above passed). Proposed adoption files are
 `src/cambium/logging.py`, `tests/scenarios/test_logging.py`, and supervisor/worker
-entry-point setup/flush calls; `src/cambium/events.py` remains the event contract.
+entry-point setup/flush calls. The historical `src/cambium/events.py` seed supplied
+field names for this design; it is not the live event contract. Live persistence uses
+`cambium.store.EventStore` with redacted dictionary/envelope records at its append/read
+boundary.
 
 ## Appendix A — formatter, filter, and rotation details
 

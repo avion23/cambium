@@ -235,8 +235,8 @@ reduction was a config failure; reduction with a canary miss was a compaction fa
 metric gain with canary regression was rejected as reward hacking.
 
 No consensus, 90% discount, universally cheap branching, or mandatory MCTS was inferred
-from this protocol. Static prefix caching and latency claims required direct measurement;
-the design only said byte-stable prefixes could be cacheable.
+from this protocol. Static prefix caching and latency claims required direct measurement.
+The design only said byte-stable prefixes could be cacheable.
 
 ## Appendix G — compaction failure matrix
 
@@ -261,7 +261,6 @@ second summary and did not change the covered range; it was the explicit freshne
 for the next provider turn. `reserve_tokens` protected response headroom, while
 `max_summary_tokens` protected the summarizer call. These values were configuration
 inputs, not evidence-backed universal constants.
-the design only said byte-stable prefixes could be cacheable.
 
 ## Appendix H — conversation-store query contract
 
@@ -347,6 +346,7 @@ mid-tool call, and using a parent or sibling transcript as the child's context. 
 adopted alternative was append-only node-local history plus a bounded summary/checkpoint
 at a safe turn boundary. The proposal did not claim that a separate process-per-child
 sandbox, universal branching discount, or mandatory MCTS policy follows from this
+choice; those are outside the evidence recorded here.
 
 The canary compared claims, TODOs, open questions, and covered IDs before and after
 compaction. It rejected a summary that reduced tokens but dropped a claim reference or

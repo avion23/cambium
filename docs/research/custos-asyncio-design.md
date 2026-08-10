@@ -1,7 +1,8 @@
 # Custos — Event-Loop Architecture
 
-**Historical snapshot — 2026-08-09.** Design spec from the csp research worktree
-(`wt-custos`); it resolves the proposed M4 asyncio gap, not current implementation.
+**Historical snapshot — 2026-08-09.** Design spec from the recorded
+`/tmp/opencode/cambium-csp` worktree; the source record does not identify a branch ref.
+It resolves the proposed M4 asyncio gap, not current implementation.
 Current behavior is in [`docs/architecture/architecture.md`](../architecture/architecture.md),
 source/tests, and [`v2-1-status.md`](v2-1-status.md).
 

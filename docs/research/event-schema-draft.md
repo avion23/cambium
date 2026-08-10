@@ -327,9 +327,9 @@ decisions still belonged to Architectus/Custos boundaries, not to a worker stdou
 This kept event definitions precise while leaving current source ownership to tests and
 `docs/architecture/architecture.md`.
 
-The machine-interface source for this draft is the named **“JSON-Lines on stdio —
-RECOMMENDED primary”** section in `docs/research/tui-best-practices.md`, not a fragile
-line-number citation. It supports the same one-object-per-newline boundary and
+The machine-interface source for this draft is the named **“JSON-Lines stdio — event
+stream is the interface”** section in `docs/research/tui-best-practices.md`, not a
+fragile line-number citation. It supports the same one-object-per-newline boundary and
 headless subscriber use; it does not establish current Cambium event kinds.
 
 ## Appendix J — advisory and terminal field inventory
