@@ -36,6 +36,8 @@ from typing import Any
 
 _WRITER_BUSY_TIMEOUT_MS = 5000
 _STARTUP_TIMEOUT_S = 10.0
+_WRITE_TIMEOUT_S = 30.0
+_MAX_CHAIN_DEPTH = 1_000_000
 _SCHEMA_VERSION = 2
 _SENTINEL = object()
 _BRANCH_ROLE = "branch"
@@ -65,10 +67,17 @@ _SELECT_HEAD = (
     "SELECT id FROM conversations WHERE node_id = ? "
     "ORDER BY seq DESC, id DESC LIMIT 1"
 )
-_SELECT_ROW = (
-    "SELECT id, node_id, parent_id, turn, role, content, ts, seq, tokens, kind, meta "
-    "FROM conversations WHERE id = ?"
+_SELECT_CHAIN = """WITH RECURSIVE chain(id, parent_id, depth) AS (
+    SELECT id, parent_id, 0 FROM conversations WHERE id = :head_id
+    UNION ALL
+    SELECT c.id, c.parent_id, chain.depth + 1
+    FROM chain JOIN conversations c ON c.id = chain.parent_id
+    WHERE chain.depth < :max_depth
 )
+SELECT c.id, c.node_id, c.parent_id, c.turn, c.role, c.content,
+       c.ts, c.seq, c.tokens, c.kind, c.meta
+FROM chain JOIN conversations c ON c.id = chain.id
+ORDER BY chain.depth DESC"""
 _INSERT_ROW = (
     "INSERT INTO conversations"
     "(node_id, parent_id, turn, role, content, ts, seq, tokens, kind, meta) "
@@ -307,6 +316,8 @@ class ConversationStore:
                 self._closed = True
                 self._queue.put_nowait(_SENTINEL)
         self._thread.join()
+        if self._dead is not None:
+            raise ConversationStoreError("conversation store failed while closing") from self._dead
 
     def _submit(
         self,
@@ -326,7 +337,10 @@ class ConversationStore:
                 raise RuntimeError("ConversationStore is closed")
             self._queue.put_nowait((node_id, role, content, parent_id, tokens, kind, meta, pending))
 
-        pending.event.wait()
+        if not pending.event.wait(_WRITE_TIMEOUT_S):
+            raise ConversationStoreError(
+                f"conversation write did not complete within {_WRITE_TIMEOUT_S}s"
+            )
         if pending.exc is not None:
             if isinstance(pending.exc, ValueError):
                 raise pending.exc
@@ -552,32 +566,31 @@ class ConversationStore:
         *,
         stop_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        rows: list[tuple[Any, ...]] = []
-        seen: set[int] = set()
-        current_id: int | None = head_id
-        stop_index: int | None = None
-        while current_id is not None:
-            if current_id in seen:
+        rows = conn.execute(
+            _SELECT_CHAIN,
+            {"head_id": head_id, "max_depth": _MAX_CHAIN_DEPTH},
+        ).fetchall()
+        deepest = rows[0]
+        if deepest[2] is not None:
+            if deepest[2] in {row[0] for row in rows}:
                 raise ConversationStoreError(
-                    f"cycle in conversation parent chain at id {current_id}"
+                    f"cycle in conversation parent chain at id {deepest[2]}"
                 )
-            seen.add(current_id)
-            row = conn.execute(_SELECT_ROW, (current_id,)).fetchone()
-            if row is None:
-                raise ConversationStoreError(
-                    f"conversation parent id does not exist: {current_id}"
+            raise ConversationStoreError(
+                f"conversation parent id does not exist: {deepest[2]}"
+            )
+
+        if stop_id is not None:
+            stop_index = next(
+                (index for index, row in enumerate(rows) if int(row[0]) == stop_id),
+                None,
+            )
+            if stop_index is None:
+                raise ValueError(
+                    f"conversation id is not on node {head_id}'s path: {stop_id}"
                 )
-            rows.append(row)
-            if stop_id is not None and int(row[0]) == stop_id:
-                stop_index = len(rows) - 1
-            current_id = row[2]
+            rows = rows[: stop_index + 1]
 
-        if stop_id is not None and stop_index is None:
-            raise ValueError(f"conversation id is not on node {head_id}'s path: {stop_id}")
-        if stop_index is not None:
-            rows = rows[stop_index:]
-
-        rows.reverse()
         return [cls._row_to_dict(row) for row in rows]
 
     @staticmethod

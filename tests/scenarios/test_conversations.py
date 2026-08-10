@@ -6,8 +6,13 @@ import asyncio
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 
-from cambium.conversations import ConversationStore
+import pytest
+
+import cambium.conversations as conversations
+from cambium.conversations import ConversationStore, ConversationStoreError
 
 
 def _open(path) -> ConversationStore:
@@ -272,4 +277,147 @@ def test_summary_and_token_accounting(tmp_path) -> None:
         ]
         assert store.history("node")[-1]["id"] == following
     finally:
+        store.close()
+
+
+def test_deep_chain_reads_in_root_to_head_order(tmp_path) -> None:
+    store = _open(tmp_path / "conversations.db")
+    try:
+        ids = [store.append("node", "assistant", str(index), tokens=1) for index in range(1500)]
+
+        history = store.history("node")
+        path = store.path("node", ids[-1])
+        accounting = store.token_accounting("node")
+
+        assert [record["id"] for record in history] == ids
+        assert [record["id"] for record in path] == ids
+        assert len(history) == len(path) == 1500
+        assert accounting["tokens_by_kind"] == {"turn": 1500, "summary": 0, "system": 0}
+    finally:
+        store.close()
+
+
+def test_chain_reports_cycle_created_outside_store(tmp_path) -> None:
+    path = tmp_path / "conversations.db"
+    store = _open(path)
+    try:
+        root = store.append("node", "user", "root")
+        store.append("node", "assistant", "middle")
+        leaf = store.append("node", "assistant", "leaf")
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE conversations SET parent_id = ? WHERE id = ?", (leaf, root))
+
+        with pytest.raises(
+            ConversationStoreError,
+            match=rf"^cycle in conversation parent chain at id {root}$",
+        ):
+            store.history("node")
+    finally:
+        store.close()
+
+
+def test_chain_reports_missing_parent_created_outside_store(tmp_path) -> None:
+    path = tmp_path / "conversations.db"
+    store = _open(path)
+    try:
+        root = store.append("node", "user", "root")
+        store.append("node", "assistant", "middle")
+        store.append("node", "assistant", "leaf")
+        with sqlite3.connect(path) as conn:
+            conn.execute("DELETE FROM conversations WHERE id = ?", (root,))
+
+        with pytest.raises(
+            ConversationStoreError,
+            match=rf"^conversation parent id does not exist: {root}$",
+        ):
+            store.history("node")
+    finally:
+        store.close()
+
+
+def test_path_rejects_stop_id_outside_active_chain(tmp_path) -> None:
+    store = _open(tmp_path / "conversations.db")
+    try:
+        head = store.append("node", "user", "root")
+        outside = store.append("other", "user", "other")
+
+        with pytest.raises(
+            ValueError,
+            match=rf"^conversation id is not on node {head}'s path: {outside}$",
+        ):
+            store.path("node", outside)
+    finally:
+        store.close()
+
+
+def test_chain_read_uses_one_recursive_statement_per_operation(tmp_path, monkeypatch) -> None:
+    store = _open(tmp_path / "conversations.db")
+    try:
+        ids = [store.append("node", "assistant", str(index), tokens=1) for index in range(1500)]
+        recursive_statements: list[str] = []
+        original_reader = store._reader
+
+        def traced_reader() -> sqlite3.Connection:
+            conn = original_reader()
+            conn.set_trace_callback(
+                lambda statement: recursive_statements.append(statement)
+                if statement.lstrip().upper().startswith("WITH RECURSIVE")
+                else None
+            )
+            return conn
+
+        monkeypatch.setattr(store, "_reader", traced_reader)
+        for operation in (
+            lambda: store.history("node"),
+            lambda: store.path("node", ids[-1]),
+            lambda: store.token_accounting("node"),
+        ):
+            recursive_statements.clear()
+            operation()
+            assert len(recursive_statements) == 1
+    finally:
+        store.close()
+
+
+def test_close_propagates_final_fsync_failure(tmp_path, monkeypatch) -> None:
+    store = _open(tmp_path / "conversations.db")
+    store.append("node", "user", "message")
+
+    def fail_fsync(self) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(ConversationStore, "_fsync_now", fail_fsync)
+    with pytest.raises(
+        ConversationStoreError,
+        match="conversation store failed while closing",
+    ) as exc:
+        store.close()
+    assert isinstance(exc.value.__cause__, OSError)
+
+
+def test_submit_times_out_when_writer_stalls(tmp_path, monkeypatch) -> None:
+    store = _open(tmp_path / "conversations.db")
+    writer_stalled = threading.Event()
+    release_writer = threading.Event()
+    original_insert = store._insert_row
+
+    def stalled_insert(*args, **kwargs) -> int:
+        writer_stalled.set()
+        release_writer.wait(5.0)
+        return original_insert(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_insert_row", stalled_insert)
+    monkeypatch.setattr(conversations, "_WRITE_TIMEOUT_S", 0.05)
+    try:
+        start = time.monotonic()
+        with pytest.raises(
+            ConversationStoreError,
+            match=r"^conversation write did not complete within 0\.05s$",
+        ):
+            store.append("node", "user", "message")
+        elapsed = time.monotonic() - start
+        assert writer_stalled.is_set()
+        assert 0.04 <= elapsed < 1.0
+    finally:
+        release_writer.set()
         store.close()
