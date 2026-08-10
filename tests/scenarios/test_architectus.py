@@ -689,6 +689,58 @@ def test_spawn_after_abort_is_not_emitted_and_in_flight_matches_actions() -> Non
     assert core.in_flight == emitted_in_flight == {"a"}
 
 
+def test_rejected_action_wave_does_not_consume_reset_retry() -> None:
+    tree = build_tree(_plan([("root", "FEATURE", [], None)]))
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [
+                [
+                    {"action": "reset_retry", "task_id": "root"},
+                    {"action": "unknown_action", "task_id": "root"},
+                ]
+            ]
+        ),
+        tree=tree,
+    )
+
+    with pytest.raises(ValueError, match="unknown Architectus action"):
+        asyncio.run(core.step([]))
+
+    assert core.reset_retry_tasks == frozenset()
+    assert core.in_flight == set()
+    assert core.action_history == []
+
+
+def test_abort_subtree_clears_same_wave_descendant_spawn_and_quiesces() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [
+                [
+                    {"action": "spawn", "task_id": "child"},
+                    {"action": "abort_subtree", "task_id": "root"},
+                ],
+                [],
+            ]
+        ),
+        tree=tree,
+    )
+    core.aggregate("root", _envelope(None))
+
+    actions = asyncio.run(core.step([]))
+
+    assert {"action": "abort_subtree", "task_id": "root"} in actions
+    assert "child" not in core.in_flight
+    assert asyncio.run(core.step([])) == []
+
+
 def test_malformed_later_failure_event_does_not_consume_prior_event() -> None:
     tree = build_tree(_plan([("root", "FEATURE", [], None)]))
     core = ArchitectusCore(

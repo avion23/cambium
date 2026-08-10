@@ -503,10 +503,12 @@ class ArchitectusCore:
             actions.append({"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id})
         return actions
 
-    def _mark_subtree_failed(self, task_id: str) -> None:
-        """Record an abort and release the failed task's execution slot."""
+    def _mark_subtree_failed(self, task_id: str) -> set[str]:
+        """Record an abort, block its subtree, and release all subtree slots."""
+        subtree = self._subtree_task_ids(task_id)
         self._failed_subtrees.add(task_id)
-        self._in_flight.discard(task_id)
+        self._in_flight.difference_update(subtree)
+        return subtree
 
     def _restore_reset_retry_tasks(
         self, durable_state: Mapping[str, Any] | None
@@ -536,6 +538,7 @@ class ArchitectusCore:
         proposed: Sequence[Mapping[str, Any]],
         ready: Sequence[Any],
     ) -> list[dict[str, Any]]:
+        proposed_actions = self._validate_actions(proposed)
         ready_ids = [node.task_id for node in ready]
         ready_rank = {task_id: index for index, task_id in enumerate(ready_ids)}
         capacity = max(self._max_width - len(self._in_flight), 0)
@@ -545,10 +548,7 @@ class ArchitectusCore:
         accepted_spawns: list[tuple[int, str, int]] = []
         spawn_segment = 0
 
-        for raw_index, raw_action in enumerate(proposed):
-            if not isinstance(raw_action, Mapping):
-                raise TypeError("each LLM action must be a mapping")
-            action = self._normalise_action(raw_action)
+        for raw_index, action in enumerate(proposed_actions):
             kind = ActionKind(action["action"])
             if kind is ActionKind.SPAWN:
                 task_id = self._action_task_id(action)
@@ -577,14 +577,12 @@ class ArchitectusCore:
                             "action": ActionKind.ABORT_SUBTREE.value,
                             "task_id": task_id,
                         }
-                        self._mark_subtree_failed(task_id)
-                        aborted_spawn_ids.add(task_id)
+                        aborted_spawn_ids.update(self._mark_subtree_failed(task_id))
                         spawn_segment += 1
                     else:
                         self._reset_retry_tasks.add(task_id)
                 elif kind is ActionKind.ABORT_SUBTREE:
-                    self._mark_subtree_failed(task_id)
-                    aborted_spawn_ids.add(task_id)
+                    aborted_spawn_ids.update(self._mark_subtree_failed(task_id))
                     spawn_segment += 1
             non_spawn.append((raw_index, action))
 
@@ -601,7 +599,7 @@ class ArchitectusCore:
             spawn_assignments.update(dict(zip(positions, task_ids, strict=True)))
 
         actions: list[dict[str, Any]] = []
-        for raw_index, _raw_action in enumerate(proposed):
+        for raw_index, _raw_action in enumerate(proposed_actions):
             task_id = spawn_assignments.get(raw_index)
             if task_id is not None:
                 actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
@@ -614,6 +612,28 @@ class ArchitectusCore:
         for task_id in accepted_spawn_ids:
             if task_id not in aborted_spawn_ids:
                 self._in_flight.add(task_id)
+        return actions
+
+    def _validate_actions(
+        self, proposed: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Validate and normalize a complete action wave before applying it."""
+        task_actions = {
+            ActionKind.SPAWN,
+            ActionKind.STEER,
+            ActionKind.AGGREGATE,
+            ActionKind.RESET_RETRY,
+            ActionKind.ABORT_SUBTREE,
+        }
+        actions: list[dict[str, Any]] = []
+        for raw_action in proposed:
+            if not isinstance(raw_action, Mapping):
+                raise TypeError("each LLM action must be a mapping")
+            action = self._normalise_action(raw_action)
+            kind = ActionKind(action["action"])
+            if kind in task_actions:
+                self._node(self._action_task_id(action))
+            actions.append(action)
         return actions
 
     def _record_action(self, action: dict[str, Any]) -> None:
@@ -675,14 +695,19 @@ class ArchitectusCore:
     def _blocked_task_ids(self) -> set[str]:
         blocked: set[str] = set()
         for root in self._failed_subtrees:
-            pending = [root]
-            while pending:
-                task_id = pending.pop()
-                if task_id in blocked:
-                    continue
-                blocked.add(task_id)
-                pending.extend(self._children.get(task_id, ()))
+            blocked.update(self._subtree_task_ids(root))
         return blocked
+
+    def _subtree_task_ids(self, root: str) -> set[str]:
+        subtree: set[str] = set()
+        pending = [root]
+        while pending:
+            task_id = pending.pop()
+            if task_id in subtree:
+                continue
+            subtree.add(task_id)
+            pending.extend(self._children.get(task_id, ()))
+        return subtree
 
     def _dynamic_tail(self, node: Any, config: Mapping[str, Any]) -> list[dict[str, Any]]:
         segments: list[dict[str, Any]] = []
