@@ -64,7 +64,7 @@ Boundary failure policy:
 Generate the inventory from current tracked files with `git ls-files`; do not copy planned names from architecture.
 Current source is under `src/cambium/`; current tests are under `tests/` and `src/cambium/modules/example/tests/`.
 CLI: `src/cambium/cli.py:main`; version: `src/cambium/__init__.py`.
-Runtime: `src/cambium/ipc.py`, `src/cambium/worker.py`, `src/cambium/supervisor.py`, `src/cambium/tasktree.py`, and `src/cambium/worker_pool.py`.
+Runtime: `src/cambium/ipc.py`, `src/cambium/worker.py`, `src/cambium/supervisor.py`, and `src/cambium/tasktree.py`.
 State and control: `src/cambium/store.py`, `src/cambium/merge.py`, `src/cambium/dlq.py`, `src/cambium/events.py`, `src/cambium/conversations.py`, `src/cambium/approval.py`, and `src/cambium/provider_config.py`.
 Tools: `src/cambium/schemas.py`, `src/cambium/tools.py` (`TOOL_DISPATCH`), and `src/cambium/approval.py`; keep the map complete across all three.
 Decision module: `src/cambium/modules/example/`; harness scenarios are in `tests/scenarios/`.
