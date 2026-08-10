@@ -21,7 +21,7 @@ Trace callers and tests; a failed name search is not proof of absence.
 
 Current code is a deterministic Python harness. `src/cambium/__init__.py` exports only `__version__`; no public `Cambium`/`Session`/`Result` API exists.
 `worker.do_work` is a deterministic marker/commit seed; no DSPy ReAct loop is present.
-There is no example eval harness, smoke module, or example `__main__.py` in the tracked source; these are targets only.
+There is no example eval harness or smoke module in the tracked source; these are targets only. The example module has a module CLI entry point (`python -m cambium.modules.example`).
 Custos, Opifex, Nuntius, Surculus, and Unio are architecture target names mapped to current supervisor, worker, ipc, worktree, and merge portions and symbols.
 Matching role modules are not proof. No TUI exists.
 
@@ -44,7 +44,7 @@ Matching role modules are not proof. No TUI exists.
 - Protocol handling is boundary-specific; malformed advisory lines are logged/skipped, while fatal cases are listed under IPC below; model parsing follows the module's bounded failure policy.
 - Use enums for domain alternatives. Cite only `Decision` in `src/cambium/modules/example/decide.py` and `NodeStatus` in `src/cambium/tasktree.py`.
 
-Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a deny-by-name regex, not a strict environment allowlist. Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
+Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a fail-closed environment allowlist. Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
 
 `supervisor.run_plan` concurrently fans out supplied tasks under one `asyncio.TaskGroup`; `tasktree.py` validates but does not schedule. The architecture DAG is target only.
 Boundary failure policy:
@@ -65,7 +65,7 @@ State and control: `src/cambium/store.py`, `src/cambium/merge.py`, `src/cambium/
 Tools: `src/cambium/schemas.py`, `src/cambium/tools.py` (`TOOL_DISPATCH`), and `src/cambium/approval.py`; keep the map complete across all three.
 Decision module: `src/cambium/modules/example/`; harness scenarios are in `tests/scenarios/`.
 Current data is the split `{train,eval,canaries}.jsonl`; combined `example_pairs.jsonl` is legacy fallback only.
-Fallback references: `src/cambium/modules/example/dataset.py:59-77` and `src/cambium/bench.py:215-255`.
+Fallback references: `src/cambium/modules/example/dataset.py:59-77` and the `bench.py` fallback path.
 `pyproject.toml` has `dependencies = []` and no `[dspy]` extra yet; `requires-python` is `>=3.14` with no packaging upper bound.
 Architecture's `>=3.14,<3.15` claim is open packaging work, not a fact.
 The docs tree is `docs/architecture/...` and `docs/research/...`.
@@ -87,7 +87,7 @@ Run from the repository root. The IPC fuzz test is load-sensitive; if it fails, 
 | CLI version | `uv run --python 3.14.7 cambium version` |
 | Patch check | `git diff --check` |
 
-A module CLI is allowed only when its `__main__.py` exists. None exists in the tracked example package.
+A module CLI is allowed only when its `__main__.py` exists; the example package has one (`python -m cambium.modules.example`).
 
 ## Workflow
 
