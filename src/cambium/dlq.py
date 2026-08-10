@@ -66,7 +66,6 @@ class DeadLetterQueue:
 
         session_dir = Path(dir)
         self._base_directory = session_dir / ".cambium"
-        self._directory = self._base_directory / "dlq"
         self._path = self._base_directory / "dlq.db"
         self._max_entries = max_entries
         self._redactor = redactor if redactor is not None else Redactor()
@@ -78,11 +77,6 @@ class DeadLetterQueue:
 
         self._base_directory.mkdir(parents=True, exist_ok=True)
         _make_private_dir(self._base_directory)
-        database_existed = self._path.exists()
-        legacy_records = self._read_legacy_records() if not database_existed else []
-        legacy_target = self._base_directory / "dlq.legacy"
-        if legacy_records and legacy_target.exists():
-            raise FileExistsError(f"legacy DLQ target already exists: {legacy_target}")
         _make_private_db_file(self._path)
 
         self._thread = threading.Thread(
@@ -98,11 +92,6 @@ class DeadLetterQueue:
         if self._dead is not None:
             raise RuntimeError(str(self._dead)) from self._dead
 
-        if legacy_records:
-            for record in legacy_records:
-                self._put_redacted(self._redactor.redact_mapping(record))
-            self._directory.rename(legacy_target)
-
     def put(self, record: dict) -> int:
         """Redact and durably insert *record*, then return its SQLite row id."""
 
@@ -111,29 +100,29 @@ class DeadLetterQueue:
         return self._put_redacted(self._redactor.redact_mapping(record))
 
     def entries(self) -> list[dict]:
-        """Return records oldest-to-newest with synthetic ``<id>.json`` names."""
+        """Return records oldest-to-newest with their SQLite row ids."""
 
         rows = self._read_rows("SELECT id, record FROM dlq_records ORDER BY id")
         result: list[dict] = []
         for row_id, encoded in rows:
             record = self._decode_record(encoded)
-            record["file"] = f"{row_id}.json"
+            record["id"] = row_id
             result.append(record)
         return result
 
-    def get(self, name: str | Path) -> dict:
-        """Read one queue record by its synthetic filename."""
+    def get(self, row_id: int) -> dict:
+        """Read one queue record by its positive SQLite row id."""
 
-        row_id = self._id_for_name(name)
+        row_id = self._validate_row_id(row_id)
         rows = self._read_rows("SELECT record FROM dlq_records WHERE id = ?", (row_id,))
         if not rows:
-            raise FileNotFoundError(str(name))
+            raise FileNotFoundError(str(row_id))
         return self._decode_record(rows[0][0])
 
-    def remove(self, name: str | Path) -> None:
-        """Remove one record by filename; an absent record is harmless."""
+    def remove(self, row_id: int) -> None:
+        """Remove one record by row id; an absent record is harmless."""
 
-        self._submit("remove", self._id_for_name(name))
+        self._submit("remove", self._validate_row_id(row_id))
 
     def summarize(self) -> dict[str, Any]:
         """Summarize status and failure reason using stored SQL columns."""
@@ -292,26 +281,6 @@ class DeadLetterQueue:
         finally:
             conn.close()
 
-    def _read_legacy_records(self) -> list[dict]:
-        if not self._directory.is_dir():
-            return []
-        paths = sorted(
-            (
-                path
-                for path in self._directory.iterdir()
-                if path.is_file() and path.suffix == ".json"
-            ),
-            key=lambda path: (path.stat().st_mtime_ns, path.name),
-        )
-        records: list[dict] = []
-        for path in paths:
-            with path.open(encoding="utf-8") as stream:
-                record = json.load(stream)
-            if not isinstance(record, dict):
-                raise ValueError(f"dead-letter record is not an object: {path.name}")
-            records.append(record)
-        return records
-
     def _fail_pending(self, exc: BaseException) -> None:
         while True:
             try:
@@ -345,14 +314,10 @@ class DeadLetterQueue:
         return record
 
     @staticmethod
-    def _id_for_name(name: str | Path) -> int:
-        filename = Path(name).name
-        if str(name) != filename or not filename.endswith(".json"):
-            raise ValueError("name must be an <id>.json filename from the dead-letter queue")
-        identifier = filename.removesuffix(".json")
-        if not identifier.isascii() or not identifier.isdigit() or int(identifier) < 1:
-            raise ValueError("name must be an <id>.json filename from the dead-letter queue")
-        return int(identifier)
+    def _validate_row_id(row_id: object) -> int:
+        if type(row_id) is not int or row_id <= 0:
+            raise ValueError("row_id must be a positive integer")
+        return row_id
 
 
 def _label(value: object) -> str:
