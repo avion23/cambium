@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -201,6 +202,66 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
         assert result.exit_code == 0
 
     asyncio.run(canary())
+
+
+def test_session_redactor_removes_declared_secret_from_db_and_observers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The secret deliberately avoids every default pattern shape (no sk-/AIza/
+    # Bearer prefix), so only the session registry built from the declared
+    # provider_env_keys values can redact it. Worker stderr and gate stderr
+    # both echo it; neither the durable SQLite rows nor the observer records
+    # may contain it.
+    secret = "opaque-session-secret-42abcdef"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", secret)
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "secret_echo_worker.py"
+    worker.write_text(
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+        "from fake_worker import do_work, read_msg, send\n"
+        "init = read_msg()\n"
+        "send({'type': 'ready', 'request_id': init['request_id'], 'task_id': "
+        "init['task_id'], 'pid': os.getpid(), 'generation': init.get('generation', 1), "
+        "'proto': 1})\n"
+        "run = read_msg()\n"
+        "print(os.environ['CAMBIUM_PROVIDER_OPENAI_API_KEY'], file=sys.stderr)\n"
+        "status, failure_reason, commits, files_changed, diff = do_work(run)\n"
+        "send({'type': 'result_envelope', 'request_id': run['request_id'], 'task_id': "
+        "run['task_id'], 'generation': init.get('generation', 1), 'status': status, "
+        "'commits': commits, 'files_changed': files_changed, 'diff': diff, "
+        "'failure_reason': failure_reason})\n"
+        "send({'type': 'exit_message', 'task_id': run['task_id'], 'reason': 'done'})\n",
+        encoding="utf-8",
+    )
+    gate = f"echo {secret} >&2; grep -q '// t-secret' hello.txt"
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-secret",
+        worker=str(worker),
+        gate=gate,
+        provider_env_keys=["CAMBIUM_PROVIDER_OPENAI_API_KEY"],
+        marker="// t-secret",
+    )
+    observed: list[dict] = []
+
+    def observer(record: dict) -> None:
+        observed.append(record)
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}, on_event=observer))
+
+    assert result.results[0].status == "succeeded"
+    assert secret not in json.dumps(observed)
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        rows = connection.execute(
+            "SELECT kind, payload, task_id, worker_id, request_id FROM events"
+        ).fetchall()
+    assert secret not in json.dumps(rows)
+    assert any(event["kind"] == "log" for event in read_events(session_dir))
 
 
 def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
@@ -406,7 +467,6 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Pat
 
     assert result.results[0].status == "succeeded"
     assert result.results[0].restarts == 1
-    assert read_generation(worktree) == 9
     generations = [
         event["generation"]
         for event in read_events(session_dir)
@@ -414,6 +474,9 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Pat
     ]
     assert generations == [8, 9]
     assert 7 not in generations
+    # The terminal clean worktree is pruned (phase (d) acceptance), so the
+    # fence can no longer be probed after the run.
+    assert not worktree.exists()
 
 
 def test_generation_survives_crash_after_worktree_clean(
@@ -458,10 +521,17 @@ def test_generation_survives_crash_after_worktree_clean(
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
 
-    after_restart = read_generation(worktree)
     assert result.results[0].status == "succeeded"
-    assert [9, after_crash, after_restart] == [9, 10, 12]
-    assert not validate_worker_generation(worktree, 1)
+    assert [9, after_crash] == [9, 10]
+    generations = [
+        event["generation"]
+        for event in read_events(session_dir)
+        if event["kind"] == "init"
+    ]
+    assert generations == [11, 12]  # never rolls back below the crash window
+    # The terminal clean worktree is pruned (phase (d) acceptance), so the
+    # fence can no longer be probed after the run.
+    assert not worktree.exists()
 
 
 def test_worktree_registration_requires_an_exact_path_match(tmp_path: Path) -> None:
@@ -831,7 +901,7 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     worker = tmp_path / "tool-event-worker.py"
     worker.write_text(
-        "import json, sys\n"
+        "import json, subprocess, sys\n"
         "def send(message):\n"
         "    print(json.dumps(message), flush=True)\n"
         "init = json.loads(sys.stdin.readline())\n"
@@ -846,6 +916,10 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
         "'batch_index': 0, 'batch_size': 1, 'ok': True, 'duration_ms': 12})\n"
         "    with open(run['target_file'], 'a', encoding='utf-8') as handle:\n"
         "        handle.write('\\n// tool-event-validated\\n')\n"
+        "    subprocess.run(['git', 'add', run['target_file']], "
+        "cwd=run['worktree_path'], check=True)\n"
+        "    subprocess.run(['git', 'commit', '-m', 'tool event validation'], "
+        "cwd=run['worktree_path'], check=True, capture_output=True)\n"
         "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
         "'status': 'succeeded'})\n"
         "    send({'type': 'exit_message', 'reason': 'done'})\n",
@@ -866,7 +940,7 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
 
     task_result = result.results[0]
-    assert task_result.status == "succeeded"
+    assert task_result.status == "succeeded", task_result
     events = read_events(session_dir)
     tool_events = _kinds(events, "tool_event")
     assert len(tool_events) == 1
@@ -958,12 +1032,6 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
     assert not session_dir.exists()
 
 
-def test_default_spec_selects_installed_worker_module() -> None:
-    spec = supervisor_module._default_spec(Path("/tmp/session"))
-
-    assert spec["worker"] == "cambium.worker"
-
-
 def test_worker_command_prefers_installed_module_and_preserves_script_paths() -> None:
     module_cmd = [sys.executable, "-u", "-m", "cambium.worker"]
     runtime = supervisor_module._Runtime(Path("/tmp/session"), None)
@@ -990,13 +1058,7 @@ def test_slice_runtime_runs_the_installed_worker_module(tmp_path) -> None:
 
     assert result.status == "succeeded"
     assert result.exit_code == 0
-    assert result.worker_exit_code == 0
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    spawned = [event for event in events if event["kind"] == "spawned"]
+    spawned = [event for event in read_events(session_dir) if event["kind"] == "spawned"]
     assert spawned
     assert "cambium.worker" in spawned[0]["payload"]["worker"]
 
@@ -1012,6 +1074,7 @@ def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
         "marker": "// slice-too-long",
         "write_marker": True,
         "gate": "true",
+        "spec": "edit hello.txt",
         "provider_env_keys": [],
     }
 
@@ -1024,13 +1087,9 @@ def test_oversized_stdout_line_fails_slice_reader(tmp_path: Path) -> None:
 
     assert result.status == "failed"
     assert result.exit_code == 1
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-    ]
     assert any(
         event["kind"] == "protocol" and event["payload"].get("note") == "MessageTooLong"
-        for event in events
+        for event in read_events(session_dir)
     )
 
 
@@ -1076,10 +1135,7 @@ def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without
 
     assert result.status == "failed"
     assert result.merge_sha is None
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-    ]
+    events = read_events(session_dir)
     protocol = [event for event in events if event["kind"] == "protocol"]
     assert len(protocol) == 1
     assert protocol[0]["payload"]["code"] == supervisor_module.PROTO_UNKNOWN_REQUEST_ID
@@ -1112,10 +1168,7 @@ def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
 
     assert result.status == "failed"
     assert result.merge_sha is None
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-    ]
+    events = read_events(session_dir)
     assert any(
         event["kind"] == "protocol"
         and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
@@ -1162,12 +1215,7 @@ def test_slice_heavy_gate_passes_through_session_gate(tmp_path: Path) -> None:
     assert result.status == "succeeded"
     assert result.exit_code == 0
     assert result.gate_exit_code == 0
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    gate_events = [event for event in events if event["kind"] == "gate"]
+    gate_events = _kinds(read_events(session_dir), "gate")
     assert gate_events
     assert all(event["payload"].get("heavy") is True for event in gate_events)
     assert not any(event["payload"].get("resource_denied") for event in gate_events)

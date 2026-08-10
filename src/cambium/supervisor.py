@@ -1,27 +1,23 @@
-"""Minimal asyncio supervisor — the vertical-slice milestone.
+"""Cambium supervisor — the canonical asyncio runtime.
 
-End-to-end proof of the harness shape with ONE worker: spawn a worker
-subprocess, speak JSON-Lines over stdio (``init`` -> ``ready`` ->
-``run_task`` -> ``result_envelope`` -> ``exit_message``, request_id
-correlated), append events to ``<session_dir>/.cambium/events.jsonl``,
-run the task's gate command, and merge the worker's branch back with
-``git merge --ff-only`` in the scratch repo. Exit 0 only when every step
-succeeded.
+Speaks the Nuntius JSON-Lines wire protocol (docs/architecture.md §5) with N
+worker subprocesses under one ``asyncio.TaskGroup``: spawn ``python -m
+cambium.worker`` (or a task's ``worker`` script) inside a git worktree,
+correlate ``init`` -> ``ready`` -> ``run_task`` -> ``result_envelope`` ->
+``exit_message`` by request_id, run each task's gate command, and publish the
+worker branch onto ``refs/heads/main`` atomically through
+``cambium.merge.MergeSequencer``.
 
-Failure conditions (any one overrides the envelope's status to failed):
-(a) worker process exit code != 0 — the supervisor exit code then
-reflects the worker's real exit code; (b) ``exit_message`` missing at
-EOF; (c) ``result_envelope`` missing or not correlated to ``run_task``'s
-request_id. Timeouts: ``ready_timeout``, ``gate_timeout``, and an overall
-wall budget — on timeout the worker's process group is killed
-(start_new_session) and the session is failed. ``result_envelope`` must
-echo ``run_task``'s request_id; ``exit_message`` is connection-level and
-carries no request_id (arch §5.2).
+Every event is persisted to ``<session_dir>/.cambium/events.db`` through the
+canonical ``cambium.store.EventStore`` (readable via ``read_events``).
+Redaction is session-scoped: one ``cambium.redact.Redactor`` built from every
+worker-forwardable declared secret value redacts the complete event record
+before the store, the non-critical queue, and event observers.
 
-Scope guard: this is the slice, not Custos. No heartbeats, no restart
-policy, no fencing, no event-log durability beyond a per-line flush, no
-worktree recovery/prune. Every divergence from the architecture drafts
-is flagged in docs/research/vertical-slice-report.md.
+``run_plan`` drives a multi-task plan and returns a ``PlanResult``;
+``run_session`` is a thin one-task adapter that keeps the historical
+``SliceResult`` return shape. ``cambium.store`` and ``cambium.merge`` are
+hard runtime dependency contracts: import failure fails at load.
 """
 
 from __future__ import annotations
@@ -39,7 +35,6 @@ import re
 import shlex
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -55,6 +50,11 @@ from cambium.resources import DEFAULT_ACQUIRE_TIMEOUT_S, CompileGate
 from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
+from .merge import MergeSequencer
+from .modules.base import _is_secret_shaped
+from .redact import Redactor, build_session_redactor
+from .results import EXIT_CODES, Result, write_result
+from .store import CRITICAL_KINDS, EventStore
 
 PROTO = 1
 WORKER_STDIN_LIMIT = 1_048_576
@@ -132,38 +132,15 @@ class SliceResult:
     timeout_phase: str | None = None  # "ready" | "run" | "gate" | "wall"
 
 
-class EventLog:
-    """Simple JSON-Lines event log under the session dir.
+_TIMEOUT_PHASES = ("ready", "wall", "heartbeat", "pong", "stdin")
 
-    Slice-level durability intent: each line is flushed on append, but
-    there is no fsync and writes happen on the event loop. The real
-    design (architecture §6, custos design §2.4) uses a SQLite WAL on a
-    dedicated writer thread with an fsync cadence.
-    """
 
-    def __init__(self, path: Path, sink: EventSink | None = None) -> None:
-        self._path = path
-        self._sink = sink
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(path.parent, 0o700)
-        except OSError:
-            pass
-        try:
-            os.chmod(path, 0o600)
-        except FileNotFoundError:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600)
-            os.close(fd)
-        except OSError:
-            pass
-
-    def emit(self, kind: str, **payload: Any) -> None:
-        record = {"kind": kind, "timestamp": time.time(), "payload": payload}
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-            handle.flush()
-        if self._sink is not None:
-            self._sink(record)
+def _status_line_is_fence(line: str) -> bool:
+    """Whether a porcelain status line only touches the supervisor's fence dir."""
+    if len(line) < 4 or line[2] != " ":
+        return False
+    path = line[3:].strip()
+    return path == ".cambium" or path.startswith(".cambium/")
 
 
 def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) -> float:
@@ -171,24 +148,6 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     if spec_value is not None:
         return float(spec_value)
     return float(os.environ.get(env, default))
-
-
-def _validate_paths(session_dir: Path, task_spec: dict[str, Any]) -> tuple[Path, Path]:
-    """Path safety: worktree inside the session dir; target_file inside the worktree.
-
-    resolve() + prefix check so ``..`` / absolute paths are rejected.
-    """
-    session_root = session_dir.resolve()
-    scratch_repo = Path(task_spec["scratch_repo"]).resolve()
-    worktree_path = Path(task_spec["worktree_path"]).resolve()
-    if not worktree_path.is_relative_to(session_root):
-        raise ValueError(
-            f"worktree_path {worktree_path} is outside the session dir {session_root}")
-    if not task_spec.get("fanout_config"):
-        target_path = (worktree_path / task_spec["target_file"]).resolve()
-        if not target_path.is_relative_to(worktree_path):
-            raise ValueError(f"target_file {task_spec['target_file']!r} escapes the worktree")
-    return scratch_repo, worktree_path
 
 
 async def _write_json(
@@ -322,146 +281,6 @@ async def _communicate_gate_bounded(
         await asyncio.gather(readers_done, process_done, output_full, return_exceptions=True)
 
 
-async def _next_message(
-    messages: asyncio.Queue[dict[str, Any] | None], deadline: float
-) -> dict[str, Any] | None:
-    """Next message, or None at EOF. Raises TimeoutError when deadline passes."""
-    remaining = deadline - asyncio.get_running_loop().time()
-    if remaining <= 0:
-        raise TimeoutError
-    return await asyncio.wait_for(messages.get(), remaining)
-
-
-async def _run_gate(
-    command: str,
-    cwd: Path,
-    log: EventLog,
-    task_id: str,
-    timeout: float,
-    gate: CompileGate,
-) -> int:
-    """Run the gate command in the worker's worktree. Raises TimeoutError on gate timeout."""
-    command_tokens = shlex.split(command)
-    is_heavy = gate.is_heavy(command_tokens)
-    token = await gate.acquire(command_tokens) if is_heavy else None
-    if token is False:
-        log.emit(
-            "gate",
-            task_id=task_id,
-            command=command,
-            exit_code=126,
-            timed_out=False,
-            resource_denied=True,
-            heavy=True,
-        )
-        return 126
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_strip_sensitive_env(scrub_environment(), worktree=cwd),
-            start_new_session=True,
-            pass_fds=(),
-            close_fds=True,
-        )
-        _out, err = await _communicate_gate_bounded(proc, timeout)
-    except _GateOutputOverflow as exc:
-        log.emit(
-            "gate", task_id=task_id, command=command, exit_code=125,
-            timed_out=False, output_overflow=True,
-            stderr=exc.stderr.decode("utf-8", "replace")[:512],
-            heavy=is_heavy,
-        )
-        return 125
-    except TimeoutError:
-        if proc is not None:
-            await _kill_process_group_and_reap(proc)
-        log.emit(
-            "gate",
-            task_id=task_id,
-            command=command,
-            exit_code=None,
-            timed_out=True,
-            heavy=is_heavy,
-        )
-        raise
-    except asyncio.CancelledError:
-        if proc is not None:
-            await _kill_process_group_and_reap(proc)
-        raise
-    finally:
-        gate.release(token)
-    log.emit(
-        "gate",
-        task_id=task_id,
-        command=command,
-        exit_code=proc.returncode,
-        stderr=err.decode("utf-8", "replace")[:512],
-        heavy=is_heavy,
-    )
-    return proc.returncode
-
-
-async def _merge_branch(
-    scratch_repo: Path,
-    branch: str,
-    log: EventLog,
-    task_id: str,
-    *,
-    timeout: float | None = None,
-) -> str | None:
-    proc = await asyncio.create_subprocess_exec(
-        "git", "merge", "--ff-only", branch, cwd=scratch_repo,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(scrub_environment(), worktree=scratch_repo),
-        start_new_session=True,
-        pass_fds=(),
-        close_fds=True,
-    )
-    try:
-        communicate = proc.communicate()
-        if timeout is None:
-            _out, err = await communicate
-        else:
-            _out, err = await asyncio.wait_for(communicate, timeout)
-    except TimeoutError:
-        await _kill_process_group_and_reap(proc)
-        log.emit("merge", task_id=task_id, branch=branch, exit_code=None, timed_out=True)
-        raise
-    except asyncio.CancelledError:
-        await _kill_process_group_and_reap(proc)
-        raise
-    if proc.returncode != 0:
-        log.emit("merge", task_id=task_id, branch=branch, exit_code=proc.returncode,
-                 stderr=err.decode("utf-8", "replace")[:512])
-        return None
-    tip = await asyncio.create_subprocess_exec(
-        "git", "rev-parse", "HEAD", cwd=scratch_repo,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(scrub_environment(), worktree=scratch_repo),
-        start_new_session=True,
-        pass_fds=(),
-        close_fds=True,
-    )
-    try:
-        communicate = tip.communicate()
-        if timeout is None:
-            out, _ = await communicate
-        else:
-            out, _ = await asyncio.wait_for(communicate, timeout)
-    except TimeoutError:
-        await _kill_process_group_and_reap(tip)
-        log.emit("merge", task_id=task_id, branch=branch, exit_code=None, timed_out=True)
-        raise
-    except asyncio.CancelledError:
-        await _kill_process_group_and_reap(tip)
-        raise
-    sha = out.decode("utf-8", "replace").strip()
-    log.emit("merge", task_id=task_id, branch=branch, exit_code=0, sha=sha)
-    return sha
-
-
 async def run_session(
     session_dir: str | Path,
     task_spec: dict[str, Any],
@@ -469,364 +288,57 @@ async def run_session(
 ) -> SliceResult:
     """Run one worker end to end and return the slice outcome.
 
-    task_spec keys: task_id, task, worker (script path), scratch_repo,
-    worktree_path, branch, target_file, marker, write_marker, gate
-    (shell command run in the worker's worktree), spec (optional), fanout_config
-    (provider mode; requires a non-empty task),
-    ready_timeout_s / gate_timeout_s / wall_budget_s (optional; else env
-    CAMBIUM_READY_TIMEOUT_S / CAMBIUM_GATE_TIMEOUT_S / CAMBIUM_WALL_BUDGET_S).
+    Thin one-task adapter over :func:`run_plan`. The caller's slice-shaped
+    spec (``scratch_repo`` / ``spec`` / ``wall_budget_s``) is mapped to a
+    canonical one-task plan (``repo`` / ``task`` / ``max_wall_s``) with
+    ``max_restarts=0``; the resulting :class:`TaskResult` is mapped back to
+    :class:`SliceResult` to keep the public return shape.
     """
-    session_dir = Path(session_dir)
-    if task_spec.get("fanout_config"):
-        task = task_spec.get("task")
+    plan_task = _slice_to_plan_task(dict(task_spec))
+    plan_result = await run_plan(session_dir, {"tasks": [plan_task]}, on_event=on_event)
+    return _task_result_to_slice_result(plan_result.results[0])
+
+
+def _slice_to_plan_task(spec: dict[str, Any]) -> dict[str, Any]:
+    """Map a slice-shaped task spec to a canonical one-task plan entry."""
+    plan_task = dict(spec)
+    if "scratch_repo" in plan_task:
+        plan_task["repo"] = str(Path(plan_task.pop("scratch_repo")).resolve())
+    if "wall_budget_s" in plan_task:
+        plan_task["max_wall_s"] = plan_task.pop("wall_budget_s")
+    if "spec" in plan_task:
+        plan_task["task"] = plan_task.pop("spec")
+    if plan_task.get("fanout_config"):
+        task = plan_task.get("task")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("run_session provider mode requires a non-empty task")
-    log = EventLog(session_dir / ".cambium" / "events.jsonl", on_event)
-    gate = CompileGate(
-        max_concurrent=task_spec.get("compile_gate_max_concurrent"),
-        timeout_s=task_spec.get(
-            "compile_gate_acquire_timeout_s", DEFAULT_ACQUIRE_TIMEOUT_S
-        ),
+    elif not isinstance(plan_task.get("task"), str) or not plan_task["task"].strip():
+        plan_task["task"] = "run one task"
+    plan_task.setdefault("max_restarts", 0)
+    return plan_task
+
+
+def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
+    """Map one :class:`TaskResult` back to the historical slice shape.
+
+    ``TaskResult`` does not retain the worker's own exit code or wire status
+    token (the supervisor verdict is authoritative); those slice fields are
+    ``None``. Timeout state is recovered from the canonical failure reason.
+    """
+    reason = result.reason or ""
+    timeout_phase = next(
+        (phase for phase in _TIMEOUT_PHASES if phase in reason), None
     )
-    task_id = task_spec["task_id"]
-    worker = task_spec.get("worker")
-    if worker is None or worker == "cambium.worker":
-        worker_label = "cambium.worker"
-        worker_command = [sys.executable, "-u", "-m", "cambium.worker"]
-    else:
-        worker_label = str(worker)
-        worker_command = [sys.executable, "-u", worker_label]
-
-    ready_timeout = _cfg_float(task_spec, "ready_timeout_s", "CAMBIUM_READY_TIMEOUT_S", 10.0)
-    gate_timeout = _cfg_float(task_spec, "gate_timeout_s", "CAMBIUM_GATE_TIMEOUT_S", 30.0)
-    wall_budget = _cfg_float(task_spec, "wall_budget_s", "CAMBIUM_WALL_BUDGET_S", 120.0)
-
-    scratch_repo, worktree_path = _validate_paths(session_dir, task_spec)
-    loop = asyncio.get_running_loop()
-    wall_deadline = loop.time() + wall_budget
-
-    if not worktree_path.exists():
-        base_commit = str(task_spec.get("base_commit") or "main")
-        create = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "git", "worktree", "add", "-b", task_spec["branch"],
-                str(worktree_path), base_commit,
-            ],
-            cwd=str(scratch_repo),
-            capture_output=True,
-            text=True,
-            env=_strip_sensitive_env(scrub_environment(), worktree=scratch_repo),
-        )
-        if create.returncode != 0:
-            detail = (create.stderr + create.stdout).strip()[:512]
-            raise RuntimeError(f"worktree add failed for {task_spec['branch']}: {detail}")
-    await asyncio.to_thread(write_generation, worktree_path, 1)
-
-    log.emit("spawned", task_id=task_id, worker=worker_label)
-    proc = await asyncio.create_subprocess_exec(
-        *worker_command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=WORKER_STDIN_LIMIT,
-        env=_worker_environment(task_spec, 1, session_dir=session_dir),
-        start_new_session=True,
-        pass_fds=(),
-        close_fds=True,
+    return SliceResult(
+        status=result.status,
+        exit_code=result.exit_code,
+        worker_exit_code=None,
+        worker_status=None,
+        gate_exit_code=result.gate_exit_code,
+        merge_sha=result.merge_sha,
+        timed_out=timeout_phase is not None,
+        timeout_phase=timeout_phase,
     )
-
-    messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    message_too_long = False
-
-    async def _read_stdout() -> None:
-        nonlocal message_too_long
-        try:
-            async for raw in proc.stdout:
-                line = raw.decode("utf-8", "replace").rstrip("\n")
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    log.emit("parse_error", task_id=task_id, message=str(exc))
-                    continue
-                await messages.put(msg)
-        except (ValueError, asyncio.LimitOverrunError) as exc:
-            message_too_long = True
-            log.emit(
-                "protocol", task_id=task_id, note="MessageTooLong", message=str(exc)[:256]
-            )
-            await _kill_worker(proc)
-        finally:
-            await messages.put(None)  # EOF sentinel; not death by itself
-
-    async def _read_stderr() -> None:
-        async for raw in proc.stderr:
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-            if line.strip():
-                log.emit("log", task_id=task_id, stream="stderr", message=line[:512])
-
-    stdout_task = asyncio.create_task(_read_stdout())
-    stderr_task = asyncio.create_task(_read_stderr())
-
-    init_rid = make_request_id(1)
-    init_message = {
-        "type": "init", "request_id": init_rid, "task_id": task_id,
-        "proto": PROTO, "generation": 1, "spec": task_spec.get("spec", ""),
-    }
-    if task_spec.get("fanout_config"):
-        init_message["fanout_config"] = task_spec["fanout_config"]
-        init_message["provider_env_keys"] = sorted(_provider_env_keys(task_spec))
-    init_deadline = _stdin_deadline(wall_deadline)
-    init_written = await _write_json(
-        proc,
-        init_message,
-        deadline=init_deadline,
-    )
-    log.emit("init", task_id=task_id, request_id=init_rid)
-
-    run_payload = {
-        "scratch_repo": str(scratch_repo),
-        "worktree_path": str(worktree_path),
-        "branch": task_spec["branch"],
-        "generation": 1,
-    }
-    if task_spec.get("fanout_config"):
-        run_payload["task"] = task_spec["task"]
-    if not task_spec.get("fanout_config"):
-        run_payload.update(
-            target_file=task_spec["target_file"],
-            marker=task_spec["marker"],
-            write_marker=bool(task_spec.get("write_marker", True)),
-        )
-
-    # Phase 1: init -> ready (bounded by ready_timeout and the wall budget).
-    timeout_kind: str | None = None
-    protocol_failure: str | None = None
-    run_rid: str | None = None
-    saw_ready = False
-    timeout_kind = "stdin" if not init_written else None
-    ready_deadline = (
-        min(loop.time() + ready_timeout, wall_deadline)
-        if init_written
-        else loop.time()
-    )
-    while True:
-        try:
-            msg = await _next_message(messages, ready_deadline)
-        except TimeoutError:
-            if timeout_kind is None:
-                timeout_kind = "ready"
-            break
-        if msg is None:
-            break  # EOF before ready
-        if _protocol_version_mismatch(msg):
-            protocol_failure = "PROTO_VERSION_MISMATCH"
-            log.emit(
-                "protocol", task_id=task_id, error_type=protocol_failure,
-                expected=PROTO, got=msg.get("proto"),
-            )
-            await _kill_worker(proc)
-            break
-        if msg.get("type") == "ready":
-            if msg.get("request_id") != init_rid:
-                protocol_failure = PROTO_UNKNOWN_REQUEST_ID
-                log.emit(
-                    "protocol", task_id=task_id, request_id=msg.get("request_id"),
-                    code=PROTO_UNKNOWN_REQUEST_ID, note="ready request_id mismatch",
-                    expected=init_rid, got=msg.get("request_id"),
-                )
-                await _kill_worker(proc)
-                break
-            saw_ready = True
-            log.emit("ready", task_id=task_id, request_id=msg.get("request_id"),
-                     pid=msg.get("pid"))
-            run_rid = make_request_id(2)
-            run_deadline = _stdin_deadline(wall_deadline)
-            if not await _write_json(
-                proc,
-                {"type": "run_task", "request_id": run_rid,
-                 "task_id": task_id, **run_payload},
-                deadline=run_deadline,
-            ):
-                timeout_kind = "stdin"
-                log.emit("protocol", task_id=task_id, note="run_task write failed")
-            log.emit("run_task", task_id=task_id, request_id=run_rid)
-            break
-        log.emit("protocol", task_id=task_id, type=msg.get("type"), note="message before ready")
-
-    # Phase 2: run_task -> result_envelope -> exit_message (bounded by the wall budget).
-    result_envelope: dict[str, Any] | None = None
-    result_correlated = False
-    exit_reason: str | None = None
-    if saw_ready and timeout_kind is None:
-        while True:
-            try:
-                msg = await _next_message(messages, wall_deadline)
-            except TimeoutError:
-                timeout_kind = "wall"
-                break
-            if msg is None:
-                await asyncio.sleep(
-                    min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time()))
-                )
-                if proc.returncode is None:
-                    pong_rid = make_request_id(3)
-                    pong_deadline = min(wall_deadline, loop.time() + PONG_DEADLINE_S)
-                    log.emit("ping", task_id=task_id, request_id=pong_rid)
-                    pong_ok = await _write_json(
-                        proc,
-                        {"type": "ping", "request_id": pong_rid, "task_id": task_id},
-                        deadline=pong_deadline,
-                    )
-                    pong_correlated = False
-                    while pong_ok and loop.time() < pong_deadline:
-                        try:
-                            response = await asyncio.wait_for(
-                                messages.get(), pong_deadline - loop.time()
-                            )
-                        except TimeoutError:
-                            break
-                        if response is None:
-                            break
-                        if _protocol_version_mismatch(response):
-                            protocol_failure = "PROTO_VERSION_MISMATCH"
-                            log.emit(
-                                "protocol", task_id=task_id,
-                                error_type=protocol_failure, expected=PROTO,
-                                got=response.get("proto"),
-                            )
-                            break
-                        if response.get("type") != "pong":
-                            continue
-                        if response.get("request_id") == pong_rid:
-                            pong_correlated = True
-                            log.emit("pong", task_id=task_id, request_id=pong_rid)
-                            try:
-                                await asyncio.wait_for(
-                                    proc.wait(),
-                                    min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time())),
-                                )
-                            except TimeoutError:
-                                await _kill_worker(proc)
-                            break
-                        log.emit(
-                            "protocol", task_id=task_id,
-                            note="pong request_id mismatch",
-                            expected=pong_rid, got=response.get("request_id"),
-                        )
-                    if not pong_correlated:
-                        timeout_kind = "pong"
-                        await _kill_worker(proc)
-                break  # EOF without exit_message
-            if _protocol_version_mismatch(msg):
-                protocol_failure = "PROTO_VERSION_MISMATCH"
-                log.emit(
-                    "protocol", task_id=task_id, error_type=protocol_failure,
-                    expected=PROTO, got=msg.get("proto"),
-                )
-                await _kill_worker(proc)
-                break
-            mtype = msg.get("type")
-            if mtype == "result_envelope":
-                result_envelope = msg
-                result_correlated = msg.get("request_id") == run_rid
-                if not result_correlated:
-                    log.emit("protocol", task_id=task_id,
-                             note="result_envelope request_id mismatch",
-                             expected=run_rid, got=msg.get("request_id"))
-                result_payload: dict[str, Any] = {"status": msg.get("status")}
-                provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
-                if provider_metadata is not None:
-                    result_payload["provider_metadata"] = provider_metadata
-                log.emit(
-                    "result", task_id=task_id, request_id=msg.get("request_id"),
-                    **result_payload,
-                )
-            elif mtype == "exit_message":
-                exit_reason = msg.get("reason")
-                log.emit("exit", task_id=task_id, reason=exit_reason)
-                break
-            else:
-                log.emit("protocol", task_id=task_id, type=mtype or "<missing>")
-
-    if timeout_kind is not None:
-        await _kill_worker(proc)
-        log.emit("timeout", task_id=task_id, phase=timeout_kind)
-
-    worker_exit_code = await proc.wait()
-    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-
-    worker_status = result_envelope.get("status") if result_envelope else None
-    gate_rc: int | None = None
-    merge_sha: str | None = None
-    timed_out = timeout_kind is not None
-    worker_bad = worker_exit_code != 0
-    missing_exit = exit_reason is None
-    missing_result = result_envelope is None or not result_correlated
-
-    if message_too_long:
-        log.emit("protocol", task_id=task_id, note="message too long; worker failed")
-    if protocol_failure is not None:
-        status, exit_code = "failed", 1
-    elif timed_out:
-        status, exit_code = "failed", 3
-    elif message_too_long:
-        status, exit_code = "failed", 1
-    elif worker_bad:
-        status, exit_code = "failed", worker_exit_code if worker_exit_code > 0 else 1
-    elif missing_exit:
-        status, exit_code = "failed", 1
-    elif missing_result:
-        status, exit_code = "failed", 1
-    else:
-        # Primary signal: the envelope's status; the gate is the verification step.
-        worktree = Path(run_payload["worktree_path"])
-        if worktree.exists():
-            remaining = wall_deadline - loop.time()
-            try:
-                gate_rc = await _run_gate(
-                    task_spec["gate"], worktree, log, task_id,
-                    timeout=min(gate_timeout, remaining), gate=gate,
-                )
-            except TimeoutError:
-                gate_rc = None
-                timed_out = True
-                timeout_kind = "gate"
-                log.emit("timeout", task_id=task_id, phase="gate")
-        if not timed_out:
-            if worker_status == "succeeded" and gate_rc == 0:
-                status = "succeeded"
-                try:
-                    merge_sha = await _merge_branch(
-                        scratch_repo,
-                        run_payload["branch"],
-                        log,
-                        task_id,
-                        timeout=max(0.0, wall_deadline - loop.time()),
-                    )
-                except TimeoutError:
-                    status = "failed"
-                    timed_out = True
-                    timeout_kind = "merge"
-                else:
-                    if merge_sha is None:
-                        status = "failed"
-            else:
-                status = "failed"
-            exit_code = 0 if status == "succeeded" else 1
-        else:
-            status, exit_code = "failed", 3
-
-    log.emit("session_ended", task_id=task_id, status=status, exit_code=exit_code,
-             worker_exit_code=worker_exit_code, saw_ready=saw_ready,
-             exit_reason=exit_reason, timed_out=timed_out, timeout_phase=timeout_kind)
-    return SliceResult(status=status, exit_code=exit_code,
-                       worker_exit_code=worker_exit_code,
-                       worker_status=worker_status, gate_exit_code=gate_rc,
-                       merge_sha=merge_sha, timed_out=timed_out,
-                       timeout_phase=timeout_kind)
 
 
 # =====================================================================
@@ -860,12 +372,6 @@ TERM_GRACE_S = 5.0
 MAX_PARSE_ERRORS = 500
 PROTO_UNKNOWN_REQUEST_ID = "PROTO_UNKNOWN_REQUEST_ID"
 
-CRITICAL_KINDS = frozenset({
-    "result", "checkpoint", "worker_exit", "task_failed",
-    "merge_progress", "task_assigned", "merge_committed",
-    "merge_staging_quarantined", "merge_staging_cleanup_failed",
-    "merge_staging_prune_started", "merge_staging_pruned",
-})
 
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _PROVIDER_METADATA_USAGE_FIELDS = frozenset(
@@ -992,312 +498,43 @@ def _strip_sensitive_env(
     )
 
 
-class NonFastForwardError(RuntimeError):
-    """``refs/heads/main`` moved away from the expected-old SHA at publish time."""
+def _session_redactor(specs: list[dict[str, Any]]) -> Redactor:
+    """Build one session redactor from every worker-forwardable declared value.
 
-    def __init__(
-        self, *, new_tip: str, expected_old: str, current: str | None = None, detail: str = ""
-    ) -> None:
-        self.new_tip = new_tip
-        self.expected_old = expected_old
-        self.current = current
-        self.detail = detail
-        where = current or "unknown"
-        message = (
-            f"non-fast-forward publish of {new_tip}: refs/heads/main is at "
-            f"{where} but expected {expected_old}"
-        )
-        if detail:
-            message += f" ({detail})"
-        super().__init__(message)
-
-
-class MergeConflictError(RuntimeError):
-    """A rebase/merge of the worker branch onto the base hit conflicts."""
-
-    def __init__(self, message: str, conflicts: list[str] | None = None) -> None:
-        super().__init__(message)
-        self.conflicts = list(conflicts or [])
-
-
-class _FallbackEventStore:
-    """Minimal SQLite WAL event store mirroring cambium.store.EventStore's
-    append/events_after/close contract; used when cambium.store is absent.
-
-    append() blocks for critical kinds (a WAL checkpoint + fsync, i.e. the
-    durability contract of architecture §6.5 reduced to the essentials);
-    events_after() replays rows in seq order from a fresh read connection.
+    The registry must cover every value ``_worker_environment`` can forward to
+    a worker from the declared ``provider_env_keys``. The declaration is the
+    authority boundary; the variable name does not determine whether its value
+    is sensitive. Compact machine-token values (``_is_secret_shaped``) are
+    registered for substring redaction wherever they appear; prose-like
+    declared values are registered as whole strings only, so a benign
+    diagnostic that merely contains the value is not corrupted.
     """
-
-    _SCHEMA = """CREATE TABLE IF NOT EXISTS events (
-        seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind         TEXT    NOT NULL,
-        payload      TEXT    NOT NULL,
-        ts           REAL,
-        monotonic_ms INTEGER,
-        task_id      TEXT,
-        worker_id    TEXT,
-        generation   INTEGER,
-        request_id   TEXT
-    )"""
-
-    _SELECT_AFTER = (
-        "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
-        "generation, request_id FROM events WHERE seq > ? ORDER BY seq"
-    )
-
-    def __init__(self, path: Path, *, fsync_interval_s: float = 1.0) -> None:
-        self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self._path.parent, 0o700)
-        except OSError:
-            pass
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{self._path}{suffix}")
-            if sidecar.exists():
-                try:
-                    os.chmod(sidecar, 0o600)
-                except OSError:
-                    pass
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA wal_autocheckpoint=0")
-        self._conn.execute(self._SCHEMA)
-        self._closed = False
-
-    def append(self, event: dict[str, Any]) -> int:
-        kind = event.get("kind")
-        if not isinstance(kind, str) or not kind:
-            raise ValueError("event requires a non-empty string 'kind'")
-        with self._conn:
-            cur = self._conn.execute(
-                "INSERT INTO events(kind, payload, ts, monotonic_ms, task_id, "
-                "worker_id, generation, request_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    kind,
-                    json.dumps(event.get("payload", {})),
-                    event.get("ts"),
-                    event.get("monotonic_ms"),
-                    event.get("task_id"),
-                    event.get("worker_id"),
-                    event.get("generation"),
-                    event.get("request_id"),
-                ),
-            )
-            seq = int(cur.lastrowid)
-        if kind in CRITICAL_KINDS:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        return seq
-
-    def events_after(self, seq: int) -> list[dict[str, Any]]:
-        conn = sqlite3.connect(self._path)
-        try:
-            rows = conn.execute(_FallbackEventStore._SELECT_AFTER, (seq,)).fetchall()
-        finally:
-            conn.close()
-        return [
-            {
-                "seq": row[0], "kind": row[1], "payload": json.loads(row[2]),
-                "ts": row[3], "monotonic_ms": row[4], "task_id": row[5],
-                "worker_id": row[6], "generation": row[7], "request_id": row[8],
-            }
-            for row in rows
-        ]
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        except sqlite3.Error:
-            pass
-        self._conn.close()
-
-
-class _FallbackSequencer:
-    """Duck-typed stand-in for cambium.merge.MergeSequencer.
-
-    prepare_staging(repo, worktree_path, branch, base) -> staging tip SHA,
-    rebasing the branch onto base inside a throwaway worktree (raises
-    MergeConflictError on conflict, capturing the staging SHA under
-    refs/cambium/staging/<id> before the throwaway can die);
-    publish_merge(repo, new_tip, expected_old) atomically fast-forwards
-    refs/heads/main via ``git update-ref`` (raises NonFastForwardError when
-    the ref moved); cleanup_staging(repo) removes the throwaway.
-    """
-
-    _UNMERGED = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
-        """Delegate to the canonical sequencer so fallback behavior cannot drift."""
-        mod = importlib.import_module("cambium.merge")
-        return mod.MergeSequencer(*args, **kwargs)
-
-    def __init__(self, task_id: str | None = None) -> None:
-        self._task_id = task_id
-        self._worktree_path: Path | None = None
-        self._staging_branch: str | None = None
-        self._staging_ref: str | None = None
-
-    @staticmethod
-    def _env(
-        cwd: Path | None = None,
-        overrides: dict[str, str] | None = None,
-    ) -> dict[str, str]:
-        return _strip_sensitive_env(scrub_environment(), worktree=cwd, overrides=overrides)
-
-    def _run(
-        self, cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        overrides = {
-            key: env[key]
-            for key in ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
-            if env is not None and key in env
-        }
-        result = subprocess.run(
-            ["git", "-C", str(cwd), *args], capture_output=True, text=True,
-            env=self._env(Path(cwd), overrides),
-            start_new_session=True,
-        )
-        if check and result.returncode != 0:
-            raise RuntimeError(
-                f"git {args[0]} failed (rc={result.returncode}) in {cwd}: "
-                f"{(result.stderr + result.stdout).strip()[:512]}"
-            )
-        return result
-
-    def _is_registered(self, repo: Path, path: Path) -> bool:
-        result = self._run(repo, "worktree", "list", "--porcelain", "-z")
-        wanted = Path(path).resolve()
-        return any(
-            field.startswith("worktree ")
-            and Path(field.removeprefix("worktree ")).resolve() == wanted
-            for field in result.stdout.split("\0")
-        )
-
-    def prepare_staging(
-        self, repo: Path, worktree_path: Path, branch: str, base: str
-    ) -> str:
-        repo = Path(repo)
-        worktree_path = Path(worktree_path).resolve()
-        ident = self._task_id or branch
-        self._staging_branch = f"cambium-merge/{ident}"
-        self._staging_ref = f"refs/cambium/staging/{ident}"
-        self._worktree_path = worktree_path
-        if self._is_registered(repo, worktree_path):
-            raise RuntimeError("canonical merge sequencer required for existing staging")
-        base_tip = self._run(repo, "rev-parse", f"{base}^{{commit}}").stdout.strip()
-        worker_tip = self._run(
-            repo, "rev-parse", f"refs/heads/{branch}^{{commit}}"
-        ).stdout.strip()
-        self._run(
-            repo, "worktree", "add", "-B", self._staging_branch, str(worktree_path), worker_tip,
-            check=True,
-        )
-        env = dict(self._env())
-        env["GIT_EDITOR"] = "true"
-        env["GIT_SEQUENCE_EDITOR"] = "true"
-        rebase = self._run(worktree_path, "rebase", base_tip, check=False, env=env)
-        if rebase.returncode != 0:
-            conflicts = self._conflicted_paths(worktree_path, rebase.stdout + rebase.stderr)
-            self._run(worktree_path, "rebase", "--abort", check=False)
-            raise MergeConflictError(
-                f"rebase of {branch} onto {base_tip} failed; "
-                f"conflicted paths: {conflicts or '(none detected)'}",
-                conflicts,
-            )
-        staging_tip = self._run(worktree_path, "rev-parse", "HEAD").stdout.strip()
-        # capture BEFORE any worktree removal so the tip survives cleanup
-        self._run(repo, "update-ref", self._staging_ref, staging_tip, check=True)
-        return staging_tip
-
-    def publish_merge(self, repo: Path, new_tip: str, expected_old: str) -> None:
-        result = self._run(
-            repo, "update-ref", "refs/heads/main", new_tip, expected_old, check=False
-        )
-        if result.returncode == 0:
-            return
-        detail = (result.stderr + result.stdout).strip()
-        match = re.search(r"is at ([0-9a-f]{40}) but expected", detail)
-        current = match.group(1) if match else None
-        if current is not None or "reference already exists" in detail:
-            raise NonFastForwardError(
-                new_tip=new_tip, expected_old=expected_old, current=current, detail=detail[:512]
-            )
-        raise RuntimeError(f"git update-ref refs/heads/main failed: {detail[:512]}")
-
-    def cleanup_staging(self, repo: Path) -> None:
-        repo = Path(repo)
-        if self._worktree_path is not None:
-            if self._is_registered(repo, self._worktree_path):
-                raise RuntimeError("canonical merge sequencer required for staging cleanup")
-            self._worktree_path = None
-        if self._staging_branch is not None:
-            self._run(repo, "branch", "-D", self._staging_branch, check=False)
-        if self._staging_ref is not None:
-            self._run(repo, "update-ref", "-d", self._staging_ref, check=False)
-        self._staging_branch = None
-        self._staging_ref = None
-
-    def _conflicted_paths(self, worktree_path: Path, rebase_output: str) -> list[str]:
-        status = self._run(worktree_path, "status", "--porcelain", check=False)
-        conflicts: list[str] = []
-        if status.returncode == 0:
-            for line in status.stdout.splitlines():
-                if len(line) < 3:
-                    continue
-                if line[:2] in _FallbackSequencer._UNMERGED:
-                    path = line[3:].strip()
-                    if " -> " in path:
-                        path = path.split(" -> ", 1)[1]
-                    if path:
-                        conflicts.append(path)
-        if conflicts:
-            return list(dict.fromkeys(conflicts))
-        return list(
-            re.findall(r"CONFLICT \([^)]*\): Merge conflict in (\S+)", rebase_output)
-        )
-
-
-def _resolve_merge_sequencer() -> type | None:
-    try:
-        mod = importlib.import_module("cambium.merge")
-        return mod.MergeSequencer
-    except (ImportError, AttributeError):
-        return None
-
-
-def _resolve_event_store() -> type | None:
-    try:
-        mod = importlib.import_module("cambium.store")
-        return mod.EventStore
-    except (ImportError, AttributeError):
-        return None
-
-
-def _open_store(session_dir: Path) -> Any:
-    path = Path(session_dir) / ".cambium" / "events.db"
-    cls = _resolve_event_store()
-    if cls is not None:
-        return cls(path)
-    return _FallbackEventStore(path)
+    secret_values: list[str] = []
+    whole_values: list[str] = []
+    for spec in specs:
+        for key in _provider_env_keys(spec):
+            value = os.environ.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            if _is_secret_shaped(value):
+                secret_values.append(value)
+            else:
+                whole_values.append(value)
+    return build_session_redactor(secret_values, whole_values=whole_values)
 
 
 def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
     """Replay the session's durable event log from ``after_seq`` (arch §6.3)."""
-    store = _open_store(session_dir)
+    store = EventStore(Path(session_dir) / ".cambium" / "events.db")
     try:
         return store.events_after(after_seq)
     finally:
         store.close()
+
+
+def _open_store(session_dir: Path, *, redactor: Redactor | None = None) -> EventStore:
+    """Open the canonical session event store."""
+    return EventStore(Path(session_dir) / ".cambium" / "events.db", redactor=redactor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1416,6 +653,7 @@ class _Runtime:
         store: Any,
         on_event: EventSink | None = None,
         *,
+        redactor: Redactor | None = None,
         resource_thresholds: dict[str, Any] | None = None,
         compile_gate_max_concurrent: int | None = None,
         compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
@@ -1423,6 +661,7 @@ class _Runtime:
         self._session_dir = Path(session_dir)
         self._store = store
         self._on_event = on_event
+        self._redactor = redactor
         self._resource_thresholds = (
             None if resource_thresholds is None else dict(resource_thresholds)
         )
@@ -1438,7 +677,23 @@ class _Runtime:
         self._worktree_lock = asyncio.Lock()
         self._merge_lock = asyncio.Lock()
         self._rid = 0
-        self._merge_cls = _resolve_merge_sequencer()
+        self._last_envelope: dict[str, Any] | None = None
+
+    @property
+    def last_envelope(self) -> dict[str, Any] | None:
+        """The terminal correlated worker envelope, redacted before retention.
+
+        Retained from ``_GenOutcome.envelope`` until after shutdown so the
+        session result can reuse its sanitized commits/files/diff/summary
+        while the supervisor verdict stays authoritative.
+        """
+        return self._last_envelope
+
+    def _redact_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        if self._redactor is None:
+            return dict(envelope)
+        redacted = self._redactor.redact_mapping(envelope)
+        return dict(redacted)
 
     # -- event path ---------------------------------------------------------
 
@@ -1462,10 +717,14 @@ class _Runtime:
             "monotonic_ms": time.monotonic_ns() // 1_000_000,
             "payload": dict(payload),
         }
+        if self._redactor is not None:
+            record = self._redactor.redact_mapping(record)
+            kind = record["kind"]
+        durable_record = self._copy_event(record)
         if kind in CRITICAL_KINDS:
-            await asyncio.to_thread(self._store.append, self._copy_event(record))
+            await asyncio.to_thread(self._store.append, durable_record)
         else:
-            self._queue.put_nowait(self._copy_event(record))
+            self._queue.put_nowait(durable_record)
         if self._on_event is None:
             return
         observer_failure_is_fatal = (
@@ -1568,10 +827,7 @@ class _Runtime:
                 await asyncio.wait_for(self._writer_task, 10.0)
             except BaseException:
                 pass
-        try:
-            await asyncio.to_thread(self._store.close)
-        except BaseException:
-            pass
+        await asyncio.to_thread(self._store.close)
 
     def plan_result(self) -> PlanResult:
         return PlanResult(results=tuple(self._results.values()))
@@ -1621,8 +877,12 @@ class _Runtime:
     async def _ensure_worktree_locked(
         self, spec: dict[str, Any], generation: int | None = None
     ) -> int:
-        repo = Path(spec["repo"])
+        repo = Path(spec["repo"]).resolve()
         worktree = Path(spec["worktree_path"]).resolve()
+        if worktree == repo:
+            raise WorktreeRecoveryError(
+                f"worktree_path must not be the repo itself: {worktree}"
+            )
         branch = spec["branch"]
         base = spec["base_commit"]
         await self._git(repo, "worktree", "prune", check=False)
@@ -1657,8 +917,12 @@ class _Runtime:
         self, spec: dict[str, Any], generation: int | None = None
     ) -> int:
         """Worktree recovery before a respawn (arch §7.5): reset + clean."""
-        repo = Path(spec["repo"])
+        repo = Path(spec["repo"]).resolve()
         worktree = Path(spec["worktree_path"]).resolve()
+        if worktree == repo:
+            raise WorktreeRecoveryError(
+                f"worktree_path must not be the repo itself: {worktree}"
+            )
         await self._git(repo, "worktree", "prune", check=False)
         if not worktree.exists():
             return await self._ensure_worktree_locked(spec, generation)
@@ -1704,9 +968,7 @@ class _Runtime:
         try:
             async with self._worktree_lock:
                 await self._git(repo, "worktree", "prune", check=False)
-                listing = await self._git(
-                    repo, "worktree", "list", "--porcelain", check=False
-                )
+                listing = await self._git(repo, "worktree", "list", "--porcelain", check=False)
                 if listing.returncode != 0:
                     await self.emit(
                         "worktree_cleanup_deferred", task_id=task_id, reason="list_failed",
@@ -1735,9 +997,7 @@ class _Runtime:
                         )
                         if path_line is None:
                             continue
-                        registered_path = Path(
-                            path_line[len("worktree "):].strip()
-                        ).resolve()
+                        registered_path = Path(path_line[len("worktree "):].strip()).resolve()
                         if registered_path != worktree and branch_ref in lines:
                             await self.emit(
                                 "worktree_cleanup_deferred", task_id=task_id,
@@ -1755,24 +1015,28 @@ class _Runtime:
                 )
                 if status.returncode != 0:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id,
-                        reason="status_failed", _deferred_observers=deferred,
+                        "worktree_cleanup_deferred", task_id=task_id, reason="status_failed",
+                        _deferred_observers=deferred,
                     )
                     return
-                if status.stdout:
+                if any(
+                    not _status_line_is_fence(line)
+                    for line in status.stdout.splitlines()
+                ):
                     await self.emit(
                         "worktree_cleanup_deferred", task_id=task_id, reason="dirty",
                         _deferred_observers=deferred,
                     )
                     return
 
-                removed = await self._git(
-                    repo, "worktree", "remove", str(worktree), check=False
-                )
+                fence_dir = worktree / ".cambium"
+                if fence_dir.is_dir():
+                    shutil.rmtree(fence_dir, ignore_errors=True)
+                removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
                 if removed.returncode != 0:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id,
-                        reason="remove_failed", _deferred_observers=deferred,
+                        "worktree_cleanup_deferred", task_id=task_id, reason="remove_failed",
+                        _deferred_observers=deferred,
                     )
                     return
                 if branch != "main":
@@ -1945,7 +1209,20 @@ class _Runtime:
                 heartbeat_timeout=heartbeat_timeout,
                 wall_budget=wall_budget,
             )
+            if outcome.envelope is not None and outcome.correlated:
+                self._last_envelope = self._redact_envelope(outcome.envelope)
             if outcome.clean:
+                integrity = await self._worker_success_integrity(spec, worktree)
+                if integrity is not None:
+                    await self.emit(
+                        "worker_failed", task_id=task_id, generation=generation,
+                        reason=integrity,
+                    )
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason=integrity, gate_exit_code=None, restarts=restarts,
+                    )
+                    return
                 gate_rc = await self._run_gate(spec, worktree)
                 verdict_ok = bool(
                     outcome.envelope and outcome.envelope.get("status") == "succeeded"
@@ -2073,6 +1350,8 @@ class _Runtime:
             async for raw in proc.stderr:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 if line.strip():
+                    if self._redactor is not None:
+                        line = self._redactor.redact_escaped(line)
                     await self.emit(
                         "log", task_id=task_id, generation=generation, stream="stderr",
                         message=line[:512],
@@ -2434,6 +1713,37 @@ class _Runtime:
 
     # -- gate ----------------------------------------------------------------
 
+    async def _worker_success_integrity(
+        self, spec: dict[str, Any], worktree: Path
+    ) -> str | None:
+        """Reject an unpublishable worker verdict before the gate runs.
+
+        Returns a failure reason when the worker's success claim is not
+        backed by a clean, attached worktree: a detached HEAD means the
+        worker's commits may be lost, and tracked/untracked modifications
+        mean the gate would not be gating the worker's actual state. The
+        supervisor-owned ``.cambium`` fence directory is exempt.
+        """
+        worktree = Path(worktree)
+        symbolic = await self._git_stdout(
+            worktree, "symbolic-ref", "--quiet", "HEAD", check=False
+        )
+        if not symbolic:
+            return "worker_detached_head"
+        if symbolic != f"refs/heads/{spec['branch']}":
+            return "worker_wrong_branch"
+        status = await self._git(
+            worktree, "status", "--porcelain=v1", "--untracked-files=all", check=False
+        )
+        if status.returncode != 0:
+            return "worker_status_failed"
+        if any(
+            not _status_line_is_fence(line)
+            for line in status.stdout.splitlines()
+        ):
+            return "worker_tree_dirty"
+        return None
+
     async def _run_gate(self, spec: dict[str, Any], worktree: Path) -> int:
         """Run the task's gate command in the worktree (30s, bounded capture);
         skip a rerun when the worktree tree hash is unchanged since the last run."""
@@ -2480,17 +1790,20 @@ class _Runtime:
             )
             output = exc.stdout + exc.stderr
             if output:
+                message = output.decode("utf-8", "replace")
+                if self._redactor is not None:
+                    message = self._redactor.redact_escaped(message)
                 await self.emit(
                     "log", task_id=task_id, stream="gate",
-                    message=output.decode("utf-8", "replace")[:2048],
+                    message=message[:2048],
                 )
         except TimeoutError:
             if proc is not None:
                 await _kill_process_group_and_reap(proc)
             rc = 124
             await self.emit(
-                "gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=True,
-                heavy=is_heavy,
+                "gate", task_id=task_id, exit_code=rc, tree=tree,
+                timed_out=True, heavy=is_heavy,
             )
         except asyncio.CancelledError:
             if proc is not None:
@@ -2500,14 +1813,17 @@ class _Runtime:
             if tree is not None:
                 gates[tree] = rc
             await self.emit(
-                "gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=False,
-                heavy=is_heavy,
+                "gate", task_id=task_id, exit_code=rc, tree=tree,
+                timed_out=False, heavy=is_heavy,
             )
             output = (out or b"") + (err or b"")
             if output:
+                message = output.decode("utf-8", "replace")
+                if self._redactor is not None:
+                    message = self._redactor.redact_escaped(message)
                 await self.emit(
                     "log", task_id=task_id, stream="gate",
-                    message=output.decode("utf-8", "replace")[:2048],
+                    message=message[:2048],
                 )
         finally:
             self._gate.release(token)
@@ -2519,9 +1835,7 @@ class _Runtime:
         self,
         task_id: str,
         deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
-    ) -> Any:
-        if self._merge_cls is None:
-            raise RuntimeError("cambium.merge.MergeSequencer is unavailable")
+    ) -> MergeSequencer:
         loop = asyncio.get_running_loop()
 
         def persist_terminal(kind: str, payload: dict[str, Any]) -> None:
@@ -2537,7 +1851,7 @@ class _Runtime:
             )
             future.result()
 
-        return self._merge_cls(
+        return MergeSequencer(
             task_id=task_id, session_dir=self._session_dir, durable_event=persist_terminal
         )
 
@@ -2783,6 +2097,10 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         )
     spec["repo"] = str(Path(spec["repo"]).resolve())
     spec["worktree_path"] = str(worktree)
+    if Path(spec["repo"]).resolve() == worktree:
+        raise ValueError(
+            f"task {task_id}: worktree_path must not be the repo itself ({worktree})"
+        )
     provider_env_keys = spec.get("provider_env_keys", ())
     if isinstance(provider_env_keys, (str, bytes)):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
@@ -2807,6 +2125,95 @@ def _reject_duplicate_task_ids(tasks: list[dict[str, Any]]) -> None:
             seen.add(task_id)
 
 
+def _task_canonical_status(result: TaskResult) -> str:
+    """Map one supervisor TaskResult verdict to a canonical root status.
+
+    The supervisor verdict is authoritative: a worker ``succeeded`` maps to
+    ``done`` only after the gate and merge passed (the caller records the
+    merged TaskResult); any failed TaskResult is ``failed`` unless its reason
+    identifies a drive-phase timeout.
+    """
+    if result.status == "succeeded":
+        return "done"
+    reason = result.reason or ""
+    if any(phase in reason for phase in _TIMEOUT_PHASES):
+        return "timeout"
+    return "failed"
+
+
+def _aggregate_reason(results: list[TaskResult]) -> str | None:
+    failures = [f"{r.task_id}: {r.reason or 'failed'}" for r in results if r.status != "succeeded"]
+    if not failures:
+        return None
+    return "; ".join(failures)
+
+
+def _build_session_result(
+    runtime: _Runtime,
+    session_dir: Path,
+    started_at: float,
+    *,
+    cancelled: bool,
+) -> Result:
+    """Construct the canonical root result for one finished session.
+
+    One task combines the retained sanitized terminal envelope fields with
+    the authoritative supervisor verdict; flat multi-task sessions write an
+    aggregate status record without inventing a root.
+    """
+    session_dir = Path(session_dir)
+    results = list(runtime.plan_result().results)
+    ended_at = time.time()
+    if cancelled:
+        status = "cancelled"
+        failure_reason = "cancelled"
+        envelope = None
+    elif len(results) == 1:
+        task_result = results[0]
+        status = _task_canonical_status(task_result)
+        failure_reason = None if status == "done" else task_result.reason
+        envelope = runtime.last_envelope
+    else:
+        canonical = [_task_canonical_status(result) for result in results]
+        if any(item == "failed" for item in canonical):
+            status = "failed"
+        elif any(item == "timeout" for item in canonical):
+            status = "timeout"
+        else:
+            status = "done"
+        failure_reason = None if status == "done" else _aggregate_reason(results)
+        envelope = None
+    if envelope is not None:
+        commits = envelope.get("commits", ())
+        files_changed = envelope.get("files_changed", ())
+        unified_diff = envelope.get("diff", "")
+        diff_truncated = envelope.get("diff_truncated", False)
+        summary = envelope.get("summary", "")
+    else:
+        commits = ()
+        files_changed = ()
+        unified_diff = ""
+        diff_truncated = False
+        summary = ""
+    return Result(
+        status=status,
+        exit_code=EXIT_CODES[status],
+        commits=commits,
+        files_changed=files_changed,
+        unified_diff=unified_diff,
+        diff_truncated=diff_truncated,
+        summary=summary,
+        metric_score=0.0,
+        metric_breakdown={},
+        parent_task_id=None,
+        event_log_ref=f"sqlite:{session_dir / '.cambium' / 'events.db'}",
+        session_id=str(session_dir.resolve()),
+        started_at=started_at,
+        ended_at=ended_at,
+        failure_reason=failure_reason,
+    )
+
+
 async def run_plan(
     session_dir: str | Path,
     plan: dict[str, Any] | list[dict[str, Any]],
@@ -2823,7 +2230,9 @@ async def run_plan(
     Publication is ref-only: ``refs/heads/main`` advances via atomic
     ``update-ref`` and no checkout is refreshed.
     Returns a PlanResult; the session's event log is durable in
-    ``<session_dir>/.cambium/events.db`` (readable via ``read_events``).
+    ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
+    canonical root result is written atomically to
+    ``<session_dir>/.cambium/result.json`` before this coroutine returns.
     """
     session_dir = Path(session_dir)
     tasks = _plan_tasks(plan)
@@ -2835,11 +2244,14 @@ async def run_plan(
     admission = _SessionAdmission(session_dir)
     admission.acquire()
     try:
-        store = _open_store(session_dir)
+        started_at = time.time()
+        redactor = _session_redactor(specs)
+        store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
         runtime = _Runtime(
             session_dir,
             store,
             on_event=on_event,
+            redactor=redactor,
             resource_thresholds=resource_thresholds,
             compile_gate_max_concurrent=compile_gate_max_concurrent,
             compile_gate_acquire_timeout_s=compile_gate_acquire_timeout_s,
@@ -2853,13 +2265,17 @@ async def run_plan(
                     tg.create_task(runtime.supervise_task(spec))
         except asyncio.CancelledError:
             cancelled = True
-            raise
         except BaseExceptionGroup as exc_group:
             await runtime.emit(
                 "log", task_id=None, message=f"task group exception: {exc_group}"
             )
         finally:
             await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
+        result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
+        session_id = str(session_dir.resolve())
+        await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)
+        if cancelled:
+            raise asyncio.CancelledError
         return runtime.plan_result()
     finally:
         admission.release()
@@ -2882,28 +2298,30 @@ def _ensure_repo_initialized(repo: Path) -> None:
         _sh("git", "-C", str(repo), "commit", "--allow-empty", "-m", "cambium initial")
 
 
-def _default_spec(session_dir: Path) -> dict[str, Any]:
+def _builtin_demo_spec(session_dir: Path) -> dict[str, Any]:
+    """Built-in CLI demo: one cambium.worker task against a seeded repo."""
     return {
-        "task_id": "slice-001",
+        "task_id": "demo-001",
         "worker": "cambium.worker",
-        "scratch_repo": str(session_dir / "scratch"),
+        "repo": str(session_dir / "scratch"),
         "worktree_path": str(session_dir / "wt"),
-        "branch": "wt-slice-001",
+        "branch": "wt-demo-001",
         "target_file": "hello.txt",
         "marker": "// cambium-slice",
         "write_marker": True,
         "gate": "grep -q '// cambium-slice' hello.txt",
-        "spec": "append the cambium-slice marker line to the target file",
+        "task": "append the cambium-slice marker line to the target file",
     }
 
 
-def _load_task_spec(session_dir: Path, spec_path: str | None) -> dict[str, Any]:
-    if spec_path:
-        return json.loads(Path(spec_path).read_text())
-    explicit = session_dir / "task.json"
-    if explicit.exists():
-        return json.loads(explicit.read_text())
-    return _default_spec(session_dir)
+def _bootstrap_demo_repo(repo: Path, target_file: str) -> None:
+    """Seed the CLI demo repo so the built-in worker has a target to edit."""
+    _ensure_repo_initialized(repo)
+    target = repo / target_file
+    if not target.exists():
+        target.write_text("hello from the vertical slice\n")
+        _sh("git", "-C", str(repo), "add", target_file)
+        _sh("git", "-C", str(repo), "commit", "-m", "cambium initial")
 
 
 def _sh(*args: str, cwd: str | Path | None = None) -> None:
@@ -2916,25 +2334,6 @@ def _sh(*args: str, cwd: str | Path | None = None) -> None:
             scrub_environment(), worktree=Path(cwd) if cwd is not None else None
         ),
     )
-
-
-def _bootstrap_scratch(repo: Path, task_spec: dict[str, Any]) -> None:
-    """CLI convenience: turn a missing/empty scratch dir into a git repo.
-
-    The library's run_session never creates repos; this exists so the
-    documented manual run works from an empty --session-dir.
-    """
-    if (repo / ".git").exists():
-        return
-    _sh("git", "init", "-b", "main", str(repo))
-    _sh("git", "-C", str(repo), "config", "user.name", "cambium-slice")
-    _sh("git", "-C", str(repo), "config", "user.email", "slice@example.com")
-    _sh("git", "-C", str(repo), "config", "gc.auto", "0")
-    target = repo / task_spec["target_file"]
-    if not target.exists():
-        target.write_text("hello from the vertical slice\n")
-    _sh("git", "-C", str(repo), "add", task_spec["target_file"])
-    _sh("git", "-C", str(repo), "commit", "-m", "initial")
 
 
 async def _amain_plan(session_dir: Path, plan: dict[str, Any]) -> int:
@@ -2977,8 +2376,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--task-spec",
         help=(
-            "path to task spec JSON (slice mode; default: <session-dir>/task.json, "
-            "else built-in defaults)"
+            "path to task spec JSON (one-task mode; default: <session-dir>/task.json, "
+            "else the built-in demo)"
         ),
     )
     args = parser.parse_args(argv)
@@ -2993,22 +2392,19 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_amain_plan(session_dir, plan))
         except KeyboardInterrupt:
             return 130
-    task_spec = _load_task_spec(session_dir, args.task_spec)
-    _validate_paths(session_dir, task_spec)
-    _bootstrap_scratch(Path(task_spec["scratch_repo"]), task_spec)
-
-    def print_event(record: dict[str, Any]) -> None:
-        print(f'{record["kind"]:>14}  {json.dumps(record["payload"])}', flush=True)
-
-    result = asyncio.run(run_session(session_dir, task_spec, on_event=print_event))
-    print(
-        f"result: status={result.status} exit_code={result.exit_code} "
-        f"worker_exit={result.worker_exit_code} worker_status={result.worker_status} "
-        f"gate_exit={result.gate_exit_code} merge={result.merge_sha} "
-        f"timed_out={result.timed_out} timeout_phase={result.timeout_phase}",
-        flush=True,
-    )
-    return result.exit_code
+    if args.task_spec:
+        task_spec = json.loads(Path(args.task_spec).read_text())
+    elif (session_dir / "task.json").exists():
+        task_spec = json.loads((session_dir / "task.json").read_text())
+    else:
+        task_spec = _builtin_demo_spec(session_dir)
+        _bootstrap_demo_repo(Path(task_spec["repo"]), task_spec["target_file"])
+    plan_task = _slice_to_plan_task(task_spec)
+    _ensure_repo_initialized(Path(plan_task["repo"]))
+    try:
+        return asyncio.run(_amain_plan(session_dir, {"tasks": [plan_task]}))
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

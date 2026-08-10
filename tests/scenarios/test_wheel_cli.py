@@ -126,9 +126,24 @@ def test_plain_wheel_install_runs_supervisor_bench_and_module_test(tmp_path) -> 
 
 
 def _read_events(session_dir: Path) -> list[dict]:
-    path = session_dir / ".cambium" / "events.jsonl"
+    import sqlite3
+
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        rows = connection.execute(
+            "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
+            "generation, request_id FROM events ORDER BY seq"
+        ).fetchall()
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        {
+            "seq": row[0],
+            "kind": row[1],
+            "payload": json.loads(row[2]),
+            "ts": row[3],
+            "monotonic_ms": row[4],
+            "task_id": row[5],
+            "worker_id": row[6],
+            "generation": row[7],
+            "request_id": row[8],
+        }
+        for row in rows
     ]
