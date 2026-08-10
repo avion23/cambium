@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from abc import ABC, abstractmethod
@@ -35,6 +36,7 @@ _REQUIRED_MANIFEST_FIELDS = (
     "protocol",
     "dataset_schema_version",
 )
+_SAFE_MODULE_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 
 class ModuleBoundaryError(ValueError):
@@ -118,6 +120,11 @@ def load_module_manifest(
     if not isinstance(module_name, str) or not module_name:
         raise ModuleContractError(
             f"module {name!r}: manifest field 'module_name' must be a non-empty string"
+        )
+    if _SAFE_MODULE_NAME.fullmatch(module_name) is None:
+        raise ModuleContractError(
+            f"module {name!r}: manifest field 'module_name' must be a safe identifier "
+            "matching [a-z][a-z0-9_]*"
         )
 
     cli_module = data["cli_module"]

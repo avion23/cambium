@@ -72,7 +72,10 @@ def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Pa
                     raise ValueError("fixture only supports evaluate")
                 results = []
                 for record in payload["records"]:
-                    expected = record["expected"]["decompose"]
+                    expected_record = record["expected"]
+                    if not isinstance(expected_record.get("reason"), str):
+                        raise ValueError("expected.reason must be a string")
+                    expected = expected_record["decompose"]
                     results.append({
                         "prediction": {"decompose": expected},
                         "score": 1.0,
@@ -190,6 +193,83 @@ def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypat
     assert baseline["dataset_version"] == "fixture-1"
     assert baseline["dataset"]["records"] == 3
     assert baseline["metric"]["train"] == {"mean": 1.0, "std": 0.0, "count": 1}
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
+
+
+def test_invalid_module_name_fails_closed_before_baseline_write(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "../../target",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    bench_root = tmp_path / "bench" / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert "module_name" in capsys.readouterr().err
+    assert not bench_root.exists()
+    assert not (tmp_path / "target" / "baseline.json").exists()
+
+
+def test_invalid_split_schema_falls_back_to_combined_report_and_gate(
+    tmp_path, monkeypatch
+) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    datasets_dir = modules_dir / "fixture" / "datasets"
+    invalid_split = {
+        "id": "invalid-train-1",
+        "input": {"task": "Invalid split", "context": ""},
+        "expected": {"decompose": False},
+    }
+    (datasets_dir / "train.jsonl").write_text(json.dumps(invalid_split) + "\n")
+    combined = [
+        {
+            "id": "combined-1",
+            "input": {"task": "Combined atomic", "context": ""},
+            "expected": {"decompose": False, "reason": "atomic"},
+        },
+        {
+            "id": "combined-canary-1",
+            "input": {"task": "Combined canary", "context": ""},
+            "expected": {"decompose": False, "reason": "atomic"},
+            "canary": True,
+            "canary_info": {"kind": "trivially_atomic"},
+        },
+    ]
+    (datasets_dir / "example_pairs.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in combined)
+    )
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    baseline = json.loads((bench_root / "fixture_module" / "baseline.json").read_text())
+    assert baseline["metric"]["train"] is None
+    assert baseline["metric"]["eval"] is None
+    assert baseline["metric"]["canaries"] is None
+    assert baseline["metric"]["combined"] == {"mean": 1.0, "std": 0.0, "count": 2}
+    assert baseline["dataset"]["records"] == 2
+    assert "fell back to the combined file" in baseline["note"]
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
 
 

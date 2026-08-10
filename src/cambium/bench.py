@@ -260,10 +260,10 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
     """Metric/canaries/dataset sections of a module's baseline.
 
     Reads the three-split datasets (train/eval/canaries.jsonl) through the
-    module's neutral JSON CLI; if the split datasets are unreadable it falls
-    back to the combined ``*_pairs.jsonl`` file and marks the split metric
-    fields null with a ``note``.  The concrete package is never imported by
-    this harness.
+    module's neutral JSON CLI; if a split is unreadable or rejected by the
+    CLI's schema validation, it falls back to the combined ``*_pairs.jsonl``
+    file and marks the split metric fields null with a ``note``. The concrete
+    package is never imported by this harness.
     """
     manifest = _module_manifest(pkg_name)
     datasets_dir = MODULES_DIR / pkg_name / "datasets"
@@ -284,31 +284,30 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
     combined = False
     raw: dict[str, list[dict]] = {}
     scored: dict[str, list[ScoredRecord]] = {}
+    metric: dict[str, Any] = {}
+    canary_scores: list[float] = []
     try:
         for split in SPLITS:
             path = datasets_dir / f"{split}.jsonl"
             raw[split] = load_jsonl(path)
-    except DatasetError as exc:
+        for split in SPLITS:
+            scored[split] = asyncio.run(_predict(manifest, raw[split]))
+            metric[split] = score_examples(manifest, scored[split])
+            if split == "canaries":
+                canary_scores = [example.score for example in scored[split]]
+    except (DatasetError, ModuleCLIError) as exc:
         combined = True
         note = (
-            f"three-split dataset unreadable ({exc}); fell back to the combined "
+            f"three-split dataset unavailable ({exc}); fell back to the combined "
             "file and split metrics are null"
         )
         pairs = datasets_dir / f"{pkg_name}_pairs.jsonl"
         if not pairs.exists():
             pairs = datasets_dir / "example_pairs.jsonl"
         raw = {"combined": load_jsonl(pairs)}
-
-    metric: dict[str, Any] = {}
-    canary_scores: list[float] = []
-    for split in SPLITS:
-        if combined:
-            metric[split] = None
-            continue
-        scored[split] = asyncio.run(_predict(manifest, raw[split]))
-        metric[split] = score_examples(manifest, scored[split])
-        if split == "canaries":
-            canary_scores = [example.score for example in scored[split]]
+        scored = {}
+        metric = {split: None for split in SPLITS}
+        canary_scores = []
     if combined:
         scored["combined"] = asyncio.run(_predict(manifest, raw["combined"]))
         metric["combined"] = score_examples(manifest, scored["combined"])
