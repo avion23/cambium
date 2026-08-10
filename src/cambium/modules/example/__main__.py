@@ -27,6 +27,7 @@ class InputValidationError(ValueError):
 
 
 def _reject_duplicate_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate JSON object member names instead of keeping the last value."""
     fields: dict[str, Any] = {}
     for name, value in pairs:
         if name in fields:
@@ -36,22 +37,31 @@ def _reject_duplicate_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _parse_input(payload: Any) -> TaskInput:
+    """Validate one decoded JSON value and build the typed module input."""
     if not isinstance(payload, dict):
         raise InputValidationError("input must be a JSON object")
+
     unknown_fields = sorted(set(payload) - _INPUT_FIELDS)
     if unknown_fields:
         names = ", ".join(repr(field) for field in unknown_fields)
         raise InputValidationError(f"unknown input field(s): {names}")
-    task = payload.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise InputValidationError("input.task must be a non-empty string")
+    if "task" not in payload:
+        raise InputValidationError("input.task is required")
+    task = payload["task"]
+    if not isinstance(task, str):
+        raise InputValidationError("input.task must be a string")
+    if not task.strip():
+        raise InputValidationError("input.task must not be empty")
+
     context = payload.get("context", "")
     if not isinstance(context, str):
         raise InputValidationError("input.context must be a string")
+
     return TaskInput(task=task, context=context)
 
 
 def _serialize_output(output: DecomposeOutput) -> dict[str, bool | float | str]:
+    """Convert the typed domain output to its stable JSON wire shape."""
     if not isinstance(output, DecomposeOutput):
         raise TypeError("module returned an invalid output type")
     if not isinstance(output.decision, Decision):

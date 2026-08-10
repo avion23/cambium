@@ -3,5 +3,10 @@
   "dataset_version": "1.1.0",
   "eval_frozen_at": "2026-08-09",
   "canary_frozen_at": "2026-08-09",
+  "split_digests": {
+    "train": "e41f1f4ca9e1905122e1faa0955cd2833bf032635ea721d33d36d1b3b7caf136",
+    "eval": "f43cb1501ba4ba10fc27e2333a3794db04d6f5afa95ebfe586f66cf9d486d7ca",
+    "canaries": "54bf2e41663b29d1382fe965cacb553009567287dc722a7710533bfe3e92ff3e"
+  },
   "sibling_pins": {}
 }

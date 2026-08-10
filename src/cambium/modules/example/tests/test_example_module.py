@@ -7,6 +7,9 @@ every pair, and check the metric. No mocking, no network.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -143,3 +146,34 @@ def test_canary_entries_are_processed() -> None:
     assert len(processed_canaries) == len(canaries)
     assert all(item["prediction"] is not None for item in processed_canaries)
     assert all(item["metric"] == 1.0 for item in processed_canaries)
+
+
+def test_subprocess_network_client_is_denied() -> None:
+    """The module gate must protect subprocesses, not only this pytest process."""
+    if os.environ.get("CAMBIUM_MODULE_OFFLINE") != "1":
+        pytest.skip("requires the isolated module-test environment")
+
+    result = subprocess.run(
+        ["curl", "--fail", "http://127.0.0.1:9/"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    assert "network client denied" in result.stderr
+
+    python_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import socket; socket.create_connection(('127.0.0.1', 9), timeout=1)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert python_probe.returncode != 0
+    assert "network access is forbidden" in python_probe.stderr

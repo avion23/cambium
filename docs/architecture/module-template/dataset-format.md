@@ -12,7 +12,9 @@ backward-compatibility fallback.
 ## 1. Container format
 
 - **File:** newline-delimited JSON (JSONL), UTF-8, no BOM.
-- **One record per line.** Lines are independent; a malformed line does not invalidate the file.
+- **One record per line.** Lines are independently parsed, but a malformed line
+  is a hard `DatasetError`; loaders and the conformance gate never continue
+  with a partially valid dataset.
 - **Trailing newline** at end of file (POSIX convention; `git diff` clean).
 - **No trailing whitespace** within lines.
 - **No comments.** JSONL has no comment syntax.
@@ -58,6 +60,13 @@ Invariants:
 - `schema_version` is **bumped** whenever the `data` schema changes in a backwards-incompatible way. Old records are migrated explicitly (see §5).
 - `dataset_version` is bumped on every change that affects evaluation: adding records, fixing a label, re-splitting.
 - `split` is fixed at file time. Records do not migrate between splits without a dataset_version bump.
+
+The implemented v1 wire envelope keeps `input` and `expected` at the top
+level, as shown by the reference module. The `data` wrapper described in §3 is
+the typed v2.1 target and must not be inferred by a v1 loader. For the current
+split-aware gate, every record must also carry `id`, `schema_version`,
+`dataset_version`, and `split`; the record `dataset_version` must equal the
+sidecar metadata version.
 
 ---
 
@@ -111,6 +120,33 @@ Rules:
   - eval: 50 records
   - canary: 15 records
 
+### 4.1 Freeze dates and split digests
+
+The implemented conformance contract freezes split content with exact-byte
+SHA-256 digests. `datasets/meta.json` must contain:
+
+```json
+{
+  "schema_version": 1,
+  "dataset_version": "1.1.0",
+  "eval_frozen_at": "2026-08-09",
+  "canary_frozen_at": "2026-08-09",
+  "split_digests": {
+    "train": "<64 lowercase hex characters>",
+    "eval": "<64 lowercase hex characters>",
+    "canaries": "<64 lowercase hex characters>"
+  }
+}
+```
+
+Each digest is SHA-256 over the exact UTF-8 bytes of its corresponding JSONL
+file, including line endings. The gate validates all three files, record IDs,
+split labels, duplicate/cross-split canonical inputs, and the record
+`dataset_version`. `eval_frozen_at` and `canary_frozen_at` are required
+`YYYY-MM-DD` dates. A frozen split edit without a dataset-version bump is a
+hard failure; a digest change with the same version is never silently
+re-anchored.
+
 Splits are produced deterministically:
 
 ```python
@@ -155,6 +191,11 @@ A sidecar `meta.json` records the current versions and the frozen-at timestamp:
   "dataset_version": "1.0.0",
   "eval_frozen_at": "2026-08-09",
   "canary_frozen_at": "2026-08-09",
+  "split_digests": {
+    "train": "<sha256 of exact train.jsonl bytes>",
+    "eval": "<sha256 of exact eval.jsonl bytes>",
+    "canaries": "<sha256 of exact canaries.jsonl bytes>"
+  },
   "sibling_pins": {
     "TaskDecomposer": "0.3.1",
     "Opifex": "1.2.0"
@@ -176,6 +217,28 @@ above when records, labels, splits, loader semantics, or scoring change, and
 keep the wire boolean stable when only the domain representation changes. A
 domain-only migration may still re-anchor the dataset version, as the reference
 module does here, without changing `schema_version` or rewriting any records.
+
+### 5.2 Implemented gate and baseline agreement
+
+The conformance gate requires one dataset version across the complete chain:
+
+```text
+JSONL record.dataset_version == meta.json.dataset_version
+baseline.dataset_version == meta.json.dataset_version
+baseline.split_digests == meta.json.split_digests == SHA256(current split bytes)
+```
+
+The baseline JSON is validated as a schema-bearing object, not treated as an
+opaque benchmark artifact. It must contain `schema_version`, the logical
+`module` name, `dataset_version`, all three `split_digests`, provenance and
+runtime fields, per-split metrics, canary summary, dataset counts, test
+timings, and drift thresholds. Missing fields, invalid types, stale counts,
+or stale digests fail the gate.
+
+At the current tree, the split records still say `1.0.0` while
+`meta.json` and the committed baseline say `1.1.0`. That is a deliberate,
+visible dataset-owner reconciliation failure. The module-conformance change
+must report it and must not rewrite the dataset records.
 
 ---
 
@@ -265,3 +328,41 @@ def load(module_name: str, root: Path = DEFAULT_ROOT) -> Dataset:
 ```
 
 The loader raises `DatasetError` on any inconsistency: duplicate IDs, cross-split leaks, missing `meta.json`, schema mismatch, secret-pattern hit. Eval harnesses do not catch `DatasetError`; a broken dataset is a hard gate. A concrete loader may map stable wire scalars to domain enums after validating the wire schema; that mapping does not change the dataset's JSON format.
+
+---
+
+## 10. Conformance, packaging, and removal
+
+The dataset gate is run for the package-directory name, not the logical
+dataset name:
+
+```console
+uv run --extra test cambium module-test <package_name>
+```
+
+For example, the reference dataset is logically `should_decompose`, but the
+package directory and selector are `example`. Baselines use the logical name;
+imports and wheel paths use `cambium.modules.example`.
+
+Module tests run in an offline subprocess environment. Credentials and pytest
+plugin injection are removed, normal Python socket clients and common literal
+command-line network clients are denied, and normal Python child subprocesses
+inherit the same rule.
+
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for common
+forms of accidental network use; it is not a security boundary. It CANNOT
+prevent a hostile same-UID module from bypassing the check with `os.system`,
+`posix_spawn`, raw sockets, subprocess monkey-patching, or by killing a same-UID
+tracer. The harness does not start such a tracer or provide an in-harness
+sandbox. Real containment is the deployment-layer boundary.**
+
+The module cannot import a sibling decision package. Harness production code,
+`bench.py`, `scripts/`, and `tools/` cannot reverse-import a decision package;
+the gate reports any violation with its file, line, and symbol.
+
+The wheel must carry the module's code, JSON CLI, architecture document, all
+three split files, `meta.json`, colocated tests, and baselines. The installed
+wheel is probed outside the checkout with the same `module-test` command. A
+module is removable only as a complete directory deletion: no dataset,
+baseline, test, architecture, or package file may remain outside that module
+directory as a hidden dependency.

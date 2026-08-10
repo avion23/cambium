@@ -24,9 +24,15 @@ def _installed_cambium() -> str:
     return str(venv_executable)
 
 
-def _run(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    *args: str,
+    input_text: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
+    if extra_env is not None:
+        env.update(extra_env)
     return subprocess.run(
         [*CLI, *args],
         cwd=REPO_ROOT,
@@ -60,8 +66,11 @@ def test_version_prints_package_version() -> None:
     assert result.stderr == ""
 
 
-def test_doctor_exits_zero_on_healthy_repo() -> None:
-    result = _run("doctor")
+def test_doctor_exits_zero_on_healthy_repo(tmp_path: Path) -> None:
+    provider_config = tmp_path / "providers.json"
+    provider_config.write_text('{"providers": []}\n', encoding="utf-8")
+
+    result = _run("doctor", extra_env={"CAMBIUM_PROVIDERS": str(provider_config)})
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Summary:" in result.stdout
@@ -249,3 +258,41 @@ def test_tasktree_invalid_json_exits_one() -> None:
     assert result.returncode == 1
     assert result.stdout == ""
     assert "tasktree: invalid JSON in stdin" in result.stderr
+
+
+def test_module_test_runs_reference_module() -> None:
+    result = _run("module-test", "example")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    output = result.stdout + result.stderr
+    assert "test nodeid does not belong to this module's tests" in output, output
+
+
+def test_module_test_unknown_module_exits_two() -> None:
+    result = _run("module-test", "does_not_exist")
+
+    assert result.returncode == 2
+    assert "unknown module" in result.stderr
+
+
+def test_module_test_rejects_arbitrary_pytest_arguments() -> None:
+    result = _run("module-test", "example", "--maxfail=1")
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
+def test_module_test_propagates_child_failure(monkeypatch) -> None:
+    from cambium import cli
+
+    child = subprocess.CompletedProcess(args=["pytest"], returncode=1)
+    monkeypatch.setenv("EXAMPLE_API_TOKEN", "must-not-leak")
+
+    def fail_child(command, **kwargs):
+        assert "-I" not in command
+        assert "EXAMPLE_API_TOKEN" not in kwargs["env"]
+        return child
+
+    monkeypatch.setattr(cli.subprocess, "run", fail_child)
+
+    assert cli.main(["module-test", "example"]) == 1

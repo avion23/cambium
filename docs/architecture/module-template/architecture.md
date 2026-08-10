@@ -12,6 +12,8 @@
 |---|---|
 | Code | M? (assign from `docs/architecture/architecture.md` §4 catalog, or "new" if not listed) |
 | Name (Latin) | e.g., `Architectus.should_decompose` |
+| Logical module name | Stable domain name used by datasets, baselines, metrics, and reports; e.g., `should_decompose` |
+| Python package name | Import name under `cambium.modules`; e.g., `cambium.modules.example` |
 | Layer | Deterministic \| Orchestrator \| Worker \| View \| Tooling (offline) |
 | Owner | Initials or agent name; transferred on handoff |
 | Status | Draft \| In review \| Build-ready \| Done |
@@ -41,6 +43,13 @@ module authors, not files to copy into every decision module.
 
 The `redact` entry is anchored at its current DLQ integration seam because the
 checkout has no separate redaction implementation file.
+
+The logical module name and the Python package name are separate contract
+values. The logical name is the domain identity recorded in a baseline and
+dataset report. The package name is the import and wheel path used to execute
+the module. Do not derive one from the other: the reference module is logically
+`should_decompose`, but its current package is `cambium.modules.example` and
+its `module-test` selector is `example`.
 
 ---
 
@@ -104,6 +113,31 @@ compatibility.
 are the canonical tool surface. A new module that adds tools extends
 `TOOL_SCHEMAS` in `schemas.py`; it must not create a parallel schema registry
 or dispatch contract.
+
+### 3.5 JSON CLI
+
+Every decision module ships a `__main__.py` JSON adapter in its package. The
+adapter is the wire boundary used by the conformance gate and must:
+
+- read exactly one JSON object from stdin; `input.task` is a required,
+  non-empty string and `input.context` is an optional string;
+- reject unknown fields, duplicate JSON object fields, malformed JSON, and
+  invalid input with exit code 1;
+- write exactly one JSON object followed by one newline to stdout, with no
+  logs or other bytes on stdout; diagnostics may be one-line stderr output;
+- preserve the module's stable wire fields, while keeping enums and other
+  domain values in the in-process model.
+
+The invocation uses the **Python package name**, not the logical module name:
+
+```console
+$ printf '%s\n' '{"task":"Fix the typo.","context":""}' \
+    | python -m cambium.modules.<package_name>
+{"confidence":0.7,"decompose":false,"reason":"task is atomic or already scoped"}
+```
+
+The CLI must not import providers, use the network, or require the repository
+checkout as an import path.
 
 ---
 
@@ -293,6 +327,74 @@ they remain in `tests/scenarios/`.
 
 How this module is tested against **stub** siblings (frozen references) rather than live co-adapted siblings, per `docs/architecture/architecture.md` §17.2.
 
+### 9.6 Module conformance command
+
+Run the complete module gate with the package-directory selector:
+
+```console
+uv run --extra test cambium module-test <package_name>
+# reference invocation:
+uv run --extra test cambium module-test example
+```
+
+The command collects only `src/cambium/modules/<package_name>/tests/` and
+rejects arbitrary pytest arguments. It validates tracked layout, dataset and
+baseline schemas, imports, the JSON CLI, subprocess isolation, and the loaded
+module set before running the colocated tests.
+
+### 9.7 Offline subprocess and import isolation
+
+The module-test environment is offline by contract. It strips credentials and
+pytest/plugin injection from the child environment, denies normal Python socket
+connections, and rejects common literal command-line network clients. A module
+test that starts a normal Python subprocess inherits the same offline
+environment and must not depend on network access, provider credentials, or an
+external service.
+
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for common
+forms of accidental network use; it is not a security boundary. It CANNOT
+prevent a hostile same-UID module from bypassing the check with `os.system`,
+`posix_spawn`, raw sockets, subprocess monkey-patching, or by killing a same-UID
+tracer. The harness does not start such a tracer or provide an in-harness
+sandbox. Real containment is the deployment-layer boundary.**
+
+Two import directions are prohibited:
+
+- **Sibling import prohibition:** a decision module may import the shared
+  module base and its own package, but it must not import another
+  `cambium.modules.<sibling>` package, directly or through
+  `importlib.import_module`/`__import__`.
+- **Reverse-import prohibition:** harness production code, `bench.py`,
+  `scripts/`, and `tools/` must not import a decision package. Reports and
+  neutral CLI boundaries must use data or a package-neutral interface instead.
+
+Both rules are static gate failures. Existing findings are reported by file,
+line, and symbol; they are not hidden by a fallback import path.
+
+### 9.8 Baseline schema validation
+
+Every `tests/baselines/*.json` file is a tracked JSON object with the required
+fields `schema_version`, `module`, `dataset_version`, `split_digests`,
+`git_sha`, `date`, `python`, `pytest`, `metric`, `canaries`, `dataset`,
+`tests`, and `drift_thresholds`. The gate validates the field types, split
+metric counts, dataset counts, canary summary, module-scoped test node IDs,
+and non-negative finite measurements. `split_digests` and
+`dataset_version` must agree with `datasets/meta.json` and the current split
+bytes.
+
+### 9.9 Wheel inclusion and removability
+
+The built wheel must include each module's package code, `__main__.py`,
+`architecture.md`, datasets and `meta.json`, colocated tests, and baseline
+JSON. The installed-wheel probe runs `cambium module-test <package_name>`
+outside the checkout; no repository-relative fallback may be needed.
+
+A module is removable by deleting its entire
+`src/cambium/modules/<package_name>/` directory. That deletion includes code,
+the JSON CLI, architecture document, colocated tests, datasets, baselines, and
+freeze metadata. Shared harness scenarios remain because they test shared
+contracts, not the removable module.
+
 ---
 
 ## 10. Optimization Plan
@@ -320,3 +422,4 @@ Example:
 |---|---|---|
 | 0.1.0 | YYYY-MM-DD | Initial draft. |
 | 0.2.0 | 2026-08-10 | Normative colocated tests, enum/wire boundary, canonical tool surface, current module catalogue, and M1 runtime deletions. |
+| 0.3.0 | 2026-08-10 | Normative JSON CLI, module gate, offline subprocesses, import isolation, baseline validation, wheel inclusion, removability, and logical/package naming. |

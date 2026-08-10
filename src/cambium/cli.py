@@ -11,6 +11,7 @@ import argparse
 import getpass
 import importlib
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -62,7 +63,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,tasktree,version}",
+        metavar="{auth,supervisor,doctor,bench,tasktree,module-test,version}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -136,6 +137,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "tasktree",
         help="read a plan from a file or stdin and print its topological order",
     )
+    module_test = commands.add_parser(
+        "module-test",
+        help="run one module's isolated conformance gate",
+        description="Run the isolated conformance gate for one Cambium module.",
+    )
+    module_test.add_argument("name", metavar="NAME")
     commands.add_parser("version", help="print the Cambium version")
     return parser
 
@@ -256,6 +263,40 @@ def _run_bench(args: argparse.Namespace) -> int:
     return bench.main(delegated)
 
 
+def _run_module_test(args: argparse.Namespace) -> int:
+    from . import module_conformance
+
+    if args.name not in module_conformance.module_names():
+        print(f"cambium module-test: unknown module {args.name!r}", file=sys.stderr)
+        return 2
+
+    tests_dir = module_conformance.MODULES_DIR / args.name / "tests"
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-p",
+        "cambium.module_conformance",
+        "--cambium-isolated-module",
+        args.name,
+        "--strict-config",
+        "--strict-markers",
+        "-q",
+        str(tests_dir.resolve()),
+    ]
+    with module_conformance.module_offline_environment() as env:
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        env.pop("PYTEST_ADDOPTS", None)
+        env.pop("PYTEST_PLUGINS", None)
+        result = subprocess.run(
+            command,
+            cwd=module_conformance.REPO_ROOT,
+            env=env,
+            check=False,
+        )
+    return 0 if result.returncode == 0 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch one unified Cambium CLI invocation and return its exit code."""
     command_line = sys.argv[1:] if argv is None else argv
@@ -274,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_doctor(args)
     if args.command == "bench":
         return _run_bench(args)
+    if args.command == "module-test":
+        return _run_module_test(args)
     if args.command == "version":
         print(__version__)
         return 0
