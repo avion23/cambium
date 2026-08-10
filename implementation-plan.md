@@ -1,79 +1,54 @@
 # Implementation Plan (TRANSIENT — delete when implementation is done)
 
-Status date: 2026-08-09. Current merged baseline: `main@6109a6a`. This is the
-orchestrator-owned tracker for the 20-agent implementation wave. Worktrees live
-under `/tmp/opencode/cambium-<name>` on `wt-*` branches.
+Status: 2026-08-10 (pre-compaction snapshot). Orchestrator-owned. This file is the DECISION LOG + CONTEXT MAP.
+Orientation: docs/research/README.md (tiered index) → docs/architecture/architecture.md (final v2) → agents.md.
 
-## Current merged baseline
+## Context map (where everything lives)
+- Final design: docs/architecture/architecture.md (v2, deltas D1-D8 folded, §21 adoption record; Septum removed, no local cache, task tree, gates, refinement loop, include_diff note)
+- v0.1 origin + 3 adversarial reviews: docs/architecture/system-design.md, docs/architecture/reviews/
+- Module templates: docs/architecture/module-template/{architecture,dataset-format,example-spec}.md
+- Evidence/research: docs/research/ (42 docs; TIER 1 = python-3.14, sqlite-wal-durability, worktree-concurrency, ipc-protocol-draft, event-schema-draft, custos-asyncio-design, design-deltas, coding-constitution)
+- Roadmap: docs/research/v2-1-review.md (M1-M9), v2-1-status.md (living tracker), m1-canonicalization-plan.md, architectus-design.md, compaction-design.md
+- Naming map: docs/research/glossary.md
+- Code: src/cambium/ — store, merge, ipc, worker, supervisor, orchestrator, tasktree, diffundo*, bench, redact*, doctor, cli, conversations, dlq, resources, approval, fencing, system_health, lint_diag, ast_tools, schemas, eval_cache, provider_config, architectus, events (to be deleted per M1), modules/example (Decision enum v2.1)
+- * = not yet merged to main (diffundo in review; redact in flight)
+- Orientation norms: agents.md (sections 1-11; constitution subsection; module inventory §3; lookup table §9)
+- Tests: harness in tests/scenarios/; MODULE tests colocated: src/cambium/modules/<name>/tests/ (+ baselines) — removability rule
 
-The following deterministic modules are in `main`:
+## Decision log (all user directives, in order, with disposition)
+1. Python >=3.14,<3.15 REGULAR build (free-threaded rejected: verified GIL present by default; dspy 3.3.0 works on 3.14, blocked on freethreaded by orjson).
+2. Headless-first interface: JSON-Lines stdio is the contract; TUI optional view (rich/Textual, v2.1); proto-AGI upper layer spawns instances.
+3. NO LOCAL LLM CACHE in production (D1): provider-side prefix caching only; static prompt prefix top, dynamic tail bottom (D8c, diffundo.validate_prompt_structure). EVAL-HARNESS-ONLY cache exists (eval_cache.py, opt-in).
+4. Task tree / conversation tree (D2): flat task list with requires:[] → Python builds DAG (tasktree.py, Kahn, cycle detection); info hiding: upward = result envelope only (9 keys, arch §3.4).
+5. NO SANDBOXING in the harness (decision 10, D7, user directive): containment = worktree isolation + allowlists + approval gates; bwrap REMOVED from all docs (nobwrap commit); sandbox-options.md is a stub; containers = deployment vehicle outside harness (D8e).
+6. Logging: YES, non-blocking (stdlib logging + QueueHandler + writer thread; logging-design.md).
+7. Tests bundled WITH modules (colocated, deletable by removing the module dir); scenario/integration tests only (no TDD ceremony).
+8. Coding constitution (Rust/HFT) translated for Python (coding-constitution.md; agents.md §7 subsection): enums over bools, no globals, flat flow, stdlib-over-custom, delete-over-add, measure-before-optimizing. Decision enum migration done (v2.1, wire format unchanged).
+9. Prime Agent patterns adopted: persistent named workers + steer (D3, v2.1), gate+budgets (D4, in supervisor), /refine-style evidence-backed refinement loop (D5, M8).
+10. Subagents: worktree-per-agent, canaries + verifiable stats against LLM lies, adversarial review before merge; 20+ concurrent OK; backends: sol/luna working after auth fix (used for architecture/grunt), glm depleted, kimi misconfigured (never use), general/build (DeepSeek) always works.
+11. Compaction prep: this file + v2-1-status.md + glossary + tiered research index are the self-sufficient context map.
+12. Critiques 1-4 dispositions: docs/research/feedback-4-assessment.md (21 claims: 6 reject/3 adopt/6 lite/6 already).
 
-| Capability | Main merge commit |
-|---|---|
-| Foundation: `events.py`, `orchestrator.py`, `modules/base.py`, example module, test scaffold | `f66bdc6` (`merge: build(scaffold)`) |
-| Vertical-slice supervisor and fake worker | `c053d35` (`merge: feat(slice) — vertical slice milestone`) |
-| `doctor.py` diagnostics and ruff tooling | `2822139` (`merge: feat(tooling) — ruff + doctor`) |
-| `merge.py` / `MergeSequencer` | `c7e19b0` (`merge: feat(merge) — unio sequencer`) |
-| `store.py` / `EventStore` | `3d27ba3` (`merge: feat(store) — sqlite wal event store`) |
-| `tasktree.py` / deterministic DAG validation | `06ce0dc` (`merge: feat(tasktree) — dag builder`) |
-| `ipc.py` + `worker.py` / Nuntius framing and Opifex seed | `38e1d43` (`merge: feat(ipc) — nuntius framing + worker runtime`) |
-| Split dataset loader and dataset scenarios | `df8ed81` (`merge: feat(datasets) — split loaders`) |
-| Final architecture/D7 and recovery-gap specification fold | `e8f0d0f`, `d67cd5e` |
-| Ruff-clean test gate | `d7971cc` (`merge: chore(lint) — ruff-clean tests`) |
-| v2.1 architecture review and roadmap | `6109a6a` (`merge: research(v2.1) — architecture review and roadmap`) |
+## Merged state (main, clean)
+- Test suite: ~218 passed, 5 skipped (skips = diffundo/redact-dependent, activate on merge)
+- Bench: pytest plugin with committed baseline (module-colocated), drift gate, dataset-version re-anchor (fix in flight)
+- doctor: full diagnostics incl. provider env + session artifacts (extension in flight)
+- Recent merges: architectus core (9fa0d96), status tracker (4ba5f34), glossary (646b34b), agents inventory (0f652a0), hygiene (804e4fa), decision enum (4bbc7cf), index (2fc98c0), m6 staging test (a9cda37, skips until diffundo)
 
-Current source inventory: `events.py`, `orchestrator.py`, `supervisor.py`,
-`store.py`, `merge.py`, `ipc.py`, `worker.py`, `tasktree.py`, `doctor.py`,
-and `modules/{base,example}`. `diffundo.py`, `bench.py`, and `redact.py` are
-still branch-local implementation artifacts, not modules in `main`.
+## In flight (worktrees)
+- wt-impl-super: supervisor review-fix RELAUNCHED fresh (env stripping everywhere, write deadlines, fencing, ping/pong, race test) — CRITICAL PATH
+- wt-redact: redact.py (has uncommitted progress — alive)
+- wt-impl-diffundo: review fixes (busy-spin pause, budget-bounded attempts, refusal scan)
+- wt-impl-bench: review fixes (dataset_version re-anchor, canary_failed_delta wiring, CLI baseline protection, baseline regen)
+- Luna wave: luna-baseline (README+baseline), luna-tools (tool dispatch), luna-envsmoke, luna-edits (anchored edits), luna-template, luna-docx (doctor ext), luna-fuzz (IPC fuzz), luna-convtok (conversations tokens/summary nodes)
 
-Verification on current `main`:
+## Next actions (dependency order)
+1. Merge super fix → merge diffundo fix → merge redact → merge bench fix → activate m6/conformance skips
+2. HARDENING WIRING into supervisor: pipe caps+kill, stdin deadlines (in super fix), redaction filter on events, DLQ put on task failure, CompileGate on heavy gates, fencing file (in super fix)
+3. M1 canonicalization (m1-canonicalization-plan.md): run_session→adapter, delete slice machinery + events.py + orchestrator skeleton, re-run 3 audits
+4. M6: real-provider E2E (provider_config + diffundo + worker; keys env-only; user's machine has 11 configured providers)
+5. M5: architectus executor chunk (run_plan integration), M7 worker pool, M8 DSPy SIMBA + example→should_decompose rename, M9 adoption trial (≥25% token cut, ≤2pt compile degradation)
+6. Final: integration verification, worktree cleanup, DELETE THIS FILE, final report
 
-- `uv run --python 3.14.7 --extra test pytest --collect-only -q` → **108 tests collected**.
-- `uv run --python 3.14.7 --extra test pytest -q` → **108 passed**.
-- `uv run --python 3.14.7 --with ruff ruff check src` → **All checks passed**.
-
-## In-flight: 20-agent wave
-
-The implementation and follow-up wave remains in isolated worktrees. The
-active surfaces are:
-
-- `wt-impl-super`: Custos canonical runtime and store/merge wiring.
-- `wt-impl-diffundo`, `wt-impl-bench`, `wt-redact`: provider routing,
-  benchmark gate, and redaction components.
-- `wt-luna-fence`, `wt-luna-dlq`, `wt-luna-pipe`, `wt-luna-cli`,
-  `wt-luna-conv`: fencing, dead-lettering, protocol/pipeline, CLI, and
-  conversation-store work.
-- `wt-doc-*`, `wt-audit-*`, `wt-modtests`, and `wt-research-treesitter`:
-  audit, documentation, test, and v2.1 research follow-up.
-
-Branch-local green tests are not merged-state evidence. Do not mark an item
-complete until it is on one main SHA and the full suite is rerun.
-
-## Pending milestones
-
-Milestones and dependencies are defined in `docs/research/v2-1-review.md`:
-
-1. **Hardening pass** — protocol deadlines/caps, redaction, environment
-   allowlists, fencing, bounded queues, gate/resource limits, and audit fixes.
-2. **M1 — canonical runtime and audit baseline** — wire one Custos path to
-   `EventStore`, `MergeSequencer`, Nuntius, worker, redactor, and doctor;
-   remove slice and fallback paths; rerun all three audits on one SHA.
-3. **M6 — first real LLM end-to-end task** — after M1–M5, connect Diffundo,
-   one OpenAI-compatible provider, `CambiumLM`, one atomic coding task, a
-   deterministic gate, and Unio publication. Keep it manual and key-gated.
-
-M2–M5 are the hard gates between M1 and M6. M7 persistent workers, M8 DSPy
-refinement, and M9 tree-sitter research follow the first real end-to-end task.
-
-## Recorded decisions
-
-1. Python: `>=3.14,<3.15`, regular GIL build.
-2. Public interface: headless library plus JSON-Lines; TUI is optional.
-3. Provider caching is upstream; no local LLM response cache.
-4. Modules use a DSPy seam, frozen datasets, metrics, and canaries.
-5. Workers are subprocesses, never in-process.
-6. No DSPy runtime dependency enters the deterministic scaffold.
-7. The task tree is a first-class DAG of sub-LLM sessions.
-8. No sandboxing in the harness; containment is worktree isolation, permission
-   allowlists, approval gates, and host-owned controls.
+## Verification norms (canaries)
+Every agent: exact commands + outputs; UNVERIFIED markers; commit in own worktree (check git rev-parse --show-toplevel); empty report = failure; snapshots of live systems need as-of timestamps; adversarial review before merge; duplicate/conflicting branches resolved toward main + re-verify.
