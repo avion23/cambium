@@ -43,6 +43,10 @@ def write_generation(worktree: Path, generation: int) -> int:
 
     fence_dir = Path(worktree) / ".cambium"
     fence_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(fence_dir, 0o700)
+    except OSError:
+        pass
     fence_path = fence_dir / "generation"
     fd, temporary_name = tempfile.mkstemp(
         prefix=".generation.", suffix=".tmp", dir=fence_dir
@@ -74,7 +78,18 @@ def next_generation(worktree: Path) -> int:
     """
     fence_dir = Path(worktree) / ".cambium"
     fence_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(fence_dir, 0o700)
+    except OSError:
+        pass
     fence_path = fence_dir / "generation"
+    try:
+        os.chmod(fence_path, 0o600)
+    except FileNotFoundError:
+        fd = os.open(fence_path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        os.close(fd)
+    except OSError:
+        pass
 
     with fence_path.open("a+", encoding="ascii", newline="\n") as fence:
         if fcntl is not None:

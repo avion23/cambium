@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from cambium.supervisor import run_session
@@ -264,3 +265,29 @@ def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypa
     assert "OPENAI_API_KEY" not in spawned_env
     assert "CAMBIUM_PROVIDER_bad_API_KEY" not in spawned_env
     assert spawned_env["CAMBIUM_TASK_ID"] == "slice-001"
+
+
+def test_slice_event_log_is_private_and_repairs_preseeded_modes(tmp_path) -> None:
+    """umask 0022 must not widen the JSONL log (0600) or .cambium (0700)."""
+    session = tmp_path / "session"
+    script = (
+        "import os, stat, sys\n"
+        "from pathlib import Path\n"
+        "os.umask(0o022)\n"
+        "from cambium.supervisor import EventLog\n"
+        "path = Path(sys.argv[1]) / '.cambium' / 'events.jsonl'\n"
+        "log = EventLog(path)\n"
+        "log.emit('spawned', task_id='slice-001')\n"
+        "assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700, path.parent\n"
+        "assert stat.S_IMODE(path.stat().st_mode) == 0o600, path\n"
+        "os.chmod(path.parent, 0o755)\n"
+        "os.chmod(path, 0o644)\n"
+        "reopened = EventLog(path)\n"
+        "reopened.emit('spawned', task_id='slice-001')\n"
+        "assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700, path.parent\n"
+        "assert stat.S_IMODE(path.stat().st_mode) == 0o600, path\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr

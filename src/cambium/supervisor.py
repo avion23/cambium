@@ -116,6 +116,17 @@ class EventLog:
         self._path = path
         self._sink = sink
         path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+        try:
+            os.chmod(path, 0o600)
+        except FileNotFoundError:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            os.close(fd)
+        except OSError:
+            pass
 
     def emit(self, kind: str, **payload: Any) -> None:
         record = {"kind": kind, "timestamp": time.time(), "payload": payload}
@@ -963,6 +974,22 @@ class _FallbackEventStore:
     def __init__(self, path: Path, *, fsync_interval_s: float = 1.0) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self._path.parent, 0o700)
+        except OSError:
+            pass
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self._path}{suffix}")
+            if sidecar.exists():
+                try:
+                    os.chmod(sidecar, 0o600)
+                except OSError:
+                    pass
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")

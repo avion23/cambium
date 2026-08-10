@@ -799,6 +799,10 @@ def write_result(
 
     state_dir = Path(session_dir) / ".cambium"
     state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(state_dir, 0o700)
+    except OSError:
+        pass
     target = state_dir / "result.json"
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=state_dir

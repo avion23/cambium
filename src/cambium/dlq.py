@@ -66,6 +66,16 @@ class DeadLetterQueue:
 
         self._directory = Path(dir) / ".cambium" / "dlq"
         self._directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self._directory, 0o700)
+        except OSError:
+            pass
+        for entry in self._directory.iterdir():
+            if entry.is_file() and entry.name.endswith(_JSON_SUFFIX):
+                try:
+                    os.chmod(entry, 0o600)
+                except OSError:
+                    pass
         self._max_entries = max_entries
         self._lock = threading.RLock()
         if redactor is not None:
@@ -169,10 +179,22 @@ class DeadLetterQueue:
         encoded = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
         temporary = self._directory / f".{target.name}.{uuid.uuid4().hex}.tmp"
         try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o600,
+            )
+            stream = None
+            try:
+                stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
+            finally:
+                if stream is not None:
+                    stream.close()
+                else:
+                    os.close(fd)
             os.replace(temporary, target)
             self._fsync_directory()
         except BaseException:
