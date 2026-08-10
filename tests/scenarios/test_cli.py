@@ -232,12 +232,12 @@ def test_installed_console_launcher_tasktree_no_args_prints_help_without_waiting
 
 
 def test_tasktree_bad_arguments_exit_two() -> None:
-    result = _run("tasktree", "plan.json", "extra")
+    result = _run("tasktree", "plan.json", "TOP_SECRET_123")
 
     assert result.returncode == 2
     assert result.stdout == ""
     assert "usage: python -m cambium.tasktree" in result.stderr
-    assert "unrecognized arguments: extra" in result.stderr
+    assert "TOP_SECRET_123" not in result.stderr
 
 
 def test_tasktree_missing_file_exits_two(tmp_path) -> None:
