@@ -33,6 +33,7 @@ class Approval(Enum):
 
 CommandPattern = tuple[str, ...]
 ApprovalCallback = Callable[..., Awaitable[bool]]
+_POLICY_FIELDS = frozenset({"allowlist", "deny", "interactive", "fail_open"})
 
 
 def _patterns(raw: Any, field_name: str) -> tuple[CommandPattern, ...]:
@@ -87,9 +88,14 @@ class ApprovalPolicy:
     def __init__(self, config: Mapping[str, Any]) -> None:
         if not isinstance(config, Mapping):
             raise TypeError("approval policy config must be a mapping")
-        for alias in ("denylist", "deny_list"):
-            if alias in config:
-                raise ValueError(f"{alias} is not supported; use 'deny'")
+        unknown = sorted(set(config) - _POLICY_FIELDS, key=repr)
+        if unknown:
+            names = ", ".join(map(repr, unknown))
+            message = f"unknown approval policy key(s): {names}"
+            aliases = [key for key in unknown if key in {"denylist", "deny_list"}]
+            if aliases:
+                message += f"; use 'deny' instead of {', '.join(map(repr, aliases))}"
+            raise ValueError(message)
         allowlist = _patterns(config.get("allowlist", ()), "allowlist")
         denylist = _patterns(config.get("deny", ()), "deny")
         interactive = _boolean(config, "interactive", False)
