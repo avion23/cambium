@@ -38,11 +38,21 @@ _SECRET_MARKERS = frozenset(
     {
         "apikey",
         "authorization",
+        "auth",
+        "bearer",
         "password",
         "secret",
         "token",
         "credential",
+        "clientid",
         "clientsecret",
+        "oauth",
+        "session",
+        "refresh",
+        "access",
+        "private",
+        "pem",
+        "passphrase",
         "accesstoken",
         "refreshtoken",
         "privatekey",
@@ -215,6 +225,8 @@ class _CambiumLMMixin:
             num_retries=0,
             **kwargs,
         )
+        self.launch_kwargs = _freeze(self.launch_kwargs)
+        self.train_kwargs = _freeze(self.train_kwargs)
 
     def __call__(
         self,
@@ -273,6 +285,8 @@ class _CambiumLMMixin:
     def copy(self, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
         copied = super().copy(**self._safe_kwargs(kwargs))
+        if "model" in kwargs:
+            copied._provider_model = kwargs["model"]
         copied.callbacks = []
         return copied
 

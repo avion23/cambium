@@ -211,6 +211,19 @@ def test_secret_marker_variants_are_rejected(key: str) -> None:
 @pytest.mark.parametrize(
     "key",
     [
+        "auth",
+        "AUTH",
+        "bearer",
+        "Bearer",
+        "client_id",
+        "client-id",
+        "oauth",
+        "session",
+        "refresh",
+        "access",
+        "private",
+        "pem",
+        "passphrase",
         "credential",
         "CREDENTIAL",
         "api.key",
@@ -276,6 +289,53 @@ def test_copy_rejects_credential_keys_and_keeps_dump_state_clean() -> None:
     copied = lm.copy(temperature=0.5)
     assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
     assert "api.key" not in repr(copied.dump_state())
+
+
+def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    predict = dspy.Predict("question -> answer")
+    state_path = tmp_path / "state.json"
+
+    with pytest.raises(ValueError, match="provider credentials"):
+        predict.lm = CambiumLM(
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            auth="Bearer SENSITIVE_CANARY",
+        )  # type: ignore[arg-type]
+        predict.save(state_path)
+
+    assert not state_path.exists()
+
+
+def test_copy_does_not_share_mutable_launch_kwargs() -> None:
+    _require_dspy()
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    copied = lm.copy()
+
+    with pytest.raises(TypeError, match="configuration snapshots are immutable"):
+        copied.launch_kwargs["api_key"] = "SENSITIVE_CANARY"
+
+    assert "SENSITIVE_CANARY" not in repr(lm.dump_state())
+    assert "api_key" not in repr(lm.dump_state())
+    assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
+    assert "api_key" not in repr(copied.dump_state())
+
+
+def test_copy_model_override_routes_through_diffundo() -> None:
+    _require_dspy()
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(  # type: ignore[arg-type]
+        diffundo,
+        ProviderTier.FAST,
+        model="original",
+    )
+    copied = lm.copy(model="override")
+
+    assert _call(copied, "model override prompt") == ["completion text"]
+    assert diffundo.calls[0]["model"] == "override"
+    assert copied.dump_state()["model"] == "override"
 
 
 def test_copy_rejects_prompt_observing_callbacks() -> None:
