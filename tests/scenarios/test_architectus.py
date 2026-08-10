@@ -743,6 +743,56 @@ def test_abort_subtree_clears_same_wave_descendant_spawn_and_quiesces() -> None:
     assert asyncio.run(core.step([])) == []
 
 
+@pytest.mark.parametrize(
+    ("proposed", "expected"),
+    [
+        (
+            [
+                {"action": "spawn", "task_id": "child"},
+                {"action": "reset_retry", "task_id": "root"},
+            ],
+            [{"action": "abort_subtree", "task_id": "root"}],
+        ),
+        (
+            [
+                {"action": "spawn", "task_id": "child"},
+                {"action": "reset_retry", "task_id": "root"},
+                {"action": "reset_retry", "task_id": "root"},
+            ],
+            [
+                {"action": "abort_subtree", "task_id": "root"},
+                {"action": "abort_subtree", "task_id": "root"},
+            ],
+        ),
+    ],
+)
+def test_reset_converted_abort_clears_same_wave_descendant_spawn_and_history(
+    proposed: list[dict], expected: list[dict]
+) -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM([proposed]),
+        tree=tree,
+        durable_state={"reset_retry_consumed": ["root"]},
+    )
+    core.aggregate("root", _envelope(None))
+
+    actions = asyncio.run(core.step([]))
+
+    assert actions == expected
+    assert {"action": "spawn", "task_id": "child"} not in actions
+    assert core.action_history == expected
+    assert {"action": "spawn", "task_id": "child"} not in core.action_history
+    assert core.in_flight == set()
+
+
 def test_malformed_later_failure_event_does_not_consume_prior_event() -> None:
     tree = build_tree(_plan([("root", "FEATURE", [], None)]))
     core = ArchitectusCore(

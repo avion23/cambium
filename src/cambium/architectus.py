@@ -550,6 +550,7 @@ class ArchitectusCore:
         capacity = max(self._max_width - len(self._in_flight), 0)
         accepted_spawn_ids: list[str] = []
         aborted_spawn_ids: set[str] = set()
+        aborted_descendant_spawn_ids: set[str] = set()
         non_spawn: list[tuple[int, dict[str, Any]]] = []
         accepted_spawns: list[tuple[int, str, int]] = []
         spawn_segment = 0
@@ -584,12 +585,16 @@ class ArchitectusCore:
                             "action": ActionKind.ABORT_SUBTREE.value,
                             "task_id": task_id,
                         }
-                        aborted_spawn_ids.update(self._mark_subtree_failed(task_id))
+                        subtree = self._mark_subtree_failed(task_id)
+                        aborted_spawn_ids.update(subtree)
+                        aborted_descendant_spawn_ids.update(subtree - {task_id})
                         spawn_segment += 1
                     else:
                         self._reset_retry_tasks.add(task_id)
                 elif kind is ActionKind.ABORT_SUBTREE:
-                    aborted_spawn_ids.update(self._mark_subtree_failed(task_id))
+                    subtree = self._mark_subtree_failed(task_id)
+                    aborted_spawn_ids.update(subtree)
+                    aborted_descendant_spawn_ids.update(subtree - {task_id})
                     spawn_segment += 1
             non_spawn.append((raw_index, action))
 
@@ -609,7 +614,8 @@ class ArchitectusCore:
         for raw_index, _raw_action in enumerate(proposed_actions):
             task_id = spawn_assignments.get(raw_index)
             if task_id is not None:
-                actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
+                if task_id not in aborted_descendant_spawn_ids:
+                    actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
                 continue
             for index, action in non_spawn:
                 if index == raw_index:
