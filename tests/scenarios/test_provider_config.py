@@ -132,3 +132,43 @@ def test_non_positive_rpm_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="rpm.*greater than 0"):
         load_providers(path)
+
+
+def test_loopback_http_base_url_is_accepted(tmp_path: Path) -> None:
+    for base_url in (
+        "http://localhost:8080/v1",
+        "http://127.0.0.1:8080/v1",
+        "http://[::1]:8080/v1",
+    ):
+        path = _write(tmp_path / "providers.json", [_provider(base_url=base_url)])
+
+        providers = load_providers(path)
+
+        assert len(providers) == 1
+        assert providers[0].base_url == base_url
+
+
+def test_remote_http_base_url_is_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(base_url="http://api.example.test/v1")])
+
+    with pytest.raises(ValueError, match="http transport is allowed only for loopback hosts"):
+        load_providers(path)
+
+
+def test_remote_https_base_url_is_accepted(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(base_url="https://api.example.test/v1")])
+
+    providers = load_providers(path)
+
+    assert len(providers) == 1
+    assert providers[0].base_url == "https://api.example.test/v1"
+
+
+def test_url_credentials_in_base_url_are_rejected(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_provider(base_url="https://user:pass@api.example.test/v1")],
+    )
+
+    with pytest.raises(ValueError, match="must not contain URL credentials"):
+        load_providers(path)

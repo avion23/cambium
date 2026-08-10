@@ -25,6 +25,7 @@ import asyncio
 import json
 import threading
 import time
+import urllib.request
 from collections.abc import MutableMapping
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -58,16 +59,20 @@ class FakeServer:
 
     def __init__(
         self,
-        behaviors: list[tuple[int, dict[str, Any], float]],
+        behaviors: list[
+            tuple[int, dict[str, Any], float]
+            | tuple[int, dict[str, Any], float, dict[str, str]]
+        ],
         *,
         echo_authorization_in_body: bool = False,
+        host: str = "127.0.0.1",
     ) -> None:
         self.behaviors = list(behaviors)
         self.echo_authorization_in_body = echo_authorization_in_body
         self.calls: list[dict[str, Any]] = []
         self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
-        self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
+        self._httpd = HTTPServer((host, 0), _Handler)
         self._httpd.fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
@@ -75,7 +80,7 @@ class FakeServer:
             daemon=True,
         )
         self._thread.start()
-        self.base_url = f"http://127.0.0.1:{self._httpd.server_port}"
+        self.base_url = f"http://{host}:{self._httpd.server_port}"
 
     def record(self, body: dict[str, Any], headers: dict[str, str | None]) -> int:
         with self._lock:
@@ -83,10 +88,15 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float]:
-        if index < len(self.behaviors):
-            return self.behaviors[index]
-        return self.behaviors[-1]
+    def behavior_at(
+        self, index: int
+    ) -> tuple[int, dict[str, Any], float, dict[str, str]]:
+        behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
+        if len(behavior) == 3:
+            status, payload, delay = behavior
+            return status, payload, delay, {}
+        status, payload, delay, headers = behavior
+        return status, payload, delay, headers
 
     def close(self) -> None:
         self._httpd.shutdown()
@@ -112,7 +122,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "Authorization": self.headers.get("Authorization"),
             },
         )
-        status, payload, delay = server.behavior_at(index)
+        status, payload, delay, extra_headers = server.behavior_at(index)
         if delay:
             time.sleep(delay)
         if server.echo_authorization_in_body:
@@ -133,10 +143,17 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
+            for name, value in extra_headers.items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(encoded)
         except OSError:
             pass  # the client timed out (budget-capped attempt) and closed first
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        # urllib replays a 301/302/303 POST redirect as a GET; record it like a
+        # POST so redirect-leak canaries observe a stray contact at the target.
+        self.do_POST()
 
     def log_message(self, *args: object) -> None:
         pass
@@ -821,3 +838,108 @@ def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> 
         assert len(server.calls) == 2
     finally:
         server.close()
+
+
+def test_remote_http_provider_without_config_validation_is_rejected_at_call(
+    tmp_path, monkeypatch
+) -> None:
+    # A ProviderConfig constructed directly (bypassing the config loader) must
+    # still never send the Authorization header over plaintext http to a remote
+    # host: _post_sync re-checks the resolved base_url scheme before sending.
+    unvalidated = ProviderConfig(
+        name="p_insecure",
+        tier=ProviderTier.FAST,
+        base_url="http://api.example.test/v1",
+        api_key_env="K_INSECURE",
+    )
+    monkeypatch.setenv("K_INSECURE", "sk-test-K_INSECURE")
+    router = Diffundo((unvalidated,), pause_timeout_s=0.01)
+
+    with pytest.raises(AllProvidersFailed) as exc:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+    assert exc.value.last_error is not None
+    assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
+    assert "http transport is allowed only for loopback hosts" in exc.value.last_error.message
+    assert "sk-test-K_INSECURE" not in str(exc.value)
+    assert router.health("p_insecure") is HealthState.DISABLED
+
+
+# --------------------------------------------------------------------------- #
+# 9. transport hardening: redirects and proxies must never leak the key
+# --------------------------------------------------------------------------- #
+
+
+def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
+    tmp_path, monkeypatch
+) -> None:
+    # A provider completion endpoint must never redirect: urllib replays the
+    # original request headers — including Authorization — against the redirect
+    # target, which bypasses the loopback/https transport guard entirely. The
+    # redirect must be rejected before any follow-up request is made.
+    # 127.0.0.2 is reachable on the loopback interface but is NOT in the
+    # transport allowlist (only localhost/127.0.0.1/::1), so it is a genuine
+    # non-loopback http origin for the redirect target.
+    target = FakeServer([(200, _ok_payload("must never arrive"), 0.0)], host="127.0.0.2")
+    redirector = FakeServer(
+        [(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})]
+    )
+    _set_keys(monkeypatch, "K_REDIRECT")
+    router = Diffundo(
+        (_config("p_redirect", redirector, "K_REDIRECT"),),
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert len(redirector.calls) == 1
+        assert target.calls == []  # the redirect target was never contacted
+        assert target.request_headers == []  # ... so it never saw the key either
+        error = exc.value.last_error
+        assert error is not None
+        assert error.outcome is ProviderOutcome.AUTH_ERROR
+        assert "redirect" in error.message
+        assert "sk-test-K_REDIRECT" not in str(exc.value)
+        assert router.health("p_redirect") is HealthState.DISABLED
+    finally:
+        redirector.close()
+        target.close()
+
+
+def test_loopback_http_request_bypasses_proxy_and_proxy_never_sees_key(
+    tmp_path, monkeypatch
+) -> None:
+    # A loopback http provider carries the Authorization Bearer in the clear;
+    # honoring HTTP_PROXY would forward the request (and the key) to the proxy.
+    # Loopback requests must go straight to the address, never via a proxy.
+    server = FakeServer([(200, _ok_payload("direct"), 0.0)])
+    proxy = FakeServer([(200, _ok_payload("via proxy"), 0.0)])
+    _set_keys(monkeypatch, "K_PROXY")
+    for var in (
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "FTP_PROXY",
+        "ftp_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", proxy.base_url)
+    monkeypatch.setenv("http_proxy", proxy.base_url)
+    # urllib caches its default opener (with the proxies dict read at build
+    # time); reset it so the pre-fix urlopen path re-reads HTTP_PROXY and the
+    # canary actually routes through the proxy before the fix.
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    router = Diffundo((_config("p_proxy", server, "K_PROXY"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "direct"
+        assert len(server.calls) == 1  # reached the loopback provider directly
+        assert proxy.calls == []  # the proxy never saw the request ...
+        assert proxy.request_headers == []  # ... nor the Authorization header
+    finally:
+        server.close()
+        proxy.close()

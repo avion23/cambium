@@ -92,6 +92,14 @@ DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
 }
 
 _VALID_TIERS = frozenset({"fast", "balanced", "strong", "reasoning"})
+# Plaintext http transport is permitted only for loopback hosts; every remote
+# provider must use https so the Authorization: Bearer key stays encrypted.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_loopback_host(hostname: str) -> bool:
+    """True for the loopback host names that may use plaintext http transport."""
+    return hostname in _LOOPBACK_HOSTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +140,12 @@ def _validate_base_url(value: object, location: str) -> str:
         raise _error(location, "must be an absolute http(s) URL")
     if parsed.username is not None or parsed.password is not None:
         raise _error(location, "must not contain URL credentials")
+    if parsed.scheme.lower() == "http" and not is_loopback_host(parsed.hostname or ""):
+        raise _error(
+            location,
+            "http transport is allowed only for loopback hosts "
+            "(localhost, 127.0.0.1, ::1); remote providers require https",
+        )
     return base_url
 
 
@@ -410,6 +424,7 @@ __all__ = [
     "ProviderEnvSpec",
     "ProviderTier",
     "env_report",
+    "is_loopback_host",
     "load_provider_specs",
     "load_providers",
     "validate_provider_specs",

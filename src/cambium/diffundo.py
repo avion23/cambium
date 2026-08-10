@@ -55,8 +55,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 from . import __version__
+from .provider_config import is_loopback_host
 
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
@@ -408,6 +410,34 @@ class _SanitizedHTTPError(Exception):
     def __init__(self, status: int, reason: str) -> None:
         super().__init__(f"HTTP Error {status}: {reason}")
         self.status = status
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail-closed: a provider completion endpoint must never redirect.
+
+    urllib would otherwise replay the original request headers — including the
+    Authorization Bearer — against the redirect target, bypassing the
+    loopback/https transport guard. ``redirect_request`` raises an ``HTTPError``
+    carrying the 3xx status so the caller classifies it as a ``ProviderError``
+    and no follow-up request is ever made.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            "provider completion endpoints must not redirect",
+            headers,
+            fp,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -829,6 +859,18 @@ class Diffundo:
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
+        # Defensive transport guard: a ProviderConfig constructed without going
+        # through the config loader must still never send the Authorization
+        # header over plaintext http to a non-loopback host (security audit).
+        parsed = urlparse(provider.base_url)
+        scheme = parsed.scheme.lower()
+        if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "http transport is allowed only for loopback hosts; "
+                "remote providers require https",
+            )
         api_key = os.environ.get(provider.api_key_env)
         if not api_key:
             raise ProviderError(
@@ -849,11 +891,20 @@ class Diffundo:
                 "User-Agent": USER_AGENT,
             },
         )
+        # Fail-closed transport: never follow a provider redirect (urllib would
+        # replay the Authorization header against the redirect target), and
+        # never route loopback http through a proxy (HTTP_PROXY would capture
+        # the Authorization Bearer). https remote providers keep normal proxy
+        # behavior.
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if scheme == "http":
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(*handlers)
         start = time.monotonic()
         http_error: ProviderError | None = None
         http_cause: _SanitizedHTTPError | None = None
         try:
-            with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            with opener.open(request, timeout=timeout_s) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             status = exc.code
@@ -905,6 +956,16 @@ class Diffundo:
         *,
         cause: BaseException | None = None,
     ) -> ProviderError:
+        if status in (301, 302, 303, 307, 308):
+            # Reached only via _NoRedirectHandler: a completion endpoint that
+            # redirects is a contract violation that could replay the
+            # Authorization header elsewhere; disable the provider fail-closed.
+            return ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                f"HTTP {status} redirect: provider completion endpoints must not redirect",
+                cause,
+            )
         if status == 429:
             return ProviderError(
                 provider.name, ProviderOutcome.QUOTA, f"HTTP 429: {message}", cause
