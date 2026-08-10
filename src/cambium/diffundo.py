@@ -1,9 +1,9 @@
 """Diffundo — stateless, tiered, multi-provider LLM router.
 
-Implements the provider-cascade contract of docs/architecture/architecture.md §9
-as normatively extended by docs/research/cascade-design.md (fall-through classes
-§1.2, health state machine §2.4) and
-docs/research/design-deltas.md:
+Implements the provider-cascade contract of docs/architecture/architecture.md §9.
+Current cascade behavior is defined by this module and
+tests/scenarios/test_diffundo.py; research drafts provide historical context
+only:
 
 - **D1 — no local cache.** ``Diffundo`` is a stateless router; the only state is
   per-provider cooldown timers, circuit-breaker health, and token buckets
@@ -18,15 +18,15 @@ docs/research/design-deltas.md:
   per-tier recovery monitor wakes it when any provider's bucket/cooldown/breaker
   recovers.
 
-Failure semantics follow cascade-design §2.4 exactly: UNKNOWN -> HEALTHY on
-first success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN
-(probe) -> OPEN on probe failure; OPEN -> HALF_OPEN after the open interval;
-HALF_OPEN -> HEALTHY on probe success / OPEN on probe failure; any state ->
-DISABLED on a non-retryable auth/config error, first call included. Refusals
-are request-level fall-throughs that never drive health transitions. The
-**probe path is the primary OPEN trip** (a failed probe after a cooldown or on
-a half-open probe); the sliding-window failure-rate escalation is a secondary
-safety net that only fires once the window is full.
+Provider health transitions implemented here are: UNKNOWN -> HEALTHY on first
+success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN (probe) ->
+OPEN on probe failure; OPEN -> HALF_OPEN after the open interval; HALF_OPEN ->
+HEALTHY on probe success / OPEN on probe failure; any state -> DISABLED on a
+non-retryable auth/config error, first call included. Refusals are request-level
+fall-throughs that never drive health transitions. The **probe path is the
+primary OPEN trip** (a failed probe after a cooldown or on a half-open probe);
+the sliding-window failure-rate escalation is a secondary safety net that only
+fires once the window is full.
 
 Every ``call`` is bounded by a wall-clock deadline (``call_budget_s``): the
 per-attempt HTTP timeout is capped
