@@ -356,26 +356,64 @@ def test_copy_launch_and_train_snapshots_reject_dict_base_mutators() -> None:
         assert "bypass" not in snapshot
 
 
-def test_dump_state_detaches_mutable_primitive_subclass_model() -> None:
+def test_model_rejects_hostile_primitive_subclass() -> None:
     _require_dspy()
 
-    class MutableStr(str):
-        def __new__(cls, value: str, payload: dict[str, str]) -> MutableStr:
+    class HostileStr(str):
+        def __new__(cls, value: str, payload: dict[str, str]) -> HostileStr:
             instance = super().__new__(cls, value)
             instance.payload = payload
             return instance
 
+        def __str__(self) -> HostileStr:
+            return self
+
     payload = {"state": "original"}
-    model = MutableStr("provider-model", payload)
-    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST, model=model)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="exact builtin string"):
+        CambiumLM(
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            model=HostileStr("provider-model", payload),
+        )  # type: ignore[arg-type]
 
-    dumped_model = lm.dump_state()["model"]
-    assert type(dumped_model) is str
-    assert dumped_model == "provider-model"
-    assert dumped_model is not model
 
-    payload["state"] = "changed"
-    assert dumped_model == "provider-model"
+def test_copy_rejects_hostile_bytes_in_launch_kwargs() -> None:
+    _require_dspy()
+
+    class HostileBytes(bytes):
+        def __new__(cls, value: bytes, payload: dict[str, str]) -> HostileBytes:
+            instance = super().__new__(cls, value)
+            instance.payload = payload
+            return instance
+
+        def __bytes__(self) -> HostileBytes:
+            return self
+
+    payload = {"state": "original"}
+    with pytest.raises(TypeError, match="exact builtin primitive"):
+        CambiumLM(
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            launch_kwargs={"nested": {"value": HostileBytes(b"secret", payload)}},
+        )  # type: ignore[arg-type]
+
+
+def test_nested_hostile_credential_key_cannot_reach_dump_state() -> None:
+    _require_dspy()
+
+    class HostileKey(str):
+        def __str__(self) -> HostileKey:
+            return self
+
+        def lower(self) -> str:
+            return "harmless"
+
+    with pytest.raises(ValueError, match="provider credentials"):
+        CambiumLM(
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            extensions={"nested": [{HostileKey("api_key"): "SENSITIVE_CANARY"}]},
+        )  # type: ignore[arg-type]
 
 
 def test_copy_freezes_bytearrays_in_launch_and_train_kwargs() -> None:
@@ -399,7 +437,7 @@ def test_copy_freezes_bytearrays_in_launch_and_train_kwargs() -> None:
     assert copied.train_kwargs["nested"]["value"] == b"train"
 
 
-def test_copy_freezes_mutable_primitive_subclasses() -> None:
+def test_copy_rejects_mutable_primitive_subclasses() -> None:
     _require_dspy()
 
     class MutableInt(int):
@@ -410,24 +448,13 @@ def test_copy_freezes_mutable_primitive_subclasses() -> None:
 
     payload = {"state": "original"}
     value = MutableInt(7, payload)
-    lm = CambiumLM(  # type: ignore[arg-type]
-        FakeDiffundo(),
-        ProviderTier.FAST,
-        launch_kwargs={"nested": {"value": value}},
-        train_kwargs={"nested": {"value": value}},
-    )
-    copied = lm.copy()
-
-    payload["state"] = "changed"
-
-    frozen_values = (
-        lm.launch_kwargs["nested"]["value"],
-        lm.train_kwargs["nested"]["value"],
-        copied.launch_kwargs["nested"]["value"],
-        copied.train_kwargs["nested"]["value"],
-    )
-    assert all(type(frozen) is int for frozen in frozen_values)
-    assert frozen_values == (7, 7, 7, 7)
+    with pytest.raises(TypeError, match="exact builtin primitive"):
+        CambiumLM(  # type: ignore[arg-type]
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            launch_kwargs={"nested": {"value": value}},
+            train_kwargs={"nested": {"value": value}},
+        )
 
 
 def test_copy_model_override_routes_through_diffundo() -> None:

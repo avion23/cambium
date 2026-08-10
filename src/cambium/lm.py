@@ -68,6 +68,14 @@ _DIFFUNDO_REGISTRY: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDic
 _DSPY: Any | None = None
 
 
+def _normalize_key(key: Any) -> Any:
+    if type(key) is str:
+        return key
+    if isinstance(key, str):
+        return str.__str__(key)
+    return key
+
+
 class _ImmutableCallbacks(list[Any]):
     """Disposable DSPy-compatible callback view that rejects normal mutation."""
 
@@ -98,7 +106,10 @@ def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
             raise ValueError("CambiumLM kwargs must not contain reference cycles")
         memo[id(value)] = None
         frozen = MappingProxyType(
-            {_freeze(key, memo): _freeze(item, memo) for key, item in value.items()}
+            {
+                _freeze(_normalize_key(key), memo): _freeze(item, memo)
+                for key, item in value.items()
+            }
         )
         memo.pop(id(value))
         return frozen
@@ -110,19 +121,19 @@ def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
         memo.pop(id(value))
         return frozen
     if isinstance(value, bytearray | memoryview):
+        if type(value) not in (bytearray, memoryview):
+            raise TypeError(
+                f"CambiumLM configuration values must use exact builtin primitive types, not "
+                f"{type(value).__name__}"
+            )
         return bytes(value)
     if value is None or type(value) in (str, bytes, int, float, bool):
         return value
-    if isinstance(value, str):
-        return str(value)
-    if isinstance(value, bytes):
-        return bytes(value)
-    if isinstance(value, bool):
-        return bool(value)
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, float):
-        return float(value)
+    if isinstance(value, str | bytes | int | float | bool):
+        raise TypeError(
+            f"CambiumLM configuration values must use exact builtin primitive types, not "
+            f"{type(value).__name__}"
+        )
     raise TypeError(
         f"CambiumLM configuration values must be immutable JSON-shaped data, not "
         f"{type(value).__name__}"
@@ -235,8 +246,8 @@ class _CambiumLMMixin:
             raise TypeError("diffundo must provide async call(tier, prompt, ...)")
         self._diffundo = diffundo
         self._tier = ProviderTier(tier)
-        self._provider_model = model
-        self._budget_usd = budget_usd
+        self._provider_model = self._validate_model(model)
+        self._budget_usd = self._validate_budget(budget_usd)
         self._diffundo_reference = _register_diffundo(diffundo)
         kwargs = self._safe_kwargs(kwargs)
         super().__init__(
@@ -309,11 +320,17 @@ class _CambiumLMMixin:
 
     def copy(self, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
+        self._validate_model(self._provider_model)
+        self._validate_budget(self._budget_usd)
         adapter_overrides = {
             key: kwargs[key]
             for key in ("diffundo", "tier", "model", "budget_usd")
             if key in kwargs
         }
+        if "model" in adapter_overrides:
+            self._validate_model(adapter_overrides["model"])
+        if "budget_usd" in adapter_overrides:
+            self._validate_budget(adapter_overrides["budget_usd"])
         safe_kwargs = self._safe_kwargs(
             {key: value for key, value in kwargs.items() if key not in adapter_overrides}
         )
@@ -339,12 +356,14 @@ class _CambiumLMMixin:
         state.pop("model_type", None)
         state.pop("cache", None)
         state.pop("num_retries", None)
+        model = self._validate_model(self._provider_model)
+        budget_usd = self._validate_budget(self._budget_usd)
         state.update(
             {
                 "diffundo_reference": self._diffundo_reference,
                 "tier": self._tier.value,
-                "model": self._provider_model,
-                "budget_usd": self._budget_usd,
+                "model": model,
+                "budget_usd": budget_usd,
             }
         )
         return self._json_snapshot(self._safe_kwargs(state))
@@ -366,10 +385,16 @@ class _CambiumLMMixin:
 
     @staticmethod
     def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
-        forbidden = _FORBIDDEN_FIELDS.intersection(kwargs)
+        safe: dict[Any, Any] = {}
+        forbidden: list[str] = []
+        for key, value in kwargs.items():
+            normalized_key = _normalize_key(key)
+            if normalized_key in _FORBIDDEN_FIELDS:
+                forbidden.append(normalized_key)
+            elif normalized_key not in _CACHE_FIELDS:
+                safe[normalized_key] = value
         if forbidden:
             raise ValueError(f"CambiumLM does not accept {', '.join(sorted(forbidden))}")
-        safe = {key: value for key, value in kwargs.items() if key not in _CACHE_FIELDS}
         pending: list[Any] = [safe]
         visited: set[int] = set()
         while pending:
@@ -379,9 +404,12 @@ class _CambiumLMMixin:
                     continue
                 visited.add(id(value))
                 for key, nested_value in value.items():
-                    if isinstance(key, str) and key not in _GENERATION_FIELDS:
+                    normalized_key = _normalize_key(key)
+                    if type(normalized_key) is str and normalized_key not in _GENERATION_FIELDS:
                         normalized = "".join(
-                            character for character in key.lower() if character.isalnum()
+                            character
+                            for character in str.lower(normalized_key)
+                            if str.isalnum(character)
                         )
                         if any(marker in normalized for marker in _SECRET_MARKERS):
                             raise ValueError(
@@ -453,17 +481,24 @@ class _CambiumLMMixin:
         if isinstance(extensions, Mapping):
             requested_model = extensions.get("model")
             if requested_model is not None:
-                if not isinstance(requested_model, str):
-                    raise TypeError("model must be a string")
-                model = requested_model
+                model = self._validate_model(requested_model)
             requested_budget = extensions.get("budget_usd")
             if requested_budget is not None:
-                if isinstance(requested_budget, bool) or not isinstance(
-                    requested_budget, int | float
-                ):
-                    raise TypeError("budget_usd must be a number")
+                self._validate_budget(requested_budget)
                 budget_usd = float(requested_budget)
         return prompt, model, budget_usd
+
+    @staticmethod
+    def _validate_model(model: Any) -> str | None:
+        if model is not None and type(model) is not str:
+            raise TypeError("model must be an exact builtin string")
+        return model
+
+    @staticmethod
+    def _validate_budget(budget_usd: Any) -> int | float | None:
+        if budget_usd is not None and type(budget_usd) not in (int, float):
+            raise TypeError("budget_usd must be an exact builtin number")
+        return budget_usd
 
     @staticmethod
     def _message(message: Any) -> dict[str, Any]:
