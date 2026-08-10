@@ -141,13 +141,6 @@ Commands: `python3 /tmp/opencode/structure.py`, `names_only.py`, `redact_toml.py
 - Exact value/validity of every credential (intentionally not inspected).
 Provider identity normalization is required because the same logical endpoint appears as `openai` or `openai-codex`, `zai` or `zai-coding-plan`, and `kimi` or `kimi-for-coding` across tools. Keep display names and adapter IDs separate, and retain the original config path in diagnostics so operators can trace a route back to source.
 No key validity, quota, or endpoint health was tested; the matrix is deliberately an offline inventory.
-Config paths remain the authority for each observed route.
 No provider endpoint was contacted.
-Preserve path provenance and verification labels.
 
 Do not treat this offline inventory as health proof.
-
-Use it for future comparisons and canary runs.
-Future snapshots should retain each original config path beside normalized provider IDs, so a stale route can be traced to the tool that declared it.
-
-Do not infer health from configuration presence.

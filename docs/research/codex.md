@@ -98,6 +98,3 @@ Codex’s desktop worktree behavior is more extensive than the CLI: detached HEA
 4. Platform binary: aarch64, statically linked, stripped.
 5. GitHub snapshot: 104,943 stars, 15,886 forks, 9,052 commits (2026-08-09).
 6. Doctor summary: `16 ok · 1 idle · 2 notes · 1 warn · 0 fail`.
-Codex’s local history and SQLite state are separate persistence layers, and the doctor warning links them explicitly through rollout references. The useful design lesson is not “use SQLite” alone: it is to version the relation between append-only events, durable rows, and transcript files, then make the diagnostic command check all three.
-The local install’s 42 MB state database is a measured size, not a recommended allocation; its value here is the observed drift warning and migration count.
-Future snapshots should keep CLI behavior separate from desktop-app worktree behavior, because the inspected docs assign automatic snapshots and GC only to the desktop surface.

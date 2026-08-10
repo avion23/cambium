@@ -81,8 +81,5 @@ The local git history (`7b70842`, then `5984b3a chore(omp): track agent config b
 - https://omp.sh (referenced by README; not independently fetched)
 
 Stats: binary 12,099,834 bytes; local 17.2.10; npm latest 17.2.12; 950 model rows; 760 session files / 765 MB; six inline-key providers in `models.yml`; six provider-order entries; OpenAI cap 12. Vendor benchmark figures and exact local-bundle provenance remain **UNVERIFIED**.
-OMP’s local `SYSTEM.md` says to verify before reporting done, while its runtime still tolerated unresolved models and a missing MCP executable. This contrast is concrete evidence for fail-loud configuration validation: a good prompt cannot repair an absent executable or stale catalog entry.
-A canary should distinguish a timeout from an empty result: `omp stats` produced no output and then exceeded 120 seconds, so both response content and process duration matter.
 
 The original command canary also recorded the literal search pattern `https://[a-zA-Z0-9./_-]*` while scanning the bundle; retain it as command provenance, not as a source endpoint.
-Future snapshots should record whether a model warning blocks a task or merely degrades capability; the local log showed warnings without resolution.

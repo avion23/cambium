@@ -104,10 +104,6 @@ The storage measurements also show why “durable” does not mean “bounded.�
 
 The permission system is finer-grained than a single approval boolean: a rule can allow `git diff`, ask for other bash commands, deny a tool, gate external directories, and control `task`/skill loading. The docs’ last-match-wins behavior should be copied only with tests for rule ordering. The local OpenCode configuration’s active model edits show that permission and model routing drift can happen independently.
 
-The TUI configuration is intentionally separate (`~/.config/opencode/tui.json`), while `opencode run --format json` and `serve` keep automation available. This separation supports Janus’ future adapter split: a renderer can evolve without changing the worker/session protocol. It also means a TUI-only feature claim should not be treated as evidence of headless behavior.
-
-The local binary is dynamically linked (`/lib/ld-linux-aarch64.so.1`) and not stripped, unlike the Codex musl payload. The 140 MB size, 299 MB database, 91 MB cache, and 8 MB log are measured artifacts from one date; they should not be presented as fixed product limits. They do, however, make storage budgeting a concrete Cambium concern.
-
 ## 6. Sources
 
 Web: https://github.com/anomalyco/opencode ; https://opencode.ai/docs/ ; https://opencode.ai/docs/agents/ ; https://opencode.ai/docs/tools/ ; https://opencode.ai/docs/skills/ ; https://opencode.ai/docs/config/ ; https://opencode.ai/docs/tui/ ; https://opencode.ai/docs/troubleshooting/ ; https://raw.githubusercontent.com/anomalyco/opencode/dev/package.json ; https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/package.json ; https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/tui/package.json ; https://raw.githubusercontent.com/anomalyco/opencode/dev/CONTEXT.md ; https://github.com/anomalyco/opencode/issues/29638
