@@ -1916,21 +1916,22 @@ class _Runtime:
             if "resource_thresholds" in spec
             else self._resource_thresholds
         )
-        allowed, reasons = await asyncio.to_thread(can_run_heavy, thresholds)
-        if not allowed:
-            await self.emit(
-                "resource_denied",
-                task_id=task_id,
-                resource_denied=True,
-                reasons=reasons,
-            )
-            self._results[task_id] = TaskResult(
-                task_id=task_id,
-                status="failed",
-                exit_code=126,
-                reason="resource_denied",
-            )
-            return
+        if thresholds is not None:
+            allowed, reasons = await asyncio.to_thread(can_run_heavy, thresholds)
+            if not allowed:
+                await self.emit(
+                    "resource_denied",
+                    task_id=task_id,
+                    resource_denied=True,
+                    reasons=reasons,
+                )
+                self._results[task_id] = TaskResult(
+                    task_id=task_id,
+                    status="failed",
+                    exit_code=126,
+                    reason="resource_denied",
+                )
+                return
         generation = await self._ensure_worktree(spec)
 
         restarts = 0

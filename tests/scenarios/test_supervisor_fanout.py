@@ -1497,3 +1497,63 @@ def test_resource_gate_fail_closed_preflight_creates_no_worktree(tmp_path) -> No
     assert len(denied) == 1
     assert denied[0]["payload"]["resource_denied"] is True
     assert any("mem_available_frac" in reason for reason in denied[0]["payload"]["reasons"])
+
+
+def test_resource_preflight_is_opt_in_and_skipped_without_thresholds(tmp_path, monkeypatch) -> None:
+    """Without configured thresholds the health pre-flight is skipped entirely.
+
+    The host health probe is an optional fail-closed pre-flight: callers that
+    configure ``resource_thresholds`` get admission denial, but the default
+    (no thresholds) must not make every task fail on a loaded host. The
+    semaphore remains the always-on admission boundary.
+    """
+    import cambium.supervisor as supervisor_module
+
+    forced_deny = (False, ["forced health denial"])
+    monkeypatch.setattr(supervisor_module, "can_run_heavy", lambda thresholds: forced_deny)
+
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-optin",
+        worktree="wt-optin",
+        branch="wt-optin",
+        target_file="a.txt",
+        marker="// optin",
+        gate="make --version",
+        resource_thresholds=None,
+    )
+
+    result = asyncio.run(
+        run_plan(session_dir, {"tasks": [task]}, resource_thresholds=None)
+    )
+
+    assert result.exit_code == 0
+    assert result.results[0].exit_code == 0
+    assert _show(repo, "main", "a.txt") == "file a\n// optin\n"
+    assert not _kinds(read_events(session_dir), "resource_denied")
+
+    denied_task = dict(
+        task,
+        task_id="t-denied2",
+        worktree_path=str(session_dir / "wt-denied2"),
+        branch="wt-denied2",
+    )
+    denied_task["resource_thresholds"] = {
+        "mem_available_frac": 1.0,
+        "load1_per_cpu": 1_000_000.0,
+        "disk_free": 0,
+    }
+    denied = asyncio.run(
+        run_plan(
+            session_dir,
+            {"tasks": [denied_task]},
+            resource_thresholds=None,
+        )
+    )
+    assert denied.results[0].exit_code == 126
+    assert denied.results[0].reason == "resource_denied"
