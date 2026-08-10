@@ -1,112 +1,98 @@
-# agents.md - Cambium agent control plane
+# Cambium agent orientation
 
-Read this file before work. It is the short operating contract. Use the
-reference map for current code, target design, commands, and evidence.
+This is a short map. The design and status documents remain authoritative.
 
-## Top 20 controls
+## Current reality vs design target
 
-1. **Authority order.** Follow this order: task request; this file for process;
-   source and tests for current behavior; architecture for target behavior;
-   research and history for context. State conflicts.
-2. **Target is not proof.** Architecture describes a target. Source, tests, and
-   recorded commands prove current behavior.
-3. **Record before work.** Record scope, entry points, current behavior,
-   reproduction, and baseline before editing.
-4. **Search from entry points.** Start at route registration, command tables,
-   and imports. Trace callers and tests. A failed name search is not proof of
-   absence.
-5. **Keep scope tight.** Change only files needed for the causal fix. Report
-   required scope expansion before editing it.
-6. **Use an isolated worktree.** Check `git rev-parse --show-toplevel` and
-   `git worktree list`. Never commit in the shared integration checkout.
-7. **No destructive git.** Do not force-push, rewrite shared history, reset
-   another worktree, or delete work to hide a failure.
-8. **Reproduce first.** Run a deterministic failing check before editing. If it
-   does not fail, find the real entry point or mark the claim UNVERIFIED.
-9. **Make the smallest causal change.** Remove the cause. Do not mask it with a
-   fallback, retry, default, or catch-all path.
-10. **Preserve boundaries.** Keep protocol schemas, worktree isolation,
-    approval gates, public exports, and module seams intact.
-11. **Keep secrets in the environment.** Never commit, print, log, or send
-    keys or tokens. Redact evidence.
-12. **Reserve stdout.** Worker stdout is NDJSON protocol only. Send diagnostics
-    to logging or stderr.
-13. **Keep I/O off-loop.** Run disk and subprocess work off the event loop.
-    Use existing boundary helpers.
-14. **Use what exists.** Use existing dependencies, tools, and project
-    vocabulary. Add no framework or synonym without a demonstrated need.
-15. **Test offline and deterministically.** Use fake providers or workers and
-    fixed fixtures. Tests must not use the network.
-16. **Run the narrowest check.** Then run the affected package or integration
-    check when the change crosses a boundary.
-17. **Use same-version canary evidence.** The canary gate rejects degradation
-    only when candidate and baseline use the same dataset, canary, schema, and
-    baseline versions.
-18. **Approve re-anchors.** A dataset-version change re-anchors the bench gate.
-    Dataset, canary, schema, or baseline changes need explicit approval. Never
-    silently re-anchor.
-19. **Report status exactly.** Use VERIFIED only with command, cwd, exit status,
-    and evidence. Use UNVERIFIED for an unrun claim. Use BLOCKED for an
-    external blocker.
-20. **Resume with a block.** End each handoff with the resume template below.
-    State one next action.
+- CURRENT on `main`: the worker is deterministic; it performs the current task, file edit, commit, and JSON-Lines path. The checked-in supervisor is Python runtime code, not an LLM.
+- CURRENT on `main`: DSPy, ReAct, CambiumLM, and provider-backed worker execution are in-flight or planned, not active. No TUI implementation exists.
+- DESIGN target: a headless JSON-Lines harness with DSPy/ReAct workers, an LLM orchestrator, and an optional TUI view. Do not claim a target is implemented without source and status evidence on `main`.
 
-## Reference map
+## Documents and status
 
-### Current versus target
+- Authoritative behavior and interfaces: `docs/architecture/architecture.md`.
+- Plan, milestone status, and research index: `implementation-plan.md`, `docs/research/v2-1-status.md`, `docs/research/README.md`.
+- Historical only: `docs/architecture/system-design.md` is explicitly superseded by `docs/architecture/architecture.md`.
+- An absent referenced path is planned. Do not invent it; check status first.
 
-Current code is a deterministic Python harness. `src/cambium/__init__.py`
-exports only `__version__`; do not claim a public `Cambium`, `Session`, or
-`Result` API. `src/cambium/worker.py` is a deterministic marker and commit
-seed over the NDJSON protocol; no DSPy ReAct loop is present.
-`src/cambium/diffundo.py`, `src/cambium/architectus.py`,
-`src/cambium/tools.py`, and `src/cambium/edits.py` are repository files, not
-branch-local work. Architecture is a target, not proof. Use source, tests, and
-the living `docs/research/v2-1-status.md` for milestone evidence; it is being
-refreshed elsewhere, so do not copy its SHA claims.
+## Search before editing
 
-### Stable entry points
+Trace from entry points, imports, dispatch, and callers, not filenames. Start at:
 
-- CLI: `src/cambium/cli.py:main`; package version: `src/cambium/__init__.py:__version__`.
-- Runtime: `src/cambium/ipc.py`, `src/cambium/worker.py:main`,
-  `src/cambium/supervisor.py:main`, and `src/cambium/worker_pool.py`.
-- Boundaries: `src/cambium/store.py`, `src/cambium/merge.py`,
-  `src/cambium/tools.py`, `src/cambium/edits.py`, `src/cambium/diffundo.py`,
-  `src/cambium/architectus.py`, and `src/cambium/provider_config.py`.
-- Tests: `tests/scenarios/` and `src/cambium/modules/example/tests/`.
+- Package/CLI: `src/cambium/__init__.py`, `src/cambium/cli.py`.
+- Runtime: `src/cambium/supervisor.py`, `src/cambium/worker.py`, `src/cambium/ipc.py`.
+- DAG/orchestration: `src/cambium/tasktree.py`, `src/cambium/orchestrator.py`, `src/cambium/architectus.py`.
+- Module contract/example: `src/cambium/modules/base.py`, `src/cambium/modules/example/`.
 
-### Verified command table
+Discover files and entry points with:
 
-| Check | Command |
+```sh
+git ls-files 'src/cambium/**/*.py' 'tests/**/*.py'
+git grep -n -E 'def main|if __name__ == "__main__"' -- src tests
+git grep -n -E 'import cambium|from cambium' -- src tests
+```
+
+`src/cambium/events.py` and the compatibility `orchestrator.py` submit/drain skeleton are M1 deletion work. Track this in the plan/status docs, not in a permanent module inventory or branch snapshot.
+
+## Workflow
+
+- Use an isolated worktree and branch for every non-trivial change; root owns integration. Parallel work uses disjoint file scopes.
+- Same-file parallel work needs isolated worktrees and explicit merge order. Before commit, verify `git rev-parse --show-toplevel` and `git worktree list`.
+- Never commit `main`. Commit frequently. No force-push, shared rebase, or reset/removal of another agent's work.
+- Require adversarial review before merge. Report exact command, cwd, and exit status; an empty report is a failure.
+- After three distinct failed hypotheses, stop and report all three. Never log secrets, credentials, prompts, or chain-of-thought. Normal tests use no network.
+
+## Verification
+
+Run from the repository root. Use these verified project commands, not bare `python` or guessed smoke/eval entry points:
+
+```sh
+uv run --python 3.14.7 --extra test pytest -q
+uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_cli.py
+uv run --python 3.14.7 --extra test pytest --collect-only -q tests/scenarios/test_cli.py
+uv run --python 3.14.7 --extra dev ruff check src tests
+uv run --python 3.14.7 python -m compileall src tests
+uv run --python 3.14.7 cambium --help
+uv run --python 3.14.7 cambium version
+```
+
+For a module JSON CLI, first run `git ls-files 'src/cambium/modules/**/__main__.py'`; only then use `uv run --python 3.14.7 python -m cambium.modules.<name>`. No module entry point is on current `main`; do not guess an eval module. Mark checks `VERIFIED`, `UNVERIFIED`, or `BLOCKED`, with the reason.
+
+## Design-target invariants
+
+- Headless JSON-Lines is the interface. Decomposition is a task tree/DAG; parents see no child scratchpad/reasoning, only the exact envelope: `parent_task_id`, `unified_diff`, `diff_truncated`, `summary`, `metric_score`, `metric_breakdown`, `commits`, `files_changed`, `status`.
+- The supervisor owns concurrency, restarts, gates, and serialized merges. A worker executes task work and never manages the DAG.
+- Production has no local LLM response cache and no in-harness sandbox.
+- `events.db`, `conversations.db`, and `shared.db` are separate SQLite stores, each with one writer; `events.db` is the source of truth for event replay.
+- IPC and events contain no secrets. Provider configuration stores environment variable names only, never key values.
+- Current transport is JSON-Lines over stdio. FD 3 is pending M2; do not claim FD 3, the TUI, DSPy, ReAct, or CambiumLM is already implemented.
+
+## Coding constitution
+
+- Prefer flat control flow, guard clauses, exhaustive enums, and concrete code.
+- Keep business logic pure and state/I-O at the edges; use frozen `slots=True` dataclasses for value records.
+- Use enums for domain alternatives; booleans are predicates/API compatibility. No hidden mutable globals or singletons.
+- Use stdlib-first libraries, Protocols, and plain functions. Measure before optimizing. Delete over add.
+- Use list-form subprocess calls; never pass user input through `shell=True`. Worker stdout is protocol only; use logging or stderr for diagnostics.
+- Offload event-loop disk I/O with `asyncio.to_thread` or a writer thread. Keep module tests beside modules and harness scenarios under `tests/scenarios/`.
+
+## Where to look
+
+| Need | Start here |
 |---|---|
-| Full suite | `uv run --python 3.14.7 --extra test pytest -q` |
-| Collect tests | `uv run --python 3.14.7 --extra test pytest --collect-only -q` |
-| Focused scenario | `uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_worker_pool.py` |
-| Lint | `uv run --python 3.14.7 --extra dev ruff check src tests` |
-| Syntax | `python -m compileall src/cambium` |
-| CLI help | `uv run --python 3.14.7 cambium --help` |
-| CLI version | `uv run --python 3.14.7 cambium version` |
+| Architecture and behavior | `docs/architecture/architecture.md` |
+| Plan, status, research index | `implementation-plan.md`, `docs/research/v2-1-status.md`, `docs/research/README.md` |
+| Package and CLI | `src/cambium/__init__.py`, `src/cambium/cli.py` |
+| Supervisor and merge | `src/cambium/supervisor.py` |
+| Worker and IPC | `src/cambium/worker.py`, `src/cambium/ipc.py` |
+| DAG and orchestration | `src/cambium/tasktree.py`, `src/cambium/orchestrator.py`, `src/cambium/architectus.py` |
+| Durable state | `src/cambium/store.py`, `src/cambium/conversations.py` |
+| Module contract and dataset | `docs/architecture/module-template/architecture.md`, `src/cambium/modules/example/` |
+| Providers and evidence/tests | `src/cambium/provider_config.py`, `tests/scenarios/`, `docs/architecture/reviews/` |
 
-### Document authority map
+## Ask or act
 
-| Need | Read |
-|---|---|
-| Agent process and reporting | `agents.md` |
-| Current behavior | `src/cambium/` and `tests/` |
-| Architecture target | `docs/architecture/architecture.md` |
-| Module contracts | `docs/architecture/module-template/architecture.md`, `docs/architecture/module-template/dataset-format.md`, `docs/architecture/module-template/example-spec.md` |
-| Milestone evidence | `docs/research/v2-1-status.md` (living; do not copy its SHA claims) |
-| Research decisions | `docs/research/README.md`, `docs/research/design-deltas.md` |
-| Older design and reviews | `docs/architecture/system-design.md`, `docs/architecture/reviews/` |
-
-### Resume block
-
-- **Scope:**
-- **Authority and target:**
-- **Entry points read:**
-- **Baseline and reproduction:** command, cwd, result
-- **Files in scope:**
-- **Change and preserved boundary:**
-- **Checks:** command, cwd, exit status, evidence
-- **Status:** VERIFIED | UNVERIFIED | BLOCKED
-- **Next action:**
+- Act when a search, test, or document answers the question; record the assumption and continue.
+- Ask only for an unresolved equal-priority conflict, an irreversible public/API/IPC choice, or evidence that cannot decide.
+- Ask before leaving the assigned file scope.
+- After three distinct failed hypotheses, stop and report; do not ask for a search or test that can answer the question.
