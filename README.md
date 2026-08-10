@@ -14,8 +14,9 @@ What exists now:
 
 - **Example decision module** `should_decompose`
   (`src/cambium/modules/example/`) — a deterministic rule engine with a DSPy
-  seam, exact-match metric, train/eval/canaries splits, and a committed bench
-  baseline. The current dataset version is `1.0.0`.
+  seam, `Decision` enum, exact-match metric, train/eval/canaries splits, and a
+  committed bench baseline. The current dataset version is `1.1.0`; the JSON
+  wire format remains unchanged.
 - **Integrated deterministic runtime** — the multi-worker supervisor plan path,
   SQLite WAL event store, atomic merge sequencer, Nuntius NDJSON framing,
   worker runtime, task-tree validation, and doctor diagnostics.
@@ -27,8 +28,8 @@ What exists now:
 - **Vertical-slice proof** — a real supervisor subprocess-spawns a real fake
   worker, runs the task gate, and merges the worker branch. The multi-worker
   plan path also has end-to-end scenario coverage.
-- **Scenario and module coverage** — the refreshed baseline records 201 timed
-  test items. The latest full run reports 197 passed and 5 skipped; the source
+- **Scenario and module coverage** — the refreshed baseline records 205 timed
+  test items. The latest full run reports 202 passed and 4 skipped; the source
   Ruff gate is clean.
 - **Still unmerged** — `diffundo.py` and `redact.py` are not in this main
   snapshot. Real provider execution and DSPy optimization are not verified.
@@ -53,8 +54,9 @@ Next:
   are not present on current main.
 - **M7 — Persistent worker pool: not started.** No reusable worker pool is
   present.
-- **M8 — DSPy `should_decompose` refinement: not started.** The Decision
-  migration is not merged, so the dataset remains at `1.0.0`.
+- **M8 — DSPy `should_decompose` refinement: in progress.** The Decision enum
+  migration and dataset bump to `1.1.0` are merged; the package rename and
+  DSPy SIMBA refinement gates remain open.
 - **M9 — Tree-sitter context compression: research only.** AST tooling and
   feasibility research exist, but the M6-dependent paired provider trials
   have not run.
@@ -99,7 +101,8 @@ Available subcommands are `supervisor`, `doctor`, `bench report|gate`,
   - `system-design.md` — the v0.1 design draft (superseded; kept as the origin record).
   - `module-template/` — the per-module pattern: `architecture.md`, `dataset-format.md`, `example-spec.md`.
   - `reviews/` — the three adversarial reviews that shaped v2.
-- `docs/research/` — 41 evidence docs (historical, never pruned). Key reads:
+- `docs/research/` — 42 research docs plus a tiered README index (historical,
+  never pruned). Key reads:
   `python-3.14.md`, `tui-best-practices.md`, `sqlite-wal-durability.md`,
   `worktree-concurrency.md`, `design-deltas.md`.
 - `agents.md` — orientation for agents landing in this repo. Read first.
@@ -124,7 +127,7 @@ cambium/
 ├── agents.md                  orientation for agents
 ├── docs/
 │   ├── architecture/          architecture.md, system-design.md (v0.1), module-template/, reviews/
-│   └── research/              41 evidence docs
+│   └── research/              42 research docs + README index
 ├── scripts/                   dataset tooling + the fake worker
 ├── src/cambium/               approval.py, ast_tools.py, bench.py, cli.py,
 │                              conversations.py, dlq.py, doctor.py, eval_cache.py,
