@@ -28,15 +28,15 @@ def _record(task_id: str, *, status: str = "failed", reason: str = "protocol_err
     }
 
 
-def test_put_get_roundtrip_and_entries_include_filename(tmp_path) -> None:
+def test_put_get_roundtrip_and_entries_include_id(tmp_path) -> None:
     queue = DeadLetterQueue(tmp_path)
     record = _record("task-roundtrip")
 
     row_id = queue.put(record)
 
     assert isinstance(row_id, int)
-    assert queue.get(f"{row_id}.json") == record
-    assert queue.entries() == [record | {"file": f"{row_id}.json"}]
+    assert queue.get(row_id) == record
+    assert queue.entries() == [record | {"id": row_id}]
     queue.close()
 
 
@@ -48,7 +48,7 @@ def test_default_redactor_scrubs_secrets(tmp_path) -> None:
 
     row_id = queue.put(record)
 
-    persisted = json.dumps(queue.get(f"{row_id}.json"))
+    persisted = json.dumps(queue.get(row_id))
     assert secret not in persisted
     assert "test-api-value" not in persisted
     assert "***" in persisted
@@ -59,9 +59,7 @@ def test_prune_sql_keeps_newest_records(tmp_path) -> None:
     queue = DeadLetterQueue(tmp_path, max_entries=3)
     row_ids = [queue.put(_record(f"task-{index}")) for index in range(5)]
 
-    assert [entry["file"] for entry in queue.entries()] == [
-        f"{row_id}.json" for row_id in row_ids[-3:]
-    ]
+    assert [entry["id"] for entry in queue.entries()] == row_ids[-3:]
     with sqlite3.connect(tmp_path / ".cambium" / "dlq.db") as connection:
         assert connection.execute("SELECT id FROM dlq_records ORDER BY id").fetchall() == [
             (row_id,) for row_id in row_ids[-3:]
@@ -91,12 +89,24 @@ def test_remove_missing_is_harmless(tmp_path) -> None:
     queue = DeadLetterQueue(tmp_path)
     row_id = queue.put(_record("task-remove"))
 
-    queue.remove(f"{row_id}.json")
-    queue.remove(f"{row_id}.json")
+    queue.remove(row_id)
+    queue.remove(row_id)
 
     assert queue.entries() == []
     with pytest.raises(FileNotFoundError):
-        queue.get(f"{row_id}.json")
+        queue.get(row_id)
+    queue.close()
+
+
+def test_get_and_remove_require_positive_exact_integer_id(tmp_path) -> None:
+    queue = DeadLetterQueue(tmp_path)
+
+    for row_id in (True, False, 0, -1, 1.0, "1"):
+        with pytest.raises(ValueError, match="row_id must be a positive integer"):
+            queue.get(row_id)
+        with pytest.raises(ValueError, match="row_id must be a positive integer"):
+            queue.remove(row_id)
+
     queue.close()
 
 
@@ -118,7 +128,7 @@ def test_writer_redacts_again_after_enqueue(tmp_path, monkeypatch) -> None:
     row_id = queue.put({"payload": {"message": "first-secret"}})
 
     assert calls == 2
-    assert queue.get(f"{row_id}.json")["payload"]["message"] == "***"
+    assert queue.get(row_id)["payload"]["message"] == "***"
     queue.close()
 
 
@@ -175,22 +185,6 @@ def test_single_writer_thread_handles_concurrent_puts(tmp_path) -> None:
     assert errors == []
     assert len(queue.entries()) == 40
     assert queue._thread.ident == writer_ident
-    queue.close()
-
-
-def test_legacy_json_records_migrate_redacted_and_directory_is_renamed(tmp_path) -> None:
-    legacy = tmp_path / ".cambium" / "dlq"
-    legacy.mkdir(parents=True)
-    secret = "sk-proj-12345678901234567890"
-    (legacy / "old.json").write_text(
-        json.dumps({"task_id": "legacy", "payload": secret}), encoding="utf-8"
-    )
-
-    queue = DeadLetterQueue(tmp_path)
-
-    assert not legacy.exists()
-    assert (tmp_path / ".cambium" / "dlq.legacy" / "old.json").is_file()
-    assert queue.entries()[0]["payload"] == "***"
     queue.close()
 
 
