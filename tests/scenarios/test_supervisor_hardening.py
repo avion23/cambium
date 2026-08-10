@@ -223,6 +223,35 @@ def test_write_json_accepts_max_content_and_rejects_one_byte_over(
     assert killed == [oversized]
 
 
+def test_oversized_init_fails_before_spawn_without_restart_budget(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-oversized-init",
+        worker=FAKE_WORKER,
+        gate="true",
+        task="é" * 180_000,
+        max_restarts=3,
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+    events = read_events(session_dir)
+
+    assert result.results[0].status == "failed"
+    assert result.results[0].reason == supervisor_module.OUTBOUND_MESSAGE_TOO_LONG
+    assert result.results[0].restarts == 0
+    assert not _kinds(events, "spawned")
+    assert not _kinds(events, "timeout")
+    assert not _kinds(events, "restart_scheduled")
+    protocol = _kinds(events, "protocol")
+    assert len(protocol) == 1
+    assert protocol[0]["payload"]["error_type"] == "OUTBOUND_MESSAGE_TOO_LONG"
+
+
 def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
