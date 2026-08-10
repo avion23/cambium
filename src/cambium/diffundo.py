@@ -56,11 +56,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from . import __version__
+
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
 _VOLATILE_MARKERS = ("request_id", "request-id")
 _REFUSAL_MARKERS = re.compile(r"content.?filter|refus|moderat|safety", re.IGNORECASE)
+_CLOUDFLARE_1010_RE = re.compile(
+    r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
+    r"error\s*(?:code\s*)?[:#-]?\s*1010|browser(?:['’]s)?\s+signature))",
+    re.IGNORECASE | re.DOTALL,
+)
+USER_AGENT = f"cambium/{__version__}"
 # Light content scan for model refusals returned as a 200 completion (issue 4).
 # Documented heuristic: exact refusal phrases in the completion text are treated
 # as a REFUSAL fall-through so a refusing model never wins the cascade.
@@ -819,6 +827,7 @@ class Diffundo:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
+                "User-Agent": USER_AGENT,
             },
         )
         start = time.monotonic()
@@ -861,6 +870,14 @@ class Diffundo:
     def _classify_http(self, provider: ProviderConfig, status: int, message: str) -> ProviderError:
         if status == 429:
             return ProviderError(provider.name, ProviderOutcome.QUOTA, f"HTTP 429: {message}")
+        # Cloudflare's browser-signature block is a provider/network error, not
+        # evidence that the configured API credential is invalid.
+        if status == 403 and _CLOUDFLARE_1010_RE.search(message):
+            return ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                f"HTTP 403 Cloudflare 1010: {message}",
+            )
         if status in (401, 403):
             return ProviderError(
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}"

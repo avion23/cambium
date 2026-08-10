@@ -59,6 +59,7 @@ class FakeServer:
     def __init__(self, behaviors: list[tuple[int, dict[str, Any], float]]) -> None:
         self.behaviors = list(behaviors)
         self.calls: list[dict[str, Any]] = []
+        self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
         self._httpd.fake = self
@@ -70,9 +71,10 @@ class FakeServer:
         self._thread.start()
         self.base_url = f"http://127.0.0.1:{self._httpd.server_port}"
 
-    def record(self, body: dict[str, Any]) -> int:
+    def record(self, body: dict[str, Any], headers: dict[str, str | None]) -> int:
         with self._lock:
             self.calls.append(body)
+            self.request_headers.append(headers)
             return len(self.calls) - 1
 
     def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float]:
@@ -97,7 +99,13 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
         server: FakeServer = self.server.fake  # type: ignore[attr-defined]
-        index = server.record(body)
+        index = server.record(
+            body,
+            {
+                "User-Agent": self.headers.get("User-Agent"),
+                "Authorization": self.headers.get("Authorization"),
+            },
+        )
         status, payload, delay = server.behavior_at(index)
         if delay:
             time.sleep(delay)
@@ -293,6 +301,51 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
     finally:
         auth.close()
         good.close()
+
+
+def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch) -> None:
+    blocked = FakeServer(
+        [
+            (
+                403,
+                _error_payload(
+                    "Cloudflare Error 1010: access denied based on the browser's signature"
+                ),
+                0.0,
+            )
+        ]
+    )
+    _set_keys(monkeypatch, "K_BLOCKED")
+    router = Diffundo((_config("p_blocked", blocked, "K_BLOCKED"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
+        assert router.health("p_blocked") is HealthState.COOLDOWN
+        assert router.status("p_blocked") is ProviderStatus.COOLDOWN
+        assert "sk-test-K_BLOCKED" not in str(exc.value)
+    finally:
+        blocked.close()
+
+
+def test_provider_request_uses_stable_cambium_user_agent_and_keeps_authorization(
+    tmp_path, monkeypatch
+) -> None:
+    server = FakeServer([(200, _ok_payload("ok"), 0.0)])
+    _set_keys(monkeypatch, "K_UA")
+    router = Diffundo((_config("p", server, "K_UA"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "ok"
+        assert server.request_headers == [
+            {
+                "User-Agent": "cambium/0.1.0",
+                "Authorization": "Bearer sk-test-K_UA",
+            }
+        ]
+    finally:
+        server.close()
 
 
 def test_200_refusal_content_cascades_to_next_provider(tmp_path, monkeypatch) -> None:
