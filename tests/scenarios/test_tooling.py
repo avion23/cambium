@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -19,6 +20,9 @@ from cambium import doctor
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
+_CREDENTIAL_ENV_RE = re.compile(
+    r"(api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
+)
 
 
 def _run_doctor(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
@@ -54,14 +58,19 @@ def test_doctor_exits_zero_on_healthy_repo() -> None:
     assert "module-owned JSONL" in result.stdout
 
 
-def test_doctor_exits_zero_without_example_module(tmp_path) -> None:
+def test_doctor_exits_zero_without_example_module(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(tmp_path / "missing-providers.json"))
     package = tmp_path / "cambium"
     shutil.copytree(
         REPO_ROOT / "src" / "cambium",
         package,
         ignore=shutil.ignore_patterns("example", "__pycache__"),
     )
-    environment = os.environ.copy()
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "CAMBIUM_PROVIDERS" and _CREDENTIAL_ENV_RE.search(name) is None
+    }
     environment["PYTHONPATH"] = str(tmp_path)
 
     result = subprocess.run(
@@ -78,6 +87,15 @@ def test_doctor_exits_zero_without_example_module(tmp_path) -> None:
     assert "0 fail" in result.stdout
 
 
+def test_doctor_skips_absent_module_directory(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "missing-modules")
+
+    status, detail = doctor.check_dataset()
+
+    assert status is doctor.Status.SKIP
+    assert "no module-owned JSONL datasets" in detail
+
+
 def test_doctor_fails_on_invalid_module_dataset(tmp_path, monkeypatch) -> None:
     dataset = tmp_path / "modules" / "custom" / "datasets" / "records.jsonl"
     dataset.parent.mkdir(parents=True)
@@ -89,6 +107,24 @@ def test_doctor_fails_on_invalid_module_dataset(tmp_path, monkeypatch) -> None:
     assert status is doctor.Status.FAIL
     assert "invalid JSON" in detail
     assert "records.jsonl:2" in detail
+
+
+def test_doctor_fails_on_unreadable_module_directory(tmp_path, monkeypatch) -> None:
+    module = tmp_path / "modules" / "custom"
+    dataset = module / "datasets" / "records.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text("not-json\n", encoding="utf-8")
+    module.chmod(0)
+    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "modules")
+
+    try:
+        status, detail = doctor.check_dataset()
+    finally:
+        module.chmod(0o755)
+
+    assert status is doctor.Status.FAIL
+    assert "dataset integrity check failed" in detail
+    assert "cannot read directory" in detail
 
 
 def test_doctor_fails_on_corrupt_event_store(tmp_path) -> None:

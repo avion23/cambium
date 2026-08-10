@@ -29,6 +29,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 
 from .provider_config import (
     DEFAULT_SAMPLE,
@@ -56,6 +57,10 @@ class Status(enum.StrEnum):
     FAIL = "fail"
     SKIP = "skip"
     INFO = "info"
+
+
+class DatasetIntegrityError(Exception):
+    """Raised when a module-owned dataset cannot be discovered or validated."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,15 +329,51 @@ def check_system_health(path: Path) -> tuple[Status, str]:
         return Status.SKIP, f"system health unavailable: {exc}"
 
 
+def _directory_entries(directory: Path) -> list[Path] | None:
+    """List a directory, returning ``None`` only when it does not exist."""
+    try:
+        with os.scandir(directory) as entries:
+            return [Path(entry.path) for entry in entries]
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{directory}: cannot read directory: {exc}") from exc
+
+
+def _is_directory(path: Path) -> bool:
+    try:
+        return S_ISDIR(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{path}: cannot inspect directory: {exc}") from exc
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{path}: cannot inspect dataset file: {exc}") from exc
+
+
 def _dataset_jsonl_files() -> list[Path]:
-    if not MODULES_ROOT.is_dir():
+    root_entries = _directory_entries(MODULES_ROOT)
+    if root_entries is None:
         return []
+
     files: list[Path] = []
-    for module_dir in sorted(path for path in MODULES_ROOT.iterdir() if path.is_dir()):
+    for module_dir in sorted(path for path in root_entries if _is_directory(path)):
         dataset_dir = module_dir / "datasets"
-        if not dataset_dir.is_dir():
+        dataset_entries = _directory_entries(dataset_dir)
+        if dataset_entries is None:
             continue
-        files.extend(path for path in dataset_dir.glob("*.jsonl") if path.is_file())
+        files.extend(
+            path
+            for path in dataset_entries
+            if path.suffix == ".jsonl" and _is_regular_file(path)
+        )
     return sorted(files)
 
 
@@ -345,9 +386,11 @@ def _jsonl_record_count(path: Path) -> int:
             try:
                 value = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
+                raise DatasetIntegrityError(f"{path}:{line_number}: invalid JSON") from exc
             if not isinstance(value, dict):
-                raise ValueError(f"{path}:{line_number}: record is not a JSON object")
+                raise DatasetIntegrityError(
+                    f"{path}:{line_number}: record is not a JSON object"
+                )
             records += 1
     return records
 
@@ -356,6 +399,8 @@ def check_dataset() -> tuple[Status, str]:
     """Check module-owned JSONL records without importing a decision module."""
     try:
         files = _dataset_jsonl_files()
+    except DatasetIntegrityError as exc:
+        return Status.FAIL, f"dataset integrity check failed: {exc}"
     except OSError as exc:
         return Status.FAIL, f"could not discover module datasets: {exc}"
     if not files:
@@ -363,6 +408,8 @@ def check_dataset() -> tuple[Status, str]:
 
     try:
         records = sum(_jsonl_record_count(path) for path in files)
+    except DatasetIntegrityError as exc:
+        return Status.FAIL, f"dataset integrity check failed: {exc}"
     except (OSError, UnicodeError, ValueError) as exc:
         return Status.FAIL, f"dataset integrity check failed: {exc}"
     dataset_word = "dataset" if len(files) == 1 else "datasets"
