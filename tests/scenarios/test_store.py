@@ -4,6 +4,11 @@ No mocking libraries: every scenario drives the real EventStore against a temp
 directory, including a crash-durability subprocess that mirrors the methodology
 of docs/research/sqlite-wal-durability.md (os._exit mid-write, reopen, integrity
 check).
+
+M4 probes: bounded-queue overflow under a stalled writer (drop oldest
+non-critical, preserve critical), the critical-append hard deadline, the
+checkpoint-busy rule (never ack while a reader holds the WAL), and close()
+propagating a final fsync failure.
 """
 
 from __future__ import annotations
@@ -11,11 +16,18 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
-from cambium.store import CRITICAL_KINDS, EventStore, StoreError, StoreInitError
+from cambium.store import (
+    CRITICAL_KINDS,
+    EventStore,
+    StoreError,
+    StoreInitError,
+    StoreTimeout,
+)
 
 
 def _open(path):
@@ -199,3 +211,139 @@ def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
     with pytest.raises(StoreError):
         store.append({"kind": "result", "payload": {}})
     store.close()
+
+
+def test_invalid_queue_and_deadline_config_raise(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        EventStore(tmp_path / "a.db", max_queue_size=0)
+    with pytest.raises(ValueError):
+        EventStore(tmp_path / "b.db", critical_timeout_s=0.0)
+    with pytest.raises(ValueError):
+        EventStore(tmp_path / "c.db", checkpoint_busy_retry_s=0.0)
+
+
+def test_stalled_writer_flood_drops_non_critical_preserves_critical(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db",
+        fsync_interval_s=60.0,
+        max_queue_size=8,
+        critical_timeout_s=10.0,
+    )
+    release = threading.Event()
+    stalled = threading.Event()
+    real_fsync = EventStore._fsync_now
+
+    def stalled_fsync(self) -> None:
+        stalled.set()
+        release.wait(30.0)
+        real_fsync(self)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
+    try:
+        starter = threading.Thread(
+            target=lambda: store.append({"kind": "result", "payload": {"c": 0}})
+        )
+        starter.start()
+        assert stalled.wait(5.0)  # writer is now blocked in C0's fsync
+
+        start = time.monotonic()
+        for i in range(40):
+            store.append({"kind": "log", "payload": {"i": i}})
+        assert time.monotonic() - start < 5.0  # full queue never blocks non-critical
+
+        blocker = threading.Thread(
+            target=lambda: store.append({"kind": "result", "payload": {"c": 1}})
+        )
+        blocker.start()
+        while store.dropped < 33:  # 32 incoming drops + 1 eviction for the critical
+            time.sleep(0.01)
+        release.set()
+        blocker.join(10.0)
+        starter.join(10.0)
+        assert not blocker.is_alive()
+        assert not starter.is_alive()
+    finally:
+        release.set()
+        store.close()
+
+    assert store.dropped == 33
+    events = store.events_after(0)
+    # C0 (1) survives; seq 2 was evicted to admit C1 (42); seqs 10..41 dropped;
+    # the remaining 7 flood events (3..9) are written before the critical.
+    assert [e["seq"] for e in events] == [1, 3, 4, 5, 6, 7, 8, 9, 42]
+    assert [e["kind"] for e in events] == ["result"] + ["log"] * 7 + ["result"]
+
+
+def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatch) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.5
+    )
+    release = threading.Event()
+    real_fsync = EventStore._fsync_now
+
+    def stuck_fsync(self) -> None:
+        release.wait(30.0)
+        real_fsync(self)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", stuck_fsync)
+    try:
+        start = time.monotonic()
+        with pytest.raises(StoreTimeout):
+            store.append({"kind": "result", "payload": {"ok": True}})
+        elapsed = time.monotonic() - start
+        assert 0.3 <= elapsed < 5.0  # bounded by the hard deadline, no hang
+        # store stays alive: a non-critical append is unaffected while the
+        # writer is stalled, and a later critical append succeeds on recovery.
+        assert store.append({"kind": "log", "payload": {}}) > 0
+        release.set()
+        seq = store.append({"kind": "result", "payload": {"ok": True}})
+        assert seq > 0
+    finally:
+        release.set()
+        store.close()
+
+    events = store.events_after(0)
+    # the timed-out event was still written once the writer recovered — it was
+    # never acknowledged before fsync, but the pending row is not dropped.
+    assert [e["seq"] for e in events] == [1, 2, 3]
+    assert len([e for e in events if e["kind"] == "result"]) == 2
+
+
+def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=1.0)
+    reader = sqlite3.connect(path)
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT seq FROM events").fetchall()
+        start = time.monotonic()
+        with pytest.raises(StoreError):  # StoreTimeout is a StoreError
+            store.append({"kind": "result", "payload": {"ok": True}})
+        elapsed = time.monotonic() - start
+        assert 0.5 <= elapsed < 10.0  # no ack, no hang
+    finally:
+        reader.rollback()
+        reader.close()
+
+    # once the reader releases, the writer's busy retry succeeds; the store
+    # stays usable and the timed-out event is still written durably.
+    store.append({"kind": "result", "payload": {"ok": True}})
+    store.close()
+
+    events = store.events_after(0)
+    assert [e["seq"] for e in events] == [1, 2]
+    assert all(e["kind"] == "result" for e in events)
+
+
+def test_close_propagates_final_fsync_error(tmp_path, monkeypatch) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
+    store.append({"kind": "log", "payload": {"i": 0}})
+
+    def fail_fsync(self) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    with pytest.raises(OSError, match="No space left on device"):
+        store.close()
