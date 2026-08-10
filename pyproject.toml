@@ -11,6 +11,7 @@ cambium = "cambium.cli:main"
 
 [project.entry-points.pytest11]
 "cambium.bench" = "cambium.bench"
+"cambium.module_conformance" = "cambium.module_conformance"
 
 [project.optional-dependencies]
 # ast: focused alias for consumers that need only the optional tree-sitter

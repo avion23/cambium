@@ -82,3 +82,24 @@ def test_tasktree_cyclic_plan_exits_one() -> None:
     assert result.returncode == 1
     assert "cycle" in result.stderr
     assert result.stdout == ""
+
+
+def test_module_test_runs_reference_module() -> None:
+    result = _run("module-test", "example")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cambium module conformance" in result.stdout
+
+
+def test_module_test_unknown_module_exits_two() -> None:
+    result = _run("module-test", "does_not_exist")
+
+    assert result.returncode == 2
+    assert "unknown module" in result.stderr
+
+
+def test_module_test_rejects_arbitrary_pytest_arguments() -> None:
+    result = _run("module-test", "example", "--maxfail=1")
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
