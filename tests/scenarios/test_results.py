@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -131,6 +131,37 @@ def test_status_conversion_table(wire: dict[str, object], expected: str) -> None
     assert wire_to_child_result(wire)["status"] == expected
 
 
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {"status": "failed", "reason": "watchdog_timeout"},
+        {"kind": "worker_killed", "payload": {"reason": "watchdog_timeout"}},
+        {"status": "failed", "reason": "ready_timeout"},
+        {"kind": "worker_killed", "payload": {"reason": "ping_no_pong"}},
+    ],
+)
+def test_timeout_reasons_map_to_timeout_exit_code(wire: dict[str, object]) -> None:
+    status = status_from_wire(wire)
+
+    assert status == "timeout"
+    assert EXIT_CODES[status] == 3
+    assert wire_to_child_result(wire)["status"] == "timeout"
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {"status": "succeeded", "gate_exit_code": 1},
+        {"status": "succeeded", "merge_status": "failed"},
+    ],
+)
+def test_gate_and_merge_failures_keep_failed_exit_code(wire: dict[str, object]) -> None:
+    status = status_from_wire(wire)
+
+    assert status == "failed"
+    assert EXIT_CODES[status] == 1
+
+
 def test_successful_evaluator_verdict_maps_to_done() -> None:
     status = status_from_wire({"status": "succeeded", "evaluator": {"ok": True}})
 
@@ -224,3 +255,14 @@ def test_session_id_must_be_explicit_and_match(tmp_path: Path) -> None:
         write_result(result, tmp_path)  # type: ignore[call-arg]
     with pytest.raises(ValueError):
         write_result(result, tmp_path, session_id="other-session")
+
+
+def test_writer_requires_session_scoped_event_log_ref(tmp_path: Path) -> None:
+    result = _root(tmp_path)
+    foreign_ref = replace(result, event_log_ref="sqlite:/other/session/events.db")
+
+    with pytest.raises(ValueError, match="event_log_ref"):
+        write_result(foreign_ref, tmp_path, session_id="session-1")
+
+    path = write_result(result, tmp_path, session_id="session-1")
+    assert path == tmp_path / ".cambium" / "result.json"

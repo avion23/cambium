@@ -85,6 +85,13 @@ _CANCEL_TOKENS = frozenset({
     "shutdown",
 })
 _TIMEOUT_TOKENS = frozenset({"timeout", "timed_out", "watchdog_timeout"})
+_TIMEOUT_REASON_MARKERS = (
+    "timeout",
+    "timed_out",
+    "watchdog_timeout",
+    "ready_timeout",
+    "ping_no_pong",
+)
 _REJECT_TOKENS = frozenset({
     "reject",
     "rejected",
@@ -316,20 +323,22 @@ def status_from_wire(
     ):
         return "cancelled"
 
+    reason_value = _first_wire_value(wire, ("reason",))
     timeout_value = _first_wire_value(
         wire, ("timeout", "timed_out", "watchdog_timeout", "timeout_phase")
     )
     if (
         raw_token in _TIMEOUT_TOKENS
         or _token(wire_type) in _TIMEOUT_TOKENS
-        or _has_marker(raw_status, ("timeout", "timed_out"))
-        or _has_marker(wire_type, ("timeout", "timed_out"))
+        or _has_marker(raw_status, _TIMEOUT_REASON_MARKERS)
+        or _has_marker(wire_type, _TIMEOUT_REASON_MARKERS)
         or _flag(timeout_value) is True
         or timeout_value is not _MISSING
         and timeout_value is not None
         and _token(timeout_value) in _TIMEOUT_TOKENS
-        or _has_marker(timeout_value, ("timeout", "timed_out"))
-        or _has_marker(failure_value, ("timeout", "timed_out"))
+        or _has_marker(timeout_value, _TIMEOUT_REASON_MARKERS)
+        or _has_marker(failure_value, _TIMEOUT_REASON_MARKERS)
+        or _has_marker(reason_value, _TIMEOUT_REASON_MARKERS)
     ):
         return "timeout"
 
@@ -756,6 +765,18 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+def _validate_event_log_ref(event_log_ref: str, session_dir: Path | str) -> None:
+    prefix = "sqlite:"
+    if not event_log_ref.startswith(prefix):
+        raise ValueError("event_log_ref must use a sqlite: path")
+    referenced_path = event_log_ref.removeprefix(prefix)
+    if not referenced_path:
+        raise ValueError("event_log_ref must identify the session events.db")
+    expected_path = (Path(session_dir) / ".cambium" / "events.db").resolve()
+    if Path(referenced_path).resolve() != expected_path:
+        raise ValueError("result event_log_ref does not match the session events.db")
+
+
 def write_result(
     result: Result,
     session_dir: Path | str,
@@ -774,6 +795,7 @@ def write_result(
         raise ValueError("session_id must be an explicit non-empty string")
     if result.session_id != session_id:
         raise ValueError("result session_id does not match the explicit session_id")
+    _validate_event_log_ref(result.event_log_ref, session_dir)
 
     state_dir = Path(session_dir) / ".cambium"
     state_dir.mkdir(parents=True, exist_ok=True)
