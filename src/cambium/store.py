@@ -44,6 +44,13 @@ docs/architecture.md):
 Event rows and WAL checkpoints use the writer thread's connection; eviction
 reservations use a short-lived, full-synchronous metadata connection before a
 replacement can enter the queue. Readers use their own short-lived connections.
+
+Redaction is optional for backward compatibility: when an event store is
+constructed with a ``cambium.redact.Redactor``, the complete event record is
+passed through its recursive ``redact_mapping`` before it enters the bounded
+queue and again immediately before the INSERT in the writer.  Without one, the
+event is persisted unchanged.  ``build_session_redactor`` is the single place
+a session constructs the shared redactor.
 """
 
 from __future__ import annotations
@@ -60,6 +67,8 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from .redact import Redactor
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +331,7 @@ class EventStore:
         max_queue_size: int = 10_000,
         critical_timeout_s: float = 10.0,
         checkpoint_busy_retry_s: float = 10.0,
+        redactor: Redactor | None = None,
     ) -> None:
         if max_queue_size < 1:
             raise ValueError("max_queue_size must be >= 1")
@@ -329,11 +339,14 @@ class EventStore:
             raise ValueError("critical_timeout_s must be > 0")
         if checkpoint_busy_retry_s <= 0:
             raise ValueError("checkpoint_busy_retry_s must be > 0")
+        if redactor is not None and not isinstance(redactor, Redactor):
+            raise TypeError("redactor must be a cambium.redact.Redactor")
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._fsync_interval_s = fsync_interval_s
         self._critical_timeout_s = critical_timeout_s
         self._checkpoint_busy_retry_s = checkpoint_busy_retry_s
+        self._redactor = redactor
         self._queue: _BoundedEventQueue = _BoundedEventQueue(max_queue_size)
         self._lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -369,6 +382,9 @@ class EventStore:
         kind = event.get("kind")
         if not isinstance(kind, str) or not kind:
             raise ValueError("event requires a non-empty string 'kind'")
+        if self._redactor is not None:
+            event = self._redactor.redact_mapping(event)
+            kind = event.get("kind")
         row = (
             json.dumps(event.get("payload", {})),
             str(event["ts"]) if event.get("ts") is not None else None,
@@ -474,6 +490,11 @@ class EventStore:
         finally:
             conn.close()
         return [self._row_to_event(row) for row in rows]
+
+    def _redact_row(self, row: tuple) -> tuple:
+        if self._redactor is None:
+            return row
+        return self._redactor.redact_mapping(row)
 
     def _record_dropped(self, count: int) -> None:
         if count <= 0:
@@ -791,6 +812,7 @@ class EventStore:
                     cur_item = None
                     cur_pending = None
                     break
+                row = self._redact_row(row)
                 conn.execute(_INSERT, (seq, kind, *row))
                 cur_inserted = True
                 dirty = True

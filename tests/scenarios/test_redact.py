@@ -15,6 +15,7 @@ from cambium.redact import (
     REDACT_KEYS,
     REDACT_VALUES,
     Redactor,
+    build_session_redactor,
     build_worker_env,
     is_secret_name,
 )
@@ -508,3 +509,27 @@ def test_context_scanner_is_fast_and_deterministic_for_4000_fields() -> None:
 def test_non_secret_basics_are_secret_free_names() -> None:
     assert {"PATH", "HOME", "PYTHONUNBUFFERED"} <= NON_SECRET_BASICS
     assert all(not is_secret_name(name) for name in NON_SECRET_BASICS)
+
+
+def test_build_session_redactor_snapshots_secret_values() -> None:
+    secret = "opaque-session-secret"
+    source = {secret}
+    redactor = build_session_redactor(source)
+
+    source.add("added-after-build")
+
+    assert redactor.secret_values == frozenset({secret})
+    assert redactor.redact(f"stderr: {secret}") == "stderr: ***"
+    assert redactor.redact("added-after-build") == "added-after-build"
+    with pytest.raises(AttributeError):
+        redactor.secret_values.add("cannot-mutate")
+
+
+def test_build_session_redactor_defaults_to_provider_patterns() -> None:
+    redactor = build_session_redactor()
+
+    assert redactor.secret_values == frozenset()
+    output = redactor.redact(f"sk-proj-{'A' * 40} ordinary=value")
+
+    assert SK not in output
+    assert "ordinary=value" in output

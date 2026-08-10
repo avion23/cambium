@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from cambium.dlq import DeadLetterQueue
+from cambium.redact import Redactor
 
 
 def _record(task_id: str, *, status: str = "failed", reason: str = "protocol_error") -> dict:
@@ -131,3 +132,30 @@ def test_concurrent_puts_are_safe(tmp_path) -> None:
     entries = queue.entries()
     assert len(entries) == 20
     assert {entry["task_id"] for entry in entries} == {f"task-{index}" for index in range(20)}
+
+
+def test_injected_redactor_scrubs_opaque_values_before_persistence(tmp_path) -> None:
+    opaque_key = "opaque-dlq-secret-9876543210"
+    queue = DeadLetterQueue(tmp_path, redactor=Redactor(secret_values={opaque_key}))
+    record = _record("task-injected")
+    record["stderr_tail"] = f"provider failed with {opaque_key}"
+    record["payload"] = {"message": opaque_key}
+
+    path = queue.put(record)
+    content = path.read_bytes()
+
+    assert opaque_key.encode() not in content
+    assert b"***" in content
+
+
+def test_default_queue_preserves_opaque_values_without_registry(tmp_path) -> None:
+    opaque_key = "opaque-dlq-value-not-registered-42"
+    queue = DeadLetterQueue(tmp_path)
+    record = _record("task-plain")
+    record["stderr_tail"] = opaque_key
+
+    path = queue.put(record)
+    content = path.read_bytes()
+
+    assert opaque_key.encode() in content
+    assert content.count(b"***") == 0
