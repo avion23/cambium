@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -53,6 +54,8 @@ import urllib.request
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
@@ -196,6 +199,7 @@ class ProviderError(DiffundoError):
         cause: BaseException | None = None,
         *,
         budget_exhausted: bool = False,
+        retry_after_s: float | None = None,
     ) -> None:
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
@@ -203,6 +207,7 @@ class ProviderError(DiffundoError):
         self.message = message
         self.cause = cause
         self.budget_exhausted = budget_exhausted
+        self.retry_after_s = retry_after_s
 
 
 class CostBudgetExceeded(DiffundoError):
@@ -469,6 +474,46 @@ def _redact_error_text(message: str, api_key: str) -> str:
     """Remove credentials while retaining safe provider diagnostics."""
     redacted = message.replace(api_key, _REDACTED)
     return _URL_CREDENTIALS_RE.sub(r"\g<scheme>" + _REDACTED + "@", redacted)
+
+
+def _parse_retry_after(headers: Any) -> float | None:
+    """Parse one provider Retry-After value into a nonnegative delay."""
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        values = get_all("Retry-After")
+    elif isinstance(headers, Mapping):
+        value = headers.get("Retry-After")
+        values = [value] if value is not None else None
+    else:
+        values = None
+    if not values or len(values) != 1:
+        return None
+    value = values[0]
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        delay = None
+    if delay is not None:
+        if math.isfinite(delay) and delay >= 0:
+            return delay
+        return None
+    if value.count(",") > 1 or ("," in value and not re.match(r"^[A-Za-z]{3},", value)):
+        return None
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (IndexError, OverflowError, TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    delay = retry_at.timestamp() - time.time()
+    if not math.isfinite(delay):
+        return None
+    return max(0.0, delay)
 
 
 class _SanitizedHTTPError(Exception):
@@ -789,7 +834,11 @@ class Diffundo:
                             break
                         if attempt_no >= provider.max_retries:
                             break
-                        delay = self._retry_delay(attempt_no)
+                        delay = (
+                            exc.retry_after_s
+                            if exc.retry_after_s is not None
+                            else self._retry_delay(attempt_no)
+                        )
                         remaining = self._remaining(deadline)
                         if remaining is not None and remaining <= delay:
                             break
@@ -805,6 +854,7 @@ class Diffundo:
                         last_exc.message,
                         last_exc.cause,
                         budget_exhausted=last_exc.budget_exhausted,
+                        retry_after_s=last_exc.retry_after_s,
                     ) from last_exc
                 self._record_failure(provider)
                 raise ProviderError(
@@ -813,6 +863,7 @@ class Diffundo:
                     last_exc.message,
                     last_exc.cause,
                     budget_exhausted=last_exc.budget_exhausted,
+                    retry_after_s=last_exc.retry_after_s,
                 ) from last_exc
             finally:
                 runtime.probe_in_flight = False
@@ -898,7 +949,11 @@ class Diffundo:
                 status, _redact_error_text(str(exc.reason), api_key)
             )
             http_error = self._classify_http(
-                provider, status, safe_body, cause=http_cause
+                provider,
+                status,
+                safe_body,
+                cause=http_cause,
+                retry_after_s=_parse_retry_after(exc.headers) if status == 429 else None,
             )
         except urllib.error.URLError as exc:
             reason = exc.reason
@@ -936,6 +991,7 @@ class Diffundo:
         message: str,
         *,
         cause: BaseException | None = None,
+        retry_after_s: float | None = None,
     ) -> ProviderError:
         if status in (301, 302, 303, 307, 308):
             # Reached only via _NoRedirectHandler: a completion endpoint that
@@ -949,7 +1005,11 @@ class Diffundo:
             )
         if status == 429:
             return ProviderError(
-                provider.name, ProviderOutcome.QUOTA, f"HTTP 429: {message}", cause
+                provider.name,
+                ProviderOutcome.QUOTA,
+                f"HTTP 429: {message}",
+                cause,
+                retry_after_s=retry_after_s,
             )
         # Cloudflare's browser-signature block is a provider/network error, not
         # evidence that the configured API credential is invalid.
