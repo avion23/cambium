@@ -1,4 +1,4 @@
-"""Supervisor-owned controls for CPU-heavy gates and task resource budgets.
+"""Supervisor-owned controls for CPU-heavy gates.
 
 ``CompileGate`` limits only commands whose token prefix is in
 :data:`HEAVY_PATTERNS`.  The heuristic is deliberately lexical: a pattern is
@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-import time
 from typing import Final
 
 # These are command-token prefixes, not regular expressions.  Keep the public
@@ -156,62 +155,3 @@ class CompileGate:
             "waits": self._waits,
             "timeouts": self._timeouts,
         }
-
-
-class ResourceBudget:
-    """Small supervisor-owned budget for one session or task.
-
-    ``consume_heavy_op`` reserves one heavy operation.  It returns ``False``
-    when either the wall-time budget or the heavy-operation allowance is
-    exhausted.  The budget clock starts when this object is constructed and
-    is intended to be owned by one supervisor event-loop task.
-    """
-
-    __slots__ = ("_max_wall_s", "_max_heavy_ops", "_started_at", "_heavy_ops")
-
-    def __init__(self, max_wall_s: float, max_heavy_ops: int) -> None:
-        if not isinstance(max_wall_s, (int, float)) or isinstance(max_wall_s, bool):
-            raise TypeError("max_wall_s must be a number")
-        if not math.isfinite(float(max_wall_s)) or max_wall_s < 0:
-            raise ValueError("max_wall_s must be finite and non-negative")
-        if isinstance(max_heavy_ops, bool) or not isinstance(max_heavy_ops, int):
-            raise TypeError("max_heavy_ops must be an integer")
-        if max_heavy_ops < 0:
-            raise ValueError("max_heavy_ops must be non-negative")
-
-        self._max_wall_s = float(max_wall_s)
-        self._max_heavy_ops = max_heavy_ops
-        self._started_at = time.monotonic()
-        self._heavy_ops = 0
-
-    @property
-    def max_wall_s(self) -> float:
-        """Configured wall-time limit in seconds."""
-        return self._max_wall_s
-
-    @property
-    def max_heavy_ops(self) -> int:
-        """Configured heavy-operation limit."""
-        return self._max_heavy_ops
-
-    @property
-    def heavy_ops(self) -> int:
-        """Number of heavy operations reserved so far."""
-        return self._heavy_ops
-
-    @property
-    def wall_remaining_s(self) -> float:
-        """Remaining wall-time budget, clamped at zero."""
-        elapsed = time.monotonic() - self._started_at
-        return max(0.0, self._max_wall_s - elapsed)
-
-    def can_start_heavy(self) -> bool:
-        """Return whether another heavy operation may be reserved."""
-        return self.wall_remaining_s > 0 and self._heavy_ops < self._max_heavy_ops
-
-    def consume_heavy_op(self) -> bool:
-        """Reserve one heavy operation if both budget bounds remain."""
-        if not self.can_start_heavy():
-            return False
-        self._heavy_ops += 1
-        return True
