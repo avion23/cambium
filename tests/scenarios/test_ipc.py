@@ -775,6 +775,77 @@ def test_worker_fence_advance_during_post_commit_removes_stale_commit(
     assert stale_committed is False
 
 
+def test_stale_worker_rollback_preserves_newer_generation_commit(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    hook_started = tmp_path / "post-commit-started"
+    hook_release = tmp_path / "post-commit-release"
+    hook = scratch / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    worktree = session_dir / "wt"
+
+    async def scenario() -> str:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-stale-rollback",
+                          "task_id": "ipc-stale-rollback", "generation": 1})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-stale-rollback",
+                task_id="ipc-stale-rollback", generation=1,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while not hook_started.exists():
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+
+            hook.unlink()
+            (worktree / "generation-2.txt").write_text("generation 2\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(worktree), "add", "generation-2.txt"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(worktree), "commit", "-m", "generation 2"],
+                check=True,
+                capture_output=True,
+            )
+            generation_2_head = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            write_generation(worktree, 2)
+
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert "rollback skipped" in result["failure_reason"]
+            assert await w.proc.wait() == 1
+            return generation_2_head
+        finally:
+            hook_release.touch()
+            await w.stop()
+
+    generation_2_head = asyncio.run(scenario())
+
+    assert subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == generation_2_head
+    assert (worktree / "generation-2.txt").read_text(encoding="utf-8") == "generation 2\n"
+
+
 def test_worker_shutdown_graceful_exit(tmp_path) -> None:
     """shutdown acks ok, aborts the current task, and exits gracefully (code 0)."""
     session_dir = tmp_path / "session"

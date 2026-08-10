@@ -52,6 +52,7 @@ WORKER_STDIN_LIMIT = 1_048_576
 STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
 PROCESS_REAP_TIMEOUT_S = 5.0
+GATE_OUTPUT_LIMIT_BYTES = 64 * 1024
 
 EventSink = Callable[[dict[str, Any]], None]
 
@@ -74,6 +75,8 @@ def _stdin_write_timeout_s() -> float:
 
 
 def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
+    if msg.get("type") == "ready":
+        return msg.get("proto") != PROTO
     return "proto" in msg and msg["proto"] != PROTO
 
 
@@ -195,6 +198,71 @@ async def _kill_process_group_and_reap(proc: asyncio.subprocess.Process) -> None
         pass
 
 
+class _GateOutputOverflow(RuntimeError):
+    def __init__(self, stdout: bytes, stderr: bytes) -> None:
+        super().__init__("gate output exceeded capture limit")
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+async def _communicate_gate_bounded(
+    proc: asyncio.subprocess.Process, timeout: float
+) -> tuple[bytes, bytes]:
+    """Capture at most GATE_OUTPUT_LIMIT_BYTES across both gate streams."""
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    total = 0
+    overflow = asyncio.Event()
+
+    async def drain(name: str, stream: asyncio.StreamReader | None) -> None:
+        nonlocal total
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(8192)
+            if not chunk:
+                return
+            remaining = GATE_OUTPUT_LIMIT_BYTES - total
+            if remaining > 0:
+                kept = chunk[:remaining]
+                captured[name].extend(kept)
+                total += len(kept)
+            if len(chunk) > remaining:
+                overflow.set()
+                return
+
+    readers = [
+        asyncio.create_task(drain("stdout", proc.stdout)),
+        asyncio.create_task(drain("stderr", proc.stderr)),
+    ]
+    process_done = asyncio.create_task(proc.wait())
+    output_full = asyncio.create_task(overflow.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {process_done, output_full}, timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            await _kill_process_group_and_reap(proc)
+            await asyncio.gather(*readers, return_exceptions=True)
+            raise TimeoutError
+        if output_full in done and overflow.is_set():
+            await _kill_process_group_and_reap(proc)
+        await asyncio.gather(*readers, return_exceptions=True)
+        if overflow.is_set():
+            raise _GateOutputOverflow(bytes(captured["stdout"]), bytes(captured["stderr"]))
+        await process_done
+        return bytes(captured["stdout"]), bytes(captured["stderr"])
+    except asyncio.CancelledError:
+        await _kill_process_group_and_reap(proc)
+        await asyncio.gather(*readers, return_exceptions=True)
+        raise
+    finally:
+        for task in (*readers, process_done, output_full):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(process_done, output_full, return_exceptions=True)
+
+
 async def _next_message(
     messages: asyncio.Queue[dict[str, Any] | None], deadline: float
 ) -> dict[str, Any] | None:
@@ -218,7 +286,14 @@ async def _run_gate(
         close_fds=True,
     )
     try:
-        _out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        _out, err = await _communicate_gate_bounded(proc, timeout)
+    except _GateOutputOverflow as exc:
+        log.emit(
+            "gate", task_id=task_id, command=command, exit_code=125,
+            timed_out=False, output_overflow=True,
+            stderr=exc.stderr.decode("utf-8", "replace")[:512],
+        )
+        return 125
     except TimeoutError:
         await _kill_process_group_and_reap(proc)
         log.emit("gate", task_id=task_id, command=command, exit_code=None, timed_out=True)
@@ -1880,8 +1955,20 @@ class _Runtime:
             close_fds=True,
         )
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            out, err = await _communicate_gate_bounded(proc, timeout)
             rc = proc.returncode if proc.returncode is not None else 1
+        except _GateOutputOverflow as exc:
+            rc = 125
+            await self.emit(
+                "gate", task_id=task_id, exit_code=rc, tree=tree,
+                timed_out=False, output_overflow=True,
+            )
+            output = exc.stdout + exc.stderr
+            if output:
+                await self.emit(
+                    "log", task_id=task_id, stream="gate",
+                    message=output.decode("utf-8", "replace")[:2048],
+                )
         except TimeoutError:
             await _kill_process_group_and_reap(proc)
             rc = 124

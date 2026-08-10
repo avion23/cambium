@@ -153,6 +153,33 @@ def _write_worktree_state(
     path.write_text(content)
 
 
+def _rollback_owned_state(worktree: Path, generation: int, rollback_base: str) -> bool:
+    """Discard only this stale generation's state without moving newer work."""
+    if validate_worker_generation(worktree, generation):
+        return False
+    rc, current_head, _err = git("rev-parse", "HEAD", cwd=worktree)
+    if rc != 0:
+        return False
+    if current_head != rollback_base:
+        rc, commit_count, _err = git(
+            "rev-list", "--first-parent", "--count", f"{rollback_base}..{current_head}",
+            cwd=worktree,
+        )
+        if rc != 0 or commit_count != "1":
+            return False
+        if validate_worker_generation(worktree, generation):
+            return False
+        rc, _out, _err = git(
+            "update-ref", "HEAD", rollback_base, current_head, cwd=worktree
+        )
+        if rc != 0:
+            return False
+    if validate_worker_generation(worktree, generation):
+        return False
+    rc, _out, _err = git("reset", "--hard", "HEAD", cwd=worktree)
+    return rc == 0
+
+
 def cap_diff(diff: str) -> tuple[str, bool]:
     """Cap ``diff`` to ``MAX_DIFF_BYTES`` UTF-8 bytes, never splitting a
     codepoint; returns ``(diff, truncated)``."""
@@ -293,9 +320,13 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         )
         return outcome
     except GenerationFenceError as exc:
-        if rollback_base is not None:
-            git("reset", "--hard", rollback_base, cwd=worktree)
+        rolled_back = (
+            rollback_base is not None
+            and _rollback_owned_state(worktree, generation, rollback_base)
+        )
         outcome["failure_reason"] = str(exc)
+        if rollback_base is not None and not rolled_back:
+            outcome["failure_reason"] += "; rollback skipped because branch HEAD moved"
         return outcome
     except Exception as exc:  # let-it-crash: report as a failure, not a hang
         outcome["failure_reason"] = f"task crashed: {exc}"

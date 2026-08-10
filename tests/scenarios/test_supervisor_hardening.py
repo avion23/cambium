@@ -240,6 +240,40 @@ def test_gate_timeout_kills_descendant_process_group(tmp_path: Path) -> None:
                if event["kind"] == "gate")
 
 
+def test_gate_output_overflow_is_bounded_and_kills_process_group(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    pid_file = tmp_path / "noisy-gate.pid"
+    program = (
+        "import os,sys; "
+        f"open({str(pid_file)!r},'w').write(str(os.getpid())); "
+        "chunk='x'*4096; "
+        "exec(\"while True:\\n sys.stdout.write(chunk)\\n sys.stdout.flush()\")"
+    )
+    gate = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}"
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-gate-overflow",
+        worker=FAKE_WORKER,
+        gate=gate,
+        gate_timeout_s=5.0,
+        max_wall_s=10.0,
+    )
+
+    started = time.monotonic()
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    assert time.monotonic() - started < 4.0
+    assert result.results[0].status == "failed"
+    assert result.results[0].reason == "gate_failed"
+    _wait_pid_gone(int(pid_file.read_text(encoding="ascii")))
+    gate_events = _kinds(read_events(session_dir), "gate")
+    assert any(event["payload"].get("output_overflow") for event in gate_events)
+
+
 def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -578,6 +612,55 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
     ).stdout.strip() == base
 
 
+def test_ready_without_proto_is_terminal_without_run_gate_or_merge(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "missing-proto-worker.py"
+    worker.write_text(
+        "import json, sys, time\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type': 'ready', 'request_id': init['request_id']}), "
+        "flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-missing-proto",
+        worker=str(worker),
+        gate="true",
+        max_restarts=2,
+        max_wall_s=5.0,
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    task_result = result.results[0]
+    assert task_result.status == "failed"
+    assert task_result.reason == "PROTO_VERSION_MISMATCH"
+    assert task_result.restarts == 0
+    events = read_events(session_dir)
+    assert any(
+        event["kind"] == "protocol"
+        and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
+        and event["payload"].get("got") is None
+        for event in events
+    )
+    assert not _kinds(events, "run_task")
+    assert not _kinds(events, "gate")
+    assert not _kinds(events, "merge_started")
+    assert not _kinds(events, "merge_committed")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+
+
 def test_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
     tmp_path: Path,
 ) -> None:
@@ -770,6 +853,38 @@ def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without
         capture_output=True,
         text=True,
     ).stdout
+
+
+def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    worker = tmp_path / "missing-proto-slice-worker.py"
+    worker.write_text(
+        "import json, sys, time\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type': 'ready', 'request_id': init['request_id']}), "
+        "flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+    result = asyncio.run(run_session(session_dir, _slice_spec(session_dir, str(worker))))
+
+    assert result.status == "failed"
+    assert result.merge_sha is None
+    events = [
+        json.loads(line)
+        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        event["kind"] == "protocol"
+        and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
+        and event["payload"].get("got") is None
+        for event in events
+    )
+    assert not any(event["kind"] in {"run_task", "gate", "merge"} for event in events)
 
 
 def test_oversized_stdout_line_fails_custos_reader(tmp_path: Path) -> None:
