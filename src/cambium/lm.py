@@ -373,9 +373,11 @@ class _CambiumLMMixin:
         """Keep prompts and request options out of DSPy's process-global history."""
         del entry
 
-    def copy(self, **kwargs: Any) -> Any:
+    def copy(self, /, *args: Any, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
         _require_exact_keyword_keys(kwargs)
+        if args:
+            raise TypeError("CambiumLM.copy accepts keyword arguments only")
         self._validate_model(self._provider_model)
         self._validate_budget(self._budget_usd)
         launch_kwargs = self._safe_kwargs({"launch_kwargs": self.launch_kwargs})[
