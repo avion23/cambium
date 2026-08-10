@@ -8,13 +8,21 @@ run ruff over ``src`` with the project's rules.
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
+from cambium import doctor
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
+_CREDENTIAL_ENV_RE = re.compile(
+    r"(api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
+)
 
 
 def _run_doctor(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
@@ -46,7 +54,77 @@ def test_doctor_exits_zero_on_healthy_repo() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Summary:" in result.stdout
     assert "0 fail" in result.stdout
-    assert "ALL CHECKS PASSED" in result.stdout
+    assert "Dataset integrity" in result.stdout
+    assert "module-owned JSONL" in result.stdout
+
+
+def test_doctor_exits_zero_without_example_module(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(tmp_path / "missing-providers.json"))
+    package = tmp_path / "cambium"
+    shutil.copytree(
+        REPO_ROOT / "src" / "cambium",
+        package,
+        ignore=shutil.ignore_patterns("example", "__pycache__"),
+    )
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "CAMBIUM_PROVIDERS" and _CREDENTIAL_ENV_RE.search(name) is None
+    }
+    environment["PYTHONPATH"] = str(tmp_path)
+
+    result = subprocess.run(
+        DOCTOR,
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no module-owned JSONL datasets" in result.stdout
+    assert "0 fail" in result.stdout
+
+
+def test_doctor_skips_absent_module_directory(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "missing-modules")
+
+    status, detail = doctor.check_dataset()
+
+    assert status is doctor.Status.SKIP
+    assert "no module-owned JSONL datasets" in detail
+
+
+def test_doctor_fails_on_invalid_module_dataset(tmp_path, monkeypatch) -> None:
+    dataset = tmp_path / "modules" / "custom" / "datasets" / "records.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text('{"id": "ok"}\nnot-json\n', encoding="utf-8")
+    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "modules")
+
+    status, detail = doctor.check_dataset()
+
+    assert status is doctor.Status.FAIL
+    assert "invalid JSON" in detail
+    assert "records.jsonl:2" in detail
+
+
+def test_doctor_fails_on_unreadable_module_directory(tmp_path, monkeypatch) -> None:
+    module = tmp_path / "modules" / "custom"
+    dataset = module / "datasets" / "records.jsonl"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text("not-json\n", encoding="utf-8")
+    module.chmod(0)
+    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "modules")
+
+    try:
+        status, detail = doctor.check_dataset()
+    finally:
+        module.chmod(0o755)
+
+    assert status is doctor.Status.FAIL
+    assert "dataset integrity check failed" in detail
+    assert "cannot read directory" in detail
 
 
 def test_doctor_fails_on_corrupt_event_store(tmp_path) -> None:

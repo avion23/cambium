@@ -3,8 +3,9 @@
 A health check modeled on ``codex doctor`` (see ``docs/research/codex.md``).
 It exists to surface early the drift failure mode Codex's local install
 exhibits: state rows pointing at missing or unusable files. The Cambium
-analogue checked here: worktree entries whose directory is gone, and an
-event store that fails ``PRAGMA integrity_check``.
+analogue checked here: worktree entries whose directory is gone, an event
+store that fails ``PRAGMA integrity_check``, and module-owned JSONL datasets
+that contain invalid records.
 
 Exit status: 0 when no check fails (warnings and skips are allowed), 1 when
 any check fails.
@@ -28,6 +29,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 
 from .provider_config import (
     DEFAULT_SAMPLE,
@@ -37,14 +39,13 @@ from .provider_config import (
 )
 from .system_health import format_health, health
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 MIN_PYTHON = (3, 14)
 MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
 CONVERSATIONS_DB_REL = ".cambium/sessions/conversations.db"
 DLQ_REL = ".cambium/dlq"
 EVAL_CACHE_REL = ".cambium/eval-cache"
-DATASET_CHECK = REPO_ROOT / "scripts" / "check_dataset_v1.py"
+MODULES_ROOT = Path(__file__).resolve().parent / "modules"
 OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
 
 
@@ -56,6 +57,10 @@ class Status(enum.StrEnum):
     FAIL = "fail"
     SKIP = "skip"
     INFO = "info"
+
+
+class DatasetIntegrityError(Exception):
+    """Raised when a module-owned dataset cannot be discovered or validated."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,18 +329,92 @@ def check_system_health(path: Path) -> tuple[Status, str]:
         return Status.SKIP, f"system health unavailable: {exc}"
 
 
-def check_dataset() -> tuple[Status, str]:
+def _directory_entries(directory: Path) -> list[Path] | None:
+    """List a directory, returning ``None`` only when it does not exist."""
     try:
-        result = subprocess.run(
-            [sys.executable, str(DATASET_CHECK)],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+        with os.scandir(directory) as entries:
+            return [Path(entry.path) for entry in entries]
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{directory}: cannot read directory: {exc}") from exc
+
+
+def _is_directory(path: Path) -> bool:
+    try:
+        return S_ISDIR(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{path}: cannot inspect directory: {exc}") from exc
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{path}: cannot inspect dataset file: {exc}") from exc
+
+
+def _dataset_jsonl_files() -> list[Path]:
+    root_entries = _directory_entries(MODULES_ROOT)
+    if root_entries is None:
+        return []
+
+    files: list[Path] = []
+    for module_dir in sorted(path for path in root_entries if _is_directory(path)):
+        dataset_dir = module_dir / "datasets"
+        dataset_entries = _directory_entries(dataset_dir)
+        if dataset_entries is None:
+            continue
+        files.extend(
+            path
+            for path in dataset_entries
+            if path.suffix == ".jsonl" and _is_regular_file(path)
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return Status.FAIL, f"could not run {DATASET_CHECK.name}: {exc}"
-    if result.returncode == 0 and "ALL CHECKS PASSED" in result.stdout:
-        return Status.PASS, "ALL CHECKS PASSED"
-    tail = "\n".join((result.stdout + result.stderr).strip().splitlines()[-3:])
-    return Status.FAIL, f"exit {result.returncode}: {tail or 'no output'}"
+    return sorted(files)
+
+
+def _jsonl_record_count(path: Path) -> int:
+    records = 0
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise DatasetIntegrityError(f"{path}:{line_number}: invalid JSON") from exc
+            if not isinstance(value, dict):
+                raise DatasetIntegrityError(
+                    f"{path}:{line_number}: record is not a JSON object"
+                )
+            records += 1
+    return records
+
+
+def check_dataset() -> tuple[Status, str]:
+    """Check module-owned JSONL records without importing a decision module."""
+    try:
+        files = _dataset_jsonl_files()
+    except DatasetIntegrityError as exc:
+        return Status.FAIL, f"dataset integrity check failed: {exc}"
+    except OSError as exc:
+        return Status.FAIL, f"could not discover module datasets: {exc}"
+    if not files:
+        return Status.SKIP, f"{MODULES_ROOT} has no module-owned JSONL datasets"
+
+    try:
+        records = sum(_jsonl_record_count(path) for path in files)
+    except DatasetIntegrityError as exc:
+        return Status.FAIL, f"dataset integrity check failed: {exc}"
+    except (OSError, UnicodeError, ValueError) as exc:
+        return Status.FAIL, f"dataset integrity check failed: {exc}"
+    dataset_word = "dataset" if len(files) == 1 else "datasets"
+    record_word = "record" if records == 1 else "records"
+    return Status.PASS, f"{len(files)} module-owned JSONL {dataset_word}, {records} {record_word}"
 
 
 def _git_tracked(repo: Path, relative: str) -> bool:
