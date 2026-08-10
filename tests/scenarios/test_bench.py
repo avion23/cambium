@@ -62,6 +62,17 @@ FAST_TESTS = MODULE_TESTS + UNRELATED_TESTS
 
 WALL_RATIO = "--bench-wall-ratio=100"
 
+# Deterministic module-test timings for CLI-path tests whose assertions do not
+# involve wall time (drift reports, re-anchor, dataset_version fail-closed).
+# The standalone CLI re-measures the module's full test suite (57 tests) in a
+# nested pytest subprocess per invocation (~3.5s); substituting a fixed timing
+# set keeps those tests exercising the report/gate/drift-report code paths
+# without repeating identical subprocess work.
+FAKE_TIMINGS = {
+    "src/cambium/modules/example/tests/"
+    "test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.01,
+}
+
 
 def _write_fixture_module(
     tmp_path: Path,
@@ -1488,6 +1499,7 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     """``gate --drift-report`` still fails on drift and records it."""
     import cambium.bench as bench
 
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
     monkeypatch.setattr(
@@ -1511,6 +1523,7 @@ def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     artifact write fails the run instead of clobbering the anchor."""
     import cambium.bench as bench
 
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
     anchor_path = bench_root / "should_decompose" / "baseline.json"
@@ -1535,6 +1548,7 @@ def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
     preserving the anchor, and the run fails."""
     import cambium.bench as bench
 
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
     anchor_path = bench_root / "should_decompose" / "baseline.json"
@@ -1562,6 +1576,7 @@ def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     change fails the gate and preserves the anchor; ``re-anchor`` records it."""
     import cambium.bench as bench
 
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
     anchor_path = bench_root / "should_decompose" / "baseline.json"
