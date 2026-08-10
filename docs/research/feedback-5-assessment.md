@@ -59,6 +59,8 @@ m1-canonicalization-plan.md`, `docs/research/feedback-4-assessment.md`,
 **ADOPT-LITE 3** (9, 10, 12) · **ALREADY-IMPLEMENTED 4** (8, 13, 15, 17) ·
 **ALREADY-PLANNED 1** (3) · **ALREADY-IN-DESIGN 1** (16) · **PARTIAL 2** (5, 6).
 
+**Correction (claim 7):** The assertion that `graphlib.TopologicalSorter.CycleError` does not expose the cycle path is factually incorrect; verified on Python 3.14.7, `e.args[1]` is the cycle list (`('nodes are in a cycle', ['a', 'b', 'a'])`). The hand-rolled Kahn is retained for deterministic ordering and message control, not for cycle-path availability.
+
 ---
 
 ## 2. What this means for the plan
