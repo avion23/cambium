@@ -1,7 +1,7 @@
 """Scenario tests for the Diffundo provider router (src/cambium/diffundo.py).
 
-No mocks, no network: each scenario drives real ``Diffundo.call`` /
-``Diffundo.call_race`` against fake OpenAI-compatible HTTP servers
+No mocks, no network: each scenario drives real ``Diffundo.call`` against fake
+OpenAI-compatible HTTP servers
 (``http.server`` in background threads), following the test-strategy rule of
 ``asyncio.run()`` inside sync test functions. Scenarios map to the architecture
 and cascade-design contracts:
@@ -12,11 +12,9 @@ and cascade-design contracts:
    call -> DISABLED (cascade-design §2.4, first-call included).
 4. token bucket: rpm=1 -> second call cascades (D8f).
 5. all providers exhausted -> pause (bounded) then AllProvidersFailed.
-6. race: quality gate (fast-wrong vs slow-right), crashed provider does not
-   kill the race, best-by-score fallback (cascade-design §1.3).
-7. prompt guard: volatile timestamp/request_id in the top 3 lines rejected,
+6. prompt guard: volatile timestamp/request_id in the top 3 lines rejected,
    static top accepted (D8c).
-8. no local cache: the instance has no mutable mapping attribute (D1).
+7. no local cache: the instance has no mutable mapping attribute (D1).
 """
 
 from __future__ import annotations
@@ -585,30 +583,6 @@ def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypat
         malformed.close()
 
 
-def test_race_rejects_malformed_tool_call_before_quality_acceptance(
-    tmp_path, monkeypatch
-) -> None:
-    # cascade-design §1.3: a malformed [{}] tool-call completion is an ERROR
-    # attempt, so it can never win the race through the quality gate.
-    malformed = FakeServer([(200, _tool_call_payload([{}]), 0.0)])
-    ok = FakeServer([(200, _ok_payload("right"), 0.1)])
-    _set_keys(monkeypatch, "K_MAL", "K_OK")
-    router = Diffundo(
-        (
-            _config("p_mal", malformed, "K_MAL"),
-            _config("p_ok", ok, "K_OK"),
-        )
-    )
-    try:
-        result = asyncio.run(router.call_race(ProviderTier.FAST, PROMPT, race_timeout_s=5.0))
-        assert result.provider == "p_ok"
-        assert result.content == "right"
-        assert router.health("p_mal") is HealthState.COOLDOWN
-    finally:
-        malformed.close()
-        ok.close()
-
-
 def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypatch) -> None:
     # A real read_file tool call with concrete arguments must still pass
     # unchanged through the malformed-call guard.
@@ -864,124 +838,8 @@ def test_call_budget_still_allows_success_within_budget(tmp_path, monkeypatch) -
         fast.close()
 
 
-def test_race_bounded_by_timeout_with_slow_providers(tmp_path, monkeypatch) -> None:
-    slow1 = FakeServer([(200, _ok_payload("slow1"), 0.8)])
-    slow2 = FakeServer([(200, _ok_payload("slow2"), 0.8)])
-    _set_keys(monkeypatch, "K_S1", "K_S2")
-    router = Diffundo(
-        (
-            _config("p_s1", slow1, "K_S1", timeout_s=1.0, max_retries=1),
-            _config("p_s2", slow2, "K_S2", timeout_s=1.0, max_retries=1),
-        ),
-    )
-    try:
-        start = time.monotonic()
-        with pytest.raises(AllProvidersFailed):
-            asyncio.run(
-                router.call_race(ProviderTier.FAST, PROMPT, race_timeout_s=0.5)
-            )
-        # both attempts are deadline-capped; the race cannot outlive the budget
-        assert time.monotonic() - start <= 1.5
-    finally:
-        slow1.close()
-        slow2.close()
-
-
 # --------------------------------------------------------------------------- #
-# 6. race mode
-# --------------------------------------------------------------------------- #
-
-
-def test_race_fast_wrong_loses_to_slow_right(tmp_path, monkeypatch) -> None:
-    fast = FakeServer([(200, _ok_payload("fast wrong"), 0.0)])
-    slow = FakeServer([(200, _ok_payload("right answer"), 0.15)])
-    _set_keys(monkeypatch, "K_FAST", "K_SLOW")
-    router = Diffundo(
-        (
-            _config("p_fast", fast, "K_FAST"),
-            _config("p_slow", slow, "K_SLOW"),
-        )
-    )
-    try:
-        result = asyncio.run(
-            router.call_race(
-                ProviderTier.FAST,
-                PROMPT,
-                quality_gate=lambda r: "right" in r.content,
-                race_timeout_s=5.0,
-            )
-        )
-        # first-completed was fast but failed the gate; the race kept waiting
-        assert result.provider == "p_slow"
-        assert result.content == "right answer"
-        assert len(fast.calls) == 1 and len(slow.calls) == 1
-    finally:
-        fast.close()
-        slow.close()
-
-
-def test_race_crashed_provider_does_not_kill_race(tmp_path, monkeypatch) -> None:
-    # The crash completes first (instant 500, recorded as a failure); the
-    # survivor is slower. A crashed provider must neither win nor kill the race.
-    crash = FakeServer([(500, _error_payload("crash"), 0.0)])
-    ok = FakeServer([(200, _ok_payload("survivor"), 0.1)])
-    _set_keys(monkeypatch, "K_CRASH", "K_OK")
-    router = Diffundo((_config("p_crash", crash, "K_CRASH"), _config("p_ok", ok, "K_OK")))
-    try:
-        result = asyncio.run(router.call_race(ProviderTier.FAST, PROMPT, race_timeout_s=5.0))
-        assert result.provider == "p_ok"
-        assert result.content == "survivor"
-        # the crash was recorded, not swallowed: health reflects the failure
-        assert router.health("p_crash") is HealthState.COOLDOWN
-    finally:
-        crash.close()
-        ok.close()
-
-
-def test_race_best_by_score_fallback_when_nobody_passes_gate(tmp_path, monkeypatch) -> None:
-    short = FakeServer([(200, _ok_payload("short"), 0.0)])
-    long = FakeServer([(200, _ok_payload("a much longer response"), 0.0)])
-    _set_keys(monkeypatch, "K_SHORT", "K_LONG")
-    router = Diffundo(
-        (
-            _config("p_short", short, "K_SHORT"),
-            _config("p_long", long, "K_LONG"),
-        )
-    )
-    try:
-        result = asyncio.run(
-            router.call_race(
-                ProviderTier.FAST,
-                PROMPT,
-                quality_gate=lambda r: "magic" in r.content,  # both fail the gate
-                race_timeout_s=5.0,
-            )
-        )
-        # no gated winner -> best-by-score (default length proxy) is returned
-        assert result.provider == "p_long"
-        assert result.content == "a much longer response"
-        assert len(short.calls) == 1 and len(long.calls) == 1
-    finally:
-        short.close()
-        long.close()
-
-
-def test_race_all_providers_fail_raises(tmp_path, monkeypatch) -> None:
-    a = FakeServer([(500, _error_payload("a down"), 0.0)])
-    b = FakeServer([(500, _error_payload("b down"), 0.0)])
-    _set_keys(monkeypatch, "K_A", "K_B")
-    router = Diffundo((_config("p_a", a, "K_A"), _config("p_b", b, "K_B")))
-    try:
-        with pytest.raises(AllProvidersFailed) as exc:
-            asyncio.run(router.call_race(ProviderTier.FAST, PROMPT, race_timeout_s=2.0))
-        assert set(exc.value.providers_tried) == {"p_a", "p_b"}
-    finally:
-        a.close()
-        b.close()
-
-
-# --------------------------------------------------------------------------- #
-# 7. prompt guard (D8c)
+# 6. prompt guard (D8c)
 # --------------------------------------------------------------------------- #
 
 
@@ -1030,7 +888,7 @@ def test_prompt_guard_accepts_static_head_and_dynamic_tail() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 8. no local cache (D1)
+# 7. no local cache (D1)
 # --------------------------------------------------------------------------- #
 
 
