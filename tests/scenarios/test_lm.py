@@ -562,6 +562,30 @@ def test_rejected_constructions_do_not_register_diffundo() -> None:
     assert len(lm_module._DIFFUNDO_REGISTRY) == registry_size
 
 
+def test_rejected_copies_do_not_register_replacement_diffundo() -> None:
+    _require_dspy()
+    import cambium.lm as lm_module
+
+    diffundo = FakeDiffundo()
+    replacement = FakeDiffundo("https://replacement.invalid")
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    with lm_module._DIFFUNDO_REGISTRY_LOCK:
+        lm_module._DIFFUNDO_REGISTRY.clear()
+
+    for _ in range(100):
+        with pytest.raises(ValueError, match="invalid"):
+            lm.copy(diffundo=replacement, tier="invalid")
+
+    assert len(lm_module._DIFFUNDO_REGISTRY) == 0
+
+
+def test_budget_rejects_nan() -> None:
+    _require_dspy()
+
+    with pytest.raises(ValueError, match="finite"):
+        CambiumLM(FakeDiffundo(), ProviderTier.FAST, budget_usd=float("nan"))  # type: ignore[arg-type]
+
+
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -692,6 +716,25 @@ def test_predict_json_round_trip_preserves_literal_byte_marker_mapping(tmp_path:
     predict.load(state_path, allow_unsafe_lm_state=True)
 
     assert predict.lm.launch_kwargs["nested"] == marker
+
+
+def test_predict_json_round_trip_preserves_nested_tuple_mapping_key(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    expected = {("a", "b"): "value"}
+    predict = dspy.Predict("question -> answer")
+    predict.lm = CambiumLM(  # type: ignore[arg-type]
+        FakeDiffundo(),
+        ProviderTier.FAST,
+        launch_kwargs={"nested": expected},
+    )
+    state_path = tmp_path / "state.json"
+
+    predict.save(state_path)
+    predict.load(state_path, allow_unsafe_lm_state=True)
+
+    assert predict.lm.launch_kwargs["nested"] == expected
 
 
 def test_copied_budget_round_trip_routes_with_override(tmp_path: Path) -> None:

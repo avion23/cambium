@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import sysconfig
 import tempfile
@@ -72,6 +73,7 @@ _DSPY: Any | None = None
 _JSON_SNAPSHOT_SENTINEL = "__cambium_json_snapshot_v1__"
 _JSON_MAPPING_MARKER = 0
 _JSON_BYTES_MARKER = 1
+_JSON_TUPLE_MARKER = 2
 
 
 def _normalize_key(key: Any) -> Any:
@@ -381,6 +383,13 @@ class _CambiumLMMixin:
             self._validate_model(adapter_overrides["model"])
         if "budget_usd" in adapter_overrides:
             self._validate_budget(adapter_overrides["budget_usd"])
+        if "diffundo" in adapter_overrides:
+            diffundo = adapter_overrides["diffundo"]
+            if not isinstance(diffundo, Diffundo) and not callable(getattr(diffundo, "call", None)):
+                raise TypeError("diffundo must provide async call(tier, prompt, ...)")
+        copied_tier = self._tier
+        if "tier" in adapter_overrides:
+            copied_tier = ProviderTier(adapter_overrides["tier"])
         safe_kwargs = self._safe_kwargs(
             {key: value for key, value in kwargs.items() if key not in adapter_overrides}
         )
@@ -388,18 +397,16 @@ class _CambiumLMMixin:
         copied.launch_kwargs = safe_kwargs.get("launch_kwargs", launch_kwargs)
         copied.train_kwargs = safe_kwargs.get("train_kwargs", train_kwargs)
         if "diffundo" in adapter_overrides:
-            diffundo = adapter_overrides["diffundo"]
-            if not isinstance(diffundo, Diffundo) and not callable(getattr(diffundo, "call", None)):
-                raise TypeError("diffundo must provide async call(tier, prompt, ...)")
             copied._diffundo = diffundo
-            copied._diffundo_reference = _register_diffundo(diffundo)
         if "tier" in adapter_overrides:
-            copied._tier = ProviderTier(adapter_overrides["tier"])
-            copied.model = f"cambium/{copied._tier.value}"
+            copied._tier = copied_tier
+            copied.model = f"cambium/{copied_tier.value}"
         if "model" in adapter_overrides:
             copied._provider_model = adapter_overrides["model"]
         if "budget_usd" in adapter_overrides:
             copied._budget_usd = adapter_overrides["budget_usd"]
+        if "diffundo" in adapter_overrides:
+            copied._diffundo_reference = _register_diffundo(diffundo)
         return copied
 
     def dump_state(self) -> dict[str, Any]:
@@ -490,7 +497,12 @@ class _CambiumLMMixin:
                 pairs = [[encode(key), encode(nested)] for key, nested in item.items()]
                 return {_JSON_SNAPSHOT_SENTINEL: [_JSON_MAPPING_MARKER, pairs]}
             if isinstance(item, tuple):
-                return [encode(nested) for nested in item]
+                return {
+                    _JSON_SNAPSHOT_SENTINEL: [
+                        _JSON_TUPLE_MARKER,
+                        [encode(nested) for nested in item],
+                    ]
+                }
             return item
 
         return {key: encode(item) for key, item in value.items()}
@@ -515,6 +527,10 @@ class _CambiumLMMixin:
                 if type(payload) is not str:
                     raise TypeError("CambiumLM byte snapshot must contain an exact builtin string")
                 return base64.b64decode(payload, validate=True)
+            if marker == _JSON_TUPLE_MARKER:
+                if type(payload) is not list:
+                    raise ValueError("invalid CambiumLM tuple snapshot")
+                return tuple(decode(nested) for nested in payload)
             if marker != _JSON_MAPPING_MARKER or type(payload) is not list:
                 raise ValueError("invalid CambiumLM JSON snapshot marker")
 
@@ -589,6 +605,8 @@ class _CambiumLMMixin:
     def _validate_budget(budget_usd: Any) -> int | float | None:
         if budget_usd is not None and type(budget_usd) not in (int, float):
             raise TypeError("budget_usd must be an exact builtin number")
+        if type(budget_usd) is float and not math.isfinite(budget_usd):
+            raise ValueError("budget_usd must be finite")
         return budget_usd
 
     @staticmethod
