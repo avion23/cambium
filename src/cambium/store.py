@@ -155,23 +155,29 @@ class _BoundedEventQueue:
         evict_noncritical: bool = True,
         on_admit: Callable[[], Any] | None = None,
         cancel: threading.Event | None = None,
+        check: Callable[[], None] | None = None,
     ) -> int:
         deadline = time.monotonic() + timeout
-        with self._cond:
+
+        def check_state() -> None:
             if cancel is not None and cancel.is_set():
                 raise _AdmissionCancelled
+            if check is not None:
+                check()
+
+        with self._cond:
+            check_state()
             if not critical:
                 if len(self._items) >= self._maxsize:
+                    check_state()
                     return 1
-                if cancel is not None and cancel.is_set():
-                    raise _AdmissionCancelled
+                check_state()
                 self._items.append(on_admit() if on_admit is not None else item)
                 self._cond.notify()
                 return 0
             dropped = 0
             while len(self._items) >= self._maxsize:
-                if cancel is not None and cancel.is_set():
-                    raise _AdmissionCancelled
+                check_state()
                 if evict_noncritical and self._evict_oldest_noncritical():
                     dropped += 1
                     continue
@@ -179,8 +185,7 @@ class _BoundedEventQueue:
                 if remaining <= 0:
                     raise queue.Full
                 self._cond.wait(remaining)
-            if cancel is not None and cancel.is_set():
-                raise _AdmissionCancelled
+            check_state()
             self._items.append(on_admit() if on_admit is not None else item)
             self._cond.notify()
             return dropped
@@ -304,6 +309,10 @@ class EventStore:
 
         def admit() -> tuple[int, str, tuple, _Pending]:
             with self._lock:
+                if self._dead is not None:
+                    raise StoreError("event store is dead") from self._dead
+                if self._closed:
+                    raise _AdmissionCancelled
                 seq = self._next_seq
                 self._next_seq += 1
             seq_holder.append(seq)
@@ -317,6 +326,7 @@ class EventStore:
                 timeout=remaining,
                 on_admit=admit,
                 cancel=self._close_requested,
+                check=self._check_writer_alive,
             )
         except _AdmissionCancelled:
             raise RuntimeError("EventStore is closed") from None
@@ -373,6 +383,12 @@ class EventStore:
             return
         with self._lock:
             self._dropped += count
+
+    def _check_writer_alive(self) -> None:
+        with self._lock:
+            dead = self._dead
+        if dead is not None:
+            raise StoreError("event store is dead") from dead
 
     def close(self) -> None:
         with self._lock:
@@ -488,7 +504,7 @@ class EventStore:
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM events"
                 ).fetchone()[0]
                 self._started.set()
-        except Exception as exc:
+        except BaseException as exc:
             with self._lock:
                 self._dead = exc
                 self._started.set()
@@ -548,31 +564,37 @@ class EventStore:
                     break
                 pending.event.set()
                 cur_pending = None
-        except Exception as exc:
+        except BaseException as exc:
             dead_exc = exc
-            with self._lock:
-                if self._dead is None:
-                    self._dead = exc
+            self._record_writer_failure(exc)
             self._fail_pending(exc)
             if cur_pending is not None:
-                cur_pending.exc = self._termination_error()
+                cur_pending.exc = exc
                 cur_pending.event.set()
         finally:
             if dead_exc is None and not self._stop_requested.is_set():
                 try:
                     self._fsync_now()
-                except Exception as exc:
-                    with self._lock:
-                        if self._close_error is None:
-                            self._close_error = exc
-                        if self._dead is None:
-                            self._dead = exc
+                except BaseException as exc:
+                    self._record_writer_failure(exc, close_error=True)
+                    self._fail_pending(exc)
+                    if cur_pending is not None:
+                        cur_pending.exc = exc
+                        cur_pending.event.set()
             if wal_fd is not None:
                 os.close(wal_fd)
             if db_fd is not None:
                 os.close(db_fd)
             if conn is not None:
                 conn.close()
+
+    def _record_writer_failure(self, exc: BaseException, *, close_error: bool = False) -> None:
+        with self._lock:
+            if self._dead is None:
+                self._dead = exc
+            if close_error and self._close_error is None:
+                self._close_error = exc
+        self._queue.wake()
 
     def _termination_error(self) -> BaseException:
         with self._lock:

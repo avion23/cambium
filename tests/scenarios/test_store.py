@@ -527,6 +527,112 @@ def test_close_raises_after_writer_death(tmp_path, monkeypatch) -> None:
     assert isinstance(error.value.__cause__, OSError)
 
 
+def test_uncaught_base_exception_marks_writer_dead_and_wakes_critical_append(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=10.0)
+    fsync_started = threading.Event()
+    release = threading.Event()
+    append_errors: list[BaseException] = []
+
+    def fail_with_system_exit(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise SystemExit("injected writer termination")
+
+    def append_result() -> None:
+        try:
+            store.append({"kind": "result", "payload": {}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_with_system_exit)
+    caller = threading.Thread(target=append_result)
+    try:
+        caller.start()
+        assert fsync_started.wait(1.0)
+        release_at = time.monotonic()
+        release.set()
+        caller.join(1.0)
+        elapsed = time.monotonic() - release_at
+        assert not caller.is_alive()
+        assert elapsed < 0.5
+        assert store._dead is not None
+        assert isinstance(store._dead, SystemExit)
+        assert len(append_errors) == 1
+        assert isinstance(append_errors[0], StoreError)
+        assert isinstance(append_errors[0].__cause__, SystemExit)
+    finally:
+        release.set()
+        caller.join(1.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(1.0)
+
+
+def test_writer_death_rejects_waiting_admission_and_wakes_all_callers(
+    tmp_path, monkeypatch
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=10.0
+    )
+    fsync_started = threading.Event()
+    release = threading.Event()
+    append_errors: list[tuple[int, BaseException]] = []
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        release.wait(5.0)
+        raise OSError("fsync failed")
+
+    def append_result(value: int) -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append((value, exc))
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    first = threading.Thread(target=append_result, args=(0,))
+    queued = threading.Thread(target=append_result, args=(1,))
+    waiting = threading.Thread(target=append_result, args=(2,))
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        queued.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with store._queue._cond:
+                if len(store._queue._items) == 1:
+                    break
+            time.sleep(0.001)
+        else:
+            pytest.fail("queued event was not admitted")
+        waiting.start()
+        time.sleep(0.02)
+        release_at = time.monotonic()
+        release.set()
+        for caller in (first, queued, waiting):
+            caller.join(1.0)
+        elapsed = time.monotonic() - release_at
+
+        assert elapsed < 0.5
+        assert all(not caller.is_alive() for caller in (first, queued, waiting))
+        assert len(append_errors) == 3
+        assert all(isinstance(error, StoreError) for _, error in append_errors)
+        with store._queue._cond:
+            assert not store._queue._items
+        assert store._dead is not None
+    finally:
+        release.set()
+        for caller in (first, queued, waiting):
+            caller.join(1.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(1.0)
+
+
 def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
     tmp_path, monkeypatch
 ) -> None:
