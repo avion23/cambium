@@ -31,11 +31,13 @@ no mutable module state.
 
 from __future__ import annotations
 
+import argparse
 import heapq
 import json
 import sys
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from pathlib import Path
 from typing import Any
 
 # Build-time per-parent fan-out bound (I2.3). This is NOT the session-wide
@@ -480,14 +482,53 @@ def upward_result(node: TaskNode) -> dict[str, Any]:
     return {key: values[key] for key in _ENVELOPE_KEYS}
 
 
-def main() -> int:
-    """CLI (D8a): read one plan JSON object from stdin, print the topological
-    order as one JSON value per line to stdout; errors to stderr, exit 1."""
-    payload = sys.stdin.buffer.read()
+def _build_cli_parser() -> argparse.ArgumentParser:
+    """Build the standalone tasktree argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="python -m cambium.tasktree",
+        description=(
+            "Read a task plan JSON object from PLAN or stdin and print its "
+            "topological order."
+        ),
+    )
+    parser.add_argument(
+        "plan",
+        nargs="?",
+        metavar="PLAN",
+        help="path to a plan JSON file; omit or use '-' to read stdin",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the tasktree CLI from a JSON file or stdin.
+
+    With no plan argument, an empty stdin stream prints help so a package-level
+    module smoke invocation is useful. A non-empty stdin stream remains the
+    D8a pipe contract used by ``cambium tasktree`` and existing callers.
+    """
+    parser = _build_cli_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.plan is None or args.plan == "-":
+        payload = sys.stdin.buffer.read()
+        if args.plan is None and not payload.strip():
+            parser.print_help()
+            return 0
+    else:
+        try:
+            payload = Path(args.plan).read_bytes()
+        except OSError as exc:
+            parser.error(f"cannot read plan file {args.plan!r}: {exc}")
+
     try:
         plan = json.loads(payload)
         order = topological_order(build_tree(plan))
-    except (ValueError, TaskTreeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        source = "stdin" if args.plan in (None, "-") else f"plan file {args.plan!r}"
+        print(f"tasktree: invalid JSON in {source}: {exc}", file=sys.stderr)
+        return 1
+    except TaskTreeError as exc:
         print(f"tasktree: {exc}", file=sys.stderr)
         return 1
     for task_id in order:

@@ -63,10 +63,16 @@ def _build_parser() -> argparse.ArgumentParser:
         mode_parser.add_argument("--bench-metric-delta", type=float, metavar="FLOAT")
         mode_parser.add_argument("--bench-wall-ratio", type=float, metavar="FLOAT")
 
-    commands.add_parser(
+    tasktree = commands.add_parser(
         "tasktree",
-        help="read a plan from stdin and print its topological order",
-        description="Read one task plan JSON object from stdin and run tasktree.",
+        help="read a plan from a file or stdin and print its topological order",
+        description="Read one task plan JSON object from PLAN or stdin and run tasktree.",
+    )
+    tasktree.add_argument(
+        "plan",
+        nargs="?",
+        metavar="PLAN",
+        help="path to a plan JSON file; omit or use '-' to read stdin",
     )
     commands.add_parser("version", help="print the Cambium version")
     return parser
@@ -137,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "tasktree":
         from . import tasktree
 
-        return tasktree.main()
+        return tasktree.main([] if args.plan is None else [args.plan])
     if args.command == "version":
         print(__version__)
         return 0

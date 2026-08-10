@@ -417,11 +417,11 @@ def test_upward_result_root_has_null_parent_and_defaults() -> None:
 # -- 7. CLI (D8a): pipe a plan in, get the topological order as JSON lines ----
 
 
-def _run_cli(payload: str) -> subprocess.CompletedProcess[str]:
+def _run_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return subprocess.run(
-        [sys.executable, "-m", "cambium.tasktree"],
+        [sys.executable, "-m", "cambium.tasktree", *args],
         input=payload,
         capture_output=True,
         text=True,
@@ -441,6 +441,42 @@ def test_cli_prints_topological_order_json_lines() -> None:
     assert result.returncode == 0, result.stderr
     assert [json.loads(line) for line in result.stdout.splitlines()] == ["r", "a", "b"]
     assert result.stderr == ""
+
+
+def test_cli_reads_plan_from_json_file(tmp_path: Path) -> None:
+    plan = _plan([
+        ("r", "FEATURE", []),
+        ("a", "BUGFIX", ["r"]),
+    ])
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    result = _run_cli("", str(plan_path))
+
+    assert result.returncode == 0, result.stderr
+    assert [json.loads(line) for line in result.stdout.splitlines()] == ["r", "a"]
+    assert result.stderr == ""
+
+
+def test_cli_no_args_prints_help_for_empty_stdin() -> None:
+    result = _run_cli()
+
+    assert result.returncode == 0
+    assert result.stdout.startswith("usage: python -m cambium.tasktree")
+    assert "PLAN" in result.stdout
+    assert result.stderr == ""
+
+
+def test_cli_bad_plan_argument_exits_two_with_stderr(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-plan.json"
+
+    result = _run_cli("", str(missing))
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage:" in result.stderr
+    assert "cannot read plan file" in result.stderr
+    assert str(missing) in result.stderr
 
 
 def test_cli_cyclic_plan_exits_one_with_stderr() -> None:
