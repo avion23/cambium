@@ -53,7 +53,15 @@ Committed reference baselines live at
 `src/cambium/modules/<name>/tests/baselines/baseline.json`; ephemeral reports
 belong in gitignored `.cambium/baselines/`.
 
-### The schema (complete reference example)
+### The schema (abbreviated structural excerpt; not copyable)
+
+The following excerpt shows the required shape and live values, but it is
+intentionally abbreviated: `tests.count` is 57 while `tests.by_nodeid` shows
+one representative node only. It must not be copied as a committed baseline
+and does not by itself satisfy `module_conformance`. The canonical complete
+artifact is the tracked
+`src/cambium/modules/example/tests/baselines/baseline.json`; in every complete
+artifact, `tests.count` must equal the number of entries in `tests.by_nodeid`.
 
 ```jsonc
 {
@@ -99,9 +107,10 @@ belong in gitignored `.cambium/baselines/`.
 }
 ```
 
-The counts, digests, timings, and SHA above are the committed example baseline
-snapshot. The SHA is run provenance, not a claim about the current tree; a new
-run must record its own SHA and date.
+The counts, digests, timings, and SHA above are copied from the committed
+example snapshot for orientation only. The SHA is run provenance, not a claim
+about the current tree; a new run must record its own SHA and date. Use the
+tracked artifact when a complete baseline is required.
 
 `dataset_version` selects the anchor. Compare only with the last baseline of
 the same version. A version change creates a new anchor; a digest change with
