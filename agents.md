@@ -78,7 +78,8 @@ not current `run_plan` behavior.
 ## Module and hazard map
 
 Generate inventories with `git ls-files`; the current package is under
-`src/cambium/` and tests are under `tests/` plus the example module tests.
+`src/cambium/` and tests are the example module data-in/data-out pairs under
+`src/cambium/modules/example/tests/`.
 
 | Concern | Current source |
 | --- | --- |
@@ -113,11 +114,13 @@ is not OS containment.
 
 ## Checks and handoff
 
-Run the narrowest real check, then the affected package or integration check
-when a boundary changes. Useful system commands from the repository root:
+Tests are example data-in/data-out pairs: deterministic module input produces
+the expected module output. Run the narrowest real check, then the affected
+package check when a boundary changes. Useful system commands from the
+repository root:
 
 ```sh
-python3.14 -m pytest -q tests/scenarios/test_supervisor_fanout.py
+python3.14 -m pytest -q src/cambium/modules/example/tests/
 python3.14 -m compileall src tests
 PYTHONPATH=src python3.14 -m cambium.cli --help
 git diff --check
