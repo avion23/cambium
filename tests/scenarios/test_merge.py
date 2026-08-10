@@ -651,6 +651,44 @@ def test_task_directory_swap_at_move_boundary_restores_staging(tmp_path, monkeyp
     assert not list(sink.iterdir())
 
 
+def test_task_directory_swap_after_final_check_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "swap-after-check"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must return to source")
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
+    outside = tmp_path / "outside"
+    displaced = outside / "displaced"
+    sink = outside / "sink"
+    outside.mkdir()
+    sink.mkdir()
+    original = seq._is_open_child
+    checks = 0
+
+    def swap_after_check(parent_fd, name, child_fd):
+        nonlocal checks
+        contained = original(parent_fd, name, child_fd)
+        checks += 1
+        if checks == 8:
+            task_dir.rename(displaced)
+            task_dir.symlink_to(sink, target_is_directory=True)
+        return contained
+
+    monkeypatch.setattr(seq, "_is_open_child", swap_after_check)
+    with pytest.raises(StagingCleanupError, match="changed during worktree move"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must return to source"
+    assert not list(displaced.iterdir())
+    assert not list(sink.iterdir())
+
+
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)

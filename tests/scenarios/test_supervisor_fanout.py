@@ -498,6 +498,7 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
     seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
     staged = seq.prepare_staging(repo, staging, "wt-lost-reconciliation", "main")
+    (staging / "recovery-evidence.bin").write_bytes(b"preserve this evidence")
     seq.publish_merge(repo, staged, base)
     plan = {
         "tasks": [
@@ -519,8 +520,21 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     first = asyncio.run(run_plan(session_dir, plan))
     assert first.exit_code == 0
     assert not staging.exists()
-    assert not _kinds(read_events(session_dir), "merge_reconciled")
-    assert len(_kinds(read_events(session_dir), "merge_committed")) == 1
+    first_events = read_events(session_dir)
+    assert not _kinds(first_events, "spawned")
+    assert not _kinds(first_events, "merge_reconciled")
+    committed = _kinds(first_events, "merge_committed")
+    assert len(committed) == 1
+    quarantined = _kinds(first_events, "merge_staging_quarantined")
+    assert len(quarantined) == 1
+    assert committed[0]["seq"] < quarantined[0]["seq"]
+    artifact = (
+        session_dir / ".cambium" / "quarantine"
+        / quarantined[0]["payload"]["quarantine_id"]
+    )
+    assert (artifact / "recovery-evidence.bin").read_bytes() == b"preserve this evidence"
+    expired = time.time_ns() - 8 * 24 * 60 * 60 * 1_000_000_000
+    os.utime(artifact, ns=(expired, expired))
     commits_after_recovery = subprocess.run(
         ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
         check=True, capture_output=True, text=True,

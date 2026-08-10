@@ -1450,7 +1450,19 @@ class _Runtime:
     def _make_sequencer(self, task_id: str) -> Any:
         if self._merge_cls is None:
             raise RuntimeError("cambium.merge.MergeSequencer is unavailable")
-        return self._merge_cls(task_id=task_id, session_dir=self._session_dir)
+        loop = asyncio.get_running_loop()
+
+        def persist_terminal(kind: str, payload: dict[str, Any]) -> None:
+            event_payload = dict(payload)
+            event_task_id = event_payload.pop("task", task_id)
+            future = asyncio.run_coroutine_threadsafe(
+                self.emit(kind, task_id=event_task_id, **event_payload), loop
+            )
+            future.result()
+
+        return self._merge_cls(
+            task_id=task_id, session_dir=self._session_dir, durable_event=persist_terminal
+        )
 
     async def _flush_sequencer_events(
         self, seq: Any, task_keys: dict[str, str] | None = None

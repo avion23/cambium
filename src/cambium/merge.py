@@ -43,6 +43,7 @@ import shutil
 import stat
 import subprocess
 import time
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -186,6 +187,7 @@ class MergeSequencer:
         quarantine_max_bytes: int = DEFAULT_QUARANTINE_MAX_BYTES,
         quarantine_retention_ns: int = DEFAULT_QUARANTINE_RETENTION_NS,
         quarantine_min_free_bytes: int = DEFAULT_QUARANTINE_MIN_FREE_BYTES,
+        durable_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._task_id = task_id
         self._task_key = sha256((task_id or "unknown").encode()).hexdigest()[:16]
@@ -194,6 +196,7 @@ class MergeSequencer:
         self._quarantine_max_bytes = quarantine_max_bytes
         self._quarantine_retention_ns = quarantine_retention_ns
         self._quarantine_min_free_bytes = quarantine_min_free_bytes
+        self._durable_event = durable_event
         self._worktree_path: Path | None = None
         self._staging_branch: str | None = None
         self._staging_ref: str | None = None
@@ -461,6 +464,22 @@ class MergeSequencer:
             anchored_destination = Path(
                 f"/proc/{os.getpid()}/fd/{task_fd}/{destination_name}"
             )
+
+            def restore_staging() -> None:
+                try:
+                    os.rename(destination_name, worktree_path, src_dir_fd=task_fd)
+                except OSError as exc:
+                    raise StagingCleanupError(
+                        "quarantine containment failed and staging could not be restored"
+                    ) from exc
+                repaired = self._run_repo(
+                    repo, "worktree", "repair", str(worktree_path), check=False
+                )
+                if repaired.returncode != 0:
+                    raise StagingCleanupError(
+                        "quarantine containment failed and staging could not be restored"
+                    )
+
             result = self._run_repo(
                 repo, "worktree", "move", str(worktree_path), str(anchored_destination),
                 check=False,
@@ -468,15 +487,13 @@ class MergeSequencer:
             if result.returncode == 0 and not all(
                 self._is_open_child(*link) for link in chain
             ):
-                restored = self._run_repo(
-                    repo, "worktree", "move", str(anchored_destination),
-                    str(worktree_path), check=False,
-                )
-                if restored.returncode != 0:
-                    raise StagingCleanupError(
-                        "quarantine containment failed and staging could not be restored"
-                    )
+                restore_staging()
                 raise StagingCleanupError("quarantine path changed during worktree move")
+            if result.returncode == 0:
+                allocated = self._artifact_bytes(repo, anchored_destination)
+                if not all(self._is_open_child(*link) for link in chain):
+                    restore_staging()
+                    raise StagingCleanupError("quarantine path changed during worktree move")
         finally:
             for fd in (task_fd, root_fd, quarantine_fd, cambium_fd, session_fd):
                 if fd >= 0:
@@ -488,7 +505,6 @@ class MergeSequencer:
             )
             raise StagingCleanupError("cannot move dirty staging worktree to quarantine")
         destination = root / task_name / destination_name
-        allocated = self._artifact_bytes(repo, destination)
         relative_id = Path("merge") / task_name / destination_name
         self._event(
             "merge_staging_quarantined", task=self._task_id, staging_sha=staging_sha,
@@ -855,6 +871,10 @@ class MergeSequencer:
                     expiry=entry.stat().st_mtime_ns + self._quarantine_retention_ns,
                 )
             self._prune_quarantine(repo)
+        try:
+            current = self._rev_parse(repo, MAIN_REF)
+        except GitError:
+            return None
         if worktree_path is not None and self._is_registered_worktree(repo, worktree_path):
             worktree_path = Path(worktree_path).resolve()
             self._worktree_path = worktree_path
@@ -866,15 +886,36 @@ class MergeSequencer:
             self._staging_ref = f"{STAGING_REF_PREFIX}/{suffix}" if suffix else None
             reasons = self._dirty_reasons(worktree_path)
             if reasons:
+                staging_ref = self._staging_ref
+                staging_tip = (
+                    self._rev_parse(repo, staging_ref) if staging_ref else None
+                )
+                if staging_tip == current:
+                    if self._durable_event is None:
+                        raise StagingCleanupError(
+                            "dirty recovery requires durable terminal event persistence"
+                        )
+                    self._durable_event(
+                        "merge_committed",
+                        {
+                            "task": self._task_id,
+                            "new": current,
+                            "repo": str(repo),
+                            "staging_ref": staging_ref,
+                            "reason": "recovered-ref-advance",
+                        },
+                    )
                 self._quarantine_staging(repo, worktree_path, reasons)
+                if staging_tip == current:
+                    self._event(
+                        "merge_reconciled", task=self._task_id, new=current,
+                        repo=str(repo), staging_ref=staging_ref,
+                        reason="ref-advanced-before-event",
+                    )
             else:
                 if self._staging_ref is not None:
                     reconciled_ref = self._staging_ref
                     reconciled_tip = self._rev_parse(repo, reconciled_ref)
-        try:
-            current = self._rev_parse(repo, MAIN_REF)
-        except GitError:
-            return None
         if reconciled_tip == current:
             self._event(
                 "merge_committed", task=self._task_id, new=current, repo=str(repo),
