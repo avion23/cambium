@@ -484,7 +484,7 @@ def test_baseline_rejects_foreign_test_nodeid(monkeypatch) -> None:
         if finding.detail == "test nodeid does not belong to this module's tests"
     ]
 
-    assert len(baseline["tests"]["by_nodeid"]) == 40
+    assert len(baseline["tests"]["by_nodeid"]) == 57
     assert len(committed_foreign) == 0
 
     def change(baseline: dict) -> None:
@@ -606,7 +606,7 @@ print(json.dumps({
     assert observed["tracked_are_wheel_paths"] is True
     assert observed["resources_exist"] is True
     assert observed["committed_foreign_count"] == 0
-    assert observed["owned_count"] == 40
+    assert observed["owned_count"] == 57
     assert observed["owned_foreign_count"] == 0
     assert observed["reverse_paths"] == []
 
