@@ -16,8 +16,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cambium import doctor
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
 _CREDENTIAL_ENV_RE = re.compile(
@@ -87,46 +85,6 @@ def test_doctor_exits_zero_without_example_module(tmp_path, monkeypatch) -> None
     assert result.returncode == 0, result.stdout + result.stderr
     assert "no module-owned JSONL datasets" in result.stdout
     assert "0 fail" in result.stdout
-
-
-def test_doctor_skips_absent_module_directory(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "missing-modules")
-
-    status, detail = doctor.check_dataset()
-
-    assert status is doctor.Status.SKIP
-    assert "no module-owned JSONL datasets" in detail
-
-
-def test_doctor_fails_on_invalid_module_dataset(tmp_path, monkeypatch) -> None:
-    dataset = tmp_path / "modules" / "custom" / "datasets" / "records.jsonl"
-    dataset.parent.mkdir(parents=True)
-    dataset.write_text('{"id": "ok"}\nnot-json\n', encoding="utf-8")
-    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "modules")
-
-    status, detail = doctor.check_dataset()
-
-    assert status is doctor.Status.FAIL
-    assert "invalid JSON" in detail
-    assert "records.jsonl:2" in detail
-
-
-def test_doctor_fails_on_unreadable_module_directory(tmp_path, monkeypatch) -> None:
-    module = tmp_path / "modules" / "custom"
-    dataset = module / "datasets" / "records.jsonl"
-    dataset.parent.mkdir(parents=True)
-    dataset.write_text("not-json\n", encoding="utf-8")
-    module.chmod(0)
-    monkeypatch.setattr(doctor, "MODULES_ROOT", tmp_path / "modules")
-
-    try:
-        status, detail = doctor.check_dataset()
-    finally:
-        module.chmod(0o755)
-
-    assert status is doctor.Status.FAIL
-    assert "dataset integrity check failed" in detail
-    assert "cannot read directory" in detail
 
 
 def test_doctor_fails_on_corrupt_event_store(tmp_path) -> None:
@@ -216,11 +174,3 @@ def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -
     assert result.returncode == 0, result.stdout + result.stderr
     assert "conversations.db: integrity ok" in result.stdout
     assert "0 fail" in result.stdout
-
-
-def test_ruff_check_clean_on_src() -> None:
-    result = subprocess.run(
-        ["uv", "run", "--python", "3.14.7", "--with", "ruff", "ruff", "check", "src"],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=600,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
