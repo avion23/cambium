@@ -391,6 +391,7 @@ class EventStore:
             raise StoreError("event store is dead") from dead
 
     def close(self) -> None:
+        close_deadline = time.monotonic() + _CLOSE_JOIN_TIMEOUT_S
         with self._lock:
             if self._closed:
                 failure = self._close_error or self._dead
@@ -412,10 +413,9 @@ class EventStore:
             self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
             self._raise_close_failure(failure)
 
-        admission_deadline = time.monotonic() + _CLOSE_JOIN_TIMEOUT_S
         with self._lock:
             while self._active_admissions:
-                remaining = admission_deadline - time.monotonic()
+                remaining = close_deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._admission_cond.wait(remaining)
@@ -432,7 +432,10 @@ class EventStore:
                 self._queue.put(
                     _SENTINEL,
                     critical=True,
-                    timeout=self._critical_timeout_s,
+                    timeout=max(
+                        min(self._critical_timeout_s, close_deadline - time.monotonic()),
+                        0.0,
+                    ),
                     evict_noncritical=False,
                 )
             except queue.Full:

@@ -462,7 +462,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
 
 def test_close_full_critical_queue_is_bounded(tmp_path, monkeypatch) -> None:
     store = EventStore(
-        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
     )
     release = threading.Event()
     stalled = threading.Event()
@@ -500,7 +500,7 @@ def test_close_full_critical_queue_is_bounded(tmp_path, monkeypatch) -> None:
         with pytest.raises(StoreTimeout):
             store.close()
         elapsed = time.monotonic() - start
-        assert elapsed < 2.0
+        assert elapsed < 3.0
     finally:
         release.set()
         first.join(5.0)
