@@ -952,6 +952,37 @@ def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
     )
 
 
+def test_module_timing_subprocess_env_scrubs_credentials(tmp_path, monkeypatch) -> None:
+    """The timing subprocess env must never receive credential variables.
+
+    ``_measure_module_timings`` re-runs the module's tests in a pytest
+    subprocess, and the module's CLI tests propagate that env when they spawn
+    the module CLI. A ``CAMBIUM_PROVIDER_*_API_KEY`` / ``OPENAI_API_KEY`` set
+    in the parent must not reach the timing subprocess: the env is built with
+    ``scrub_environment`` instead of copying ``os.environ`` wholesale.
+    """
+    import cambium.bench as bench
+
+    captured_env: dict[str, str] = {}
+    real_run = bench.subprocess.run
+
+    def spy_run(command, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(bench.subprocess, "run", spy_run)
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "synthetic-provider-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai-secret")
+
+    timings = bench._measure_module_timings("example")
+
+    assert timings  # the scrubbed run still measured the module tests
+    assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in captured_env
+    assert "OPENAI_API_KEY" not in captured_env
+    assert "synthetic-provider-secret" not in captured_env.values()
+    assert "synthetic-openai-secret" not in captured_env.values()
+
+
 def test_standalone_cli_gate_detects_wall_time_regression(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -977,6 +1008,24 @@ def test_standalone_cli_gate_detects_wall_time_regression(
     monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: {nodeid: 100.0})
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
     assert "DRIFT should_decompose: tests.wall_seconds.p90" in capsys.readouterr().out
+
+
+def test_standalone_cli_immediate_gate_does_not_false_fail_under_load(tmp_path) -> None:
+    """An immediate report->gate on unchanged code must not fail under load.
+
+    The standalone gate re-measures the module tests live and compares the new
+    p90 against the report's recorded p90; a ~1.6x load swing between the two
+    runs (0.72 > 0.46 * 1.5) used to fail the gate. The tolerant standalone
+    defaults (3x ratio plus 0.5s absolute slack) keep unchanged code passing
+    while a real 100s regression still fails (covered by
+    ``test_standalone_cli_gate_detects_wall_time_regression``). Both runs are
+    live: the report and the gate each spawn the module-timing subprocess.
+    """
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
 
 
 def test_gate_passes_without_drift(tmp_path) -> None:

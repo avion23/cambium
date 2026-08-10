@@ -21,6 +21,24 @@ dataset records/duplicate ids/leaks/balance; test count + p50/p90/max wall
 times; and the drift thresholds the gate enforces.
 
 Only the Python standard library plus pytest is used.
+
+Wall-time gate design: the pytest plugin compares the current session's wall
+p90 against a fixed committed anchor with the strict 1.5x ratio. The
+standalone CLI (``python -m cambium.bench``) has no session report objects, so
+it re-measures the module's tests in a throwaway pytest subprocess and compares
+two live runs. To keep that live-vs-live comparison robust to legitimate load
+variation between the report and gate invocations (a 1.6x swing was observed),
+the standalone path defaults to a 3x ratio plus a 0.5s absolute slack instead
+of 1.5x. The slack is additive: the gate fails only when the live p90 exceeds
+``anchor_p90 * ratio + slack``, which still flags a real regression (e.g. a
+test that sleeps 100s) while not false-failing unchanged code under load. The
+plugin path behavior is unchanged, and ``--bench-wall-ratio`` overrides the
+standalone default.
+
+Credential hygiene: every child process spawned by the harness (including the
+timing subprocess and, transitively, the module's own CLI tests) gets a
+scrubbed environment via :func:`cambium.auth.scrub_environment`; ``os.environ``
+is never copied wholesale into a subprocess.
 """
 
 from __future__ import annotations
@@ -31,7 +49,6 @@ import datetime as _dt
 import hashlib
 import json
 import math
-import os
 import platform
 import statistics
 import subprocess
@@ -43,6 +60,7 @@ from typing import Any
 
 import pytest
 
+from cambium.auth import scrub_environment
 from cambium.modules.base import (
     DatasetError,
     ModuleBoundaryError,
@@ -65,6 +83,7 @@ CANARY_TAXONOMY: tuple[str, ...] = (
 DEFAULT_THRESHOLDS: dict[str, Any] = {
     "metric_mean_delta": 0.05,
     "wall_p90_ratio": 1.5,
+    "wall_p90_abs_slack": 0.0,
     "canary_failed_delta": 0,
     "dataset": {"duplicate_ids": 0, "cross_split_leaks": 0},
 }
@@ -492,7 +511,8 @@ def compare_against_anchor(
     ``drift_thresholds``, which override the defaults.
 
     Metric means only fail when they fall by more than ``metric_mean_delta``;
-    wall p90 fails when it exceeds ``anchor * wall_p90_ratio``; duplicate ids
+    wall p90 fails when it exceeds ``anchor * wall_p90_ratio +
+    wall_p90_abs_slack``; duplicate ids
     or cross-split leaks of any size and missing canaries always fail; a
     canary failure is a regression when it exceeds the anchor's count by more
     than ``canary_failed_delta``; unavailable split metrics are regressions.
@@ -543,11 +563,12 @@ def compare_against_anchor(
     a_wall = (anchor.get("tests") or {}).get("wall_seconds") or {}
     if a_wall.get("p90") and r_wall.get("p90"):
         wall_ratio = merged["wall_p90_ratio"]
-        if r_wall["p90"] > a_wall["p90"] * wall_ratio:
+        wall_slack = merged["wall_p90_abs_slack"]
+        if r_wall["p90"] > a_wall["p90"] * wall_ratio + wall_slack:
             regressions.append(
                 (
                     "tests.wall_seconds.p90",
-                    f"{r_wall['p90']} > {a_wall['p90']} * {wall_ratio}",
+                    f"{r_wall['p90']} > {a_wall['p90']} * {wall_ratio} + {wall_slack}",
                 )
             )
 
@@ -832,7 +853,13 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
     except (ModuleBoundaryError, DatasetError):
         return {}
     with tempfile.TemporaryDirectory(prefix="cambium-bench-timings-") as root:
-        env = dict(os.environ)
+        # Credential scrubbing is mandatory: the timing subprocess re-runs the
+        # module's own tests, whose CLI tests spawn further subprocesses from
+        # ``os.environ``. Never copy ``os.environ`` wholesale into the timing
+        # run; ``scrub_environment`` removes CAMBIUM_PROVIDER_* and other
+        # credential-like variables (the same fail-closed scrub the supervisor
+        # applies to every child environment).
+        env = scrub_environment()
         env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         env.pop("PYTEST_ADDOPTS", None)
         env.pop("PYTEST_PLUGINS", None)
@@ -925,6 +952,15 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: python -m cambium.bench report|gate|re-anchor", file=sys.stderr)
         return 2
     thresholds = dict(DEFAULT_THRESHOLDS)
+    # The standalone CLI compares two live measurements (the recorded report
+    # p90 and the gate's re-measured p90), so its default wall tolerance must
+    # absorb legitimate load variation between the two runs without disabling
+    # real regression detection: a 3x ratio plus 0.5s absolute slack passes
+    # the observed 1.6x load swing while a 100s regression still fails. The
+    # pytest plugin path keeps the strict 1.5x ratio (its anchor is a fixed
+    # committed baseline), and explicit CLI flags override these defaults.
+    thresholds["wall_p90_ratio"] = 3.0
+    thresholds["wall_p90_abs_slack"] = 0.5
     if args.bench_metric_delta is not None:
         thresholds["metric_mean_delta"] = args.bench_metric_delta
     if args.bench_wall_ratio is not None:
