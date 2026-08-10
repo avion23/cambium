@@ -12,7 +12,8 @@ the worker worktree, and successful commits publish to `refs/heads/main`.
 - `worker.do_work` has deterministic marker mode and a bounded custom provider
   and tool loop. Provider calls go through `Diffundo`; strict actions dispatch
   validated tools, emit checkpoints, and end in one worker commit.
-- `Diffundo` has tier, priority, cooldown, quota, and retry behavior. HTTP 429
+- `Diffundo` has tier, priority, cooldown, configured-RPM request-rate buckets,
+  and retry behavior. Rate-limited providers report `RATE_LIMITED`; HTTP 429
   `Retry-After` is honored. External-provider acceptance still needs credentials
   and a smoke run.
 - `tasktree` validates and snapshots dependency specs, but `run_plan` does not
@@ -27,18 +28,17 @@ are in [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 
 ## Quickstart
 
-Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.14 and the project dependencies installed for pytest.
 
 ```sh
-uv sync --extra test --python 3.14.7
-uv run --python 3.14.7 --extra test pytest -q
+PYTHONPATH=src python3.14 -m pytest -q
 ```
 
 Run the deterministic demo:
 
 ```sh
-uv run --python 3.14.7 --extra test python -m cambium.supervisor --session-dir demo
-uv run --python 3.14.7 --extra test cambium --help
+PYTHONPATH=src python3.14 -m cambium.supervisor --session-dir demo
+PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 Plan publication advances `refs/heads/main` only. Read that ref or explicitly

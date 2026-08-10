@@ -43,10 +43,11 @@ distinguishes the diagnosis from alternatives.
   present. Provider mode runs the custom bounded `Diffundo` loop: one provider
   call per turn, strict `tool_call`/`finish` parsing, schema and permission
   checks, tool events, checkpoints, and one fenced commit.
-- `Diffundo` sorts eligible providers by configured priority, tracks health and
-  quota state, and honors an HTTP 429 `Retry-After` delay before retrying. It has
-  no local response cache. Usage is returned in worker metadata but lacks a
-  production observability and quota contract.
+- `Diffundo` sorts eligible providers by configured priority and tracks health
+  plus each provider's configured RPM request-rate bucket. A depleted bucket
+  reports `RATE_LIMITED`; HTTP 429 `Retry-After` is honored before retrying. It
+  has no local response cache. Provider token, cost, and account-quota usage
+  remains a production observability contract gap.
 - `tasktree.build_tree` validates roots, dependencies, cycles, and bounds, and
   deep-copies each input spec into its node as a snapshot. `topological_order` and
   `ready_tasks` are pure helpers; `run_plan` does not call them to schedule a
@@ -76,7 +77,7 @@ Generate inventories with `git ls-files`; the current package is under
 Do not cite `worker_pool.py`, `events.py`, `dlq.py`, `eval_cache.py`, or
 `ResourceBudget` as current code: none is tracked at this revision. There is
 no per-worker OS sandbox and no production approval gate in the `run_plan`
-worker context. `ApprovalGate` is a reusable command-policy primitive;
+worker context. `approval.py:ApprovalGate` is a reusable command-policy primitive;
 `fail_open` is an explicit dangerous option. Worktree/process-group isolation
 is not OS containment.
 

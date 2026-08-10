@@ -51,10 +51,11 @@ returns cumulative provider usage and latency as redacted metadata. `lm.py`
 contains optional DSPy-compatible `CambiumLM` and `ArchitectusLM` adapters;
 they are not a supervisor planner.
 
-`Diffundo` is a tiered provider router with health, token-bucket quota,
-cooldown, circuit-breaker, and configured-priority ordering. It has no local
-response cache. HTTP 429 responses carry a parsed `Retry-After` delay into the
-same-provider retry path. Weighted routing and a production usage/quota
+`Diffundo` is a tiered provider router with health, configured RPM request-rate
+buckets, cooldown, circuit-breaker, and configured-priority ordering. A
+depleted bucket reports `RATE_LIMITED`. It has no local response cache. HTTP 429
+responses carry a parsed `Retry-After` delay into the same-provider retry path.
+Weighted routing and a production provider token, cost, and account-quota
 observability contract are not implemented.
 
 ### Trees, diagnostics, and modules
@@ -99,10 +100,10 @@ IPC is bounded and correlated by request ID and worker generation. Fatal
 
 Provider credentials are allowlisted environment values. They must not enter
 task specs, prompts persisted as events, gate commands/output, logs, or result
-artifacts. Worktree and process-group isolation is not an OS sandbox. An
-`ApprovalGate` primitive exists in `tools.py`, but the `run_plan` worker
-context does not provide a production approval service; `fail_open` is an
-explicit dangerous policy option.
+artifacts. Worktree and process-group isolation is not an OS sandbox. The
+`ApprovalGate` primitive is defined in `approval.py` and consumed by `tools.py`,
+but the `run_plan` worker context does not provide a production approval
+service; `fail_open` is an explicit dangerous policy option.
 
 ## 3. Target contracts and delivery order
 
@@ -128,9 +129,10 @@ for that wrapper, not proof that every production worker is contained.
 ### Provider accounting before routing policy
 
 Define durable usage events, provider and model identity, token/cost fields,
-quota ownership, and privacy/redaction rules. Test Retry-After, quota
-exhaustion, and accounting failure first. Only then evaluate weighted routing;
-priority ordering remains the current policy.
+request-rate status, account-quota ownership, and privacy/redaction rules. Test
+Retry-After, `RATE_LIMITED`, token/cost accounting, and accounting failure
+first. Only then evaluate weighted routing; priority ordering remains the
+current policy.
 
 ### External-provider acceptance
 
@@ -138,11 +140,6 @@ Run a disposable, credentialed provider smoke through worker loop, tool event,
 checkpoint, gate, and ref-only merge. Credentials stay in the environment and
 the run is never a default network test. External credentials are not present
 in this checkout, so external-provider acceptance remains open.
-
-A root-confirmed loopback smoke has exercised the disposable path with a
-bounded host scope, two provider requests, one commit, a passing gate, and a
-ref publication. It is not external-provider acceptance or proof of
-per-worker OS isolation.
 
 ## 4. Failure policy by boundary
 

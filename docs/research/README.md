@@ -7,11 +7,12 @@ define the runtime by themselves.
 
 When documents disagree, use:
 
-1. [`../../agents.md`](../../agents.md) for process and current-truth notes.
-2. [`../architecture/architecture.md`](../architecture/architecture.md) for the
-   current-versus-target contract.
-3. `src/cambium/` for implementation.
-4. `tests/` and `src/cambium/modules/example/tests/` for observed behavior.
+1. The task request for scope and required behavior.
+2. [`../../agents.md`](../../agents.md) for process and current-truth notes.
+3. `src/cambium/` for implementation and `tests/` plus
+   `src/cambium/modules/example/tests/` for observed behavior.
+4. [`../architecture/architecture.md`](../architecture/architecture.md) for
+   current-versus-target boundaries.
 5. Research files for context or measured evidence.
 
 Check imports, callers, and tests. A matching name in a proposal is not proof

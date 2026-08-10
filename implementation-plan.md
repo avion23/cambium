@@ -21,22 +21,24 @@ is not a branch ledger or merge log.
 - Select and implement the host boundary for each worker's process, filesystem,
   CPU/memory/task limits, network policy, and teardown. Worktree/process-group
   isolation alone is not sufficient.
-- Pass a production `ApprovalGate` policy and callback into the worker tool
-  context. Keep denied commands fail-closed; treat `fail_open` as development
-  configuration only.
+- Pass an `approval.py:ApprovalGate` policy and callback into the worker tool
+  context (consumed by `tools.py`). Keep denied commands fail-closed; treat
+  `fail_open` as development configuration only.
 - Add focused checks for containment setup/teardown, resource exhaustion,
   denied and unavailable approval, and no publication after control failure.
 
 ## 3. Provider usage and quota contract
 
 - Specify redacted durable usage events: provider, model, request/turn,
-  token fields, cost, latency, Retry-After, quota owner, and failure reason.
+  token fields, cost, latency, Retry-After, request-rate status, account-quota
+  owner, and failure reason.
 - Connect accounting at the supervisor/event boundary and define behavior when
-  accounting or quota state is unavailable. Preserve environment-only secrets.
-- Test 429 `Retry-After`, same-provider retry, quota exhaustion, and provider
-  fallback against the contract. Do not introduce weighted routing until the
-  usage and quota evidence is stable; configured priority remains the current
-  policy.
+  rate-limit, token, cost, or account-quota state is unavailable. Preserve
+  environment-only secrets.
+- Test 429 `Retry-After`, same-provider retry, `RATE_LIMITED` buckets, and
+  provider fallback against the contract. Do not introduce weighted routing
+  until the usage and quota evidence is stable; configured priority remains the
+  current policy.
 
 ## 4. External-provider smoke
 
@@ -46,8 +48,8 @@ is not a branch ledger or merge log.
 - Keep the run opt-in and networked only by explicit command. Record request
   count, usage events, commit, gate result, merge ref, and the failure case that
   leaves `main` unchanged without recording secrets.
-- A loopback smoke is useful regression evidence, but it does not substitute
-  for an external-provider run or prove per-worker OS isolation.
+- Local fake-provider fixtures can support regression tests, but they do not
+  substitute for an external-provider run or prove per-worker OS isolation.
 
 ## 5. Follow-on evaluation
 
