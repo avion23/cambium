@@ -51,6 +51,12 @@ from cambium.ipc import (
 
 MARKER = "// cambium-ipc"
 DIFF_CAP_BYTES = 64 * 1024
+# Worker tasks wait for the heartbeat loop to observe the stop flag before
+# emitting the result envelope. The default 1s interval makes every happy-path
+# run cost ~1s of pure drain time; a short interval keeps the repeated
+# stress-loop signal of the 20x regression test while making the drain
+# negligible.
+TEST_HEARTBEAT_INTERVAL_S = 0.02
 
 
 def _make_scratch(repo: Path) -> str:
@@ -117,6 +123,11 @@ class WorkerSupervisor:
         assert self.proc is not None
         if msg.get("type") == "init":
             self._generation = int(msg.get("generation", 1))
+            msg = {
+                **msg,
+                "heartbeat": msg.get("heartbeat")
+                or {"interval_s": TEST_HEARTBEAT_INTERVAL_S},
+            }
         if msg.get("type") == "run_task":
             scratch = Path(msg["scratch_repo"]).resolve()
             worktree = Path(msg["worktree_path"]).resolve()
@@ -495,7 +506,7 @@ def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
             assert ready["type"] == "ready"
 
             await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=2.0))
+                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.5))
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -571,7 +582,7 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             assert ready["type"] == "ready"
 
             await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=2.0))
+                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.5))
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
