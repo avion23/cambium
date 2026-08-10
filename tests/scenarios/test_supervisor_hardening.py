@@ -26,6 +26,11 @@ GATE_DESCENDANT = str(ROOT / "tests" / "fixtures" / "gate_descendant.py")
 TOO_LONG_WORKER = str(ROOT / "tests" / "fixtures" / "too_long_worker.py")
 CRASH_ONCE_WORKER = str(ROOT / "tests" / "fixtures" / "crash_once_worker.py")
 FAKE_WORKER = str(ROOT / "scripts" / "fake_worker.py")
+TEST_RESOURCE_THRESHOLDS = {
+    "mem_available_frac": 0.0,
+    "load1_per_cpu": 1_000_000.0,
+    "disk_free": 0,
+}
 
 PROBE_ENV = {
     "TEST_API_KEY_DEMO": "sk-demo-value",
@@ -87,6 +92,7 @@ def _task(
         "gate": gate,
         "base_commit": base,
         "provider_env_keys": provider_env_keys or [],
+        "resource_thresholds": TEST_RESOURCE_THRESHOLDS,
     }
     task.update(extra)
     return task
@@ -1079,3 +1085,27 @@ def test_oversized_stdout_line_fails_custos_reader(tmp_path: Path) -> None:
         event["kind"] == "protocol" and event["payload"].get("note") == "MessageTooLong"
         for event in read_events(session_dir)
     )
+
+
+def test_slice_heavy_gate_passes_through_session_gate(tmp_path: Path) -> None:
+    """The slice path threads a session CompileGate through its gate runner."""
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    spec = _slice_spec(session_dir, "cambium.worker")
+    spec["marker"] = "// slice-heavy-gate"
+    spec["gate"] = "make --version"
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "succeeded"
+    assert result.exit_code == 0
+    assert result.gate_exit_code == 0
+    events = [
+        json.loads(line)
+        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    gate_events = [event for event in events if event["kind"] == "gate"]
+    assert gate_events
+    assert all(event["payload"].get("heavy") is True for event in gate_events)
+    assert not any(event["payload"].get("resource_denied") for event in gate_events)
