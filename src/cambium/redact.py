@@ -434,6 +434,116 @@ def _exact_value_pattern(values: frozenset[str]) -> re.Pattern[str] | None:
     return re.compile("|".join(re.escape(value) for value in alternatives))
 
 
+_ESCAPE_CHARACTERS = {
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "a": "\a",
+    "v": "\v",
+}
+
+
+def _decode_escape_char(text: str, position: int) -> tuple[str, int]:
+    """Decode one character at *position* in wire text, handling escapes.
+
+    JSON serialization and Python ``repr`` rewrite a single character into
+    ``\\n``-style escapes, ``\\uXXXX``, ``\\xHH``, or octal escapes before
+    redaction sees the output, so matching the decoded character (not the wire
+    bytes) catches every valid encoding.  A backslash that does not begin a
+    valid escape is treated as a literal backslash so ordinary diagnostics
+    are not corrupted.
+    """
+    character = text[position]
+    if character != "\\" or position + 1 >= len(text):
+        return character, position + 1
+    escaped = text[position + 1]
+    if escaped in _ESCAPE_CHARACTERS:
+        return _ESCAPE_CHARACTERS[escaped], position + 2
+    if escaped in {'"', "'", "/"}:
+        return escaped, position + 2
+    if escaped == "\\":
+        return "\\", position + 2
+    if escaped in "xXuU":
+        digits = 2 if escaped == "x" else (4 if escaped == "u" else 8)
+        start = position + 2
+        end = start + digits
+        if end <= len(text):
+            try:
+                codepoint = int(text[start:end], 16)
+            except ValueError:
+                codepoint = -1
+            if 0 <= codepoint <= 0x10FFFF:
+                return chr(codepoint), end
+        return "\\", position + 1
+    if escaped in "01234567":
+        end = position + 2
+        while end < min(len(text), position + 4) and text[end] in "01234567":
+            end += 1
+        return chr(int(text[position + 1 : end], 8)), end
+    return "\\", position + 1
+
+
+def _escaped_value_spans(text: str, value: str) -> list[tuple[int, int]]:
+    """Return spans of *text* that decode to exactly *value*.
+
+    Scanning decodes up to ``len(value)`` characters from every offset, so a
+    credential whose wire form mixes raw characters, short escapes, and
+    ``\\uXXXX``/hex escapes (either hex case) is matched as one span.  A match
+    advances past its own span; decoding is deterministic per offset.
+    """
+    target = len(value)
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        decoded: list[str] = []
+        position = index
+        while len(decoded) < target and position < len(text):
+            character, position = _decode_escape_char(text, position)
+            decoded.append(character)
+        if len(decoded) == target and "".join(decoded) == value:
+            spans.append((index, position))
+            index = position
+        else:
+            index += 1
+    return spans
+
+
+def _decodes_to(text: str, value: str) -> bool:
+    """Return whether the entire *text* decodes to exactly *value*."""
+    if not text:
+        return False
+    decoded: list[str] = []
+    position = 0
+    while len(decoded) < len(value) and position < len(text):
+        character, position = _decode_escape_char(text, position)
+        decoded.append(character)
+    return (
+        len(decoded) == len(value)
+        and "".join(decoded) == value
+        and position == len(text)
+    )
+
+
+def _replace_spans(text: str, spans: list[tuple[int, int]], replacement: str) -> str:
+    """Replace the merged, non-overlapping spans of *text* with *replacement*."""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    parts: list[str] = []
+    position = 0
+    for start, end in merged:
+        parts.append(text[position:start])
+        parts.append(replacement)
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
+
+
 def _marker_positions(text: str, marker: str) -> Iterable[int]:
     start = 0
     while True:
@@ -1032,7 +1142,10 @@ class Redactor:
     pattern collection is authoritative: only those patterns run for string
     values, while secret-named structured keys remain whole-value redaction
     boundaries.  ``secret_values`` is an immutable set of exact, case-sensitive
-    values that is applied additively before the configured pattern behavior.
+    values that is applied additively as unbounded substrings before the
+    configured pattern behavior; ``whole_values`` is an immutable set of exact
+    values that is replaced only when a whole string equals one of them, so a
+    prose-like credential never corrupts a larger benign diagnostic.
     ``replacement`` is inserted literally, even when it contains backslashes
     or digits.
     """
@@ -1043,6 +1156,7 @@ class Redactor:
         *,
         replacement: str = _DEFAULT_REPLACEMENT,
         secret_values: Iterable[str] | None = None,
+        whole_values: Iterable[str] | None = None,
     ) -> None:
         if not isinstance(replacement, str):
             raise TypeError("replacement must be a string")
@@ -1056,7 +1170,15 @@ class Redactor:
             raise TypeError("secret_values must contain strings")
         if any(not value for value in registered):
             raise ValueError("secret_values must not contain empty strings")
+        if isinstance(whole_values, (str, bytes)):
+            raise TypeError("whole_values must be an iterable of values, not a string")
+        whole = frozenset() if whole_values is None else frozenset(whole_values)
+        if any(not isinstance(value, str) for value in whole):
+            raise TypeError("whole_values must contain strings")
+        if any(not value for value in whole):
+            raise ValueError("whole_values must not contain empty strings")
         self._secret_values = registered
+        self._whole_values = whole
         self._exact_value_pattern = _exact_value_pattern(registered)
         self.replacement = replacement
 
@@ -1072,15 +1194,50 @@ class Redactor:
         return _replacement_sub(self._exact_value_pattern, text, self.replacement)
 
     def redact(self, text: str) -> str:
-        """Redact secrets and email addresses from *text*."""
+        """Redact secrets and email addresses from *text*.
+
+        A whole-value registration is honored first: a string that exactly
+        equals one is replaced outright, so prose-like credentials never
+        corrupt a larger benign diagnostic.
+        """
 
         if not isinstance(text, str):
             raise TypeError("text must be a string")
+        if text in self._whole_values:
+            return self.replacement
         text = self._redact_exact_values(text)
         if self._patterns == DEFAULT_PATTERNS:
             return _redact_default(text, self.replacement)
         for pattern in self._patterns:
             text = _replacement_sub(pattern, text, self.replacement)
+        return text
+
+    def redact_escaped(self, text: str) -> str:
+        """Redact *text* after decoding JSON/repr escape sequences in place.
+
+        The plain text pass runs first; a second pass decodes ``\\uXXXX``,
+        ``\\xHH``, octal, and short escapes at every offset so a credential
+        whose wire form was rewritten (any hex case, any mix of escapes) is
+        matched as the decoded value.  Whole-value registrations stay whole:
+        an escaped whole value is replaced only when the entire text decodes
+        to it.
+        """
+
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        if "\\" not in text:
+            return self.redact(text)
+        text = self.redact(text)
+        if "\\" not in text:
+            return text
+        spans: list[tuple[int, int]] = []
+        for value in self._secret_values:
+            spans.extend(_escaped_value_spans(text, value))
+        if spans:
+            text = _replace_spans(text, spans, self.replacement)
+        for value in self._whole_values:
+            if _decodes_to(text, value):
+                return self.replacement
         return text
 
     def redact_mapping(self, mapping: object) -> object:
