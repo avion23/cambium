@@ -315,7 +315,7 @@ A future DSPy `decide` adds two more (see §3.4): `ModelUnavailable` and `Malfor
 
 ## 9. Test Strategy
 
-### 9.1 Scenario test (`tests/scenarios/test_example_module.py`)
+### 9.1 Scenario test (`src/cambium/modules/example/tests/test_example_module.py`)
 
 One scenario test, no mocking, no network:
 
@@ -345,7 +345,7 @@ N/A. `should_decompose` is the first module; no siblings to pin. The `siblings-s
 
 ```
 # Run from repo root, on a Python 3.14 interpreter:
-uv run --python 3.14.7 --extra test pytest tests/scenarios/test_example_module.py -v
+uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests/test_example_module.py -v
 uv run --python 3.14.7 --extra test pytest -q          # whole suite
 ```
 
@@ -411,7 +411,7 @@ src/cambium/modules/example/
 2. ✅ Dataset committed (`datasets/example_pairs.jsonl`, 9 records, 2 canaries).
 3. ✅ Loader runs green on the dataset; `DatasetError` raised on malformed records.
 4. ✅ Rule-engine `decide()` scores 1.0 over the full dataset (including canaries).
-5. ✅ Scenario test passes: `uv run --python 3.14.7 --extra test pytest tests/scenarios/test_example_module.py -v` exits 0.
+5. ✅ Scenario test passes: `uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests/test_example_module.py -v` exits 0.
 6. ⏳ End-to-end smoke test (`cambium.tests.smoke`) — pending `Architectus.execute` wiring.
 7. ⏳ Adversarial review of this module — this spec is the reviewed artifact; re-review on any contract change.
 8. ✅ All verifiable items above marked VERIFIED with the cited command from §9.6.

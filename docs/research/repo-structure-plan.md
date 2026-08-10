@@ -5,6 +5,11 @@
 **Worktree audited:** `/tmp/opencode/cambium-hygiene` (branch `wt-hygiene`, == `main` tip `96da568`)
 **Verified against:** all 22 `wt-*` branch trees via `git ls-tree` (read-only).
 
+**Current-main status:** this plan is a historical pre-wave audit. Current main
+is `6109a6a` with 80 tracked files and 33 research documents; the architecture
+and module-template paths are now under `docs/architecture/`. The counts and
+pending-merge layout below describe the audit snapshot, not current main.
+
 ---
 
 ## 1. Verification of preliminary findings
@@ -18,7 +23,7 @@ Every orchestrator claim was re-run with commands against the audit worktree.
 | No TRACKED duplicate files | `git ls-files \| xargs -I{} basename {} \| sort \| uniq -d` | Only duplicate basename among the 30 tracked files: `__init__.py` (intentional — Python packages). **Confirmed.** |
 | Dups only inside gitignored dirs | `git status --porcelain --ignored` | No ignored files present on disk in this worktree (no `.venv/`, no `__pycache__/`). Nothing tracked under them. **Confirmed (empty).** |
 | ~20 research docs | `git ls-tree -r --name-only <branch> -- docs/research/ \| sort -u` | **Corrected: 28.** `main` has 9; 19 single-commit branches each add one. The orchestrator's "~20" was an estimate of the partially-merged state. |
-| Three architecture-ish docs | `git ls-tree -r --name-only wt-arch`, `main` | Exactly three: `docs/architecture.md` (canonical, wt-arch unmerged), `docs/module-template/architecture.md` (template, wt-arch), `src/cambium/modules/example/architecture.md` (per-module, merged on main). **Confirmed.** |
+| Three architecture-ish docs | `git ls-tree -r --name-only wt-arch`, `main` | Historical pre-merge snapshot: exactly three architecture-ish docs were identified; the current canonical paths are under `docs/architecture/`, and the architecture is now merged. |
 | `implementation-plan.md` transient at root | `head implementation-plan.md` | Line 1: `# Implementation Plan (TRANSIENT — delete when implementation is done)`. **Confirmed.** |
 
 Additional verified facts:
@@ -50,7 +55,7 @@ src/cambium/                        events.py, orchestrator.py, __init__.py
 src/cambium/modules/                base.py, __init__.py
 src/cambium/modules/example/        architecture.md, dataset.py, decide.py, metric.py, __init__.py
 src/cambium/modules/example/datasets/example_pairs.jsonl
-tests/scenarios/test_example_module.py
+src/cambium/modules/example/tests/test_example_module.py
 ```
 
 ### What is junk

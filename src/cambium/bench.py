@@ -8,8 +8,8 @@ Modes::
     pytest -p cambium.bench --bench=report   # measure + write baseline JSON
     pytest -p cambium.bench --bench=gate     # fail (exit 1) on drift
 
-The report writes ``tests/baselines/<module>/baseline.json`` per the schema
-in ``docs/research/bench-harness-design.md``: schema_version, module,
+The report writes ``src/cambium/modules/<name>/tests/baselines/baseline.json``
+per the schema in ``docs/research/bench-harness-design.md``: schema_version, module,
 dataset_version, git_sha, date, python, pytest; metric mean/std/count per
 train/eval/canaries split; canary total/kinds/taxonomy coverage/failed;
 dataset records/duplicate ids/leaks/balance; test count + p50/p90/max wall
@@ -20,6 +20,7 @@ Only the Python standard library plus pytest is used.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import datetime as _dt
 import importlib
@@ -52,11 +53,21 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_DIR = REPO_ROOT / "src" / "cambium" / "modules"
-DEFAULT_BASELINE_DIR = REPO_ROOT / "tests" / "baselines"
 
 SPLITS = ("train", "eval", "canaries")
 
 _OPTIONS_ADDED = False
+
+
+def _baseline_path(
+    package_name: str,
+    module_name: str,
+    baseline_root: Path | None = None,
+) -> Path:
+    """Return a module-local baseline path, or an explicit root override."""
+    if baseline_root is not None:
+        return baseline_root / module_name / "baseline.json"
+    return MODULES_DIR / package_name / "tests" / "baselines" / "baseline.json"
 
 
 # --------------------------------------------------------------------------
@@ -369,7 +380,8 @@ class BenchPlugin:
 
     def __init__(self, config: pytest.Config, thresholds: dict[str, Any] | None = None) -> None:
         self.mode: str = config.getoption("bench")
-        self.root = Path(config.getoption("bench_root") or DEFAULT_BASELINE_DIR)
+        bench_root = config.getoption("bench_root")
+        self.root = Path(bench_root) if bench_root else None
         self.thresholds = dict(DEFAULT_THRESHOLDS)
         if thresholds:
             self.thresholds.update(thresholds)
@@ -389,7 +401,7 @@ class BenchPlugin:
             body = build_module_report(pkg_name)
             report = _assemble_baseline(body, self.times, self.thresholds)
             self.module_reports[report["module"]] = report
-            anchor_path = self.root / report["module"] / "baseline.json"
+            anchor_path = _baseline_path(pkg_name, report["module"], self.root)
             if self.mode == "report":
                 _write_baseline(report, anchor_path)
             elif not anchor_path.exists():
@@ -450,7 +462,7 @@ def pytest_addoption(parser: Any) -> None:
         "--bench-root",
         default=None,
         metavar="DIR",
-        help="baseline directory (default: tests/baselines)",
+        help="baseline root override (default: next to each module)",
     )
     group.addoption(
         "--bench-metric-delta",
@@ -479,18 +491,51 @@ def pytest_configure(config: Any) -> None:
     config.pluginmanager.register(BenchPlugin(config, thresholds), "cambium-bench")
 
 
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m cambium.bench",
+        description="Run the Cambium benchmark report or drift gate.",
+    )
+    parser.add_argument("mode", nargs="?", default="report", metavar="{report,gate}")
+    parser.add_argument(
+        "--bench-root",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="baseline root override (default: next to each module)",
+    )
+    parser.add_argument(
+        "--bench-metric-delta",
+        type=float,
+        default=None,
+        help="override the metric mean drop drift threshold",
+    )
+    parser.add_argument(
+        "--bench-wall-ratio",
+        type=float,
+        default=None,
+        help="override the wall p90 ratio drift threshold",
+    )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI form: ``python -m cambium.bench report|gate`` (no durations)."""
-    args = list(sys.argv[1:] if argv is None else argv)
-    mode = args[0] if args else "report"
+    """CLI form: ``python -m cambium.bench report|gate``."""
+    args = _cli_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    mode = args.mode
     if mode not in ("report", "gate"):
         print("usage: python -m cambium.bench report|gate", file=sys.stderr)
         return 2
+    thresholds = dict(DEFAULT_THRESHOLDS)
+    if args.bench_metric_delta is not None:
+        thresholds["metric_mean_delta"] = args.bench_metric_delta
+    if args.bench_wall_ratio is not None:
+        thresholds["wall_p90_ratio"] = args.bench_wall_ratio
     failures = 0
     for pkg_name in discover_modules():
         body = build_module_report(pkg_name)
-        report = _assemble_baseline(body, {})
-        path = DEFAULT_BASELINE_DIR / report["module"] / "baseline.json"
+        report = _assemble_baseline(body, {}, thresholds)
+        path = _baseline_path(pkg_name, report["module"], args.bench_root)
         if mode == "report":
             _write_baseline(report, path)
             print(f"cambium bench: wrote {path}")

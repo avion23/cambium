@@ -9,18 +9,19 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from cambium.modules.base import DatasetError
-from cambium.modules.example import ExampleDatasetLoader, ShouldDecomposeModule
+import pytest
 
-DATASET_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "src"
-    / "cambium"
-    / "modules"
-    / "example"
-    / "datasets"
-    / "example_pairs.jsonl"
+from cambium.modules.base import DatasetError, Example
+from cambium.modules.example import (
+    Decision,
+    DecomposeOutput,
+    ExampleDatasetLoader,
+    ShouldDecomposeModule,
+    TaskInput,
 )
+from cambium.modules.example.metric import should_decompose_metric
+
+DATASET_PATH = Path(__file__).resolve().parents[1] / "datasets" / "example_pairs.jsonl"
 
 
 def _run_all() -> list[dict]:
@@ -47,8 +48,48 @@ def _run_all() -> list[dict]:
 def test_dataset_is_loadable_and_schema_valid() -> None:
     examples = ExampleDatasetLoader(DATASET_PATH).load()
     assert len(examples) >= 8
-    assert all(ex.expected["decompose"] in (True, False) for ex in examples)
+    assert all(isinstance(ex.expected["decompose"], Decision) for ex in examples)
     assert all(hasattr(ex.input, "task") and hasattr(ex.input, "context") for ex in examples)
+
+
+def test_decision_members_exist() -> None:
+    assert set(Decision) == {Decision.DECOMPOSE, Decision.DO_NOT_DECOMPOSE}
+
+
+def test_decompose_property_is_read_only_compat_shim() -> None:
+    decomposed = DecomposeOutput(decision=Decision.DECOMPOSE, reason="parallel work")
+    atomic = DecomposeOutput(decision=Decision.DO_NOT_DECOMPOSE, reason="atomic")
+
+    assert decomposed.decompose is True
+    assert atomic.decompose is False
+    with pytest.raises(AttributeError):
+        decomposed.decompose = False
+
+
+def test_metric_matches_enum_decisions() -> None:
+    expected = {"decompose": Decision.DECOMPOSE, "reason": "parallel work"}
+    prediction = DecomposeOutput(decision=Decision.DECOMPOSE, reason="parallel work")
+    example = Example(
+        input=TaskInput("Split the work", ""), expected=expected, prediction=prediction
+    )
+    assert should_decompose_metric(example) == 1.0
+
+    wrong = example.with_prediction(
+        DecomposeOutput(decision=Decision.DO_NOT_DECOMPOSE, reason="atomic")
+    )
+    assert should_decompose_metric(wrong) == 0.0
+
+
+def test_loader_maps_wire_boolean_to_decision(tmp_path) -> None:
+    dataset = tmp_path / "pairs.jsonl"
+    dataset.write_text(
+        '{"input": {"task": "Split the work", "context": ""}, '
+        '"expected": {"decompose": true, "reason": "parallel work"}}\n'
+    )
+
+    examples = ExampleDatasetLoader(dataset).load()
+
+    assert examples[0].expected["decompose"] is Decision.DECOMPOSE
 
 
 def test_malformed_record_is_rejected(tmp_path) -> None:
@@ -79,7 +120,7 @@ def test_engine_tolerates_leading_separators() -> None:
     from cambium.modules.example.decide import should_decompose
 
     result = should_decompose("; hello world", "")
-    assert result.decompose is False
+    assert result.decision is Decision.DO_NOT_DECOMPOSE
 
 
 def test_module_scores_perfect_on_its_dataset() -> None:

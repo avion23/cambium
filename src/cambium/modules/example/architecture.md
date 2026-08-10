@@ -4,6 +4,8 @@ Reference example of the Cambium per-module pattern. Template for future
 modules; the DSPy-per-module design keeps each module independently
 hill-climbable (see `docs/architecture/system-design.md` §M9, Ascensus).
 
+Version note: v2.1 uses a domain-side `Decision` enum; the wire format is unchanged.
+
 ## Purpose
 
 Decide whether a task should be decomposed into parallel subtasks before
@@ -18,7 +20,8 @@ future caller: decompose before dispatch, evaluate results after merge.
   - `metric(example: Example) -> float` — delegates to
     `should_decompose_metric`
 - `TaskInput` — `{task: str, context: str}` (context optional)
-- `DecomposeOutput` — `{decompose: bool, reason: str, confidence: float}`
+- `DecomposeOutput` — `{decision: Decision, reason: str, confidence: float}`;
+  read-only `decompose: bool` is a compatibility shim.
 - `ExampleDatasetLoader` — JSONL dataset loader; schema in the module
   docstring, validated line by line.
 
@@ -73,8 +76,8 @@ decomposition outright (an explicit prior decomposition wins).
 
 ## Test strategy
 
-One scenario test (`tests/scenarios/test_example_module.py`), no
-mocking, no network:
+Module tests live in `src/cambium/modules/example/tests/`; no mocking, no
+network:
 
 1. Load the real dataset; assert it loads and every record is
    schema-valid, plus a negative case: a malformed record raises

@@ -37,8 +37,8 @@ SCHEMA_KEYS = {
 }
 
 FAST_TESTS = [
-    "tests/scenarios/test_example_module.py::test_dataset_is_loadable_and_schema_valid",
-    "tests/scenarios/test_example_module.py::test_malformed_record_is_rejected",
+    "tests/scenarios/test_tooling.py::test_ruff_check_clean_on_src",
+    "tests/scenarios/test_tasktree.py::test_task_kind_is_the_enum_norm",
 ]
 
 WALL_RATIO = "--bench-wall-ratio=100"
@@ -84,7 +84,7 @@ def test_report_writes_valid_baseline(tmp_path) -> None:
     baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
     assert SCHEMA_KEYS <= set(baseline)
     assert baseline["module"] == "should_decompose"
-    assert baseline["dataset_version"] == "1.0.0"
+    assert baseline["dataset_version"] == "1.1.0"
     assert baseline["metric"]["train"] == {"mean": 1.0, "std": 0.0, "count": 200}
     assert baseline["metric"]["eval"]["count"] == 50
     assert baseline["metric"]["canaries"]["count"] == 10
