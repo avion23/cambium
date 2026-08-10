@@ -176,6 +176,8 @@ def _find_cycle(task_ids: list[str], edges: list[tuple[str, str]]) -> list[str] 
     back-edge to a gray (on-stack) node closes a cycle; the trace from that
     node to the back-edge target, plus the target, is the named cycle.
     """
+    # graphlib.TopologicalSorter was considered and rejected: it does not expose
+    # the cycle path required for the decompose-and-reprompt flow.
     children: dict[str, list[str]] = {tid: [] for tid in task_ids}
     for parent, child in edges:
         children.setdefault(parent, []).append(child)

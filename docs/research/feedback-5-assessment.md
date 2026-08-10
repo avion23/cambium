@@ -97,6 +97,7 @@ Module-state is as of main `e6d8bb1`. The dispositions create these concrete fol
    `tasktree.py` noting `graphlib.TopologicalSorter` was considered and rejected
    because its `CycleError` does not name the cycle path that I2.2/DS-M6 re-prompting
    requires.
+   **Follow-up status:** Done in commit `<COMMIT_SHA>`.
 9. **AST tool wiring (claim 17).** Expose `ast_tools.extract_signature` /
    `find_references` in `tools.py` `TOOL_SCHEMAS` — the remaining wiring after the
    `tools.py` merge (74ff5aa).
