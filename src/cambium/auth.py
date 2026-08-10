@@ -179,7 +179,7 @@ def validate_provider_id(value: object) -> str:
 def derived_env_name(provider: str) -> str:
     """Derive the sole authorized environment name for ``provider``."""
     provider = validate_provider_id(provider)
-    normalized = provider.upper().replace(".", "_").replace("-", "_")
+    normalized = re.sub(r"[._-]+", "_", provider.upper())
     return f"CAMBIUM_PROVIDER_{normalized}_API_KEY"
 
 
@@ -396,6 +396,20 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
             os.close(fd)
 
 
+def _verify_directory_path(path: Path, expected_fd: int) -> None:
+    """Require a fresh traversal of ``path`` to reach ``expected_fd``'s inode."""
+    current_fd = _open_directory(path, create=False)
+    if current_fd is None:
+        raise AuthStoreError("auth store directory path changed during validation")
+    try:
+        expected = os.fstat(expected_fd)
+        current = os.fstat(current_fd)
+        if expected.st_dev != current.st_dev or expected.st_ino != current.st_ino:
+            raise AuthStoreError("auth store directory path changed during validation")
+    finally:
+        os.close(current_fd)
+
+
 def _open_secure_file(dir_fd: int, name: str) -> int:
     try:
         fd = os.open(name, _file_read_flags(), dir_fd=dir_fd)
@@ -610,6 +624,7 @@ class AuthStore:
             except OSError as exc:
                 raise AuthStoreError("could not lock the auth store") from exc
             try:
+                _verify_directory_path(self._path.parent, directory_fd)
                 _atomic_write(directory_fd, self._path.name, document)
             finally:
                 try:
@@ -675,6 +690,7 @@ class AuthStore:
         """Serialize ``values`` while the caller owns the directory lock."""
         raw = {"version": AUTH_VERSION, "providers": dict(values)}
         document = _validate_raw_document(raw)
+        _verify_directory_path(self._path.parent, directory_fd)
         _atomic_write(directory_fd, self._path.name, document)
 
     def launch_environment(self, base: Mapping[str, str] | None = None) -> dict[str, str]:

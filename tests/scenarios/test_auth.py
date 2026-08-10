@@ -91,9 +91,13 @@ def test_schema_rejects_key_over_16_kib_and_surrogate() -> None:
 
 def test_canonical_env_name_and_collision_are_rejected() -> None:
     assert auth.derived_env_name("foo.bar-baz") == "CAMBIUM_PROVIDER_FOO_BAR_BAZ_API_KEY"
+    canonical = auth.derived_env_name("foo-bar")
+    assert auth.derived_env_name("foo--bar") == canonical
+    assert auth.derived_env_name("foo__bar") == canonical
+    assert auth.is_provider_env_name(canonical)
     collision = (
         b'{"version":1,"providers":{'
-        b'"foo-bar":{"api_key":"one"},"foo_bar":{"api_key":"two"}}}'
+        b'"foo--bar":{"api_key":"one"},"foo__bar":{"api_key":"two"}}}'
     )
 
     with pytest.raises(auth.AuthSchemaError, match="conflicts"):
@@ -290,6 +294,40 @@ def test_directory_swap_during_validation_does_not_write_outside(
 
     assert swapped
     assert not (outside_directory / "auth.json").exists()
+
+
+def test_directory_swap_after_validation_does_not_write_moved_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    path = _store_path(home)
+    path.parent.mkdir(parents=True, mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    moved_local = outside / "moved-local"
+    final_identity = (path.parent.stat().st_dev, path.parent.stat().st_ino)
+    real_stat = auth.os.stat
+    swapped = False
+
+    def swap_after_final_directory_stat(
+        target: os.PathLike[str] | str | int, *args: object, **kwargs: object
+    ) -> os.stat_result:
+        nonlocal swapped
+        result = real_stat(target, *args, **kwargs)
+        if not swapped and (result.st_dev, result.st_ino) == final_identity:
+            swapped = True
+            (home / ".local").rename(moved_local)
+            path.parent.mkdir(parents=True, mode=0o700)
+        return result
+
+    monkeypatch.setattr(auth.os, "stat", swap_after_final_directory_stat)
+
+    with pytest.raises(auth.AuthStoreError, match="changed"):
+        auth.AuthStore(path).set_provider("openai", SECRET)
+
+    assert swapped
+    assert not (moved_local / "share" / "cambium" / "auth.json").exists()
+    assert not path.exists()
 
 
 def test_launch_environment_scrubs_inherited_credentials() -> None:

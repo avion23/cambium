@@ -61,6 +61,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cambium.auth import scrub_environment
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
 
 PROTO = 1
@@ -94,7 +95,9 @@ async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
 
 
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, env=scrub_environment()
+    )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
