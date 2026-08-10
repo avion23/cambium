@@ -930,6 +930,29 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     assert any(field == "metric.train.mean" for field, _detail in regressions)
 
 
+def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A symlinked drift-report.json must not redirect the gate's drift write
+    onto a baseline anchor: the gate never writes the baseline, and a rejected
+    artifact write fails the run instead of clobbering the anchor."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_before = anchor_path.read_bytes()
+    artifact = bench_root / "drift-report.json"
+    artifact.symlink_to(anchor_path)
+
+    assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
+
+    captured = capsys.readouterr()
+    assert "symlink" in captured.err
+    assert anchor_path.read_bytes() == anchor_before  # anchor bytes unchanged
+    assert artifact.is_symlink()  # artifact never materialized over the link
+
+
 def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     tmp_path, monkeypatch, capsys
 ) -> None:

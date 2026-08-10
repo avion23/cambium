@@ -31,6 +31,7 @@ import datetime as _dt
 import hashlib
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
@@ -763,7 +764,14 @@ def _write_drift_report(
     mode: str,
     full: bool,
 ) -> Path:
-    """Write a drift artifact summarizing each module against its anchor."""
+    """Write a drift artifact summarizing each module against its anchor.
+
+    The artifact path must never be a symlink: a symlinked
+    ``drift-report.json`` could redirect the write onto a baseline anchor,
+    violating "gate never writes the baseline". The path is checked and then
+    opened with ``O_NOFOLLOW`` so a symlink is rejected atomically at write
+    time instead of being followed.
+    """
     artifact: dict[str, Any] = {
         "schema_version": 1,
         "date": _utc_now_iso(),
@@ -781,8 +789,15 @@ def _write_drift_report(
         },
     }
     path = root / "drift-report.json"
+    if path.is_symlink():
+        raise OSError(
+            f"refusing to write drift report: {path} is a symlink; remove it "
+            "and rerun to allow the artifact to be written"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(artifact, indent=2) + "\n")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(artifact, indent=2) + "\n")
     return path
 
 
@@ -892,14 +907,19 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"cambium bench: gate passed: {report['module']}")
     if args.drift_report:
-        written = _write_drift_report(
-            root,
-            module_reports,
-            drift,
-            mode=mode,
-            full=args.full,
-        )
-        print(f"cambium bench: wrote drift report {written}")
+        try:
+            written = _write_drift_report(
+                root,
+                module_reports,
+                drift,
+                mode=mode,
+                full=args.full,
+            )
+        except OSError as exc:
+            print(f"cambium bench: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"cambium bench: wrote drift report {written}")
     return 1 if failures else 0
 
 

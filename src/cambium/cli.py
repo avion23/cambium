@@ -123,7 +123,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     bench = commands.add_parser(
         "bench",
-        help="run benchmark report or gate",
+        help="run benchmark report, gate, or re-anchor",
         description="Run the Cambium benchmark plugin CLI.",
     )
     bench_commands = bench.add_subparsers(dest="bench_command", required=True)
