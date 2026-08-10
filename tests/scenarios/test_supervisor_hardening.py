@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 import cambium.supervisor as supervisor_module
-from cambium.fencing import read_generation, write_generation
+from cambium.fencing import read_generation, validate_worker_generation, write_generation
 from cambium.supervisor import DuplicateTaskIDError, read_events, run_plan, run_session
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -277,6 +277,54 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Pat
     assert 7 not in generations
 
 
+def test_generation_survives_crash_after_worktree_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worktree = session_dir / "wt-t-crash-window"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-crash-window",
+         str(worktree), base],
+        check=True,
+        capture_output=True,
+    )
+    write_generation(worktree, 9)
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-crash-window",
+        worker=CRASH_ONCE_WORKER,
+        gate="true",
+        max_restarts=1,
+    )
+    runtime = supervisor_module._Runtime(session_dir, None)
+    real_git = runtime._git
+
+    async def crash_after_clean(path, *args, check=True):
+        result = await real_git(path, *args, check=check)
+        if args[:2] == ("clean", "-fd"):
+            raise RuntimeError("simulated supervisor crash after git clean")
+        return result
+
+    monkeypatch.setattr(runtime, "_git", crash_after_clean)
+    with pytest.raises(RuntimeError, match="simulated supervisor crash"):
+        asyncio.run(runtime._recover_worktree(task))
+
+    after_crash = read_generation(worktree)
+    assert after_crash >= 10
+    assert not validate_worker_generation(worktree, 1)
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    after_restart = read_generation(worktree)
+    assert result.results[0].status == "succeeded"
+    assert [9, after_crash, after_restart] == [9, 10, 12]
+    assert not validate_worker_generation(worktree, 1)
+
+
 @pytest.mark.parametrize("worker", [EOF_QUIET_WORKER, EOF_STALE_PONG_WORKER])
 def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     tmp_path: Path, monkeypatch, worker: str
@@ -320,6 +368,39 @@ def test_duplicate_task_id_is_rejected_before_store_or_spawn(tmp_path: Path, mon
     with pytest.raises(DuplicateTaskIDError, match="duplicate"):
         asyncio.run(run_plan(tmp_path / "session", plan))
     assert not (tmp_path / "session" / ".cambium").exists()
+
+
+def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkeypatch) -> None:
+    session_dir = tmp_path / "session"
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    hook_report = tmp_path / "hook-report.txt"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"${{DATABASE_URL:-absent}}\" > {shlex.quote(str(hook_report))}\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    monkeypatch.setenv("DATABASE_URL", "postgres://host-secret")
+    task = {
+        "task_id": "duplicate",
+        "repo": str(repo),
+        "worktree_path": str(session_dir / "wt-duplicate"),
+        "branch": "wt-duplicate",
+    }
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({"tasks": [task, task]}), encoding="utf-8")
+
+    with pytest.raises(DuplicateTaskIDError, match="duplicate"):
+        supervisor_module.main(["--session-dir", str(session_dir), "--plan", str(plan_path)])
+
+    assert not hook_report.exists()
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+    ).returncode != 0
+    assert not session_dir.exists()
 
 
 def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:

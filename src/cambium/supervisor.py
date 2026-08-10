@@ -1176,16 +1176,16 @@ class _Runtime:
         await self._git(repo, "worktree", "prune", check=False)
         if not worktree.exists():
             return await self._ensure_worktree_locked(spec, generation)
-        # Advance the durable token before touching the worktree.  The final
-        # write happens after ``git clean -fd`` because clean removes the
-        # untracked .cambium directory.
+        # Advance the durable token before touching the worktree, then exclude
+        # the supervisor-owned fence directory from the destructive clean.
+        # A supervisor crash after clean must leave this generation durable.
         persisted_generation = await asyncio.to_thread(next_generation, worktree)
         new_generation = max(persisted_generation, generation or 0)
+        await asyncio.to_thread(write_generation, worktree, new_generation)
         for op in ("rebase", "merge", "cherry-pick"):
             await self._git(worktree, op, "--abort", check=False)
         await self._git(worktree, "reset", "--hard", spec["base_commit"], check=False)
-        await self._git(worktree, "clean", "-fd", check=False)
-        await asyncio.to_thread(write_generation, worktree, new_generation)
+        await self._git(worktree, "clean", "-fd", "-e", ".cambium/", check=False)
         await self.emit(
             "recover", task_id=spec["task_id"], generation=new_generation,
             base_commit=spec["base_commit"],
@@ -1959,6 +1959,7 @@ def _ensure_repo_initialized(repo: Path) -> None:
     rc = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "refs/heads/main"],
         capture_output=True,
+        env=_strip_sensitive_env(dict(os.environ), worktree=repo),
     )
     if rc.returncode != 0:
         _sh("git", "-C", str(repo), "commit", "--allow-empty", "-m", "cambium initial")
@@ -1990,7 +1991,13 @@ def _load_task_spec(session_dir: Path, spec_path: str | None) -> dict[str, Any]:
 
 
 def _sh(*args: str, cwd: str | Path | None = None) -> None:
-    subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+    subprocess.run(
+        args,
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        env=_strip_sensitive_env(dict(os.environ)),
+    )
 
 
 def _bootstrap_scratch(repo: Path, task_spec: dict[str, Any]) -> None:
@@ -2060,7 +2067,9 @@ def main(argv: list[str] | None = None) -> int:
     session_dir = Path(args.session_dir)
     if args.plan:
         plan = json.loads(Path(args.plan).read_text())
-        for task in _plan_tasks(plan):
+        tasks = _plan_tasks(plan)
+        _reject_duplicate_task_ids(tasks)
+        for task in tasks:
             _ensure_repo_initialized(Path(task["repo"]).resolve())
         try:
             return asyncio.run(_amain_plan(session_dir, plan))
