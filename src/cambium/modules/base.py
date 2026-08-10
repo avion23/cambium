@@ -51,6 +51,10 @@ class ModuleCLIError(ModuleBoundaryError):
     """Raised when a module JSON CLI fails or violates its wire contract."""
 
 
+class ModuleSplitError(ModuleCLIError):
+    """Raised when a module explicitly reports an unavailable or invalid split."""
+
+
 @dataclass(frozen=True, slots=True)
 class ModuleManifest:
     """Validated, import-free metadata for one decision package."""
@@ -160,6 +164,29 @@ def _cli_detail(stdout: str, stderr: str) -> str:
     return detail if len(detail) <= 500 else f"{detail[:497]}..."
 
 
+def _split_error_status(output: object) -> str | None:
+    """Return the fallback-eligible split status from a CLI error object."""
+    if not isinstance(output, dict):
+        return None
+    error = output.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    for field in ("code", "status", "type"):
+        value = error.get(field)
+        if not isinstance(value, str):
+            continue
+        normalized = value.upper().replace("-", "_")
+        if normalized in {"UNAVAILABLE", "SCHEMA_INVALID"}:
+            return normalized
+
+    # The reference module predates the explicit status marker but emits this
+    # typed validation error for invalid dataset records.
+    if error.get("type") == "InputValidationError":
+        return "SCHEMA_INVALID"
+    return None
+
+
 def run_module_cli(
     cli_module: str,
     payload: dict[str, Any],
@@ -203,6 +230,16 @@ def run_module_cli(
         raise ModuleCLIError(f"module {cli_module!r}: CLI could not run: {exc}") from exc
 
     if result.returncode != 0:
+        try:
+            output = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            output = None
+        status = _split_error_status(output)
+        if status is not None:
+            raise ModuleSplitError(
+                f"module {cli_module!r}: CLI reported split {status}: "
+                f"{_cli_detail(result.stdout, result.stderr)}"
+            )
         raise ModuleCLIError(
             f"module {cli_module!r}: CLI exited {result.returncode}: "
             f"{_cli_detail(result.stdout, result.stderr)}"
@@ -219,6 +256,12 @@ def run_module_cli(
             f"module {cli_module!r}: CLI output must be one JSON object"
         )
     if "error" in output:
+        status = _split_error_status(output)
+        if status is not None:
+            raise ModuleSplitError(
+                f"module {cli_module!r}: CLI reported split {status}: "
+                f"{_cli_detail(result.stdout, result.stderr)}"
+            )
         raise ModuleCLIError(
             f"module {cli_module!r}: CLI returned an error object: {output['error']}"
         )

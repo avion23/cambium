@@ -66,6 +66,9 @@ def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Pa
             import json
             import sys
 
+            class SchemaInvalidError(ValueError):
+                pass
+
             def main():
                 payload = json.load(sys.stdin)
                 if payload["operation"] != "evaluate":
@@ -74,7 +77,7 @@ def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Pa
                 for record in payload["records"]:
                     expected_record = record["expected"]
                     if not isinstance(expected_record.get("reason"), str):
-                        raise ValueError("expected.reason must be a string")
+                        raise SchemaInvalidError("expected.reason must be a string")
                     expected = expected_record["decompose"]
                     results.append({
                         "prediction": {"decompose": expected},
@@ -83,7 +86,16 @@ def _write_fixture_module(tmp_path: Path, *, manifest: dict | None = None) -> Pa
                 print(json.dumps({"results": results}))
 
             if __name__ == "__main__":
-                main()
+                try:
+                    main()
+                except SchemaInvalidError as exc:
+                    print(json.dumps({
+                        "error": {
+                            "code": "SCHEMA_INVALID",
+                            "message": str(exc),
+                        }
+                    }))
+                    raise SystemExit(1)
             """
         )
     )
@@ -291,6 +303,36 @@ def test_invalid_split_schema_falls_back_to_combined_report_and_gate(
     assert baseline["canaries"]["total"] == 1
     assert "fell back to the combined file" in baseline["note"]
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
+
+
+def test_cli_timeout_fails_without_combined_fallback(tmp_path, monkeypatch, capsys) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    calls: list[list[dict]] = []
+
+    def timeout(_cli_module, payload, **_kwargs):
+        calls.append(payload["records"])
+        raise bench.ModuleCLIError("simulated train-split timeout")
+
+    monkeypatch.setattr(bench, "run_module_cli", timeout)
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert len(calls) == 1
+    assert len(calls[0]) == 1
+    assert not (bench_root / "fixture_module" / "baseline.json").exists()
+    assert "ERROR ModuleCLIError: simulated train-split timeout" in capsys.readouterr().err
 
 
 def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:
@@ -526,6 +568,29 @@ def test_compare_metric_delta_default_and_run_override() -> None:
     run_thresholds = {"metric_mean_delta": 0.01}
     assert compare_against_anchor(_fake_report(mean=0.98), anchor, run_thresholds) != []
     assert compare_against_anchor(_fake_report(mean=0.995), anchor, run_thresholds) == []
+
+
+def test_compare_combined_metric_delta_is_gated_for_fallback_reports() -> None:
+    from cambium.bench import compare_against_anchor
+
+    anchor = _fake_report()
+    report = _fake_report()
+    anchor["metric"] = {
+        "train": None,
+        "eval": None,
+        "canaries": None,
+        "combined": {"mean": 1.0, "std": 0.0, "count": 9},
+    }
+    report["metric"] = {
+        "train": None,
+        "eval": None,
+        "canaries": None,
+        "combined": {"mean": 0.0, "std": 0.0, "count": 9},
+    }
+
+    assert compare_against_anchor(report, anchor) == [
+        ("metric.combined.mean", "1.0 -> 0.0 (drop 1.0000 > 0.05)")
+    ]
 
 
 def test_compare_canary_failed_delta_is_wired() -> None:

@@ -40,6 +40,7 @@ from cambium.modules.base import (
     ModuleBoundaryError,
     ModuleCLIError,
     ModuleManifest,
+    ModuleSplitError,
     load_jsonl,
     load_module_manifest,
     run_module_cli,
@@ -265,10 +266,11 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
     """Metric/canaries/dataset sections of a module's baseline.
 
     Reads the three-split datasets (train/eval/canaries.jsonl) through the
-    module's neutral JSON CLI; if a split is unreadable or rejected by the
-    CLI's schema validation, it falls back to the combined ``*_pairs.jsonl``
-    file and marks the split metric fields null with a ``note``. The concrete
-    package is never imported by this harness.
+    module's neutral JSON CLI; if a split is unavailable or explicitly
+    schema-invalid, it falls back to the combined ``*_pairs.jsonl`` file and
+    marks the split metric fields null with a ``note``. Other CLI failures
+    propagate instead of silently shrinking the dataset. The concrete package
+    is never imported by this harness.
     """
     manifest = _module_manifest(pkg_name)
     datasets_dir = MODULES_DIR / pkg_name / "datasets"
@@ -304,7 +306,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
                     for example in scored[split]
                     if _is_canary(example.record)
                 ]
-    except (DatasetError, ModuleCLIError) as exc:
+    except (DatasetError, ModuleSplitError) as exc:
         combined = True
         note = (
             f"three-split dataset unavailable ({exc}); fell back to the combined "
@@ -402,7 +404,7 @@ def compare_against_anchor(
     regressions: list[tuple[str, str]] = []
 
     metric_delta = merged["metric_mean_delta"]
-    for split in SPLITS:
+    for split in SPLITS + ("combined",):
         r_metric = (report.get("metric") or {}).get(split)
         a_metric = (anchor.get("metric") or {}).get(split)
         if not isinstance(r_metric, dict) or not isinstance(a_metric, dict):
