@@ -222,14 +222,13 @@ class MergeSequencer:
         return result.stdout.strip()
 
     def _is_registered_worktree(self, repo: Path, worktree_path: Path) -> bool:
-        result = self._run_repo(repo, "worktree", "list", "--porcelain")
-        wanted = os.path.abspath(worktree_path)
-        for line in result.stdout.splitlines():
-            if line.startswith("worktree "):
-                current = os.path.abspath(line[len("worktree "):].strip())
-                if current == wanted:
-                    return True
-        return False
+        result = self._run_repo(repo, "worktree", "list", "--porcelain", "-z")
+        wanted = worktree_path.resolve()
+        return any(
+            field.startswith("worktree ")
+            and Path(field.removeprefix("worktree ")).resolve() == wanted
+            for field in result.stdout.split("\0")
+        )
 
     def _ensure_worker_tip(self, repo: Path, branch: str) -> str:
         """Resolve the worker branch tip, fetching it from origin if not local.

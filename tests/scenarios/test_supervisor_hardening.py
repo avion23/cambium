@@ -713,6 +713,65 @@ def test_oversized_stdout_line_fails_slice_reader(tmp_path: Path) -> None:
     )
 
 
+def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    worker = tmp_path / "wrong-ready-result-slice-worker.py"
+    worker.write_text(
+        "import json, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "def send(message):\n"
+        "    print(json.dumps(message), flush=True)\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "send({'type': 'ready', 'request_id': 'wrong-request-id', 'proto': 1})\n"
+        "run = json.loads(sys.stdin.readline())\n"
+        "if run.get('type') != 'run_task':\n"
+        "    raise SystemExit(1)\n"
+        "repo = Path(run['scratch_repo'])\n"
+        "worktree = Path(run['worktree_path'])\n"
+        "subprocess.run(['git', 'worktree', 'add', '-b', run['branch'],\n"
+        "                str(worktree), 'main'], cwd=repo, check=True,\n"
+        "                capture_output=True)\n"
+        "target = worktree / run['target_file']\n"
+        "target.write_text(target.read_text() + '\\n// slice-wrong-ready\\n')\n"
+        "subprocess.run(['git', 'add', run['target_file']], cwd=worktree, check=True,\n"
+        "                capture_output=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'wrong ready'], cwd=worktree, check=True,\n"
+        "                capture_output=True)\n"
+        "send({'type': 'result_envelope', 'request_id': run['request_id'],\n"
+        "      'status': 'succeeded'})\n"
+        "send({'type': 'exit_message', 'reason': 'done'})\n",
+        encoding="utf-8",
+    )
+    spec = _slice_spec(session_dir, str(worker))
+    spec.update({
+        "marker": "// slice-wrong-ready",
+        "gate": "grep -q '// slice-wrong-ready' hello.txt",
+    })
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.merge_sha is None
+    events = [
+        json.loads(line)
+        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
+    ]
+    protocol = [event for event in events if event["kind"] == "protocol"]
+    assert len(protocol) == 1
+    assert protocol[0]["payload"]["code"] == supervisor_module.PROTO_UNKNOWN_REQUEST_ID
+    assert not any(event["kind"] in {"gate", "merge"} for event in events)
+    assert "// slice-wrong-ready" not in subprocess.run(
+        ["git", "show", "main:hello.txt"],
+        cwd=session_dir / "scratch",
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
 def test_oversized_stdout_line_fails_custos_reader(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"

@@ -424,10 +424,16 @@ async def run_session(
             await _kill_worker(proc)
             break
         if msg.get("type") == "ready":
-            saw_ready = True
             if msg.get("request_id") != init_rid:
-                log.emit("protocol", task_id=task_id, note="ready request_id mismatch",
-                         expected=init_rid, got=msg.get("request_id"))
+                protocol_failure = PROTO_UNKNOWN_REQUEST_ID
+                log.emit(
+                    "protocol", task_id=task_id, request_id=msg.get("request_id"),
+                    code=PROTO_UNKNOWN_REQUEST_ID, note="ready request_id mismatch",
+                    expected=init_rid, got=msg.get("request_id"),
+                )
+                await _kill_worker(proc)
+                break
+            saw_ready = True
             log.emit("ready", task_id=task_id, request_id=msg.get("request_id"),
                      pid=msg.get("pid"))
             run_rid = make_request_id(2)

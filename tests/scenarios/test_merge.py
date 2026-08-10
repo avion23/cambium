@@ -399,6 +399,23 @@ def test_staging_conflict_with_spaced_path(tmp_path) -> None:
     seq.cleanup_staging(repo)
 
 
+def test_registered_staging_path_with_literal_newline_is_reusable_and_cleaned(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    wt_a = tmp_path / "wt-a"
+    _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
+
+    staging = tmp_path / "staging\npath"
+    seq = MergeSequencer(task_id="newline-path")
+    staged = seq.prepare_staging(repo, staging, "wt-a", "main")
+    reused = seq.prepare_staging(repo, staging, "wt-a", "main")
+
+    assert reused == staged
+    assert staging.is_dir()
+    seq.cleanup_staging(repo)
+    assert not staging.exists()
+
+
 def test_prepare_staging_fetches_branch_from_remote(tmp_path) -> None:
     remote = tmp_path / "remote.git"
     subprocess.run(
