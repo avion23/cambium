@@ -802,7 +802,7 @@ async def publish_merge(self, verified_tip: str) -> str:
 - `merge_staging_quarantined`, `merge_staging_cleanup_failed`,
   `merge_staging_prune_started`, and `merge_staging_pruned` are critical events.
   Cleanup and move failures are not suppressed.
-- No working-tree checkout of `main` is performed by `Unio`. The publish is purely a ref update; the working tree of `main` (if any) is updated by the host system or a separate Cambium command, never automatically. This is the same lesson Codex's CLI applies ("create git checkpoints; do not auto-mutate the working tree") — see `docs/research/codex.md`.
+- No working-tree checkout of `main` is performed by `Unio`. The publish is purely a ref update; the working tree of `main` (if any) is updated by the host system, never automatically (a dedicated Cambium command to update it is future work and does not exist today). This is the same lesson Codex's CLI applies ("create git checkpoints; do not auto-mutate the working tree") — see `docs/research/codex.md`.
 
 **Lock scope.** The `Unio` lock is held across verify-in-throwaway-worktree **and** publish. This serializes the whole merge pipeline. Throughput impact is documented in DS-M1; the throwaway-worktree + batch-test mode mitigates wall-clock cost without weakening the single-writer invariant.
 

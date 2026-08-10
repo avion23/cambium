@@ -109,6 +109,11 @@ uv run --python 3.14.7 --extra test cambium --help
 Available subcommands are `auth`, `supervisor`, `doctor`, `bench report|gate`,
 `tasktree`, `module-test`, and `version`.
 
+In plan mode the target `repo` is a ref-publication/control repository: a
+successful publication advances `refs/heads/main` but does **not** refresh any
+checkout. To build or test the published result, materialize the SHA in a
+separate detached worktree: `git worktree add --detach BUILD_DIR MERGE_SHA`.
+
 ## Documentation
 
 - `docs/architecture/` — canonical design:
