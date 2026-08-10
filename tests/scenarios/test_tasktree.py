@@ -473,6 +473,27 @@ def test_cli_reads_plan_from_json_file(tmp_path: Path) -> None:
     assert result.stderr == ""
 
 
+def test_cli_explicit_dash_reads_plan_from_stdin() -> None:
+    plan = _plan([
+        ("r", "FEATURE", []),
+        ("a", "BUGFIX", ["r"]),
+    ])
+
+    result = _run_cli(json.dumps(plan), "-")
+
+    assert result.returncode == 0, result.stderr
+    assert [json.loads(line) for line in result.stdout.splitlines()] == ["r", "a"]
+    assert result.stderr == ""
+
+
+def test_cli_explicit_dash_rejects_invalid_json_from_stdin() -> None:
+    result = _run_cli("{", "-")
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "tasktree: invalid JSON in stdin" in result.stderr
+
+
 def test_cli_no_args_prints_help_for_empty_stdin() -> None:
     result = _run_cli()
 
