@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 
 from cambium.modules.base import Example, Module
 
@@ -56,13 +57,29 @@ class TaskInput:
     context: str = ""
 
 
+class Decision(Enum):
+    """Domain decision for whether a task should be decomposed."""
+
+    DECOMPOSE = "decompose"
+    DO_NOT_DECOMPOSE = "do_not_decompose"
+
+
 @dataclass(frozen=True, slots=True)
 class DecomposeOutput:
-    """Prediction: whether the task should be decomposed into subtasks."""
+    """Prediction: whether the task should be decomposed into subtasks.
 
-    decompose: bool
+    ``decompose`` is a read-only compatibility shim for the former boolean
+    field. Domain code must use ``decision``.
+    """
+
+    decision: Decision
     reason: str
     confidence: float = 1.0
+
+    @property
+    def decompose(self) -> bool:
+        """Return the legacy boolean view; use ``decision`` as the domain model."""
+        return self.decision is Decision.DECOMPOSE
 
 
 def should_decompose(task: str, context: str = "") -> DecomposeOutput:
@@ -79,7 +96,7 @@ def should_decompose(task: str, context: str = "") -> DecomposeOutput:
 
     if "subtask" in context_lowered or "decompos" in context_lowered:
         return DecomposeOutput(
-            decompose=False,
+            decision=Decision.DO_NOT_DECOMPOSE,
             reason="context already provides a decomposition",
             confidence=0.9,
         )
@@ -132,12 +149,12 @@ def should_decompose(task: str, context: str = "") -> DecomposeOutput:
 
     if evidence >= 2:
         return DecomposeOutput(
-            decompose=True,
+            decision=Decision.DECOMPOSE,
             reason="; ".join(reasons) or "evidence threshold met",
             confidence=0.8,
         )
     return DecomposeOutput(
-        decompose=False,
+        decision=Decision.DO_NOT_DECOMPOSE,
         reason="task is atomic or already scoped",
         confidence=0.7,
     )

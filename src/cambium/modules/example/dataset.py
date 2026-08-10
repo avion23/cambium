@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cambium.modules.base import DatasetError, DatasetLoader, Example, load_jsonl
 
-from .decide import TaskInput
+from .decide import Decision, TaskInput
 
 
 class Split(Enum):
@@ -35,12 +35,14 @@ class ExampleDatasetLoader(DatasetLoader):
     """Loads input/expected pairs from a JSONL file.
 
     Each line: ``{"input": {"task", "context"}, "expected":
-    {"decompose", "reason"}}``. The optional boolean ``canary`` field
-    flags dataset-integrity entries planted to catch reward hacking in
-    future evals; they are loaded and scored like any other entry by
-    :meth:`load`. Split-aware loads (:meth:`load_split`, :meth:`load_all`)
-    read ``datasets/<split>.jsonl`` and exclude canaries from train/eval
-    (they load only via :data:`Split.CANARIES`).
+    {"decompose": bool, "reason"}}``. The loader maps the wire boolean
+    ``expected.decompose`` to :class:`Decision` in ``Example.expected``.
+    The optional boolean ``canary`` field flags dataset-integrity entries
+    planted to catch reward hacking in future evals; they are loaded and
+    scored like any other entry by :meth:`load`. Split-aware loads
+    (:meth:`load_split`, :meth:`load_all`) read ``datasets/<split>.jsonl`` and
+    exclude canaries from train/eval (they load only via
+    :data:`Split.CANARIES`).
 
     The v1 split files are loaded under the dataset-format.md §9
     contract: every record must carry a non-empty string ``id``, ids are
@@ -164,10 +166,16 @@ class ExampleDatasetLoader(DatasetLoader):
                 raise DatasetError(
                     f"{path}:{line_no}: invalid input fields: {exc}"
                 ) from exc
+            expected = dict(record["expected"])
+            expected["decompose"] = (
+                Decision.DECOMPOSE
+                if expected["decompose"]
+                else Decision.DO_NOT_DECOMPOSE
+            )
             examples.append(
                 Example(
                     input=task_input,
-                    expected=record["expected"],
+                    expected=expected,
                     canary=bool(record.get("canary", False)),
                 )
             )
