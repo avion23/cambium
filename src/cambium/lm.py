@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sysconfig
+import tempfile
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,7 +31,24 @@ _GENERATION_FIELDS = (
     "response_format",
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
-_SECRET_MARKERS = ("apikey", "authorization", "password", "secret", "token")
+_SECRET_MARKERS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "credential",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+        "privatekey",
+        "sessionkey",
+        "authtoken",
+    }
+)
+_DSPY_LOAD_LOCK = threading.Lock()
+_DSPY: Any | None = None
 
 
 def _load_dspy() -> Any:
@@ -38,33 +57,49 @@ def _load_dspy() -> Any:
     Packaging has no GIL ABI environment marker, so uv can resolve DSPy for
     cp314t. CambiumLM rejects that build when this module is imported instead.
     """
-    previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
-    os.environ["DSPY_CACHEDIR"] = os.devnull
-    try:
-        try:
-            import dspy
-        except ImportError as exc:
-            raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
-    finally:
-        if previous_cache_dir is None:
-            os.environ.pop("DSPY_CACHEDIR", None)
-        else:
-            os.environ["DSPY_CACHEDIR"] = previous_cache_dir
+    global _DSPY
+    if _DSPY is not None:
+        return _DSPY
 
-    configure_cache = getattr(dspy, "configure_cache", None)
-    if not callable(configure_cache):
-        raise RuntimeError("CambiumLM requires a DSPy version with cache configuration")
-    cache = getattr(dspy, "cache", None)
-    if (
-        getattr(cache, "enable_disk_cache", True)
-        or getattr(cache, "enable_memory_cache", True)
-    ):
-        configure_cache(
-            enable_disk_cache=False,
-            enable_memory_cache=False,
-            disk_cache_dir=None,
-        )
-    return dspy
+    with _DSPY_LOAD_LOCK:
+        if _DSPY is not None:
+            return _DSPY
+
+        previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
+        # DSPy 3.3 constructs its default disk cache during import. A valid,
+        # non-HOME directory avoids its /dev/null fallback warning; the cache
+        # is disabled before this function returns.
+        with tempfile.TemporaryDirectory(prefix="cambium-dspy-cache-") as cache_dir:
+            os.environ["DSPY_CACHEDIR"] = cache_dir
+            try:
+                try:
+                    import dspy
+                except ImportError as exc:
+                    raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
+            finally:
+                if previous_cache_dir is None:
+                    os.environ.pop("DSPY_CACHEDIR", None)
+                else:
+                    os.environ["DSPY_CACHEDIR"] = previous_cache_dir
+
+            configure_cache = getattr(dspy, "configure_cache", None)
+            if not callable(configure_cache):
+                raise RuntimeError("CambiumLM requires a DSPy version with cache configuration")
+            cache = getattr(dspy, "cache", None)
+            if (
+                getattr(cache, "enable_disk_cache", True)
+                or getattr(cache, "enable_memory_cache", True)
+            ):
+                configure_cache(
+                    enable_disk_cache=False,
+                    enable_memory_cache=False,
+                    disk_cache_dir=None,
+                )
+                close_disk_cache = getattr(getattr(cache, "disk_cache", None), "close", None)
+                if callable(close_disk_cache):
+                    close_disk_cache()
+        _DSPY = dspy
+        return _DSPY
 
 
 class CambiumLM:

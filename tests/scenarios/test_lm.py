@@ -7,6 +7,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ import pytest
 
 from cambium.architectus import ArchitectusCore
 from cambium.diffundo import CallResult, ProviderTier
-from cambium.lm import ArchitectusLM, CambiumLM
+from cambium.lm import ArchitectusLM, CambiumLM, _load_dspy
 from cambium.tasktree import build_tree
 
 
@@ -99,6 +100,7 @@ assert dspy.cache.enable_memory_cache is False
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
     assert _tree(tmp_path) == ()
     assert real_cache.exists() is real_cache_before_exists
     assert _tree(real_cache) == real_cache_before
@@ -205,3 +207,48 @@ def test_secret_marker_variants_are_rejected(key: str) -> None:
     _require_dspy()
     with pytest.raises(ValueError, match="provider credentials"):
         CambiumLM(FakeDiffundo(), ProviderTier.FAST, **{key: "secret"})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "credential",
+        "CREDENTIAL",
+        "client_secret",
+        "client-secret",
+        "CLIENT-SECRET",
+        "access_token",
+        "ACCESS-TOKEN",
+        "refresh_token",
+        "refresh-token",
+        "private_key",
+        "PRIVATE-KEY",
+        "session_key",
+        "SESSION-KEY",
+        "auth_token",
+        "AUTH-TOKEN",
+    ],
+)
+def test_credential_marker_variants_cannot_reach_dump_state(key: str) -> None:
+    _require_dspy()
+    with pytest.raises(ValueError, match="provider credentials"):
+        CambiumLM(
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            **{key: "SENSITIVE_CANARY"},
+        )  # type: ignore[arg-type]
+
+
+def test_concurrent_dspy_loads_preserve_cache_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    _require_dspy()
+    sentinel = "/tmp/cambium-dspy-cache-sentinel"
+    monkeypatch.setenv("DSPY_CACHEDIR", sentinel)
+
+    def load_repeatedly(_: int) -> None:
+        for _ in range(2000):
+            _load_dspy()
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(load_repeatedly, range(16)))
+
+    assert os.environ["DSPY_CACHEDIR"] == sentinel
