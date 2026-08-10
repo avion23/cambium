@@ -87,6 +87,9 @@ class ApprovalPolicy:
     def __init__(self, config: Mapping[str, Any]) -> None:
         if not isinstance(config, Mapping):
             raise TypeError("approval policy config must be a mapping")
+        for alias in ("denylist", "deny_list"):
+            if alias in config:
+                raise ValueError(f"{alias} is not supported; use 'deny'")
         allowlist = _patterns(config.get("allowlist", ()), "allowlist")
         denylist = _patterns(config.get("deny", ()), "deny")
         interactive = _boolean(config, "interactive", False)
