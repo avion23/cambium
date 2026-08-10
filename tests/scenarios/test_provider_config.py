@@ -96,6 +96,24 @@ def test_env_report_only_returns_presence_booleans(
     assert env_report(providers) == {"present": True, "missing": False}
 
 
+def test_env_report_treats_empty_value_as_unconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [
+            _provider("empty"),
+            _provider("present"),
+        ],
+    )
+    monkeypatch.setenv("CAMBIUM_PROVIDER_EMPTY_API_KEY", "")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_PRESENT_API_KEY", "non-empty-secret")
+
+    providers = load_providers(path)
+
+    assert env_report(providers) == {"empty": False, "present": True}
+
+
 def test_default_path_missing_has_clear_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -380,12 +380,17 @@ def env_report(
     providers: list[ProviderConfig | ProviderEnvSpec]
     | tuple[ProviderConfig | ProviderEnvSpec, ...]
 ) -> dict[str, bool]:
-    """Return whether each provider's key environment variable is present.
+    """Return whether each provider's key environment variable is usable.
 
-    The report contains only provider names and booleans. It never returns an
-    environment-variable name or value.
+    A variable is usable only when set to a non-empty value, matching
+    Diffundo's call-time check: ``_post_sync`` rejects an empty key with
+    ``ProviderOutcome.AUTH_ERROR``. The report contains only provider names and
+    booleans. It never returns an environment-variable name or value.
     """
-    return {provider.name: provider.api_key_env in os.environ for provider in providers}
+    return {
+        provider.name: bool(os.environ.get(provider.api_key_env))
+        for provider in providers
+    }
 
 
 def __getattr__(name: str) -> object:
