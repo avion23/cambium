@@ -22,7 +22,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _require_reference_module() -> None:
+    if not (REPO_ROOT / "src" / "cambium" / "modules" / "example").is_dir():
+        pytest.skip("reference module cambium.modules.example is absent")
 
 
 def _build_and_install_wheel(site_dir: Path) -> Path:
@@ -79,6 +86,7 @@ def _run(
 
 
 def test_plain_wheel_install_runs_supervisor_bench_and_module_test(tmp_path) -> None:
+    _require_reference_module()
     site = tmp_path / "site-packages"
     unrelated = tmp_path / "unrelated"
     unrelated.mkdir()

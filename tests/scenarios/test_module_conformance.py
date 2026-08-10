@@ -62,6 +62,9 @@ def test_reference_module_discovery_uses_tracked_contract() -> None:
     assert any(path.name == "baseline.json" for path in spec.baseline_files)
     assert any(path.name == "eval.jsonl" for path in spec.dataset_files)
     assert spec.test_files
+    assert spec.manifest is not None
+    assert spec.manifest.package_name == name
+    assert spec.manifest.cli_module == spec.package_name
 
 
 def test_reference_module_has_no_forbidden_imports() -> None:
@@ -121,6 +124,132 @@ def test_gate_fails_on_metadata_digest_mismatch(monkeypatch) -> None:
         module_conformance.validate_module(_one_discovered_module())
 
     assert "metadata digest does not match content" in str(raised.value)
+
+
+def test_validate_module_requires_tracked_module_json(monkeypatch) -> None:
+    name = _one_discovered_module()
+    original_regular = module_conformance._is_regular_file
+
+    def regular_except_module_json(path: Path) -> bool:
+        if Path(path).name == "module.json":
+            return False
+        return original_regular(path)
+
+    monkeypatch.setattr(module_conformance, "_is_regular_file", regular_except_module_json)
+
+    with pytest.raises(module_conformance.ModuleConformanceError) as raised:
+        module_conformance.validate_module(name)
+
+    assert "missing tracked regular file" in str(raised.value)
+    assert "module.json" in str(raised.value)
+
+
+def test_validate_module_rejects_baseline_module_name_mismatch(monkeypatch) -> None:
+    name = _one_discovered_module()
+    original_load_json = module_conformance._load_json
+
+    def renamed_baseline(path: Path):
+        value = original_load_json(path)
+        if path.name == "baseline.json" and isinstance(value, dict):
+            value = dict(value)
+            value["module"] = "not-the-logical-module"
+        return value
+
+    monkeypatch.setattr(module_conformance, "_load_json", renamed_baseline)
+
+    with pytest.raises(module_conformance.ModuleConformanceError) as raised:
+        module_conformance.validate_module(name)
+
+    assert "must match module.json module_name" in str(raised.value)
+
+
+def test_module_scan_fails_closed_on_non_literal_dynamic_import(tmp_path) -> None:
+    spec = _validated_spec_or_skip()
+    probe = tmp_path / "dynamic_import_probe.py"
+    probe.write_text(
+        "import importlib\n"
+        "target = 'cambium.modules.' + 'example'\n"
+        "importlib.import_module(target)\n"
+        "__import__(target)\n",
+        encoding="utf-8",
+    )
+
+    issues = module_conformance._scan_python_file(probe, spec)
+
+    assert sum("non-literal target" in issue for issue in issues) == 2
+
+
+def test_module_scan_flags_cambium_harness_import(tmp_path) -> None:
+    spec = _validated_spec_or_skip()
+    probe = tmp_path / "harness_import_probe.py"
+    probe.write_text("from cambium import supervisor\n", encoding="utf-8")
+
+    issues = module_conformance._scan_python_file(probe, spec)
+
+    assert any(
+        "cambium harness import is forbidden: cambium.supervisor" in issue
+        for issue in issues
+    )
+
+
+def test_reverse_scan_flags_builtin_import_of_decision_package(
+    tmp_path, monkeypatch
+) -> None:
+    name = _one_discovered_module()
+    probe = tmp_path / "reverse_builtin_import_probe.py"
+    probe.write_text(f"__import__('cambium.modules.{name}')\n", encoding="utf-8")
+    monkeypatch.setattr(module_conformance, "_reverse_scan_paths", lambda: (probe,))
+    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
+
+    findings = module_conformance.scan_reverse_imports()
+
+    assert any(
+        finding.rule == "reverse-import"
+        and f"loads decision package cambium.modules.{name}" in finding.detail
+        for finding in findings
+    )
+
+
+def test_reverse_scan_fails_closed_on_non_literal_dynamic_import(
+    tmp_path, monkeypatch
+) -> None:
+    probe = tmp_path / "reverse_dynamic_import_probe.py"
+    probe.write_text(
+        "import importlib\n"
+        "target = 'cambium.modules.example'\n"
+        "importlib.import_module(target)\n"
+        "__import__(target)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module_conformance, "_reverse_scan_paths", lambda: (probe,))
+    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
+
+    findings = module_conformance.scan_reverse_imports()
+
+    assert sum("non-literal target" in finding.detail for finding in findings) == 2
+
+
+def test_probe_reports_siblings_loaded_inside_cli_probe(monkeypatch) -> None:
+    spec = _validated_spec_or_skip()
+
+    def fake_run(command, **kwargs):
+        import_log = Path(kwargs["env"]["CAMBIUM_MODULE_PROBE_IMPORT_LOG"])
+        import_log.write_text(
+            f"cambium.modules.{spec.name}\n"
+            "cambium.modules.sibling_package\n"
+            "cambium.modules.sibling_package.extra\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout='{"ok": true}\n', stderr="")
+
+    monkeypatch.setattr(module_conformance, "module_names", lambda: [spec.name, "sibling_package"])
+    monkeypatch.setattr(module_conformance.subprocess, "run", fake_run)
+
+    with pytest.raises(module_conformance.ModuleConformanceError) as raised:
+        module_conformance.probe_module_cli(spec)
+
+    assert "sibling modules loaded inside the JSON CLI probe" in str(raised.value)
+    assert "cambium.modules.sibling_package" in str(raised.value)
 
 
 def test_offline_subprocess_environment_strips_credentials_and_denies_network(
@@ -513,6 +642,8 @@ def test_baseline_rejects_foreign_path_containing_module_prefix(monkeypatch) -> 
 def test_installed_package_ignores_unrelated_git_and_normalizes_nodeids(
     tmp_path: Path,
 ) -> None:
+    if not module_conformance.discover_modules():
+        pytest.skip("no decision modules are installed")
     checkout = tmp_path / "unrelated"
     checkout.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
@@ -662,3 +793,76 @@ def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch)
     assert len(findings) == 1
     assert findings[0].symbol == "eval"
     assert "without dataset_version bump (1.0.0)" in findings[0].detail
+
+
+def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
+    """Deleting one module directory must not break the shared scenarios.
+
+    Copies the repository into a throwaway directory, deletes only
+    ``src/cambium/modules/example/``, and runs the shared scenario suite plus
+    the clean-wheel checks from the copy. Every module-dependent scenario must
+    skip (tolerate absence) and everything else must stay green; any scenario
+    that hardcodes the removed module fails this canary.
+    """
+    if not module_conformance.discover_modules():
+        pytest.skip("no decision modules are installed; nothing to delete")
+    copy = tmp_path / "repo"
+    copy.mkdir()
+    ignore = shutil.ignore_patterns(
+        "__pycache__",
+        "*.pyc",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".venv",
+        ".cambium",
+        "dist",
+        "build",
+    )
+    for entry in sorted(os.scandir(module_conformance.REPO_ROOT), key=lambda e: e.name):
+        if entry.name == ".git":
+            continue
+        source = Path(entry.path)
+        destination = copy / entry.name
+        if entry.is_dir():
+            shutil.copytree(source, destination, symlinks=True, ignore=ignore)
+        else:
+            shutil.copy2(source, destination)
+    git = ["git", "-c", "user.name=Cambium Test", "-c", "user.email=test@example.invalid"]
+    subprocess.run([*git, "init", "-q"], cwd=copy, check=True, capture_output=True)
+    subprocess.run([*git, "add", "-A"], cwd=copy, check=True, capture_output=True)
+    subprocess.run(
+        [*git, "commit", "-qm", "snapshot for deletion canary"],
+        cwd=copy,
+        check=True,
+        capture_output=True,
+    )
+    shutil.rmtree(copy / "src" / "cambium" / "modules" / "example")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTEST_ADDOPTS", "PYTEST_PLUGINS"}
+    }
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--python",
+            "3.14.7",
+            "--extra",
+            "test",
+            "pytest",
+            "-q",
+            "tests/scenarios/test_module_conformance.py",
+            "tests/scenarios/test_wheel_cli.py",
+            "tests/scenarios/test_bench.py",
+            "tests/scenarios/test_tooling.py",
+        ],
+        cwd=copy,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
