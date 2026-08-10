@@ -44,8 +44,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cambium.fencing import next_generation, write_generation
+from cambium.process_env import build_subprocess_env
+
 PROTO = 1
 WORKER_STDIN_LIMIT = 1_048_576
+STDIN_WRITE_TIMEOUT_S = 5.0
+PONG_DEADLINE_S = 10.0
+PROCESS_REAP_TIMEOUT_S = 5.0
 
 EventSink = Callable[[dict[str, Any]], None]
 
@@ -116,12 +122,29 @@ def _validate_paths(session_dir: Path, task_spec: dict[str, Any]) -> tuple[Path,
     return scratch_repo, worktree_path
 
 
-async def _write_json(proc: asyncio.subprocess.Process, msg: dict[str, Any]) -> bool:
+async def _write_json(
+    proc: asyncio.subprocess.Process,
+    msg: dict[str, Any],
+    *,
+    deadline: float | None = None,
+) -> bool:
+    """Write one wire message before ``deadline`` or kill its process group."""
+    if proc.stdin is None or proc.stdin.is_closing():
+        return False
+    loop = asyncio.get_running_loop()
+    write_deadline = deadline
+    if write_deadline is None:
+        write_deadline = loop.time() + STDIN_WRITE_TIMEOUT_S
+    remaining = write_deadline - loop.time()
+    if remaining <= 0:
+        await _kill_worker(proc)
+        return False
     try:
         proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
+        await asyncio.wait_for(proc.stdin.drain(), remaining)
         return True
-    except (BrokenPipeError, ConnectionResetError):
+    except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
+        await _kill_worker(proc)
         return False
 
 
@@ -129,7 +152,25 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
     """SIGKILL the worker's process group (worker is its own session/group leader)."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+async def _kill_process_group_and_reap(proc: asyncio.subprocess.Process) -> None:
+    """Kill a subprocess group, including descendants, and reap its leader."""
+    await _kill_worker(proc)
+    try:
+        await asyncio.wait_for(proc.wait(), PROCESS_REAP_TIMEOUT_S)
+        return
+    except (ProcessLookupError, TimeoutError):
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), PROCESS_REAP_TIMEOUT_S)
+    except (ProcessLookupError, TimeoutError):
         pass
 
 
@@ -150,27 +191,54 @@ async def _run_gate(
     proc = await asyncio.create_subprocess_exec(
         "sh", "-c", command, cwd=cwd, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(dict(os.environ)),
+        env=_strip_sensitive_env(dict(os.environ), worktree=cwd),
+        start_new_session=True,
+        pass_fds=(),
+        close_fds=True,
     )
     try:
         _out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _kill_process_group_and_reap(proc)
         log.emit("gate", task_id=task_id, command=command, exit_code=None, timed_out=True)
+        raise
+    except asyncio.CancelledError:
+        await _kill_process_group_and_reap(proc)
         raise
     log.emit("gate", task_id=task_id, command=command, exit_code=proc.returncode,
              stderr=err.decode("utf-8", "replace")[:512])
     return proc.returncode
 
 
-async def _merge_branch(scratch_repo: Path, branch: str, log: EventLog, task_id: str) -> str | None:
+async def _merge_branch(
+    scratch_repo: Path,
+    branch: str,
+    log: EventLog,
+    task_id: str,
+    *,
+    timeout: float | None = None,
+) -> str | None:
     proc = await asyncio.create_subprocess_exec(
         "git", "merge", "--ff-only", branch, cwd=scratch_repo,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(dict(os.environ)),
+        env=_strip_sensitive_env(dict(os.environ), worktree=scratch_repo),
+        start_new_session=True,
+        pass_fds=(),
+        close_fds=True,
     )
-    _out, err = await proc.communicate()
+    try:
+        communicate = proc.communicate()
+        if timeout is None:
+            _out, err = await communicate
+        else:
+            _out, err = await asyncio.wait_for(communicate, timeout)
+    except TimeoutError:
+        await _kill_process_group_and_reap(proc)
+        log.emit("merge", task_id=task_id, branch=branch, exit_code=None, timed_out=True)
+        raise
+    except asyncio.CancelledError:
+        await _kill_process_group_and_reap(proc)
+        raise
     if proc.returncode != 0:
         log.emit("merge", task_id=task_id, branch=branch, exit_code=proc.returncode,
                  stderr=err.decode("utf-8", "replace")[:512])
@@ -178,9 +246,24 @@ async def _merge_branch(scratch_repo: Path, branch: str, log: EventLog, task_id:
     tip = await asyncio.create_subprocess_exec(
         "git", "rev-parse", "HEAD", cwd=scratch_repo,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=_strip_sensitive_env(dict(os.environ)),
+        env=_strip_sensitive_env(dict(os.environ), worktree=scratch_repo),
+        start_new_session=True,
+        pass_fds=(),
+        close_fds=True,
     )
-    out, _ = await tip.communicate()
+    try:
+        communicate = tip.communicate()
+        if timeout is None:
+            out, _ = await communicate
+        else:
+            out, _ = await asyncio.wait_for(communicate, timeout)
+    except TimeoutError:
+        await _kill_process_group_and_reap(tip)
+        log.emit("merge", task_id=task_id, branch=branch, exit_code=None, timed_out=True)
+        raise
+    except asyncio.CancelledError:
+        await _kill_process_group_and_reap(tip)
+        raise
     sha = out.decode("utf-8", "replace").strip()
     log.emit("merge", task_id=task_id, branch=branch, exit_code=0, sha=sha)
     return sha
@@ -219,9 +302,19 @@ async def run_session(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=WORKER_STDIN_LIMIT,
-        env=_strip_sensitive_env({**os.environ, "PYTHONUNBUFFERED": "1",
-                                  "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": "1"}),
+        env=_strip_sensitive_env(
+            dict(os.environ),
+            allowed_keys=task_spec.get("provider_env_keys", ()),
+            worktree=worktree_path,
+            overrides={
+                "CAMBIUM_TASK_ID": task_id,
+                "CAMBIUM_GENERATION": "1",
+                "CAMBIUM_SESSION_ID": str(session_dir.resolve()),
+            },
+        ),
         start_new_session=True,
+        pass_fds=(),
+        close_fds=True,
     )
 
     messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
@@ -249,10 +342,16 @@ async def run_session(
     stderr_task = asyncio.create_task(_read_stderr())
 
     init_rid = make_request_id(1)
-    await _write_json(proc, {
-        "type": "init", "request_id": init_rid, "task_id": task_id,
-        "proto": PROTO, "generation": 1, "spec": task_spec.get("spec", ""),
-    })
+    init_deadline = min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S)
+    init_written = await _write_json(
+        proc,
+        {
+            "type": "init", "request_id": init_rid, "task_id": task_id,
+            "proto": PROTO, "generation": 1, "spec": task_spec.get("spec", ""),
+            "provider_env_keys": list(task_spec.get("provider_env_keys", ())),
+        },
+        deadline=init_deadline,
+    )
     log.emit("init", task_id=task_id, request_id=init_rid)
 
     run_payload = {
@@ -262,18 +361,25 @@ async def run_session(
         "target_file": task_spec["target_file"],
         "marker": task_spec["marker"],
         "write_marker": bool(task_spec.get("write_marker", True)),
+        "generation": 1,
     }
 
     # Phase 1: init -> ready (bounded by ready_timeout and the wall budget).
     timeout_kind: str | None = None
     run_rid: str | None = None
     saw_ready = False
-    ready_deadline = min(loop.time() + ready_timeout, wall_deadline)
+    timeout_kind = "stdin" if not init_written else None
+    ready_deadline = (
+        min(loop.time() + ready_timeout, wall_deadline)
+        if init_written
+        else loop.time()
+    )
     while True:
         try:
             msg = await _next_message(messages, ready_deadline)
         except TimeoutError:
-            timeout_kind = "ready"
+            if timeout_kind is None:
+                timeout_kind = "ready"
             break
         if msg is None:
             break  # EOF before ready
@@ -285,8 +391,14 @@ async def run_session(
             log.emit("ready", task_id=task_id, request_id=msg.get("request_id"),
                      pid=msg.get("pid"))
             run_rid = make_request_id(2)
-            if not await _write_json(proc, {"type": "run_task", "request_id": run_rid,
-                                            "task_id": task_id, **run_payload}):
+            run_deadline = min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S)
+            if not await _write_json(
+                proc,
+                {"type": "run_task", "request_id": run_rid,
+                 "task_id": task_id, **run_payload},
+                deadline=run_deadline,
+            ):
+                timeout_kind = "stdin"
                 log.emit("protocol", task_id=task_id, note="run_task write failed")
             log.emit("run_task", task_id=task_id, request_id=run_rid)
             break
@@ -304,6 +416,49 @@ async def run_session(
                 timeout_kind = "wall"
                 break
             if msg is None:
+                await asyncio.sleep(
+                    min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time()))
+                )
+                if proc.returncode is None:
+                    pong_rid = make_request_id(3)
+                    pong_deadline = min(wall_deadline, loop.time() + PONG_DEADLINE_S)
+                    log.emit("ping", task_id=task_id, request_id=pong_rid)
+                    pong_ok = await _write_json(
+                        proc,
+                        {"type": "ping", "request_id": pong_rid, "task_id": task_id},
+                        deadline=pong_deadline,
+                    )
+                    pong_correlated = False
+                    while pong_ok and loop.time() < pong_deadline:
+                        try:
+                            response = await asyncio.wait_for(
+                                messages.get(), pong_deadline - loop.time()
+                            )
+                        except TimeoutError:
+                            break
+                        if response is None:
+                            break
+                        if response.get("type") != "pong":
+                            continue
+                        if response.get("request_id") == pong_rid:
+                            pong_correlated = True
+                            log.emit("pong", task_id=task_id, request_id=pong_rid)
+                            try:
+                                await asyncio.wait_for(
+                                    proc.wait(),
+                                    min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time())),
+                                )
+                            except TimeoutError:
+                                await _kill_worker(proc)
+                            break
+                        log.emit(
+                            "protocol", task_id=task_id,
+                            note="pong request_id mismatch",
+                            expected=pong_rid, got=response.get("request_id"),
+                        )
+                    if not pong_correlated:
+                        timeout_kind = "pong"
+                        await _kill_worker(proc)
                 break  # EOF without exit_message
             mtype = msg.get("type")
             if mtype == "result_envelope":
@@ -361,9 +516,21 @@ async def run_session(
         if not timed_out:
             if worker_status == "succeeded" and gate_rc == 0:
                 status = "succeeded"
-                merge_sha = await _merge_branch(scratch_repo, run_payload["branch"], log, task_id)
-                if merge_sha is None:
+                try:
+                    merge_sha = await _merge_branch(
+                        scratch_repo,
+                        run_payload["branch"],
+                        log,
+                        task_id,
+                        timeout=max(0.0, wall_deadline - loop.time()),
+                    )
+                except TimeoutError:
                     status = "failed"
+                    timed_out = True
+                    timeout_kind = "merge"
+                else:
+                    if merge_sha is None:
+                        status = "failed"
             else:
                 status = "failed"
             exit_code = 0 if status == "succeeded" else 1
@@ -418,14 +585,25 @@ CRITICAL_KINDS = frozenset({
     "merge_progress", "task_assigned", "merge_committed",
 })
 
-_API_KEY_RE = re.compile(
-    r"(api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
-)
+def _strip_sensitive_env(
+    env: dict[str, str],
+    *,
+    allowed_keys: Any = None,
+    worktree: Path | None = None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the strict child environment used by every supervisor spawn.
 
-
-def _strip_sensitive_env(env: dict[str, str]) -> dict[str, str]:
-    """Drop env keys with API-key-ish names; keep everything else (arch §9)."""
-    return {k: v for k, v in env.items() if not _API_KEY_RE.search(k)}
+    The historical name remains because it is part of the supervisor's
+    internal call-site contract.  This is now a fail-closed allowlist, not a
+    name-based secret scrub.
+    """
+    return build_subprocess_env(
+        env,
+        allowed_keys=allowed_keys,
+        worktree=worktree,
+        overrides=overrides,
+    )
 
 
 class NonFastForwardError(RuntimeError):
@@ -563,17 +741,24 @@ class _FallbackSequencer:
         self._staging_ref: str | None = None
 
     @staticmethod
-    def _env() -> dict[str, str]:
-        env = dict(os.environ)
-        env.pop("GIT_QUARANTINE_PATH", None)
-        return env
+    def _env(
+        cwd: Path | None = None,
+        overrides: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        return build_subprocess_env(worktree=cwd, overrides=overrides)
 
     def _run(
         self, cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
+        overrides = {
+            key: env[key]
+            for key in ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+            if env is not None and key in env
+        }
         result = subprocess.run(
             ["git", "-C", str(cwd), *args], capture_output=True, text=True,
-            env=self._env() if env is None else env,
+            env=self._env(Path(cwd), overrides),
+            start_new_session=True,
         )
         if check and result.returncode != 0:
             raise RuntimeError(
@@ -737,6 +922,10 @@ class PlanResult:
         return 0 if all(r.status == "succeeded" for r in self.results) else 1
 
 
+class DuplicateTaskIDError(ValueError):
+    """The plan cannot be dispatched because a task id is repeated."""
+
+
 @dataclass(slots=True)
 class WorkerHandle:
     """Loop-affine per-generation worker state (custos design §3.1)."""
@@ -886,7 +1075,11 @@ class _Runtime:
         self, path: Path, args: tuple[str, ...], check: bool
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            ["git", "-C", str(path), *args], capture_output=True, text=True
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            env=_strip_sensitive_env(dict(os.environ), worktree=path),
+            start_new_session=True,
         )
         if check and result.returncode != 0:
             raise RuntimeError(
@@ -906,11 +1099,13 @@ class _Runtime:
 
     # -- worktree lifecycle --------------------------------------------------
 
-    async def _ensure_worktree(self, spec: dict[str, Any]) -> None:
+    async def _ensure_worktree(self, spec: dict[str, Any]) -> int:
         async with self._worktree_lock:
-            await self._ensure_worktree_locked(spec)
+            return await self._ensure_worktree_locked(spec)
 
-    async def _ensure_worktree_locked(self, spec: dict[str, Any]) -> None:
+    async def _ensure_worktree_locked(
+        self, spec: dict[str, Any], generation: int | None = None
+    ) -> int:
         repo = Path(spec["repo"])
         worktree = Path(spec["worktree_path"]).resolve()
         branch = spec["branch"]
@@ -918,8 +1113,7 @@ class _Runtime:
         await self._git(repo, "worktree", "prune", check=False)
         listing = await self._git_stdout(repo, "worktree", "list", "--porcelain") or ""
         if str(worktree) in listing:
-            await self._recover_worktree_locked(spec)
-            return
+            return await self._recover_worktree_locked(spec, generation)
         if worktree.exists():
             # stale unregistered directory; it is session-owned, so drop it
             shutil.rmtree(worktree, ignore_errors=True)
@@ -931,29 +1125,38 @@ class _Runtime:
             raise RuntimeError(
                 f"worktree add for {branch} failed: {(result.stderr + result.stdout).strip()[:512]}"
             )
+        initial_generation = max(generation or 1, 1)
+        await asyncio.to_thread(write_generation, worktree, initial_generation)
+        return initial_generation
 
-    async def _recover_worktree(self, spec: dict[str, Any], generation: int | None = None) -> None:
+    async def _recover_worktree(self, spec: dict[str, Any], generation: int | None = None) -> int:
         async with self._worktree_lock:
-            await self._recover_worktree_locked(spec, generation)
+            return await self._recover_worktree_locked(spec, generation)
 
     async def _recover_worktree_locked(
         self, spec: dict[str, Any], generation: int | None = None
-    ) -> None:
+    ) -> int:
         """Worktree recovery before a respawn (arch §7.5): reset + clean."""
         repo = Path(spec["repo"])
         worktree = Path(spec["worktree_path"]).resolve()
         await self._git(repo, "worktree", "prune", check=False)
         if not worktree.exists():
-            await self._ensure_worktree_locked(spec)
-            return
+            return await self._ensure_worktree_locked(spec, generation)
+        # Advance the durable token before touching the worktree.  The final
+        # write happens after ``git clean -fd`` because clean removes the
+        # untracked .cambium directory.
+        persisted_generation = await asyncio.to_thread(next_generation, worktree)
+        new_generation = max(persisted_generation, generation or 0)
         for op in ("rebase", "merge", "cherry-pick"):
             await self._git(worktree, op, "--abort", check=False)
         await self._git(worktree, "reset", "--hard", spec["base_commit"], check=False)
         await self._git(worktree, "clean", "-fd", check=False)
+        await asyncio.to_thread(write_generation, worktree, new_generation)
         await self.emit(
-            "recover", task_id=spec["task_id"], generation=generation,
+            "recover", task_id=spec["task_id"], generation=new_generation,
             base_commit=spec["base_commit"],
         )
+        return new_generation
 
     # -- spawn environment ---------------------------------------------------
 
@@ -970,14 +1173,20 @@ class _Runtime:
         return [sys.executable, "-u", str(worker)]
 
     def _worker_env(self, spec: dict[str, Any], generation: int) -> dict[str, str]:
-        env = _strip_sensitive_env(dict(os.environ))
-        env["PYTHONUNBUFFERED"] = "1"
-        env["CAMBIUM_TASK_ID"] = spec["task_id"]
-        env["CAMBIUM_GENERATION"] = str(generation)
-        return env
+        worktree = Path(spec["worktree_path"]).resolve()
+        return _strip_sensitive_env(
+            dict(os.environ),
+            allowed_keys=spec.get("provider_env_keys", ()),
+            worktree=worktree,
+            overrides={
+                "CAMBIUM_TASK_ID": spec["task_id"],
+                "CAMBIUM_GENERATION": str(generation),
+                "CAMBIUM_SESSION_ID": str(self._session_dir.resolve()),
+            },
+        )
 
     def _run_payload(
-        self, spec: dict[str, Any], run_rid: str, wall_budget: float
+        self, spec: dict[str, Any], run_rid: str, wall_budget: float, generation: int
     ) -> dict[str, Any]:
         repo = Path(spec["repo"])
         return {
@@ -992,6 +1201,7 @@ class _Runtime:
             "target_file": spec.get("target_file"),
             "marker": spec.get("marker"),
             "write_marker": bool(spec.get("write_marker", True)),
+            "generation": generation,
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
             "max_wall_s": wall_budget,
@@ -1044,10 +1254,9 @@ class _Runtime:
             "task_assigned", task_id=task_id, repo=str(repo), branch=spec["branch"],
             base_commit=spec["base_commit"], task=spec.get("task", ""),
         )
-        await self._ensure_worktree(spec)
+        generation = await self._ensure_worktree(spec)
 
         restarts = 0
-        generation = 1
         while True:
             handle = WorkerHandle(task_id=task_id, generation=generation)
             self._handles[task_id] = handle
@@ -1114,8 +1323,7 @@ class _Runtime:
                 delay_s=round(delay, 3), reason=reason,
             )
             await asyncio.sleep(delay)
-            await self._recover_worktree(spec, generation + 1)
-            generation += 1
+            generation = await self._recover_worktree(spec, generation + 1)
 
     async def _drive_generation(
         self, spec: dict[str, Any], handle: WorkerHandle, *,
@@ -1137,7 +1345,16 @@ class _Runtime:
                 stderr=asyncio.subprocess.PIPE,
                 limit=WORKER_STDIN_LIMIT,
                 cwd=str(worktree),
-                env=_strip_sensitive_env(env),
+                env=_strip_sensitive_env(
+                    env,
+                    allowed_keys=spec.get("provider_env_keys", ()),
+                    worktree=worktree,
+                    overrides={
+                        "CAMBIUM_TASK_ID": task_id,
+                        "CAMBIUM_GENERATION": str(generation),
+                        "CAMBIUM_SESSION_ID": str(self._session_dir.resolve()),
+                    },
+                ),
                 start_new_session=True,
                 pass_fds=(),
                 close_fds=True,
@@ -1200,25 +1417,89 @@ class _Runtime:
             "heartbeat": {"interval_s": heartbeat_interval, "timeout_s": heartbeat_timeout},
             "budget": {"max_wall_s": wall_budget, "max_restarts": DEFAULT_MAX_RESTARTS},
             "permissions": {"shell": True, "network": False},
+            "provider_env_keys": list(spec.get("provider_env_keys", ())),
         }
         await self.emit("init", task_id=task_id, request_id=init_rid, generation=generation)
-        await _write_json(proc, init_msg)
+        init_written = await _write_json(
+            proc,
+            init_msg,
+            deadline=min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S),
+        )
 
         phase = "ready"  # "ready" | "run"
-        ready_deadline = loop.time() + ready_timeout
+        ready_deadline = loop.time() + ready_timeout if init_written else loop.time()
         last_heartbeat: float | None = None
         run_rid: str | None = None
         envelope: dict[str, Any] | None = None
         exit_reason: str | None = None
         correlated = False
-        timeout_phase: str | None = None
+        timeout_phase: str | None = "stdin" if not init_written else None
 
         async def _cancel_and_kill() -> None:
             try:
-                await _write_json(proc, {"type": "cancel", "reason": timeout_phase or "timeout"})
+                await _write_json(
+                    proc,
+                    {
+                        "type": "cancel",
+                        "request_id": self._next_rid(),
+                        "reason": timeout_phase or "timeout",
+                    },
+                    deadline=min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S),
+                )
             except Exception:
                 pass
             await _kill_worker(proc)
+
+        async def _probe_after_eof() -> bool:
+            """Require one exact pong before treating an EOF survivor as live."""
+            nonlocal timeout_phase
+            if proc.returncode is not None:
+                return False
+            pong_rid = self._next_rid()
+            pong_deadline = min(wall_deadline, loop.time() + PONG_DEADLINE_S)
+            await self.emit(
+                "ping", task_id=task_id, generation=generation, request_id=pong_rid
+            )
+            if not await _write_json(
+                proc,
+                {"type": "ping", "request_id": pong_rid, "task_id": task_id,
+                 "generation": generation},
+                deadline=pong_deadline,
+            ):
+                timeout_phase = "pong"
+                return False
+            while loop.time() < pong_deadline:
+                remaining = pong_deadline - loop.time()
+                try:
+                    response = await asyncio.wait_for(messages.get(), remaining)
+                except TimeoutError:
+                    break
+                if response is None:
+                    break
+                if response.get("type") != "pong":
+                    await self.emit(
+                        "protocol", task_id=task_id, generation=generation,
+                        note="unexpected message during EOF pong probe",
+                        type=response.get("type"),
+                    )
+                    continue
+                if response.get("request_id") != pong_rid:
+                    await self.emit(
+                        "protocol", task_id=task_id, generation=generation,
+                        note="pong request_id mismatch",
+                        expected=pong_rid, got=response.get("request_id"),
+                    )
+                    continue
+                await self.emit(
+                    "pong", task_id=task_id, generation=generation, request_id=pong_rid
+                )
+                return True
+            timeout_phase = "pong"
+            await self.emit(
+                "protocol", task_id=task_id, generation=generation,
+                note="missing correlated pong after EOF", expected=pong_rid,
+            )
+            return False
 
         try:
             while True:
@@ -1228,7 +1509,8 @@ class _Runtime:
                     await _cancel_and_kill()
                     break
                 if phase == "ready" and now >= ready_deadline:
-                    timeout_phase = "ready"
+                    if timeout_phase is None:
+                        timeout_phase = "ready"
                     await _cancel_and_kill()
                     break
                 if (
@@ -1249,18 +1531,38 @@ class _Runtime:
                 except TimeoutError:
                     continue
                 if msg is None:
-                    # EOF alone is never death (arch §5.3): 5s grace, then poll.
+                    # EOF alone is never death (arch §5.3): grace, then an
+                    # exact request_id-correlated ping/pong probe.
                     await self.emit(
                         "log", task_id=task_id, generation=generation,
                         message="stdout EOF; grace then poll",
                     )
-                    await asyncio.sleep(EOF_GRACE_S)
+                    await asyncio.sleep(
+                        min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time()))
+                    )
                     if proc.returncode is None:
-                        await self.emit(
-                            "log", task_id=task_id, generation=generation,
-                            message="process alive after EOF; killing process group",
-                        )
-                        await _kill_worker(proc)
+                        probe_ok = await _probe_after_eof()
+                        if probe_ok:
+                            try:
+                                await asyncio.wait_for(
+                                    proc.wait(),
+                                    min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time())),
+                                )
+                            except TimeoutError:
+                                await self.emit(
+                                    "log", task_id=task_id, generation=generation,
+                                    message="EOF survivor did not exit after correlated pong",
+                                )
+                                await _kill_worker(proc)
+                        else:
+                            await self.emit(
+                                "log", task_id=task_id, generation=generation,
+                                    message=(
+                                        "EOF survivor has no correlated pong; "
+                                        "killing process group"
+                                    ),
+                            )
+                            await _kill_worker(proc)
                     break
                 mtype = msg.get("type")
                 if mtype == "ready":
@@ -1277,11 +1579,14 @@ class _Runtime:
                         generation=generation, pid=msg.get("pid"), proto=msg.get("proto"),
                     )
                     run_rid = self._next_rid()
-                    payload = self._run_payload(spec, run_rid, wall_budget)
-                    if not await _write_json(proc, {
-                        "type": "run_task", "request_id": run_rid,
-                        "task_id": task_id, **payload,
-                    }):
+                    payload = self._run_payload(spec, run_rid, wall_budget, generation)
+                    if not await _write_json(
+                        proc,
+                        {"type": "run_task", "request_id": run_rid,
+                         "task_id": task_id, **payload},
+                        deadline=min(wall_deadline, loop.time() + STDIN_WRITE_TIMEOUT_S),
+                    ):
+                        timeout_phase = "stdin"
                         await self.emit("protocol", task_id=task_id, note="run_task write failed")
                     await self.emit(
                         "run_task", task_id=task_id, request_id=run_rid, generation=generation
@@ -1414,19 +1719,21 @@ class _Runtime:
         proc = await asyncio.create_subprocess_exec(
             "sh", "-c", gate, cwd=str(worktree),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_strip_sensitive_env(dict(os.environ)),
+            env=_strip_sensitive_env(dict(os.environ), worktree=worktree),
+            start_new_session=True,
+            pass_fds=(),
+            close_fds=True,
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
             rc = proc.returncode if proc.returncode is not None else 1
         except TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
+            await _kill_process_group_and_reap(proc)
             rc = 124
             await self.emit("gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=True)
+        except asyncio.CancelledError:
+            await _kill_process_group_and_reap(proc)
+            raise
         else:
             if tree is not None:
                 gates[tree] = rc
@@ -1512,9 +1819,11 @@ def _plan_tasks(plan: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, A
 def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, Any]:
     """Path safety and required-field checks for one plan task."""
     session_root = Path(session_dir).resolve()
+    if not isinstance(task, dict):
+        raise ValueError("plan task must be an object")
     spec = dict(task)
     task_id = spec.get("task_id")
-    if not task_id:
+    if not isinstance(task_id, str) or not task_id:
         raise ValueError("plan task requires 'task_id'")
     if "repo" not in spec:
         raise ValueError(f"task {task_id} requires 'repo'")
@@ -1529,9 +1838,28 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         )
     spec["repo"] = str(Path(spec["repo"]).resolve())
     spec["worktree_path"] = str(worktree)
+    provider_env_keys = spec.get("provider_env_keys", ())
+    if isinstance(provider_env_keys, (str, bytes)):
+        raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
+    if not isinstance(provider_env_keys, (list, tuple)):
+        raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
+    spec["provider_env_keys"] = list(provider_env_keys)
     spec.setdefault("base_commit", None)
     spec.setdefault("write_marker", True)
     return spec
+
+
+def _reject_duplicate_task_ids(tasks: list[dict[str, Any]]) -> None:
+    """Reject duplicate IDs before validation can create session side effects."""
+    seen: set[str] = set()
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        task_id = task.get("task_id")
+        if isinstance(task_id, str) and task_id in seen:
+            raise DuplicateTaskIDError(f"duplicate task_id {task_id!r} at tasks[{index}]")
+        if isinstance(task_id, str):
+            seen.add(task_id)
 
 
 async def run_plan(
@@ -1547,7 +1875,9 @@ async def run_plan(
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``).
     """
     session_dir = Path(session_dir)
-    specs = [_validate_plan_task(session_dir, t) for t in _plan_tasks(plan)]
+    tasks = _plan_tasks(plan)
+    _reject_duplicate_task_ids(tasks)
+    specs = [_validate_plan_task(session_dir, t) for t in tasks]
     if not specs:
         raise ValueError("plan contains no tasks")
 
