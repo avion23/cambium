@@ -1,12 +1,11 @@
 """Generate the v1 should_decompose dataset (train/eval/canaries).
 
-Method: rule-based enumeration over the evidence rules in
-``cambium.modules.example.decide``. Each candidate (task, context) pair
-is hand-authored prose mapped to an intended evidence profile; the gold
-label, reason, and confidence are computed by RUNNING the rule engine, so
-every record is self-consistent with the current rule engine by
-construction. The script asserts the engine's decision matches the
-intended label for every record before writing anything.
+Method: rule-based enumeration over the evidence rules in the owning module.
+Each candidate (task, context) pair is hand-authored prose mapped to an
+intended evidence profile; the gold label, reason, and confidence are computed
+by running the module's neutral JSON CLI, so every record is self-consistent
+with the current rule engine by construction. The script asserts the engine's
+decision matches the intended label for every record before writing anything.
 
 Records follow the dataset-format.md envelope. Module fields
 ``input``/``expected`` stay at top level (the authoritative schema of the
@@ -17,22 +16,28 @@ semantics. Canary records add ``canary: true`` and ``canary_info``.
 Run: python3.12 scripts/generate_should_decompose_v1.py
 """
 
+# The hand-authored dataset sentences intentionally remain readable as single
+# strings; existing E501 findings in this data are not executable logic.
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cambium.modules.example.decide import should_decompose  # noqa: E402
+from cambium.modules.base import load_module_manifest, run_module_cli  # noqa: E402
 
 ADDED_AT = "2026-08-09"
 ADDED_BY = "agent:data-builder-v1"
-DATASET_VERSION = "1.0.0"
+DATASET_VERSION = "1.1.0"
 SCHEMA_VERSION = 1
+
+MODULE_DIR = ROOT / "src" / "cambium" / "modules" / "example"
+MANIFEST = load_module_manifest(MODULE_DIR, "example")
 
 T = True
 F = False
@@ -593,14 +598,33 @@ def rationale_keywords(reason: str) -> list[str]:
     return [frag for frag in reason.split("; ") if frag]
 
 
+def neutral_decide(task: str, context: str) -> dict[str, object]:
+    """Run one candidate through the owning module's neutral CLI."""
+    output = run_module_cli(
+        MANIFEST.cli_module,
+        {"task": task, "context": context},
+        cwd=ROOT,
+        source_root=ROOT / "src",
+    )
+    if not isinstance(output.get("decompose"), bool):
+        raise SystemExit("module CLI returned no boolean 'decompose' decision")
+    if not isinstance(output.get("reason"), str):
+        raise SystemExit("module CLI returned no string 'reason'")
+    confidence = output.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise SystemExit("module CLI returned no numeric 'confidence'")
+    return output
+
+
 def build_record(
     task: str, context: str, label: bool, split: str, rid: str, note: str, source: str, canary: dict | None = None
 ) -> dict:
-    out = should_decompose(task, context)
-    if out.decompose != label:
+    out = neutral_decide(task, context)
+    if out["decompose"] != label:
         raise SystemExit(
-            f"MISMATCH: id={rid} split={split} intended={label} engine={out.decompose}\n"
-            f"  task: {task}\n  context: {context}\n  reason: {out.reason}"
+            f"MISMATCH: id={rid} split={split} intended={label} "
+            f"engine={out['decompose']}\n"
+            f"  task: {task}\n  context: {context}\n  reason: {out['reason']}"
         )
     record = {
         "id": rid,
@@ -613,9 +637,9 @@ def build_record(
         "license": "internal",
         "redacted": False,
         "input": {"task": task, "context": context},
-        "expected": {"decompose": out.decompose, "reason": out.reason},
-        "expected_confidence": out.confidence,
-        "rationale_keywords": rationale_keywords(out.reason),
+        "expected": {"decompose": out["decompose"], "reason": out["reason"]},
+        "expected_confidence": out["confidence"],
+        "rationale_keywords": rationale_keywords(out["reason"]),
         "notes": note,
     }
     if canary is not None:

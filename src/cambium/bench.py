@@ -23,18 +23,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as _dt
-import importlib
 import json
+import math
 import platform
 import statistics
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from cambium.modules.base import DatasetError, DatasetLoader, Example, Module, load_jsonl
+from cambium.modules.base import (
+    DatasetError,
+    ModuleBoundaryError,
+    ModuleCLIError,
+    ModuleManifest,
+    ModuleSplitError,
+    load_jsonl,
+    load_module_manifest,
+    run_module_cli,
+)
 
 CANARY_TAXONOMY: tuple[str, ...] = (
     "trivially_atomic",
@@ -119,28 +129,26 @@ def percentiles(times: list[float]) -> dict[str, float]:
 
 
 def discover_modules() -> list[str]:
-    """Names of modules under ``src/cambium/modules/`` that ship a dataset."""
+    """Names of dataset-bearing modules with valid neutral manifests.
+
+    Discovery is deliberately a filesystem operation.  Every candidate is
+    validated before any report work starts, so a malformed sibling cannot be
+    silently skipped after another module has already passed.
+    """
     if not MODULES_DIR.is_dir():
         return []
-    return sorted(
-        child.name
-        for child in MODULES_DIR.iterdir()
-        if child.is_dir() and (child / "datasets").is_dir()
-    )
+    names: list[str] = []
+    for child in sorted(MODULES_DIR.iterdir(), key=lambda path: path.name):
+        if not child.is_dir() or not (child / "datasets").is_dir():
+            continue
+        load_module_manifest(child, child.name)
+        names.append(child.name)
+    return names
 
 
-def _module_class(pkg: Any) -> type[Module] | None:
-    for obj in vars(pkg).values():
-        if isinstance(obj, type) and issubclass(obj, Module) and obj is not Module:
-            return obj
-    return None
-
-
-def _loader_class(pkg: Any) -> type[DatasetLoader] | None:
-    for obj in vars(pkg).values():
-        if isinstance(obj, type) and issubclass(obj, DatasetLoader) and obj is not DatasetLoader:
-            return obj
-    return None
+def _module_manifest(pkg_name: str) -> ModuleManifest:
+    package_dir = MODULES_DIR / pkg_name
+    return load_module_manifest(package_dir, pkg_name)
 
 
 def _read_meta(path: Path) -> dict[str, Any] | None:
@@ -150,16 +158,58 @@ def _read_meta(path: Path) -> dict[str, Any] | None:
         return None
 
 
-async def _predict(module: Module, examples: list[Example]) -> list[Example]:
-    scored: list[Example] = []
-    for ex in examples:
-        scored.append(ex.with_prediction(await module.decide(ex.input)))
+@dataclass(frozen=True, slots=True)
+class ScoredRecord:
+    """One raw dataset record and the metric returned by the module CLI."""
+
+    record: dict[str, Any]
+    score: float
+
+
+def _is_canary(record: dict[str, Any]) -> bool:
+    """Return whether a raw dataset record carries the canary marker."""
+    return record.get("canary", False) is True
+
+
+async def _predict(manifest: ModuleManifest, records: list[dict]) -> list[ScoredRecord]:
+    """Evaluate raw records through the module's neutral subprocess boundary."""
+    output = run_module_cli(
+        manifest.cli_module,
+        {"operation": "evaluate", "records": records},
+        cwd=REPO_ROOT,
+        source_root=manifest.source_root,
+    )
+    results = output.get("results")
+    if not isinstance(results, list) or len(results) != len(records):
+        raise ModuleCLIError(
+            f"module {manifest.package_name!r}: evaluate returned "
+            f"{len(results) if isinstance(results, list) else 'no'} "
+            f"results for {len(records)} records"
+        )
+
+    scored: list[ScoredRecord] = []
+    for index, (record, result) in enumerate(zip(records, results, strict=True)):
+        if not isinstance(result, dict):
+            raise ModuleCLIError(
+                f"module {manifest.package_name!r}: evaluate result {index} is not an object"
+            )
+        score = result.get("score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            raise ModuleCLIError(
+                f"module {manifest.package_name!r}: evaluate result {index} has no numeric score"
+            )
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ModuleCLIError(
+                f"module {manifest.package_name!r}: evaluate result {index} score is outside [0, 1]"
+            )
+        scored.append(ScoredRecord(record=record, score=float(score)))
     return scored
 
 
-def score_examples(module: Module, scored: list[Example]) -> dict[str, float]:
-    """Metric mean/std/count over already-predicted examples."""
-    scores = [module.metric(ex) for ex in scored]
+def score_examples(module: Any, scored: list[ScoredRecord]) -> dict[str, float]:
+    """Metric mean/std/count over records scored by the neutral CLI."""
+    del module  # Kept in the signature for the existing drift-test seam.
+    scores = [example.score for example in scored]
     if not scores:
         return {"mean": 0.0, "std": 0.0, "count": 0}
     mean = statistics.fmean(scores)
@@ -183,7 +233,7 @@ def dataset_stats(records: list[dict]) -> dict[str, int]:
         "cross_split_leaks": leaks,
         "decompose_true": sum(1 for r in records if r["expected"]["decompose"] is True),
         "decompose_false": sum(1 for r in records if r["expected"]["decompose"] is False),
-        "canaries": sum(1 for r in records if r.get("canary", False)),
+        "canaries": sum(1 for r in records if _is_canary(r)),
     }
 
 
@@ -216,67 +266,76 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
     """Metric/canaries/dataset sections of a module's baseline.
 
     Reads the three-split datasets (train/eval/canaries.jsonl) through the
-    module's own loader; if the split datasets are unreadable it falls back
-    to the combined ``*_pairs.jsonl`` file and marks the split metric fields
-    null with a ``note``.
+    module's neutral JSON CLI; if a split is unavailable or explicitly
+    schema-invalid, it falls back to the combined ``*_pairs.jsonl`` file and
+    marks the split metric fields null with a ``note``. Other CLI failures
+    propagate instead of silently shrinking the dataset. The concrete package
+    is never imported by this harness.
     """
-    pkg = importlib.import_module(f"cambium.modules.{pkg_name}")
-    module_cls = _module_class(pkg)
-    if module_cls is None:
-        raise ValueError(f"cambium.modules.{pkg_name} exports no Module subclass")
-    module = module_cls()
+    manifest = _module_manifest(pkg_name)
     datasets_dir = MODULES_DIR / pkg_name / "datasets"
     meta = _read_meta(datasets_dir / "meta.json")
     dataset_version = meta.get("dataset_version") if meta else None
+    meta_schema = meta.get("schema_version") if meta else None
+    if meta_schema is not None and (
+        isinstance(meta_schema, bool)
+        or not isinstance(meta_schema, int)
+        or meta_schema != manifest.dataset_schema_version
+    ):
+        raise ModuleBoundaryError(
+            f"module {pkg_name!r}: dataset schema_version {meta_schema!r} does not "
+            f"match manifest dataset_schema_version {manifest.dataset_schema_version}"
+        )
 
     note: str | None = None
     combined = False
+    raw: dict[str, list[dict]] = {}
+    scored: dict[str, list[ScoredRecord]] = {}
+    metric: dict[str, Any] = {}
+    canary_scores: list[float] = []
     try:
-        loader_cls = _loader_class(pkg)
-        if loader_cls is None:
-            raise DatasetError("module exports no DatasetLoader")
-        raw: dict[str, list[dict]] = {}
-        examples: dict[str, list[Example]] = {}
         for split in SPLITS:
             path = datasets_dir / f"{split}.jsonl"
             raw[split] = load_jsonl(path)
-            examples[split] = loader_cls(path).load()
-    except (DatasetError, OSError, ValueError) as exc:
+        for split in SPLITS:
+            scored[split] = asyncio.run(_predict(manifest, raw[split]))
+            metric[split] = score_examples(manifest, scored[split])
+            if split == "canaries":
+                canary_scores = [
+                    example.score
+                    for example in scored[split]
+                    if _is_canary(example.record)
+                ]
+    except (DatasetError, ModuleSplitError) as exc:
         combined = True
         note = (
-            f"three-split dataset unreadable ({exc}); fell back to the combined "
+            f"three-split dataset unavailable ({exc}); fell back to the combined "
             "file and split metrics are null"
         )
         pairs = datasets_dir / f"{pkg_name}_pairs.jsonl"
         if not pairs.exists():
             pairs = datasets_dir / "example_pairs.jsonl"
-        loader_cls = _loader_class(pkg)
         raw = {"combined": load_jsonl(pairs)}
-        examples = {"combined": loader_cls(pairs).load() if loader_cls else []}
-
-    metric: dict[str, Any] = {}
-    canary_scores: list[float] = []
-    for split in SPLITS:
-        if combined:
-            metric[split] = None
-            continue
-        scored = asyncio.run(_predict(module, examples[split]))
-        metric[split] = score_examples(module, scored)
-        if split == "canaries":
-            canary_scores = [module.metric(ex) for ex in scored]
+        scored = {}
+        metric = {split: None for split in SPLITS}
+        canary_scores = []
     if combined:
-        scored = asyncio.run(_predict(module, examples["combined"]))
-        metric["combined"] = score_examples(module, scored)
-        canary_scores = [module.metric(ex) for ex in scored if ex.canary]
+        scored["combined"] = asyncio.run(_predict(manifest, raw["combined"]))
+        metric["combined"] = score_examples(manifest, scored["combined"])
+        canary_scores = [
+            example.score
+            for example in scored["combined"]
+            if _is_canary(example.record)
+        ]
 
     records = [r for split in SPLITS for r in raw.get(split, [])] or raw.get("combined", [])
+    canary_source = raw["combined"] if combined else raw.get("canaries", [])
+    canary_records = [record for record in canary_source if _is_canary(record)]
     report: dict[str, Any] = {
-        "module": module.name,
+        "module": manifest.module_name,
         "dataset_version": dataset_version,
         "metric": metric,
-        "canaries": canary_stats(
-            raw.get("canaries") or raw.get("combined", []), canary_scores
-        ),
+        "canaries": canary_stats(canary_records, canary_scores),
         "dataset": dataset_stats(records),
     }
     if note:
@@ -345,7 +404,7 @@ def compare_against_anchor(
     regressions: list[tuple[str, str]] = []
 
     metric_delta = merged["metric_mean_delta"]
-    for split in SPLITS:
+    for split in SPLITS + ("combined",):
         r_metric = (report.get("metric") or {}).get(split)
         a_metric = (anchor.get("metric") or {}).get(split)
         if not isinstance(r_metric, dict) or not isinstance(a_metric, dict):
@@ -415,6 +474,7 @@ class BenchPlugin:
         self.module_reports: dict[str, dict[str, Any]] = {}
         self.regressions: dict[str, list[tuple[str, str]]] = {}
         self.reanchored: dict[str, str] = {}
+        self.error: str | None = None
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_makereport(self, item: Any, call: Any) -> None:
@@ -424,9 +484,23 @@ class BenchPlugin:
     def pytest_sessionfinish(self, session: Any, exitstatus: Any) -> None:
         if exitstatus != 0:
             return  # never anchor a baseline on a red run
-        for pkg_name in discover_modules():
-            body = build_module_report(pkg_name)
-            report = _assemble_baseline(body, self.times, self.thresholds)
+        try:
+            package_names = discover_modules()
+            pending = [
+                (
+                    pkg_name,
+                    _assemble_baseline(
+                        build_module_report(pkg_name), self.times, self.thresholds
+                    ),
+                )
+                for pkg_name in package_names
+            ]
+        except (ModuleBoundaryError, DatasetError) as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            session.exitstatus = 1
+            return
+
+        for pkg_name, report in pending:
             self.module_reports[report["module"]] = report
             anchor_path = _baseline_path(pkg_name, report["module"], self.root)
             if self.mode == "report":
@@ -452,6 +526,9 @@ class BenchPlugin:
     def pytest_terminal_summary(
         self, terminalreporter: Any, exitstatus: Any, config: Any
     ) -> None:
+        if self.error:
+            terminalreporter.section("cambium bench", yellow=True)
+            terminalreporter.write_line(f"ERROR {self.error}", red=True)
         if not self.module_reports:
             return
         terminalreporter.section("cambium bench", yellow=True)
@@ -571,9 +648,19 @@ def main(argv: list[str] | None = None) -> int:
         thresholds["wall_p90_ratio"] = args.bench_wall_ratio
     failures = 0
     root = args.bench_root or RUNTIME_BASELINE_DIR
-    for pkg_name in discover_modules():
-        body = build_module_report(pkg_name)
-        report = _assemble_baseline(body, {}, thresholds)
+    try:
+        pending = [
+            (
+                pkg_name,
+                _assemble_baseline(build_module_report(pkg_name), {}, thresholds),
+            )
+            for pkg_name in discover_modules()
+        ]
+    except (ModuleBoundaryError, DatasetError) as exc:
+        print(f"cambium bench: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    for pkg_name, report in pending:
         path = _baseline_path(pkg_name, report["module"], root)
         if mode == "report":
             _write_baseline(report, path)

@@ -2,16 +2,14 @@
 
 Independent of the generator: reads the three JSONL files from disk,
 validates the dataset-format.md envelope, checks counts/balance/duplicates/
-cross-split leaks/secrets, loads every record through the real
-``ExampleDatasetLoader``, runs the rule engine over every example, and
-asserts the metric is perfect (labels self-consistent with decide.py).
+cross-split leaks/secrets, evaluates every record through the module's neutral
+JSON CLI, and asserts the metric is perfect.
 
 Run: python3.12 scripts/check_dataset_v1.py
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
@@ -22,10 +20,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cambium.modules.example import ExampleDatasetLoader, ShouldDecomposeModule  # noqa: E402
-from cambium.modules.example.decide import ACTION_VERBS, HIGH_SIGNAL, should_decompose  # noqa: E402
+from cambium.modules.base import load_module_manifest, run_module_cli  # noqa: E402
 
-DATASETS = ROOT / "src" / "cambium" / "modules" / "example" / "datasets"
+MODULE_DIR = ROOT / "src" / "cambium" / "modules" / "example"
+MANIFEST = load_module_manifest(MODULE_DIR, "example")
+DATASETS = MODULE_DIR / "datasets"
 FILES = {
     "train": DATASETS / "train.jsonl",
     "eval": DATASETS / "eval.jsonl",
@@ -58,7 +57,39 @@ SECRET_PATTERNS = [
     re.compile(r"\b\+?[0-9][0-9\s\-()]{8,}[0-9]\b"),
 ]
 
-# Evidence signals copied from decide.py — report-only difficulty metric.
+# Evidence signals used only for the report-only difficulty metric.  Decision
+# labels and metric scores come from the neutral module CLI below.
+ACTION_VERBS = frozenset(
+    {
+        "add",
+        "update",
+        "refactor",
+        "implement",
+        "migrate",
+        "build",
+        "fix",
+        "create",
+        "remove",
+        "rewrite",
+        "backfill",
+        "introduce",
+        "restructure",
+        "split",
+        "port",
+    }
+)
+HIGH_SIGNAL = (
+    "multiple",
+    "several",
+    "both",
+    "subtasks",
+    "components",
+    "services",
+    "independently",
+    "in parallel",
+    "separately",
+    "decompose",
+)
 FILE_RE = re.compile(r"[A-Za-z0-9_./-]+\.(?:py|rs|ts|js|go|toml|json|yaml|md|sh|sql)\b")
 ITEM_RE = re.compile(r"(?m)(?:^\s*[-*]\s+|\d+[).]\s)")
 
@@ -111,7 +142,7 @@ def load_records(path: Path) -> list[dict]:
         try:
             rec = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise SystemExit(f"{path.name}:{line_no}: invalid JSON: {exc}")
+            raise SystemExit(f"{path.name}:{line_no}: invalid JSON: {exc}") from exc
         assert isinstance(rec, dict), f"{path.name}:{line_no}: not an object"
         records.append(rec)
     return records
@@ -133,7 +164,7 @@ def main() -> int:
 
     # --- envelope + schema checks ------------------------------------------
     for split, records in all_records.items():
-        for i, r in enumerate(records):
+        for r in records:
             rid = r["id"]
             for key, typ in ENVELOPE.items():
                 assert isinstance(r.get(key), typ), f"{split} {rid}: envelope.{key} bad/missing"
@@ -147,7 +178,10 @@ def main() -> int:
             assert isinstance(inp.get("context"), str), f"{rid}: context"
             assert isinstance(exp.get("decompose"), bool), f"{rid}: decompose"
             assert isinstance(exp.get("reason"), str), f"{rid}: reason"
-            assert isinstance(r["expected_confidence"], (int, float)) and 0 <= r["expected_confidence"] <= 1
+            assert (
+                isinstance(r["expected_confidence"], (int, float))
+                and 0 <= r["expected_confidence"] <= 1
+            )
             assert isinstance(r["rationale_keywords"], list) and r["rationale_keywords"]
             assert all(isinstance(k, str) for k in r["rationale_keywords"])
             assert isinstance(r["notes"], str) and len(r["notes"]) <= 500, f"{rid}: notes"
@@ -159,20 +193,28 @@ def main() -> int:
                     assert isinstance(ci.get(k), str) and ci[k], f"{rid}: canary_info.{k}"
                 assert isinstance(ci.get("anti_expected"), bool), f"{rid}: anti_expected"
                 rng = ci.get("anti_expected_confidence_range")
-                assert isinstance(rng, list) and len(rng) == 2 and all(isinstance(x, (int, float)) for x in rng)
+                assert (
+                    isinstance(rng, list)
+                    and len(rng) == 2
+                    and all(isinstance(x, (int, float)) for x in rng)
+                )
     print("envelope + module-schema checks passed")
 
     # --- uniqueness + cross-split leak check ---------------------------------
     task_ids: dict[tuple[str, str], str] = {}
     data_hashes: dict[str, str] = {}
-    for split, records in all_records.items():
+    for _split, records in all_records.items():
         for r in records:
             key = (r["input"]["task"], r["input"]["context"])
-            assert key not in task_ids, f"cross-split duplicate (task,context): {task_ids[key]} vs {r['id']}"
+            assert key not in task_ids, (
+                f"cross-split duplicate (task,context): {task_ids[key]} vs {r['id']}"
+            )
             task_ids[key] = r["id"]
             payload = (r["input"]["task"], r["input"]["context"], r["expected"]["decompose"])
             digest = hashlib.sha256(json.dumps(payload).encode()).hexdigest()
-            assert digest not in data_hashes, f"duplicate data payload: {data_hashes[digest]} vs {r['id']}"
+            assert digest not in data_hashes, (
+                f"duplicate data payload: {data_hashes[digest]} vs {r['id']}"
+            )
             data_hashes[digest] = r["id"]
     n_tasks = len(task_ids)
     print(f"uniqueness: {n_tasks} distinct (task, context) payloads, no cross-split leaks")
@@ -214,27 +256,35 @@ def main() -> int:
                 assert not pat.search(content), f"{split} {r['id']}: secret pattern {pat.pattern}"
     print("secrets scan passed")
 
-    # --- engine consistency through the real loader+module+metric ------------
+    # --- engine consistency through the neutral JSON module boundary ---------
     total = 0
-    for split, path in FILES.items():
-        loader = ExampleDatasetLoader(path)
-        examples = loader.load()
-        assert len(examples) == EXPECTED_COUNTS[split], f"{split}: loader count mismatch"
-        module = ShouldDecomposeModule()
-
-        async def run():
-            bad = []
-            for ex in examples:
-                pred = await module.decide(ex.input)
-                scored = ex.with_prediction(pred)
-                if module.metric(scored) != 1.0:
-                    bad.append(ex.input.task)
-            return bad
-
-        bad = asyncio.run(run())
+    for split, _path in FILES.items():
+        records = all_records[split]
+        response = run_module_cli(
+            MANIFEST.cli_module,
+            {"operation": "evaluate", "records": records},
+            cwd=ROOT,
+            source_root=ROOT / "src",
+        )
+        results = response.get("results")
+        assert isinstance(results, list), f"{split}: CLI did not return results"
+        assert len(results) == len(records), f"{split}: CLI count mismatch"
+        bad = []
+        for record, result in zip(records, results, strict=True):
+            assert isinstance(result, dict), f"{split} {record['id']}: bad CLI result"
+            if result.get("score") != 1.0:
+                bad.append(record["input"]["task"])
+            prediction = result.get("prediction")
+            assert isinstance(prediction, dict), f"{split} {record['id']}: missing prediction"
+            assert prediction.get("decompose") == record["expected"]["decompose"], (
+                f"{split} {record['id']}: decision mismatch"
+            )
         assert not bad, f"{split}: {len(bad)} engine mismatches: {bad[:3]}"
-        total += len(examples)
-    print(f"engine consistency: module metric == 1.0 on all {total} records through the real loader")
+        total += len(records)
+    print(
+        f"engine consistency: module metric == 1.0 on all {total} records "
+        "through the neutral CLI"
+    )
 
     print("ALL CHECKS PASSED")
     return 0
