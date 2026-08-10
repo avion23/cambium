@@ -3,42 +3,64 @@
 Cambium is a Python-native multi-agent coding-agent harness. A deterministic
 supervisor manages isolated worker subprocesses, each running a coding agent
 in its own git worktree, speaking JSON-Lines-on-stdio IPC with `request_id`
-RPC framing. An LLM-driven orchestrator decomposes tasks, routes work, and
-evaluates results; all state is recorded in an event-sourced log. Design
+RPC framing. The current main provides deterministic plan execution, task-tree
+validation, durable event storage, and atomic merge sequencing. LLM-driven
+decomposition, provider calls, and result evaluation remain roadmap work. Design
 philosophy: **LLM plans, deterministic code executes.**
 
 ## Status
 
 What exists now:
 
-- **Scaffold** — the public API skeleton (`Orchestrator`, event log) and the
-  `Module` base pattern every decision module follows.
-- **Example module** `should_decompose` (`src/cambium/modules/example/`) — a
-  rule-engine `decide()` with a DSPy seam, an exact-match `metric()`, and
-  dataset v1 (the combined `example_pairs.jsonl` plus the seeded
-  `train`/`eval`/`canaries` split) with canary records.
-- **Deterministic runtime foundations** — SQLite WAL storage (`store.py`), the
-  atomic merge sequencer (`merge.py`), NDJSON framing (`ipc.py`), the worker
-  runtime (`worker.py`), task-tree validation (`tasktree.py`), and diagnostics
-  (`doctor.py`).
-- **Vertical-slice milestone** — supervisor to worker to gate to merge,
-  end-to-end: a real supervisor subprocess-spawns a real worker, runs the
-  task's gate, and merges the worker branch with `git merge --ff-only`.
-- **Scenario coverage** — 108 tests are collected from `tests/scenarios/`.
-  Current main reports 108 passed, and the source ruff gate is clean.
-- **Not in this main snapshot** — `diffundo.py`, `bench.py`, and `redact.py`
-  remain in implementation worktrees and are not current modules in
-  `src/cambium/`.
+- **Example decision module** `should_decompose`
+  (`src/cambium/modules/example/`) — a deterministic rule engine with a DSPy
+  seam, exact-match metric, train/eval/canaries splits, and a committed bench
+  baseline. The current dataset version is `1.0.0`.
+- **Integrated deterministic runtime** — the multi-worker supervisor plan path,
+  SQLite WAL event store, atomic merge sequencer, Nuntius NDJSON framing,
+  worker runtime, task-tree validation, and doctor diagnostics.
+- **Runtime controls and tooling** — approval gates, generation fencing,
+  compile-gate resource budgets, a bounded dead-letter queue, conversation
+  storage, provider configuration validation, JSON tool schemas, host health
+  probes, Ruff diagnostics, AST search, the benchmark plugin, and the unified
+  `cambium` CLI. These modules are not all wired into one production runtime.
+- **Vertical-slice proof** — a real supervisor subprocess-spawns a real fake
+  worker, runs the task gate, and merges the worker branch. The multi-worker
+  plan path also has end-to-end scenario coverage.
+- **Scenario and module coverage** — the refreshed baseline records 201 timed
+  test items. The latest full run reports 197 passed and 5 skipped; the source
+  Ruff gate is clean.
+- **Still unmerged** — `diffundo.py` and `redact.py` are not in this main
+  snapshot. Real provider execution and DSPy optimization are not verified.
 
 Next:
 
-- **Hardening pass** — clear the current source gate, complete the implementation
-  audit actions, and verify the supervisor, store, IPC, worker, task-tree, and
-  merge paths together.
-- **v2.1** — exercise the DSPy seam and optimization/eval path described in
-  `docs/architecture/module-template/example-spec.md`, then land the remaining
-  provider, benchmark, redaction, and recovery work. The roadmap is in
-  `docs/research/v2-1-review.md`.
+- **M1 — Canonical runtime and audit baseline: in progress.** The canonical
+  store, merge, IPC, worker, doctor, and multi-worker paths exist, but the
+  supervisor still retains the slice `EventLog` and slice entry path.
+- **M2 — Protocol and pipe hardening: in progress.** Framing limits, worker
+  controls, and the durable DLQ exist; the roadmap's FD-3 transport, complete
+  write deadlines, and production overflow contract are not complete.
+- **M3 — Security boundary and fencing: in progress.** Fencing and approval
+  gates landed, but the canonical redaction module is not merged.
+- **M4 — Gate/resource hardening and deep budgets: in progress.** Resource
+  controls landed; GateRunner extraction, deep turn/process deadlines, and
+  bounded store backpressure remain open.
+- **M5 — Architectus/task-tree execution and conversations: in progress.** The
+  task tree, plan runtime, and conversation store exist; LLM decomposition,
+  routing, aggregation, and recursive completion are not complete.
+- **M6 — First real LLM task: not started.** Diffundo and a real provider path
+  are not present on current main.
+- **M7 — Persistent worker pool: not started.** No reusable worker pool is
+  present.
+- **M8 — DSPy `should_decompose` refinement: not started.** The Decision
+  migration is not merged, so the dataset remains at `1.0.0`.
+- **M9 — Tree-sitter context compression: research only.** AST tooling and
+  feasibility research exist, but the M6-dependent paired provider trials
+  have not run.
+
+No v2.1 milestone meets all of its acceptance criteria in this snapshot. The
+full roadmap is in `docs/research/v2-1-review.md`.
 
 ## Quickstart
 
@@ -52,13 +74,23 @@ uv run --python 3.14.7 --extra test pytest -q
 Vertical-slice demo (no LLM, no network — stdlib + git only):
 
 ```sh
-uv run --python 3.14.7 python -m cambium.supervisor --session-dir /tmp/opencode/slice-run
+uv run --python 3.14.7 --extra test python -m cambium.supervisor --session-dir demo
 ```
 
 The supervisor reads `<session-dir>/task.json` if present (otherwise uses
 built-in defaults), bootstraps a scratch git repo, spawns the worker, runs the
 gate, and merges. See `docs/research/vertical-slice-report.md` for the wire
 protocol and the full manual-run transcript.
+
+The installed command exposes the same entry points plus the plan-oriented
+adapters:
+
+```sh
+uv run --python 3.14.7 --extra test cambium --help
+```
+
+Available subcommands are `supervisor`, `doctor`, `bench report|gate`,
+`tasktree`, and `version`.
 
 ## Documentation
 
@@ -67,7 +99,7 @@ protocol and the full manual-run transcript.
   - `system-design.md` — the v0.1 design draft (superseded; kept as the origin record).
   - `module-template/` — the per-module pattern: `architecture.md`, `dataset-format.md`, `example-spec.md`.
   - `reviews/` — the three adversarial reviews that shaped v2.
-- `docs/research/` — 33 evidence docs (historical, never pruned). Key reads:
+- `docs/research/` — 41 evidence docs (historical, never pruned). Key reads:
   `python-3.14.md`, `tui-best-practices.md`, `sqlite-wal-durability.md`,
   `worktree-concurrency.md`, `design-deltas.md`.
 - `agents.md` — orientation for agents landing in this repo. Read first.
@@ -76,7 +108,9 @@ protocol and the full manual-run transcript.
 
 - Python >= 3.14, regular build (GIL present; free-threaded build optional).
 - Headless-first: the public interface is JSON-Lines on stdio; the TUI is an optional view.
-- No local LLM cache — provider-side caching only.
+- No production local LLM cache — `EvalCache` is opt-in and limited to the
+  frozen evaluation harness; provider-side caching remains the production
+  policy.
 - No sandboxing in the harness: containment via git worktrees + permission allowlists + approval gates.
 - Task tree with information hiding: decomposition produces a tree; subtasks see only what they need.
 - Per-module DSPy seam, datasets with canaries, frozen metric + held-out eval.
@@ -90,11 +124,16 @@ cambium/
 ├── agents.md                  orientation for agents
 ├── docs/
 │   ├── architecture/          architecture.md, system-design.md (v0.1), module-template/, reviews/
-│   └── research/              33 evidence docs
+│   └── research/              41 evidence docs
 ├── scripts/                   dataset tooling + the fake worker
-├── src/cambium/               events.py, orchestrator.py, supervisor.py, doctor.py,
-│                              ipc.py, merge.py, store.py, tasktree.py, worker.py, modules/
-├── tests/scenarios/           108 example/dataset/runtime scenario tests
+├── src/cambium/               approval.py, ast_tools.py, bench.py, cli.py,
+│                              conversations.py, dlq.py, doctor.py, eval_cache.py,
+│                              events.py, fencing.py, ipc.py, lint_diag.py, merge.py,
+│                              orchestrator.py, provider_config.py, resources.py,
+│                              schemas.py, store.py, supervisor.py, system_health.py,
+│                              tasktree.py, worker.py, modules/
+│   └── modules/example/       should_decompose decision module, datasets, tests, baseline
+├── tests/scenarios/           runtime, tooling, and integration scenarios
 └── pyproject.toml
 ```
 
