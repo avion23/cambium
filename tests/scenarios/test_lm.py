@@ -425,7 +425,7 @@ def test_nested_hostile_credential_key_cannot_reach_dump_state() -> None:
         def lower(self) -> str:
             return "harmless"
 
-    with pytest.raises(ValueError, match="provider credentials"):
+    with pytest.raises(TypeError, match="exact builtin string"):
         CambiumLM(
             FakeDiffundo(),
             ProviderTier.FAST,
@@ -599,6 +599,41 @@ def test_request_rejects_private_copy_and_direct_nan_budget_before_diffundo() ->
         _call(lm, "budget bypass canary")
 
     assert diffundo.calls == []
+
+
+def test_copy_rejects_hostile_private_keys_without_tier_or_provider_corruption() -> None:
+    _require_dspy()
+    import dspy
+
+    class HostileKey(str):
+        def __hash__(self) -> int:
+            return hash(("hidden", str.__str__(self)))
+
+    provider_a = FakeDiffundo("https://provider-a.invalid")
+    provider_b = FakeDiffundo("https://provider-b.invalid")
+    lm = CambiumLM(provider_a, ProviderTier.FAST)  # type: ignore[arg-type]
+    other = CambiumLM(provider_b, ProviderTier.FAST)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="exact builtin string"):
+        lm.copy(**{HostileKey("_tier"): "invalid"})
+    with pytest.raises(TypeError, match="exact builtin string"):
+        lm.copy(
+            **{
+                HostileKey("_diffundo_reference"): other._diffundo_reference,
+            }
+        )
+
+    assert provider_a.calls == []
+    assert provider_b.calls == []
+    state = lm.dump_state()
+    assert _call(lm, "live prompt") == ["completion text"]
+    loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
+    assert _call(loaded, "loaded prompt") == ["completion text"]
+    assert [call["endpoint"] for call in provider_a.calls] == [
+        "https://provider-a.invalid",
+        "https://provider-a.invalid",
+    ]
+    assert provider_b.calls == []
 
 
 def test_copy_model_override_routes_through_diffundo() -> None:

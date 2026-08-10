@@ -79,12 +79,16 @@ _JSON_BYTES_MARKER = 1
 _JSON_TUPLE_MARKER = 2
 
 
-def _normalize_key(key: Any) -> Any:
-    if type(key) is str:
-        return key
-    if isinstance(key, str):
-        return str.__str__(key)
+def _reject_string_subclass_key(key: Any) -> Any:
+    if isinstance(key, str) and type(key) is not str:
+        raise TypeError("CambiumLM string keys must use exact builtin strings")
     return key
+
+
+def _require_exact_keyword_keys(kwargs: Mapping[Any, Any]) -> None:
+    for key in kwargs:
+        if type(key) is not str:
+            raise TypeError("CambiumLM keyword keys must use exact builtin strings")
 
 
 class _ImmutableCallbacks(list[Any]):
@@ -118,7 +122,7 @@ def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
         memo[id(value)] = None
         frozen = MappingProxyType(
             {
-                _freeze(_normalize_key(key), memo): _freeze(item, memo)
+                _freeze(_reject_string_subclass_key(key), memo): _freeze(item, memo)
                 for key, item in value.items()
             }
         )
@@ -371,6 +375,7 @@ class _CambiumLMMixin:
 
     def copy(self, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
+        _require_exact_keyword_keys(kwargs)
         self._validate_model(self._provider_model)
         self._validate_budget(self._budget_usd)
         launch_kwargs = self._safe_kwargs({"launch_kwargs": self.launch_kwargs})[
@@ -458,6 +463,7 @@ class _CambiumLMMixin:
 
     @staticmethod
     def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        _require_exact_keyword_keys(kwargs)
         if type(kwargs) is dict and any(key in _FORBIDDEN_FIELDS for key in kwargs):
             forbidden = sorted(key for key in kwargs if key in _FORBIDDEN_FIELDS)
             raise ValueError(f"CambiumLM does not accept {', '.join(forbidden)}")
