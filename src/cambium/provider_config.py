@@ -6,6 +6,9 @@ only. The values are deliberately not inspected while loading; Diffundo reads
 them from the environment when it makes a call. The optional ``required`` flag
 is doctor metadata: it defaults to ``False`` so a missing key is a warning;
 ``cambium doctor`` reports a missing key as a failure only when it is ``True``.
+``select_provider`` is a stateless one-shot picker: it chooses one enabled
+configured provider by explicit name or by existing priority/tier order and
+never reads the environment or a key value.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -390,6 +394,56 @@ def load_providers(source: str | Path | None = None) -> list[ProviderConfig]:
     return providers
 
 
+class ProviderSelectionError(ValueError):
+    """A requested provider cannot be selected from the configured set."""
+
+
+def select_provider(
+    providers: Sequence[ProviderConfig],
+    *,
+    name: str | None = None,
+    tier: ProviderTier | None = None,
+) -> ProviderConfig:
+    """Deterministically select one enabled configured provider.
+
+    With an explicit ``name``, return that provider when it is configured and
+    enabled. Otherwise select the first enabled provider by ascending
+    ``priority`` order — optionally restricted to ``tier`` — matching the
+    ordering Diffundo applies to cascade candidates. A missing name, a disabled
+    choice, or no enabled candidate raises ``ProviderSelectionError``. The
+    decision is pure: it reads only validated config fields and never the
+    environment or a secret value.
+    """
+    if name is not None:
+        for provider in providers:
+            if provider.name != name:
+                continue
+            if not provider.enabled:
+                raise ProviderSelectionError(
+                    f"provider selection: provider {name!r} is disabled"
+                )
+            return provider
+        raise ProviderSelectionError(
+            f"provider selection: no provider named {name!r} is configured"
+        )
+
+    candidates = sorted(
+        (
+            provider
+            for provider in providers
+            if provider.enabled and (tier is None or provider.tier is tier)
+        ),
+        key=lambda provider: provider.priority,
+    )
+    if not candidates:
+        if tier is not None:
+            raise ProviderSelectionError(
+                f"provider selection: no enabled provider configured for tier {tier.value!r}"
+            )
+        raise ProviderSelectionError("provider selection: no enabled provider is configured")
+    return candidates[0]
+
+
 def env_report(
     providers: list[ProviderConfig | ProviderEnvSpec]
     | tuple[ProviderConfig | ProviderEnvSpec, ...]
@@ -422,10 +476,12 @@ __all__ = [
     "DEFAULT_SAMPLE",
     "ProviderConfig",
     "ProviderEnvSpec",
+    "ProviderSelectionError",
     "ProviderTier",
     "env_report",
     "is_loopback_host",
     "load_provider_specs",
     "load_providers",
+    "select_provider",
     "validate_provider_specs",
 ]
