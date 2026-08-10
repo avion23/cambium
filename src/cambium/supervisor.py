@@ -641,6 +641,7 @@ EOF_GRACE_S = 5.0
 WORKER_EXIT_WAIT_S = 10.0
 TERM_GRACE_S = 5.0
 MAX_PARSE_ERRORS = 500
+PROTO_UNKNOWN_REQUEST_ID = "PROTO_UNKNOWN_REQUEST_ID"
 
 CRITICAL_KINDS = frozenset({
     "result", "checkpoint", "worker_exit", "task_failed",
@@ -830,12 +831,13 @@ class _FallbackSequencer:
         return result
 
     def _is_registered(self, repo: Path, path: Path) -> bool:
-        result = self._run(repo, "worktree", "list", "--porcelain")
-        wanted = os.path.abspath(path)
-        for line in result.stdout.splitlines():
-            if line.startswith("worktree ") and os.path.abspath(line[9:].strip()) == wanted:
-                return True
-        return False
+        result = self._run(repo, "worktree", "list", "--porcelain", "-z")
+        wanted = Path(path).resolve()
+        return any(
+            field.startswith("worktree ")
+            and Path(field.removeprefix("worktree ")).resolve() == wanted
+            for field in result.stdout.split("\0")
+        )
 
     def prepare_staging(
         self, repo: Path, worktree_path: Path, branch: str, base: str
@@ -1014,7 +1016,7 @@ class _GenOutcome:
     """Outcome of one generation's drive loop."""
 
     clean: bool  # worker delivered a verdict (result + exit + rc 0)
-    fatal: bool = False  # restarting cannot help (spawn error)
+    fatal: bool = False  # restarting cannot help (spawn or terminal protocol error)
     reason: str | None = None
     timeout_phase: str | None = None
     exit_code: int | None = None
@@ -1170,11 +1172,9 @@ class _Runtime:
     @staticmethod
     def _registered_worktree_paths(listing: str) -> set[Path]:
         paths: set[Path] = set()
-        for entry in listing.split("\n\n"):
-            for line in entry.splitlines():
-                if line.startswith("worktree "):
-                    paths.add(Path(line.removeprefix("worktree ")).resolve())
-                    break
+        for field in listing.split("\0"):
+            if field.startswith("worktree "):
+                paths.add(Path(field.removeprefix("worktree ")).resolve())
         return paths
 
     # -- worktree lifecycle --------------------------------------------------
@@ -1191,7 +1191,9 @@ class _Runtime:
         branch = spec["branch"]
         base = spec["base_commit"]
         await self._git(repo, "worktree", "prune", check=False)
-        listing = await self._git_stdout(repo, "worktree", "list", "--porcelain") or ""
+        listing = await self._git_stdout(
+            repo, "worktree", "list", "--porcelain", "-z"
+        ) or ""
         if worktree in self._registered_worktree_paths(listing):
             return await self._recover_worktree_locked(spec, generation)
         stale_generation = 0
@@ -1548,6 +1550,7 @@ class _Runtime:
         envelope: dict[str, Any] | None = None
         exit_reason: str | None = None
         correlated = False
+        protocol_reason: str | None = None
         protocol_failure: str | None = None
         timeout_phase: str | None = "stdin" if not init_written else None
 
@@ -1698,14 +1701,19 @@ class _Runtime:
                     await _kill_worker(proc)
                     break
                 if mtype == "ready":
+                    if msg.get("request_id") != init_rid:
+                        protocol_reason = "ready_request_id_mismatch"
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            request_id=msg.get("request_id"), code=PROTO_UNKNOWN_REQUEST_ID,
+                            note="ready request_id mismatch", expected=init_rid,
+                            got=msg.get("request_id"),
+                        )
+                        await _kill_worker(proc)
+                        break
                     phase = "run"
                     last_heartbeat = loop.time()
                     handle.state = "RUNNING"
-                    if msg.get("request_id") != init_rid:
-                        await self.emit(
-                            "protocol", task_id=task_id, note="ready request_id mismatch",
-                            expected=init_rid, got=msg.get("request_id"),
-                        )
                     await self.emit(
                         "ready", task_id=task_id, request_id=msg.get("request_id"),
                         generation=generation, pid=msg.get("pid"), proto=msg.get("proto"),
@@ -1820,6 +1828,8 @@ class _Runtime:
             reason: str | None = None
         elif timeout_phase is not None:
             reason = timeout_phase
+        elif protocol_reason is not None:
+            reason = protocol_reason
         elif exit_code != 0:
             reason = f"worker_exit_{exit_code}"
         elif exit_reason is None:
@@ -1829,8 +1839,9 @@ class _Runtime:
         else:
             reason = "result_request_id_mismatch"
         return _GenOutcome(
-            clean=clean, fatal=protocol_failure is not None,
-            reason=protocol_failure or reason, timeout_phase=timeout_phase,
+            clean=clean,
+            fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",
+            reason=protocol_failure or protocol_reason or reason, timeout_phase=timeout_phase,
             exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
             correlated=correlated,
         )

@@ -356,6 +356,42 @@ def test_worktree_registration_requires_an_exact_path_match(tmp_path: Path) -> N
     assert (registered_extra / "hello.txt").read_text(encoding="utf-8") == "hello\n"
 
 
+def test_registered_worktree_path_with_literal_newline_is_not_deleted(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worktree = session_dir / "wt\nname"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-newline", str(worktree), base],
+        check=True,
+        capture_output=True,
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-newline-path",
+        worker=FAKE_WORKER,
+        gate="true",
+        worktree_path=str(worktree),
+        branch="wt-newline",
+    )
+    runtime = supervisor_module._Runtime(session_dir, None)
+
+    asyncio.run(runtime._ensure_worktree(task))
+
+    assert worktree.is_dir()
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert f"worktree {worktree}\0".encode() in listing
+    assert (worktree / "hello.txt").read_text(encoding="utf-8") == "hello\n"
+
+
 def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -533,6 +569,63 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
     assert not _kinds(events, "run_task")
     assert not _kinds(events, "gate")
     assert not _kinds(events, "merge_started")
+    assert not _kinds(events, "merge_committed")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+
+
+def test_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "wrong-ready-result-worker.py"
+    worker.write_text(
+        "import json, sys\n"
+        "def send(message):\n"
+        "    print(json.dumps(message), flush=True)\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "send({'type': 'ready', 'request_id': 'wrong-request-id', "
+        "'task_id': init['task_id'], 'generation': init['generation'], 'proto': 1})\n"
+        "run = json.loads(sys.stdin.readline())\n"
+        "if run.get('type') == 'run_task':\n"
+        "    with open(run['target_file'], 'a', encoding='utf-8') as handle:\n"
+        "        handle.write('\\n// wrong-ready-result\\n')\n"
+        "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
+        "'status': 'succeeded'})\n"
+        "    send({'type': 'exit_message', 'reason': 'done'})\n",
+        encoding="utf-8",
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-wrong-ready-result",
+        worker=str(worker),
+        gate="grep -q '// wrong-ready-result' hello.txt",
+        max_restarts=2,
+        max_wall_s=5.0,
+        marker="// wrong-ready-result",
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    task_result = result.results[0]
+    assert task_result.status == "failed"
+    assert task_result.reason == "ready_request_id_mismatch"
+    assert task_result.restarts == 0
+    events = read_events(session_dir)
+    protocol = _kinds(events, "protocol")
+    assert len(protocol) == 1
+    assert protocol[0]["payload"]["code"] == supervisor_module.PROTO_UNKNOWN_REQUEST_ID
+    assert protocol[0]["payload"]["expected"] != protocol[0]["payload"]["got"]
+    assert not _kinds(events, "run_task")
+    assert not _kinds(events, "gate")
     assert not _kinds(events, "merge_committed")
     assert subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
