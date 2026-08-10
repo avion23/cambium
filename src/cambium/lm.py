@@ -216,8 +216,16 @@ def _freeze(
                 f"CambiumLM configuration values must use exact builtin primitive types, not "
                 f"{type(value).__name__}"
             )
+        if json_safe:
+            raise TypeError(
+                "CambiumLM request values must be JSON-serializable; bytes are not supported"
+            )
         return bytes(value)
     if value is None or type(value) in (str, bytes, int, float, bool):
+        if json_safe and type(value) is bytes:
+            raise TypeError(
+                "CambiumLM request values must be JSON-serializable; bytes are not supported"
+            )
         return value
     if isinstance(value, str | bytes | int | float | bool):
         raise TypeError(

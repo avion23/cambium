@@ -1110,6 +1110,30 @@ def test_explicit_request_response_format_credentials_are_rejected(entry_point: 
 
 
 @pytest.mark.parametrize("entry_point", ["call", "acall"])
+def test_explicit_request_response_format_bytes_are_rejected_before_dispatch(
+    entry_point: str,
+) -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"response_format": {"blob": b"x"}},
+    )
+
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        if entry_point == "call":
+            lm(request=request)
+        else:
+            asyncio.run(lm.acall(request=request))
+
+    assert diffundo.calls == []
+
+
+@pytest.mark.parametrize("entry_point", ["call", "acall"])
 def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
     entry_point: str,
 ) -> None:
