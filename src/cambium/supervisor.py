@@ -799,7 +799,8 @@ class _Runtime:
 
     async def emit(
         self, kind: str, *, task_id: str | None = None, generation: int | None = None,
-        request_id: str | None = None, **payload: Any,
+        request_id: str | None = None, _observer_failure_is_fatal: bool = True,
+        **payload: Any,
     ) -> None:
         record = {
             "kind": kind,
@@ -816,9 +817,13 @@ class _Runtime:
         else:
             self._queue.put_nowait(record)
         if self._on_event is not None:
-            result = self._on_event(record)
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = self._on_event(record)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                if _observer_failure_is_fatal:
+                    raise
 
     async def _writer_loop(self) -> None:
         while True:
@@ -1456,7 +1461,11 @@ class _Runtime:
             event_payload = dict(payload)
             event_task_id = event_payload.pop("task", task_id)
             future = asyncio.run_coroutine_threadsafe(
-                self.emit(kind, task_id=event_task_id, **event_payload), loop
+                self.emit(
+                    kind, task_id=event_task_id, _observer_failure_is_fatal=False,
+                    **event_payload,
+                ),
+                loop,
             )
             future.result()
 
@@ -1499,6 +1508,11 @@ class _Runtime:
     async def reconcile(self, specs: list[dict[str, Any]]) -> None:
         """Reconcile staging moves and the git-ref/event publish gap on startup."""
         scanned_repos: set[Path] = set()
+        durable_quarantines = [
+            event["payload"]
+            for event in await asyncio.to_thread(self._store.events_after, 0)
+            if event["kind"] == "merge_staging_quarantined"
+        ]
         task_keys = {
             hashlib.sha256(spec["task_id"].encode()).hexdigest()[:16]: spec["task_id"]
             for spec in specs
@@ -1512,6 +1526,7 @@ class _Runtime:
             current = await asyncio.to_thread(
                 seq.reconcile, repo, throwaway,
                 scan_quarantine=repo not in scanned_repos,
+                quarantine_events=durable_quarantines,
             )
             scanned_repos.add(repo)
             emitted = await self._flush_sequencer_events(seq, task_keys)

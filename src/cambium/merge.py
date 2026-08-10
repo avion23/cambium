@@ -531,8 +531,17 @@ class MergeSequencer:
             destination = root / task_name / destination_name
             relative_id = Path("merge") / task_name / destination_name
             recording_event_index = len(self._events)
+            durably_recorded = False
 
             def containment_failure(message: str, cause: Exception | None = None) -> None:
+                if durably_recorded:
+                    self._worktree_path = None
+                    self._staging_branch = None
+                    self._staging_ref = None
+                    error = StagingCleanupError(message)
+                    if cause is not None:
+                        raise error from cause
+                    raise error
                 restore_staging()
                 del self._events[recording_event_index:]
                 error = StagingCleanupError(message)
@@ -541,6 +550,7 @@ class MergeSequencer:
                 raise error
 
             try:
+                destination_info = os.fstat(destination_fd)
                 quarantine_payload = {
                     "task": self._task_id,
                     "staging_sha": staging_sha,
@@ -548,12 +558,15 @@ class MergeSequencer:
                     "allocated_bytes": allocated,
                     "reason": ",".join(reasons),
                     "expiry": time.time_ns() + self._quarantine_retention_ns,
+                    "quarantine_device": destination_info.st_dev,
+                    "quarantine_inode": destination_info.st_ino,
                 }
                 self._event("merge_staging_quarantined", **quarantine_payload)
                 if self._durable_event is not None:
                     self._durable_event(
                         "merge_staging_quarantined", dict(quarantine_payload)
                     )
+                    durably_recorded = True
             except Exception as exc:
                 if not all(self._is_open_child(*link) for link in chain):
                     containment_failure("quarantine path changed during recording", exc)
@@ -915,8 +928,72 @@ class MergeSequencer:
             )
         raise RuntimeError(f"git update-ref {MAIN_REF} failed: {detail[:512]}")
 
+    def _restore_recorded_quarantines(self, events: list[dict[str, Any]]) -> None:
+        if self._session_dir is None:
+            return
+        root = self._quarantine_root()
+        identity_pattern = re.compile(
+            r"merge/task-[0-9a-f]{16}/[0-9]+-[0-9a-f]{16}"
+        )
+        for payload in events:
+            quarantine_id = payload.get("quarantine_id")
+            device = payload.get("quarantine_device")
+            inode = payload.get("quarantine_inode")
+            if (
+                not isinstance(quarantine_id, str)
+                or identity_pattern.fullmatch(quarantine_id) is None
+                or not isinstance(device, int)
+                or not isinstance(inode, int)
+            ):
+                continue
+            expected = self._session_dir / ".cambium" / "quarantine" / quarantine_id
+            if expected.is_symlink():
+                raise StagingCleanupError("recorded quarantine path is a symlink")
+            if expected.exists():
+                info = expected.stat()
+                if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != (
+                    device,
+                    inode,
+                ):
+                    raise StagingCleanupError("recorded quarantine path has changed identity")
+                continue
+
+            displaced: Path | None = None
+            for current, directories, _files in os.walk(
+                self._session_dir, topdown=True, followlinks=False
+            ):
+                safe_directories: list[str] = []
+                for name in directories:
+                    candidate = Path(current) / name
+                    info = candidate.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        continue
+                    if (info.st_dev, info.st_ino) == (device, inode):
+                        displaced = candidate
+                        break
+                    safe_directories.append(name)
+                directories[:] = safe_directories
+                if displaced is not None:
+                    break
+            if displaced is None:
+                raise StagingCleanupError("recorded quarantine evidence cannot be located")
+
+            task_name = Path(quarantine_id).parts[1]
+            task_dir = self._secure_directory(root, task_name, root)
+            if expected.parent != task_dir:
+                raise StagingCleanupError("recorded quarantine path escapes its task directory")
+            displaced.rename(expected)
+            restored = expected.stat()
+            if (restored.st_dev, restored.st_ino) != (device, inode):
+                raise StagingCleanupError("restored quarantine path has changed identity")
+
     def reconcile(
-        self, repo: Path, worktree_path: Path | None = None, *, scan_quarantine: bool = True
+        self,
+        repo: Path,
+        worktree_path: Path | None = None,
+        *,
+        scan_quarantine: bool = True,
+        quarantine_events: list[dict[str, Any]] | None = None,
     ) -> str | None:
         """Return the current ``refs/heads/main`` SHA, or None if absent.
 
@@ -928,6 +1005,7 @@ class MergeSequencer:
         reconciled_tip: str | None = None
         reconciled_ref: str | None = None
         if self._session_dir is not None and scan_quarantine:
+            self._restore_recorded_quarantines(quarantine_events or [])
             root = self._quarantine_root()
             for entry in self._quarantine_entries(root):
                 relative_id = entry.relative_to(self._session_dir / ".cambium" / "quarantine")

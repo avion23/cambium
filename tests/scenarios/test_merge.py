@@ -18,6 +18,7 @@ and the six findings the sequencer encodes:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import subprocess
@@ -36,6 +37,8 @@ from cambium.merge import (
     QuarantineError,
     StagingCleanupError,
 )
+from cambium.store import EventStore
+from cambium.supervisor import _Runtime
 
 SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 
@@ -725,7 +728,7 @@ def test_task_directory_rename_before_recording_restores_staging(tmp_path, monke
     assert not list(displaced.iterdir())
 
 
-def test_quarantine_is_durable_before_cleanup_returns(tmp_path) -> None:
+def test_quarantine_is_durable_before_cleanup_returns_and_reconciles_rename(tmp_path) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
     _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
@@ -753,9 +756,47 @@ def test_quarantine_is_durable_before_cleanup_returns(tmp_path) -> None:
     displaced = tmp_path / "displaced-after-cleanup"
     destination.rename(displaced)  # the old supervisor flush happened after this boundary
 
-    assert (displaced / "evidence.bin").read_bytes() == (
+    recovery = MergeSequencer(task_id="durable-before-return", session_dir=tmp_path)
+    recovery.reconcile(repo, quarantine_events=[persisted[0][1]])
+
+    assert destination.is_dir()
+    assert not displaced.exists()
+    assert (destination / "evidence.bin").read_bytes() == (
         b"must be recorded before descriptors close"
     )
+
+
+def test_observer_failure_after_durable_append_does_not_restore_staging(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    store = EventStore(tmp_path / ".cambium" / "events.db")
+
+    def reject_event(_event: dict) -> None:
+        raise RuntimeError("observer rejected durable event")
+
+    async def quarantine() -> None:
+        runtime = _Runtime(tmp_path, store, on_event=reject_event)
+        seq = runtime._make_sequencer("observer-failure")
+        seq.prepare_staging(repo, staging, "worker", "main")
+        (staging / "evidence.bin").write_bytes(b"observer cannot strand evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+
+    try:
+        asyncio.run(quarantine())
+        events = [
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        ]
+    finally:
+        store.close()
+
+    assert len(events) == 1
+    destination = tmp_path / ".cambium" / "quarantine" / events[0]["payload"]["quarantine_id"]
+    assert destination.is_dir()
+    assert not staging.exists()
+    assert (destination / "evidence.bin").read_bytes() == b"observer cannot strand evidence"
 
 
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
