@@ -15,8 +15,29 @@ import threading
 from pathlib import Path
 
 
+def _canonical_json(value: dict) -> str:
+    """Serialize a dict canonically so equivalent dicts hash identically."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
 class EvalCache:
     """A bounded, opt-in cache for deterministic evaluation-harness calls.
+
+    Cache identity (F6-15) is the full request as seen by the provider:
+    provider name/revision, provider model, the exact prompt dict, and the
+    sampling/request params that reach the provider. ``EvalCache.key`` hashes
+    that identity with SHA-256 over a canonical JSON serialization, so a
+    change in any component — provider revision, temperature, tool schema,
+    prompt content — yields a distinct key and never reuses a response from
+    a materially different request. This module keeps a static stdlib-only
+    import boundary; only the eval harness and its tests construct
+    ``EvalCache``.
 
     ``enabled`` defaults to ``False`` so merely constructing the helper does
     not activate disk caching. The eval harness must explicitly pass
@@ -43,19 +64,30 @@ class EvalCache:
             self.dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def key(prompt: dict, model: str) -> str:
-        """Return a deterministic SHA-256 key for the complete prompt and model."""
-        normalized_prompt = json.dumps(
-            prompt,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+    def key(
+        prompt: dict,
+        *,
+        provider: str,
+        model: str,
+        params: dict | None = None,
+    ) -> str:
+        """Return a deterministic SHA-256 key for the full request identity.
+
+        The identity is the complete request as seen by the provider:
+        provider name/revision, provider model, the exact prompt dict, and
+        the sampling/request params. Every component is serialized
+        canonically, so a change in any of them (provider revision,
+        temperature, tool schema, prompt content) produces a distinct key.
+        """
         digest = hashlib.sha256()
-        digest.update(normalized_prompt.encode("utf-8"))
+        digest.update(provider.encode("utf-8"))
         digest.update(b"\0")
         digest.update(model.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_canonical_json(prompt).encode("utf-8"))
+        if params is not None:
+            digest.update(b"\0")
+            digest.update(_canonical_json(params).encode("utf-8"))
         return digest.hexdigest()
 
     def get(self, key: str) -> dict | None:
