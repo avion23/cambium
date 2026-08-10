@@ -11,6 +11,7 @@ import threading
 import uuid
 import weakref
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 if sysconfig.get_config_var("Py_GIL_DISABLED") or os.environ.get("Py_GIL_DISABLED") == "1":
@@ -67,30 +68,6 @@ _DIFFUNDO_REGISTRY: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDic
 _DSPY: Any | None = None
 
 
-class _ImmutableDict(dict[Any, Any]):
-    """JSON-serializable mapping snapshot that rejects later mutation."""
-
-    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-        raise TypeError("CambiumLM configuration snapshots are immutable")
-
-    __delitem__ = _reject_mutation
-    __ior__ = _reject_mutation
-    __setitem__ = _reject_mutation
-    clear = _reject_mutation
-    pop = _reject_mutation
-    popitem = _reject_mutation
-    setdefault = _reject_mutation
-    update = _reject_mutation
-
-    def __copy__(self) -> _ImmutableDict:
-        return self
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> _ImmutableDict:
-        del memo
-        return self
-
-
 class _ImmutableCallbacks(list[Any]):
     """Disposable DSPy-compatible callback view that rejects normal mutation."""
 
@@ -120,7 +97,7 @@ def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
         if id(value) in memo:
             raise ValueError("CambiumLM kwargs must not contain reference cycles")
         memo[id(value)] = None
-        frozen = _ImmutableDict(
+        frozen = MappingProxyType(
             {_freeze(key, memo): _freeze(item, memo) for key, item in value.items()}
         )
         memo.pop(id(value))
@@ -184,22 +161,20 @@ def _load_dspy() -> Any:
         if _DSPY is not None:
             return _DSPY
 
-        previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
-        # DSPy 3.3 constructs its default disk cache during import. A valid,
-        # non-HOME directory avoids its /dev/null fallback warning; the cache
-        # is disabled before this function returns.
+        # DSPy 3.3 constructs its default disk cache during import. When the
+        # variable is absent, a valid non-HOME directory avoids its /dev/null
+        # fallback warning; the cache is disabled before this function returns.
         with tempfile.TemporaryDirectory(prefix="cambium-dspy-cache-") as cache_dir:
-            os.environ["DSPY_CACHEDIR"] = cache_dir
+            previous_cache_dir = os.environ.get("DSPY_CACHEDIR")
+            os.environ.setdefault("DSPY_CACHEDIR", cache_dir)
             try:
                 try:
                     import dspy
                 except ImportError as exc:
                     raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
             finally:
-                if previous_cache_dir is None:
+                if previous_cache_dir is None and os.environ.get("DSPY_CACHEDIR") == cache_dir:
                     os.environ.pop("DSPY_CACHEDIR", None)
-                else:
-                    os.environ["DSPY_CACHEDIR"] = previous_cache_dir
 
             configure_cache = getattr(dspy, "configure_cache", None)
             if not callable(configure_cache):
@@ -372,8 +347,7 @@ class _CambiumLMMixin:
                 "budget_usd": self._budget_usd,
             }
         )
-        self._safe_kwargs(state)
-        return state
+        return self._json_snapshot(self._safe_kwargs(state))
 
     @classmethod
     def load_state(
@@ -422,6 +396,17 @@ class _CambiumLMMixin:
                 visited.add(id(value))
                 pending.extend(value)
         return {key: _freeze(value) for key, value in safe.items()}
+
+    @staticmethod
+    def _json_snapshot(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                _CambiumLMMixin._json_snapshot(key): _CambiumLMMixin._json_snapshot(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(_CambiumLMMixin._json_snapshot(item) for item in value)
+        return value
 
     @classmethod
     def _call_kwargs(cls, kwargs: Mapping[str, Any]) -> dict[str, Any]:

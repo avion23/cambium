@@ -318,13 +318,64 @@ def test_copy_does_not_share_mutable_launch_kwargs() -> None:
     lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
     copied = lm.copy()
 
-    with pytest.raises(TypeError, match="configuration snapshots are immutable"):
+    with pytest.raises(TypeError):
         copied.launch_kwargs["api_key"] = "SENSITIVE_CANARY"
 
     assert "SENSITIVE_CANARY" not in repr(lm.dump_state())
     assert "api_key" not in repr(lm.dump_state())
     assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
     assert "api_key" not in repr(copied.dump_state())
+
+
+def test_copy_launch_and_train_snapshots_reject_dict_base_mutators() -> None:
+    _require_dspy()
+    lm = CambiumLM(
+        FakeDiffundo(),
+        ProviderTier.FAST,
+        launch_kwargs={"original": "launch"},
+        train_kwargs={"original": "train"},
+    )  # type: ignore[arg-type]
+    copied = lm.copy()
+
+    mutators = (
+        lambda value: dict.__setitem__(value, "bypass", "changed"),
+        lambda value: dict.__delitem__(value, "original"),
+        lambda value: dict.update(value, {"bypass": "changed"}),
+        lambda value: dict.clear(value),
+        lambda value: dict.pop(value, "original"),
+        lambda value: dict.popitem(value),
+        lambda value: dict.setdefault(value, "bypass", "changed"),
+        lambda value: dict.__ior__(value, {"bypass": "changed"}),
+    )
+    for attribute in ("launch_kwargs", "train_kwargs"):
+        snapshot = getattr(copied, attribute)
+        for mutate in mutators:
+            with pytest.raises(TypeError):
+                mutate(snapshot)
+        assert getattr(lm, attribute) == snapshot
+        assert "bypass" not in snapshot
+
+
+def test_dump_state_detaches_mutable_primitive_subclass_model() -> None:
+    _require_dspy()
+
+    class MutableStr(str):
+        def __new__(cls, value: str, payload: dict[str, str]) -> MutableStr:
+            instance = super().__new__(cls, value)
+            instance.payload = payload
+            return instance
+
+    payload = {"state": "original"}
+    model = MutableStr("provider-model", payload)
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST, model=model)  # type: ignore[arg-type]
+
+    dumped_model = lm.dump_state()["model"]
+    assert type(dumped_model) is str
+    assert dumped_model == "provider-model"
+    assert dumped_model is not model
+
+    payload["state"] = "changed"
+    assert dumped_model == "provider-model"
 
 
 def test_copy_freezes_bytearrays_in_launch_and_train_kwargs() -> None:
@@ -558,6 +609,68 @@ assert len({id(value) for value in results}) == 1
 assert lm._DSPY is results[0]
 assert cold_load_count == 1, cold_load_count
 assert os.environ["DSPY_CACHEDIR"] == sentinel
+"""
+    env = os.environ.copy()
+    env.pop("Py_GIL_DISABLED", None)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+
+
+def test_dspy_load_preserves_cache_environment_writer_during_import() -> None:
+    _require_dspy()
+    source = Path(__file__).resolve().parents[2] / "src"
+    script = """
+import builtins
+import os
+import sys
+import threading
+
+sys.path.insert(0, sys.argv[1])
+os.environ["DSPY_CACHEDIR"] = "/tmp/cambium-dspy-cache-stale"
+import cambium.lm as lm
+
+assert lm._DSPY is None
+assert "dspy" not in sys.modules
+
+import_started = threading.Event()
+allow_import = threading.Event()
+writer_errors = []
+real_import = builtins.__import__
+
+
+def gated_import(name, *args, **kwargs):
+    if name == "dspy":
+        import_started.set()
+        if not allow_import.wait(5):
+            raise RuntimeError("dspy import gate timed out")
+    return real_import(name, *args, **kwargs)
+
+
+builtins.__import__ = gated_import
+
+
+def write_new_cache_dir():
+    if not import_started.wait(5):
+        writer_errors.append("dspy import did not start")
+    else:
+        os.environ["DSPY_CACHEDIR"] = "/tmp/cambium-dspy-cache-new"
+    allow_import.set()
+
+
+writer = threading.Thread(target=write_new_cache_dir)
+writer.start()
+lm._load_dspy()
+writer.join(5)
+assert not writer.is_alive()
+assert writer_errors == []
+assert os.environ["DSPY_CACHEDIR"] == "/tmp/cambium-dspy-cache-new"
 """
     env = os.environ.copy()
     env.pop("Py_GIL_DISABLED", None)
