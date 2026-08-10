@@ -58,8 +58,9 @@ reference map for current code, target design, commands, and evidence.
 Current code is a deterministic Python harness. `src/cambium/__init__.py`
 exports only `__version__`; do not claim a public `Cambium`, `Session`, or
 `Result` API. `src/cambium/worker.py` is a deterministic marker and commit
-seed over the NDJSON protocol; no DSPy ReAct loop is present. `diffundo.py`,
-`architectus.py`, `tools.py`, and `edits.py` are repository files, not
+seed over the NDJSON protocol; no DSPy ReAct loop is present.
+`src/cambium/diffundo.py`, `src/cambium/architectus.py`,
+`src/cambium/tools.py`, and `src/cambium/edits.py` are repository files, not
 branch-local work. Architecture is a target, not proof. Use source, tests, and
 the living `docs/research/v2-1-status.md` for milestone evidence; it is being
 refreshed elsewhere, so do not copy its SHA claims.
@@ -67,10 +68,11 @@ refreshed elsewhere, so do not copy its SHA claims.
 ### Stable entry points
 
 - CLI: `src/cambium/cli.py:main`; package version: `src/cambium/__init__.py:__version__`.
-- Runtime: `src/cambium/ipc.py`, `worker.py:main`, `supervisor.py:main`, and
-  `worker_pool.py`.
-- Boundaries: `store.py`, `merge.py`, `tools.py`, `edits.py`, `diffundo.py`,
-  `architectus.py`, and `provider_config.py` under `src/cambium/`.
+- Runtime: `src/cambium/ipc.py`, `src/cambium/worker.py:main`,
+  `src/cambium/supervisor.py:main`, and `src/cambium/worker_pool.py`.
+- Boundaries: `src/cambium/store.py`, `src/cambium/merge.py`,
+  `src/cambium/tools.py`, `src/cambium/edits.py`, `src/cambium/diffundo.py`,
+  `src/cambium/architectus.py`, and `src/cambium/provider_config.py`.
 - Tests: `tests/scenarios/` and `src/cambium/modules/example/tests/`.
 
 ### Verified command table
@@ -92,7 +94,7 @@ refreshed elsewhere, so do not copy its SHA claims.
 | Agent process and reporting | `agents.md` |
 | Current behavior | `src/cambium/` and `tests/` |
 | Architecture target | `docs/architecture/architecture.md` |
-| Module contracts | `docs/architecture/module-template/architecture.md`, `dataset-format.md`, `example-spec.md` |
+| Module contracts | `docs/architecture/module-template/architecture.md`, `docs/architecture/module-template/dataset-format.md`, `docs/architecture/module-template/example-spec.md` |
 | Milestone evidence | `docs/research/v2-1-status.md` (living; do not copy its SHA claims) |
 | Research decisions | `docs/research/README.md`, `docs/research/design-deltas.md` |
 | Older design and reviews | `docs/architecture/system-design.md`, `docs/architecture/reviews/` |
