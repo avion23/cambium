@@ -153,12 +153,13 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
             sys.stdout.flush()
 
         init = json.loads(sys.stdin.readline())
+        generation = init.get("generation", 1)
         send({
             "type": "ready",
-            "request_id": "wrong-request-id",
+            "request_id": init["request_id"] if generation > 1 else "wrong-request-id",
             "task_id": init["task_id"],
             "pid": 0,
-            "generation": init.get("generation", 1),
+            "generation": generation,
             "proto": 1,
         })
         run = json.loads(sys.stdin.readline())
@@ -176,7 +177,7 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
         send({
             "type": "exit_message",
             "task_id": init["task_id"],
-            "generation": init.get("generation", 1),
+            "generation": generation,
             "reason": "done",
         })
     """), encoding="utf-8")
@@ -197,7 +198,6 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
                 marker="// wrong-ready-must-not-run",
                 gate="grep -q '// wrong-ready-must-not-run' a.txt",
                 worker=str(worker),
-                max_restarts=0,
             )
         ]
     }
@@ -210,14 +210,15 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
     assert task.restarts == 0
     assert "ready_request_id_mismatch" in (task.reason or "")
     events = read_events(session_dir)
+    assert len(_kinds(events, "spawned")) == 1
+    assert {event["generation"] for event in _kinds(events, "spawned")} == {1}
+    assert not _kinds(events, "restart_scheduled")
     protocol = _kinds(events, "protocol")
     assert len(protocol) == 1
     assert protocol[0]["payload"]["code"] == "PROTO_UNKNOWN_REQUEST_ID"
     assert protocol[0]["payload"]["expected"] != protocol[0]["payload"]["got"]
-    failed = _kinds(events, "worker_failed")
-    assert len(failed) == 1
-    assert failed[0]["payload"]["reason"] == "ready_request_id_mismatch"
     assert not _kinds(events, "run_task")
+    assert not _kinds(events, "gate")
     assert not _kinds(events, "merge_committed")
     assert _show(repo, "main", "a.txt") == "file a\n"
 

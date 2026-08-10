@@ -759,7 +759,7 @@ class _GenOutcome:
     """Outcome of one generation's drive loop."""
 
     clean: bool  # worker delivered a verdict (result + exit + rc 0)
-    fatal: bool = False  # restarting cannot help (spawn error)
+    fatal: bool = False  # restarting cannot help (spawn or terminal protocol error)
     reason: str | None = None
     timeout_phase: str | None = None
     exit_code: int | None = None
@@ -1399,7 +1399,8 @@ class _Runtime:
         else:
             reason = "result_request_id_mismatch"
         return _GenOutcome(
-            clean=clean, fatal=False, reason=reason, timeout_phase=timeout_phase,
+            clean=clean, fatal=protocol_reason == "ready_request_id_mismatch", reason=reason,
+            timeout_phase=timeout_phase,
             exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
             correlated=correlated,
         )
