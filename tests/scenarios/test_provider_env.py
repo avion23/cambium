@@ -17,28 +17,29 @@ import pytest
 
 diffundo = pytest.importorskip("cambium.diffundo")
 
+from cambium.auth import derived_env_name  # noqa: E402
 from cambium.provider_config import DEFAULT_SAMPLE, env_report, load_providers  # noqa: E402
 
-# The documented env names are used verbatim for the providers that have one.
-# The remaining landscape identities have inline/OAuth/no-key credentials in
-# the document, so they receive valid, deliberately absent env-name slots for
-# this env-only smoke. LOCAL_LLM_API_KEY comes from DEFAULT_SAMPLE.
-_LANDSCAPE_PROVIDER_KEYS: tuple[tuple[str, str], ...] = (
-    ("openai", "OPENAI_API_KEY"),
-    ("opencode-go", "OPENCODE_GO_API_KEY"),
-    ("google", "GEMINI_API_KEY"),
-    ("zai-coding-plan", "ZAI_API_KEY"),
-    ("kimi-for-coding", "KIMI_API_KEY"),
-    ("micu-free2", "MICU_FREE2_API_KEY"),
-    ("micu-vip2", "MICU_VIP2_API_KEY"),
-    ("openrouter", "OPENROUTER_API_KEY"),
-    ("nvidia", "NVIDIA_API_KEY"),
-    ("tokenrouter", "TOKENROUTER_API_KEY"),
-    ("groq", "GROQ_API_KEY"),
-    ("llama-cpp", "LOCAL_LLM_API_KEY"),
-    ("zenmux", "ZENMUX_API_KEY"),
+# Every provider uses the canonical env name derived from its provider id.
+_LANDSCAPE_PROVIDER_KEYS: tuple[tuple[str, str], ...] = tuple(
+    (name, derived_env_name(name))
+    for name in (
+        "openai",
+        "opencode-go",
+        "google",
+        "zai-coding-plan",
+        "kimi-for-coding",
+        "micu-free2",
+        "micu-vip2",
+        "openrouter",
+        "nvidia",
+        "tokenrouter",
+        "groq",
+        "llama-cpp",
+        "zenmux",
+    )
 )
-_KNOWN_PRESENT_ENV_KEY = "GEMINI_API_KEY"
+_KNOWN_PRESENT_ENV_KEY = "CAMBIUM_PROVIDER_GOOGLE_API_KEY"
 _KEY_NAME_PARTS = ("API", "KEY", "TOKEN")
 
 
@@ -88,7 +89,10 @@ def test_provider_landscape_config_loads_and_validates(tmp_path: Path) -> None:
     assert all(isinstance(provider, diffundo.ProviderConfig) for provider in providers)
 
 
-def test_env_report_is_boolean_presence_only(tmp_path: Path) -> None:
+def test_env_report_is_boolean_presence_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_KNOWN_PRESENT_ENV_KEY, "secret-value-that-must-not-be-reported")
     providers = load_providers(_write_config(tmp_path / "providers.json", _landscape_config()))
     report = env_report(providers)
 
@@ -114,7 +118,7 @@ def test_env_report_is_boolean_presence_only(tmp_path: Path) -> None:
 def test_missing_api_key_env_loads_but_reports_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    missing_env_name = "CAMBIUM_PROVIDER_ENV_SMOKE_MISSING_API_KEY"
+    missing_env_name = derived_env_name("missing-key")
     monkeypatch.delenv(missing_env_name, raising=False)
 
     config = copy.deepcopy(DEFAULT_SAMPLE)

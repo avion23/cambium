@@ -29,6 +29,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import auth
+from .auth import AuthError, AuthStore
 from .provider_config import (
     DEFAULT_SAMPLE,
     env_report,
@@ -241,6 +243,118 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
     return Status.PASS, f"{source}: {states or 'no providers'}"
 
 
+def _auth_path(path: Path | None) -> Path:
+    return auth.auth_store_path() if path is None else Path(path)
+
+
+def check_auth_metadata(path: Path | None = None) -> tuple[Status, str]:
+    """Check fixed auth directory/file ownership, modes, type, and link count."""
+    target = _auth_path(path)
+    metadata = auth.inspect_metadata(target)
+    if not metadata.directory_exists:
+        return Status.WARN, "auth store is not configured"
+    if metadata.issue is not None:
+        return Status.FAIL, f"auth store metadata invalid: {metadata.issue}"
+    if not metadata.file_exists:
+        return Status.WARN, "auth store file is not present"
+    if not metadata.directory_secure or not metadata.file_secure:
+        return Status.FAIL, "auth store metadata is not secure"
+    return Status.PASS, "auth store directory and file metadata are secure"
+
+
+def check_auth_schema(path: Path | None = None) -> tuple[Status, str]:
+    """Check the exact auth schema without printing a key or a key name."""
+    target = _auth_path(path)
+    metadata = auth.inspect_metadata(target)
+    if not metadata.directory_exists:
+        return Status.WARN, "auth store schema is unavailable because the directory is absent"
+    if metadata.issue is not None or not metadata.directory_secure:
+        return Status.FAIL, "auth store schema cannot be checked on insecure metadata"
+    if not metadata.file_exists:
+        return Status.WARN, "auth store schema is unavailable because the file is absent"
+    if not metadata.file_secure:
+        return Status.FAIL, "auth store schema cannot be checked on insecure metadata"
+    try:
+        document = AuthStore(target).read()
+    except AuthError as exc:
+        return Status.FAIL, f"auth store schema invalid: {exc}"
+    return Status.PASS, f"auth store schema valid ({len(document.providers)} provider entries)"
+
+
+def _doctor_provider_specs(cwd: Path) -> tuple[str, tuple[object, ...]]:
+    path, explicit = _provider_config_path(cwd)
+    if path.exists():
+        if not path.is_file():
+            raise ValueError("provider config path is not a file")
+        return str(path), load_provider_specs(path)
+    if explicit:
+        raise ValueError("configured provider file does not exist")
+    return "default sample", validate_provider_specs(DEFAULT_SAMPLE)
+
+
+def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, str]:
+    """Compare configured providers with stored entries; never use the network."""
+    target = _auth_path(path)
+    try:
+        source, raw_specs = _doctor_provider_specs(cwd)
+    except (OSError, ValueError) as exc:
+        return Status.SKIP, f"auth coverage skipped: provider config validation failed: {exc}"
+
+    metadata = auth.inspect_metadata(target)
+    if not metadata.directory_exists:
+        return Status.WARN, "auth store coverage is unavailable because the directory is absent"
+    if metadata.issue is not None or not metadata.directory_secure:
+        return Status.FAIL, "auth store coverage cannot be checked on insecure metadata"
+    if not metadata.file_exists:
+        return Status.WARN, "auth store coverage is unavailable because the file is absent"
+    if not metadata.file_secure:
+        return Status.FAIL, "auth store coverage cannot be checked on insecure metadata"
+    try:
+        document = AuthStore(target).read()
+    except AuthError as exc:
+        return Status.FAIL, f"auth store coverage cannot be checked: {exc}"
+
+    specs = tuple(raw_specs)
+    stored = {credential.provider: credential for credential in document.providers}
+    missing_required = [
+        spec.name for spec in specs if spec.required and spec.name not in stored
+    ]
+    missing_optional = [
+        spec.name for spec in specs if not spec.required and spec.name not in stored
+    ]
+    present = [
+        f"{spec.name}={spec.api_key_env}"
+        for spec in specs
+        if spec.name in stored
+    ]
+    configured_names = {spec.name for spec in specs}
+    extra = sorted(name for name in stored if name not in configured_names)
+
+    if missing_required:
+        detail = (
+            f"{source}: required providers missing from auth store: "
+            f"{', '.join(missing_required)}"
+        )
+        if present:
+            detail += f"; configured entries: {', '.join(present)}"
+        return Status.FAIL, detail
+    if missing_optional:
+        detail = (
+            f"{source}: optional providers missing from auth store: "
+            f"{', '.join(missing_optional)}"
+        )
+        if present:
+            detail += f"; configured entries: {', '.join(present)}"
+        return Status.WARN, detail
+    if extra:
+        return Status.WARN, f"{source}: unconfigured auth entries: {', '.join(extra)}"
+    if present:
+        return Status.PASS, (
+            f"{source}: auth coverage complete; configured entries: {', '.join(present)}"
+        )
+    return Status.PASS, f"{source}: auth coverage complete"
+
+
 def _sqlite_integrity(db: Path) -> list[str]:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
@@ -378,10 +492,13 @@ def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
         (6, "Dataset integrity", check_dataset()),
         (7, "Secrets hygiene", check_secrets()),
         (8, "Provider env", check_provider_env(cwd)),
-        (9, "Conversation store", check_conversation_store(session_dir)),
-        (10, "DLQ directory", check_dlq(session_dir)),
-        (11, "Eval-cache directory", check_eval_cache(session_dir)),
-        (12, "System health", check_system_health(cwd)),
+        (9, "Auth metadata", check_auth_metadata()),
+        (10, "Auth schema", check_auth_schema()),
+        (11, "Auth coverage", check_auth_coverage(cwd)),
+        (12, "Conversation store", check_conversation_store(session_dir)),
+        (13, "DLQ directory", check_dlq(session_dir)),
+        (14, "Eval-cache directory", check_eval_cache(session_dir)),
+        (15, "System health", check_system_health(cwd)),
     ]
     return [
         Check(number=number, name=name, status=status, detail=detail)

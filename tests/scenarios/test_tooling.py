@@ -23,7 +23,9 @@ def _run_doctor(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProces
     )
 
 
-def _provider(*, required: bool = False, api_key_env: str = "MISSING_API_KEY") -> dict:
+def _provider(
+    *, required: bool = False, api_key_env: str = "CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY"
+) -> dict:
     return {
         "name": "test-provider",
         "tier": "fast",
@@ -79,7 +81,7 @@ def test_doctor_fails_on_corrupt_conversation_store(tmp_path) -> None:
 
 def test_doctor_warns_on_missing_optional_provider_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    monkeypatch.delenv("MISSING_API_KEY", raising=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", raising=False)
     config = tmp_path / ".cambium" / "providers.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"providers": [_provider()]}), encoding="utf-8")
@@ -94,7 +96,7 @@ def test_doctor_warns_on_missing_optional_provider_key(tmp_path, monkeypatch) ->
 
 def test_doctor_fails_on_missing_required_provider_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    monkeypatch.delenv("MISSING_API_KEY", raising=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", raising=False)
     config = tmp_path / ".cambium" / "providers.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"providers": [_provider(required=True)]}), encoding="utf-8")
@@ -108,7 +110,7 @@ def test_doctor_fails_on_missing_required_provider_key(tmp_path, monkeypatch) ->
 
 def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    monkeypatch.delenv("MISSING_API_KEY", raising=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", raising=False)
     invalid = _provider()
     invalid["required"] = "yes"
     config = tmp_path / ".cambium" / "providers.json"

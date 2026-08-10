@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .auth import validate_derived_env_name, validate_provider_id
+
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
 
@@ -60,7 +62,7 @@ DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
             "name": "openai",
             "tier": "strong",
             "base_url": "https://api.openai.com/v1",
-            "api_key_env": "OPENAI_API_KEY",
+            "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
             "required": False,
             "timeout_s": 30.0,
             "max_retries": 2,
@@ -75,7 +77,7 @@ DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
             "name": "llama-cpp",
             "tier": "fast",
             "base_url": "http://127.0.0.1:8080/v1",
-            "api_key_env": "LOCAL_LLM_API_KEY",
+            "api_key_env": "CAMBIUM_PROVIDER_LLAMA_CPP_API_KEY",
             "required": False,
             "timeout_s": 30.0,
             "max_retries": 0,
@@ -133,11 +135,14 @@ def _validate_base_url(value: object, location: str) -> str:
     return base_url
 
 
-def _validate_api_key_env(value: object, location: str) -> str:
+def _validate_api_key_env(value: object, location: str, provider: str) -> str:
     api_key_env = _require_string(value, location)
     if _ENV_NAME.fullmatch(api_key_env) is None:
         raise _error(location, "must be a non-empty environment-variable NAME")
-    return api_key_env
+    try:
+        return validate_derived_env_name(provider, api_key_env)
+    except ValueError as exc:
+        raise _error(location, "must be the derived CAMBIUM provider environment name") from exc
 
 
 def _diffundo_types() -> tuple[type[ProviderConfig], type[ProviderTier]]:
@@ -166,8 +171,10 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         raise _error(location, f"missing required field(s): {', '.join(missing)}")
 
     name = _require_string(raw["name"], f"{location}.name")
-    if not name:
-        raise _error(f"{location}.name", "must be non-empty")
+    try:
+        validate_provider_id(name)
+    except ValueError as exc:
+        raise _error(f"{location}.name", "must be a valid provider id") from exc
 
     tier_value = raw["tier"]
     if not isinstance(tier_value, str):
@@ -177,7 +184,9 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         raise _error(f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}")
 
     base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
-    api_key_env = _validate_api_key_env(raw["api_key_env"], f"{location}.api_key_env")
+    api_key_env = _validate_api_key_env(
+        raw["api_key_env"], f"{location}.api_key_env", name
+    )
 
     values = {**_DEFAULTS, **raw}
     timeout_s = _require_number(values["timeout_s"], f"{location}.timeout_s")
@@ -242,6 +251,7 @@ def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
 
     mappings: list[dict[str, object]] = []
     names: set[str] = set()
+    env_names: dict[str, str] = {}
     for index, entry in enumerate(entries):
         mapping = _validate_provider_mapping(entry, index)
         name = mapping["name"]
@@ -250,6 +260,16 @@ def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
         if name in names:
             raise _error(f"providers[{index}].name", f"duplicate provider name {name!r}")
         names.add(name)
+        env_name = mapping["api_key_env"]
+        if not isinstance(env_name, str):
+            raise TypeError("validated provider environment name is not a string")
+        previous = env_names.get(env_name)
+        if previous is not None:
+            raise _error(
+                f"providers[{index}].name",
+                f"provider mapping collides with provider {previous!r}",
+            )
+        env_names[env_name] = name
         mappings.append(mapping)
     return mappings
 
@@ -320,9 +340,18 @@ def _read_config(source: str | Path | None) -> object:
 
     try:
         text = path.read_text(encoding="utf-8")
-        return json.loads(text)
+        return json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid provider config JSON in {path}: {exc}") from exc
+
+
+def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError("provider config contains duplicate JSON fields")
+        values[key] = value
+    return values
 
 
 def load_provider_specs(source: str | Path | None = None) -> tuple[ProviderEnvSpec, ...]:
