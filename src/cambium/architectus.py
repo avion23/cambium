@@ -486,15 +486,19 @@ class ArchitectusCore:
 
         actions: list[dict[str, Any]] = []
         for decision, fields, task_id in classified:
+            blocked = self._blocked_task_ids()
             if (
                 decision == FailureDecision.RESET_RETRY.value
                 and task_id not in self._reset_retry_tasks
+                and task_id not in blocked
                 and not _reset_retry_attempted(fields)
             ):
                 self._reset_retry_tasks.add(task_id)
                 actions.append({"action": ActionKind.RESET_RETRY.value, "task_id": task_id})
                 continue
 
+            if decision == FailureDecision.ABORT_SUBTREE.value and _reset_retry_attempted(fields):
+                self._reset_retry_tasks.add(task_id)
             self._mark_subtree_failed(task_id)
             actions.append({"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id})
         return actions
@@ -538,7 +542,8 @@ class ArchitectusCore:
         accepted_spawn_ids: list[str] = []
         aborted_spawn_ids: set[str] = set()
         non_spawn: list[tuple[int, dict[str, Any]]] = []
-        spawn_positions: list[int] = []
+        accepted_spawns: list[tuple[int, str, int]] = []
+        spawn_segment = 0
 
         for raw_index, raw_action in enumerate(proposed):
             if not isinstance(raw_action, Mapping):
@@ -550,11 +555,12 @@ class ArchitectusCore:
                 if (
                     task_id not in ready_rank
                     or task_id in accepted_spawn_ids
+                    or task_id in aborted_spawn_ids
                     or len(accepted_spawn_ids) >= capacity
                 ):
                     continue
                 accepted_spawn_ids.append(task_id)
-                spawn_positions.append(raw_index)
+                accepted_spawns.append((raw_index, task_id, spawn_segment))
                 continue
 
             if kind in {
@@ -566,29 +572,39 @@ class ArchitectusCore:
                 task_id = self._action_task_id(action)
                 self._node(task_id)
                 if kind is ActionKind.RESET_RETRY:
-                    if task_id in self._reset_retry_tasks:
+                    if task_id in self._reset_retry_tasks or task_id in self._blocked_task_ids():
                         action = {
                             "action": ActionKind.ABORT_SUBTREE.value,
                             "task_id": task_id,
                         }
                         self._mark_subtree_failed(task_id)
                         aborted_spawn_ids.add(task_id)
+                        spawn_segment += 1
                     else:
                         self._reset_retry_tasks.add(task_id)
                 elif kind is ActionKind.ABORT_SUBTREE:
                     self._mark_subtree_failed(task_id)
                     aborted_spawn_ids.add(task_id)
+                    spawn_segment += 1
             non_spawn.append((raw_index, action))
 
-        accepted_spawn_ids.sort(key=ready_rank.__getitem__)
-        spawn_iter = iter(accepted_spawn_ids)
+        spawn_assignments: dict[int, str] = {}
+        spawn_segments: dict[int, list[tuple[int, str]]] = {}
+        for raw_index, task_id, segment in accepted_spawns:
+            spawn_segments.setdefault(segment, []).append((raw_index, task_id))
+        for segment_spawns in spawn_segments.values():
+            positions = sorted(raw_index for raw_index, _task_id in segment_spawns)
+            task_ids = sorted(
+                (task_id for _raw_index, task_id in segment_spawns),
+                key=ready_rank.__getitem__,
+            )
+            spawn_assignments.update(dict(zip(positions, task_ids, strict=True)))
+
         actions: list[dict[str, Any]] = []
-        spawn_position_set = set(spawn_positions)
         for raw_index, _raw_action in enumerate(proposed):
-            if raw_index in spawn_position_set:
-                task_id = next(spawn_iter)
-                action = {"action": ActionKind.SPAWN.value, "task_id": task_id}
-                actions.append(action)
+            task_id = spawn_assignments.get(raw_index)
+            if task_id is not None:
+                actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
                 continue
             for index, action in non_spawn:
                 if index == raw_index:

@@ -470,6 +470,38 @@ def test_step_back_reset_rerun_and_replayed_second_failure_abort() -> None:
     assert asyncio.run(core.step([])) == []
 
 
+def test_attempted_exhaustion_abort_consumes_one_shot_and_stays_aborted() -> None:
+    tree = build_tree(_plan([("root", "FEATURE", [], None)]))
+    core = ArchitectusCore(
+        ScriptedLLM([[{"action": "spawn", "task_id": "root"}]]),
+        tree=tree,
+    )
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+
+    attempted_failure = {
+        "kind": "gate_failed",
+        "task_id": "root",
+        "retries_remaining": 0,
+        "reset_retry_attempted": True,
+    }
+    assert asyncio.run(core.step([attempted_failure])) == [
+        {"action": "abort_subtree", "task_id": "root"}
+    ]
+    assert core.reset_retry_tasks == frozenset({"root"})
+    assert core.in_flight == set()
+
+    unmarked_failure = {
+        "kind": "gate_failed",
+        "task_id": "root",
+        "retries_remaining": 0,
+    }
+    assert asyncio.run(core.step([unmarked_failure])) == [
+        {"action": "abort_subtree", "task_id": "root"}
+    ]
+    assert core.reset_retry_tasks == frozenset({"root"})
+    assert core.in_flight == set()
+
+
 def test_reset_retry_consumption_survives_reconstruction() -> None:
     tree = build_tree(_plan([("root", "FEATURE", [], None)]))
     event = {"kind": "gate_failed", "task_id": "root", "retries_remaining": 0}
@@ -614,6 +646,47 @@ def test_mixed_spawn_and_repeated_reset_does_not_leave_aborted_task_in_flight() 
     ]
     assert core.in_flight == set()
     assert asyncio.run(core.step([])) == []
+
+
+def test_spawn_after_abort_is_not_emitted_and_in_flight_matches_actions() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("a", "TEST", ["root"], None),
+                ("b", "TEST", ["root"], None),
+            ]
+        )
+    )
+    proposal = [
+        {"action": "spawn", "task_id": "b"},
+        {"action": "reset_retry", "task_id": "b"},
+        {"action": "reset_retry", "task_id": "b"},
+        {"action": "spawn", "task_id": "a"},
+    ]
+    core = ArchitectusCore(ScriptedLLM([proposal]), tree=tree)
+    core.aggregate("root", _envelope(None))
+
+    actions = asyncio.run(core.step([]))
+
+    assert actions == [
+        {"action": "spawn", "task_id": "b"},
+        {"action": "reset_retry", "task_id": "b"},
+        {"action": "abort_subtree", "task_id": "b"},
+        {"action": "spawn", "task_id": "a"},
+    ]
+    abort_index = actions.index({"action": "abort_subtree", "task_id": "b"})
+    assert not any(
+        action == {"action": "spawn", "task_id": "b"}
+        for action in actions[abort_index + 1 :]
+    )
+    emitted_in_flight: set[str] = set()
+    for action in actions:
+        if action["action"] == "spawn":
+            emitted_in_flight.add(action["task_id"])
+        elif action["action"] == "abort_subtree":
+            emitted_in_flight.discard(action["task_id"])
+    assert core.in_flight == emitted_in_flight == {"a"}
 
 
 def test_malformed_later_failure_event_does_not_consume_prior_event() -> None:
