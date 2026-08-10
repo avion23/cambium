@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+from cambium import supervisor as supervisor_module
 from cambium.merge import MergeSequencer
 from cambium.store import EventStore
 from cambium.supervisor import read_events, run_plan
@@ -465,11 +466,77 @@ def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(tmp_pat
     assert result.results[0].merge_sha == staged
     assert not staging.exists()
     assert not _kinds(events, "spawned")
-    assert not _kinds(events, "merge_committed")
+    committed = _kinds(events, "merge_committed")
+    assert len(committed) == 1
+    assert committed[0]["payload"]["reason"] == "recovered-ref-advance"
     reconciled = _kinds(events, "merge_reconciled")
     assert len(reconciled) == 1
     assert reconciled[0]["task_id"] == task_id
     assert reconciled[0]["payload"]["new"] == staged
+
+
+def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
+    tmp_path, monkeypatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-lost-reconciliation"
+    worker_tree = session_dir / "wt-lost-reconciliation"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-lost-reconciliation",
+         str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-lost-reconciliation", "main")
+    seq.publish_merge(repo, staged, base)
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-lost-reconciliation",
+                branch="wt-lost-reconciliation", target_file="a.txt",
+                marker="// must-never-run", gate="grep -q '// must-never-run' a.txt",
+            )
+        ]
+    }
+    original_emit = supervisor_module._Runtime.emit
+
+    async def lose_reconciliation(self, kind, **kwargs):
+        if kind == "merge_reconciled":
+            return None
+        return await original_emit(self, kind, **kwargs)
+
+    monkeypatch.setattr(supervisor_module._Runtime, "emit", lose_reconciliation)
+    first = asyncio.run(run_plan(session_dir, plan))
+    assert first.exit_code == 0
+    assert not staging.exists()
+    assert not _kinds(read_events(session_dir), "merge_reconciled")
+    assert len(_kinds(read_events(session_dir), "merge_committed")) == 1
+    commits_after_recovery = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    second = asyncio.run(run_plan(session_dir, plan))
+    events = read_events(session_dir)
+
+    assert second.exit_code == 0
+    assert second.results[0].merge_sha == staged
+    assert not _kinds(events, "spawned")
+    assert len(_kinds(events, "merge_committed")) == 1
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == commits_after_recovery
 
 
 def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypatch) -> None:

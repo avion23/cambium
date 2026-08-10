@@ -65,6 +65,20 @@ def _init_repo(repo: Path) -> str:
     return _rev(repo, "HEAD")
 
 
+def _init_separate_git_dir_repo(repo: Path, git_dir: Path) -> str:
+    subprocess.run(
+        ["git", "init", "-b", "main", f"--separate-git-dir={git_dir}", str(repo)],
+        check=True, capture_output=True,
+    )
+    for key, value in (("user.name", "merge-test"), ("user.email", "merge@test"),
+                       ("gc.auto", "0")):
+        _run(repo, "config", key, value)
+    (repo / "base.txt").write_text("base\n")
+    _run(repo, "add", "base.txt")
+    _run(repo, "commit", "-m", "initial")
+    return _rev(repo, "HEAD")
+
+
 def _worker_commit(repo: Path, branch: str, wt: Path, files: dict[str, str], from_: str) -> str:
     """Worker-style worktree on ``branch`` with one commit. Returns the tip SHA."""
     _run(repo, "worktree", "add", "-b", branch, str(wt), from_)
@@ -600,6 +614,43 @@ def test_precreated_quarantine_task_symlink_is_refused(tmp_path) -> None:
     assert not list(outside.iterdir())
 
 
+def test_task_directory_swap_at_move_boundary_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "swap-at-move"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must remain at source")
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
+    outside = tmp_path / "outside"
+    displaced = outside / "displaced"
+    sink = outside / "sink"
+    outside.mkdir()
+    sink.mkdir()
+    original = seq._run_repo
+    swapped = False
+
+    def swap_then_move(repo_path, *args, **kwargs):
+        nonlocal swapped
+        if args[:2] == ("worktree", "move") and not swapped:
+            swapped = True
+            task_dir.rename(displaced)
+            task_dir.symlink_to(sink, target_is_directory=True)
+        return original(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(seq, "_run_repo", swap_then_move)
+    with pytest.raises(StagingCleanupError, match="changed during worktree move"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must remain at source"
+    assert not list(displaced.iterdir())
+    assert not list(sink.iterdir())
+
+
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
@@ -725,6 +776,54 @@ def test_expired_artifact_is_pruned_on_reconcile(tmp_path) -> None:
     seq.reconcile(repo)
     assert not destination.exists()
     assert any(kind == "merge_staging_pruned" for kind, _ in seq.drain_events())
+
+
+def test_expired_artifact_is_pruned_with_separate_git_dir(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_separate_git_dir_repo(repo, tmp_path / "repo-git")
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(
+        task_id="separate-expired", session_dir=tmp_path, quarantine_retention_ns=1,
+        quarantine_min_free_bytes=0,
+    )
+    seq.prepare_staging(repo, staging, "worker", "main")
+    (staging / "dirty").write_text("expired evidence")
+    seq.cleanup_staging(repo)
+    _, destination = _quarantined(seq)
+    time.sleep(0.001)
+
+    seq.reconcile(repo)
+
+    assert not destination.exists()
+
+
+def test_count_cap_prunes_with_separate_git_dir(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_separate_git_dir_repo(repo, tmp_path / "repo-git")
+    _worker_commit(repo, "worker-a", tmp_path / "worker-a", {"a.txt": "a\n"}, base)
+    first = MergeSequencer(
+        task_id="separate-first", session_dir=tmp_path, quarantine_min_free_bytes=0,
+    )
+    first_staging = tmp_path / "staging-a"
+    first.prepare_staging(repo, first_staging, "worker-a", "main")
+    (first_staging / "dirty").write_text("first evidence")
+    first.cleanup_staging(repo)
+    _, first_destination = _quarantined(first)
+
+    _worker_commit(repo, "worker-b", tmp_path / "worker-b", {"b.txt": "b\n"}, base)
+    second = MergeSequencer(
+        task_id="separate-second", session_dir=tmp_path, quarantine_max_entries=1,
+        quarantine_min_free_bytes=0,
+    )
+    second_staging = tmp_path / "staging-b"
+    second.prepare_staging(repo, second_staging, "worker-b", "main")
+    (second_staging / "dirty").write_text("second evidence")
+    second.cleanup_staging(repo)
+    _, second_destination = _quarantined(second)
+
+    assert not first_destination.exists()
+    assert second_destination.exists()
 
 
 def test_sparse_dirty_staging_is_preserved(tmp_path) -> None:

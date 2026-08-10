@@ -1473,7 +1473,10 @@ class _Runtime:
                 if match:
                     task_id = task_keys.get(match.group(1))
             await self.emit(kind, task_id=task_id, **payload)
-            if kind == "merge_reconciled" and task_id is not None:
+            recovered = kind == "merge_committed" and payload.get("reason") == (
+                "recovered-ref-advance"
+            )
+            if (kind == "merge_reconciled" or recovered) and task_id is not None:
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="succeeded", exit_code=0,
                     reason=None, merge_sha=payload.get("new"),
@@ -1499,16 +1502,27 @@ class _Runtime:
                 scan_quarantine=repo not in scanned_repos,
             )
             scanned_repos.add(repo)
-            await self._flush_sequencer_events(seq, task_keys)
+            emitted = await self._flush_sequencer_events(seq, task_keys)
+            if "merge_committed" in emitted and getattr(seq, "staging_ref", None) is not None:
+                await asyncio.to_thread(seq.cleanup_staging, repo)
+                await self._flush_sequencer_events(seq, task_keys)
             if current is None:
                 continue
             events = await asyncio.to_thread(self._store.events_after, 0)
-            recorded = {
-                event["payload"].get("new")
-                for event in events
-                if event["kind"] in ("merge_committed", "merge_reconciled")
-            }
-            if current in recorded:
+            terminal = next(
+                (
+                    event for event in reversed(events)
+                    if event["kind"] in ("merge_committed", "merge_reconciled")
+                    and event["payload"].get("new") == current
+                    and event.get("task_id") == task_id
+                ),
+                None,
+            )
+            if terminal is not None:
+                self._results[task_id] = TaskResult(
+                    task_id=task_id, status="succeeded", exit_code=0,
+                    reason=None, merge_sha=current,
+                )
                 continue
             refs = await self._git_stdout(
                 repo, "for-each-ref", "--format=%(refname:strip=3) %(objectname)",
