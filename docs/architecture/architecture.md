@@ -1,301 +1,183 @@
 # Cambium architecture
 
-**Status:** design and implementation map. This file separates the runtime that
-exists from contracts that are still targets. It does not declare a release
-readiness state.
-
-`agents.md`, the source under `src/cambium/`, and tests under `tests/` establish
-current behavior. This document describes target boundaries and invariants;
-research drafts are context, not implementation proof.
+**Status:** current-versus-target contract. Source and tests establish current
+behavior. This document names targets but does not turn them into features.
+See [`agents.md`](../../agents.md) for the operating contract and
+[`docs/research/v2-1-status.md`](../research/v2-1-status.md) for the detailed
+live gap table.
 
 ## 1. Current runtime
 
-Cambium is a Python 3.14 coding-agent harness. Its checked-in package exports
-only `__version__`; there is no public `Cambium`, `Session`, `Result`, or
-`Instance` library API.
+`pyproject.toml` installs one `cambium` script at `cambium.cli:main`. The CLI
+routes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`, `module-test`, and
+`version`. `cambium.__init__` exports only `__version__`; there is no public
+session API.
 
-### Plan execution
+### Plan and publication
 
-`cambium.supervisor.run_plan` is the current plan entry point. It:
+`cambium.supervisor.run_plan` accepts a mapping with `tasks` or a task list. It
+validates supplied task records, rejects duplicate IDs and unsafe worktree
+paths, then supervises the supplied tasks concurrently in one
+`asyncio.TaskGroup`. A task worker runs in a Git worktree and process group; a
+gate runs before merge. Successful publication uses an expected-old atomic
+update of `refs/heads/main`. It is ref-only and never refreshes the caller's
+checkout or index.
 
-1. accepts a mapping with `tasks` or a task list;
-2. rejects malformed task records, duplicate IDs, and unsafe worktree paths;
-3. starts one supervisor runtime and supervises each supplied task in an
-   `asyncio.TaskGroup`;
-4. runs each worker's gate and publishes successful merges by advancing
-   `refs/heads/main` with an expected-old check; publication does not refresh a
-   checkout; and
-5. returns a `PlanResult` and stores events in `.cambium/events.db` when the
-   canonical store is available.
+The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
+records through it, and writes `.cambium/result.json` after shutdown. The
+one-task `run_session` adapter remains for compatibility. It is not a DAG
+scheduler. `EventStore` is the current event boundary; there is no current
+`events.py` or dead-letter queue module.
 
-`run_session` is an older one-task slice that remains in the supervisor. The
-supervisor also retains `EventLog`, `_FallbackEventStore`, and
-`_FallbackSequencer` paths. These are compatibility paths, not a second
-architecture. Canonicalization is incomplete until the slice and fallbacks are
-removed and the canonical store/redaction/result paths are wired together.
+The supervisor gives each worker a bounded decoded-stdout `asyncio.Queue` and
+routes worker and runtime records through `EventStore`'s bounded writer queue.
+Worker stdout remains protocol-only NDJSON; diagnostics use stderr/logging.
+Non-critical store records can be dropped under the store overflow policy.
 
-The plan path has one session-admission guard. It opens the event store, starts
-the runtime, reconciles the supplied task specifications, and waits for the
-task group to finish. Cancellation shuts the runtime down with a cancelled
-session status. A task result records status, exit code, gate result, merge
-SHA (when published), restart count, and a failure reason when applicable.
+### Worker and providers
 
-The plan input is deliberately smaller than a task-tree contract. Each task
-must provide an ID, non-empty task text, repository, worktree path, and branch.
-The worktree must be below the session directory. Provider environment names
-are copied as a list, and default marker-mode fields are filled at this
-boundary. This validation prevents unsafe setup; it does not infer
-dependencies or decompose task text.
+`worker.do_work` selects one of two explicit modes:
 
-### Worker and provider paths
+1. Without `fanout_config`, the deterministic marker worker edits and fences
+   one commit.
+2. With `fanout_config`, the worker loads the configured providers and runs a
+   custom bounded loop. Each turn calls `Diffundo`, requires exactly one strict
+   `tool_call` or `finish` action, validates permissions and tool arguments,
+   dispatches the tool, emits a `tool_event` and checkpoint, and then creates
+   one fenced result commit.
 
-`cambium.worker` has two explicit modes:
+The loop bounds turns, tokens, wall time, transcript size, and summaries. It
+returns cumulative provider usage and latency as redacted metadata. `lm.py`
+contains optional DSPy-compatible `CambiumLM` and `ArchitectusLM` adapters;
+they are not a supervisor planner.
 
-- Without `fanout_config`, `do_work` runs the deterministic marker-edit worker.
-- With `fanout_config`, it loads provider configuration, calls the Diffundo
-  router once per bounded turn, parses a strict `tool_call` or `finish` action,
-  checks permissions, dispatches a tool, emits `tool_event` and `checkpoint`
-  messages, and commits the worker result.
+`Diffundo` is a tiered provider router with health, configured RPM request-rate
+buckets, cooldown, circuit-breaker, and configured-priority ordering. A
+depleted bucket reports `RATE_LIMITED`. It has no local response cache. HTTP 429
+responses carry a parsed `Retry-After` delay into the same-provider retry path.
+Weighted routing and a production provider token, cost, and account-quota
+observability contract are not implemented.
 
-`src/cambium/lm.py` contains the optional DSPy-compatible `CambiumLM` adapter
-and `ArchitectusLM`; their integration tests use a fake Diffundo. A loopback
-provider scenario proves the worker-loop-to-gate-to-merge path. A real external
-provider release proof is still a target.
+### Trees, diagnostics, and modules
 
-The provider loop is bounded by worker configuration. It records cumulative
-provider usage and latency, keeps a bounded transcript, and stops on a strict
-finish action, invalid response, tool failure policy, or configured turn/wall
-limits. A provider response is not a worker result until the worker has
-produced its result envelope and commit. Provider metadata is safe summary
-data; credentials stay in the worker environment and are not copied into event
-payloads.
+`tasktree.build_tree` validates one rooted dependency tree, cycle and
+depth/width bounds, and deep-copies each input `spec` into frozen node records.
+`topological_order` and `ready_tasks` are pure inspection/scheduling inputs.
+`run_plan` currently bypasses them and fans out the supplied flat list.
 
-### Task trees and disconnected modules
+`architectus.ArchitectusCore` is tested with injected LLMs but has no caller in
+`run_plan`. Dynamic decomposition and the conversation store are not wired into
+that path; `orchestrator.py` is a skeleton. Persistent worker reuse is absent.
 
-`tasktree.build_tree` validates task IDs, dependency references, depth/width
-bounds, and cycles. `topological_order` and `ready_tasks` are pure helpers.
-`supervisor.run_plan` currently dispatches the supplied list directly; it does
-not use these helpers to schedule a DAG.
+`doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
+auth coverage, optional event and conversation databases, module datasets, and
+advisory host health. `resources.CompileGate` limits configured heavy gate
+commands. There is no `ResourceBudget` class. `module_conformance` provides an
+isolated module-test gate. `modules/example` has deterministic decision logic,
+train/eval/canary data, split metrics, and a JSON CLI with `decide` and
+`evaluate` operations. There is no `eval_cache.py`.
 
-`architectus.ArchitectusCore` is a pure scheduling core with an injected LLM
-port. Tests cover its decisions and topological waves, but no supervisor module
-imports it. `orchestrator.py` remains a submit/drain skeleton.
+The tracked source does not contain `worker_pool.py`, `events.py`, or `dlq.py`.
+Do not use those names as current architecture components.
 
-Persistent worker reuse is not implemented.
+## 2. Ownership and invariants
 
-### Implemented supporting modules
+1. The caller owns the session directory and supplies plan records.
+2. The supervisor owns validation, worker handles, generations, event
+   admission, gates, restart decisions, and publication order.
+3. A worker owns its worktree edits, provider calls, tool context, and commit;
+   it cannot publish `main` directly.
+4. The merge sequencer owns staging, expected-old checks, quarantine, and
+   cleanup. A conflict, non-fast-forward, failed gate, or cleanup violation
+   does not advance `main`.
+5. The event store owns durable rows and its writer thread. Observer copies
+   cannot mutate persisted records.
 
-The repository contains independently tested modules for:
+IPC is bounded and correlated by request ID and worker generation. Fatal
+   framing, oversized lines, missing correlated results, non-zero exits, and
+   deadline failures follow the boundary-specific supervisor policy; advisory
+   malformed lines are logged or skipped. Tool schemas reject malformed calls.
 
-- JSON-Lines framing and request IDs (`ipc.py`);
-- SQLite WAL event storage (`store.py`) and serialized Git publication
-  (`merge.py`);
-- worker fencing, worktree cleanup, gates, resource admission, tool schemas,
-  approval, provider configuration, redaction, DLQ, conversations, and result
-  records; and
-- the `cambium` CLI and the `modules/example` decision module.
+Provider credentials are allowlisted environment values. They must not enter
+task specs, prompts persisted as events, gate commands/output, logs, or result
+artifacts. Worktree and process-group isolation is not an OS sandbox. The
+`ApprovalGate` primitive is defined in `approval.py` and consumed by `tools.py`,
+but the `run_plan` worker context does not provide a production approval
+service; `fail_open` is an explicit dangerous policy option.
 
-Presence of a module or a passing unit/scenario test does not mean that
-`run_plan` wires every module into one production path.
+## 3. Target contracts and delivery order
 
-### Current event and result boundaries
+These are open contracts, not current interfaces:
 
-The canonical store writes append-only event rows to SQLite WAL from a writer
-thread. Critical events wait for admission; non-critical events are handed to
-the runtime queue and can be dropped according to the store policy. The
-supervisor currently creates the store without a session redactor and also
-keeps an unbounded in-process non-critical handoff, so the end-to-end redaction
-and backpressure contract is not complete.
+### Production hierarchy and admission
 
-Worker result messages and root/session results are different boundaries. The
-worker emits the strict child envelope defined by `results.py`; the root result
-record has its own fields and exit-code mapping. `write_result` can atomically
-write `.cambium/result.json`, but the current supervisor does not call it for
-the plan lifecycle. Do not treat a worker `result` event as proof that a root
-result file exists.
+The smallest production slice is harness-owned: it receives one explicit,
+validated `TaskTree`, computes static ready-node waves, and admits only nodes
+whose dependencies and width limits are satisfied. Each child receives a fresh
+bounded context derived from its task and allowed parent envelope. Upward flow
+uses the strict envelope key set; sibling context and unbounded transcripts do
+not cross the boundary.
 
-Merge publication uses a throwaway staging worktree and `git update-ref` with
-an expected old value. A worker branch is not rebased in place. Conflicts,
-non-fast-forward races, unsafe quarantine state, and cleanup failures stop
-publication or preserve forensic state; they do not silently advance `main`.
+Dynamic child admission follows the static slice. A parent may propose a typed
+tree revision, but the supervisor must validate and durably admit it before
+dispatch; a provider response cannot mutate the live tree in place. Wire the
+Architectus decision port and conversation persistence only with callers and
+failure tests. Prompt-prefix stability and provider cache-hit metrics are
+required acceptance measures for the provider path.
 
-## 2. Runtime sequence and ownership
+### Per-worker containment and approval
 
-The current `run_plan` path has these ownership boundaries:
+Add an explicit host boundary for per-worker OS containment, resource limits,
+and process cleanup. Compose it with a production approval callback/policy at
+the tool boundary. Prove denied commands, unavailable approval, containment
+failure, and teardown behavior. A systemd or cgroup smoke wrapper is evidence
+for that wrapper, not proof that every production worker is contained.
 
-1. The caller owns the session directory and supplies task records.
-2. The supervisor validates records and owns worker handles, generations,
-   restart decisions, task admission, and event emission on one event loop.
-3. A worker owns its process group, worktree edits, provider calls, tool
-   transcript, and worker commit. It cannot publish `main` directly.
-4. The gate runs in the worker worktree under a finite deadline. A failed gate
-   ends the task before the merge step.
-5. The merge sequencer owns staging, expected-old checks, ref publication, and
-   worktree cleanup. It does not refresh the caller's checkout.
-6. The event store owns durable event rows and its writer thread. Observers
-   receive copies of event records and cannot mutate the persisted object.
+### Provider accounting before routing policy
 
-This separation is a runtime fact only for paths that call the corresponding
-canonical module. The retained slice and fallback classes are the reason the
-canonicalization step remains open.
+Define durable usage events, provider and model identity, token/cost fields,
+request-rate status, account-quota ownership, and privacy/redaction rules. Test
+Retry-After, `RATE_LIMITED`, token/cost accounting, and accounting failure
+first. Measure prompt-prefix stability and provider-reported cache-hit metrics
+on fixed prompt fixtures. Only then evaluate weighted routing; priority
+ordering remains the current policy.
 
-## 3. Target contracts
+### External-provider acceptance
 
-The following are targets, not current public interfaces or completion claims:
+Run a disposable, credentialed provider smoke through worker loop, tool event,
+checkpoint, gate, and ref-only merge. Credentials stay in the environment and
+the run is never a default network test. External credentials are not present
+in this checkout, so external-provider acceptance remains open.
 
-- expose a small host-facing session/result API from `cambium.__init__`;
-- schedule a validated, fixed task tree through an integrated Architectus
-  runtime; dynamic replanning is out of scope for the first integration;
-- connect one canonical supervisor/store/sequencer path, redaction at event
-  admission, and atomic root-result publication;
-- provide bounded transport and runtime queues, deadline-bound subprocess and
-  gate waits, and durable overflow handling; and
-- evaluate persistent worker reuse only after the canonical path and provider
-  vertical proof are accepted.
+## 4. Failure policy by boundary
 
-Targets must be demonstrated by source and tests before being described as
-implemented.
-
-### Target host boundary
-
-A future host-facing API may expose session creation, status polling, event
-consumption, cancellation, and a typed root result. Its names and signatures
-are not fixed by this document. Until exports and tests exist, callers should
-use the CLI or the module-level functions that are present in source.
-
-The target result boundary is atomic: a completed plan writes one typed root
-record only after event persistence and publication decisions are final. A
-worker envelope is an input to that record, not a substitute for it. Exit code
-and status mappings must remain stable once a public API is introduced.
-
-### Target fixed-tree boundary
-
-The first scheduler integration will accept a validated tree, compute ready
-nodes from completed dependencies, and dispatch only those nodes. It will not
-let a provider response mutate the live tree in place. A later revision protocol
-may be evaluated after the fixed-tree path has deterministic tests and durable
-checkpoint semantics.
-
-### Target control boundary
-
-Transport limits, queue bounds, subprocess deadlines, event-store admission,
-redaction, approval, resource admission, fencing, and merge publication must be
-composed at the supervisor boundary. A helper module is not evidence that its
-control is active in the plan path. Each control needs a caller and a focused
-failure test before it moves from target to current.
-
-## 4. Boundaries and invariants
-
-These behavioral rules apply to current code and to the target integration.
-
-### Process and protocol
-
-- Workers run in separate Git worktrees and process groups. A worker's stdout is
-  the NDJSON protocol; diagnostics go to stderr/logging.
-- Each protocol message is one UTF-8 JSON object per newline. Blank lines and
-  malformed advisory lines are skipped. A line over `ipc.MAX_LINE_BYTES` is a
-  fatal framing error after the reader resynchronizes. EOF is an end-of-stream
-  condition, not a protocol message.
-- Correlated requests carry a request ID. A result, pong, or ready message is
-  accepted only for the active task and generation; stale or wrong-correlated
-  messages cannot advance the task.
-- Blocking Git, file, and store work stays outside the event loop. The event
-  store has a bounded writer queue, while the supervisor's non-critical event
-  handoff remains an integration gap until it is bounded end to end.
-
-The worker protocol is intentionally narrow. Initialization carries the task
-and generation, task dispatch carries a request ID, and the worker returns
-status/result/exit records for that request. Heartbeats and checkpoints carry
-progress but do not change task ownership. A malformed advisory line may be
-logged and skipped; malformed framing, an oversized line, a wrong request ID
-at a fatal handshake point, a missing correlated result, or a non-zero worker
-exit fails the task according to supervisor policy.
-
-### Validation, gate, and publication
-
-- Plan validation rejects missing required fields, duplicate IDs, unknown task
-  dependencies, malformed dependency graphs, and cycles where `build_tree` is
-  used.
-- A non-zero gate result or gate timeout fails a task before publication.
-- Merge conflicts, non-fast-forward updates, quarantine violations, and stale
-  expected-old refs do not publish `main`.
-- Publication is ref-only and atomic. It never updates a checkout or index.
-
-The task-tree validator and the plan validator are separate boundaries. The
-plan validator protects the current flat entry point. The tree validator is a
-pure DAG check that can be invoked by a future scheduler. Neither validator
-turns free-form provider output into an accepted task without explicit schema
-validation.
-
-### Controls and secrets
-
-- Tool schemas reject malformed calls. Git reset/checkout and shell execution
-  pass through the injected approval gate; approval denies by default when no
-  callback is available. `fail_open` is an explicit opt-in and is not a
-  mandatory production control.
-- Worker environments are built from an allowlist. Provider credentials are
-  environment values only and must not enter task specs, events, gate output,
-  or DLQ records. Redaction is implemented at store/DLQ boundaries, but the
-  canonical supervisor wiring is still pending.
-- Cambium provides worktree isolation and command controls. It does not claim
-  an in-harness OS sandbox.
-
-The process environment is rebuilt for worker and Git subprocesses. Provider
-key names may be selected by task configuration, but secret values are read
-only by the provider boundary. Gate commands, event observers, logs, and DLQ
-records must receive redacted data. The current supervisor wiring is the gap to
-close; adding another redact call at a leaf does not close it.
-
-### Provider and cache policy
-
-`Diffundo` routes provider calls by configured tier and priority. It has no
-local response cache; repeated calls remain provider calls. Provider-side
-caching is outside this repository. Cascade behavior is an implementation
-contract only where covered by `diffundo.py` and its tests; research drafts do
-not add policy.
-
-The provider adapter is optional at import time. Core modules must not import
-DSPy eagerly, and the example module can run offline. A provider failure is a
-worker/task failure or a router outcome; it is not a reason for the
-deterministic supervisor to invent a fallback result. Local response caching
-is not part of the runtime contract.
-
-## 5. Failure policy by boundary
-
-| Boundary | Current behavior | Required invariant |
+| Boundary | Current check | Required outcome |
 | --- | --- | --- |
-| Plan | Reject malformed task records and duplicate IDs before task setup. | No task side effect before structural validation. |
-| Task tree | `build_tree` rejects duplicate IDs, missing dependencies, bounds violations, and cycles. | A scheduler never dispatches an unvalidated graph. |
-| IPC | Skip advisory malformed lines; reject oversized frames; enforce request/generation correlation at task checks. | A stale worker cannot complete a newer generation. |
-| Worker | Restart or fail on missing results, fatal protocol checks, non-zero exits, and deadline exhaustion. | A worker result is accepted only for its live request. |
-| Gate | Non-zero exit or timeout returns a failed task. | No failed gate reaches publication. |
-| Merge | Conflict, non-fast-forward, quarantine, or cleanup failure prevents unsafe publication. | `main` advances only through the expected-old ref contract. |
-| Approval | Unsafe Git operations require an approval gate; missing callback denies by default. | `fail_open` is explicit configuration, not an assumption. |
-| Schema | Invalid tool-call shapes return validation errors. | Tools receive only validated arguments. |
-| Store | Critical event admission waits for the writer; store death raises. | Durable boundaries fail closed; no silent success after writer failure. |
+| Plan | `run_plan` rejects malformed tasks, duplicate IDs, and unsafe paths before worker setup. | No worker side effect before structural validation. |
+| Task tree | `build_tree` rejects missing dependencies, multiple roots/parents, cycles, and bounds. | A future scheduler dispatches only a validated graph with snapshotted specs. |
+| IPC | Framing limits, request IDs, generations, heartbeat deadlines, and correlated result checks are enforced in `_Runtime._drive_generation`. | Stale or missing worker messages cannot complete a task. |
+| Worker | Provider/tool failures, missing results, non-zero exits, and wall/token limits fail the generation; recoverable failures may restart it. | A worker verdict is accepted only for its active generation. |
+| Gate | Non-zero exit, timeout, output overflow, or resource-acquire failure fails before merge. | A failed gate never reaches publication. |
+| Merge | Conflict, non-fast-forward, unsafe quarantine, or cleanup failure stops publication. | `main` advances only through the expected-old ref contract. |
+| Store | Critical event admission waits for the writer; writer death raises; non-critical overflow follows the bounded queue policy. | Durable failure is visible; no silent success after store failure. |
 
-The table describes existing checks where the source path calls them. It does
-not mark the full runtime as complete; the current supervisor still has the
-slice/fallback and queue/redaction wiring gaps listed above.
+The table describes checks on paths that call these modules. A helper's
+existence is not proof of integration: approval, redaction, resource admission,
+hierarchy, and containment remain targets where the plan path has no caller.
 
-## 6. Source map
+## 5. Source map
 
-| Concern | Current source | Current status |
+| Concern | Current source | State |
 | --- | --- | --- |
-| CLI and version | `src/cambium/cli.py`, `src/cambium/__init__.py` | CLI exists; package export is version-only |
-| Plan supervisor | `src/cambium/supervisor.py` | Flat concurrent `run_plan`; slice/fallback paths remain |
-| Worker | `src/cambium/worker.py` | Marker mode and bounded provider tool loop |
-| Task validation | `src/cambium/tasktree.py` | Pure validation/order helpers; not run-plan scheduling |
-| Architectus | `src/cambium/architectus.py`, `src/cambium/orchestrator.py` | Pure core; not wired |
-| IPC | `src/cambium/ipc.py` | NDJSON framing and request IDs |
-| Store and merge | `src/cambium/store.py`, `src/cambium/merge.py` | Canonical modules used by the plan runtime when available |
-| Controls | `approval.py`, `resources.py`, `fencing.py`, `tools.py`, `schemas.py` | Independently tested; integration is partial |
-| Providers and LM | `diffundo.py`, `provider_config.py`, `lm.py` | Provider router and `CambiumLM` merged; external proof pending |
-| Evidence | `tests/scenarios/` and `src/cambium/modules/example/tests/` | Behavior tests are authoritative for implemented paths |
+| CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Installed CLI; version-only package export |
+| Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan`; one-task adapter retained |
+| Worker/IPC | `src/cambium/worker.py`, `ipc.py` | Marker mode, custom provider loop, bounded NDJSON |
+| Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
+| Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; no run-plan hierarchy wiring |
+| Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
+| Controls | `tools.py`, `schemas.py`, `approval.py`, `resources.py`, `redact.py` | Primitives; production approval/containment gaps |
+| Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` | CLI diagnostics and example evaluation exist |
 
-## 7. Evolution order
-
-Implementation work follows the short plan in `implementation-plan.md`:
-canonical runtime and controls, a thin real-provider vertical proof, fixed-tree
-scheduling, then measured experiments. Any new contract must name its source
-entry point and a distinguishing test.
+Any target moves to current only after a caller and focused failure test
+demonstrate it. Keep public names and status mappings stable once a host API is
+introduced; a worker envelope is not a substitute for a typed root result.

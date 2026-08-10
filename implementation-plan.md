@@ -1,52 +1,79 @@
 # Implementation plan
 
-This is an ordered work plan. It is not a branch ledger, merge log, or review
-archive. Source and tests decide whether a step is complete.
+Ordered work only. Source and tests decide when a step is complete; this file
+is not a branch ledger or merge log.
 
-## 1. Canonical runtime and controls
+## 1. Smallest production hierarchy slice: static waves
 
-- Make `run_plan` use one supervisor/store/sequencer path. Remove the slice and
-  fallback implementations after callers and tests move to the canonical
-  interfaces.
-- Wire session redaction before event admission and connect the root result
-  writer to the plan lifecycle.
-- Bound supervisor event handoff and transport queues. Keep line limits,
-  deadline-bound waits, fencing, worktree recovery, approval, resource gates,
-  and fail-closed publication behavior.
-- Add focused checks for each boundary: malformed plan, protocol overflow,
-  worker restart, gate failure, redaction, and non-fast-forward publication.
+- Make the harness own one explicit validated `TaskTree`. Integrate
+  `build_tree`, `ready_tasks`, and `topological_order` with `run_plan` so static
+  ready-node waves, dependency order, and width limits control admission.
+- Give every admitted child a fresh bounded context derived from its own task
+  and allowed parent envelope. Permit upward data only through the strict
+  envelope key set; do not expose sibling context or an unbounded transcript.
+- Acceptance measures: a fixed fixture proves exact ready waves, no unready
+  dispatch, width enforcement, bounded child context, and exact envelope keys;
+  failed children stop dependent admission.
 
-**Exit evidence:** one deterministic `run_plan` path passes its focused
-scenario set, writes a redacted event store and root result, and leaves no
-slice/fallback caller.
+## 2. Validated dynamic child admission
 
-## 2. Thin real-provider vertical proof
+- After the static slice is reproducible, let a parent propose a child only as a
+  typed tree revision. The harness validates and durably records each revision
+  before admission; a provider response cannot mutate the live tree directly.
+- Connect the injected Architectus decision port and conversation persistence
+  only at this boundary, with explicit schemas and failure paths.
+- Acceptance measures: duplicate, cyclic, multi-parent, over-depth, and
+  over-width revisions spawn nothing; a valid child is admitted only at a ready
+  wave and its envelope is visible only to its parent.
 
-Run one explicit provider configuration through the bounded worker loop, a
-deterministic gate, and ref-only merge. Keep credentials in the environment,
-use a disposable test repository, and do not make this the default CI path.
+## 3. Per-worker OS containment and approval
 
-**Exit evidence:** a recorded provider request, tool/checkpoint events, one
-worker commit, a passing gate, and the expected `refs/heads/main` update; the
-failure case leaves `main` unchanged.
+- Select and implement the host boundary for each worker's process, filesystem,
+  CPU/memory/task limits, network policy, and teardown. Worktree/process-group
+  isolation alone is not sufficient.
+- Pass an `approval.py:ApprovalGate` policy and callback into the worker tool
+  context (consumed by `tools.py`). Keep denied commands fail-closed; treat
+  `fail_open` as development configuration only.
+- Add focused checks for containment setup/teardown, resource exhaustion,
+  denied and unavailable approval, and no publication after control failure.
+- Acceptance measures: a denied or unavailable approval cannot run the command;
+  a containment setup or teardown failure cannot publish a worker result.
 
-## 3. Fixed-tree scheduling
+## 4. Provider usage, prompt stability, and quota contract
 
-Connect `tasktree.build_tree`, `topological_order`, and `ready_tasks` to the
-supervisor. Integrate the pure Architectus core behind an injected decision
-port, schedule only ready nodes, and preserve dependency validation and result
-information hiding. Do not add dynamic replanning to this first integration.
+- Specify redacted durable usage events: provider, model, request/turn,
+  token fields, cost, latency, Retry-After, request-rate status, account-quota
+  owner, and failure reason.
+- Measure prompt-prefix stability and provider-reported cache-hit metrics for
+  the same fixed prompt fixtures. These metrics are requirements for routing
+  decisions, not evidence that a local response cache exists.
+- Connect accounting at the supervisor/event boundary and define behavior when
+  rate-limit, token, cost, or account-quota state is unavailable. Preserve
+  environment-only secrets.
+- Test 429 `Retry-After`, same-provider retry, `RATE_LIMITED` buckets, and
+  provider fallback against the contract. Do not introduce weighted routing
+  until the usage and quota evidence is stable; configured priority remains the
+  current policy.
+- Acceptance measures: fixed prompts report stable prefix and cache-hit fields;
+  rate-limit and accounting failures are visible without exposing credentials.
 
-**Exit evidence:** deterministic scenarios prove dependency order, bounded
-parallel width, failure propagation, and no dispatch of an unready node.
+## 5. External-provider smoke
 
-## 4. Measured experiments
+- When credentials exist, run one disposable provider configuration through the
+  custom worker loop, tool/checkpoint events, deterministic gate, and ref-only
+  merge under the selected containment boundary.
+- Keep the run opt-in and networked only by explicit command. Record request
+  count, usage events, commit, gate result, merge ref, and the failure case that
+  leaves `main` unchanged without recording secrets.
+- Acceptance measures: the credentialed run has a recorded provider response,
+  usage record, passing gate, one expected ref update, and an unchanged `main`
+  on the failure fixture.
+- Local fake-provider fixtures can support regression tests, but they do not
+  substitute for an external-provider run or prove per-worker OS isolation.
 
-After the runtime path is reproducible, run isolated experiments for persistent
-worker widths, provider routing, context compression, and the example module's
-DSPy refinement. Pin inputs and record the metric and failure criteria before
-comparing runs.
+## 6. Follow-on evaluation
 
-**Exit evidence:** each experiment has a reproducible command, fixed fixtures,
-an explicit baseline, and a decision to adopt, defer, or reject. No experiment
-changes the runtime contract without a new source/test proof.
+After steps 1–5 are reproducible, measure worker reuse, provider routing,
+context compression, and the example module's DSPy seam with fixed datasets,
+baselines, and failure criteria. Adopt, defer, or reject each experiment from
+its evidence; do not change the runtime contract silently.

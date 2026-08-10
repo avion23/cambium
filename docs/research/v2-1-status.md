@@ -1,39 +1,39 @@
 # Cambium capability and gap tracker
 
-This is a concise snapshot of the checked-in runtime. Source and tests remain
-the authority. Recheck the table after integration work; it contains no branch
-or commit bookkeeping.
+This is the sole detailed live capability/gap table. Source and tests remain
+the authority; this page contains no branch, SHA, or test-count bookkeeping.
 
-## Capability summary
-
-| Area | Current capability | Gap |
+| Area | Current capability | Gap / next proof |
 | --- | --- | --- |
-| Plan supervisor | `supervisor.run_plan` validates a flat task list, supervises tasks concurrently, runs gates, and publishes successful commits by ref update. | It does not schedule a dependency DAG; the one-task `run_session` slice and supervisor fallback paths remain. |
-| Worker | Deterministic marker mode and a bounded provider tool loop are implemented and scenario-tested. | A real external-provider release proof is not complete. |
-| Providers and LM | Diffundo routing, provider configuration, `CambiumLM`, and `ArchitectusLM` are merged; loopback provider integration is tested. | No public package API exposes these capabilities, and external-provider acceptance is unverified. |
-| Task tree | `build_tree`, `topological_order`, and `ready_tasks` validate and inspect dependency graphs. | `run_plan` bypasses them; fixed-tree scheduling is not wired. |
-| Architectus | Pure `ArchitectusCore` behavior is covered with injected test LLMs. | No production caller; `orchestrator.py` is still a skeleton. |
-| Worker reuse | Not implemented. | Persistent worker reuse remains a future capability. |
-| Persistence and merge | SQLite WAL `EventStore`, `MergeSequencer`, fencing, worktree cleanup, and result-record modules exist and are tested. | Supervisor still keeps `EventLog`, fallback store/sequencer, and slice paths; canonical redaction/result wiring is incomplete. |
-| IPC and controls | NDJSON framing, request IDs, line limits, gates, approval, resource helpers, schemas, provider environment filtering, redaction, and DLQ modules exist. | End-to-end bounded supervisor queues, durable overflow routing, and some control wiring remain open. |
-| Example module | `modules/example` has deterministic decision logic, train/eval/canary data, a metric, CLI, and DSPy seam. | It is not the runtime planner or a proof of whole-system optimization. |
+| CLI and diagnostics | `pyproject.toml` registers `cambium.cli:main` with `auth`, `supervisor`, `doctor`, `bench`, `tasktree`, `module-test`, and `version`. `doctor` checks runtime, worktrees, provider/auth state, optional stores, datasets, and host health. | Diagnostics are not production admission or approval. |
+| Plan supervisor | `supervisor.run_plan` validates a flat supplied task list, fans out under one `asyncio.TaskGroup`, runs gates, persists `EventStore` events, writes a root result, and publishes successful commits by ref-only update. | No dependency DAG scheduling, hierarchy admission, or dynamic decomposition. The first target is a harness-owned validated tree with static ready-node waves; dynamic child admission follows. The one-task `run_session` adapter remains. |
+| Worker | `worker.do_work` has deterministic marker mode and a custom bounded provider/tool loop. The loop parses strict actions, dispatches validated tools, checkpoints, tracks bounded usage/transcript data, and makes one fenced commit. | No production per-worker OS sandbox or approval service in the run-plan worker context. |
+| Providers | `Diffundo` performs tiered priority ordering with cooldown, circuit-breaker, configured RPM request-rate buckets, and bounded retry behavior. A depleted bucket reports `RATE_LIMITED`; HTTP 429 `Retry-After` is honored. | Provider token, cost, account-quota ownership, privacy, prompt-prefix stability, and provider cache-hit metrics must precede weighted routing. External-provider acceptance is not evidenced. |
+| Event path | Worker stdout is NDJSON; each worker has a bounded decoded-stdout queue. Runtime records route through the bounded `store.EventStore` writer queue at `.cambium/events.db`. | Non-critical overflow is policy-dropped; end-to-end usage/accounting and operational dashboards are open. There is no current `events.py` or DLQ module. |
+| Publication | Gates, fencing, merge sequencing, expected-old ref checks, cleanup, and `.cambium/result.json` are active in `run_plan`. | Publication is still ref-only by design; consumer checkouts need explicit materialization. |
+| Task tree | `build_tree`, `topological_order`, and `ready_tasks` validate roots, dependencies, cycles, and bounds. `build_tree` deep-copies input specs into node snapshots. | `run_plan` bypasses these helpers. Integrate static ready-node waves with fresh bounded child contexts and strict upward envelopes; admit dynamic children only through validated revisions. |
+| Architectus and conversations | `ArchitectusCore` is tested with injected LLMs. The conversation database and doctor check exist as separate modules. | No Architectus caller, dynamic decomposition admission, or conversation-store wiring exists in `run_plan`; `orchestrator.py` remains a skeleton. |
+| Controls | `tools.py` consumes schemas, command policy, and injected gates; `approval.py` defines `ApprovalGate`, and `resources.py` defines `CompileGate`. Provider environments are allowlisted and redaction is available. | No production approval callback or per-worker OS containment. `ResourceBudget`, `worker_pool.py`, `dlq.py`, `events.py`, and `eval_cache.py` are not tracked modules. |
+| Module evaluation | `modules/example` exposes deterministic `decide` and `evaluate` JSON operations, split evaluators, train/eval/canary data, and metrics. `module_conformance` provides an isolated `module-test` gate. | Example evaluation is offline module evidence, not planner or whole-system optimization proof. |
+| Provider smoke | No committed external-provider smoke command or artifact exists, and credentials/configuration are absent. | Run an opt-in disposable smoke through the worker loop, gate, and ref-only merge once credentials exist; do not treat local fixtures as acceptance evidence. |
 
-## Gaps in delivery order
+## Ordered gaps
 
-1. Canonicalize the runtime and wire controls at the supervisor boundaries.
-2. Prove one thin real-provider worker → gate → merge path with explicit
-   credentials and no default network run.
-3. Integrate fixed-tree validation and ready-node scheduling with the
-   supervisor; keep dynamic replanning out of this first proof.
-4. Measure worker reuse, provider routing, and context or DSPy experiments only
-   after the preceding path is reproducible.
+1. Smallest static ready-node slice with harness-owned tree, fresh bounded child contexts, and strict envelopes; then validated dynamic admission.
+2. Per-worker OS containment and a fail-closed production approval boundary.
+3. Provider usage observability and quota contract; weighted routing follows.
+4. Opt-in external-provider smoke once credentials exist.
+
+See [`../../implementation-plan.md`](../../implementation-plan.md) for ordered
+work and [`../architecture/architecture.md`](../architecture/architecture.md)
+for the current-versus-target contract.
 
 ## Evidence pointers
 
-- Runtime entry points: `src/cambium/supervisor.py`, `worker.py`,
-  `tasktree.py`, and `architectus.py`.
-- Provider and adapter tests: `tests/scenarios/test_worker_provider.py`,
-  `test_lm.py`, and `test_diffundo*.py`.
-- Plan, merge, IPC, controls, and store tests: the corresponding files under
-  `tests/scenarios/`.
-- Authority and target boundaries: [`docs/architecture/architecture.md`](../architecture/architecture.md).
+- Runtime: `src/cambium/supervisor.py`, `worker.py`, `ipc.py`, `store.py`, and
+  `merge.py`.
+- Providers and adapters: `src/cambium/diffundo.py`, `provider_config.py`, and
+  `lm.py`; scenarios are under `tests/scenarios/`.
+- Trees, controls, diagnostics, and evaluation:
+  `src/cambium/tasktree.py`, `tools.py`, `approval.py`, `resources.py`,
+  `doctor.py`, `module_conformance.py`, and `modules/example/`.

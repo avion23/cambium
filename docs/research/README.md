@@ -1,74 +1,64 @@
 # Research docs index
 
-Research files preserve evidence, experiments, and design history. They do not
+Research files preserve experiments, evidence, and design history. They do not
 define the runtime by themselves.
 
 ## Authority order
 
-Use these sources in this order when they disagree:
+When documents disagree, use:
 
-1. `agents.md` for process and current-truth notes.
-2. [`../architecture/architecture.md`](../architecture/architecture.md) for
-   target boundaries and behavioral invariants. It marks which contracts are
-   implemented and which are targets.
-3. `src/cambium/` for implementation.
-4. `tests/` and `src/cambium/modules/example/tests/` for observed behavior.
-5. Research files for context or measured evidence only.
+1. The task request for scope and required behavior.
+2. [`../../agents.md`](../../agents.md) for process and current-truth notes.
+3. `src/cambium/` for implementation and `tests/` plus
+   `src/cambium/modules/example/tests/` for observed behavior.
+4. [`../architecture/architecture.md`](../architecture/architecture.md) for
+   current-versus-target boundaries.
+5. Research files for context or measured evidence.
 
-Matching names in a draft are not proof that a module is wired. Check imports,
-callers, and tests.
+Check imports, callers, and tests. A matching name in a proposal is not proof
+that a module is present or wired.
 
-## Evidence and supporting references
+## Live references
 
-Read these when the architecture or task cites them:
-
+- [`v2-1-status.md`](v2-1-status.md) — the detailed capability/gap table.
 - [`python-3.14.md`](python-3.14.md) — runtime assumptions.
-- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — measured SQLite
-  durability.
-- [`worktree-concurrency.md`](worktree-concurrency.md) — measured Git
-  worktree and merge behavior.
-- [`design-deltas.md`](design-deltas.md) — adopted design decisions; verify
-  each against source before implementation.
-- [`vertical-slice-report.md`](vertical-slice-report.md) — the recorded
-  deterministic worker/gate/merge proof.
+- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — measured store behavior.
+- [`worktree-concurrency.md`](worktree-concurrency.md) — measured Git behavior.
+- [`vertical-slice-report.md`](vertical-slice-report.md) — deterministic worker,
+  gate, and merge evidence.
 - [`test-strategy.md`](test-strategy.md), [`security-audit.md`](security-audit.md),
   [`conformance-report.md`](conformance-report.md), and
   [`constitution-compliance.md`](constitution-compliance.md) — point-in-time
-  evidence, not completion claims.
-- [`treesitter-context.md`](treesitter-context.md) and
-  [`worker-coldstart.md`](worker-coldstart.md) — experiment records.
+  evidence; recheck claims against source.
+- [`coding-constitution.md`](coding-constitution.md) — coding-principles pointer.
+
+The accepted target shape is defined in the architecture and plan: a
+harness-owned validated tree, static ready-node scheduling before dynamic child
+admission, fresh bounded child contexts, strict upward envelopes, and
+prompt-prefix/cache-hit metrics. These are targets, not current runtime proof.
 
 ## Historical drafts
 
-These files describe proposals or earlier vocabulary. They are retained for
-provenance and must not override source, tests, or the architecture:
+Protocol, event, orchestration, cascade, canonicalization, replay, and
+compaction drafts are retained for provenance. In particular,
+[`ipc-protocol-draft.md`](ipc-protocol-draft.md),
+[`event-schema-draft.md`](event-schema-draft.md),
+[`custos-asyncio-design.md`](custos-asyncio-design.md),
+[`architectus-design.md`](architectus-design.md), and
+[`cascade-design.md`](cascade-design.md) do not override current imports and
+callers. Some older drafts name modules that are no longer tracked.
 
-- [`ipc-protocol-draft.md`](ipc-protocol-draft.md) and
-  [`event-schema-draft.md`](event-schema-draft.md) — protocol/event drafts;
-  current framing and event behavior live in `src/cambium/ipc.py`,
-  `src/cambium/store.py`, and their tests.
-- [`custos-asyncio-design.md`](custos-asyncio-design.md) and
-  [`architectus-design.md`](architectus-design.md) — orchestration proposals;
-  current wiring is shown by imports and callers.
-- [`cascade-design.md`](cascade-design.md) — historical cascade proposal;
-  conflicting cache or routing policy is not normative. Use
-  `src/cambium/diffundo.py` and `tests/scenarios/test_diffundo*.py`.
-- [`m1-canonicalization-plan.md`](m1-canonicalization-plan.md),
-  [`replay-restart-design.md`](replay-restart-design.md), and
-  [`compaction-design.md`](compaction-design.md) — open or superseded plans.
-- Competitive analyses, feedback assessments, the v2.1 review, and other
-  drafts in this directory — historical evidence only.
-
-The milestone tracker is intentionally separate from the authority chain:
-[`v2-1-status.md`](v2-1-status.md) reports current capabilities and gaps; it
-does not turn a research proposal into an implementation.
+The benchmark and example-module documents describe offline evaluation, not
+the production supervisor path. Use [`bench-harness-design.md`](bench-harness-design.md)
+with `src/cambium/bench.py` and the example evaluator when reproducing those
+experiments.
 
 ## Finding the current surface
 
 ```sh
 git ls-files src/cambium tests | sort
-rg -n "run_plan|do_work|ArchitectusCore|worker_pool|CambiumLM" src tests
+rg -n "run_plan|do_work|Diffundo|EventStore|ArchitectusCore|evaluate_split" src tests
 ```
 
-Start from the entry point, then follow imports and tests. Do not bulk-read the
-research directory or infer behavior from a document title.
+Start at the entry point and follow imports and tests. Do not bulk-read the
+research directory or infer behavior from a filename.
