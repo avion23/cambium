@@ -464,7 +464,8 @@ def wire_to_child_result(
 
     Only :data:`CHILD_RESULT_KEYS` are emitted.  ``diff`` is the worker wire
     spelling for ``unified_diff``; ``include_diff=False`` (or an omitted diff)
-    produces the required empty string while preserving the key.
+    produces the required empty string while preserving the key.  An explicit
+    ``None`` diff is rejected: the field is always a string.
     """
     if not isinstance(wire, Mapping):
         raise TypeError("worker result must be a mapping")
@@ -481,10 +482,12 @@ def wire_to_child_result(
     diff = _wire_value(wire, "unified_diff")
     if diff is _MISSING:
         diff = _wire_value(wire, "diff")
-    if not include_diff or diff is _MISSING or diff is None:
+    if not include_diff or diff is _MISSING:
         unified_diff = ""
+    elif not isinstance(diff, str):
+        raise TypeError("unified_diff must be a string")
     else:
-        unified_diff = _text(diff)
+        unified_diff = diff
 
     metric_score, metric_breakdown = _metrics_from_wire(wire)
     diff_truncated = _wire_value(wire, "diff_truncated")
@@ -523,6 +526,14 @@ def _final_metric_score(value: Any) -> float:
     return score
 
 
+def _unit_metric_score(value: Any) -> float:
+    """Coerce a metric score and enforce the public [0.0, 1.0] contract."""
+    score = _final_metric_score(value)
+    if not 0.0 <= score <= 1.0:
+        raise ValueError(f"metric_score must be in [0.0, 1.0], got {score!r}")
+    return score
+
+
 def _final_metric_breakdown(value: Any) -> dict[str, float]:
     if value is _MISSING or value is None:
         return {}
@@ -532,7 +543,7 @@ def _final_metric_breakdown(value: Any) -> dict[str, float]:
     for key, item in value.items():
         if not isinstance(key, str):
             raise TypeError("metric_breakdown keys must be strings")
-        result[key] = _final_metric_score(item)
+        result[key] = _unit_metric_score(item)
     return result
 
 
@@ -596,13 +607,15 @@ class Result:
             raise TypeError("summary must be a string")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise TypeError("failure_reason must be a string or None")
+        if not isinstance(self.diff_truncated, bool):
+            raise TypeError("diff_truncated must be a boolean")
         started_at = _final_metric_score(self.started_at)
         ended_at = _final_metric_score(self.ended_at)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "commits", _final_sequence(self.commits))
         object.__setattr__(self, "files_changed", _final_sequence(self.files_changed))
-        object.__setattr__(self, "diff_truncated", bool(self.diff_truncated))
-        object.__setattr__(self, "metric_score", _final_metric_score(self.metric_score))
+        object.__setattr__(self, "diff_truncated", self.diff_truncated)
+        object.__setattr__(self, "metric_score", _unit_metric_score(self.metric_score))
         object.__setattr__(self, "metric_breakdown", _final_metric_breakdown(self.metric_breakdown))
         object.__setattr__(self, "started_at", started_at)
         object.__setattr__(self, "ended_at", ended_at)
@@ -667,15 +680,18 @@ def _root_from_child(
     event_log_ref = f"sqlite:{session_root / '.cambium' / 'events.db'}"
     status = status_from_wire(child)
     now = time.time()
+    unified_diff = child.get("unified_diff", "")
+    if not isinstance(unified_diff, str):
+        raise TypeError("unified_diff must be a string")
     return Result(
         status=status,
         exit_code=EXIT_CODES[status],
         commits=_final_sequence(child.get("commits", _MISSING)),
         files_changed=_final_sequence(child.get("files_changed", _MISSING)),
-        unified_diff=_text(child.get("unified_diff", "")),
+        unified_diff=unified_diff,
         diff_truncated=bool(child.get("diff_truncated", False)),
         summary=_text(child.get("summary", "")),
-        metric_score=_final_metric_score(child.get("metric_score", None)),
+        metric_score=_unit_metric_score(child.get("metric_score", None)),
         metric_breakdown=_final_metric_breakdown(child.get("metric_breakdown", {})),
         parent_task_id=None,
         event_log_ref=event_log_ref,
