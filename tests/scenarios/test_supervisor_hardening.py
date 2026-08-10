@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -201,6 +202,66 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
         assert result.exit_code == 0
 
     asyncio.run(canary())
+
+
+def test_session_redactor_removes_declared_secret_from_db_and_observers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The secret deliberately avoids every default pattern shape (no sk-/AIza/
+    # Bearer prefix), so only the session registry built from the declared
+    # provider_env_keys values can redact it. Worker stderr and gate stderr
+    # both echo it; neither the durable SQLite rows nor the observer records
+    # may contain it.
+    secret = "opaque-session-secret-42abcdef"
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", secret)
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "secret_echo_worker.py"
+    worker.write_text(
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+        "from fake_worker import do_work, read_msg, send\n"
+        "init = read_msg()\n"
+        "send({'type': 'ready', 'request_id': init['request_id'], 'task_id': "
+        "init['task_id'], 'pid': os.getpid(), 'generation': init.get('generation', 1), "
+        "'proto': 1})\n"
+        "run = read_msg()\n"
+        "print(os.environ['CAMBIUM_PROVIDER_OPENAI_API_KEY'], file=sys.stderr)\n"
+        "status, failure_reason, commits, files_changed, diff = do_work(run)\n"
+        "send({'type': 'result_envelope', 'request_id': run['request_id'], 'task_id': "
+        "run['task_id'], 'generation': init.get('generation', 1), 'status': status, "
+        "'commits': commits, 'files_changed': files_changed, 'diff': diff, "
+        "'failure_reason': failure_reason})\n"
+        "send({'type': 'exit_message', 'task_id': run['task_id'], 'reason': 'done'})\n",
+        encoding="utf-8",
+    )
+    gate = f"echo {secret} >&2; grep -q '// t-secret' hello.txt"
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-secret",
+        worker=str(worker),
+        gate=gate,
+        provider_env_keys=["CAMBIUM_PROVIDER_OPENAI_API_KEY"],
+        marker="// t-secret",
+    )
+    observed: list[dict] = []
+
+    def observer(record: dict) -> None:
+        observed.append(record)
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}, on_event=observer))
+
+    assert result.results[0].status == "succeeded"
+    assert secret not in json.dumps(observed)
+    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
+        rows = connection.execute(
+            "SELECT kind, payload, task_id, worker_id, request_id FROM events"
+        ).fetchall()
+    assert secret not in json.dumps(rows)
+    assert any(event["kind"] == "log" for event in read_events(session_dir))
 
 
 def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(

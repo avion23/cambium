@@ -167,6 +167,7 @@ _SAFE_METADATA_NAMES = frozenset(
         "cambium_task_id",
         "cambium_generation",
         "cambium_session_id",
+        "session_status",
     }
 )
 

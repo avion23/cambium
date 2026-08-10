@@ -55,6 +55,7 @@ from cambium.resources import DEFAULT_ACQUIRE_TIMEOUT_S, CompileGate
 from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
+from .redact import Redactor, build_session_redactor, is_secret_name
 
 PROTO = 1
 WORKER_STDIN_LIMIT = 1_048_576
@@ -1283,12 +1284,35 @@ def _resolve_event_store() -> type | None:
         return None
 
 
-def _open_store(session_dir: Path) -> Any:
+def _open_store(session_dir: Path, *, redactor: Redactor | None = None) -> Any:
     path = Path(session_dir) / ".cambium" / "events.db"
     cls = _resolve_event_store()
     if cls is not None:
-        return cls(path)
+        return cls(path, redactor=redactor)
     return _FallbackEventStore(path)
+
+
+def _session_redactor(specs: list[dict[str, Any]]) -> Redactor:
+    """Build one session redactor from every worker-forwardable secret value.
+
+    The registry must cover every value ``_worker_environment`` can forward to
+    a worker from the declared ``provider_env_keys``: for each declared key
+    present in the host environment whose NAME is secret-bearing (the canonical
+    ``CAMBIUM_PROVIDER_*_API_KEY`` shape), its exact value is registered so the
+    complete event record is redacted before truncation. Non-secret declared
+    names (probe paths, proxy overrides) are intentionally not registered: their
+    values are not credentials, and registering them would corrupt event text
+    via substring replacement.
+    """
+    values: list[str] = []
+    for spec in specs:
+        for key in _provider_env_keys(spec):
+            if not is_secret_name(key):
+                continue
+            value = os.environ.get(key)
+            if isinstance(value, str) and value:
+                values.append(value)
+    return build_session_redactor(values)
 
 
 def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
@@ -1416,6 +1440,7 @@ class _Runtime:
         store: Any,
         on_event: EventSink | None = None,
         *,
+        redactor: Redactor | None = None,
         resource_thresholds: dict[str, Any] | None = None,
         compile_gate_max_concurrent: int | None = None,
         compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
@@ -1423,6 +1448,7 @@ class _Runtime:
         self._session_dir = Path(session_dir)
         self._store = store
         self._on_event = on_event
+        self._redactor = redactor
         self._resource_thresholds = (
             None if resource_thresholds is None else dict(resource_thresholds)
         )
@@ -1462,6 +1488,9 @@ class _Runtime:
             "monotonic_ms": time.monotonic_ns() // 1_000_000,
             "payload": dict(payload),
         }
+        if self._redactor is not None:
+            record = self._redactor.redact_mapping(record)
+            kind = record["kind"]
         if kind in CRITICAL_KINDS:
             await asyncio.to_thread(self._store.append, self._copy_event(record))
         else:
@@ -2835,11 +2864,13 @@ async def run_plan(
     admission = _SessionAdmission(session_dir)
     admission.acquire()
     try:
-        store = _open_store(session_dir)
+        redactor = _session_redactor(specs)
+        store = _open_store(session_dir, redactor=redactor)
         runtime = _Runtime(
             session_dir,
             store,
             on_event=on_event,
+            redactor=redactor,
             resource_thresholds=resource_thresholds,
             compile_gate_max_concurrent=compile_gate_max_concurrent,
             compile_gate_acquire_timeout_s=compile_gate_acquire_timeout_s,
