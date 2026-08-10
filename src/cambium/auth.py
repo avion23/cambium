@@ -695,6 +695,14 @@ class AuthStore:
             for credential in document.providers
         )
 
+    def has_provider(self, provider: str) -> bool:
+        """Return whether ``provider`` is configured in the auth store.
+
+        Reuses the validated store read and never returns or logs a key value.
+        """
+        provider = validate_provider_id(provider)
+        return provider in self.read().provider_names()
+
 
 def build_launch_environment(
     document: AuthDocument | Mapping[str, str],
