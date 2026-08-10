@@ -596,6 +596,13 @@ def test_writer_death_rejects_waiting_admission_and_wakes_all_callers(
     first = threading.Thread(target=append_result, args=(0,))
     queued = threading.Thread(target=append_result, args=(1,))
     waiting = threading.Thread(target=append_result, args=(2,))
+    admission_waiting = threading.Event()
+    real_wait = store._queue._cond.wait
+
+    def track_wait(timeout=None):
+        admission_waiting.set()
+        return real_wait(timeout)
+
     try:
         first.start()
         assert fsync_started.wait(1.0)
@@ -608,8 +615,9 @@ def test_writer_death_rejects_waiting_admission_and_wakes_all_callers(
             time.sleep(0.001)
         else:
             pytest.fail("queued event was not admitted")
+        monkeypatch.setattr(store._queue._cond, "wait", track_wait)
         waiting.start()
-        time.sleep(0.02)
+        assert admission_waiting.wait(1.0)
         release_at = time.monotonic()
         release.set()
         for caller in (first, queued, waiting):
