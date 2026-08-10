@@ -5,15 +5,19 @@
 **Baseline audited:** `/home/ubuntu/cambium` main `3d27ba3` ("merge: feat(store) — sqlite wal event store")
 **Scope:** `src/cambium/{store,merge,ipc,worker,tasktree,events,supervisor,orchestrator,doctor}.py`, `tests/scenarios/*.py` vs `docs/architecture/architecture.md` §5/§6/§7.8, `docs/research/{event-schema-draft,ipc-protocol-draft,sqlite-wal-durability,worktree-concurrency}.md`.
 
-**Verification harness at audit time:** `uv run pytest tests/ -q` → `38 passed`.
+**Verification harness at audit time:** `uv run pytest tests/ -q` → `38 passed` (historical baseline for this audit).
 
-**Current-main status (2026-08-09):** main is now `6109a6a`; the current
-verification is `uv run --python 3.14.7 --extra test pytest --collect-only -q`
-→ 108 collected and `pytest -q` → 108 passed. M3 is **FALSE as a current N-A**:
-`ipc.py` and `worker.py` are re-auditable after merge `38e1d43`. M1 is
-**RESOLVED** by the recovery-gap specification fix `dcc1bbb`. M2 remains
-**IN-FLIGHT** on `wt-impl-super`, which is wiring `EventStore` and
-`MergeSequencer` into the canonical runtime.
+**Current-main status (2026-08-10):** main is now `b709375`; the current
+verification is `uv run --python 3.14.7 --extra test pytest -q` → **647 passed,
+4 skipped**. The findings below are recorded against `3d27ba3`; several have
+since changed on the baseline: `ipc.py` and `worker.py` are re-auditable after
+merge `38e1d43`; `redact.py` is merged in `39005fa`; `diffundo.py` and the
+worker-provider router are merged in `77f3d52`; store/merge hardening landed in
+`c31e781`; and the canonical supervisor integration (`wt-impl-super`) has merged
+into `b709375`, which added stdin write deadlines but still keeps the slice
+`EventLog`, both fallback classes, and the unwired DLQ. The wiring gaps that
+follow (M2 supervisor integration, M4 orphaned `events.py`, M5 `worker_id`
+derivation) remain open.
 
 ---
 
@@ -234,5 +238,6 @@ runtime. Check 4 is no longer N-A.
 - Specs: `architecture.md:449` (bounded queue), `:458-476` (§6.3 DDL), `:500` (critical set), `:505-511` (fsync mechanism), `:520` (recovery_gap), `:708-757` (§7.8), `:167-172` (Result.status), `:372-376` (exit no-rid).
 - Research: `sqlite-wal-durability.md:26-32,175-184` (fsync correctness + busy warning), `worktree-concurrency.md:40-76,146-154,211-224,274-285,321,327,334` (F-numbers/experiments), `event-schema-draft.md:30-41,78,336-342,555-556,580-597`.
 - Code: `store.py:13-25,42-57,123-158,177-191,210-233,267-272`; `merge.py:158-164,174-177,296-321,339-341,344-354,370-405,450-459,482-531`; `supervisor.py:43,67-87,161-178,310-312,354-361`; `events.py:14-47`; `orchestrator.py:15,58-59`; `doctor.py:139-165`.
-- Tests: current main collects 108 scenario tests and reports 108 passed; the
-  original 38-test audit run is retained as the historical baseline.
+- Tests: current main (`b709375`) collects 651 and reports **647 passed, 4
+  skipped**; the original 38-test audit run and the later 108-test run are
+  retained as historical baselines.

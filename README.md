@@ -30,35 +30,43 @@ What exists now:
 - **Vertical-slice proof** — a real supervisor subprocess-spawns a real fake
   worker, runs the task gate, and merges the worker branch. The multi-worker
   plan path also has end-to-end scenario coverage.
-- **Scenario and module coverage** — the refreshed baseline records 307 timed
-  test items. The latest full run reports 305 passed and 2 skipped; the source
-  Ruff gate is clean.
-- **Still unmerged** — `redact.py` is not in this main snapshot. Real provider
-  execution and DSPy optimization are not verified.
+- **Scenario and module coverage** — the committed module baseline records 307
+  timed node IDs (not yet module-scoped; the module-test gate is blocked on 278
+  foreign scenario IDs). The verified full run on `b709375` reports **647 passed
+  and 4 skipped**; the source Ruff gate is clean.
+- **Still unmerged** — `CambiumLM` (the real-provider LM adapter) is branch-local
+  in `wt-dspy-cambiumlm`. Real provider execution and DSPy optimization are not
+  verified.
 
 Next:
 
 - **M1 — Canonical runtime and audit baseline: in progress.** The canonical
   store, merge, IPC, worker, doctor, and multi-worker paths exist, but the
-  supervisor still retains the slice `EventLog` and slice entry path.
+  supervisor still retains the slice `EventLog`, both fallback classes, and the
+  slice entry path, and redaction is not yet wired at enqueue/INSERT.
 - **M2 — Protocol and pipe hardening: in progress.** Framing limits, worker
-  controls, and the durable DLQ exist; the roadmap's FD-3 transport, complete
-  write deadlines, and production overflow contract are not complete.
-- **M3 — Security boundary and fencing: in progress.** Fencing and approval
-  gates landed, but the canonical redaction module is not merged.
+  controls, the durable DLQ, and stdin write deadlines exist; the roadmap's
+  FD-3 transport, bounded runtime queues, and production overflow contract are
+  not complete.
+- **M3 — Security boundary and fencing: in progress.** Fencing, approval gates,
+  and the canonical redaction module are merged; strict spawn-time environment
+  allowlisting (the `_worker_environment` provider-key leak), durable approval,
+  ref validation, and runtime fencing remain open.
 - **M4 — Gate/resource hardening and deep budgets: in progress.** Resource
   controls landed; GateRunner extraction, deep turn/process deadlines, and
   bounded store backpressure remain open.
 - **M5 — Architectus/task-tree execution and conversations: in progress.** The
-  task tree, scheduling core, plan runtime, and conversation store exist; full
-  Custos integration and recursive completion are not complete.
+  task tree, Architectus execution core, plan runtime, and conversation store
+  exist; the core is not wired into the supervisor and the orchestrator is still
+  a skeleton.
 - **M6 — First real LLM task: in progress.** Diffundo, provider configuration,
   provider-environment coverage, the fake-provider staging test, and the
   M6-hygiene quota-fallback and exact-publish-scope assertions are merged. The
-  staging path is verified with a loopback fake provider; real-provider
-  execution and M6 acceptance remain unverified.
-- **M7 — Persistent worker pool: blocked.** No reusable worker pool is present,
-  and its M2–M6 prerequisites are not accepted.
+  staging path is verified with a loopback fake provider; `CambiumLM` is
+  branch-local, and real-provider execution and M6 acceptance remain
+  unverified.
+- **M7 — Persistent worker pool: blocked.** Only a pure state-machine seed is
+  merged (explicitly not acceptance); its M2–M6 prerequisites are not accepted.
 - **M8 — DSPy `should_decompose` refinement: in progress.** The Decision enum
   migration and dataset bump to `1.1.0` are merged; the package rename and
   DSPy SIMBA refinement gates remain open.
@@ -98,8 +106,8 @@ adapters:
 uv run --python 3.14.7 --extra test cambium --help
 ```
 
-Available subcommands are `supervisor`, `doctor`, `bench report|gate`,
-`tasktree`, and `version`.
+Available subcommands are `auth`, `supervisor`, `doctor`, `bench report|gate`,
+`tasktree`, `module-test`, and `version`.
 
 ## Documentation
 
@@ -136,13 +144,14 @@ cambium/
 │   ├── architecture/          architecture.md, system-design.md (v0.1), module-template/, reviews/
 │   └── research/              44 research docs + README index
 ├── scripts/                   dataset tooling + the fake worker
-├── src/cambium/               approval.py, architectus.py, ast_tools.py, bench.py,
-│                              cli.py, conversations.py, diffundo.py, dlq.py,
-│                              doctor.py, edits.py, eval_cache.py, events.py,
+├── src/cambium/               approval.py, architectus.py, ast_tools.py, auth.py,
+│                              bench.py, cli.py, conversations.py, diffundo.py,
+│                              dlq.py, doctor.py, edits.py, eval_cache.py, events.py,
 │                              fencing.py, ipc.py, lint_diag.py, merge.py,
-│                              orchestrator.py, provider_config.py, resources.py,
+│                              module_conformance.py, orchestrator.py, process_env.py,
+│                              provider_config.py, redact.py, resources.py, results.py,
 │                              schemas.py, store.py, supervisor.py, system_health.py,
-│                              tasktree.py, tools.py, worker.py, modules/
+│                              tasktree.py, tools.py, worker.py, worker_pool.py, modules/
 │   └── modules/example/       should_decompose decision module, datasets, tests, baseline
 ├── tests/scenarios/           runtime, tooling, and integration scenarios
 └── pyproject.toml

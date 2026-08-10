@@ -11,7 +11,7 @@ Orientation: docs/research/README.md (tiered index) → docs/architecture/archit
 - Roadmap: docs/research/v2-1-review.md (M1-M9), v2-1-status.md (living tracker), m1-canonicalization-plan.md, architectus-design.md, compaction-design.md
 - Naming map: docs/research/glossary.md
 - Code: src/cambium/ — store, merge, ipc, worker, supervisor, orchestrator, tasktree, diffundo, bench, doctor, cli, conversations, dlq, resources, approval, fencing, system_health, lint_diag, ast_tools, schemas, eval_cache, provider_config, architectus, events (to be deleted per M1), modules/example (Decision enum v2.1)
-- Redaction is still absent from main; Diffundo and the M6 fake-provider staging path are merged.
+- Redaction (`39005fa`), Diffundo + worker-provider routing (`77f3d52`), and the M6 fake-provider staging path are merged; redaction is still not wired into the supervisor's enqueue/INSERT paths.
 - Orientation norms: agents.md (sections 1-11; constitution subsection; module inventory §3; lookup table §9)
 - Tests: harness in tests/scenarios/; MODULE tests colocated: src/cambium/modules/<name>/tests/ (+ baselines) — removability rule
 
@@ -29,26 +29,34 @@ Orientation: docs/research/README.md (tiered index) → docs/architecture/archit
 11. Compaction prep: this file + v2-1-status.md + glossary + tiered research index are the self-sufficient context map.
 12. Critiques 1-4 dispositions: docs/research/feedback-4-assessment.md (21 claims: 6 reject/3 adopt/6 lite/6 already).
 
-## Merged state (main, clean)
-- Test suite: 307 tests are collected; the verified full run reports 305 passed and 2 skipped; the committed baseline records all 307 node IDs.
-- Bench: pytest plugin with a committed module-local baseline, drift gate, dataset-version re-anchor, and fail-closed missing-anchor behavior.
-- M6: Diffundo, provider configuration, fake-provider staging, and M6-hygiene quota/publish-scope assertions are merged; real-provider acceptance remains unverified.
-- Recent merges: status tracker, glossary, agents inventory, decision enum, research index, Diffundo, M6 staging, M6-hygiene (`4c4065f`), and the current pure worker-pool state seed.
+## Merged state (main, clean; HEAD `b709375`)
+- Test suite: verified full run = **647 passed, 4 skipped** (`uv run --python 3.14.7 --extra test pytest -q`, 2026-08-10 at `b709375`). The committed module baseline still records 307 node IDs, of which 278 are scenario tests outside the module — a module-test gate blocker (see Blockers).
+- Bench: pytest plugin with a committed module-local baseline, drift gate, dataset-version re-anchor, and fail-closed missing-anchor behavior; dataset 1.1 (`382f7f6`) and bench-decouple (`4f54e5d`) are merged.
+- M6: Diffundo (`77f3d52`), provider configuration, fake-provider staging, and M6-hygiene quota/publish-scope assertions are merged; real-provider acceptance remains unverified.
+- Merged since the last tracker refresh: redaction (`39005fa`), worker-provider/Diffundo (`77f3d52`), results (`a0403ae`), ready-correlation (`5e27be7`), worktree-cleanup (`19d2135`), doctor-decouple (`3bfbd0b`), luna-baseline (`38d46a7`), tasktree-cli (`c558205`), auth store (`7f9823a`), module-conformance gate (`9b8b32e`), store-hardening (`c31e781`), staging-quarantine (`629c5bf`), supervisor-hardening v2 (HEAD `b709375`), and the worker-pool state seed (`worker_pool.py`).
 
-## In flight (worktrees)
-- wt-impl-super: supervisor review-fix RELAUNCHED fresh (env stripping everywhere, write deadlines, fencing, ping/pong, race test) — CRITICAL PATH
-- wt-redact: redact.py (has uncommitted progress — alive)
-- wt-impl-diffundo: review fixes (busy-spin pause, budget-bounded attempts, refusal scan)
-- wt-impl-bench: review fixes (dataset_version re-anchor, canary_failed_delta wiring, CLI baseline protection, baseline regen)
-- Luna wave: luna-baseline (README+baseline), luna-tools (tool dispatch), luna-envsmoke, luna-edits (anchored edits), luna-template, luna-docx (doctor ext), luna-fuzz (IPC fuzz), luna-convtok (conversations tokens/summary nodes)
+## Blockers (verified against `b709375`)
+- No public `Cambium`/`Session`/`Instance` API: `src/cambium/__init__.py` is version-only.
+- No `result.json` production wiring: `results.write_result_json` exists but nothing in the supervisor calls it.
+- Worker is single marker-append only (no tool loop): `worker.py` loads the provider but returns exactly one append-marker decision.
+- Credential leak: `_worker_environment` forwards every env var matching the canonical provider-key namespace (`CAMBIUM_PROVIDER_*_API_KEY`) regardless of `provider_env_keys` (`supervisor.py:824-826`).
+- Module-test gate fails: the baseline records 278 foreign scenario node IDs, and the offline `test_subprocess_network_client_is_denied` raises `PermissionError`.
+- No FD-3 transport; the supervisor uses an unbounded `asyncio.Queue` (`supervisor.py:448`), and the DLQ is unwired.
+- Architectus execution core exists (`decide`/`step`/`compose_context`/`aggregate`) but is not wired into the supervisor; `orchestrator.py` is still a submit/drain skeleton.
+- M1 deletion set still present: slice `EventLog` (`supervisor.py:105`), `_FallbackEventStore` (`:930`), `_FallbackSequencer` (`:1016`), and `events.py` (only importer is `orchestrator.py`).
+
+## In flight (worktrees, from `git worktree list` 2026-08-10)
+- wt-agents-condense, wt-auth-store, wt-dataset-version, wt-dspy-cambiumlm (CambiumLM still branch-local), wt-eval-cache-fix, wt-module-conformance, wt-staging-quarantine, wt-super-hardening-v2, wt-module-cli, wt-status-refresh
+- Scratch/derivative worktrees at `b709375`: wt-fix-baseline, wt-module-offline-test, wt-packaging-bench, wt-redact-store, wt-supervisor-consolidation, wt-tasktree-leak, wt-worker-tool-loop, wt-tracker-refresh
 
 ## Next actions (dependency order)
-1. Merge super fix → merge diffundo fix → merge redact → merge bench fix → activate m6/conformance skips
-2. HARDENING WIRING into supervisor: pipe caps+kill, stdin deadlines (in super fix), redaction filter on events, DLQ put on task failure, CompileGate on heavy gates, fencing file (in super fix)
-3. M1 canonicalization (m1-canonicalization-plan.md): run_session→adapter, delete slice machinery + events.py + orchestrator skeleton, re-run 3 audits
-4. M6: real-provider E2E (provider_config + diffundo + worker; keys env-only; user's machine has 11 configured providers)
-5. M5: architectus executor chunk (run_plan integration), M7 worker pool, M8 DSPy SIMBA + example→should_decompose rename, M9 adoption trial (≥25% token cut, ≤2pt compile degradation)
-6. Final: integration verification, worktree cleanup, DELETE THIS FILE, final report
+1. Merge supervisor consolidation: credential isolation (fix the `_worker_environment` leak), provider default, plan validation, `cambium.worker` default.
+2. Merge module baseline regeneration (re-scope to module-local node IDs) + offline-test fix.
+3. Merge worker tool-loop (marker-append → real tool loop).
+4. Supervisor serial wave: publish-integrity guards, redaction wiring (enqueue/INSERT), `result.json` wiring, M1 deletion (`EventLog`/fallbacks/`events.py`/slice path).
+5. Real-provider E2E via `cambium auth run supervisor`.
+6. M5 integration (wire Architectus), M7 pool, M8 SIMBA + `example`→`should_decompose` rename, M9 adoption.
+7. Final: re-baseline module-scoped, worktree cleanup, DELETE THIS FILE, final report.
 
 ## Verification norms (canaries)
 Every agent: exact commands + outputs; UNVERIFIED markers; commit in own worktree (check git rev-parse --show-toplevel); empty report = failure; snapshots of live systems need as-of timestamps; adversarial review before merge; duplicate/conflicting branches resolved toward main + re-verify.
