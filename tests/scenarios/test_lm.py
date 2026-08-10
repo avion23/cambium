@@ -1,11 +1,8 @@
-"""Integration scenarios for the optional DSPy-to-Diffundo boundary."""
+"""Integration scenarios for the DSPy-to-Diffundo boundary."""
 
 from __future__ import annotations
 
 import asyncio
-import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +21,7 @@ class FakeDiffundo:
         self.endpoint = endpoint
         self.calls: list[dict[str, Any]] = []
         self.session_markers: list[object] = []
+        self.events: list[dict[str, Any]] = []
 
     async def call(
         self,
@@ -40,6 +38,15 @@ class FakeDiffundo:
         content = "completion text"
         if prompt["messages"][0]["role"] == "system":
             content = '[{"action":"spawn","task_id":"root"}]'
+        self.events.append(
+            {
+                "kind": "llm_call",
+                "provider": self.endpoint,
+                "model": model or "fake-model",
+                "tier": tier.value,
+                "cache_hit": False,
+            }
+        )
         return CallResult(
             provider=self.endpoint,
             model=model or "fake-model",
@@ -90,6 +97,7 @@ def test_session_context_is_isolated_and_retains_no_prompt() -> None:
         assert dspy.settings.cambium_session is original_marker
     assert not hasattr(dspy.settings, "cambium_session")
     assert diffundo.session_markers[0] is not original_marker
+    assert "PROMPT-CANARY" not in repr(diffundo.events)
     assert lm.history == []
 
 
@@ -102,37 +110,3 @@ def test_architectus_real_decide_port_uses_cambium_lm() -> None:
     actions = asyncio.run(ArchitectusCore(ArchitectusLM(lm), tree=tree).step([{"kind": "tick"}]))
     assert actions == [{"action": "spawn", "task_id": "root"}]
     assert len(diffundo.calls) == 1
-
-
-def test_core_module_imports_never_import_dspy() -> None:
-    source = Path(__file__).resolve().parents[2] / "src"
-    script = """
-import sys
-sys.path.insert(0, sys.argv[1])
-import cambium
-import cambium.architectus
-import cambium.diffundo
-import cambium.lm
-import cambium.orchestrator
-assert 'dspy' not in sys.modules
-"""
-    completed = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(source)],
-        env=os.environ.copy(),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_free_threaded_build_is_rejected_before_dspy_use(monkeypatch: pytest.MonkeyPatch) -> None:
-    import cambium.lm as lm_module
-
-    monkeypatch.setattr(
-        lm_module.sysconfig,
-        "get_config_var",
-        lambda name: int(name == "Py_GIL_DISABLED"),
-    )
-    with pytest.raises(RuntimeError, match="free-threaded CPython"):
-        CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]

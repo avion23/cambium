@@ -1,12 +1,13 @@
-"""Optional DSPy adapters that keep provider policy inside Diffundo."""
+"""DSPy adapters that keep provider policy inside Diffundo."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import sysconfig
 from collections.abc import Mapping
 from typing import Any
+
+import dspy
 
 from .diffundo import CallResult, Diffundo, ProviderTier
 
@@ -23,36 +24,8 @@ _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_
 _SECRET_MARKERS = ("api_key", "authorization", "password", "secret", "token")
 
 
-def _load_dspy() -> Any:
-    """Load DSPy on first use and reject unsupported free-threaded CPython.
-
-    Packaging has no GIL ABI environment marker, so uv can resolve DSPy for
-    cp314t. CambiumLM enforces the GIL-build requirement at runtime instead.
-    """
-    if sysconfig.get_config_var("Py_GIL_DISABLED"):
-        raise RuntimeError(
-            "CambiumLM does not support free-threaded CPython; use a GIL-enabled CPython build"
-        )
-    try:
-        import dspy
-    except ImportError as exc:
-        raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
-    return dspy
-
-
-class CambiumLM:
-    """Lazily construct a concrete subclass of ``dspy.LM``."""
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> CambiumLM:
-        if cls is not CambiumLM:
-            return super().__new__(cls)
-        dspy = _load_dspy()
-        implementation = type("CambiumLM", (_CambiumLMMixin, dspy.LM, CambiumLM), {})
-        return implementation(*args, **kwargs)
-
-
-class _CambiumLMMixin:
-    """DSPy LM implementation whose only provider edge is Diffundo.call."""
+class CambiumLM(dspy.LM):
+    """DSPy LM whose only provider edge is :meth:`Diffundo.call`."""
 
     forward_contract = "typed_lm"
 
@@ -93,7 +66,6 @@ class _CambiumLMMixin:
         **kwargs: Any,
     ) -> Any:
         """Call synchronously with session-local, non-retaining settings."""
-        dspy = _load_dspy()
         with self._session_context(dspy):
             return super().__call__(
                 *items,
@@ -112,7 +84,6 @@ class _CambiumLMMixin:
         **kwargs: Any,
     ) -> Any:
         """Call asynchronously with session-local, non-retaining settings."""
-        dspy = _load_dspy()
         with self._session_context(dspy):
             return await super().acall(
                 *items,
@@ -232,7 +203,6 @@ class _CambiumLMMixin:
 
     @staticmethod
     def _response(result: CallResult) -> Any:
-        dspy = _load_dspy()
         return dspy.LMResponse.from_text(
             result.content,
             model=result.model,
