@@ -767,6 +767,35 @@ def test_duplicate_task_id_is_rejected_before_store_or_spawn(tmp_path: Path, mon
     assert not (tmp_path / "session" / ".cambium").exists()
 
 
+@pytest.mark.parametrize("task_value", [None, 42, "", "   ", "\n\t "])
+def test_plan_task_requires_non_empty_task_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_value
+) -> None:
+    def fail_spawn(*args, **kwargs):
+        raise AssertionError("invalid task spawned a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+    plan = {"tasks": [{"task_id": "t-invalid", "task": task_value}]}
+
+    with pytest.raises(ValueError, match="requires a non-empty 'task'"):
+        asyncio.run(run_plan(tmp_path / "session", plan))
+    assert not (tmp_path / "session" / ".cambium").exists()
+
+
+def test_plan_task_missing_task_is_rejected_before_store_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_spawn(*args, **kwargs):
+        raise AssertionError("missing task spawned a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+    plan = {"tasks": [{"task_id": "t-missing-task"}]}
+
+    with pytest.raises(ValueError, match="requires a non-empty 'task'"):
+        asyncio.run(run_plan(tmp_path / "session", plan))
+    assert not (tmp_path / "session" / ".cambium").exists()
+
+
 def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkeypatch) -> None:
     session_dir = tmp_path / "session"
     repo = tmp_path / "repo"

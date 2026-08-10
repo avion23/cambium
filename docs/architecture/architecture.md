@@ -612,7 +612,7 @@ proc = await asyncio.create_subprocess_exec(
 
 After spawn, the supervisor sends `init` and **waits for `ready`** before considering the worker RUNNING. There is a `ready_timeout` (default 60 s) covering cold-start cost (IMPL-M2). On timeout, the worker is killed and the restart policy engages. Spawn returns **admission** — a supervisor-internal ack to the orchestrator/host issued synchronously when the spawn is accepted, before the worker is RUNNING (D3; it is not a wire message — see §5.2).
 
-**Least-privilege worker env (D7, resolves threat-model R4).** The spawn path does **not** pass `{**os.environ, ...}`. `_construct_worker_env` builds a scrubbed dict: `PATH` (minimal), `PYTHONUNBUFFERED=1`, `CAMBIUM_TASK_ID`, `CAMBIUM_GENERATION`, `CAMBIUM_SESSION_ID`, `HOME` (worktree-scoped, optional), **plus only the keys named in `init.provider_env_keys`** (names only; values resolved from the host env — §12.2). Everything else is dropped, so a compromised worker cannot `print(os.environ)` for unrelated secrets (this is the `--setenv` per-worker key-allowlist norm of the removed sandbox, repointed to spawn-time env construction — §18.3 IMPL-M6).
+**Least-privilege worker env (D7, resolves threat-model R4).** The spawn path does **not** pass `{**os.environ, ...}`. `_construct_worker_env` builds a scrubbed dict with a controlled runtime base — `PATH` (fixed, `os.defpath`), `PYTHONPATH`, `PYTHONUNBUFFERED=1`, locale/git controls, `CAMBIUM_TASK_ID`, `CAMBIUM_GENERATION`, `CAMBIUM_SESSION_ID`, `HOME` (worktree-scoped, optional) — **plus only the keys named in `init.provider_env_keys`** (names only; values resolved from the host env — §12.2). Host runtime variables such as `ENV_DUMP_PATH`, `NO_PROXY`, or an undeclared canonical provider key are **not** copied; a task must declare every name it needs. In provider mode (`init.fanout_config` present) the supervisor also sets an **absolute `CAMBIUM_PROVIDERS`** in the worker env (explicit host value if set, else the default `.cambium/providers.json` under the supervisor cwd), resolved before the worker changes cwd (§12.2). Everything else is dropped, so a compromised worker cannot `print(os.environ)` for unrelated secrets (this is the `--setenv` per-worker key-allowlist norm of the removed sandbox, repointed to spawn-time env construction — §18.3 IMPL-M6).
 
 **Containment policy (D7).** With the sandbox module removed, containment is the stack:
 - **Worktree isolation** — per-task throwaway worktrees, `Surculus` recovery, generation fencing, quarantine (§7.3, §7.5).
@@ -977,7 +977,7 @@ Final score: `score = (tests × w1 + spec_adherence × w2 + diff_quality × w3 +
 - **At rest:** no API key is ever written to disk by Cambium. Keys live in the host process's environment.
 - **In transit to workers:** keys are inherited via the subprocess environment; they never appear in protocol messages.
 - **In logs:** every event passes through a redaction filter before it reaches the writer thread.
-- **At spawn (D7, resolves threat-model R4):** the worker env is a **constructed least-privilege dict** — `PATH` (minimal), `PYTHONUNBUFFERED=1`, `CAMBIUM_TASK_ID`, `CAMBIUM_GENERATION`, `CAMBIUM_SESSION_ID`, optional worktree-scoped `HOME`, **plus only the keys named in `init.provider_env_keys`**; everything else is dropped (§7.2). This is the per-worker key allowlist the removed sandbox enforced via `--setenv`, repointed to spawn-time env construction.
+- **At spawn (D7, resolves threat-model R4):** the worker env is a **constructed least-privilege dict** — a controlled runtime base (`PATH` fixed to `os.defpath`, `PYTHONPATH`, `PYTHONUNBUFFERED=1`, locale/git controls, `CAMBIUM_TASK_ID`, `CAMBIUM_GENERATION`, `CAMBIUM_SESSION_ID`, optional worktree-scoped `HOME`), **plus only the keys named in `init.provider_env_keys`**; everything else is dropped (§7.2). `CAMBIUM_PROVIDERS` is **non-secret runtime configuration** (a filesystem path, not a credential): it is set to an absolute path for provider-mode workers and never reveals key values. This is the per-worker key allowlist the removed sandbox enforced via `--setenv`, repointed to spawn-time env construction.
 
 ### 12.2 Loading
 
@@ -998,6 +998,8 @@ def load_providers(config_path: Path) -> tuple[ProviderConfig, ...]:
 ```
 
 `providers.toml` contains **only env-var names**, never key values. The host is responsible for setting the environment (systemd `EnvironmentFile`, k8s secrets, shell export, etc.).
+
+The provider document is **JSON at the path named by `CAMBIUM_PROVIDERS`, or the default `.cambium/providers.json` under the supervisor cwd when that variable is unset** (`CAMBIUM_PROVIDERS` holds a path — non-secret runtime configuration, unlike the key variables the document references). The supervisor resolves `CAMBIUM_PROVIDERS` to an **absolute path** (`~` expanded, relative paths anchored to the supervisor cwd) and passes it to provider-mode workers in their environment, **before the worker changes its working directory**, so the worker always loads the same file the supervisor resolved.
 
 ### 12.3 Redaction filter
 

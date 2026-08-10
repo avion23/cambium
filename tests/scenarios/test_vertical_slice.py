@@ -238,6 +238,7 @@ def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypa
     no generic credential-shaped variable (regression: the spawn used to pass
     the env through a stripper that removed the explicitly authorized key)."""
     monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "authorized-secret")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_ANTHROPIC_API_KEY", "undeclared-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
     monkeypatch.setenv("CAMBIUM_PROVIDER_bad_API_KEY", "noncanonical-secret")
     dump_path = tmp_path / "worker-env.json"
@@ -251,6 +252,7 @@ def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypa
     _make_scratch(scratch)
     spec = _spec(session_dir, write_marker=True)
     spec["worker"] = env_worker
+    spec["provider_env_keys"] = ["CAMBIUM_PROVIDER_OPENAI_API_KEY", "ENV_DUMP_PATH"]
 
     result = asyncio.run(run_session(session_dir, spec))
 
@@ -258,6 +260,7 @@ def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypa
     assert result.exit_code == 0
     spawned_env = json.loads(dump_path.read_text(encoding="utf-8"))
     assert spawned_env["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == "authorized-secret"
+    assert "CAMBIUM_PROVIDER_ANTHROPIC_API_KEY" not in spawned_env
     assert "OPENAI_API_KEY" not in spawned_env
     assert "CAMBIUM_PROVIDER_bad_API_KEY" not in spawned_env
     assert spawned_env["CAMBIUM_TASK_ID"] == "slice-001"
