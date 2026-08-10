@@ -1,89 +1,56 @@
 # Cambium
 
-Cambium is a Python-native coding-agent harness. The supervisor starts worker
-subprocesses in isolated Git worktrees, speaks JSON Lines over stdio, runs a
-gate, and publishes successful worker commits to `refs/heads/main`.
+Cambium is a Python-native coding-agent harness. The `cambium` CLI starts a
+supervisor, workers edit isolated Git worktrees over NDJSON stdio, gates run in
+the worker worktree, and successful commits publish to `refs/heads/main`.
 
-The repository contains a deterministic runtime plus a provider-backed worker
-path. The implementation and tests are authoritative; architecture and
-research documents label targets separately.
+## Current shape
 
-## Current status
+- `cambium.supervisor.run_plan` accepts a flat supplied task list and supervises
+  it concurrently. It persists events in `.cambium/events.db`, writes a root
+  result, and never refreshes a checkout after ref publication.
+- `worker.do_work` has deterministic marker mode and a bounded custom provider
+  and tool loop. Provider calls go through `Diffundo`; strict actions dispatch
+  validated tools, emit checkpoints, and end in one worker commit.
+- `Diffundo` has tier, priority, cooldown, quota, and retry behavior. HTTP 429
+  `Retry-After` is honored. External-provider acceptance still needs credentials
+  and a smoke run.
+- `tasktree` validates and snapshots dependency specs, but `run_plan` does not
+  schedule that tree. Architectus, dynamic decomposition, and the conversation
+  store are not wired into `run_plan`.
+- The package exports only `__version__`; use the CLI or module-level functions.
+  The example module includes deterministic `decide` and `evaluate` operations.
 
-- `src/cambium/worker.py` has a deterministic marker mode and a bounded
-  provider worker loop. Provider mode calls Diffundo, parses strict tool or
-  finish actions, dispatches validated tools through the worker context, emits
-  checkpoints, and commits the result.
-- `src/cambium/lm.py` contains the merged optional DSPy-compatible `CambiumLM`
-  adapter (and `ArchitectusLM`). Integration tests cover the adapter and a
-  loopback provider. Real external-provider acceptance is not yet evidenced.
-- `cambium.supervisor.run_plan` validates a **flat task list** and supervises
-  supplied tasks concurrently with `asyncio.TaskGroup`. It does not schedule a
-  DAG.
-- `tasktree.build_tree` validates dependency graphs, but the current
-  `run_plan` path does not call it for scheduling. `ArchitectusCore` is tested
-  standalone and is not connected to the supervisor. The orchestrator remains
-  a skeleton, and persistent worker reuse is not implemented.
-- The package has no public library API: `src/cambium/__init__.py` exports only
-  `__version__`. Use the CLI or the module-level supervisor functions.
-- Canonicalization is incomplete. The supervisor still contains the one-task
-  `run_session` slice, `EventLog`, and fallback store/sequencer paths; canonical
-  store, redaction, and root-result wiring still need one integrated path.
-
-The `modules/example` decision module is deterministic and has train, eval, and
-canary data plus a DSPy seam. It is an example module, not the supervisor's
-planner.
+See [`docs/research/v2-1-status.md`](docs/research/v2-1-status.md) for the live
+capability and gap table. Source and tests are the evidence; target contracts
+are in [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 
 ## Quickstart
 
-Requires Python 3.14 (regular build) and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.14 and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 uv sync --extra test --python 3.14.7
 uv run --python 3.14.7 --extra test pytest -q
 ```
 
-Run the deterministic one-worker demo:
+Run the deterministic demo:
 
 ```sh
 uv run --python 3.14.7 --extra test python -m cambium.supervisor --session-dir demo
-```
-
-The installed CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
-`module-test`, and `version`:
-
-```sh
 uv run --python 3.14.7 --extra test cambium --help
 ```
 
-In plan mode, a successful publication advances `refs/heads/main` only. It
-does not refresh a checkout; materialize the published ref in a separate
-worktree before building or testing it.
+Plan publication advances `refs/heads/main` only. Read that ref or explicitly
+update a consumer checkout before building or testing it.
 
 ## Documentation authority
 
-- [`agents.md`](agents.md) — agent process and current-truth orientation.
+- [`agents.md`](agents.md) — operating contract and current module map.
 - [`docs/architecture/architecture.md`](docs/architecture/architecture.md) —
-  current/target architecture split and behavioral invariants.
-- `src/cambium/` and `tests/` — implementation and behavior evidence.
-- [`docs/research/README.md`](docs/research/README.md) — research index;
-  drafts are historical unless an authoritative document cites them.
-- [`docs/research/v2-1-status.md`](docs/research/v2-1-status.md) — concise
-  capability/gap tracker.
-- [`implementation-plan.md`](implementation-plan.md) — ordered implementation
-  work, not a merge log.
-
-## Repository layout
-
-```
-cambium/
-├── agents.md
-├── docs/architecture/architecture.md
-├── docs/research/
-├── src/cambium/        runtime, controls, providers, and modules
-├── tests/scenarios/    runtime and integration scenarios
-└── pyproject.toml
-```
-
-Read `agents.md` before changing code. Work in an isolated `wt-*` branch and
-verify claims with the narrowest relevant check.
+  canonical current-versus-target contract.
+- [`docs/research/v2-1-status.md`](docs/research/v2-1-status.md) — sole detailed
+  live capability/gap table.
+- [`implementation-plan.md`](implementation-plan.md) — ordered work only.
+- [`docs/research/README.md`](docs/research/README.md) — research authority and
+  index. Drafts provide context, not runtime proof.

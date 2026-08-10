@@ -1,52 +1,57 @@
 # Implementation plan
 
-This is an ordered work plan. It is not a branch ledger, merge log, or review
-archive. Source and tests decide whether a step is complete.
+Ordered work only. Source and tests decide when a step is complete; this file
+is not a branch ledger or merge log.
 
-## 1. Canonical runtime and controls
+## 1. Production hierarchy and dynamic admission
 
-- Make `run_plan` use one supervisor/store/sequencer path. Remove the slice and
-  fallback implementations after callers and tests move to the canonical
-  interfaces.
-- Wire session redaction before event admission and connect the root result
-  writer to the plan lifecycle.
-- Bound supervisor event handoff and transport queues. Keep line limits,
-  deadline-bound waits, fencing, worktree recovery, approval, resource gates,
-  and fail-closed publication behavior.
-- Add focused checks for each boundary: malformed plan, protocol overflow,
-  worker restart, gate failure, redaction, and non-fast-forward publication.
+- Integrate `tasktree.build_tree`, `ready_tasks`, and `topological_order` with
+  `supervisor.run_plan` so only validated, dependency-ready nodes are admitted.
+- Define the production hierarchy boundary: root ownership, depth/width and
+  session admission, envelope-only child results, durable revision records, and
+  failure propagation.
+- Connect the injected Architectus decision port and conversation persistence
+  only after their callers, schemas, and failure paths are explicit. A provider
+  response may propose a revision, but cannot mutate the live tree directly.
+- Add deterministic checks for unready dispatch, duplicate/cyclic revisions,
+  width limits, parent isolation, and cancellation.
 
-**Exit evidence:** one deterministic `run_plan` path passes its focused
-scenario set, writes a redacted event store and root result, and leaves no
-slice/fallback caller.
+## 2. Per-worker OS containment and approval
 
-## 2. Thin real-provider vertical proof
+- Select and implement the host boundary for each worker's process, filesystem,
+  CPU/memory/task limits, network policy, and teardown. Worktree/process-group
+  isolation alone is not sufficient.
+- Pass a production `ApprovalGate` policy and callback into the worker tool
+  context. Keep denied commands fail-closed; treat `fail_open` as development
+  configuration only.
+- Add focused checks for containment setup/teardown, resource exhaustion,
+  denied and unavailable approval, and no publication after control failure.
 
-Run one explicit provider configuration through the bounded worker loop, a
-deterministic gate, and ref-only merge. Keep credentials in the environment,
-use a disposable test repository, and do not make this the default CI path.
+## 3. Provider usage and quota contract
 
-**Exit evidence:** a recorded provider request, tool/checkpoint events, one
-worker commit, a passing gate, and the expected `refs/heads/main` update; the
-failure case leaves `main` unchanged.
+- Specify redacted durable usage events: provider, model, request/turn,
+  token fields, cost, latency, Retry-After, quota owner, and failure reason.
+- Connect accounting at the supervisor/event boundary and define behavior when
+  accounting or quota state is unavailable. Preserve environment-only secrets.
+- Test 429 `Retry-After`, same-provider retry, quota exhaustion, and provider
+  fallback against the contract. Do not introduce weighted routing until the
+  usage and quota evidence is stable; configured priority remains the current
+  policy.
 
-## 3. Fixed-tree scheduling
+## 4. External-provider smoke
 
-Connect `tasktree.build_tree`, `topological_order`, and `ready_tasks` to the
-supervisor. Integrate the pure Architectus core behind an injected decision
-port, schedule only ready nodes, and preserve dependency validation and result
-information hiding. Do not add dynamic replanning to this first integration.
+- When credentials exist, run one disposable provider configuration through the
+  custom worker loop, tool/checkpoint events, deterministic gate, and ref-only
+  merge under the selected containment boundary.
+- Keep the run opt-in and networked only by explicit command. Record request
+  count, usage events, commit, gate result, merge ref, and the failure case that
+  leaves `main` unchanged without recording secrets.
+- A loopback smoke is useful regression evidence, but it does not substitute
+  for an external-provider run or prove per-worker OS isolation.
 
-**Exit evidence:** deterministic scenarios prove dependency order, bounded
-parallel width, failure propagation, and no dispatch of an unready node.
+## 5. Follow-on evaluation
 
-## 4. Measured experiments
-
-After the runtime path is reproducible, run isolated experiments for persistent
-worker widths, provider routing, context compression, and the example module's
-DSPy refinement. Pin inputs and record the metric and failure criteria before
-comparing runs.
-
-**Exit evidence:** each experiment has a reproducible command, fixed fixtures,
-an explicit baseline, and a decision to adopt, defer, or reject. No experiment
-changes the runtime contract without a new source/test proof.
+After steps 1–4 are reproducible, measure worker reuse, provider routing,
+context compression, and the example module's DSPy seam with fixed datasets,
+baselines, and failure criteria. Adopt, defer, or reject each experiment from
+its evidence; do not change the runtime contract silently.
