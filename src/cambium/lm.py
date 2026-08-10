@@ -69,6 +69,9 @@ _IMPLEMENTATION_LOCK = threading.Lock()
 _DIFFUNDO_REGISTRY_LOCK = threading.Lock()
 _DIFFUNDO_REGISTRY: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _DSPY: Any | None = None
+_JSON_SNAPSHOT_SENTINEL = "__cambium_json_snapshot_v1__"
+_JSON_MAPPING_MARKER = 0
+_JSON_BYTES_MARKER = 1
 
 
 def _normalize_key(key: Any) -> Any:
@@ -291,7 +294,6 @@ class _CambiumLMMixin:
         self._tier = ProviderTier(tier)
         self._provider_model = self._validate_model(model)
         self._budget_usd = self._validate_budget(budget_usd)
-        self._diffundo_reference = _register_diffundo(diffundo)
         kwargs = self._safe_kwargs(kwargs)
         super().__init__(
             model=f"cambium/{self._tier.value}",
@@ -304,6 +306,7 @@ class _CambiumLMMixin:
         )
         self.launch_kwargs = _freeze(self.launch_kwargs)
         self.train_kwargs = _freeze(self.train_kwargs)
+        self._diffundo_reference = _register_diffundo(diffundo)
 
     def __call__(
         self,
@@ -479,32 +482,50 @@ class _CambiumLMMixin:
 
     @staticmethod
     def _json_snapshot(value: Any) -> Any:
-        if type(value) is bytes:
-            return {"__cambium_bytes_base64__": base64.b64encode(value).decode("ascii")}
-        if isinstance(value, Mapping):
-            return {
-                _CambiumLMMixin._json_snapshot(key): _CambiumLMMixin._json_snapshot(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, tuple):
-            return tuple(_CambiumLMMixin._json_snapshot(item) for item in value)
-        return value
+        def encode(item: Any) -> Any:
+            if type(item) is bytes:
+                payload = base64.b64encode(item).decode("ascii")
+                return {_JSON_SNAPSHOT_SENTINEL: [_JSON_BYTES_MARKER, payload]}
+            if isinstance(item, Mapping):
+                pairs = [[encode(key), encode(nested)] for key, nested in item.items()]
+                return {_JSON_SNAPSHOT_SENTINEL: [_JSON_MAPPING_MARKER, pairs]}
+            if isinstance(item, tuple):
+                return [encode(nested) for nested in item]
+            return item
+
+        return {key: encode(item) for key, item in value.items()}
 
     @staticmethod
     def _restore_json_snapshot(value: Any) -> Any:
-        if type(value) is dict and set(value) == {"__cambium_bytes_base64__"}:
-            encoded = value["__cambium_bytes_base64__"]
-            if type(encoded) is not str:
-                raise TypeError("CambiumLM byte snapshot must contain an exact builtin string")
-            return base64.b64decode(encoded, validate=True)
-        if type(value) is dict:
-            return {
-                key: _CambiumLMMixin._restore_json_snapshot(item)
-                for key, item in value.items()
-            }
-        if type(value) is list:
-            return [_CambiumLMMixin._restore_json_snapshot(item) for item in value]
-        return value
+        def decode(item: Any) -> Any:
+            if type(item) is list:
+                return [decode(nested) for nested in item]
+            if type(item) is not dict:
+                return item
+            if set(item) != {_JSON_SNAPSHOT_SENTINEL}:
+                raise ValueError("invalid CambiumLM JSON snapshot wrapper")
+
+            wrapper = item[_JSON_SNAPSHOT_SENTINEL]
+            if type(wrapper) is not list or len(wrapper) != 2:
+                raise ValueError("invalid CambiumLM JSON snapshot wrapper")
+            marker, payload = wrapper
+            if type(marker) is not int:
+                raise ValueError("invalid CambiumLM JSON snapshot marker")
+            if marker == _JSON_BYTES_MARKER:
+                if type(payload) is not str:
+                    raise TypeError("CambiumLM byte snapshot must contain an exact builtin string")
+                return base64.b64decode(payload, validate=True)
+            if marker != _JSON_MAPPING_MARKER or type(payload) is not list:
+                raise ValueError("invalid CambiumLM JSON snapshot marker")
+
+            restored: dict[Any, Any] = {}
+            for pair in payload:
+                if type(pair) is not list or len(pair) != 2:
+                    raise ValueError("invalid CambiumLM JSON snapshot mapping")
+                restored[decode(pair[0])] = decode(pair[1])
+            return restored
+
+        return {key: decode(item) for key, item in value.items()}
 
     @classmethod
     def _call_kwargs(cls, kwargs: Mapping[str, Any]) -> dict[str, Any]:

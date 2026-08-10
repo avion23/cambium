@@ -546,6 +546,22 @@ def test_construction_registers_diffundo_once() -> None:
     assert len(lm_module._DIFFUNDO_REGISTRY) == 100
 
 
+def test_rejected_constructions_do_not_register_diffundo() -> None:
+    _require_dspy()
+    import cambium.lm as lm_module
+
+    diffundo = FakeDiffundo()
+    with lm_module._DIFFUNDO_REGISTRY_LOCK:
+        lm_module._DIFFUNDO_REGISTRY.clear()
+        registry_size = len(lm_module._DIFFUNDO_REGISTRY)
+
+    for _ in range(100):
+        with pytest.raises(ValueError, match="callbacks"):
+            CambiumLM(diffundo, ProviderTier.FAST, callbacks=[object()])  # type: ignore[arg-type]
+
+    assert len(lm_module._DIFFUNDO_REGISTRY) == registry_size
+
+
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -657,6 +673,25 @@ def test_predict_json_round_trip_preserves_bytearray_snapshot(tmp_path: Path) ->
     predict.load(state_path, allow_unsafe_lm_state=True)
 
     assert predict.lm.launch_kwargs["value"] == b"x"
+
+
+def test_predict_json_round_trip_preserves_literal_byte_marker_mapping(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    marker = {"__cambium_bytes_base64__": "eA=="}
+    predict = dspy.Predict("question -> answer")
+    predict.lm = CambiumLM(  # type: ignore[arg-type]
+        FakeDiffundo(),
+        ProviderTier.FAST,
+        launch_kwargs={"nested": marker},
+    )
+    state_path = tmp_path / "state.json"
+
+    predict.save(state_path)
+    predict.load(state_path, allow_unsafe_lm_state=True)
+
+    assert predict.lm.launch_kwargs["nested"] == marker
 
 
 def test_copied_budget_round_trip_routes_with_override(tmp_path: Path) -> None:
