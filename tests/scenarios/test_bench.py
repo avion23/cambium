@@ -100,6 +100,15 @@ def test_report_writes_valid_baseline(tmp_path) -> None:
     assert baseline["tests"]["by_nodeid"].keys() == set(FAST_TESTS)
 
 
+def test_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
+    bench_root = tmp_path / "baselines"
+    gate = run_bench(bench_root, "gate")
+
+    assert gate.returncode == 1, gate.stdout + gate.stderr
+    assert "missing pre-existing anchor" in gate.stdout
+    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+
+
 def test_gate_passes_without_drift(tmp_path) -> None:
     bench_root = tmp_path / "baselines"
     report = run_bench(bench_root, "report")
