@@ -55,6 +55,7 @@ def _spec(session_dir: Path, *, write_marker: bool) -> dict:
         "write_marker": write_marker,
         "gate": GATE,
         "spec": "append the cambium-slice marker line to the target file",
+        "provider_env_keys": ["FAKE_MODE"],
     }
 
 

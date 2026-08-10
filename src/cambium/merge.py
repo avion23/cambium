@@ -48,6 +48,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from cambium.process_env import build_subprocess_env
+
 from .auth import scrub_environment
 
 MAIN_REF = "refs/heads/main"
@@ -613,11 +615,19 @@ class MergeSequencer:
     # -- git plumbing -------------------------------------------------------
 
     @staticmethod
-    def _git_env() -> dict[str, str]:
-        """Credential-scrubbed env for git subprocesses and their hooks."""
-        env = scrub_environment()
-        env.pop(_QUARANTINE_ENV, None)
-        return env
+    def _git_env(
+        cwd: str | Path | None = None,
+        overrides: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Strict environment for git and its hooks, quarantine-free."""
+        if cwd is None:
+            env = scrub_environment()
+            env.pop(_QUARANTINE_ENV, None)
+            return env
+        return build_subprocess_env(
+            worktree=Path(cwd) if cwd is not None else None,
+            overrides=overrides,
+        )
 
     def _run(
         self,
@@ -626,13 +636,19 @@ class MergeSequencer:
         check: bool = True,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        trusted_overrides = {
+            key: env[key]
+            for key in ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+            if env is not None and key in env
+        }
         try:
             result = subprocess.run(
                 ["git", *args],
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
-                env=self._git_env() if env is None else env,
+                env=self._git_env(cwd, trusted_overrides),
+                start_new_session=True,
             )
         except OSError as exc:
             # e.g. the repo path is a file, not a directory (NotADirectoryError)
@@ -651,14 +667,13 @@ class MergeSequencer:
         return result.stdout.strip()
 
     def _is_registered_worktree(self, repo: Path, worktree_path: Path) -> bool:
-        result = self._run_repo(repo, "worktree", "list", "--porcelain")
-        wanted = os.path.abspath(worktree_path)
-        for line in result.stdout.splitlines():
-            if line.startswith("worktree "):
-                current = os.path.abspath(line[len("worktree "):].strip())
-                if current == wanted:
-                    return True
-        return False
+        result = self._run_repo(repo, "worktree", "list", "--porcelain", "-z")
+        wanted = worktree_path.resolve()
+        return any(
+            field.startswith("worktree ")
+            and Path(field.removeprefix("worktree ")).resolve() == wanted
+            for field in result.stdout.split("\0")
+        )
 
     def _ensure_worker_tip(self, repo: Path, branch: str) -> str:
         """Resolve the worker branch tip, fetching it from origin if not local.
@@ -686,11 +701,11 @@ class MergeSequencer:
             ) from None
 
     @staticmethod
-    def _rebase_env() -> dict[str, str]:
-        env = MergeSequencer._git_env()
-        env["GIT_EDITOR"] = "true"
-        env["GIT_SEQUENCE_EDITOR"] = "true"
-        return env
+    def _rebase_env(cwd: str | Path | None = None) -> dict[str, str]:
+        return MergeSequencer._git_env(
+            cwd,
+            {"GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"},
+        )
 
     def _conflicted_paths(
         self, worktree_path: Path, rebase_output: str
@@ -775,7 +790,8 @@ class MergeSequencer:
         self._staging_ref = staging_ref
 
         rebase = self._run(
-            worktree_path, "rebase", base_tip, check=False, env=self._rebase_env()
+            worktree_path, "rebase", base_tip, check=False,
+            env=self._rebase_env(worktree_path),
         )
         if rebase.returncode != 0:
             conflicts = self._conflicted_paths(worktree_path, rebase.stdout + rebase.stderr)

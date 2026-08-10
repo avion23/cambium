@@ -29,14 +29,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from cambium.fencing import read_generation, write_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
@@ -88,6 +92,7 @@ class WorkerSupervisor:
         self.stderr_lines: list[str] = []
         self._stderr_task: asyncio.Task | None = None
         self._env = env
+        self._generation = 1
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
@@ -110,6 +115,20 @@ class WorkerSupervisor:
 
     async def send(self, msg: dict) -> None:
         assert self.proc is not None
+        if msg.get("type") == "init":
+            self._generation = int(msg.get("generation", 1))
+        if msg.get("type") == "run_task":
+            scratch = Path(msg["scratch_repo"]).resolve()
+            worktree = Path(msg["worktree_path"]).resolve()
+            if not worktree.exists():
+                subprocess.run(
+                    ["git", "-C", str(scratch), "worktree", "add", "-b",
+                     msg["branch"], str(worktree), "main"],
+                    check=True,
+                    capture_output=True,
+                )
+            if read_generation(worktree) < self._generation:
+                write_generation(worktree, self._generation)
         self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
         await self.proc.stdin.drain()
 
@@ -576,6 +595,315 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             await w.stop()
 
     asyncio.run(scenario())
+
+
+def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-ping-1",
+                          "task_id": "ipc-ping", "generation": 1})
+            assert (await w.recv())["type"] == "ready"
+            await w.send({"type": "ping", "request_id": "ping-exact-1"})
+            pong = await w.recv()
+            assert pong == {
+                "type": "pong",
+                "request_id": "ping-exact-1",
+                "task_id": "ipc-ping",
+                "generation": 1,
+                "monotonic_ms": pong["monotonic_ms"],
+            }
+            await w.send({"type": "shutdown", "request_id": "shutdown-ping"})
+            assert (await w.recv())["type"] == "ok"
+            assert (await w.recv())["reason"] == "shutdown"
+            assert await w.proc.wait() == 0
+        finally:
+            await w.stop()
+
+    asyncio.run(scenario())
+
+
+def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    worktree = session_dir / "wt"
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-fence-1",
+                          "task_id": "ipc-fence", "generation": 2})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-fence-1", work_delay_s=1.0,
+                task_id="ipc-fence", generation=2,
+            ))
+            assert (await w.recv())["type"] == "heartbeat"
+            write_generation(worktree, 3)
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert "// cambium-ipc" not in (worktree / "hello.txt").read_text()
+            assert await w.proc.wait() == 1
+        finally:
+            await w.stop()
+
+    asyncio.run(scenario())
+
+
+def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    hook_started = tmp_path / "hook-started"
+    hook_release = tmp_path / "hook-release"
+    hook = scratch / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    worktree = session_dir / "wt"
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-fence-hook",
+                          "task_id": "ipc-fence-hook", "generation": 2})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-fence-hook", task_id="ipc-fence-hook",
+                generation=2,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while not hook_started.exists():
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            write_generation(worktree, 3)
+            await asyncio.sleep(0.05)
+            hook_release.touch()
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert await w.proc.wait() == 1
+        finally:
+            hook_release.touch()
+            await w.stop()
+
+    asyncio.run(scenario())
+
+    commits_after_fence = subprocess.run(
+        ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert commits_after_fence == "0"
+    assert MARKER not in subprocess.run(
+        ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    hook_started = tmp_path / "post-commit-started"
+    hook_release = tmp_path / "post-commit-release"
+    hook = scratch / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    worktree = session_dir / "wt"
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-post-commit-fence",
+                          "task_id": "ipc-post-commit-fence", "generation": 2})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-post-commit-fence",
+                task_id="ipc-post-commit-fence", generation=2,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while not hook_started.exists():
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            write_generation(worktree, 3)
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert await w.proc.wait() == 1
+        finally:
+            hook_release.touch()
+            await w.stop()
+
+    asyncio.run(scenario())
+
+    # The stale worker owns no recovery operations after fence invalidation.
+    # Its commit remains only on the disposable task branch until supervisor
+    # recovery resets that branch; refs/heads/main is never published.
+    commits_before_recovery = int(subprocess.run(
+        ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout)
+    assert commits_before_recovery == 1
+    assert MARKER in subprocess.run(
+        ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert MARKER not in subprocess.run(
+        ["git", "-C", str(scratch), "show", "refs/heads/main:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert read_generation(worktree) == 3
+
+    from cambium import supervisor as supervisor_module
+
+    runtime = supervisor_module._Runtime(session_dir, None)
+    recovered_generation = asyncio.run(runtime._recover_worktree({
+        "repo": str(scratch),
+        "worktree_path": str(worktree),
+        "branch": "wt-ipc-001",
+        "base_commit": base,
+        "task_id": "ipc-post-commit-fence",
+    }))
+
+    assert recovered_generation == 4
+    assert read_generation(worktree) == 4
+    assert subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+    assert MARKER not in (worktree / "hello.txt").read_text(encoding="utf-8")
+
+
+def test_stale_worker_never_mutates_newer_generations_staged_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    worktree = session_dir / "wt"
+    subprocess.run(
+        [
+            "git", "-C", str(scratch), "worktree", "add", "-b", "wt-stale",
+            str(worktree), base,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    write_generation(worktree, 1)
+    hook_started = tmp_path / "post-commit-started"
+    hook_release = tmp_path / "post-commit-release"
+    hook = scratch / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    from cambium import worker as worker_module
+
+    allow_stale_detection = threading.Event()
+    real_validate = worker_module.validate_worker_generation
+
+    def controlled_validate(path: Path, generation: int) -> bool:
+        if generation == 1 and read_generation(path) == 2:
+            return not allow_stale_detection.is_set()
+        return real_validate(path, generation)
+
+    monkeypatch.setattr(worker_module, "validate_worker_generation", controlled_validate)
+    result_holder: list[dict] = []
+    worker_thread = threading.Thread(
+        target=lambda: result_holder.append(worker_module.do_work({
+            "scratch_repo": str(scratch),
+            "worktree_path": str(worktree),
+            "target_file": "hello.txt",
+            "marker": MARKER,
+            "write_marker": True,
+            "task_id": "stale-generation-1",
+            "generation": 1,
+        }, threading.Event())),
+        daemon=True,
+    )
+    worker_thread.start()
+    deadline = time.monotonic() + 5.0
+    while not hook_started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert hook_started.exists()
+
+    # Generation 2 takes ownership and stages in-progress work before generation
+    # 1 observes the invalidated fence.
+    write_generation(worktree, 2)
+    generation_2_file = worktree / "generation-2.txt"
+    generation_2_file.write_text("generation 2 in progress\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "generation-2.txt"], check=True)
+    head_before_stale_detection = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    staged_before_stale_detection = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
+    allow_stale_detection.set()
+    hook_release.touch()
+    worker_thread.join(timeout=5.0)
+
+    assert not worker_thread.is_alive()
+    assert result_holder[0]["status"] == "failed"
+    assert "generation mismatch" in result_holder[0]["failure_reason"]
+    assert read_generation(worktree) == 2
+    assert subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == head_before_stale_detection
+    assert subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines() == staged_before_stale_detection == ["generation-2.txt"]
+    assert generation_2_file.read_text(encoding="utf-8") == "generation 2 in progress\n"
 
 
 def test_worker_shutdown_graceful_exit(tmp_path) -> None:

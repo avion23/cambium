@@ -76,7 +76,10 @@ def do_work(run: dict) -> tuple[str, str | None, list[str], list[str], str]:
     if worktree.exists():
         git("worktree", "remove", "--force", str(worktree), cwd=scratch)
     git("branch", "-D", branch, cwd=scratch)
-    rc, _out, err = git("worktree", "add", "-b", branch, str(worktree), "main", cwd=scratch)
+    base_ref = run.get("base_commit") or "main"
+    rc, _out, err = git(
+        "worktree", "add", "-b", branch, str(worktree), base_ref, cwd=scratch
+    )
     if rc != 0:
         return ("failed", f"worktree add failed: {err}", [], [], "")
     if not write_marker:

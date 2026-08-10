@@ -70,31 +70,28 @@ async def _read_line(reader: asyncio.StreamReader, limit: int) -> bytes | None:
     """Read exactly one newline-terminated line, bounded by ``limit`` bytes.
 
     Returns the line bytes including its trailing newline, or ``None`` when
-    EOF is reached. Reads one byte at a time so a single ``reader.read(n)``
-    can never consume bytes past the first newline. Raises ``MessageTooLong``
-    (after resyncing past the oversized line) when more than ``limit`` content
-    bytes accumulate without a newline.
+    EOF is reached. ``readuntil`` preserves bytes after the first newline and
+    avoids one coroutine step per byte. A reader constructed with a smaller
+    limit is temporarily raised for this call and restored afterwards.
+    Oversized input is resynchronized to the next newline before
+    ``MessageTooLong`` is raised.
 
-    Perf tradeoff: byte-at-a-time reads cost one coroutine step per byte for
-    already-buffered data (no syscall amplification — the pipe transport
-    fills the reader's buffer in bulk), keeping the per-call ``limit`` exact
-    and the newline boundary precise. An alternative is ``readuntil`` /
-    ``StreamReader.readline`` on a reader constructed with a matching limit,
-    but that couples the cap to the reader's constructor and needs explicit
-    ``LimitOverrunError`` resync. Keep byte-accurate reads unless profiling
-    shows them on a hot path.
+    The temporary reader limit preserves the public ``limit`` argument even
+    for in-memory readers created with asyncio's smaller default.
     """
-    buf = bytearray()
-    while True:
-        if len(buf) > limit:
+    original_limit = reader._limit
+    reader._limit = limit
+    try:
+        try:
+            return await reader.readuntil(b"\n")
+        except asyncio.IncompleteReadError as exc:
+            return exc.partial or None
+        except asyncio.LimitOverrunError as exc:
+            await reader.read(exc.consumed)
             await _discard_to_newline(reader)
-            raise MessageTooLong(len(buf))
-        byte = await reader.read(1)
-        if not byte:
-            return bytes(buf) or None
-        buf.extend(byte)
-        if byte == b"\n":
-            return bytes(buf)
+            raise MessageTooLong(exc.consumed) from exc
+    finally:
+        reader._limit = original_limit
 
 
 async def read_message(
