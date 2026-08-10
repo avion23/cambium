@@ -31,7 +31,10 @@ distinguishes the diagnosis from alternatives.
   `auth`, `supervisor`, `doctor`, `bench`, `tasktree`, `module-test`, and
   `version`.
 - `supervisor.run_plan` validates a flat list of supplied tasks, starts one
-  runtime, and fans tasks out under an `asyncio.TaskGroup`. It creates
+  runtime, and fans tasks out under an `asyncio.TaskGroup`. There is no
+  worker-count semaphore: an 11-task canary observed 11 concurrent
+  supervisions. `resource_thresholds` checks host health; `CompileGate` limits
+  only classified heavy gate commands. It creates
   `store.EventStore`, writes `.cambium/result.json`, runs gates, and publishes
   successful merges by an expected-old update of `refs/heads/main`. Publication
   is ref-only; it does not refresh a checkout.
@@ -58,6 +61,10 @@ distinguishes the diagnosis from alternatives.
   health. `module_conformance` supplies the isolated `module-test` gate. The
   example module has deterministic `decide` and `evaluate` CLI operations and
   split evaluators in `metric.py`.
+- The redaction canary
+  `tests/scenarios/test_bench.py::test_bench_stderr_never_leaks_escaped_secret_in_free_form_text`
+  fails: mixed raw/Unicode-escaped stderr retains `\u005c` through the
+  `modules/base.py` → `redact.py` boundary. Fix it before live use.
 
 ### Accepted target boundary
 

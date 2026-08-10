@@ -23,6 +23,11 @@ gate runs before merge. Successful publication uses an expected-old atomic
 update of `refs/heads/main`. It is ref-only and never refreshes the caller's
 checkout or index.
 
+There is no worker-count semaphore: an 11-task canary observed 11 concurrent
+supervisions. `resource_thresholds` only checks host health;
+`resources.CompileGate` limits heavy gate commands, so neither bounds worker
+admission.
+
 The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
 records through it, and writes `.cambium/result.json` after shutdown. The
 one-task `run_session` adapter remains for compatibility. It is not a DAG
@@ -57,6 +62,10 @@ depleted bucket reports `RATE_LIMITED`. It has no local response cache. HTTP 429
 responses carry a parsed `Retry-After` delay into the same-provider retry path.
 Weighted routing and a production provider token, cost, and account-quota
 observability contract are not implemented.
+
+The bench canary currently fails at the module diagnostic boundary: mixed
+raw/Unicode-escaped free-form stderr retains `\u005c` through
+`modules/base.py` → `redact.py`. This is a current defect, not live-safety proof.
 
 ### Trees, diagnostics, and modules
 
@@ -105,9 +114,14 @@ artifacts. Worktree and process-group isolation is not an OS sandbox. The
 but the `run_plan` worker context does not provide a production approval
 service; `fail_open` is an explicit dangerous policy option.
 
+External live use is blocked until worker admission, escaped free-form
+redaction, deployment credentials/configuration, and per-worker OS containment
+are verified. A loopback smoke does not prove them.
+
 ## 3. Target contracts and delivery order
 
-These are open contracts, not current interfaces:
+These are open contracts, not current interfaces. Stabilize live-run
+prerequisites before adding hierarchy or dynamic admission.
 
 ### Production hierarchy and admission
 
@@ -144,10 +158,10 @@ ordering remains the current policy.
 
 ### External-provider acceptance
 
-Run a disposable, credentialed provider smoke through worker loop, tool event,
-checkpoint, gate, and ref-only merge. Credentials stay in the environment and
-the run is never a default network test. External credentials are not present
-in this checkout, so external-provider acceptance remains open.
+Run a disposable credentialed smoke through the worker loop, tool event,
+checkpoint, gate, and ref-only merge. Keep credentials in the environment and
+network opt-in. Deployment credentials/configuration are external and
+ephemeral; doctor currently reports no runnable configured provider.
 
 ## 4. Failure policy by boundary
 
