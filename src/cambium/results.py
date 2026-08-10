@@ -24,6 +24,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 CHILD_RESULT_KEYS: tuple[str, ...] = (
@@ -136,10 +137,10 @@ def _token(value: Any) -> str | None:
 
 
 def _text(value: Any) -> str:
-    if value is None:
+    if value is _MISSING:
         return ""
-    if not isinstance(value, str):
-        raise TypeError("result text fields must be strings")
+    if value is None or not isinstance(value, str):
+        raise TypeError("summary must be a string")
     return value
 
 
@@ -433,7 +434,10 @@ def _copy_sequence(value: Any) -> list[Any]:
         return []
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise TypeError("commits and files_changed must be sequences")
-    return list(value)
+    items = list(value)
+    if not all(isinstance(item, str) for item in items):
+        raise TypeError("commits and files_changed must contain strings")
+    return items
 
 
 def _final_bool(value: Any) -> bool:
@@ -520,9 +524,9 @@ def wire_to_child_result(
         "parent_task_id": parent_task_id,
         "unified_diff": unified_diff,
         "diff_truncated": _final_bool(_wire_value(wire, "diff_truncated")),
-        "summary": _text(summary if summary is not _MISSING else None),
-        "metric_score": metric_score,
-        "metric_breakdown": metric_breakdown,
+        "summary": _text(summary),
+        "metric_score": _unit_metric_score(metric_score),
+        "metric_breakdown": _final_metric_breakdown(metric_breakdown),
         "commits": _copy_sequence(_wire_value(wire, "commits")),
         "files_changed": _copy_sequence(_wire_value(wire, "files_changed")),
         "status": status,
@@ -546,6 +550,17 @@ def _final_metric_score(value: Any) -> float:
     if not math.isfinite(score):
         raise ValueError("metric_score must be finite")
     return score
+
+
+def _final_timestamp(value: Any) -> float:
+    if value is _MISSING or value is None:
+        raise TypeError("timestamps must be numbers")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("timestamps must be numbers")
+    timestamp = float(value)
+    if not math.isfinite(timestamp):
+        raise ValueError("timestamps must be finite")
+    return timestamp
 
 
 def _unit_metric_score(value: Any) -> float:
@@ -597,7 +612,7 @@ class Result:
     diff_truncated: bool
     summary: str
     metric_score: float
-    metric_breakdown: dict[str, float]
+    metric_breakdown: Mapping[str, float]
     parent_task_id: str | None
     event_log_ref: str
     session_id: str
@@ -631,14 +646,18 @@ class Result:
             raise TypeError("failure_reason must be a string or None")
         if not isinstance(self.diff_truncated, bool):
             raise TypeError("diff_truncated must be a boolean")
-        started_at = _final_metric_score(self.started_at)
-        ended_at = _final_metric_score(self.ended_at)
+        started_at = _final_timestamp(self.started_at)
+        ended_at = _final_timestamp(self.ended_at)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "commits", _final_sequence(self.commits))
         object.__setattr__(self, "files_changed", _final_sequence(self.files_changed))
         object.__setattr__(self, "diff_truncated", self.diff_truncated)
         object.__setattr__(self, "metric_score", _unit_metric_score(self.metric_score))
-        object.__setattr__(self, "metric_breakdown", _final_metric_breakdown(self.metric_breakdown))
+        object.__setattr__(
+            self,
+            "metric_breakdown",
+            MappingProxyType(_final_metric_breakdown(self.metric_breakdown)),
+        )
         object.__setattr__(self, "started_at", started_at)
         object.__setattr__(self, "ended_at", ended_at)
 
@@ -672,7 +691,7 @@ class Result:
 def _timestamp(value: Any, default: float) -> float:
     if value is _MISSING or value is None:
         value = default
-    return _final_metric_score(value)
+    return _final_timestamp(value)
 
 
 def _failure_reason(wire: Mapping[str, Any], status: str) -> str | None:
@@ -793,7 +812,8 @@ def result_to_dict(result: Result) -> dict[str, Any]:
     record = {key: getattr(result, key) for key in ROOT_RESULT_KEYS}
     record["commits"] = list(result.commits)
     record["files_changed"] = list(result.files_changed)
-    record["metric_breakdown"] = dict(result.metric_breakdown)
+    record["metric_score"] = _unit_metric_score(result.metric_score)
+    record["metric_breakdown"] = dict(_final_metric_breakdown(result.metric_breakdown))
     return record
 
 

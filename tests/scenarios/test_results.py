@@ -115,6 +115,32 @@ def test_child_mapper_rejects_explicit_none_diff() -> None:
         wire_to_child_result(_wire(diff=None))
 
 
+def test_child_mapper_rejects_out_of_range_metrics() -> None:
+    with pytest.raises(ValueError, match="metric_score"):
+        wire_to_child_result(_wire(metric_score=2))
+    with pytest.raises(ValueError, match="metric_score"):
+        wire_to_child_result(_wire(metric_breakdown={"x": 2}))
+    with pytest.raises(ValueError, match="metric_score"):
+        wire_to_child_result(
+            _wire(metrics={"metric_score": 0.5, "metric_breakdown": {"x": 2}})
+        )
+    child = wire_to_child_result(_wire(metric_score=0.9, metric_breakdown={"x": 0.7}))
+    assert child["metric_score"] == 0.9
+    assert child["metric_breakdown"] == {"x": 0.7}
+
+
+def test_child_mapper_rejects_non_string_sequence_elements_and_none_summary() -> None:
+    for value in ({"commits": [42]}, {"files_changed": [42]}):
+        with pytest.raises(TypeError, match="contain strings"):
+            wire_to_child_result(_wire(**value))
+    with pytest.raises(TypeError, match="summary"):
+        wire_to_child_result(_wire(summary=None))
+    child = wire_to_child_result({"status": "succeeded"})
+    assert child["summary"] == ""
+    assert child["commits"] == []
+    assert child["files_changed"] == []
+
+
 def test_root_result_rejects_none_unified_diff(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="unified_diff"):
         _root(tmp_path, status="succeeded", unified_diff=None)
@@ -334,6 +360,19 @@ def test_metric_breakdown_values_are_range_checked(tmp_path: Path) -> None:
         _root(tmp_path, status="succeeded", metric_breakdown={"tests": 1.5})
 
 
+def test_result_metric_breakdown_is_immutable_after_construction(
+    tmp_path: Path,
+) -> None:
+    result = _root(tmp_path, status="succeeded", metric_breakdown={"tests": 0.9})
+    with pytest.raises(TypeError):
+        result.metric_breakdown["tests"] = 2.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.metric_breakdown["extra"] = 2.0  # type: ignore[index]
+    object.__setattr__(result, "metric_breakdown", {"tests": 2.0})
+    with pytest.raises(ValueError, match="metric_score"):
+        result_to_dict(result)
+
+
 def test_result_exit_codes_are_canonical(tmp_path: Path) -> None:
     for status, exit_code in (
         ("succeeded", 0),
@@ -389,6 +428,21 @@ def test_result_rejects_non_finite_timestamps(tmp_path: Path) -> None:
         replace(result, started_at=float("inf"))
     with pytest.raises(ValueError, match="finite"):
         replace(result, ended_at=float("nan"))
+
+
+def test_result_timestamps_reject_numeric_strings_and_none(tmp_path: Path) -> None:
+    result = _root(tmp_path, status="succeeded")
+    for value in ("12.5", None):
+        with pytest.raises(TypeError, match="timestamps"):
+            replace(result, started_at=value)
+    with pytest.raises(TypeError, match="timestamps"):
+        replace(result, ended_at="12.5")
+    with pytest.raises(TypeError, match="timestamps"):
+        root_result_from_wire(
+            {"status": "succeeded", "started_at": "12.5"},
+            tmp_path,
+            session_id="session-1",
+        )
 
 
 def test_result_writer_uses_atomic_replace_and_leaves_no_temp(tmp_path: Path, monkeypatch) -> None:
