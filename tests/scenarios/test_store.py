@@ -1432,6 +1432,28 @@ def test_redactor_scrubs_opaque_secret_from_durable_rows(tmp_path) -> None:
     assert request_id == opaque_key
 
 
+def test_redactor_preserves_numeric_payload_fields_while_redacting_secret_value(
+    tmp_path,
+) -> None:
+    store = EventStore(
+        tmp_path / "events.db",
+        fsync_interval_s=5.0,
+        redactor=Redactor(secret_values={"2"}),
+    )
+    try:
+        store.append({
+            "kind": "result",
+            "payload": {"pid": 20471, "id": 42, "worker": "worker 2 ready"},
+        })
+    finally:
+        store.close()
+
+    payload = store.events_after(0)[0]["payload"]
+    assert payload["pid"] == 20471
+    assert payload["id"] == 42
+    assert payload["worker"] == "worker *** ready"
+
+
 def test_redactor_runs_before_storage_on_long_strings_with_shaped_key(tmp_path) -> None:
     opaque_key = "opaque-worker-key-" + "B" * 24
     shaped_key = "sk-proj-" + "A" * 40

@@ -527,7 +527,16 @@ class EventStore:
     def _redact_row(self, row: tuple) -> tuple:
         if self._redactor is None:
             return row
-        return self._redactor.redact_mapping(row)
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, ValueError):
+            # Undecodable payloads are left untouched; substring redaction of
+            # the encoded text would corrupt them further.
+            return (row[0],) + self._redactor.redact_mapping(row[1:])
+        redacted_payload = self._redactor.redact_mapping(payload)
+        return (json.dumps(redacted_payload),) + self._redactor.redact_mapping(
+            row[1:]
+        )
 
     def _record_dropped(self, count: int) -> None:
         if count <= 0:
