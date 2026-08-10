@@ -7,6 +7,7 @@ every pair, and check the metric. No mocking, no network.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,10 @@ def test_decompose_property_is_read_only_compat_shim() -> None:
 
     assert decomposed.decompose is True
     assert atomic.decompose is False
-    with pytest.raises(AttributeError):
+    # Frozen slots dataclasses reject assignment in their generated
+    # __setattr__ before the read-only property descriptor is reached.
+    # FrozenInstanceError is the precise AttributeError subtype here.
+    with pytest.raises(FrozenInstanceError):
         decomposed.decompose = False
 
 
