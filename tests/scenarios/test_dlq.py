@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -159,3 +161,51 @@ def test_default_queue_preserves_opaque_values_without_registry(tmp_path) -> Non
 
     assert opaque_key.encode() in content
     assert content.count(b"***") == 0
+
+
+def test_queue_and_records_are_private_under_permissive_umask(tmp_path) -> None:
+    """umask 0022 must not widen the DLQ dir (0700) or its records (0600)."""
+    session = tmp_path / "session"
+    script = (
+        "import os, stat, sys\n"
+        "from pathlib import Path\n"
+        "os.umask(0o022)\n"
+        "from cambium.dlq import DeadLetterQueue\n"
+        "session = Path(sys.argv[1])\n"
+        "queue = DeadLetterQueue(session)\n"
+        "record = queue.put({'task_id': 't', 'generation': 1, 'status': 'failed'})\n"
+        "dlq = session / '.cambium' / 'dlq'\n"
+        "assert stat.S_IMODE(dlq.stat().st_mode) == 0o700, dlq\n"
+        "assert stat.S_IMODE(record.stat().st_mode) == 0o600, record\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_reopen_repairs_preseeded_permissive_dlq_records(tmp_path) -> None:
+    """Reopening a queue repairs a permissively preseeded dir and record files."""
+    session = tmp_path / "session"
+    script = (
+        "import os, stat, sys\n"
+        "from pathlib import Path\n"
+        "os.umask(0o022)\n"
+        "from cambium.dlq import DeadLetterQueue\n"
+        "session = Path(sys.argv[1])\n"
+        "queue = DeadLetterQueue(session)\n"
+        "first = queue.put({'task_id': 't1', 'generation': 1, 'status': 'failed'})\n"
+        "dlq = session / '.cambium' / 'dlq'\n"
+        "os.chmod(dlq, 0o755)\n"
+        "os.chmod(first, 0o644)\n"
+        "reopened = DeadLetterQueue(session)\n"
+        "assert stat.S_IMODE(dlq.stat().st_mode) == 0o700, dlq\n"
+        "assert stat.S_IMODE(first.stat().st_mode) == 0o600, first\n"
+        "second = reopened.put({'task_id': 't2', 'generation': 1, 'status': 'failed'})\n"
+        "assert stat.S_IMODE(second.stat().st_mode) == 0o600, second\n"
+        "assert len(reopened.entries()) == 2\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr

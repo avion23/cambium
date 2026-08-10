@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -266,3 +268,30 @@ def test_writer_requires_session_scoped_event_log_ref(tmp_path: Path) -> None:
 
     path = write_result(result, tmp_path, session_id="session-1")
     assert path == tmp_path / ".cambium" / "result.json"
+
+
+def test_result_and_cambium_dir_are_private_under_permissive_umask(tmp_path: Path) -> None:
+    """umask 0022 must not widen .cambium (0700) or result.json (0600)."""
+    session = tmp_path / "session"
+    script = (
+        "import os, stat, sys, time\n"
+        "from pathlib import Path\n"
+        "os.umask(0o022)\n"
+        "from cambium.results import Result, write_result\n"
+        "session = Path(sys.argv[1])\n"
+        "ref = str(session / '.cambium' / 'events.db')\n"
+        "result = Result(\n"
+        "    status='done', exit_code=0, commits=(), files_changed=(), unified_diff='',\n"
+        "    diff_truncated=False, summary='', metric_score=0.0, metric_breakdown={},\n"
+        "    parent_task_id=None, event_log_ref='sqlite:' + ref, session_id='s1',\n"
+        "    started_at=time.time(), ended_at=time.time(), failure_reason=None,\n"
+        ")\n"
+        "path = write_result(result, session, session_id='s1')\n"
+        "assert path == session / '.cambium' / 'result.json'\n"
+        "assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700, path.parent\n"
+        "assert stat.S_IMODE(path.stat().st_mode) == 0o600, path\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr

@@ -124,6 +124,37 @@ _SENTINEL = object()
 _TIMER = object()
 
 
+def _make_private_dir(path: Path) -> None:
+    """Ensure a session-owned directory is not readable by other local users."""
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        # Best effort: a pre-existing directory with a restrictive parent may
+        # refuse chmod; the DB/DLQ files below are still forced private.
+        pass
+
+
+def _make_private_db_file(path: Path) -> None:
+    """Pre-create the SQLite DB as mode 0600 so WAL/SHM sidecars inherit it.
+
+    SQLite derives ``-wal``/``-shm`` files with the same mode as the database
+    when it already exists, so creating the DB privately before ``connect``
+    keeps all three files private under a normal 0022 umask.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            try:
+                os.chmod(sidecar, 0o600)
+            except OSError:
+                pass
+
+
 class _AdmissionCancelled(Exception):
     """A close started while an append was waiting for queue admission."""
 
@@ -343,6 +374,8 @@ class EventStore:
             raise TypeError("redactor must be a cambium.redact.Redactor")
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        _make_private_dir(self._path.parent)
+        _make_private_db_file(self._path)
         self._fsync_interval_s = fsync_interval_s
         self._critical_timeout_s = critical_timeout_s
         self._checkpoint_busy_retry_s = checkpoint_busy_retry_s

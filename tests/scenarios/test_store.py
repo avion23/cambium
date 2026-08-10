@@ -1462,3 +1462,76 @@ def test_redactor_runs_before_storage_on_long_strings_with_shaped_key(tmp_path) 
 def test_event_store_rejects_non_redactor_argument(tmp_path) -> None:
     with pytest.raises(TypeError, match="redactor"):
         EventStore(tmp_path / "events.db", redactor=object())
+
+
+def test_session_artifacts_are_private_under_permissive_umask(tmp_path) -> None:
+    """umask 0022 must not widen .cambium (0700) or events.db/-wal/-shm (0600)."""
+    session = tmp_path / "session"
+    script = (
+        "import os, stat, sys\n"
+        "from pathlib import Path\n"
+        "os.umask(0o022)\n"
+        "from cambium.store import EventStore\n"
+        "session = Path(sys.argv[1])\n"
+        "store = EventStore(session / '.cambium' / 'events.db', fsync_interval_s=60.0)\n"
+        "store.append({'kind': 'result', 'payload': {'ok': True}})\n"
+        "base = session / '.cambium'\n"
+        "assert stat.S_IMODE(base.stat().st_mode) == 0o700, base\n"
+        "for rel in ('events.db', 'events.db-wal', 'events.db-shm'):\n"
+        "    path = base / rel\n"
+        "    assert path.exists(), rel\n"
+        "    assert stat.S_IMODE(path.stat().st_mode) == 0o600, (\n"
+        "        rel, oct(stat.S_IMODE(path.stat().st_mode)))\n"
+        "store.close()\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_reopen_repairs_preseeded_permissive_artifacts(tmp_path) -> None:
+    """A crash leaves -wal/-shm behind; a permissive preseed must be repaired on reopen."""
+    session = tmp_path / "session"
+    crash = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from cambium.store import EventStore\n"
+        "store = EventStore(Path(sys.argv[1]) / '.cambium' / 'events.db')\n"
+        "for i in range(5):\n"
+        "    store.append({'kind': 'result', 'payload': {'i': i}})\n"
+        "os._exit(9)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", crash, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 9, proc.stderr
+    base = session / ".cambium"
+    for rel in ("events.db", "events.db-wal", "events.db-shm"):
+        assert (base / rel).exists(), rel
+    os.chmod(base, 0o755)
+    os.chmod(base / "events.db", 0o644)
+    os.chmod(base / "events.db-wal", 0o644)
+    os.chmod(base / "events.db-shm", 0o644)
+
+    reopen = (
+        "import os, stat, sys\n"
+        "from pathlib import Path\n"
+        "os.umask(0o022)\n"
+        "from cambium.store import EventStore\n"
+        "session = Path(sys.argv[1])\n"
+        "base = session / '.cambium'\n"
+        "store = EventStore(base / 'events.db', fsync_interval_s=60.0)\n"
+        "store.append({'kind': 'result', 'payload': {'ok': True}})\n"
+        "assert stat.S_IMODE(base.stat().st_mode) == 0o700, base\n"
+        "for rel in ('events.db', 'events.db-wal', 'events.db-shm'):\n"
+        "    path = base / rel\n"
+        "    assert path.exists(), rel\n"
+        "    assert stat.S_IMODE(path.stat().st_mode) == 0o600, (\n"
+        "        rel, oct(stat.S_IMODE(path.stat().st_mode)))\n"
+        "store.close()\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", reopen, str(session)], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
