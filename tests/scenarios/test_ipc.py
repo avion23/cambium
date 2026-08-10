@@ -715,6 +715,66 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
     ).stdout
 
 
+def test_worker_fence_advance_during_post_commit_removes_stale_commit(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    hook_started = tmp_path / "post-commit-started"
+    hook_release = tmp_path / "post-commit-release"
+    hook = scratch / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    worktree = session_dir / "wt"
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-post-commit-fence",
+                          "task_id": "ipc-post-commit-fence", "generation": 2})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-post-commit-fence",
+                task_id="ipc-post-commit-fence", generation=2,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while not hook_started.exists():
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            write_generation(worktree, 3)
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert await w.proc.wait() == 1
+        finally:
+            hook_release.touch()
+            await w.stop()
+
+    asyncio.run(scenario())
+
+    commits_after_fence = int(subprocess.run(
+        ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout)
+    stale_committed = MARKER in subprocess.run(
+        ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert commits_after_fence == 0
+    assert stale_committed is False
+
+
 def test_worker_shutdown_graceful_exit(tmp_path) -> None:
     """shutdown acks ok, aborts the current task, and exits gracefully (code 0)."""
     session_dir = tmp_path / "session"

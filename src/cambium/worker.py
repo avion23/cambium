@@ -189,6 +189,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         "diff_truncated": False,
         "summary": "",
     }
+    rollback_base: str | None = None
     try:
         scratch = Path(run["scratch_repo"]).resolve()
         worktree = Path(run["worktree_path"]).resolve()
@@ -229,6 +230,10 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
 
         if not worktree.exists():
             outcome["failure_reason"] = f"worker worktree is missing: {worktree}"
+            return outcome
+        rc, rollback_base, err = guarded_git("rev-parse", "HEAD", cwd=worktree)
+        if rc != 0:
+            outcome["failure_reason"] = f"cannot resolve worktree HEAD: {err}"
             return outcome
 
         # Optional work_delay_s pauses before the edit (testing hook); the
@@ -276,6 +281,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         _rc, sha, _err = guarded_git("rev-parse", "HEAD", cwd=worktree)
         _rc, diff, _err = guarded_git("diff", f"{base_commit}..HEAD", cwd=worktree)
         diff, diff_truncated = cap_diff(diff)
+        _require_generation(worktree, generation)
         outcome.update(
             status="succeeded",
             failure_reason=None,
@@ -287,6 +293,8 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         )
         return outcome
     except GenerationFenceError as exc:
+        if rollback_base is not None:
+            git("reset", "--hard", rollback_base, cwd=worktree)
         outcome["failure_reason"] = str(exc)
         return outcome
     except Exception as exc:  # let-it-crash: report as a failure, not a hang

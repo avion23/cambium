@@ -73,6 +73,10 @@ def _stdin_write_timeout_s() -> float:
     return max(0.0, timeout)
 
 
+def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
+    return "proto" in msg and msg["proto"] != PROTO
+
+
 def _stdin_deadline(wall_deadline: float) -> float:
     loop = asyncio.get_running_loop()
     return min(wall_deadline, loop.time() + _stdin_write_timeout_s())
@@ -393,6 +397,7 @@ async def run_session(
 
     # Phase 1: init -> ready (bounded by ready_timeout and the wall budget).
     timeout_kind: str | None = None
+    protocol_failure: str | None = None
     run_rid: str | None = None
     saw_ready = False
     timeout_kind = "stdin" if not init_written else None
@@ -410,6 +415,14 @@ async def run_session(
             break
         if msg is None:
             break  # EOF before ready
+        if _protocol_version_mismatch(msg):
+            protocol_failure = "PROTO_VERSION_MISMATCH"
+            log.emit(
+                "protocol", task_id=task_id, error_type=protocol_failure,
+                expected=PROTO, got=msg.get("proto"),
+            )
+            await _kill_worker(proc)
+            break
         if msg.get("type") == "ready":
             saw_ready = True
             if msg.get("request_id") != init_rid:
@@ -465,6 +478,14 @@ async def run_session(
                             break
                         if response is None:
                             break
+                        if _protocol_version_mismatch(response):
+                            protocol_failure = "PROTO_VERSION_MISMATCH"
+                            log.emit(
+                                "protocol", task_id=task_id,
+                                error_type=protocol_failure, expected=PROTO,
+                                got=response.get("proto"),
+                            )
+                            break
                         if response.get("type") != "pong":
                             continue
                         if response.get("request_id") == pong_rid:
@@ -487,6 +508,14 @@ async def run_session(
                         timeout_kind = "pong"
                         await _kill_worker(proc)
                 break  # EOF without exit_message
+            if _protocol_version_mismatch(msg):
+                protocol_failure = "PROTO_VERSION_MISMATCH"
+                log.emit(
+                    "protocol", task_id=task_id, error_type=protocol_failure,
+                    expected=PROTO, got=msg.get("proto"),
+                )
+                await _kill_worker(proc)
+                break
             mtype = msg.get("type")
             if mtype == "result_envelope":
                 result_envelope = msg
@@ -521,7 +550,9 @@ async def run_session(
 
     if message_too_long:
         log.emit("protocol", task_id=task_id, note="message too long; worker failed")
-    if timed_out:
+    if protocol_failure is not None:
+        status, exit_code = "failed", 1
+    elif timed_out:
         status, exit_code = "failed", 3
     elif message_too_long:
         status, exit_code = "failed", 1
@@ -1507,6 +1538,7 @@ class _Runtime:
         envelope: dict[str, Any] | None = None
         exit_reason: str | None = None
         correlated = False
+        protocol_failure: str | None = None
         timeout_phase: str | None = "stdin" if not init_written else None
 
         async def _cancel_and_kill() -> None:
@@ -1526,7 +1558,7 @@ class _Runtime:
 
         async def _probe_after_eof() -> bool:
             """Require one exact pong before treating an EOF survivor as live."""
-            nonlocal timeout_phase
+            nonlocal protocol_failure, timeout_phase
             if proc.returncode is not None:
                 return False
             pong_rid = self._next_rid()
@@ -1550,6 +1582,14 @@ class _Runtime:
                     break
                 if response is None:
                     break
+                if _protocol_version_mismatch(response):
+                    protocol_failure = "PROTO_VERSION_MISMATCH"
+                    await self.emit(
+                        "protocol", task_id=task_id, generation=generation,
+                        error_type=protocol_failure, expected=PROTO,
+                        got=response.get("proto"),
+                    )
+                    return False
                 if response.get("type") != "pong":
                     await self.emit(
                         "protocol", task_id=task_id, generation=generation,
@@ -1639,6 +1679,14 @@ class _Runtime:
                             await _kill_worker(proc)
                     break
                 mtype = msg.get("type")
+                if _protocol_version_mismatch(msg):
+                    protocol_failure = "PROTO_VERSION_MISMATCH"
+                    await self.emit(
+                        "protocol", task_id=task_id, generation=generation,
+                        error_type=protocol_failure, expected=PROTO, got=msg.get("proto"),
+                    )
+                    await _kill_worker(proc)
+                    break
                 if mtype == "ready":
                     phase = "run"
                     last_heartbeat = loop.time()
@@ -1771,7 +1819,8 @@ class _Runtime:
         else:
             reason = "result_request_id_mismatch"
         return _GenOutcome(
-            clean=clean, fatal=False, reason=reason, timeout_phase=timeout_phase,
+            clean=clean, fatal=protocol_failure is not None,
+            reason=protocol_failure or reason, timeout_phase=timeout_phase,
             exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
             correlated=correlated,
         )

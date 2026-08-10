@@ -458,6 +458,59 @@ def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     )
 
 
+def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "wrong-proto-worker.py"
+    worker.write_text(
+        "import json, sys, time\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type': 'ready', 'request_id': init['request_id'], "
+        "'task_id': init['task_id'], 'generation': init['generation'], "
+        "'proto': 999}), flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-wrong-proto",
+        worker=str(worker),
+        gate="true",
+        max_restarts=2,
+        max_wall_s=5.0,
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    task_result = result.results[0]
+    assert task_result.status == "failed"
+    assert task_result.reason == "PROTO_VERSION_MISMATCH"
+    assert task_result.restarts == 0
+    events = read_events(session_dir)
+    assert any(
+        event["kind"] == "protocol"
+        and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
+        and event["payload"].get("expected") == supervisor_module.PROTO
+        and event["payload"].get("got") == 999
+        for event in events
+    )
+    assert not _kinds(events, "run_task")
+    assert not _kinds(events, "gate")
+    assert not _kinds(events, "merge_started")
+    assert not _kinds(events, "merge_committed")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base
+
+
 def test_duplicate_task_id_is_rejected_before_store_or_spawn(tmp_path: Path, monkeypatch) -> None:
     def fail_spawn(*args, **kwargs):
         raise AssertionError("duplicate plan spawned a subprocess")
