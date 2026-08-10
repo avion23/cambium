@@ -24,10 +24,10 @@ no per-worker sandbox or production shell approval, and no dynamic hierarchy.
 ### 1.1 Deterministic substrate delivered in the snapshot
 
 1. **EventStore:** one writer, SQLite WAL, critical append ack after checkpoint/fsync, reader
-   connections (`store.py:93–158,172–272`; conformance §1.2–1.3). `recovery_gap` was folded out
+   connections (`store.py:93–158,172–272`; `conformance-report.md` §§1 (Check 1), 2 (Store)). `recovery_gap` was folded out
    in favor of no-gap-by-construction plus phantom-read semantics (architecture §§6.3, 6.5).
 2. **MergeSequencer:** throwaway staging worktree, reachable staging ref, quarantine refusal,
-   ancestry/expected-old `update-ref` publish (`merge.py:158–177,281–482`; conformance §3).
+   ancestry/expected-old `update-ref` publish (`merge.py:158–177,281–482`; `conformance-report.md` §3).
 3. **Nuntius/Opifex seed:** 1 MiB cap/resync, malformed-object skip/torn-tail handling,
    request correlation, heartbeat/cancel/health, result/exit ordering, 64 KiB diff and deadlines
    (`ipc.py:28–129`; `worker.py:66–93,219–317,356–494`; merged `38e1d43`).
@@ -54,19 +54,18 @@ no per-worker sandbox or production shell approval, and no dynamic hierarchy.
 
 - **Security:** 22 findings (1 HIGH, 7 MEDIUM, 4 LOW, 6 PASS, 4 INFO); F-01 full env,
   F-02 absent redaction, F-04 worktree reuse, F-05 refs, F-06 writes/merge, F-07 queue, F-20
-  runtime bypass. Approval and generation-file fencing are absent/UNVERIFIED (`security-audit.md`).
+  runtime bypass. Approval and generation-file fencing are absent/UNVERIFIED (`security-audit.md` §§1, 3).
 - **Conformance:** 5 MEDIUM + 8 LOW; IPC-file N-A later closed; surviving M2 production wiring,
-  M4 orphan event model, M5 `worker_id`, and DDL/queue L1–L8 (`conformance-report.md`).
-- **Constitution:** 11 COMPLIANT, 5 PARTIAL: bounds/enum/delete-over-add/module CLI/let-it-crash;
-  events/orchestrator dead code and broad worker catch (`constitution-compliance.md`).
+  M4 orphan event model, M5 `worker_id`, and DDL/queue L1–L8 (`conformance-report.md` §3).
+- **Constitution snapshot:** 11 COMPLIANT, 5 PARTIAL: bounds/enum/delete-over-add/module CLI/let-it-crash;
+  historical events/orchestrator seed code and broad worker catch (`constitution-compliance.md` §1).
 
 ## 2. Release-blocking gaps
 
 ### P0 integration/security
 
 1. **One canonical runtime is absent on `wt-sol2`.** Slice supervisor writes JSONL on the loop,
-   inherits host env, and uses plain `git merge --ff-only` (`supervisor.py:1–24,67–87,181–217,
-   321–372`): F-01/F-20 and M2. Branch-local Custos is not proof.
+   inherits host env, and uses plain `git merge --ff-only` (`supervisor.py:1–24,67–87,181–217,321–372`): F-01/F-20 and M2. Branch-local Custos is not proof.
 2. **Redaction is not wired.** Branch Custos emits raw stderr/errors/gate output/commands;
    F-02 closes only when the same versioned filter runs at enqueue and INSERT (architecture §§6.2,
    12.3; `redact.py` branch).
@@ -91,10 +90,9 @@ no per-worker sandbox or production shell approval, and no dynamic hierarchy.
 
 ### P1 product gaps
 
-11. **ConversationStore absent:** architecture specifies `${session_dir}/.cambium/sessions/
-    conversations.db`, node-indexed queries (§6.6/16.2).
+11. **ConversationStore absent:** architecture specifies `${session_dir}/.cambium/sessions/conversations.db`, node-indexed queries (§6.6/16.2).
 12. **Architectus skeleton:** no should-decompose→TaskTree→dependency scheduling→aggregation→
-    steering/root evaluation (`orchestrator.py:1–59`; branch `wt-impl-super`).
+    steering/root evaluation (historical seed `orchestrator.py:1–59`; branch `wt-impl-super`).
 13. **No real provider end-to-end evidence:** no provider→worker decision→edit→gate→Unio run;
     `CambiumLM`/DSPy integration is UNVERIFIED.
 14. **No persistent cross-task pool:** measured cold 2.22 s/worker and 7.03 s/10 versus warm
@@ -276,10 +274,10 @@ dead-end consensus is adopted.
 
 ## 10. Stop-list rationale
 
-The M1 delete list is causal, not stylistic. The slice `EventLog`, `_merge_branch`, `run_session`,
+The M1 delete list is causal, not stylistic. The historical slice `EventLog`, `_merge_branch`, `run_session`,
 CLI bootstrap, and duplicate helpers bypass the durable store and Unio (F-20). Fallback stores
 and sequencers are more dangerous than an import failure because they silently weaken durability
-and expected-old publication. The seed `events.py`/orchestrator submit-drain path has no caller
+and expected-old publication. The historical seed `events.py`/orchestrator submit-drain path has no caller
 and disagrees with the canonical envelope; keeping it would preserve two event models. `call_race`
 has no accepted v2.1 use case and cancellation/metered-provider behavior biases its result.
 

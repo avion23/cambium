@@ -32,7 +32,7 @@ N-A finding is closed by `38e1d43`; canonical supervisor wiring remains M2 evide
 | 2. Store vs event-schema envelope | **CONFORM with gaps** | Audited field names round-trip (`event-schema-draft.md:30–41`; `store.py:47–57,275–290`). `event_id` is draft-only (L7), `ts` is TEXT (L1), and producer-side `worker_id = task_id#generation` is absent (M5). |
 | 3. `merge.py` vs §7.8 | **CONFORM component; GAP integration** | Expected-old publish, FF check, empty-old guard/`create_main`, quarantine defense, staging capture, throwaway branch, cleanup, and reconcile are implemented (`merge.py:296–321,339–354,360–459,482–531`). F5/F11/F18 and Experiments 2e/4/6a match `worktree-concurrency.md`. Events and Unio's cross-verify/publish lock are not wired (M2). |
 | 4. `ipc.py` + `worker.py` vs §5 | **RE-AUDITABLE** | `38e1d43` merged framing, 1 MiB cap/resync, request correlation, deadlines, result/exit vocabulary, and 64 KiB diff. The old `ad372ae` branch remains historical. Slice-only message/status drift is L6; Custos integration is M2. |
-| 5. `events.py` seed | **GAP (M4)** | Dataclasses are imported only by unused `orchestrator.py`; production writes use supervisor JSONL or store dicts. `type/timestamp` conflicts with canonical `kind/ts`. |
+| 5. Historical `events.py` seed | **GAP (M4)** | Snapshot dataclasses were imported only by unused `orchestrator.py`; production writes used supervisor JSONL or store dicts. `type/timestamp` conflicted with canonical `kind/ts`; both seed files are absent now. |
 | 6. seq/worker/generation cross-module | **GAP/N-A (M2/M5)** | Store-internal reservation/replay is consistent and tested, but no production producer wires envelope identity into it. |
 
 ## 2. Retained mechanics and drifts
@@ -65,7 +65,7 @@ seq/worker/generation consistency unexercised (M5).
 
 The canonical files now provide framing and worker behavior; the slice still has
 `result_envelope`/`exit_message` and `succeeded`/`failed` vocabulary where architecture uses
-`result`/`exit` and includes `done` (L6). `events.py` and `orchestrator.py` are orphaned (M4).
+`result`/`exit` and includes `done` (L6). Historical `events.py` and `orchestrator.py` were orphaned (M4) and are absent now.
 
 ## 3. Gap register
 
@@ -74,7 +74,7 @@ The canonical files now provide framing and worker behavior; the slice still has
 | **M1** | MEDIUM | `store.py:13–19`; `architecture.md:520`; `event-schema-draft.md:336–342`; `dcc1bbb` | `recovery_gap` is superseded; reconcile the spec (done in the historical fold) or implement tail-gap detection. |
 | **M2** | MEDIUM | `supervisor.py:67–87,161–178`; `merge.py:482–492` | No production `EventStore`/`MergeSequencer` caller; wire the canonical runtime, merge events, replay, and single-writer lock. |
 | **M3** | RESOLVED | `src/cambium/{ipc,worker}.py` via `38e1d43`; old `ad372ae` | Nuntius framing/Opifex worker are present and re-auditable; retain the branch history and finish Custos integration under M2. |
-| **M4** | MEDIUM | `events.py:14–47`; `orchestrator.py:15,58–59` | Seed dataclasses are orphaned and disagree with store envelope; delete or wire them, then update draft Appendix A. |
+| **M4** | MEDIUM | Historical `events.py:14–47`; `orchestrator.py:15,58–59` | Seed dataclasses were orphaned and disagreed with store envelope; delete or wire them, then update draft Appendix A. Both are absent now. |
 | **M5** | LOW/MEDIUM | `store.py:53–55`; `event-schema-draft.md:38,556` | `worker_id` derivation is not implemented; construct `task_id#generation` in the producer. |
 | **L1** | LOW | `store.py:51,129`; `architecture.md:461`; draft `ts` | Align `ts` type and non-null wall timestamp. |
 | **L2** | LOW | `store.py:53`; `architecture.md:460` | Make `monotonic_ms` `NOT NULL`, or revise the spec. |
@@ -95,11 +95,8 @@ Check 4 re-auditable; Check 5 GAP; Check 6 GAP/N-A. Counts were 5 MEDIUM (M1–M
 (L1–L8), with no HIGH. The original top gap was M2 production wiring; M1's specification
 reconciliation is recorded as resolved.
 
-Primary pointers retained: architecture §§5.1, 6.2–6.5, 7.8; `event-schema-draft.md:30–41,
-78,336–342,555–556,580–597`; `ipc-protocol-draft.md`; `sqlite-wal-durability.md:26–32,
-175–184,265–273`; `worktree-concurrency.md:40–76,146–154,211–224,274–285,321,327,334`;
-`store.py:13–25,42–57,123–158,177–191,210–233,267–272`; `merge.py:158–177,296–321,
-339–354,370–405,450–459,482–531`; `supervisor.py:43,67–87,161–178,310–312,354–361`;
+Primary pointers retained: architecture §§5.1, 6.2–6.5, 7.8; `event-schema-draft.md:30–41,78,336–342,555–556,580–597`; `ipc-protocol-draft.md`; `sqlite-wal-durability.md:26–32,175–184,265–273`; `worktree-concurrency.md:40–76,146–154,211–224,274–285,321,327,334`;
+`store.py:13–25,42–57,123–158,177–191,210–233,267–272`; `merge.py:158–177,296–321,339–354,370–405,450–459,482–531`; `supervisor.py:43,67–87,161–178,310–312,354–361`;
 `doctor.py:139–165`; and `tests/scenarios/` store/merge/IPC coverage.
 
 ## 5. Historical evidence detail
@@ -148,7 +145,7 @@ The old N-A item was based on `ad372ae` branch-only IPC. Merge `38e1d43` placed 
 after an oversized line, skips malformed/non-object JSON, caps diff at 64 KiB, and enforces
 ready/init/idle deadlines. The slice remains a separate path with `result_envelope`/
 `exit_message` names and `succeeded`/`failed` statuses; the draft uses the former and the
-architecture table uses `result`/`exit` and includes `done`. `events.py`'s `type`/`timestamp`
+architecture table uses `result`/`exit` and includes `done`. Historical `events.py`'s `type`/`timestamp`
 dataclasses are imported only through the unused `orchestrator.py`; store and slice producers
 write dict envelopes with `kind`/`ts`. This is why M4 is a model-selection problem, not a missing
 field bug.

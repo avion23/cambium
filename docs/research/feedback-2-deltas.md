@@ -153,10 +153,10 @@ repeated here.
 The “directory mess” claim was checked against tracked files, not a live virtual environment:
 the only `cambium` directory was `src/cambium/`, duplicate basenames were intentional Python
 package markers, and no `.venv`, `.pytest_cache`, or `__pycache__` file was tracked. The real
-residue was documentation volume and the deliberate template/instance pair. `repo-structure-
-plan.md` classified research evidence, reviews, canonical architecture, templates, per-module
-docs, and transient plans; no file move was required. This rejects the critique without deleting
-historical evidence.
+residue was documentation volume and the deliberate template/instance pair. `repo-structure-plan.md`
+classified research evidence, reviews, canonical architecture, templates, per-module docs, and
+transient plans; no file move was required. This rejects the critique without deleting historical
+evidence.
 
 The independent-optimization claim was already handled by architecture §17.2: each module uses
 frozen sibling references, not live co-adapted modules. The dataset v1 deviation is 10 canaries

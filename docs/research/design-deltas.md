@@ -281,8 +281,7 @@ as advisory, with process wait/exit message definitive and heartbeat/drain watch
 Milestone 0 is intentionally narrower than M1: fake LLM, exactly one worker and throwaway
 worktree, one `edit_file` change with uniqueness, scenario gate, Unio atomic `update-ref`,
 fsynced `merge_committed`, atomic `result.json` (`status="done"`), no orphan process/worktree,
-and exit 0. `agents.md` §5/§9 and example-spec §9.4 referenced the smoke path (`python -m
-cambium.tests.smoke`) but `Architectus.execute` wiring was pending. Q6.1–Q6.3 keep the path,
+and exit 0. `agents.md` §5/§9 and example-spec §9.4 referenced the smoke path (`python -m cambium.tests.smoke`) but `Architectus.execute` wiring was pending. Q6.1–Q6.3 keep the path,
 atomic fast-path, and fake-versus-real provider choice explicit.
 
 ### D7: sandbox removal is not a security claim
@@ -403,7 +402,7 @@ stale grant. The exact callback shape remains unresolved at Q7.2; no source curr
 
 The register prevents a common historical-reading error: an adopted delta can amend a normative
 section while its code remains absent. “Adopt” records the decision and its rationale; milestone
-acceptance requires the source/test checks in `v2-1-review.md` and the current status pointer.
+acceptance requires the source/test checks in `v2-1-review.md` §§4, 11 and the current status pointer.
 
 ## 8. Explicit non-adoptions
 
@@ -516,9 +515,7 @@ architecture, source, and v2-1-status. They are not alternate current specificat
 
 For that reason the compact records retain dates, branches, source URLs, IDs, severities,
 accepted/rejected reasons, and unresolved boundaries even when repeated prose and copied maps are
-gone. The preservation canary below checks those anchors before and after the edit.
-
-It also checks local links, changed-file scope, word counts, and whitespace so historical edits do
-not introduce a new documentation failure.
+gone. Observed edit check: 122/122 unique IDs, 3/3 URLs, and 48/48 refs were preserved with no
+loss/addition; local-link, exact-scope, word-count, and whitespace checks passed.
 
 The check is a canary for evidence preservation, not a runtime test.

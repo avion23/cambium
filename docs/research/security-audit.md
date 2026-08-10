@@ -19,8 +19,7 @@ paths; F-21 is false after D7 fold `e8f0d0f`; the old UP041 lint observation was
 
 ## 0. Baseline verification
 
-Historical commands from the audit worktree: `uv run --python 3.14.7 --extra test pytest
---collect-only -q` → 108 collected; `pytest -q` → 108 passed; ruff source gate → clean. Doctor
+Historical commands from the audit worktree: `uv run --python 3.14.7 --extra test pytest --collect-only -q` → 108 collected; `pytest -q` → 108 passed; ruff source gate → clean. Doctor
 reported `~/.omp/agent/models.yml is git-tracked` as a WARN. These results anchor the snapshot.
 
 ## 1. Findings

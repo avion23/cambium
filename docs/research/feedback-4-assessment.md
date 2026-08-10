@@ -34,14 +34,14 @@ Paths are repository-relative. Checks are listed in §3. The source tree at the 
 | 10 | Data → function → data; supervisor side effects | **ALREADY-IMPLEMENTED** | Pure module contract, writer thread, worker subprocesses, deterministic LLM-free layer (base `Module.decide`; architecture §§2, 4; `agents.md` §7). |
 | 11 | Only lock is final merge | **ALREADY-IMPLEMENTED** | Unio lock spans verify/publish; store lock protects writer scalars, not merge (`architecture §7.8`; event draft §3.11; `worktree-concurrency.md`; D6). |
 | 12 | Mailboxes/queues (CSP) | **ALREADY-IMPLEMENTED** | Single-writer store/logging queues and worker pipes. Store queue is intentionally unbounded v2.1 (`store.py:20–22,106`; review §1.3 P0 gap 10; architecture §§5.1, 6.2). |
-| 13 | `check_system_health` before heavy ops | **ADOPT** | Stdlib `/proc`/`os.sysconf` health gate for resource gap; `system_health.py` existed on `wt-luna-health@d4db2ff`, unmerged in snapshot (`v2-1-review` §1.3 P0 gap 9). |
-| 14 | Token bucket limiter | **ALREADY-IMPLEMENTED** | D8f per-provider buckets, pause/recovery, and cascade are folded into architecture and branch Diffundo (`architecture` §§7.4, 9.1–9.2; D8f; `v2-1-review` §1.1 item 7). |
+| 13 | `check_system_health` before heavy ops | **ADOPT** | Stdlib `/proc`/`os.sysconf` health gate for resource gap; `system_health.py` existed on `wt-luna-health@d4db2ff`, unmerged in snapshot (`v2-1-review` §2 P0 liveness/resources, item 9). |
+| 14 | Token bucket limiter | **ALREADY-IMPLEMENTED** | D8f per-provider buckets, pause/recovery, and cascade are folded into architecture and branch Diffundo (`architecture` §§7.4, 9.1–9.2; D8f; `v2-1-review` §3E). |
 | 15 | Local cache for DSPy evals | **ADOPT (scoped)** | Eval-only full-prompt/model cache is safe with frozen datasets; never production. `eval_cache.py` `wt-luna-evalcache@d8f9408` was unmerged in snapshot (`design-deltas` D1; architecture §8.1/M9; `meta.json`). Current note: eval cache is absent. |
 | 16 | Mock git env + AST asserts | **ALREADY-IMPLEMENTED IN PART** | Frozen splits/metrics exist; mock-git/AST scoring is DRAFT v2.1 (`bench-harness-design.md` §8; `example-datasets-v1.md`; `test_dataset_splits.py`). |
 | 17 | AST code search | **ADOPT** | `ast_tools.py` `1ed155b` had tree-sitter + stdlib fallback; version verification and tool wiring were unverified in snapshot. |
 | 18 | LSP/lint diagnostics | **ADOPT-LITE** | Reuse ruff; no pyright. `lint_diag.py` `wt-luna-lint@2d26e5f` was unmerged in snapshot. |
 | 19 | Strict tool schemas | **ADOPT-LITE** | Stdlib dataclass→JSON-Schema and validation, no pydantic dependency; `schemas.py` `4e2c2ea` merged in snapshot. |
-| 20 | Speculative batched tool calls | **ADOPT-LITE** | Record as v2.1 worker-loop note; v2 remains sequential heartbeat loop (architecture §7.6; architectus-design; v2-1-review §1.1 item 3). |
+| 20 | Speculative batched tool calls | **ADOPT-LITE** | Record as v2.1 worker-loop note; v2 remains sequential heartbeat loop (architecture §7.6; architectus-design; `v2-1-review` §4 roadmap; no current batching claim). |
 | 21 | `include_diff` flag | **ADOPT-LITE** | Higher tiers may omit diff; evaluator stays default-on and schema enforcement remains (architecture §3.4; D8b). |
 
 **Counts:** 21 rows — REJECT 6 (1–6) · ADOPT 3 (13,15,17) · ADOPT-LITE 6 (7,8,18–21) ·
@@ -49,15 +49,19 @@ ALREADY-IMPLEMENTED 6 (9,10,11,12,14,16). Claim 7's correction is retained: Pyth
 `graphlib` exposes `CycleError.args[1]`;
 Kahn remains for deterministic ordering/message control.
 
+These implementation labels are limited to the cited task-tree, module, lock, queue, limiter,
+and fixture surfaces. They do not certify full runtime integration or the absent sandbox/approval
+boundary; the current source and status pointer above govern those findings.
+
 ## 2. Plan consequences
 
-1. Land FD-3 IPC as M2 once, atomically across worker/fixtures/pool (v2-1-review §§2B, 3 M2).
+1. Land FD-3 IPC as M2 once, atomically across worker/fixtures/pool (`v2-1-review` §3B, §4 M2).
 2. Add immutable ≤200-token Core Directive to the static prompt prefix (claim 11/D8c).
 3. Record “three gate failures → reset to `base_commit`, retry once, abort subtree” and keep
    `evaluate_goal` as the existing gate (claim 12).
 4. Mine corrected DLQ trajectories for M8 few-shots (claim 14).
 5. Record host `systemd-run` cgroups as deployment note; harness health gate remains stdlib.
-6. Specify M7 pre-warmed pool (worker-coldstart/v2-1-review numbers).
+6. Specify M7 pre-warmed pool (worker-coldstart; `v2-1-review` §4 M7).
 7. Document separate single-writer `events.db`/`conversations.db`/`shared.db` tradeoff.
 8. Keep the `graphlib` alternative comment (follow-up `9b071e0` was recorded as done).
 9. Expose AST signature/reference tools after `tools.py` merge (`74ff5aa` in snapshot).

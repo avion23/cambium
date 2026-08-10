@@ -15,7 +15,8 @@ no per-worker sandbox or production shell approval, and no dynamic hierarchy.
 
 ## 0. Scope and verdict key
 
-Audited surfaces were `store.py`, `merge.py`, `supervisor.py`, `events.py`, `orchestrator.py`,
+Historical audited surfaces included `store.py`, `merge.py`, `supervisor.py`, `events.py`, and
+`orchestrator.py`; the latter two seed files are deleted/absent in current source.
 `doctor.py`, `__init__.py`, `modules/base.py`, `modules/example/{__init__,decide,dataset,metric}.py`,
 `tasktree.py`, IPC/worker (`38e1d43`), and `tests/scenarios/*`. Repository-relative citations
 were read directly; cold-start and unbuilt design norms are **UNVERIFIED**.
@@ -28,8 +29,8 @@ severity is impact on merged code, not a hypothetical future risk.
 | ID | Norm | Verdict | Severity | Evidence / finding |
 |---|---|---|---|---|
 | (a) | Measure before optimizing | COMPLIANT | — | Byte-accurate `ipc._read_line` is correctness-driven (`ipc.py:69–88`); cold-start evidence is documented, not re-profiled here. |
-| (b) | Flat frozen/slots records | COMPLIANT | — | `events.py:14,22,31,41`; `base.py:21–22`; `decide.py:51–65`; `doctor.py:47`; `supervisor.py:53`. |
-| (c) | No shared mutable state; single writer | COMPLIANT | — | Store writer thread and immutable handoffs (`store.py:112–115,172`); worker `to_thread` crosses only `threading.Event` (`worker.py:211`). Deviations: unbounded store queue and slice EventLog on the loop. |
+| (b) | Flat frozen/slots records | **Historical snapshot: COMPLIANT; seed deleted/absent now** | — | Historical `events.py:14,22,31,41`; live records remain in `base.py:21–22`, `decide.py:51–65`, `doctor.py:47`, and `supervisor.py:53`. |
+| (c) | No shared mutable state; single writer | COMPLIANT | — | Store writer thread and immutable handoffs (`store.py:112–115,172`); worker `to_thread` crosses only `threading.Event` (`worker.py:211`). Historical deviations: unbounded store queue and slice EventLog on the loop. |
 | (d) | Functional core / imperative shell | COMPLIANT | — | Pure `should_decompose` and `Module.decide` seam (`decide.py:68–161`). |
 | (e) | Loop-affine state; queues over locks; bounds | PARTIAL | LOW | `store.py:107` uses a minimal `threading.Lock`; queue is unbounded. No `asyncio.Lock` appears in the snapshot; Unio's intended lock is architectural. |
 | (f) | Protocols/plain functions over hierarchies | COMPLIANT | — | `base.py:17,40`; one-level module inheritance; no dynamic machinery. |
@@ -38,12 +39,12 @@ severity is impact on merged code, not a hypothetical future risk.
 | (i) | Enums over bools/strings | PARTIAL | MEDIUM | Reviewed v2 `decompose: bool` (`decide.py:63`, `example-spec.md` §3.2) is retained; worker/supervisor status allowlists are strings (`worker.py:54,78,89–96`; `supervisor.py:57,64`); `doctor.Status` is the good example. |
 | (j) | Battle-tested libraries | COMPLIANT | — | stdlib `sqlite3`, subprocess, logging, JSON; no pydantic/tenacity/new framework (`pyproject.toml`, `merge.py:187–193`). Shell gate is host-authored and documented. |
 | (k) | No globals/hidden state/singletons | COMPLIANT | — | No cache decorators; state is instance/session-owned. Read-only module tables `_UNMERGED_PAIRS` and `EXIT_CODES` are low-severity mutability nits. |
-| (l) | Delete over add | PARTIAL | LOW | `events.py:41` `LogEvent`, `orchestrator.py:1–59`, and `ipc.make_request_id` lack production consumers; seed dataclasses and store dicts are duplicate event models. |
+| (l) | Delete over add | PARTIAL | LOW | Historical `events.py:41` `LogEvent` and `orchestrator.py:1–59` (both deleted/absent now), plus `ipc.make_request_id`, lacked production consumers; seed dataclasses and store dicts were duplicate event models. |
 | §7 | Module shape / JSON CLI | PARTIAL | MEDIUM | `modules/example/` has no `__main__`; template defers the standalone entry to v2.1 (`module-template/architecture.md:217,223`; `example-spec.md:330,402`). |
 | §7 | Protocol dependencies / engine swap | COMPLIANT | — | Example imports only `base.py`; rule engine sits behind `Module.decide` (`example/decide.py:13,146–157`). |
 | §8.3 | Let it crash | PARTIAL | LOW | `worker.py:172–174` catches all task exceptions and emits in-band `failed`, masking the supervisor restart path. |
 
-**Counts:** COMPLIANT 11 · PARTIAL 5 · VIOLATION 0. The unverified design flags are listed in
+**Snapshot counts:** COMPLIANT 11 · PARTIAL 5 · VIOLATION 0. The unverified design flags are listed in
 §5, not counted as violations.
 
 ## 2. Evidence by deviation
@@ -68,7 +69,7 @@ boundary would satisfy the norm. Genuine booleans (`write_marker`, `canary`, `ti
 
 ### Delete-over-add and module shape (l/§7)
 
-`events.py`/unused `orchestrator.py` form a disconnected `type/timestamp` model beside the
+Historical `events.py`/unused `orchestrator.py` formed a disconnected `type/timestamp` model beside the
 production `kind/ts` store and supervisor JSONL. Either wire the seed to `EventStore` or delete
 both and update constitution citations; `make_request_id` is test/public-helper-only. The
 example module has typed JSON-shaped inputs/outputs but no module CLI, a doc-vs-template mismatch.
@@ -82,11 +83,11 @@ pattern must not reach the DSPy worker.
 
 ## 3. Cross-cutting observations and priorities
 
-1. `EventLog` and `EventStore` coexist without wiring; `doctor.py:153–165` checks the SQLite
-   DB while the slice writes `events.jsonl`.
+1. **Historical snapshot:** `EventLog` and `EventStore` coexisted without wiring; `doctor.py:153–165`
+   checked the SQLite DB while the slice wrote `events.jsonl`. The seed files are deleted/absent now.
 2. IPC/worker are now in main via `38e1d43`; the historical branch-only N-A is not current.
-3. Constitution citations (`events.py:14,22,31,41`; `base.py:17,21–22,40`; `decide.py:63`;
-   `metric.py:18–19`; `dataset.py:49`) were re-verified at the snapshot.
+3. Historical constitution citations (`events.py:14,22,31,41`; `base.py:17,21–22,40`;
+   `decide.py:63`; `metric.py:18–19`; `dataset.py:49`) were re-verified at the snapshot.
 
 Priority order retained: reconcile module CLI with the template; introduce enum boundaries at
 the worker; resolve the events/orchestrator dead code; document the store queue/lock tradeoff;
@@ -96,12 +97,12 @@ and narrow the worker catch. These are recommendations, not changes made by this
 
 | Check | Result |
 |---|---|
-| Frozen event types | Verified at `events.py:14,22,31,41`. |
+| Frozen event types | Historical snapshot verified at `events.py:14,22,31,41`; seed deleted/absent now. |
 | `functools.cache`/`lru_cache` | 0 hits in `src/`/`tests/`. |
 | `asyncio.Lock` | 0 hits in snapshot source. |
 | `threading` users | `store.py`, `worker.py` only. |
 | Example module CLI | Absent (`rg "if __name__"`; no `__main__.py`). |
-| `LogEvent` / `Orchestrator` consumers | None outside defining modules. |
+| `LogEvent` / `Orchestrator` consumers | Historical snapshot: none outside defining modules; seed files are deleted/absent now. |
 | AST nesting | store 3, merge 2, ipc 1, worker 3, supervisor 6. |
 | Cold-start and §8 design norms | **UNVERIFIED** here; relied on `review-implementation.md` §M2, `dspy-python-314.md` §Recommendation, and architecture contracts. |
 
@@ -119,7 +120,7 @@ would violate the IPC boundary. It runs against asyncio's in-memory buffer, and 
 oversized-line error path. Store fsync cadence, `busy_timeout`, and `synchronous=NORMAL` came from
 `sqlite-wal-durability.md`, not speculative tuning.
 
-All four event types (`events.py:14,22,31,41`) and module records are frozen/slots; merge
+All four historical event types (`events.py:14,22,31,41`; seed deleted/absent now) and module records are frozen/slots; merge
 exceptions are transient classes and do not carry hot-path records. `store.py:127–135`,
 `supervisor.py:81–87`, and `worker.py:89–96` move flat JSON dicts across boundaries. The note
 matters because the constitution's “no object-graph serialization” rule is satisfied even where
@@ -131,7 +132,7 @@ The store has one daemon writer thread and short-lived reader connections; `_que
 `_next_seq`, `_dead`, and `_closed` are the only shared scalars. The worker's `asyncio.to_thread`
 handoff passes a `threading.Event`; the outcome dict remains thread-local. Supervisor and merge
 are pure asyncio/synchronous subprocess paths, and doctor has no thread. The queue is unbounded
-by design and EventLog performs loop-thread disk I/O, both explicitly documented slice
+by design and the historical slice EventLog performed loop-thread disk I/O, both explicitly documented slice
 deviations. The lock protects seq reservation and lifecycle flags with no I/O or nesting; moving
 reservation into the writer would remove it but change the no-gap invariant.
 
@@ -164,7 +165,7 @@ singletons.
 
 ### (l) cleanup candidates and §8.3
 
-`LogEvent` has no consumer; `orchestrator.py` has no importer and is the only consumer of the
+Historical `LogEvent` had no consumer; deleted/absent `orchestrator.py` had no importer and was the only consumer of the
 seed event types. `ipc.make_request_id` is used by a scenario but not production. The safe choice
 is either wire the seed to the real store and add a scenario, or delete both and update the
 constitution's (b) citations. Broad `do_work` exception handling is a separate boundary: task
@@ -191,7 +192,7 @@ rationale for future implementation:
 2. **Status enum:** introduce a Python `ResultStatus`/`Literal` at the worker boundary while
    serializing explicit wire strings; keep the reviewed `decompose: bool` until a dataset schema
    bump. This is the highest-value (i) fix because it preserves JSON compatibility.
-3. **Event seed:** either wire `Orchestrator.run` to the real `EventStore` and add a scenario,
+3. **Historical event seed:** either wire `Orchestrator.run` to the real `EventStore` and add a scenario,
    or delete `events.py`/`orchestrator.py` and update the constitution's (b) evidence. Keeping
    both unconnected models is the opposite of (l).
 4. **Store deviations:** document the unbounded queue and seq-reservation lock as an explicit

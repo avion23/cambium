@@ -30,7 +30,7 @@ The rows retain the original verdict and the evidence pointer. “New” means t
 | ID | Principle translated for Cambium | Snapshot verdict and evidence |
 |---|---|---|
 | (a) | **Mechanical sympathy:** measure before optimizing; worker cold start (interpreter + `import dspy`, about 2.1 s) dominates; only then tune allocations/hot loops. | **Partial / new standing norm.** `ready_timeout` and off-loop event logging are architectural (`docs/architecture.md` §7.2, §6.2). Benchmark provenance: `docs/research/worker-coldstart.md` @ `108c83d`; supporting `docs/reviews/review-implementation.md` §M2 and `docs/research/dspy-python-314.md` §Recommendation. |
-| (b) | **Data-oriented design:** frozen `slots=True` dataclasses, lists, and flat JSON event payloads; no pointer graphs. | **Yes.** `src/cambium/events.py`, `modules/base.py:Example`, `modules/example/decide.py:TaskInput/DecomposeOutput`; `docs/research/event-schema-draft.md` §2. |
+| (b) | **Data-oriented design:** frozen `slots=True` dataclasses, lists, and flat JSON event payloads; no pointer graphs. | **Historical snapshot: Yes; seed deleted/absent now.** `src/cambium/events.py` was snapshot evidence, alongside `modules/base.py:Example`, `modules/example/decide.py:TaskInput/DecomposeOutput`, and `docs/research/event-schema-draft.md` §2. |
 | (c) | **CSP/actor:** never share mutable state across threads; single writer, bounded/drop-on-full queues, workers as processes over stdio. | **Yes structurally.** `docs/architecture.md` §6.2, `docs/research/custos-asyncio-design.md` §2.4/§3.3, `docs/research/logging-design.md` §2.9, and architecture §5.1. SQLite single-writer evidence: `sqlite-wal-durability.md` §6. |
 | (d) | **Functional core / imperative shell:** pure module rules; state and I/O at supervisor, worker, and store edges. | **Yes.** `docs/module-template/architecture.md` §5.1; `src/cambium/modules/base.py` `Module.decide`; `modules/example/decide.py` `should_decompose`. |
 | (e) | **Concurrency rules:** loop-affine state, queues over locks, bounded waits, no shared mutex state. | **Yes in the target design.** `custos-asyncio-design.md` §3.1–§4 and `docs/architecture.md` §6.2/§7.8; Unio's merge lock is the sole intended `asyncio.Lock`. |
@@ -44,13 +44,15 @@ The rows retain the original verdict and the evidence pointer. “New” means t
 
 ## 3. Translation summary and verification
 
-- All 12 principles are covered. **Already implemented:** (b), (c), (d), (e), (g), (h), (i),
-  (j), (k). **Partial:** (a), (f). **New:** (l). Rust-only mechanics are rejected or translated
+- All 12 principles are covered. **Snapshot implementation labels:** (b), (c), (d), (e), (g),
+  (h), (i), (j), (k); (b)'s event seed is historical/deleted. **Partial:** (a), (f).
+  **New:** (l). Rust-only mechanics are rejected or translated
   as listed in §1.
 - The brief's cold-start premise was corrected: the benchmark is now in current main, but the
   original branch provenance is historical. Delete-over-add was not previously an `agents.md`
   norm.
-- Spot checks retained from the original record: frozen event dataclasses (`events.py:14,22,31,41`),
+- Spot checks retained from the original record: historical frozen event dataclasses (seed now
+  deleted/absent; `events.py:14,22,31,41`),
   `Output`/`Metric` Protocols and `Example` (`base.py:17,21–22,40`), `DecomposeOutput` and its
   loader/metric (`decide.py:63`, `metric.py:18–19`, `dataset.py:49`), bounded logging queue
   (`logging-design.md` §§2.2, 2.9), and module-template ports (`architecture.md` §§3–5).
@@ -111,7 +113,7 @@ as a **new** norm rather than misattributed history.
 | Principle | Snapshot references retained |
 |---|---|
 | (a) | `docs/architecture.md` §§7.2, 6.2; `worker-coldstart.md`; `review-implementation.md` §M2; `dspy-python-314.md` §Recommendation; `event-schema-draft.md` §3.2. |
-| (b) | `src/cambium/events.py`; `src/cambium/modules/base.py`; `src/cambium/modules/example/decide.py`; `event-schema-draft.md` §2. |
+| (b) | Historical snapshot seed, deleted/absent now: `src/cambium/events.py`; live module evidence remains `src/cambium/modules/base.py`, `src/cambium/modules/example/decide.py`; `event-schema-draft.md` §2. |
 | (c)/(e) | `architecture.md` §§5.1, 6.2, 7.8; `custos-asyncio-design.md` §§2.4, 3.1–3.3, 4; `logging-design.md` §§2.2, 2.9; `sqlite-wal-durability.md` §6. |
 | (d)/(g) | `docs/module-template/architecture.md` §§3–5, §9.5; `architecture.md` §§2, 17.2; `modules/example/__init__.py`. |
 | (f)/(h) | `modules/base.py` Protocols; `modules/example/decide.py` guards; `agents.md` §7 flat-control-flow bullet. |
@@ -119,8 +121,7 @@ as a **new** norm rather than misattributed history.
 | (j)/(k) | `pyproject.toml`; `architecture.md` §§1, 8.1, 16.2, 19; stdlib `sqlite3`/logging/subprocess; `dspy-python-314.md`. |
 | (l) | `agents.md` §7 and `architecture.md` §19 search; nearest proxy is “Concrete over abstract.” |
 
-The target-base research anchor for the proposed agents patch was `/tmp/opencode/
-cambium-agentsmd/agents.md@2b3bf93`. The patch itself is intentionally absent from this record;
+The target-base research anchor for the proposed agents patch was `/tmp/opencode/cambium-agentsmd/agents.md@2b3bf93`. The patch itself is intentionally absent from this record;
 the current root `agents.md` is authoritative. This avoids a second copied constitution while
 retaining the exact source location and the distinction between translated intent and verified
 implementation.
