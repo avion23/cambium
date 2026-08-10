@@ -112,7 +112,7 @@ Use bounded queues for stderr and tool output. A worker may emit frequent logs w
 
 ### Screen states and controls
 
-The first future screen can stay small: task list, selected task timeline, worker/gate status, and a detail pane for diffs/errors. Keyboard commands should map to control messages (`submit_task`, `cancel`, `approve`, `open_log`, `follow`) carrying correlation IDs. Destructive controls need the same approval policy as the headless interface; a TUI must not silently bypass Septum. Mouse support is optional.
+The first future screen can stay small: task list, selected task timeline, worker/gate status, and a detail pane for diffs/errors. Keyboard commands should map to control messages (`submit_task`, `cancel`, `approve`, `open_log`, `follow`) carrying correlation IDs. Destructive controls need the same approval policy as the headless interface; a TUI must not bypass the target production approval/containment boundary. Septum was removed from the harness. Mouse support is optional.
 
 ### Terminal degradation matrix
 

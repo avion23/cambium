@@ -6,7 +6,7 @@
 [Tree-sitter Python bindings](https://tree-sitter.github.io/py-tree-sitter/).
 Experiment data is in `/tmp/opencode/exp-treesitter` (outside the worktree).
 Question: does AST extraction reduce context without hurting compile/test
-success, under `docs/research/v2-1-review.md` §3 M9?
+success, under `docs/research/v2-1-review.md` §4 M9?
 
 1. **>=25% reduction** in median input tokens per compile-successful task.
 2. **<=2-point compile-success degradation** (paired 95% CI excluding a worse
@@ -71,7 +71,7 @@ backends:
 
 The compressed output is a **view, not valid code** (see §4). It is a context
 adapter only, never part of worker file operations or supervisor state (M9
-scope; architecture §3.7 I2.4).
+scope; architecture §3, production hierarchy and admission).
 
 ### Finding: byte-offset vs char-index bug (fixed)
 
@@ -155,7 +155,7 @@ points**) could **not be measured** in this experiment:
   requires “freeze at least 30 tasks across three supported languages, same
   provider/model, temperature, gate, task budget,” run **paired** raw-context
   and AST-context trials. M6 is not built on the current baseline
-  (`v2-1-review.md` §1.3 P1-13: no real LLM end-to-end run is evidenced), so
+  (`v2-1-review.md` §2 P1 product gaps, item 13: no real LLM end-to-end run is evidenced), so
   there is no harness to attach the compressor to.
 - No real provider, no frozen 30-task dataset, no gate metric exists on this
   branch. Any compile-success number produced here would be fabricated.
@@ -185,7 +185,7 @@ points**) could **not be measured** in this experiment:
   proxy reduction does not guarantee a 25% real-token reduction
   (**UNVERIFIED** for real tokenizers).
 - Non-ASCII sources require byte-offset-safe slicing (§2 finding).
-- Info hiding (architecture §3.7 I2.7) is unaffected: the compressor shrinks
+- Info hiding (architecture §3, production hierarchy and admission) is unaffected: the compressor shrinks
   the parent's view of the codebase; child→parent envelopes stay
   summary+diff+metric.
 

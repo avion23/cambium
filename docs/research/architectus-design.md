@@ -10,7 +10,8 @@ and [`v2-1-status.md`](v2-1-status.md).
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; provider cascade is source-defined and honors
 `Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
-approval; DLQ and eval cache are absent. Historical DAG scheduling, blackboard,
+production approval service. `ToolContext` accepts an optional `ApprovalGate`, but the
+run-plan worker path does not inject one. DLQ and eval cache are absent. Historical DAG scheduling, blackboard,
 steering, and decomposition below remain proposals.
 
 The explicit-tree direction is part of this historical boundary: harness-owned
@@ -47,7 +48,8 @@ and merge requests. It never calls an LLM or imports DSPy. Proposed primitives:
 
 **Architectus (orchestration layer):** plan/decompose via `should_decompose` (LLM-C6
 fast path), build with `tasktree.build_tree` (I2.1–I2.3), schedule bounded waves,
-compose context, steer, aggregate I2.7 `upward_result`, evaluate (arch §10), and
+compose context, steer, aggregate I2.7 `upward_result`, evaluate under the
+architecture's target contracts, and
 replan on typed outcomes. It never spawns/kills, writes worktrees, runs gates, or emits
 durable events directly.
 
@@ -184,7 +186,8 @@ Architectus-owned, not an input marker.
 restart/generation; 7 static/dynamic context and prompt-lint; 8 scratchpad rejection;
 9 dead-end propagation; 10 conversation queries/reconstruction; 11 deterministic wave
 order; 12 steer routing/sibling isolation; 13 scripted-LLM replan; 14 root-directive
-199/200/201-token boundary, reset replay, retry aliases. Scenarios 7–10 are M5 AC3/AC4.
+199/200/201-token boundary, reset replay, retry aliases. Scenarios 7–10 cover the retained
+M5 context and conversation criteria.
 
 ## 8. M5 slicing and provenance
 
@@ -206,8 +209,10 @@ D8c/D8d/D8f/D8g, I2.1–I2.5/I2.7, DS-M6, LLM-C6, M1–M9, and Q3/Q8.
 
 ## 9. Verification record
 
-Snapshot claims were checked against `v2-1-review.md` M5 AC1–AC4 and decisions A/C/D/F;
-architecture §§3.4/3.7, 4, 5.2, 6.6, 7.1/7.4/16.2; `tasktree.py` build/topo/ready/
+Snapshot claims were checked against `v2-1-review.md` §4 M5 and its retained criteria,
+plus decisions A/C/D/F;
+the current architecture's §§1–3 (runtime, invariants, and target contracts);
+`tasktree.py` build/topo/ready/
 subtree/upward; IPC draft §§2.1/3/5 (steer request gap; result/version proposals);
 event draft catalog; design-deltas D2/D3;
 feedback-2 D8a/b/c/d/g; and custos design. `feedback-4-assessment.md` #21,
@@ -342,7 +347,7 @@ distinguish causal decisions from fallback behavior.
 ## Appendix C — milestone dependency record
 
 S1 depended on the M5 base and could run beside S2/S4. S2 needed the conversation-store
-gap (v2-1-review §1.3 gap 11), then S3 consumed S1/S2. S4 needed M2 IPC hardening; S5
+gap (v2-1-review §2 P1 product gaps, item 11), then S3 consumed S1/S2. S4 needed M2 IPC hardening; S5
 needed M4 gate verdicts; S6 needed evaluator/envelope retention; S7 needed M1, M3, M4
 and ran a real worker, ScriptedLLM, gate, and Unio. M7's persistent pool (multiple init
 messages), M8 DSPy refinement, and M9 tree-sitter compression were explicitly excluded.
@@ -384,7 +389,7 @@ The design's verification appendix intentionally distinguished facts from propos
 
 | Anchor | Snapshot result |
 |---|---|
-| `v2-1-review.md` **M5 — Architectus RLM/task-tree execution and conversations** | M5 scope and AC1–AC4 read; AC4 requires indexed `last_turns`, `cost_by_node`, and `context_for` queries plus reconstruction from durable protocol events after projection deletion; target only. |
+| `v2-1-review.md` **§4 M5 — Architectus/tree/conversations** | M5 scope and retained criteria require indexed `last_turns`, `cost_by_node`, and `context_for` queries plus reconstruction from durable protocol events after projection deletion; target only. |
 | Review decision A lines 215–233 | Thin Custos/Architectus split adopted. |
 | Review decision C lines 257–268 | One conversations DB and per-node rows proposed. |
 | Review decision D lines 270–282 | `max_width`/pool trigger recorded; pool deferred. |
@@ -392,7 +397,7 @@ The design's verification appendix intentionally distinguished facts from propos
 | `tasktree.py:233-478` | build/topological/ready/subtree/upward contracts read. |
 | `ipc-protocol-draft.md` §§2.1/3/5 | steer request gap and result/version proposals read. |
 | `event-schema-draft.md` catalog | kind/tier mapping read; new kinds remain draft. |
-| `costos-asyncio-design.md` §§1–2 | loop-affine WorkerHandle and writer handoff read. |
+| `custos-asyncio-design.md` §§1–2 | loop-affine WorkerHandle and writer handoff read. |
 
 Still **UNVERIFIED** at the snapshot: canonical `run_plan` on main, `conversations.py`,
 Diffundo, worker-side steer consumption, `shared.db`, `shared_update`, include-diff
