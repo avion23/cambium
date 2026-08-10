@@ -1,10 +1,8 @@
 # Python 3.14: verified capabilities for Cambium
 
-Research date: 2026-08-09. Purpose: fact-check Python 3.14 for the Cambium LLM
-coding-agent harness (multi-process orchestrator, async I/O, IPC, DSPy-based
-per-module optimization). Every claim below is either a real command output
-pasted verbatim from a locally installed CPython 3.14.7, or a URL. Anything
-that could not be checked is marked **UNVERIFIED**.
+**Snapshot (2026-08-09):** historical CPython 3.14.7 run for Cambium; confirm
+current semantics in the [Python 3.14 documentation](https://docs.python.org/3.14/whatsnew/3.14.html).
+Claims are command output or URLs; unchecked items are **UNVERIFIED**.
 
 ## Interpreters used
 
@@ -13,8 +11,8 @@ Installed via `uv python install` into `~/.local/share/uv/python/`:
 - Regular (GIL) build: `cpython-3.14.7-linux-aarch64-gnu` (`python3.14`)
 - Free-threaded build: `cpython-3.14.7+freethreaded-linux-aarch64-gnu` (`python3.14t`)
 
-Platform: Linux aarch64. Both are the builds uv distributes (compiled with
-Clang 22.1.3), not `python.org` binaries.
+Platform: Linux aarch64; uv distributions compiled with Clang 22.1.3 (not
+`python.org` binaries).
 
 ## Verified facts (with real outputs)
 
@@ -56,7 +54,9 @@ accessing value -> NameError: name 'NonExistentNameAtDefTime' is not defined
 ```
 
 The traceback for the access error shows evaluation happens inside a lazily
-created `__annotate__` function (the PEP 649 mechanism):
+created `__annotate__` function (the PEP 649 mechanism). The evaluated
+`f.__annotations__` remains a normal dict; `f.__annotate__` is the separate
+lazy evaluator:
 
 ```
 Traceback (most recent call last):
@@ -164,9 +164,10 @@ with -X gil=1, _is_gil_enabled(): True
 ```
 
 `-X gil=0,1` is documented at
-https://docs.python.org/3.14/using/cmdline.html#cmdoption-X (added in 3.13;
-`-X gil=0` requires a build configured with `--disable-gil`). The `PYTHON_GIL`
-environment variable is the equivalent env switch (verified on the FT build).
+https://docs.python.org/3.14/using/cmdline.html#cmdoption-X
+(`-X gil=0`
+requires `--disable-gil`. `PYTHON_GIL` is the equivalent env switch (verified
+on the FT build).
 
 JIT (PEP 744, experimental): enabled only via the `PYTHON_JIT=1` environment
 variable on this build; `-X jit`, `-X jit=1`, `-X jit=yes` are accepted but do
@@ -185,29 +186,21 @@ is_enabled: False
 `sys._jit` introspection namespace has `is_available()`, `is_enabled()`,
 `is_active()` (source: https://docs.python.org/3.14/whatsnew/3.14.html#sys).
 
-Caveat about the JIT: the official whatsnew text says the *macOS and Windows*
-release binaries include the experimental JIT and free-threaded builds do not
-support it (https://docs.python.org/3.14/whatsnew/3.14.html). On this
-particular uv Linux aarch64 build, `sys._jit.is_available()` is `True`, so uv's
-Linux build also ships it compiled in (off by default). A single synthetic
-loop (3,000,000 int additions) ran 0.160s without the JIT and 0.228s with it
-(≈43% slower) on this machine — a microbenchmark datapoint only; the documented
-range is "10% slower to 20% faster" depending on workload
-(https://docs.python.org/3.14/whatsnew/3.14.html#whatsnew314-jit-compiler).
+Caveat: official macOS/Windows binaries include the experimental JIT and
+free-threaded builds do not (https://docs.python.org/3.14/whatsnew/3.14.html).
+This uv Linux build reports it available (off by default). The 3,000,000-add
+microbenchmark ran 0.160s without and 0.228s with it (≈43% slower); this is a
+single-machine datapoint (documented range: 10% slower to 20% faster;
+https://docs.python.org/3.14/whatsnew/3.14.html#whatsnew314-jit-compiler).
 
 ## What's new in 3.14 relevant to Cambium
 
 All claims below are from https://docs.python.org/3.14/whatsnew/3.14.html
 unless a real output is pasted.
 
-- **PEP 649/749 deferred annotations (default).** Forward references no longer
-  need string quoting; annotations cost nothing at definition time. Verified
-  above. Relevant: DSPy/LiteLLM and any type-heavy agent code can drop
-  `from __future__ import annotations` unless a dependency requires it.
-  Migration caveat: code that evaluates `__annotations__` values at runtime
-  (e.g. Pydantic/DSPy signature introspection) will now get lazy
-  `AnnotateFunction` objects; use `annotationlib.get_annotations()` for
-  explicit control.
+- **PEP 649/749 deferred annotations (default).** Forward references need no
+  quoting; see the verified behavior above. Runtime introspection should use
+  `annotationlib.get_annotations()` for explicit format control.
 - **PEP 734 subinterpreters + `concurrent.interpreters`.** Multiple
   interpreters in one process, each with its own GIL since 3.12 (PEP 684),
   exposed as a stdlib module in 3.14. Verified:
@@ -217,34 +210,25 @@ unless a real output is pasted.
   $ python3.14 -c "from concurrent.futures import InterpreterPoolExecutor; print('InterpreterPoolExecutor OK')"
   InterpreterPoolExecutor OK
   ```
-  Subinterpreters are still NOT the default execution model — they are opt-in
-  via this new module. Cambium's subprocess workers could in principle be
-  replaced by `InterpreterPoolExecutor` for lower spawn cost, but process
-  isolation (which Cambium already has via git-worktree workers) is stronger.
+  Subinterpreters are opt-in; process isolation remains stronger for workers.
 - **`python -m asyncio ps|pstree PID`** — introspect running tasks in a
   process. Verified present:
   ```
   $ python3.14 -m asyncio --help
   usage: python3 -m asyncio [-h] {ps,pstree} ...
   ```
-  Useful for diagnosing a wedged orchestrator. Backed by a new per-thread
-  doubly linked task list that also made standard asyncio benchmarks 10-20%
-  faster.
-- **asyncio free-threading support.** Multiple event loops can now run in
-  parallel threads on the FT build (linear scaling). Only matters if Cambium
-  runs parallel loops in threads, not across its subprocess workers.
+  Useful for diagnosing a wedged orchestrator; standard asyncio benchmarks are
+  reported 10-20% faster.
+- **asyncio free-threading support.** Multiple event loops can run in parallel
+  threads on the FT build; this does not affect subprocess-worker parallelism.
 - **asyncio `create_task()` kwargs.** `asyncio.create_task()` and
   `TaskGroup.create_task()` pass arbitrary kwargs to the Task factory.
-- **`multiprocessing` / `concurrent.futures`.** `forkserver` is now the default
-  start method for `ProcessPoolExecutor`/`multiprocessing` on Unix (non-macOS)
-  — a real behavior change for any process-pool code. New
-  `terminate_workers()`/`kill_workers()` on `ProcessPoolExecutor` and
-  `Process.interrupt()` (SIGINT to a child) — directly useful for an
-  orchestrator that must stop worker processes.
+- **`multiprocessing` / `concurrent.futures`.** `forkserver` is now default on
+  non-macOS Unix; 3.14 adds `terminate_workers()`, `kill_workers()`, and
+  `Process.interrupt()`.
 - **PEP 768 remote debugging.** `sys.remote_exec(pid, script)` and
-  `python -m pdb -p PID` attach to a running process; gated by
-  `-X disable-remote-debug` / `PYTHON_DISABLE_REMOTE_DEBUG`. Useful for
-  debugging subprocess workers in place.
+  `python -m pdb -p PID` attach to a process; `-X disable-remote-debug` /
+  `PYTHON_DISABLE_REMOTE_DEBUG` gates it.
 - **GC note:** 3.14.0–3.14.4 shipped an incremental GC, reverted to the 3.13
   generational GC in 3.14.5+ after production memory-pressure reports.
   Verified on this 3.14.7 build (3-tuple = generational):
@@ -252,11 +236,10 @@ unless a real output is pasted.
   $ python3.14 -c "import gc; print('gc.get_threshold():', gc.get_threshold())"
   gc.get_threshold(): (2000, 10, 10)
   ```
-- **Improved error messages** (keyword typo suggestions, `elif` after `else`,
-  unhashable type messages, `async with`/`with` protocol mismatch).
+- **Improved error messages** (keyword typos, `elif` after `else`, unhashable
+  types, and context-manager mismatches).
 - **Tail-call interpreter** (opt-in `--with-tail-call-interp`): documented
-  3-5% faster on pyperformance, but only for specific compiler/platform combos.
-  Not relevant to a stock install.
+  3-5% pyperformance gain on selected builds; not stock-install relevant.
 
 ## GIL / free-threading: the precise truth
 
@@ -312,31 +295,27 @@ the default build**. The precise truth, verified:
 **Pin: `requires-python = ">=3.14,<3.15"` on the regular (GIL) build. Do not
 target the free-threaded build by default.**
 
-Reasoning, tied to the system design and the reviews in `docs/architecture/reviews/`:
+Reasoning (see `docs/architecture/reviews/`; review M5/M1). This is a
+historical design recommendation, not a claim that the current repository has
+only I/O-bound LLM threads:
 
-- Cambium's parallelism is **subprocess-based** (git-worktree workers) plus
-  async I/O. Process isolation already gives true multi-core parallelism; the
-  GIL is only a constraint for *in-process CPU-bound threads*. The review
-  `docs/architecture/reviews/review-distributed-systems.md` M5 already makes exactly this
-  point, and nothing in 3.14 changes it. The only in-process thread use in the
-  design is `asyncio.to_thread` for LLM calls, which is I/O-bound — the GIL is
-  released during blocking I/O anyway.
+- The historical design used subprocess workers plus async I/O, so process
+  isolation already gave multi-core parallelism. Current source also has an
+  `EventStore` SQLite writer thread (`src/cambium/store.py`) and uses
+  `asyncio.to_thread` for event-store append/close, git, worker, tool, file,
+  and LLM boundary work (`src/cambium/supervisor.py`, `src/cambium/worker.py`,
+  `src/cambium/tools.py`); reassess GIL impact at those boundaries.
 - The FT build would add only risk for Cambium: ~5-10% single-threaded
   overhead, no JIT, and C-extension compatibility exposure (DSPy, LiteLLM,
   tokenizers, torch, numpy, orjson). Whether those wheels are FT-safe on this
-  platform is **UNVERIFIED** — none are installed in this repo (no
-  `pyproject.toml` exists), and no FT stress test was run.
-- Free-threading is officially supported in 3.14 (PEP 779) but still optional
-  and not the default; a plain `python3.14` is a GIL build, so pinning plain
-  3.14 in `pyproject.toml` gives everyone the GIL build automatically.
-- Keep free-threading **optional and additive**, gated behind a runtime
-  capability check (`sys._is_gil_enabled() is False` or
-  `sysconfig.get_config_var('Py_GIL_DISABLED')`), if SIMBA fan-out ever needs
-  true thread-level CPU parallelism; pair it with a documented fallback
-  (`ProcessPoolExecutor` or `concurrent.futures.InterpreterPoolExecutor`,
-  both available in 3.14) as the reviews' M1 asks. On the GIL build, prefer
-  `InterpreterPoolExecutor` for in-process parallelism — it gives real
-  multi-core without FT risk.
+  platform is **UNVERIFIED**. This historical run did not install them or run
+  an FT stress test; current optional extras are declared in `pyproject.toml`.
+- Free-threading is officially supported in 3.14 (PEP 779) but optional;
+  plain `python3.14` remains a GIL build.
+- Keep free-threading **optional and additive**, gated by
+  `sys._is_gil_enabled()`/`Py_GIL_DISABLED` if SIMBA needs thread-level CPU
+  parallelism; use `ProcessPoolExecutor` or `InterpreterPoolExecutor` as the
+  fallback. On the GIL build, the latter gives multi-core without FT risk.
 - Use `>=3.14,<3.15` rather than an exact pin so security patch releases
   (3.14.x) are picked up; `>=3.14` alone is acceptable if no upper bound is
   wanted.

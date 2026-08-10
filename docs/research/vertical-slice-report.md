@@ -1,14 +1,12 @@
 # Vertical Slice — End-to-End Proof (ONE worker)
 
-**Branch:** `wt-slice` · **Date:** 2026-08-09 · **Status:** built + verified.
-**Purpose:** the adversarial review's gate: prove the harness works end-to-end with ONE
-worker before more theory. A real supervisor subprocess-spawns a real worker script, speaks
-JSON-Lines over pipes, runs a real gate, and merges a real git change — all stdlib + git,
-Python 3.14.7 (uv), no LLM, no network, no DSPy, no sandbox.
-
-**Current-main note (2026-08-09):** this is the historical slice report, not the current
-suite report. Main now collects 108 scenario tests and the full suite passes; the
-slice-only test total below is superseded by that current-main count.
+**Snapshot:** branch `wt-slice`, 2026-08-09; historical record of a claimed
+end-to-end slice. It describes one supervisor/worker subprocess, JSON-Lines
+IPC, gate, and git merge on Python 3.14.7 (stdlib + git; no LLM, network, DSPy,
+or sandbox). A provenance discrepancy below prevents treating every transcript
+SHA as one independently verified run.
+Current behavior is defined by the [Python 3.14 docs](https://docs.python.org/3.14/)
+and the repository tests; this record keeps only the slice evidence.
 
 **Revision 2 (review CONDITIONAL-PASS must-fixes):** enforced worker-exit / exit_message /
 result_envelope failure conditions, run_task↔result_envelope request_id correlation,
@@ -68,10 +66,11 @@ rc=1, no merge, `main` unchanged, supervisor exit 1.
 
 All run from the worktree root `/tmp/opencode/cambium-slice`.
 
-1. `uv run --python 3.14.7 --extra test pytest --collect-only -q` → `108 tests collected`.
-   The full command `uv run --python 3.14.7 --extra test pytest -q` → `108 passed`;
-   `uv run --python 3.14.7 --with ruff ruff check src` → `All checks passed`. The
-   slice-only total is historical.
+1. `uv run --python 3.14.7 --extra test pytest --collect-only -q`; the full
+   `uv run --python 3.14.7 --extra test pytest -q`; and
+   `uv run --python 3.14.7 --with ruff ruff check src` all passed in the slice
+   run. Test counts are intentionally omitted; rerun the commands for a current
+   count.
 2. `uv run --python 3.14.7 python -m compileall -q src scripts` → rc=0 (no output).
 3. Manual run:
    `uv run --python 3.14.7 python -m cambium.supervisor --session-dir /tmp/opencode/slice-run`
@@ -84,7 +83,7 @@ All run from the worktree root `/tmp/opencode/cambium-slice`.
      `status=failed exit_code=1 … exit_reason=null merge=None`, `SUPERVISOR_EXIT=1`, `main` unchanged.
 5. `git status --porcelain` after commit → clean (see commit hash in the final report).
 
-Manual-run transcript (happy path):
+Recorded manual-run transcript (claimed happy path; provenance unresolved):
 
 ```
        spawned  {"task_id": "slice-001", "worker": "…/scripts/fake_worker.py"}
@@ -100,13 +99,19 @@ result: status=succeeded exit_code=0 worker_exit=0 worker_status=succeeded gate_
 SUPERVISOR_EXIT=0
 ```
 
+**Unresolved provenance discrepancy:** the recorded merge event reports
+`b39339d…`, while the recorded `git log` below reports `24d9491`. No session
+artifacts are available to reconcile them, so this document retains both values
+but does not present them as one verified end-to-end result.
+
 Correlation in the event log: `ready.request_id == init.request_id` (R1),
 `result.request_id == run_task.request_id` (R2), and the `exit` event carries no
 `request_id`.
 
 Event log `/tmp/opencode/slice-run/.cambium/events.jsonl` (kinds in order):
 `spawned, init, ready, run_task, result, exit, gate, merge, session_ended` — the mandated
-sequence (init, ready, run_task, result, exit) is present in order. Merged result:
+sequence (init, ready, run_task, result, exit) is present in order. Recorded
+checkout output (SHA provenance unresolved):
 
 ```
 $ cat /tmp/opencode/slice-run/scratch/hello.txt
@@ -123,70 +128,45 @@ Negative-path manual run (via `<session-dir>/task.json`, `write_marker=false`):
 
 ## Divergences from the architecture drafts (flagged)
 
-1. **`run_task` wire message.** `arch §5.2` has no wire dispatch message (one task per
-   process, delivered entirely by `init`; persistent pool deferred to v2.1). The slice uses
-   `init` + `run_task`, the IPC draft's flagged extension (§7.1) — the task mandated it.
-2. **Message names / status values.** Built with the draft names `result_envelope`,
-   `exit_message`, `status ∈ {succeeded, failed}` (IPC draft §7.7–8); `arch §5.2` names them
-   `result`/`exit` with `status ∈ {done, failed, …}`. Wire-shape semantics identical.
-3. **No `ok` response to `run_task`.** The draft (§2.2) has the worker reply `ok` when the
-   loop starts; the slice goes straight `run_task` → `result_envelope`.
-4. **Event log is plain appended JSON-Lines, not SQLite WAL on a writer thread.**
-   `arch §6` / custos-design §2.4 specify SQLite WAL + dedicated writer thread + fsync
-   cadence + critical-event tiers; the slice appends to `.cambium/events.jsonl` with a
-   per-line flush, **synchronously on the event loop** (a direct DS-C1/DS-M3 deviation, and
-   the arch's JSONL is only an optional mirror). Durability intent: append+flush only; a
-   crash can lose the tail. The writer-thread/fsync design is the next milestone, not this
-   slice.
-5. **`request_id` is not a ULID.** Draft §5 requires ULID (monotonic-ish). No new deps →
-   `f"{time.time_ns():x}-{seq:04x}"` — monotonic, unique within a run, not a real ULID.
-6. **Merge is `git merge --ff-only` in the scratch checkout, not Unio's
-   throwaway-worktree + `update-ref refs/heads/main <tip> <old>`.** Per the
-   worktree-concurrency findings (F3/F17): concurrent ff-only merges in one checkout are
-   the hazard; with exactly ONE worker (serialized by construction) ff-only in the scratch
-   repo is safe, and it also fast-forwards the working tree so the test/reader sees the
-   merged edit. The `update-ref`-with-old-SHA publish is the concurrency-safe form needed
-   when N workers merge — future Unio milestone. The findings' other rules are honored:
-   worker branches are never merged into from a worker worktree, and the worker only
-   advances its own branch.
-7. **Worker creates its own worktree on `run_task`.** `arch §7.5`/Surculus creates/reovers
-   the worktree before spawn; the slice worker does `git worktree add` (with a stale
-   worktree/branch teardown first). Worktree recovery/prune/quarantine are out of scope.
-8. **Event `kind` names follow the wire messages** (`init`, `ready`, `run_task`, `result`,
-   `exit`, `gate`, `merge`) rather than arch §3.6 kinds (`worker_spawned`, `worker_ready`,
-   …). Shape is `{"kind","timestamp","payload"}`, not the full §3.6 Event schema
-   (`request_id`, `monotonic_ms`, `generation` as top-level fields).
-9. **CLI bootstraps the scratch repo** (`git init -b main` + initial commit when missing)
-   so the documented manual run works from an empty `--session-dir`. The library
-   `run_session` never creates repos; this is a test-harness convenience only.
-10. **`generation` is fixed at 1; no fencing.** `.cambium/generation` is not written and no
-    mismatch check runs (arch §7.3). Fencing is explicitly out of scope (below).
+1. **`run_task` wire message.** `arch §5.2` delivers one task via `init` (persistent
+   pool deferred to v2.1); the slice adds the mandated IPC-draft extension (§7.1) and
+   uses `init` + `run_task`.
+2. **Message names/status.** The slice uses `result_envelope`, `exit_message`, and
+   `{succeeded, failed}` (IPC §7.7–8), versus `result`/`exit` and `{done, failed, …}` in
+   `arch §5.2`; wire-shape semantics are unchanged.
+3. **No `ok` response.** The draft (§2.2) replies `ok` when the loop starts; the slice goes
+   directly `run_task` → `result_envelope`.
+4. **Event log.** The slice uses synchronous per-line-flushed `.cambium/events.jsonl`, not
+   the SQLite WAL/writer/fsync design in `arch §6` / custos-design §2.4 (DS-C1/DS-M3);
+   a crash can lose the tail. That design is a later milestone.
+5. **`request_id` is not a ULID.** Draft §5 requires ULID; the slice uses
+   `f"{time.time_ns():x}-{seq:04x}"`, unique and monotonic within one run.
+6. **Merge.** The slice uses `git merge --ff-only` in the scratch checkout. F3/F17 show
+   shared-checkout races; one worker is serialized and safe. Unio needs throwaway-worktree
+   `update-ref refs/heads/main <tip> <old>` for N workers; worker branches stay worker-owned.
+7. **Worker worktree.** `arch §7.5`/Surculus creates it before spawn; the slice worker runs
+   `git worktree add` after stale worktree/branch teardown. Recovery/prune/quarantine are out.
+8. **Event kinds.** Wire names (`init`, `ready`, `run_task`, `result`, `exit`, `gate`, `merge`)
+   replace arch §3.6 kinds; shape is `{"kind","timestamp","payload"}`, not the full Event
+   schema with top-level request/generation fields.
+9. **CLI bootstrap.** The CLI runs `git init -b main` and an initial commit when needed;
+   library `run_session` does not create repositories.
+10. **No fencing.** `generation` is fixed at 1; `.cambium/generation` and mismatch checks
+    are absent (arch §7.3). Fencing is out of scope below.
 
 Review must-fix additions (this revision):
 
-11. **Correlation semantics.** `result_envelope` echoes **run_task's** request_id (R2);
-    `exit_message` is connection-level and carries **no** request_id, per `arch §5.2` `exit`
-    (the IPC draft §2.4 said it echoes init — the reviewer overrode this). A
-    `result_envelope` whose request_id != R2 is treated as undeliverable → failed.
-12. **Enforced failure conditions.** The earlier draft logged `eof_without_exit` but did not
-    fail; it logged `proc.wait()` but derived the exit code only from the envelope. Now
-    worker exit != 0, missing `exit_message`, and missing/undeliverable `result_envelope`
-    each override the envelope's status to failed, and the supervisor exit code reflects the
-    worker's real exit code (e.g. 5) instead of a flat 1. This is stricter than `arch §5.3`
-    prescribes for the "exit is authoritative" cross-check and matches the review demand.
-13. **Minimal timeouts (draft addition; arch defines none in the wire loop).** ready_timeout
-    10 s, gate_timeout 30 s, wall budget 120 s (task_spec key or `CAMBIUM_READY_TIMEOUT_S` /
-    `CAMBIUM_GATE_TIMEOUT_S` / `CAMBIUM_WALL_BUDGET_S` env). On timeout the worker's
-    process group is killed (`killpg` via `start_new_session=True`, arch §7.2) and the
-    session fails with exit code 3 (arch §16.4 timeout). No restart policy — a timed-out
-    task is failed, not retried. The merge step is not individually timeout-wrapped; it is
-    gated by the wall budget.
-14. **Path safety.** `target_file` must resolve inside the worker's worktree; `worktree_path`
-    must resolve inside the session dir; the worker refuses to `git worktree remove --force`
-    a path that is not under the session scratch root (scratch repo's parent). Enforcement:
-    `_validate_paths()` (supervisor, before spawn and before CLI bootstrap) + the same
-    prefix checks in the worker. This is defense against `..`/absolute-path payloads, not a
-    substitute for the (out-of-scope) sandbox.
+11. **Correlation.** `result_envelope` echoes `run_task` R2; connection-level `exit_message`
+    carries no request ID (`arch §5.2`; IPC §2.4 differed). A non-R2 envelope is undeliverable.
+12. **Failure enforcement.** Worker exit != 0, missing exit, or missing/misrouted envelope
+    overrides status to failed; the supervisor returns the worker's real code (e.g. 5),
+    stricter than `arch §5.3`'s cross-check.
+13. **Timeouts.** ready 10 s, gate 30 s, wall 120 s (`CAMBIUM_*` env/task keys); timeout
+    kills the process group (`killpg`, `arch §7.2`) and returns 3 (`arch §16.4`). No retry;
+    merge is covered by the wall budget.
+14. **Path safety.** `target_file` stays inside the worktree and `worktree_path` inside
+    the session; `_validate_paths()` and worker prefix checks reject `..`/absolute escapes.
+    Forced removal outside the scratch root is refused; this is not a sandbox.
 
 ## NOT in scope (explicitly, per the task)
 

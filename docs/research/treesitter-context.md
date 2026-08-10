@@ -1,22 +1,20 @@
 # Tree-sitter AST context compression (v2.1 roadmap M9, Proposal 1)
 
-Research date: 2026-08-09. Worktree: `/tmp/opencode/cambium-research-treesitter`
-(branch `wt-research-treesitter`, created from `main@6109a6a`). Experiment
-directory: `/tmp/opencode/exp-treesitter` (outside the worktree, per task).
-Purpose: answer the falsifiable question — does tree-sitter-based AST
-extraction reduce LLM context tokens meaningfully without hurting
-compile/test success? — against the M9 acceptance criteria in
-`docs/research/v2-1-review.md` §3 M9:
+**Snapshot (2026-08-09):** historical run from
+`/tmp/opencode/cambium-research-treesitter` (branch `wt-research-treesitter`,
+`main@6109a6a`); verify current APIs in the
+[Tree-sitter Python bindings](https://tree-sitter.github.io/py-tree-sitter/).
+Experiment data is in `/tmp/opencode/exp-treesitter` (outside the worktree).
+Question: does AST extraction reduce context without hurting compile/test
+success, under `docs/research/v2-1-review.md` §3 M9?
 
 1. **>=25% reduction** in median input tokens per compile-successful task.
 2. **<=2-point compile-success degradation** (paired 95% CI excluding a worse
    decline).
 
-Verification rule (mirrors `docs/research/worker-coldstart.md`): every number
-below is a real run on this host; anything that could not be measured is
-marked **UNVERIFIED**. Token counts use the **chars/4 heuristic** as the
-documented proxy for LLM tokens; no tiktoken (per task instruction), so all
-token figures are proxy estimates, not provider tokenizer counts.
+Every number below is a real run on this host; unchecked items are
+**UNVERIFIED**. Token counts use the **chars/4 proxy** (no tiktoken), not a
+provider tokenizer.
 
 ## Host and environment
 
@@ -51,8 +49,8 @@ function_definition
 
 - `tree-sitter 0.26.0`, `tree-sitter-python 0.25.0` — both pure wheels, no
   build step on this host.
-- `tree-sitter-language-pack` was **not needed** and **not attempted** (the
-  primary path worked), so its 3.14 support is **UNVERIFIED**.
+- `tree-sitter-language-pack` was not needed or attempted; its 3.14 support is
+  **UNVERIFIED**.
 - Pure-python fallback (stdlib `ast`) was implemented and cross-checked anyway
   as a contingency; it reproduces the tree-sitter token counts within 1 token
   per file on signatures-only mode (see §3). It would have carried the
@@ -63,21 +61,17 @@ function_definition
 ## 2. Prototype
 
 `/tmp/opencode/exp-treesitter/compressor.py` implements
-`compress_file(path, *, relevant: set[str]) -> str` with two interchangeable
-backends (`treesitter`, `ast`):
+`compress_file(path, *, relevant: set[str]) -> str` with `treesitter` and `ast`
+backends:
 
-- **Keep:** every top-level def/class signature — decorators plus the header,
-  capped at the first 3 lines — and the **full body** of any top-level def/
-  class whose name is in `relevant` **or that contains a nested def/class whose
-  name is in `relevant`** (member/method relevance propagates to the enclosing
-  class).
-- **Replace everything else** (module docstrings, imports, module-level
-  assignments, nested bodies of non-relevant symbols) with `# ...`.
+- **Keep:** top-level def/class signatures (decorators and up to 3 header
+  lines), plus full bodies whose names or relevant nested names match.
+- **Replace:** docstrings, imports, module assignments, and non-relevant nested
+  bodies with `# ...`.
 
-The compressed output is a **view, not valid code** (see §4). The compressor
-is a context adapter only; it never runs inside a worker's file operations and
-has no supervisor concern (M9 scope: “never a supervisor concern”;
-architecture §3.7 I2.4 context composition).
+The compressed output is a **view, not valid code** (see §4). It is a context
+adapter only, never part of worker file operations or supervisor state (M9
+scope; architecture §3.7 I2.4).
 
 ### Finding: byte-offset vs char-index bug (fixed)
 
@@ -91,10 +85,9 @@ real repo must document byte-vs-char offset handling.
 
 ## 3. Fidelity: signature coverage (machine-checkable)
 
-Primary fidelity metric (per task): **signature coverage** — the fraction of
-def/class names from the original file that appear in the compressed view as
-whole words. Coverage is computed by stdlib `ast` walk + regex boundary
-check, so it is machine-checkable.
+Primary metric: **signature coverage**, the fraction of original def/class
+names appearing as whole words. A stdlib `ast` walk plus regex boundary check
+makes it machine-checkable.
 
 | File set | Scope | Coverage |
 |---|---|---|
@@ -102,9 +95,8 @@ check, so it is machine-checkable.
 | example module (4 files) | **all** names (incl. nested), `relevant` = every name | 100% (23/23) |
 | synthetic repo (20 files) | top-level names, signatures-only view | 100% per file, all 20 |
 
-The signatures-only view intentionally drops nested bodies, so **nested names
-survive only when `relevant` includes them** (or their enclosing top-level
-symbol); this is the mechanism, not a defect.
+Signatures-only drops nested bodies; nested names survive when `relevant`
+includes them (or their enclosing top-level symbol).
 
 Bonus data point: `ast.parse` accepts **0/20** signatures-only views (stdlib
 `ast` reports “expected an indented block” — a `# ...`-only body is not a
@@ -132,14 +124,12 @@ touches most symbols.)
 ### 4b. Synthetic 20-file repo (generated deterministically)
 
 `gen_repo.py` writes 20 files (92,282 chars) to
-`/tmp/opencode/exp-treesitter/synthrepo`; `scenario.py` measures three
-context variants:
+`/tmp/opencode/exp-treesitter/synthrepo`; `scenario.py` measures:
 
 - **raw** = every file verbatim (baseline);
 - **sig** = every file signatures-only;
-- **targeted** = a task touching 3 files (`service.py`, `repository.py`,
-  `api.py`) keeps full bodies of the touched symbols (`run`, `_compute`),
-  other symbols in those files and all other files are signatures-only.
+- **targeted** = a task touching `service.py`, `repository.py`, and `api.py`
+  keeps touched bodies (`run`, `_compute`); all other content is signatures-only.
 
 | Context variant | tokens (chars/4) | reduction vs raw |
 |---|---:|---:|
@@ -153,10 +143,8 @@ tokens) while the untouched 17 files stay at ~89% reduction.
 
 ### 4c. M9 acceptance criterion 1: **PASS (measured)**
 
-Every measured context variant reduces input tokens by **80.8%–95.5%**,
-comfortably above the **>=25%** threshold. This holds for both the real
-example module and a 20-file synthetic repo, and for both signatures-only and
-targeted-task compositions.
+Every measured variant reduces input tokens by **80.8%–95.5%**, above the
+**>=25%** threshold, across the real module and synthetic repo.
 
 ## 5. Compile-success degradation — **UNVERIFIED**
 
@@ -176,19 +164,14 @@ points**) could **not be measured** in this experiment:
 
 ### Proposed harness experiment (for M6/M9)
 
-1. Freeze >=30 tasks across Python/Rust/TypeScript with pinned grammar wheels
-   (`tree-sitter-python` verified; `tree-sitter-rust`,
-   `tree-sitter-typescript` **UNVERIFIED** on 3.14.7).
-2. For each task run a **paired** trial: raw-context vs AST-context, same
-   provider/model, temperature, gate command, and task budget; record input
-   tokens, compile-success, gate-pass, wall time, changed-file recall.
-3. Compile the context with the compressor in signatures-only mode plus
-   `relevant` = the symbols the task's spec names (as in §4b), fall back to an
-   explicit unsupported-language result — never a silent text heuristic (M9
-   scope).
-4. Metric: median input tokens per compile-successful task; adopt iff median
-   drops >=25% **and** compile-success drops <=2 points with a paired 95% CI
-   excluding a worse decline.
+1. Freeze >=30 Python/Rust/TypeScript tasks with pinned grammar wheels
+   (`tree-sitter-python` verified; rust/typescript **UNVERIFIED**).
+2. Run paired raw/AST trials with the same provider, model, temperature, gate,
+   and budget; record tokens, compile/gate success, wall time, and file recall.
+3. Use signatures-only plus task-named `relevant` symbols; return an explicit
+   unsupported-language result, never a silent text heuristic.
+4. Adopt iff median tokens per successful task drops >=25% and compile success
+   drops <=2 points with a paired 95% CI excluding a worse decline.
 
 ## 6. Design caveats to carry forward
 
@@ -236,33 +219,9 @@ candidate.** Concretely:
    wheels **UNVERIFIED**) and implement the explicit unsupported-language
    fallback before any broader adoption.
 
-## Appendix: commands and raw outputs
+## Appendix: additional backend check
 
-Feasibility:
-
-```
-$ uv run --python 3.14.7 --with tree-sitter python -c "import tree_sitter; print(tree_sitter.__version__)"
-0.26.0
-```
-
-Example module totals (`measure_real.py`):
-
-```
-full=4179 sig=188 rel=3502
-signatures-only reduction: 95.5%
-all-relevant reduction:    16.2%
-```
-
-Synthetic repo totals (`scenario.py`):
-
-```
-generated 20 files, 92282 chars total
-raw=23063 sig=2607 targeted=4435
-signatures-only reduction: 88.7%
-targeted-task reduction:   80.8%
-sig-coverage all files 100%: True
-```
-
-Backend parity (`compressor.py` treesitter vs ast, signatures-only, 20 files):
-`ts=2607 ast=2574` tokens. Signatures-only views parse with stdlib `ast`:
-`0/20` (expected — views are not code).
+Backend parity (`compressor.py`, signatures-only, 20 files): `ts=2607`
+`ast=2574` tokens. Signatures-only views parse with stdlib `ast`: `0/20`
+(expected; views are not code). Feasibility and aggregate totals are recorded
+in §§1 and 4 above.

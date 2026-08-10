@@ -1,11 +1,12 @@
 # Worker cold-start cost: fork-per-task vs persistent pool
 
-Research date: 2026-08-09. Worktree: `/tmp/opencode/cambium-coldstart` (branch
-`wt-coldstart`). Benchmark directory: `/tmp/opencode/exp-coldstart` (outside
-the worktree, per task). Purpose: decide the worker-spawn architecture open
-question — persistent worker pool (v2.1) vs fork-per-task — with measured
-numbers. Verification rule: every number below is a real measurement taken on
-this host; anything that could not be measured is marked **UNVERIFIED**.
+**Snapshot (2026-08-09):** historical benchmark from
+`/tmp/opencode/cambium-coldstart` (branch `wt-coldstart`); the original
+artifacts were written under `/tmp/opencode/exp-coldstart` (outside the
+worktree), but that path is absent in the current environment. It compares the v2.1
+persistent pool with fork-per-task. Check current dspy metadata at the [dspy
+PyPI JSON](https://pypi.org/pypi/dspy/json). Every number is a host
+measurement; unchecked items are **UNVERIFIED**.
 
 ## Host and environment
 
@@ -23,9 +24,9 @@ this host; anything that could not be measured is marked **UNVERIFIED**.
 
 Timing method: each sample = wall time of one full subprocess invocation of the
 given command (Python `subprocess.run`, `time.perf_counter`), excluding the
-driver itself. Median/p90 computed on sorted samples. Primary batch ran at
-`loadavg 2.6`; earlier exploratory runs at `loadavg 7–17` are not used in the
-table.
+driver itself. Median/p90 computed on sorted samples; the audit p90 uses linear
+interpolation at `0.9*(N-1)`. Primary batch ran at `loadavg 2.6`; earlier
+exploratory runs at `loadavg 7–17` are not used in the table.
 
 ## Per-operation measurements (median / p90, ms)
 
@@ -41,17 +42,17 @@ table.
 | `uv run --with dspy python -c "import dspy"` | 5 | **2260.7** | **2579.9** | 2214.6 | 2736.0 |
 | `import dspy` only (dspy ephemeral env python, no uv) | 5 | **2188.7** | **2285.6** | 2108.3 | 2304.4 |
 | subprocess worker: `python -c "import dspy; from cambium.modules.example.decide import ShouldDecomposeModule"` | 5 | **2221.2** | **2349.2** | 2201.2 | 2404.3 |
-| fork from warmed parent (cambium pre-imported, RSS 22.8 MB) | 30 | **1.83** | **2.31** | 1.38 | 2.98 |
+| fork from warmed parent (cambium pre-imported, RSS 22.8 MB) | 30 | **1.83** | **2.34** | 1.38 | 2.98 |
 | fork from warmed parent (cambium + dspy pre-imported, RSS 89 MB) | 10 | **5.60** | **6.87** | 3.80 | 7.42 |
 
-The four dspy rows and both fork-dspy rows were re-measured on 2026-08-09 and
-replaced with the new medians/p90s (raw data in the appendix); `loadavg` at
-measurement time: `uv run --with dspy` 6.93; `import dspy` only 7.39;
-subprocess worker dspy 6.81; fork (cambium+dspy) 5.59. The first batch's
-figures for these rows (2166.8 / 2126.1 / 2087.4 / 5.33 ms) had no captured raw
-data and are superseded.
+The dspy and fork-dspy rows were re-measured on 2026-08-09; the table keeps
+the resulting medians/p90s. Earlier figures without raw data are superseded.
 
-Representative raw samples (median run of each), ms:
+Representative raw samples (median run of each) are retained inline for the
+rows listed in the reproducibility audit below. The four startup rows without
+tracked samples are not recomputable. Samples are displayed at their recorded
+precision, so recomputation can differ from the table's final displayed digit
+where unrounded samples were used:
 
 - `uv run --python 3.14.7 python -c "pass"`: `[35.4, 39.0, 35.7, 38.0, 44.0, 32.4, 37.4, 37.2, 41.3, 33.1, 34.6, 42.6, 35.3, 45.0, 46.6, 41.5, 34.3, 43.0, 37.3, 37.8]`
 - `uv run` + Orchestrator: `[148.5, 125.5, 137.2, 126.2, 113.3, 122.3, 122.8, 118.2, 112.9, 128.1, 138.2, 114.4, 114.7, 118.6, 115.6, 147.0, 126.9, 113.3, 115.1, 116.1]`
@@ -61,6 +62,22 @@ Representative raw samples (median run of each), ms:
 - subprocess worker, dspy + cambium.decide (re-measured): `[2221.2, 2404.3, 2266.5, 2210.7, 2201.2]`
 - fork, warmed (cambium): `[2.18, 2.98, 1.72, 2.95, 1.84, 1.52, 1.78, 2.17, 1.86, 2.31, 1.63, 1.82, 1.92, 1.73, 1.89, 1.83, 1.85, 1.82, 1.63, 1.38, 2.58, 2.12, 1.69, 1.88, 1.71, 1.76, 1.74, 1.78, 1.43, 1.88]`
 - fork, warmed (cambium + dspy), re-measured: `[6.81, 5.94, 5.66, 5.86, 5.54, 3.80, 7.42, 4.03, 3.92, 3.80]`
+
+### Reproducibility status
+
+| Table entries | Retained primary source | Status |
+|---|---|---|
+| `uv run ... pass`; `uv run` + `Orchestrator`; `venv/bin/python` + `ShouldDecomposeModule`; `import dspy`; `uv run --with dspy`; dspy subprocess | Matching inline arrays above | **RECOMPUTABLE** |
+| `python3.14 -c "pass"`; `exp-coldstart-venv/bin/python -c "pass"`; `uv run` + `ShouldDecomposeModule`; `venv/bin/python` + `Orchestrator` | No tracked raw samples in git history; `/tmp/opencode/exp-coldstart/measurements2.jsonl` is absent | **UNVERIFIED / NON-RECOMPUTABLE** |
+| Fork from warmed parent (cambium, 30 samples) | Inline 30-sample array | **RECOMPUTABLE; recorded p90 inconsistency** |
+| Fork from warmed parent (cambium + dspy, 10 samples) | Inline array and retained JSON record | **RECOMPUTABLE** |
+| All four 10-worker fan-out entries | Inline table samples and retained JSON records | **RECOMPUTABLE** |
+
+The recorded p90 for the 30 warm-cambium samples was **2.31 ms**. Sorting the
+retained values and applying the documented linear interpolation at
+`0.9*(N-1)` gives **2.337 ms**, displayed as **2.34 ms**. This is a recorded
+inconsistency, not a rounding explanation; the table uses the recomputed value
+and retains **2.31 ms** here as the historical result.
 
 ### Derived costs (venv-based, no dspy)
 
@@ -118,30 +135,22 @@ per worker / ~178 ms fan-out** vs **~1.8 ms per fork / ~7.2 ms fan-out**.
 5.6 ms).** dspy's import dominates everything else in the worker path, so the
 decision hinges on whether that 2.2 s is paid once or per task.
 
-Caveat — pooling mechanism is a separate choice. The numbers support *not*
-paying 2.2 s per task, but:
-- `os.fork` from the supervisor contradicts architecture v2.0 invariants: the
-  deterministic layer (Custos) must never import a DSPy module, workers must
-  stay isolated (sandbox, own FDs), and fork-after-threads (asyncio supervisor,
-  provider clients) is unsafe.
-- The same win is available while keeping the existing subprocess + stdio IPC
-  (`Nuntius` JSON-Lines/`request_id`) design: **pre-spawn a pool of subprocesses
-  once (~2.2 s each, amortized over their lifetime) and reuse them across
-  tasks**, so the marginal per-task cost is an IPC round-trip, not a process
-  spawn. This is the v2.1 persistent-worker-pool direction.
+Caveat: supervisor `os.fork` violates v2.0 isolation and fork-after-threads
+invariants. Keep Nuntius stdio IPC and pre-spawn subprocess workers once
+(~2.2 s each), then reuse them so each task pays an IPC round-trip; this is the
+v2.1 persistent-worker-pool direction.
 
-Numbers not independently re-measured and therefore not used: none; every figure
-above is a measured sample on this host. All measurements were taken under
-concurrent third-party load (`loadavg` ranged 2.6–8.7 across batches); the fork
-figures are the most robust (min 1.38 ms, tight distribution), the dspy fan-out
-figures the noisiest (±~1 s), and the dspy fork figures are COW/load sensitive
-(first-touch page faults spike the p90: 6.87–34.5 ms across batches).
+Every figure is a host measurement under concurrent load (`loadavg` 2.6–8.7).
+Fork timings are tight (min 1.38 ms); dspy fan-out is noisy (±~1 s), and dspy
+fork p90 is COW/load-sensitive (6.87–34.5 ms across batches).
 
-## Appendix: re-measured evidence (dspy rows, fork-dspy, 10-worker fan-outs)
+## Appendix: re-measured evidence (dspy rows, fork-dspy, fan-outs)
 
-Raw data for the re-measured figures lives outside the worktree at
+Raw data for the re-measured figures was written outside the worktree at
 `/tmp/opencode/exp-coldstart/measurements2.jsonl` (newline-delimited JSON, one
 record per run; each record carries `loadavg`, `raw_ms`, `median_ms`, `p90_ms`).
+That path is absent in the current environment; the records below are the
+durable subset retained in this document.
 
 Generation driver: `/tmp/opencode/exp-coldstart/bench2.py`, invoked as
 `<py> bench2.py <mode> <N> <name> [dspy|nodspy] [-- cmd...]` with modes
@@ -152,8 +161,9 @@ The dspy scenarios used the dspy ephemeral env
 `PYTHONPATH=/home/ubuntu/cambium/src`; no-dspy scenarios used
 `/tmp/opencode/exp-coldstart-venv/bin/python`.
 
-The records backing the updated table rows (verbatim from `measurements2.jsonl`,
-rounded to 3 decimals):
+The records backing the updated table rows (verbatim from
+`measurements2.jsonl`, rounded to 3 decimals) are retained here because the
+external file may be unavailable:
 
 ```
 {"mode": "cmd", "name": "uv-run-with-dspy", "n": 5, "loadavg": [6.93, 6.28, 6.25], "raw_ms": [2735.953, 2345.846, 2248.33, 2260.676, 2214.642], "median_ms": 2260.676, "p90_ms": 2579.91}
