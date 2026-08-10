@@ -203,8 +203,8 @@ def test_stdin_write_deadline_kills_non_reader_group(tmp_path: Path, monkeypatch
     assert "stdin" in (result.results[0].reason or "")
     events = read_events(session_dir)
     assert any(
-        event["kind"] == "protocol"
-        and "write failed" in event["payload"].get("note", "")
+        event["kind"] == "timeout"
+        and event["payload"].get("phase") == "stdin"
         for event in events
     )
 

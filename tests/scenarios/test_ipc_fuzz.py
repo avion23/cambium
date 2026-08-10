@@ -53,8 +53,8 @@ def _utf8_fragments(rng: random.Random, length: int) -> bytes:
 
 
 def _random_payload(rng: random.Random, case: int) -> bytes:
-    # Keep most cases short because the framing layer deliberately reads one
-    # byte at a time; mode 4 still supplies near-cap single-line inputs.
+    # Keep most cases short so deterministic payload generation stays bounded;
+    # mode 4 still supplies near-cap single-line inputs.
     length = int(rng.random() ** 2 * (MAX_RANDOM_BYTES + 1))
     mode = case % 8
     if mode == 0:
