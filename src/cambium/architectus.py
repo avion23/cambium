@@ -459,7 +459,7 @@ class ArchitectusCore:
 
     def _failure_actions(self, events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Route all exhausted gate failures through the stateful failure edge."""
-        actions: list[dict[str, Any]] = []
+        classified: list[tuple[str, dict[str, Any], str]] = []
         for event in events:
             try:
                 decision = decide_failure(event)
@@ -475,7 +475,10 @@ class ArchitectusCore:
             if not isinstance(task_id, str) or not task_id:
                 raise ValueError(f"{decision} failure event requires a non-empty task_id")
             self._node(task_id)
+            classified.append((decision, fields, task_id))
 
+        actions: list[dict[str, Any]] = []
+        for decision, fields, task_id in classified:
             if (
                 decision == FailureDecision.RESET_RETRY.value
                 and task_id not in self._reset_retry_tasks
@@ -503,6 +506,7 @@ class ArchitectusCore:
         ready_rank = {task_id: index for index, task_id in enumerate(ready_ids)}
         capacity = max(self._max_width - len(self._in_flight), 0)
         accepted_spawn_ids: list[str] = []
+        aborted_spawn_ids: set[str] = set()
         non_spawn: list[tuple[int, dict[str, Any]]] = []
         spawn_positions: list[int] = []
 
@@ -538,10 +542,12 @@ class ArchitectusCore:
                             "task_id": task_id,
                         }
                         self._mark_subtree_failed(task_id)
+                        aborted_spawn_ids.add(task_id)
                     else:
                         self._reset_retry_tasks.add(task_id)
                 elif kind is ActionKind.ABORT_SUBTREE:
                     self._mark_subtree_failed(task_id)
+                    aborted_spawn_ids.add(task_id)
             non_spawn.append((raw_index, action))
 
         accepted_spawn_ids.sort(key=ready_rank.__getitem__)
@@ -560,7 +566,8 @@ class ArchitectusCore:
                     break
 
         for task_id in accepted_spawn_ids:
-            self._in_flight.add(task_id)
+            if task_id not in aborted_spawn_ids:
+                self._in_flight.add(task_id)
         return actions
 
     def _record_action(self, action: dict[str, Any]) -> None:

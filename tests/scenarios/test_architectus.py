@@ -560,3 +560,63 @@ def test_repeated_reset_retry_aborts_running_task_and_releases_slot() -> None:
 
     assert asyncio.run(core.step([])) == []
     assert core.in_flight == set()
+
+
+def test_mixed_spawn_and_repeated_reset_does_not_leave_aborted_task_in_flight() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [
+                [
+                    {"action": "spawn", "task_id": "root"},
+                    {"action": "reset_retry", "task_id": "root"},
+                    {"action": "reset_retry", "task_id": "root"},
+                ],
+                [],
+            ]
+        ),
+        tree=tree,
+    )
+
+    assert asyncio.run(core.step([])) == [
+        {"action": "spawn", "task_id": "root"},
+        {"action": "reset_retry", "task_id": "root"},
+        {"action": "abort_subtree", "task_id": "root"},
+    ]
+    assert core.in_flight == set()
+    assert asyncio.run(core.step([])) == []
+
+
+def test_malformed_later_failure_event_does_not_consume_prior_event() -> None:
+    tree = build_tree(_plan([("root", "FEATURE", [], None)]))
+    core = ArchitectusCore(
+        ScriptedLLM([[{"action": "spawn", "task_id": "root"}]]),
+        tree=tree,
+    )
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+
+    first_failure = {
+        "kind": "gate_failed",
+        "task_id": "root",
+        "retries_remaining": 0,
+    }
+    malformed_later_failure = {
+        "kind": "gate_failed",
+        "retries_remaining": 0,
+    }
+
+    with pytest.raises(ValueError, match="requires a non-empty task_id"):
+        asyncio.run(core.step([first_failure, malformed_later_failure]))
+
+    assert core.reset_retry_tasks == frozenset()
+    assert core.in_flight == {"root"}
+    assert asyncio.run(core.step([first_failure])) == [
+        {"action": "reset_retry", "task_id": "root"}
+    ]
