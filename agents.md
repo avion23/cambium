@@ -29,6 +29,7 @@ Matching role modules are not proof. No TUI exists.
 
 - Keep scope tight. Report required file-scope expansion before editing.
 - Work in an isolated worktree. Verify `git rev-parse --show-toplevel` and `git worktree list`; never work or commit on `main` or in a shared integration checkout.
+- Plan-mode `run_plan` publication is ref-only: it advances `refs/heads/main` and never refreshes a checkout, so the runtime primary checkout is not a consumer workspace.
 - Children never merge other branches into their own worktree. Committing to the integration branch and merging child branches are forbidden for children; all merges are root-owned, verified, and ordered.
 - Read-only reports state `files changed: none, commit: none`.
 - Do not force-push, rewrite shared history, reset another worktree, or delete work to hide a failure.

@@ -2536,6 +2536,8 @@ async def run_plan(
 
     Workers are spawned as ``python -m cambium.worker`` (or the task's
     ``worker`` script); results are gated and merged onto ``refs/heads/main``.
+    Publication is ref-only: ``refs/heads/main`` advances via atomic
+    ``update-ref`` and no checkout is refreshed.
     Returns a PlanResult; the session's event log is durable in
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``).
     """
