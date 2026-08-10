@@ -1,15 +1,13 @@
 # DSPy on Python 3.14.7: compatibility research
 
-Research date: 2026-08-09. Purpose: decide the per-module DSPy strategy of the
-Cambium harness (architecture says each module gets its own DSPy program; the
-scaffold deliberately avoids a `dspy` dependency). Verification rule: every
-local claim is a real command run with its verbatim output; web claims cite the
-URL. Anything that could not be checked is marked **UNVERIFIED**.
+**Snapshot (2026-08-09):** historical compatibility run; verify current
+metadata at the [dspy PyPI JSON](https://pypi.org/pypi/dspy/json) and
+[pydantic PyPI JSON](https://pypi.org/pypi/pydantic/json). Every local claim is
+a command result; unchecked items are **UNVERIFIED**.
 
-Environment: uv 0.12.2 (`aarch64-unknown-linux-gnu`), Linux aarch64, all
-installations via `uv run` in `/tmp/opencode/exp-dspy` (NOT in the worktree
-`/tmp/opencode/cambium-dspy`). Interpreters: `cpython-3.14.7` and
-`cpython-3.14.7+freethreaded` from `uv python list`.
+Environment: uv 0.12.2 (`aarch64-unknown-linux-gnu`), Linux aarch64; `uv run` in
+`/tmp/opencode/exp-dspy` (not `/tmp/opencode/cambium-dspy`); interpreters are
+`cpython-3.14.7` and `cpython-3.14.7+freethreaded` from `uv python list`.
 
 ## Bottom line
 
@@ -193,30 +191,25 @@ any dspy version installs there is **UNVERIFIED** (not probed further).
 ## Recommendation for Cambium
 
 1. **Add dspy as an optional extra**, not a hard dependency, so the scaffold
-   keeps its dspy-free baseline (matching the current `pyproject.toml`, which
-   has `dependencies = []`):
+   keeps its dspy-free baseline (`pyproject.toml` has `dependencies = []`):
 
    ```toml
    [project.optional-dependencies]
    dspy = ["dspy>=3.3.0,<3.4"]
    ```
 
-   - Pin `dspy>=3.3.0,<3.4` for reproducibility: 3.3.0 is the newest release
-     and the only one verified end-to-end here.
-   - If a lower bound is preferred over a hard ceiling, use `dspy>=3.1.0` —
-     that is the metadata floor for Python 3.14 support. Below that (3.0.x,
-     2.6.x) the wheel metadata excludes 3.14 and must not be relied on, even
-     though 3.0.4 happened to install and pass the smoke.
+   - Pin `dspy>=3.3.0,<3.4` for reproducibility (newest release and only one
+     verified end-to-end here). A lower bound of `dspy>=3.1.0` is the metadata
+     floor; 3.0.x/2.6.x declare 3.14 unsupported despite the 3.0.4 smoke pass.
 2. **Per-module DSPy programs must run on the GIL 3.14 build.** The
    freethreaded build cannot install dspy (orjson blocker). This matches the
    existing `docs/research/python-3.14.md` recommendation to target the regular
    build and keep free-threading optional/additive. The Cambium module
    protocol should import dspy lazily inside each module's `decide.py` so a
    missing dspy extra degrades to a clear error instead of failing the harness.
-3. **No change to the per-module design is needed.** The minimal
-   `dspy.configure(lm=...)` + `dspy.Predict` + forward pattern used in the
-   scaffold's intended module programs works unchanged on 3.14.7. The fake-LM
-   subclass pattern is available for offline tests without network.
+3. **No per-module design change is needed.** The
+   `dspy.configure(lm=...)` + `dspy.Predict` + forward pattern works on 3.14.7;
+   the fake-LM subclass supports offline tests.
 4. Be aware of dependency weight: `--with dspy` resolves 57 packages (litellm,
    openai, httpx, tiktoken, tokenizers, pydantic-core, orjson, …). For
    environments that only need Predict/optimizers without LiteLLM provider
@@ -224,16 +217,8 @@ any dspy version installs there is **UNVERIFIED** (not probed further).
 
 ## Sources
 
-- dspy PyPI JSON (requires-python + release history):
-  https://pypi.org/pypi/dspy/json
-- dspy latest GitHub release (3.3.0):
-  https://api.github.com/repos/stanfordnlp/dspy/releases/latest
-- dspy README: https://raw.githubusercontent.com/stanfordnlp/dspy/main/README.md
-- pydantic PyPI JSON (version, requires-python, classifiers):
-  https://pypi.org/pypi/pydantic/json
-- Companion research on the 3.14 interpreters used here:
-  `docs/research/python-3.14.md` (same machine, same uv-installed CPython
-  3.14.7 / 3.14.7+freethreaded)
+See **Web cross-checks**; companion results are in
+`docs/research/python-3.14.md`.
 
 ## UNVERIFIED items
 

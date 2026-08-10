@@ -1,22 +1,20 @@
 # Tree-sitter AST context compression (v2.1 roadmap M9, Proposal 1)
 
-Research date: 2026-08-09. Worktree: `/tmp/opencode/cambium-research-treesitter`
-(branch `wt-research-treesitter`, created from `main@6109a6a`). Experiment
-directory: `/tmp/opencode/exp-treesitter` (outside the worktree, per task).
-Purpose: answer the falsifiable question — does tree-sitter-based AST
-extraction reduce LLM context tokens meaningfully without hurting
-compile/test success? — against the M9 acceptance criteria in
-`docs/research/v2-1-review.md` §3 M9:
+**Snapshot (2026-08-09):** historical run from
+`/tmp/opencode/cambium-research-treesitter` (branch `wt-research-treesitter`,
+`main@6109a6a`); verify current APIs in the
+[Tree-sitter Python bindings](https://tree-sitter.github.io/py-tree-sitter/).
+Experiment data is in `/tmp/opencode/exp-treesitter` (outside the worktree).
+Question: does AST extraction reduce context without hurting compile/test
+success, under `docs/research/v2-1-review.md` §3 M9?
 
 1. **>=25% reduction** in median input tokens per compile-successful task.
 2. **<=2-point compile-success degradation** (paired 95% CI excluding a worse
    decline).
 
-Verification rule (mirrors `docs/research/worker-coldstart.md`): every number
-below is a real run on this host; anything that could not be measured is
-marked **UNVERIFIED**. Token counts use the **chars/4 heuristic** as the
-documented proxy for LLM tokens; no tiktoken (per task instruction), so all
-token figures are proxy estimates, not provider tokenizer counts.
+Every number below is a real run on this host; unchecked items are
+**UNVERIFIED**. Token counts use the **chars/4 proxy** (no tiktoken), not a
+provider tokenizer.
 
 ## Host and environment
 
@@ -51,8 +49,8 @@ function_definition
 
 - `tree-sitter 0.26.0`, `tree-sitter-python 0.25.0` — both pure wheels, no
   build step on this host.
-- `tree-sitter-language-pack` was **not needed** and **not attempted** (the
-  primary path worked), so its 3.14 support is **UNVERIFIED**.
+- `tree-sitter-language-pack` was not needed or attempted; its 3.14 support is
+  **UNVERIFIED**.
 - Pure-python fallback (stdlib `ast`) was implemented and cross-checked anyway
   as a contingency; it reproduces the tree-sitter token counts within 1 token
   per file on signatures-only mode (see §3). It would have carried the
@@ -74,10 +72,9 @@ backends (`treesitter`, `ast`):
 - **Replace everything else** (module docstrings, imports, module-level
   assignments, nested bodies of non-relevant symbols) with `# ...`.
 
-The compressed output is a **view, not valid code** (see §4). The compressor
-is a context adapter only; it never runs inside a worker's file operations and
-has no supervisor concern (M9 scope: “never a supervisor concern”;
-architecture §3.7 I2.4 context composition).
+The compressed output is a **view, not valid code** (see §4). It is a context
+adapter only, never part of worker file operations or supervisor state (M9
+scope; architecture §3.7 I2.4).
 
 ### Finding: byte-offset vs char-index bug (fixed)
 
@@ -236,33 +233,9 @@ candidate.** Concretely:
    wheels **UNVERIFIED**) and implement the explicit unsupported-language
    fallback before any broader adoption.
 
-## Appendix: commands and raw outputs
+## Appendix: additional backend check
 
-Feasibility:
-
-```
-$ uv run --python 3.14.7 --with tree-sitter python -c "import tree_sitter; print(tree_sitter.__version__)"
-0.26.0
-```
-
-Example module totals (`measure_real.py`):
-
-```
-full=4179 sig=188 rel=3502
-signatures-only reduction: 95.5%
-all-relevant reduction:    16.2%
-```
-
-Synthetic repo totals (`scenario.py`):
-
-```
-generated 20 files, 92282 chars total
-raw=23063 sig=2607 targeted=4435
-signatures-only reduction: 88.7%
-targeted-task reduction:   80.8%
-sig-coverage all files 100%: True
-```
-
-Backend parity (`compressor.py` treesitter vs ast, signatures-only, 20 files):
-`ts=2607 ast=2574` tokens. Signatures-only views parse with stdlib `ast`:
-`0/20` (expected — views are not code).
+Backend parity (`compressor.py`, signatures-only, 20 files): `ts=2607`
+`ast=2574` tokens. Signatures-only views parse with stdlib `ast`: `0/20`
+(expected; views are not code). Feasibility and aggregate totals are recorded
+in §§1 and 4 above.

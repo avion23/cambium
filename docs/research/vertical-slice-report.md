@@ -1,14 +1,10 @@
 # Vertical Slice — End-to-End Proof (ONE worker)
 
-**Branch:** `wt-slice` · **Date:** 2026-08-09 · **Status:** built + verified.
-**Purpose:** the adversarial review's gate: prove the harness works end-to-end with ONE
-worker before more theory. A real supervisor subprocess-spawns a real worker script, speaks
-JSON-Lines over pipes, runs a real gate, and merges a real git change — all stdlib + git,
-Python 3.14.7 (uv), no LLM, no network, no DSPy, no sandbox.
-
-**Current-main note (2026-08-09):** this is the historical slice report, not the current
-suite report. Main now collects 108 scenario tests and the full suite passes; the
-slice-only test total below is superseded by that current-main count.
+**Snapshot:** branch `wt-slice`, 2026-08-09; historical, built + verified. The
+slice proves one real supervisor/worker subprocess, JSON-Lines IPC, gate, and
+git merge on Python 3.14.7 (stdlib + git; no LLM, network, DSPy, or sandbox).
+Current behavior is defined by the [Python 3.14 docs](https://docs.python.org/3.14/)
+and the repository tests; this record keeps only the slice evidence.
 
 **Revision 2 (review CONDITIONAL-PASS must-fixes):** enforced worker-exit / exit_message /
 result_envelope failure conditions, run_task↔result_envelope request_id correlation,
@@ -68,10 +64,11 @@ rc=1, no merge, `main` unchanged, supervisor exit 1.
 
 All run from the worktree root `/tmp/opencode/cambium-slice`.
 
-1. `uv run --python 3.14.7 --extra test pytest --collect-only -q` → `108 tests collected`.
-   The full command `uv run --python 3.14.7 --extra test pytest -q` → `108 passed`;
-   `uv run --python 3.14.7 --with ruff ruff check src` → `All checks passed`. The
-   slice-only total is historical.
+1. `uv run --python 3.14.7 --extra test pytest --collect-only -q`; the full
+   `uv run --python 3.14.7 --extra test pytest -q`; and
+   `uv run --python 3.14.7 --with ruff ruff check src` all passed in the slice
+   run. Test counts are intentionally omitted; rerun the commands for a current
+   count.
 2. `uv run --python 3.14.7 python -m compileall -q src scripts` → rc=0 (no output).
 3. Manual run:
    `uv run --python 3.14.7 python -m cambium.supervisor --session-dir /tmp/opencode/slice-run`

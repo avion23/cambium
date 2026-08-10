@@ -1,10 +1,9 @@
 # SQLite WAL event-log durability: empirical validation
 
-Research date: 2026-08-09. Validates the Cambium event-log durability design
-(architecture §6.1–6.5) against a real SQLite 3.53.1 WAL database driven by
-Python 3.14.7 `sqlite3`. Every number below is a real run output from
-`/tmp/opencode/exp-sqlite/` (the experiment directory, outside the worktree);
-anything that could not be tested is marked **UNVERIFIED**.
+**Snapshot (2026-08-09):** historical SQLite 3.53.1/Python 3.14.7 WAL run
+against architecture §6.1–6.5. Recheck current behavior in the
+[SQLite WAL documentation](https://sqlite.org/wal.html). Numbers are runs from
+`/tmp/opencode/exp-sqlite/`; unchecked items are **UNVERIFIED**.
 
 ## Claim under test (architecture.md)
 
@@ -112,19 +111,13 @@ and compares committed-before-crash vs survived. Script: `02_crash_loss.py`.
 | SIGKILL r2 | NORMAL | 0 | SIGKILL @1 s | 7 657 | 7 657 | **0** | ok |
 | batch txn mid-write | NORMAL | 0 | SIGKILL mid-`BEGIN…INSERT` | 1 (pre-batch) | 1 | whole txn rolled back | ok |
 
-Key finding: on a **process crash** (the "supervisor crash" the contract names),
-`synchronous=NORMAL` with **no fsync at all** loses **zero** committed events
-(8/8 trials, 44 992 committed events), and `integrity_check` is `ok` in every scenario
-including a SIGKILL mid-transaction (the uncommitted transaction is rolled
-back atomically, not corrupted). Committed events survive because the OS page
-cache persists across process death; `conn.commit()` returns only after the
-WAL frames reach the page cache via `write()`, and a supervisor crash does not
-drop the page cache.
+Key finding: on a **process crash**, `synchronous=NORMAL` with **no fsync** lost
+**zero** committed events (8/8 trials, 44 992 events); `integrity_check` was
+`ok` in every scenario, including SIGKILL mid-transaction. The page cache
+survives process death, so committed WAL frames remain recoverable.
 
-The measured non-critical loss window for a process crash is therefore
-**0 s for committed events**, not "at most 1 s" — the architecture's contract
-is satisfied and is, on this axis, conservative. The 1 s cadence is what
-matters for the *other* failure mode (power/kernel loss, §4).
+The measured process-crash loss window is therefore **0 s for committed
+events**, not “at most 1 s”; the 1 s cadence matters for power/kernel loss (§4).
 
 ## 3. The correct fsync target (Q3)
 
@@ -154,34 +147,24 @@ All incantations recovered all 3 000 events after the process crash
 (integrity `ok`) — expected, because the page cache survives the process (§2);
 the fsync target only decides what survives *power loss*.
 
-Conclusions on the reviewer's flag:
+Reviewer-flag conclusions:
 
-1. **`os.fsync(db_fd)` alone is confirmed a no-op for uncheckpointed commits.**
-   S4 shows it touches only `<q4inc.db>`; the WAL file (holding every frame of
-   the 3 000 commits) is untouched and keeps its 24.9 MB. Architecture §6.2.4's
-   parenthetical is empirically correct.
+1. **`os.fsync(db_fd)` alone is a no-op for uncheckpointed commits.** S4 shows
+   only `<q4inc.db>` is touched; the WAL remains 24.9 MB.
 2. **The correct target depends on checkpoint state.** Uncheckpointed frames
    live in `-wal`, so **fsync the WAL fd** (`fsync_wal` is the one incantation
    that flushes them in place). After `wal_checkpoint(TRUNCATE)` the frames
    have moved into `events.db` and the WAL is truncated to **0 bytes**, so the
    effective barrier is now **fsync the DB fd**; fsyncing the WAL fd then is a
    no-op on an empty file.
-3. **`PRAGMA wal_checkpoint(TRUNCATE)` alone is already a full barrier on this
-   SQLite build.** S4 `ckpt_truncate` shows it issues its own `fsync(wal)` then
-   `fsync(db)` under `synchronous=NORMAL` (confirmed in the standalone probe:
-   `fsync(wal) → fsync(db) → fsync(wal)`; cf. `probe_ckpt.py`). So
-   `wal_checkpoint(TRUNCATE)` + `os.fsync(db_fd)` is the minimal correct
-   incantation.
-4. **The architecture's `_fsync_now` is correct in net effect but its comment
-   is wrong at the wrong moment.** `checkpoint(TRUNCATE) → fsync(wal_fd) →
-   fsync(db_fd)` works: after the TRUNCATE the explicit `fsync(wal_fd)` is a
-   harmless no-op (WAL is empty) and durability comes from the DB fsync (done
-   both inside the checkpoint and explicitly). The comment "fsync the WAL file
-   (recent commits live here)" (line 461) is only true *before* the checkpoint;
-   post-checkpoint the recent commits live in `events.db`. One real defect: the
-   snippet ignores the checkpoint return row `(busy, log, ckpt_frames)` — if a
-   checkpoint returns `busy` the call returns without flushing and the writer
-   would ack a critical event as durable. Recommend checking the return value.
+3. **`PRAGMA wal_checkpoint(TRUNCATE)` alone is a full barrier on this build.**
+   S4 shows its `fsync(wal)` then `fsync(db)` under NORMAL (`probe_ckpt.py`
+   confirms the sequence); adding `os.fsync(db_fd)` is belt-and-braces.
+4. **`_fsync_now` is correct in net effect, but its comment is stale after the
+   checkpoint.** `checkpoint(TRUNCATE) → fsync(wal_fd) → fsync(db_fd)` works;
+   the explicit WAL fsync is a harmless no-op after truncation. One real defect:
+   it ignores `(busy, log, ckpt_frames)`; a `busy` result could ack a critical
+   event without a flush. Check the return value.
 
 ## 4. The ≤1 s loss window for power/kernel loss (strace cadence)
 
@@ -226,13 +209,10 @@ Findings:
   jitter. The "at most `fsync_interval_s`" non-critical power-loss window holds
   provided the timer actually runs `_fsync_now` on the writer thread (§6).
 
-So: the ≤1 s loss window is **not a property of NORMAL + WAL alone** — it is a
-property of the architecture's explicit timer-driven `_fsync_now`, and the
-design correctly relies on it. The architecture text attaches the "at most 1 s"
-window to "supervisor crash"; the measured supervisor-crash window is actually
-0 s for committed events (§2), and the 1 s bound is what protects against the
-*kernel/page-cache-loss* case. The two failure modes are conflated in the
-wording but both are met by the design.
+Thus the ≤1 s window is not a property of NORMAL+WAL alone: it comes from the
+explicit timer-driven `_fsync_now`. The text labels it “supervisor crash,” but
+§2 measured 0 s for committed events; the bound protects kernel/page-cache
+loss.
 
 ## 5. Critical events: "immediate" barrier cost
 
@@ -299,33 +279,19 @@ of NORMAL + explicit checkpoint is empirically validated.
 
 ## Verdict
 
-**The durability contract holds, with one wording correction and one
-recommendation.**
+**The durability contract holds, with wording and checking corrections.**
 
-1. **Read-while-write, atomicity, crash-recovery-without-corruption: confirmed.**
-   WAL mode behaves exactly as documented; `integrity_check` passes after every
-   crash, including uncheckpointed-WAL SIGKILL and mid-transaction SIGKILL.
-2. **Supervisor-crash loss window: actually 0 s for committed events, stronger
-   than the claimed ≤1 s.** `synchronous=NORMAL` with no fsync loses no
-   committed events on process crash (page cache survives); only the uncommitted
-   in-flight transaction is lost (rolled back). §6.5's "at most 1 s" is a
-   bound, not the achieved value.
-3. **Correct fsync target: the reviewer is right that it's state-dependent —
-   and the architecture's code is right anyway.** fsync the **WAL fd** while
-   frames are uncheckpointed; fsync the **DB fd** after a checkpoint (or rely
-   on `wal_checkpoint(TRUNCATE)`, which on SQLite 3.53.1 under NORMAL internally
-   fsyncs both). `os.fsync(db_fd)` alone for WAL-resident commits is confirmed
-   a no-op. `_fsync_now`'s order works because the DB fsync (checkpoint-internal
-   or explicit) is the effective barrier; its "recent commits live in the WAL"
-   comment is misleading post-truncate, and its ignored checkpoint return value
-   is the one real risk.
-4. **The ≤1 s non-critical loss window holds for power/kernel loss only
-   because of the explicit 1 s timer — NORMAL + autocheckpoint alone does not
-   provide it.** At heartbeat-like rates SQLite issues zero WAL fsyncs (S5);
-   the measured timer-driven cadence bounds the window to 1.009 s (S3). The
-   design's mechanism is necessary and sufficient; the wording should say the
-   1 s window is a power-loss bound, with supervisor-crash loss actually 0.
-5. **NORMAL over FULL: confirmed.** FULL's per-commit fsync costs ~90× here.
+1. WAL read-while-write and crash recovery are confirmed; every
+   `integrity_check` passed, including uncheckpointed and mid-transaction
+   SIGKILL. Process-crash loss was **0 s** for committed events (only the
+   in-flight transaction rolled back), stronger than the §6.5 ≤1 s wording.
+2. Fsync target is state-dependent: fsync the **WAL fd** before checkpoint and
+   the **DB fd** after; `wal_checkpoint(TRUNCATE)` already fsyncs both on 3.53.1.
+   `os.fsync(db_fd)` alone is a no-op for WAL-resident commits. `_fsync_now`'s
+   post-truncate WAL comment is stale, and it must check `(busy, log, ckpt_frames)`.
+3. The ≤1 s bound protects power/kernel loss only through the explicit timer;
+   NORMAL+autocheckpoint has no bound at heartbeat rates. S3 measured 1.009 s;
+   FULL costs ~90× NORMAL here.
 
 Caveats: filesystem is btrfs (`compress=zstd:3,noatime`); fsync latencies and
 the FULL penalty are fs-specific, though the qualitative conclusions are POSIX

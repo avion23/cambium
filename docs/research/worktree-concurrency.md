@@ -1,23 +1,24 @@
 # Research: git worktree concurrency semantics
 
-**Date:** 2026-08-09
-**Environment:** git 2.43.0 (`arm-server-01`, aarch64), experiments run in throwaway repos under `/tmp/opencode/exp-wt` (NOT the worktree).
-**Purpose:** verify the concurrency semantics that Cambium's **M3 Surculus** (worktree manager) and **M7 Unio** (merge sequencer, §7.8) rely on, per reviews DS-M1 / IMPL-M3 / IMPL-C1.
-**Verification rule:** every claim cites the exact command + observed output (exit code where meaningful). Anything not reproduced is marked **UNVERIFIED**. Experiments are real concurrent runs (`&` + `wait`), not simulations.
-
-Sources read before experimentation:
-- `docs/architecture/system-design.md` — M3 Surculus (§M3), M7 Unio (§M7).
-- `docs/architecture/reviews/review-distributed-systems.md` — DS-C5 (worktree locks), DS-M1 (merge serialization), IMPL-M3 (git worktree concurrency).
-- `docs/architecture/reviews/review-implementation.md` — IMPL-C1 (merge sequencer no concurrency guard).
-- `architecture.md` §7.5 (worktree recovery), §7.8 (atomic `refs/heads/main` update via `update-ref`).
+**Snapshot (2026-08-09):** historical git 2.43.0 run on `arm-server-01`
+(aarch64), in throwaway repos under `/tmp/opencode/exp-wt`. Recheck current
+semantics in the [git worktree documentation](https://git-scm.com/docs/git-worktree)
+and [git update-ref documentation](https://git-scm.com/docs/git-update-ref).
+The experiments are real concurrent runs (`&` + `wait`); unreproduced claims
+are **UNVERIFIED**. Scope: M3 Surculus/M7 Unio (§7.8), DS-C5/DS-M1,
+IMPL-M3/IMPL-C1.
 
 ---
 
 ## Methodology
 
-All experiments ran in `/tmp/opencode/exp-wt` (a scratch area, deliberately NOT the worktree, which lives at `/tmp/opencode/cambium-wtexp`). Each experiment used a fresh throwaway repo (`git init -b main`), `gc.auto 0`, and only commits as needed. Scripts and raw logs: `/tmp/opencode/exp-wt/exp*.sh`, `/tmp/opencode/exp-wt/out/`. Refs used: `main`, `wt1..wt4`, `ur`, `probe3`.
+All experiments ran in `/tmp/opencode/exp-wt`, not worktree
+`/tmp/opencode/cambium-wtexp`, with fresh repos (`git init -b main`), `gc.auto
+0`, and only needed commits. Scripts/logs:
+`/tmp/opencode/exp-wt/exp*.sh`, `/tmp/opencode/exp-wt/out/`; refs: `main`,
+`wt1..wt4`, `ur`, `probe3`.
 
-Two harness bugs were found and fixed during the run and are reported here because they are themselves findings about git state:
+Two harness bugs found during the run are findings about git state:
 1. Concurrent `--no-ff` merges leave `MERGE_HEAD` + a staged index behind; a harness that only moved the ref (`git update-ref`) between trials was polluted by the previous trial's leftovers (first-pass data discarded).
 2. `git status`/`git diff`/`git log` are read-only and do NOT take `index.lock`; lock-blocking tests must use index-*writing* commands (`git add`, `git commit`, `git merge`).
 
@@ -336,20 +337,20 @@ After publishing, a `git status` in the main repo showed `D f1.txt` (the ref mov
 
 ---
 
-## Conclusion — real pitfalls vs myths, and design implications for Unio
+## Conclusion — real pitfalls and Unio implications
 
-**Myths (do not engineer around them):**
-- Workers committing in different worktrees never collide on `index.lock` or branch refs (each worktree owns its index and its ref lock).
-- Concurrent merges do **not** silently corrupt `refs/heads/main` — git's ref update carries the expected old SHA and rejects stale merges loudly.
-- `git worktree add` is safe during other worktrees' writes; read-only git commands never take `index.lock`; stale `index.lock` is *not* auto-recovered by age (needs explicit cleanup).
+The findings table separates myths from observed failures. The load-bearing
+rules are:
 
-**Real pitfalls (must engineer around them):**
-1. **Concurrent merges in the same checkout** (the IMPL-C1 scenario): `index.lock` errors and, worse, **leftover half-merged state** (`MERGE_HEAD`, staged loser-tree, dirty status) that poisons the repo until `git merge --abort` + `reset --hard`. → serialize Unio (asyncio.Lock / single-consumer queue) **and** do all merging in a throwaway worktree; never merge in the shared checkout.
-2. **Detached-HEAD worker commits vanish on worktree removal.** → capture the tip SHA and make it reachable (a ref) before `worktree remove`; never rely on `fsck` recovery.
-3. **`update-ref` semantics are the load-bearing primitive.** Without the expected-old argument a concurrent publish is a silent lost update; with it, a concurrent `main` move (including a human push) is a loud `NonFastForward`. §7.8's `update-ref refs/heads/main <verified_tip> <old_sha>` is **correct and required**; the crash story (lockfile+rename, no torn state, stale `main.lock` detected loudly) is confirmed.
+1. Serialize concurrent merges and use a throwaway worktree: shared-checkout
+   races leave `index.lock`, `MERGE_HEAD`, staged loser state, and dirty files.
+2. Capture a detached worker tip in a ref before removing its worktree; after
+   removal it is dangling and gc-eligible.
+3. Publish with `git update-ref refs/heads/main <verified_tip> <old_sha>`.
+   Without the old SHA, concurrent publishes silently lose updates; with it,
+   stale moves fail loudly. The lockfile+`renameat` path is atomic (F16).
 
-**Additional implications for the sequencer and Surculus:**
-- Rebase **local staging branches** inside the throwaway worktree, not the worker's branch ref (F18).
-- `Surculus.recover()` must remove `index.lock`/ref `.lock` files (no git auto-recovery, F14), abort `MERGE_HEAD`/rebase state (F3 leftovers), and reset to base — exactly §7.5.
-- Set `gc.auto 0` (as the reviews recommend) so a background `git gc` never trips the 12 h `gc.pid` lock against a worker's commit; and `unset GIT_QUARANTINE_PATH` before `update-ref` if env could carry it (F5).
-- Never `--force`-remove a worktree with uncommitted worker state (F8) or mid-git-op (F9); locked worktrees need `-f -f` (F10). Capture-then-remove is the only safe ordering.
+Sequencer/Surculus must rebase a local staging branch (F18), remove stale lock
+files and abort leftover merge/rebase state (F14/F3, §7.5), keep `gc.auto 0`, unset
+`GIT_QUARANTINE_PATH` before publish (F5), and capture state before removing
+dirty or mid-operation worktrees (F8–F10).
