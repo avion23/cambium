@@ -196,6 +196,25 @@ def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypat
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
 
 
+def test_real_combined_dataset_reports_only_flagged_canaries(monkeypatch) -> None:
+    import cambium.bench as bench
+
+    load_jsonl = bench.load_jsonl
+
+    def force_combined(path: Path) -> list[dict]:
+        if path.name in {"train.jsonl", "eval.jsonl", "canaries.jsonl"}:
+            raise bench.DatasetError("force combined fallback")
+        return load_jsonl(path)
+
+    monkeypatch.setattr(bench, "load_jsonl", force_combined)
+
+    report = bench.build_module_report("example")
+
+    assert report["dataset"]["records"] == 9
+    assert report["dataset"]["canaries"] == 2
+    assert report["canaries"]["total"] == 2
+
+
 def test_invalid_module_name_fails_closed_before_baseline_write(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -269,8 +288,45 @@ def test_invalid_split_schema_falls_back_to_combined_report_and_gate(
     assert baseline["metric"]["canaries"] is None
     assert baseline["metric"]["combined"] == {"mean": 1.0, "std": 0.0, "count": 2}
     assert baseline["dataset"]["records"] == 2
+    assert baseline["canaries"]["total"] == 1
     assert "fell back to the combined file" in baseline["note"]
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
+
+
+def test_zero_canary_combined_dataset_fails_gate(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    datasets_dir = modules_dir / "fixture" / "datasets"
+    invalid_split = {
+        "id": "invalid-train-1",
+        "input": {"task": "Invalid split", "context": ""},
+        "expected": {"decompose": False},
+    }
+    (datasets_dir / "train.jsonl").write_text(json.dumps(invalid_split) + "\n")
+    normal = {
+        "id": "combined-normal-1",
+        "input": {"task": "Combined normal", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    (datasets_dir / "example_pairs.jsonl").write_text(json.dumps(normal) + "\n")
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    baseline = json.loads((bench_root / "fixture_module" / "baseline.json").read_text())
+    assert baseline["canaries"]["total"] == 0
+
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) != 0
 
 
 def test_module_contract_violation_fails_closed_with_module_diagnostic(

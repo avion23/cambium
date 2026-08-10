@@ -165,6 +165,11 @@ class ScoredRecord:
     score: float
 
 
+def _is_canary(record: dict[str, Any]) -> bool:
+    """Return whether a raw dataset record carries the canary marker."""
+    return record.get("canary", False) is True
+
+
 async def _predict(manifest: ModuleManifest, records: list[dict]) -> list[ScoredRecord]:
     """Evaluate raw records through the module's neutral subprocess boundary."""
     output = run_module_cli(
@@ -227,7 +232,7 @@ def dataset_stats(records: list[dict]) -> dict[str, int]:
         "cross_split_leaks": leaks,
         "decompose_true": sum(1 for r in records if r["expected"]["decompose"] is True),
         "decompose_false": sum(1 for r in records if r["expected"]["decompose"] is False),
-        "canaries": sum(1 for r in records if r.get("canary", False)),
+        "canaries": sum(1 for r in records if _is_canary(r)),
     }
 
 
@@ -294,7 +299,11 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
             scored[split] = asyncio.run(_predict(manifest, raw[split]))
             metric[split] = score_examples(manifest, scored[split])
             if split == "canaries":
-                canary_scores = [example.score for example in scored[split]]
+                canary_scores = [
+                    example.score
+                    for example in scored[split]
+                    if _is_canary(example.record)
+                ]
     except (DatasetError, ModuleCLIError) as exc:
         combined = True
         note = (
@@ -314,17 +323,17 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         canary_scores = [
             example.score
             for example in scored["combined"]
-            if example.record.get("canary", False)
+            if _is_canary(example.record)
         ]
 
     records = [r for split in SPLITS for r in raw.get(split, [])] or raw.get("combined", [])
+    canary_source = raw["combined"] if combined else raw.get("canaries", [])
+    canary_records = [record for record in canary_source if _is_canary(record)]
     report: dict[str, Any] = {
         "module": manifest.module_name,
         "dataset_version": dataset_version,
         "metric": metric,
-        "canaries": canary_stats(
-            raw.get("canaries") or raw.get("combined", []), canary_scores
-        ),
+        "canaries": canary_stats(canary_records, canary_scores),
         "dataset": dataset_stats(records),
     }
     if note:
