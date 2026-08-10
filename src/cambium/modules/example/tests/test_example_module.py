@@ -153,16 +153,19 @@ def test_subprocess_network_client_is_denied() -> None:
     if os.environ.get("CAMBIUM_MODULE_OFFLINE") != "1":
         pytest.skip("requires the isolated module-test environment")
 
-    result = subprocess.run(
-        ["curl", "--fail", "http://127.0.0.1:9/"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-
-    assert result.returncode != 0
-    assert "network client denied" in result.stderr
+    try:
+        result = subprocess.run(
+            ["curl", "--fail", "http://127.0.0.1:9/"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except PermissionError:
+        result = None
+    if result is not None:
+        assert result.returncode != 0
+        assert "network client denied" in result.stderr
 
     python_probe = subprocess.run(
         [

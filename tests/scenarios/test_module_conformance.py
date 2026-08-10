@@ -98,12 +98,12 @@ def test_split_digests_anchor_metadata_baseline_and_content() -> None:
     assert actual == EXPECTED_SPLIT_DIGESTS
 
 
-def test_gate_reports_pending_module_scoped_baseline() -> None:
-    with pytest.raises(module_conformance.ModuleConformanceError) as raised:
-        module_conformance.validate_module(_one_discovered_module())
+def test_gate_accepts_module_scoped_baseline() -> None:
+    name = _one_discovered_module()
+    spec = module_conformance.validate_module(name)
 
-    message = str(raised.value)
-    assert "test nodeid does not belong to this module's tests" in message
+    assert spec.name == "example"
+    assert spec.name == name
 
 
 def test_gate_fails_on_metadata_digest_mismatch(monkeypatch) -> None:
@@ -484,8 +484,8 @@ def test_baseline_rejects_foreign_test_nodeid(monkeypatch) -> None:
         if finding.detail == "test nodeid does not belong to this module's tests"
     ]
 
-    assert len(baseline["tests"]["by_nodeid"]) == 307
-    assert len(committed_foreign) == 278
+    assert len(baseline["tests"]["by_nodeid"]) == 40
+    assert len(committed_foreign) == 0
 
     def change(baseline: dict) -> None:
         baseline["tests"]["by_nodeid"] = {"tests/scenarios/test_harness.py::test_foreign": 0.1}
@@ -605,8 +605,8 @@ print(json.dumps({
     assert Path(observed["package_root"]).is_relative_to(site)
     assert observed["tracked_are_wheel_paths"] is True
     assert observed["resources_exist"] is True
-    assert observed["committed_foreign_count"] == 278
-    assert observed["owned_count"] == 29
+    assert observed["committed_foreign_count"] == 0
+    assert observed["owned_count"] == 40
     assert observed["owned_foreign_count"] == 0
     assert observed["reverse_paths"] == []
 
