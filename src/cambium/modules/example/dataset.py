@@ -116,8 +116,14 @@ class ExampleDatasetLoader(DatasetLoader):
         meta = self.datasets_dir / "meta.json"
         try:
             text = meta.read_text()
-        except OSError:
-            return {}
+        except FileNotFoundError as exc:
+            if not meta.is_symlink():
+                return {}
+            raise DatasetError(f"{meta}: cannot read metadata: {exc}") from exc
+        except OSError as exc:
+            raise DatasetError(f"{meta}: cannot read metadata: {exc}") from exc
+        except UnicodeError as exc:
+            raise DatasetError(f"{meta}: invalid text: {exc}") from exc
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:

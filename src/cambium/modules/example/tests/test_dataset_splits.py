@@ -162,6 +162,8 @@ def test_split_record_version_drift_rejected_by_loader(tmp_path) -> None:
 
     loader = ExampleDatasetLoader(src)
     with pytest.raises(DatasetError, match="schema_version.*dataset_version"):
+        ExampleDatasetLoader(train_path).load()
+    with pytest.raises(DatasetError, match="schema_version.*dataset_version"):
         loader.load_split(Split.TRAIN)
 
     record["schema_version"] = 999
@@ -169,6 +171,70 @@ def test_split_record_version_drift_rejected_by_loader(tmp_path) -> None:
     train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     with pytest.raises(DatasetError, match="schema_version"):
         loader.load_split(Split.TRAIN)
+
+
+def test_meta_directory_rejected_by_load_and_load_split(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    (src / "meta.json").mkdir()
+    record = {
+        "id": "train-1",
+        "schema_version": 999,
+        "dataset_version": "0.0.0",
+        "input": {"task": "Do a thing.", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    train_path = src / "train.jsonl"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    with pytest.raises(DatasetError, match="cannot read metadata"):
+        ExampleDatasetLoader(train_path).load()
+    with pytest.raises(DatasetError, match="cannot read metadata"):
+        ExampleDatasetLoader(src).load_split(Split.TRAIN)
+
+
+def test_invalid_meta_rejected_by_load_and_load_split(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    (src / "meta.json").write_text("{\n", encoding="utf-8")
+    record = {
+        "id": "train-1",
+        "input": {"task": "Do a thing.", "context": ""},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    train_path = src / "train.jsonl"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    with pytest.raises(DatasetError, match="invalid JSON"):
+        ExampleDatasetLoader(train_path).load()
+    with pytest.raises(DatasetError, match="invalid JSON"):
+        ExampleDatasetLoader(src).load_split(Split.TRAIN)
+
+
+def test_bench_falls_back_after_load_rejects_split_version_drift(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = tmp_path / "modules"
+    datasets_dir = modules_dir / "example" / "datasets"
+    shutil.copytree(DATASETS_DIR, datasets_dir)
+    train_path = datasets_dir / "train.jsonl"
+    record = json.loads(train_path.read_text(encoding="utf-8").splitlines()[0])
+    record["schema_version"] = 999
+    record["dataset_version"] = "0.0.0"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    report = bench.build_module_report("example")
+
+    assert report["metric"]["train"] is None
+    assert report["metric"]["eval"] is None
+    assert report["metric"]["canaries"] is None
+    assert report["metric"]["combined"] == {
+        "mean": 1.0,
+        "std": 0.0,
+        "count": 9,
+    }
+    assert "three-split dataset unreadable" in report["note"]
 
 
 def test_dataset_version_defaults_when_meta_missing(tmp_path) -> None:
