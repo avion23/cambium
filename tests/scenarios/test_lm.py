@@ -1351,6 +1351,60 @@ def test_state_serialization_rejects_userinfo_base_url_raw_state_canary() -> Non
     assert "https://api.example.invalid/v1" in raw_state
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example.invalid/v1?api_key=QUERY_SECRET_CANARY",
+        "https://api.example.invalid/v1#fragment=QUERY_SECRET_CANARY",
+    ],
+)
+def test_state_serialization_rejects_query_or_fragment_base_url_canary(
+    base_url: str,
+) -> None:
+    _require_dspy()
+    from cambium.diffundo import Diffundo, ProviderConfig
+
+    credential_diffundo = Diffundo(
+        [
+            ProviderConfig(
+                name="p",
+                tier=ProviderTier.FAST,
+                base_url=base_url,
+                api_key_env="K_FAKE",
+                model="m",
+            )
+        ]
+    )
+    lm = CambiumLM(credential_diffundo, ProviderTier.FAST)
+
+    with pytest.raises(ValueError, match="query parameters"):
+        lm.dump_state()
+    # The rejection reason must not echo the canary back into the process.
+    with pytest.raises(ValueError) as excinfo:
+        lm.dump_state()
+    assert "QUERY_SECRET_CANARY" not in str(excinfo.value)
+
+
+def test_valid_queryless_base_url_still_serializes() -> None:
+    _require_dspy()
+    from cambium.diffundo import Diffundo, ProviderConfig
+
+    diffundo = Diffundo(
+        [
+            ProviderConfig(
+                name="p",
+                tier=ProviderTier.FAST,
+                base_url="https://api.example.invalid/v1",
+                api_key_env="K_FAKE",
+                model="m",
+            )
+        ]
+    )
+    raw_state = repr(CambiumLM(diffundo, ProviderTier.FAST).dump_state())
+    assert "https://api.example.invalid/v1" in raw_state
+    assert "QUERY_SECRET_CANARY" not in raw_state
+
+
 def test_reasoning_and_tool_choice_reach_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -1552,6 +1606,100 @@ def test_tool_call_content_and_tool_calls_are_both_preserved() -> None:
 
     assert response.text == "explaining the call"
     assert [call.name for call in response.tool_calls] == ["f"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"path":',
+        '[1, 2]',
+        '"not-an-object"',
+        "null",
+    ],
+)
+def test_malformed_tool_call_arguments_raise_provider_error_not_empty_args(
+    arguments: str,
+) -> None:
+    _require_dspy()
+    import dspy
+
+    from cambium.diffundo import ProviderError
+
+    class MalformedArgsDiffundo(FakeDiffundo):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            return CallResult(
+                provider=self.endpoint,
+                model=model or "fake-model",
+                tier=tier,
+                content="",
+                latency_s=0.01,
+                tool_calls=(
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": arguments},
+                    },
+                ),
+            )
+
+    lm = CambiumLM(MalformedArgsDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    with pytest.raises(ProviderError, match="arguments"):
+        lm(
+            request=dspy.LMRequest(
+                model="cambium/fast",
+                messages=[{"role": "user", "parts": [{"type": "text", "text": "read a file"}]}],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        {"id": "c", "type": "function", "function": {"name": "f"}},
+        {"id": "c", "type": "function", "function": {"name": "f", "arguments": ""}},
+        {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+    ],
+)
+def test_empty_or_missing_tool_call_arguments_map_to_empty_args(
+    tool_call: dict[str, Any],
+) -> None:
+    _require_dspy()
+    import dspy
+
+    class EmptyArgsDiffundo(FakeDiffundo):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+        ) -> CallResult:
+            return CallResult(
+                provider=self.endpoint,
+                model=model or "fake-model",
+                tier=tier,
+                content="",
+                latency_s=0.01,
+                tool_calls=(tool_call,),
+            )
+
+    lm = CambiumLM(EmptyArgsDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    response = lm(
+        request=dspy.LMRequest(
+            model="cambium/fast",
+            messages=[{"role": "user", "parts": [{"type": "text", "text": "hi"}]}],
+        )
+    )
+    assert [call.name for call in response.tool_calls] == ["f"]
+    assert response.tool_calls[0].args == {}
 
 
 def test_concurrent_dspy_loads_preserve_cache_environment() -> None:

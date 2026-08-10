@@ -25,7 +25,15 @@ if sysconfig.get_config_var("Py_GIL_DISABLED") or os.environ.get("Py_GIL_DISABLE
     )
 
 # isort: off
-from .diffundo import CallResult, Diffundo, ProviderConfig, ProviderTier
+from .diffundo import (
+    CallResult,
+    Diffundo,
+    ProviderConfig,
+    ProviderError,
+    ProviderOutcome,
+    ProviderTier,
+    _tool_call_arguments,
+)
 
 # isort: on
 
@@ -602,10 +610,17 @@ class _CambiumLMMixin:
                 raise TypeError(
                     f"provider {provider.name!r} base_url must be an exact builtin string"
                 )
-            if urlparse(base_url).username is not None or urlparse(base_url).password is not None:
+            parsed_base_url = urlparse(base_url)
+            if (
+                parsed_base_url.username is not None
+                or parsed_base_url.password is not None
+                or parsed_base_url.query
+                or parsed_base_url.fragment
+            ):
                 raise ValueError(
-                    f"provider {provider.name!r} base_url must not contain URL credentials; "
-                    "provider credentials belong in the environment (api_key_env)"
+                    f"provider {provider.name!r} base_url must not contain URL credentials, "
+                    "query parameters, or a fragment; provider credentials belong in the "
+                    "environment (api_key_env)"
                 )
             serialized_providers.append(
                 {
@@ -878,7 +893,9 @@ class _CambiumLMMixin:
         if result.content:
             parts.append({"type": "text", "text": result.content})
         for tool_call in result.tool_calls or ():
-            parts.append(_CambiumLMMixin._tool_call_part(tool_call))
+            parts.append(
+                _CambiumLMMixin._tool_call_part(tool_call, provider=result.provider)
+            )
         if not parts:
             parts.append({"type": "text", "text": ""})
         return dspy.LMResponse(
@@ -895,23 +912,24 @@ class _CambiumLMMixin:
         )
 
     @staticmethod
-    def _tool_call_part(tool_call: Any) -> dict[str, Any]:
-        """Convert an OpenAI-shaped tool call into an ``LMToolCallPart`` dict."""
+    def _tool_call_part(tool_call: Any, *, provider: str) -> dict[str, Any]:
+        """Convert an OpenAI-shaped tool call into an ``LMToolCallPart`` dict.
+
+        Malformed arguments raise ``ProviderError``; only genuinely empty or
+        missing arguments map to ``{}``.
+        """
         if not isinstance(tool_call, Mapping):
             raise TypeError("Diffundo tool_calls must be OpenAI-shaped mappings")
         function = tool_call.get("function", {})
         function = function if isinstance(function, Mapping) else {}
-        raw_arguments = function.get("arguments", tool_call.get("arguments", "{}"))
-        args: Any = {}
-        if isinstance(raw_arguments, str):
-            try:
-                args = json.loads(raw_arguments)
-            except json.JSONDecodeError:
-                args = {}
-        elif isinstance(raw_arguments, Mapping):
-            args = dict(raw_arguments)
-        if not isinstance(args, dict):
-            args = {}
+        try:
+            args = _tool_call_arguments(tool_call) or {}
+        except ValueError as exc:
+            raise ProviderError(
+                provider,
+                ProviderOutcome.ERROR,
+                f"malformed tool call arguments: {exc}",
+            ) from exc
         name = function.get("name") or tool_call.get("name") or ""
         if type(name) is not str or not name.strip():
             raise TypeError("Diffundo tool_calls must carry a non-empty function name")

@@ -51,7 +51,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -367,6 +367,14 @@ class _RawResponse:
                         ProviderOutcome.ERROR,
                         "malformed response: tool call without a function name",
                     )
+                try:
+                    _tool_call_arguments(tool_call)
+                except ValueError as exc:
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        f"malformed response: {exc}",
+                    ) from exc
             tool_calls = tuple(raw_tool_calls)
         if not isinstance(content, str):
             if tool_calls is None:
@@ -421,6 +429,40 @@ def _tool_call_name(tool_call: Any) -> str | None:
     else:
         return None
     return name if name.strip() else None
+
+
+def _tool_call_arguments(tool_call: Any) -> dict[str, Any] | None:
+    """Return parsed tool-call arguments, or None when empty or missing.
+
+    Only genuinely empty/missing arguments map to ``{}`` at the DSPy boundary;
+    present-but-malformed arguments raise ``ValueError`` so the caller rejects
+    the tool call fail-closed instead of silently dropping them.
+    """
+    if not isinstance(tool_call, Mapping):
+        raise ValueError("tool call must be an object")
+    function = tool_call.get("function")
+    function = function if isinstance(function, Mapping) else {}
+    raw = function.get("arguments", tool_call.get("arguments", ""))
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"tool call arguments are not valid JSON: {raw[:80]!r}"
+            ) from exc
+    elif isinstance(raw, Mapping):
+        parsed = dict(raw)
+    else:
+        raise ValueError(
+            f"tool call arguments must be a JSON object, got {type(raw).__name__}"
+        )
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"tool call arguments must be a JSON object, got {type(parsed).__name__}"
+        )
+    return parsed
 
 
 def _default_quality_gate(result: CallResult) -> bool:

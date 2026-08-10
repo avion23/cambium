@@ -552,6 +552,39 @@ def test_tool_call_response_rejects_empty_function_name(tmp_path, monkeypatch) -
         malformed.close()
 
 
+def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypatch) -> None:
+    # A tool call whose arguments are not a JSON object is a malformed response
+    # and must be rejected, never forwarded as a silent args={} call.
+    malformed = FakeServer(
+        [
+            (
+                200,
+                _tool_call_payload(
+                    [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":'},
+                        }
+                    ]
+                ),
+                0.0,
+            )
+        ]
+    )
+    _set_keys(monkeypatch, "K_MALARGS")
+    router = Diffundo((_config("p_malargs", malformed, "K_MALARGS"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
+        assert "arguments" in exc.value.last_error.message
+        assert router.health("p_malargs") is HealthState.COOLDOWN
+    finally:
+        malformed.close()
+
+
 def test_race_rejects_malformed_tool_call_before_quality_acceptance(
     tmp_path, monkeypatch
 ) -> None:
