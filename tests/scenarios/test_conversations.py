@@ -297,8 +297,13 @@ def test_deep_chain_reads_in_root_to_head_order(tmp_path) -> None:
         store.close()
 
 
-def test_chain_reports_cycle_created_outside_store(tmp_path) -> None:
+def test_chain_reports_cycle_created_outside_store(tmp_path, monkeypatch) -> None:
     path = tmp_path / "conversations.db"
+    # The recursive chain walk is bounded by _MAX_CHAIN_DEPTH (1M by default);
+    # a cycle walks the full bound before being reported. 100 levels (same
+    # residue class mod the 3-node cycle, so the reported id is unchanged)
+    # proves the cycle detection without the 1M-step walk.
+    monkeypatch.setattr(conversations, "_MAX_CHAIN_DEPTH", 100)
     store = _open(path)
     try:
         root = store.append("node", "user", "root")

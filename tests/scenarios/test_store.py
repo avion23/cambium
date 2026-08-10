@@ -24,6 +24,7 @@ import time
 
 import pytest
 
+import cambium.store as store_module
 from cambium.redact import Redactor
 from cambium.store import (
     CRITICAL_KINDS,
@@ -196,8 +197,15 @@ def test_corrupt_db_init_raises_not_hangs(tmp_path) -> None:
     assert time.monotonic() - start < 5.0
 
 
-def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
+def test_writer_dead_on_locked_db_critical_append_raises(
+    tmp_path, monkeypatch
+) -> None:
     path = tmp_path / "events.db"
+    # The writer's SQLite busy timeout is what bounds the wait on the locked
+    # DB; 5s (production default) is an implementation detail, not the signal.
+    # The signal is: the append waits the busy timeout, then raises, and the
+    # store is dead afterwards.
+    monkeypatch.setattr(store_module, "_WRITER_BUSY_TIMEOUT_MS", 1000)
     store = _open(path)
     blocker = sqlite3.connect(path, isolation_level=None)
     try:
@@ -206,7 +214,7 @@ def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
         with pytest.raises(StoreError):
             store.append({"kind": "result", "payload": {"ok": True}})
         elapsed = time.monotonic() - start
-        assert 4.0 <= elapsed < 30.0  # bounded by busy_timeout, not a hang
+        assert 0.8 <= elapsed < 10.0  # bounded by busy_timeout, not a hang
     finally:
         blocker.close()
     # store is dead: subsequent appends fail immediately, and close() surfaces
@@ -220,9 +228,13 @@ def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
 
 
 def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "events.db"
+    # Shorten the writer busy timeout (see the dead-writer test above) so the
+    # locked-DB writer failure is observed quickly; the drop accounting and
+    # sequence burn do not depend on the timeout value.
+    monkeypatch.setattr(store_module, "_WRITER_BUSY_TIMEOUT_MS", 1000)
     store = EventStore(path, fsync_interval_s=60.0)
     blocker = sqlite3.connect(path, isolation_level=None)
     try:
