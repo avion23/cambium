@@ -430,8 +430,11 @@ def test_post_construction_callback_does_not_observe_prompt() -> None:
             observed.append(inputs)
 
     lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    callback = PromptCallback()
     with pytest.raises(TypeError, match="callbacks are immutable"):
-        lm.callbacks.append(PromptCallback())
+        lm.callbacks.append(callback)
+
+    list.append(lm.callbacks, callback)
 
     assert _call(lm, "PROMPT-CANARY") == ["completion text"]
     assert observed == []

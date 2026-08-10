@@ -92,7 +92,7 @@ class _ImmutableDict(dict[Any, Any]):
 
 
 class _ImmutableCallbacks(list[Any]):
-    """Empty DSPy-compatible callback list that rejects later mutation."""
+    """Disposable DSPy-compatible callback view that rejects normal mutation."""
 
     def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -235,10 +235,15 @@ class _CambiumLMMixin:
 
     forward_contract = "typed_lm"
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "callbacks":
-            value = _ImmutableCallbacks()
-        super().__setattr__(name, value)
+    @property
+    def callbacks(self) -> _ImmutableCallbacks:
+        """Return a disposable empty callback view instead of stored callbacks."""
+        return _ImmutableCallbacks()
+
+    @callbacks.setter
+    def callbacks(self, value: Any) -> None:
+        """Discard DSPy callback assignments at the instance boundary."""
+        del value
 
     def __init__(
         self,
@@ -287,6 +292,7 @@ class _CambiumLMMixin:
                 prompt=prompt,
                 messages=messages,
                 request=request,
+                callbacks=(),
                 **self._call_kwargs(kwargs),
             )
 
@@ -306,6 +312,7 @@ class _CambiumLMMixin:
                 prompt=prompt,
                 messages=messages,
                 request=request,
+                callbacks=(),
                 **self._call_kwargs(kwargs),
             )
 
@@ -349,7 +356,6 @@ class _CambiumLMMixin:
             copied._provider_model = adapter_overrides["model"]
         if "budget_usd" in adapter_overrides:
             copied._budget_usd = adapter_overrides["budget_usd"]
-        copied.callbacks = _ImmutableCallbacks()
         return copied
 
     def dump_state(self) -> dict[str, Any]:
