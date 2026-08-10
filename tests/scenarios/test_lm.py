@@ -239,6 +239,47 @@ def test_credential_marker_variants_cannot_reach_dump_state(key: str) -> None:
         )  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("key", ["apiKey", "API-Key", "api_key", "api.key"])
+def test_nested_extension_credential_keys_cannot_reach_dump_state(key: str) -> None:
+    _require_dspy()
+    with pytest.raises(ValueError, match="provider credentials"):
+        CambiumLM(
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            extensions={"nested": [({key: "SENSITIVE_CANARY"},)]},
+        )  # type: ignore[arg-type]
+
+
+def test_copy_rejects_credential_keys_and_keeps_dump_state_clean() -> None:
+    _require_dspy()
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="provider credentials"):
+        lm.copy(**{"api.key": "SENSITIVE_CANARY"})
+
+    copied = lm.copy(temperature=0.5)
+    assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
+    assert "api.key" not in repr(copied.dump_state())
+
+
+def test_dump_and_load_state_round_trip_routes_through_diffundo() -> None:
+    _require_dspy()
+    import dspy
+
+    import cambium.lm as lm_module
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    state = lm.dump_state()
+    assert state["_dspy_lm_class"] == "cambium.lm._CambiumLMImplementation"
+    delattr(lm_module, "_CambiumLMImplementation")
+
+    loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
+
+    assert _call(loaded, "reloaded prompt") == ["completion text"]
+    assert diffundo.calls[0]["prompt"]["messages"][0]["content"] == "reloaded prompt"
+
+
 def test_per_call_max_tokens_reaches_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()

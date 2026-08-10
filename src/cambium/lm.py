@@ -48,6 +48,7 @@ _SECRET_MARKERS = frozenset(
     }
 )
 _DSPY_LOAD_LOCK = threading.Lock()
+_IMPLEMENTATION_LOCK = threading.Lock()
 _DSPY: Any | None = None
 
 
@@ -108,9 +109,7 @@ class CambiumLM:
     def __new__(cls, *args: Any, **kwargs: Any) -> CambiumLM:
         if cls is not CambiumLM:
             return super().__new__(cls)
-        dspy = _load_dspy()
-        implementation = type("CambiumLM", (_CambiumLMMixin, dspy.LM, CambiumLM), {})
-        return implementation(*args, **kwargs)
+        return _implementation_class()(*args, **kwargs)
 
 
 class _CambiumLMMixin:
@@ -200,22 +199,67 @@ class _CambiumLMMixin:
         """Keep prompts and request options out of DSPy's process-global history."""
         del entry
 
+    def copy(self, **kwargs: Any) -> Any:
+        """Copy this LM without bypassing the Diffundo credential boundary."""
+        return super().copy(**self._safe_kwargs(kwargs))
+
+    def dump_state(self) -> dict[str, Any]:
+        """Return enough trusted runtime state to reconstruct this adapter."""
+        state = super().dump_state()
+        state.pop("model_type", None)
+        state.pop("cache", None)
+        state.pop("num_retries", None)
+        state.update(
+            {
+                "diffundo": self._diffundo,
+                "tier": self._tier.value,
+                "model": self._provider_model,
+                "budget_usd": self._budget_usd,
+            }
+        )
+        return state
+
+    @classmethod
+    def load_state(
+        cls,
+        state: dict[str, Any],
+        *,
+        allow_custom_lm_class: bool = False,
+    ) -> Any:
+        """Reconstruct a trusted adapter state through its Diffundo instance."""
+        del allow_custom_lm_class
+        constructor_state = dict(state)
+        constructor_state.pop("_dspy_lm_class", None)
+        return cls(**constructor_state)
+
     @staticmethod
     def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         safe = {key: value for key, value in kwargs.items() if key not in _CACHE_FIELDS}
-        forbidden = [
-            key
-            for key in safe
-            if key not in _GENERATION_FIELDS
-            if any(
-                marker in "".join(character for character in key.lower() if character.isalnum())
-                for marker in _SECRET_MARKERS
-            )
-        ]
-        if forbidden:
-            raise ValueError(
-                "provider credentials belong to Diffundo configuration, not CambiumLM kwargs"
-            )
+        pending: list[Any] = [safe]
+        visited: set[int] = set()
+        while pending:
+            value = pending.pop()
+            if isinstance(value, Mapping):
+                if id(value) in visited:
+                    continue
+                visited.add(id(value))
+                for key, nested_value in value.items():
+                    if isinstance(key, str) and key not in _GENERATION_FIELDS:
+                        normalized = "".join(
+                            character for character in key.lower() if character.isalnum()
+                        )
+                        if any(marker in normalized for marker in _SECRET_MARKERS):
+                            raise ValueError(
+                                "provider credentials belong to Diffundo configuration, "
+                                "not CambiumLM kwargs"
+                            )
+                    pending.append(nested_value)
+                continue
+            if isinstance(value, list | tuple):
+                if id(value) in visited:
+                    continue
+                visited.add(id(value))
+                pending.extend(value)
         return safe
 
     @classmethod
@@ -313,6 +357,31 @@ class _CambiumLMMixin:
                 "latency_s": result.latency_s,
             },
         )
+
+
+def _implementation_class() -> type[Any]:
+    implementation = globals().get("_CambiumLMImplementation")
+    if isinstance(implementation, type):
+        return implementation
+
+    dspy = _load_dspy()
+    with _IMPLEMENTATION_LOCK:
+        implementation = globals().get("_CambiumLMImplementation")
+        if isinstance(implementation, type):
+            return implementation
+        implementation = type(
+            "_CambiumLMImplementation",
+            (_CambiumLMMixin, dspy.LM, CambiumLM),
+            {"__module__": __name__},
+        )
+        globals()["_CambiumLMImplementation"] = implementation
+        return implementation
+
+
+def __getattr__(name: str) -> Any:
+    if name == "_CambiumLMImplementation":
+        return _implementation_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ArchitectusLM:
