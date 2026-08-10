@@ -1,268 +1,355 @@
 # Custos — Event-Loop Architecture
 
-**Author:** csp research worktree
-**Date:** 2026-08-09
-**Status:** Design spec. Resolves the asyncio scaffolding gap for the deterministic supervisor (M4 Custos).
-**Scope:** Event-loop vs thread vs subprocess split, I/O strategy, shared-state discipline, coordinated shutdown, and the delta from the merged `src/cambium/orchestrator.py` skeleton.
+**Historical snapshot — 2026-08-09.** Design spec from the csp research worktree
+(`wt-custos`); it resolves the proposed M4 asyncio gap, not current implementation.
+Current behavior is in [`docs/architecture/architecture.md`](../architecture/architecture.md),
+source/tests, and [`v2-1-status.md`](v2-1-status.md).
 
-## 0. What this doc settles
+**Current note (not retroactive):** active `supervisor.run_plan` is flat;
+`task_decomposed` remains unsupported; provider cascade is source-defined and honors
+`Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
+approval exists; DLQ and eval cache are absent.
 
-Three review findings drive this design:
+## 1. Decisions and execution contexts
 
-| ID | Finding | Resolution |
+| ID | Historical finding | Proposed resolution |
 |---|---|---|
-| DS-C1 | Synchronous file I/O in the asyncio event loop → backpressure cascade (pipes fill, workers stall, heartbeat monitors false-kill, thundering herd) | The event loop never performs disk I/O. Event persistence lives on a single dedicated writer thread; the loop only does `queue.put_nowait()`. All pipe reads are loop-native `StreamReader` awaits (verified non-blocking). |
-| DS-M2 | Logical races on `WorkerHandle` at `await` boundaries (heartbeat monitor kills a worker that already emitted `result`; `ProcessLookupError` uncaught in the watchdog) | `WorkerHandle` is loop-affine: only loop tasks mutate it. Each state transition is a guard-check + mutate in one synchronous block with no `await` between. The watchdog catches `ProcessLookupError` (verified: `proc.kill()` on a reaped process raises it). |
-| DS-M3 / IMPL-C8 | Event log has no durability; "append" is not "fsync"; orchestrator `await`s sync methods | Single-writer SQLite WAL on a dedicated thread with explicit fsync cadence (architecture §6.2). Sync work (git, blocking calls) escapes the loop via `asyncio.to_thread`. |
+| **DS-C1** | Sync disk I/O stalls the loop, fills pipes, and false-kills workers. | Loop only enqueues; one dedicated SQLite-WAL writer thread owns persistence. |
+| **DS-M2** | `WorkerHandle` races across `await`; watchdog can kill an exited process. | Handles are loop-affine; guard + mutate with no `await`; `poll()` re-check and catch `ProcessLookupError`. |
+| **DS-M3 / IMPL-C8** | Append is not fsync; sync methods are awaited. | Single writer with explicit fsync cadence; `asyncio.to_thread` for git/blocking calls. |
 
-**Verification rule:** every stdlib claim below was checked against real CPython 3.14.7
-(`uv run --python 3.14.7 ...`). See §7 for the command log. Anything not verified is flagged `UNVERIFIED`.
+The single event-loop thread owns worker spawn/IPC, timers, supervision, event enqueue,
+subscriber fan-out, shutdown, and policy decisions. The one writer thread owns the
+SQLite connection, redaction, inserts, WAL checkpoint/fsync, and
+`loop.call_soon_threadsafe` publication. N worker subprocesses own their ReAct loop,
+worktree, and generation token. `Unio` keeps its own `asyncio.Lock` for merge order.
+There are no shared mutable handles across threads: only immutable, already-redacted
+events cross the boundary.
 
----
-
-## 1. Component map
-
-Three execution contexts plus one library-internal helper:
-
-| Context | Count | Owns | Never owns |
-|---|---|---|---|
-| **Event loop** (single thread) | 1 | All Custos orchestration: worker spawn, IPC read/write, heartbeats, liveness, restart, event enqueue, subscriber fan-out, shutdown choreography | Disk writes, blocking syscalls, cross-`await` shared state |
-| **Event-log writer thread** | exactly 1 | The sole SQLite WAL connection, fsync cadence, publish-to-subscribers handoff | `WorkerHandle` state, process objects, any loop object |
-| **Worker subprocesses** | N (config) | Their own ReAct loop, worktree, generation token | Nothing inside the supervisor process |
-| **asyncio child watcher** | library | SIGCHLD/pidfd reaping of workers | — |
-
-### 1.1 On the event loop
-
-- **Worker spawn / termination**: `asyncio.create_subprocess_exec(...)`; `proc.kill()` / `proc.terminate()` / `await proc.wait()`.
-- **IPC readers**: one task per worker for stdout (`readline()` on `proc.stdout`) and one for stderr.
-- **IPC writer**: supervisor→worker via `proc.stdin.write(...)` + `await proc.stdin.drain()`.
-- **Timers / heartbeat**: one watchdog task per worker (periodic sleep + synchronous check-and-act), plus the EOF grace timer, the drain-deadline monitor, and the jittered restart backoff.
-- **Task scheduling**: per-worker supervise tasks under an `asyncio.TaskGroup`; `Unio` merge sequencing under its `asyncio.Lock`.
-- **Event enqueue**: `queue.Queue.put_nowait()` (non-blocking) into the writer thread's queue; critical-event overflow handled with a timeout-bounded put.
-- **Subscriber fan-out**: one `asyncio.Queue` per `Session.events()` consumer.
-- **Worktree recovery orchestration** (`Surculus`): the *decision* sequence runs here; the *git* calls are delegated to `asyncio.to_thread`.
-
-### 1.2 On dedicated threads
-
-- **Event-log writer thread** — single consumer of the bounded `queue.Queue`. Opens the SQLite connection, applies redaction, INSERTs, runs the batched `PRAGMA wal_checkpoint(TRUNCATE)` + `os.fsync(wal_fd)` cadence, and forwards events to loop subscribers via `loop.call_soon_threadsafe`.
-- **Logging `QueueListener` thread** (stdlib `logging`, architecture §13) — out of scope of the event store; noted for completeness.
-
-### 1.3 Where the task-template split differs (and why)
-
-The task template suggested `stdout/stderr pipe readers` and `subprocess wait` live on dedicated threads. This design places them on the loop, with verification:
-
-| Template suggestion | This design | Verified evidence |
-|---|---|---|
-| stdout pipe readers on a thread | **On the loop** via `StreamReader` | `asyncio.create_subprocess_exec` returns loop-native `StreamReader`s; reading is a transport-fed await, never a blocking syscall. `asyncio.create_subprocess_exec` does **not** expose the raw pipe fd to hand to a thread (no such accessor), so a thread-based reader would require abandoning `StreamReader` entirely. |
-| stderr pipe readers on a thread | **On the loop**, rate-limited + size-capped, advisory-only | Same `StreamReader` mechanism; verified stderr lines and a torn tail are delivered like stdout. Keeping it on the loop preserves the single-I/O-discipline and avoids fd extraction. It is strictly advisory (architecture §5.1.5): overflow is dropped and counted, never allowed to stall anything. |
-| subprocess wait on a thread | **On the loop** via the asyncio child watcher | Linux 3.14 default child watcher is `_PidfdChildWatcher` (verified): reaping is pidfd/loop-driven, `proc.wait()` is a coroutine and never blocks the loop. A user wait thread (`os.waitpid` in a thread) is redundant work. |
-
-The thread budget is therefore: **1 user thread (event-log writer) + N subprocesses**. Everything else is the loop.
-
-### 1.4 Worker spawn contract (normative)
+Spawn contract (proposal):
 
 ```python
-proc = await asyncio.create_subprocess_exec(
+await asyncio.create_subprocess_exec(
     *septum.wrap([sys.executable, "-X", "utf8", "-u", worker_script]),
-    stdin=asyncio.subprocess.PIPE,
-    stdout=asyncio.subprocess.PIPE,
-    stderr=asyncio.subprocess.PIPE,
-    limit=1_048_576,                       # StreamReader line limit (see §2.2)
+    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+    stderr=asyncio.subprocess.PIPE, limit=1_048_576,
     cwd=worktree_path,
     env={**os.environ, "PYTHONUNBUFFERED": "1",
          "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": str(generation)},
-    start_new_session=True,                # own process group -> killpg
-    pass_fds=(), close_fds=True,
-)
+    start_new_session=True, pass_fds=(), close_fds=True)
 ```
 
-`start_new_session=True` is verified to make the child its own process-group leader (pgid == pid), which is what makes `os.killpg(pgid, ...)` in the shutdown sequence and the C2-(a) grandchild-handling possible.
+`start_new_session=True` makes `pgid == pid`; group kill handles DS-C2 grandchild
+inheritance. The proposed line cap is 1 MiB; protocol fields are separately bounded.
 
----
+## 2. I/O and admission invariants
 
-## 2. I/O strategy
+- `StreamReader.readline()`/`readuntil()` stays on the loop; partial tails at EOF are
+  logged as `parse_error` and skipped. A checkpoint precedes a result emission, so a
+  torn result line can be recovered.
+- The default 64 KiB reader limit raises `ValueError`; pass `limit=1_048_576`, catch
+  over-limit lines, consume/resync, log and count, never kill the loop.
+- `asyncio.to_thread` handles git/worktree, merge, and blocking path operations; the
+  loop never calls `open`, `write`, `fsync`, `sqlite3`, or blocking git directly.
+- The bounded event queue is `queue.Queue(maxsize=10_000)`: non-critical records use
+  `put_nowait` and may drop the oldest non-critical item with a `drop` marker;
+  critical records (`result`, `checkpoint`, `worker_exit`, `task_failed`, merge and
+  assignment events) use a timeout-bounded put (0.1 s). The writer fsyncs critical
+  records before subscriber yield. Subscriber queues are bounded `asyncio.Queue`s;
+  worker stdin remains an OS pipe.
 
-### 2.1 Pipe readers never block the loop
+`WorkerHandle` states are `PENDING → SPAWNING → RUNNING → DONE|FAILED|REJECTED|CRASHED`.
+Only loop tasks mutate `state`, `last_heartbeat`, `proc`, `crash_times`, `generation`,
+and `result`; one synchronous transition site updates each. The watchdog checks
+`proc.poll()` before kill and catches `ProcessLookupError` (verified on a reaped
+process), so DS-M2 is guarded at its source.
 
-- All reads go through `StreamReader` on the loop. `readline()`/`readuntil()` are awaits driven by the transport as data arrives; the loop is not blocked while a pipe is idle.
-- **Partial-line buffering for NDJSON** (DS-C2 mode c): a worker killed mid-`write()` leaves a torn final line. Verified: `readline()` delivers the partial tail at EOF as a final line (no trailing `\n` required). `json.loads` failure on that line → log a `parse_error` event, skip, count it. The `result` case is not lost: `result` is persisted to the checkpoint store *before* it is emitted (architecture §5.4-c), so a torn `result` line is recovered from the checkpoint at the next watchdog tick.
-- **Pipe starvation**: a `StreamReader` that fills its transport buffer stops reading; the worker then blocks on `write()` — which is exactly the DS-C1 cascade trigger. The loop cannot stall on disk (writer thread owns all disk I/O), so the only starvation source left is a CPU-bound loop task; the per-worker **drain-deadline monitor** (architecture §5.3) flags supervisor-side stalls and suspends heartbeat enforcement instead of blaming the worker.
+## 3. Cancellation and shutdown (proposal)
 
-### 2.2 Line limits (verified: the default limit bites)
+1. Set shutdown, stop intake, and reject new submissions.
+2. Send `cancel` to live workers, swallowing `BrokenPipeError`.
+3. Wait `graceful_s=10` s for authoritative `exit`.
+4. SIGTERM each remaining process group; wait `term_grace_s=5` s.
+5. SIGKILL, `proc.kill()` as belt-and-braces, `await proc.wait()`, catch
+   `ProcessLookupError`; every child is reaped.
+6. Cancel/drain reader, watchdog, EOF, and drain-deadline tasks.
+7. Stop subscriber intake and boundedly flush queues.
+8. Emit critical `session_ended`; drain writer; `wal_checkpoint(TRUNCATE)` + fsync.
+9. `Surculus.prune()` stale `.git/worktrees/` entries (DS-N7); quarantine active trees
+   according to policy.
+10. Atomically write `result.json` (`cancelled`, exit code 4), close logging, return.
 
-The internal `StreamReader` limit defaults to 64 KiB (`_DEFAULT_LIMIT == 65536`, verified). A line that exceeds the limit raises `ValueError` (`"Separator is not found, and chunk exceed the limit"`) — an unguarded `readline()` would crash the reader task.
+Smoke assertions check every `proc.returncode` after step 5 and durable
+`session_ended` after step 8.
 
-Mitigations (both are required):
+## 4. Scaffold delta (historical proposal)
 
-1. **Raise the limit at spawn**: `asyncio.create_subprocess_exec` accepts a `limit` kwarg (verified in the 3.14.7 signature, before `**kwds`), which flows through to the internal `StreamReader`. Verified: a 200 000-byte line reads cleanly with `limit=1_000_000`. Custos passes `limit=1_048_576`.
-2. **Cap payloads in the protocol contract** (`Nuntius`): `cmd` is truncated to 120 chars, `summary` to 2 k chars, stderr lines size-capped at the reader. An over-limit line is caught (`ValueError`), logged, skipped, counted — never fatal.
+The then-merged `src/cambium/orchestrator.py` (59 lines) and `events.py` (47 lines)
+were placeholders. The intended delta was: split the facade from Custos; replace
+counter IDs with ULID task IDs plus generation fencing (§7.3); use an
+`asyncio.TaskGroup` one-for-one supervisor; route events to the writer/subscribers;
+adopt the architecture envelope (`kind`, `task_id`, `request_id`, `timestamp`,
+`monotonic_ms`, `generation`, `payload`) and tiers; add spawn/ready handshake,
+heartbeat/EOF/drain watchdogs, jittered restart, Surculus recovery/prune, async
+context/shutdown, and Unio's serialized gate/update-ref publication. The smoke gate
+was retained because the reviewed v0.1 sample had ~12 syntax/name bugs.
 
-### 2.3 Sync work escapes the loop
+## 5. Scenario canaries
 
-- `asyncio.to_thread` is verified present on 3.14.7 and executes its callable on a different OS thread. It is used for the rare blocking calls: `git` invocations in `Surculus` (worktree create/recover/prune), `Unio` merge git ops, and any synchronous `Path` I/O the deterministic layer needs. Invariant: nothing inside a `to_thread` callable touches `WorkerHandle` or any shared mutable state (architecture §14).
-- The event loop never calls `open()`, `write()`, `fsync()`, `sqlite3`, or blocking `git` directly. DS-C1 is structurally impossible.
+Use deterministic fake workers (no DSPy/network):
 
-### 2.4 Single-writer discipline for the event store
+1. DS-C2 mode c torn result: parse-error event, no reader crash, checkpoint recovery.
+2. 200,000-byte line: 1 MiB path succeeds; default limit failure is caught/counts.
+3. DS-C1 event burst: second worker's heartbeat survives; queue drop is bounded.
+4. DS-M2 exited worker: `poll()`/`ProcessLookupError` guard leaves monitor alive.
+5. Shutdown: cancel/group kill, all children reaped, durable `session_ended`, prune,
+   cancelled result in bounded time.
+6. Thread→loop handoff: critical DB row precedes subscriber delivery.
+7. DS-C4 crashes: full-jitter delay, burst cap 5/60 s, absolute cap 10, then FAILED.
+8. DS-C6 restart: generation increments; stale orphan self-terminates.
 
-The architecture §6.2 invariants are adopted verbatim and made precise:
+## 6. Verification appendix (historical commands)
 
-1. The loop enqueues with `queue.Queue.put_nowait()` — non-blocking, always.
-2. **Non-critical events** (`heartbeat`, `tool_event`, `log`, ...): on `queue.Full`, the writer drops the oldest non-critical event, logs a `drop` marker, and increments a counter. The loop never blocks.
-3. **Critical events** (`result`, `checkpoint`, `worker_exit`, `task_failed`, `merge_progress`, `task_assigned`, `merge_committed`): never dropped. On overflow the producer performs a timeout-bounded blocking put: `await asyncio.to_thread(partial(q.put, event, timeout=0.1))`. These are rare; a bounded 100 ms wait is acceptable.
-4. The writer thread is the only holder of the SQLite write connection. `PRAGMA synchronous=NORMAL`; batched `wal_checkpoint(TRUNCATE)` + `os.fsync(wal_fd)` every `fsync_interval_s` (default 1 s); the same sequence runs synchronously when a critical event is dequeued (architecture §6.5).
-5. The writer thread publishes to subscribers through `loop.call_soon_threadsafe(subscriber_q.put_nowait, event)` — verified to deliver across threads. Subscribers see events in monotonic order; critical events are fsync-d before they are published.
-6. Redaction (§12) is applied at enqueue time on the loop, before the event crosses into the writer thread.
+Run from `/tmp/opencode/cambium-csp` with `uv run --python 3.14.7`; interpreter was
+`cpython-3.14.7-linux-aarch64-gnu`.
 
-Queue inventory:
-
-| Queue | Type | Producer | Consumer | Bounded? |
-|---|---|---|---|---|
-| Event store | `queue.Queue` | loop (`put_nowait`) | writer thread | yes (10 000) |
-| Subscriber streams | `asyncio.Queue` | writer thread (via `call_soon_threadsafe`) | loop (`Session.events()`) | yes (config) |
-| Worker stdin | pipe (`StreamWriter`) | loop | worker process | OS pipe |
-
-The `queue.Queue` ↔ `asyncio.Queue` handoff point is precisely the writer thread's publish step (row 2). No other cross-thread queue exists in Custos.
-
----
-
-## 3. Shared-state discipline
-
-### 3.1 `WorkerHandle` state machine — loop-affine only
-
-States (architecture §7.1): `PENDING → SPAWNING → RUNNING → (DONE | FAILED | REJECTED | CRASHED → restartable → SPAWNING)`.
-
-Rules:
-
-1. **Loop-affinity**: only event-loop tasks may read or mutate `WorkerHandle` fields (`state`, `last_heartbeat`, `proc`, `crash_times`, `generation`, `result`). No thread ever receives a handle reference; threads only receive immutable `Event` values.
-2. **Atomic transitions**: every transition is a guard-check + mutation executed in a single synchronous block with **no `await` between check and set**. asyncio has no preemptive switching between awaits, so two loop tasks cannot interleave a check-and-set pair. This is the mechanism that makes DS-M2's logical races structurally impossible rather than merely rare.
-3. **One mutation site per field**: `last_heartbeat` and `state` are updated together by the stdout reader (a heartbeat implies `RUNNING`); the supervise task and the watchdog read them but do not set them except through the same transition helpers.
-
-### 3.2 DS-M2, resolved at the source
-
-The reviewed race was: heartbeat monitor wakes, reads a stale `last_heartbeat`, and kills a worker that has already exited. With loop-affine state this remains *possible* as a cooperative interleaving (reader task may be scheduled after the monitor), so the design adds three guards:
-
-- **Re-check before kill**: the watchdog calls `proc.poll()` and, if the process has already exited, skips the kill and lets the supervise task complete.
-- **Catch `ProcessLookupError`**: verified that `proc.kill()` on an already-reaped asyncio process raises `ProcessLookupError`. The watchdog wraps the kill in `try/except ProcessLookupError` and treats it as "already dead" (this was the latent crash in the v0.1 `_heartbeat_monitor`, line 591).
-- **The reader wins the tie**: the reader sets `last_heartbeat` + `state = RUNNING` in one synchronous step; the monitor's guard reads both fields in one synchronous step. No await between either read or write, so a torn observation is impossible.
-
-### 3.3 Messages between loop and threads
-
-| Direction | Mechanism | Verified? |
-|---|---|---|
-| loop → writer thread | `queue.Queue.put_nowait` (non-critical); `asyncio.to_thread(q.put, ev, timeout=0.1)` for critical overflow | yes (`queue.Queue`, `queue.Full`, `asyncio.QueueFull` present; `to_thread` runs off-loop) |
-| writer thread → loop | `loop.call_soon_threadsafe(sub_q.put_nowait, event)` | yes |
-| loop → worker | `proc.stdin` | yes |
-| worker → loop | `StreamReader` on stdout/stderr | yes |
-
-Only immutable, already-redacted `Event` dataclasses cross any thread boundary. There are no locks on Custos state (the only `asyncio.Lock` in the deterministic layer is `Unio`'s merge lock, architecture §7.8).
-
----
-
-## 4. Cancellation / shutdown — precise sequence
-
-Coordinated shutdown, steps 1–10. The choreographer is a single loop task; every worker-facing step is bounded by a timeout so shutdown cannot hang.
-
-1. **Stop intake.** Set `self._shutdown = True`. The orchestrator stops dispatching new tasks; `submit()` returns a rejected result for anything after this point. No new worktrees are created.
-2. **Send `cancel` to live workers.** For every handle in `RUNNING | READY | SPAWNING`, write `{"type":"cancel","request_id":...,"reason":...}` to `proc.stdin` (best-effort; swallow `BrokenPipeError` for already-dead workers). Start the per-worker grace window.
-3. **Wait for cooperative exits.** For each worker, `await asyncio.wait_for(worker_exit_event, timeout=graceful_s)` (default 10 s). A healthy worker emits `exit` (authoritative termination, architecture §5.3) and its supervise task completes normally. Workers that comply never see a signal.
-4. **SIGTERM the stragglers' process groups.** For each worker still alive: `os.killpg(handle.pgid, signal.SIGTERM)`. Killing the *group* (not just the pid) is mandatory — `start_new_session=True` means pgid == child pid, and grandchildren die with the worker (DS-C2 mode a). `await asyncio.wait_for(proc.wait(), timeout=term_grace_s)` (default 5 s).
-5. **SIGKILL what remains, then reap.** For each worker still alive: `os.killpg(handle.pgid, signal.SIGKILL)`; then `proc.kill()` (verified method) as belt-and-braces; then `await proc.wait()` — the `wait()` reaps the zombie and sets `returncode`. Catch `ProcessLookupError` (verified: raised on a reaped process). Every subprocess is reaped; nothing is left to PID 1.
-6. **Cancel loop tasks.** Cancel and drain the remaining per-worker tasks (stdout/stderr readers, watchdogs, EOF-grace timers) with `task.cancel()` + `await asyncio.gather(..., return_exceptions=True)`, or by exiting the `TaskGroup` scope. `CancelledError` is expected and swallowed here.
-7. **Drain subscriber queues.** Stop feeding the per-consumer `asyncio.Queue`s; flush what remains to attached `Session.events()` consumers (best-effort, bounded), then close them. No consumer is left waiting forever.
-8. **Flush the event log and stop the writer.** Enqueue a final **critical** `session_ended` event, set the writer's shutdown flag, and wait for the writer to drain and ack (via a `call_soon_threadsafe`-delivered done event). The writer performs a final `wal_checkpoint(TRUNCATE)` + `os.fsync(wal_fd)` and closes the SQLite connection. Postcondition: every critical event is durable (architecture §6.5).
-9. **Worktree cleanup.** `Surculus.prune()` removes stale `.git/worktrees/` entries (DS-N7); active worktrees are removed or quarantined per policy; `gc.auto=0` is already set on the managed repo. This runs before the writer thread stops only if it must be observed in the log; otherwise it runs now, after the log is durable.
-10. **Close the session contract.** Write `result.json` atomically (temp + rename) with `status="cancelled"`, exit code 4, and `failure_reason`; write final `status.json`; close the logging `QueueListener`; return from `shutdown()`.
-
-Verification hooks: after step 5, a smoke assertion checks every handle's `proc.returncode is not None` (all reaped). After step 8, a smoke assertion checks the DB has the `session_ended` row.
-
----
-
-## 5. The scaffolding gap — deltas to the merged skeleton
-
-Read: `src/cambium/orchestrator.py` (59 lines) and `src/cambium/events.py` (47 lines). The skeleton is a placeholder: a single `Orchestrator` class with an `asyncio.Queue` of task specs, a counter-based `task_id`, a serial `submit → run → _emit` loop, and no supervisor, no subprocesses, no event store, no shutdown. Concrete deltas to reach this design (spec only, no code):
-
-1. **Split facade from supervisor.** Introduce a `Custos` component that owns the `WorkerHandle` table, the event-log writer thread, and the restart policy. `Orchestrator` (Architectus) keeps decomposition/routing/evaluation and calls `Custos.run_task(spec) -> Result`. The skeleton's single class conflates both layers.
-2. **Replace the counter task-id scheme.** `self._next_task_id` + `task-{n}` is replaced by ULID task ids issued by Custos, plus a per-task monotonic `generation` (fencing token, architecture §7.3). Counter-based ids cannot fence and invite the DS-M2 class of identity confusion.
-3. **Replace the serial drain loop.** `run()`'s `while not self._queue.empty(): ... await _emit(...)` becomes concurrent supervision: each task runs its own supervise task inside an `asyncio.TaskGroup`. A crashed task must not cancel siblings (Erlang one-for-one). `run()` returns the aggregated `Result` and writes `result.json` atomically.
-4. **Route events to the writer, not to callbacks.** `_emit` currently awaits a caller callback on the loop. Callbacks become subscribers of `Session.events()`; the loop's event path becomes `queue.Queue.put_nowait` (critical events via the bounded put). No event path may touch disk.
-5. **Upgrade the event schema.** `events.py` ships four flat types; the design needs the architecture §3.6 `Event` (`kind`, `task_id`, `request_id`, `timestamp`, `monotonic_ms`, `generation`, `payload`), frozen, with a critical/non-critical tier classifier and enqueue-time redaction. `WorkerStarted`/`WorkerFinished` map onto `worker_spawned` / `worker_exit` kinds.
-6. **Add the event-log writer.** A single consumer thread holding the SQLite WAL connection, fsync cadence, and `call_soon_threadsafe` publish path (§2.4). The skeleton has no persistence at all.
-7. **Add worker spawn + the init handshake.** `create_subprocess_exec` with the §1.4 contract (pipes, `limit`, `start_new_session`, `pass_fds=()`, `close_fds=True`, `PYTHONUNBUFFERED=1`), then `init` → wait for `ready` under `ready_timeout` (default 60 s). The skeleton spawns nothing.
-8. **Add the supervision machinery.** stdout reader (partial-line-safe, §2.1), stderr reader (rate-limited, size-capped), heartbeat watchdog with `ProcessLookupError` guard and `poll()` re-check, EOF-grace timer, drain-deadline monitor, and the jittered restart policy (burst cap + absolute cap + per-task wall budget, architecture §7.4). None of this exists in the skeleton.
-9. **Add `Surculus` integration.** Before every spawn: worktree create (first) or recover (restart: lock cleanup, rebase/merge abort, `reset --hard`, `clean -fd`, generation bump, optional checkpoint cherry-pick; quarantine on failure), each `git` call via `asyncio.to_thread`. Shutdown calls `prune()`. The skeleton has no worktree concept.
-10. **Add `shutdown()` and the async context surface.** `__aenter__`/`__aexit__` running the §4 sequence; `cancel(reason)`, `events()`, `query()`. The skeleton has no shutdown and no context-manager entry points.
-11. **Wire `Unio` after results.** On task completion, submit the branch to the merge sequencer (single `asyncio.Lock`, throwaway worktree, test gate, atomic `update-ref` publish, architecture §7.8). The skeleton emits `WorkerFinished` and stops.
-12. **Keep the smoke gate.** The scaffold's `tests/` discipline (a real dataset, no mocking, one end-to-end run) is extended with the scenario tests in §6. The scenario suite is the v0.1 lesson made into a CI gate: the reviewed code samples had ~12 syntax/name bugs because nothing was ever executed (review-implementation.md verdict).
-
----
-
-## 6. Test scenarios
-
-At the historical commit for this design there was no dedicated test-strategy
-document in `main`. Current main has `docs/research/test-strategy.md` and 108
-collected scenario tests. The scenarios below still slot into that strategy's
-§9.4 integration tier and extend the smoke test.
-
-All scenarios use a **fake worker** (`tests/fixtures/fake_worker.py`): a script that speaks canned NDJSON over stdout at a scripted pace, controllable via env vars — no DSPy, no network, deterministic.
-
-1. **Partial-line and parse-error recovery** (DS-C2 mode c). Fake worker emits `ready`, a `heartbeat`, then a torn `result` line without a trailing newline, and exits 0. Assert: the reader delivers the partial tail at EOF (verified behavior), the supervisor logs a `parse_error` event, does **not** crash, and the supervise task completes `DONE` with `exit` message cross-check.
-2. **Over-limit line guard** (§2.2). Fake worker emits a single 200 000-byte line. Assert with `limit=1 MiB` at spawn: the line is read whole and processed. Assert the guard path: an unguarded default-limit reader raises `ValueError`; Custos catches it, logs, skips, counts, and the loop stays responsive (the heartbeat watchdog still fires on schedule).
-3. **Event-loop non-blocking regression** (DS-C1). High-volume `tool_event` burst (e.g., 5 000 events) from one fake worker while a second fake worker runs a long tool emitting heartbeats. Assert: the second worker's heartbeat never false-trips, no pipe ever fills (the writer queue bounds and drops non-critical events with a `drop` counter), and wall-clock latency of a probe `ping` stays under a threshold.
-4. **Watchdog vs exited worker** (DS-M2). Fake worker exits cleanly at T+0 immediately after `ready`. The watchdog's next tick computes a stale `last_heartbeat`. Assert: `poll()` re-check prevents the kill, `ProcessLookupError` (if the kill is attempted) is caught, the monitor task does **not** die, and the supervise task completes `DONE`.
-5. **Coordinated shutdown** (§4). Start a task with a slow fake worker, call `shutdown()` mid-run. Assert the 10 steps in order: worker receives `cancel` or group SIGTERM/SIGKILL within bounds, every `proc.returncode` is set (all reaped — no zombies), the `session_ended` critical row is durable in the DB, `worktree prune` ran, `result.json` says `cancelled`, and `shutdown()` returns in bounded time.
-6. **Thread→loop handoff** (§2.4). Fake worker emits a `result` (critical) followed by a burst of `tool_event`s. Assert: a `Session.events()` subscriber receives events in monotonic order; the `result` event is present in the SQLite DB *before* the subscriber's copy is observed (fsync-before-yield, architecture §6.5).
-7. **Restart policy with jitter and caps** (DS-C4). Fake worker crashes (`exit 1`) N times with a deterministic seed. Assert: restart delays are full-jitter within `[0, base * 2^n]`, the burst cap (5 in 60 s) and absolute cap (10) both engage, and the task ends `FAILED` with the correct `failure_reason`.
-8. **Generation fencing across restart** (DS-C6). First worker exits mid-task; on respawn Custos bumps `generation`. The fake worker is scripted to read its generation and refuse to run with a stale token. Assert: the restarted worker accepts the new generation, and a simulated orphan (an extra subprocess holding the worktree's `.cambium/generation`) self-terminates on mismatch.
-
-Each scenario asserts loop liveness (a concurrent probe task completes), worker reaping, and event-log durability — the three invariants this design exists to protect.
-
----
-
-## 7. Verification appendix (real commands, CPython 3.14.7)
-
-Run from `/tmp/opencode/cambium-csp` with `uv run --python 3.14.7`. `uv` resolved `cpython-3.14.7-linux-aarch64-gnu` (the pinned GIL build).
-
-### 7.1 Required checks
-
-```
-$ uv run --python 3.14.7 python -c "import asyncio; print(hasattr(asyncio, 'create_subprocess_exec'))"
-True
-
-$ uv run --python 3.14.7 python -c "import asyncio; print(hasattr(asyncio, 'to_thread'))"
-True
+```text
+python -c "import asyncio; print(hasattr(asyncio,'create_subprocess_exec'))" → True
+python -c "import asyncio; print(hasattr(asyncio,'to_thread'))" → True
+readline partial tail → lines=['{"type":"ready"}', '{"type":"heartbeat","turn":1}', '{"type":"tool_event","cmd":"sleep"}'], rc=0
+default >64KiB → ValueError; limit=1_000_000 reads 200,001 bytes
+terminate/wait → -15; kill reaped process → ProcessLookupError
+start_new_session → pgid==pid; killpg → -9; wait_for(0.5) → TimeoutError
+asyncio.Queue(maxsize=2).put_nowait(3) → QueueFull; thread→loop handoff → delivered
+stderr lines/torn tail match stdout; Linux watcher → _PidfdChildWatcher
 ```
 
-### 7.2 Behavior checks (script: `/tmp/opencode/verify_custos.py`)
+UNVERIFIED at the snapshot: macOS group semantics, old-kernel watcher fallback,
+free-threaded 3.14t, and Windows Proactor. Sources were architecture §5.3, §6.2/6.5,
+§7.1–7.8, §13–14; the superseded `system-design.md` M4; distributed-systems review
+DS-C1/DS-M2/DS-M3; and the scaffold paths above.
 
-| Behavior | Result |
-|---|---|
-| `readline()` delivers a partial final line at EOF (no trailing `\n`) | lines = `['{"type":"ready"}', '{"type":"heartbeat","turn":1}', '{"type":"tool_event","cmd":"sleep"}']`, rc = 0 |
-| `readline()` on a line > 64 KiB default limit | `ValueError: Separator is not found, and chunk exceed the limit` |
-| `create_subprocess_exec(..., limit=1_000_000)` | 200 000-byte line read whole (200 001 bytes incl. `\n`) |
-| `proc.terminate()` → `await proc.wait()` | returncode = −15 (SIGTERM visible) |
-| `proc.kill()` on an already-reaped process | `ProcessLookupError` raised |
-| `start_new_session=True` | child pgid == child pid (own process-group leader) |
-| `os.killpg(pgid, SIGKILL)` | process group dies; `wait()` returns −9 |
-| `asyncio.wait_for(proc.wait(), timeout=0.5)` | `TimeoutError` after 0.50 s; `returncode` stays `None` until `wait()` completes |
-| `asyncio.Queue(maxsize=2).put_nowait(3)` | `asyncio.QueueFull` raised |
-| thread → loop handoff | `loop.call_soon_threadsafe(sub_q.put_nowait, ev)` delivers; loop drains `queue.Queue` via `run_in_executor(None, q.get)` |
-| stderr `StreamReader` | lines + torn tail delivered exactly like stdout; rc = 0 |
-| default child watcher (Linux 3.14) | `_PidfdChildWatcher` — reaping is loop-driven, `proc.wait()` is a coroutine |
-| `os.killpg` | present on Linux |
+## Appendix A — queue handoff and state proof
 
-### 7.3 UNVERIFIED / platform notes
+The event-store queue was intentionally the only cross-context handoff:
 
-- **macOS process-group semantics** (`os.killpg`, `start_new_session`) — `UNVERIFIED` (this box is Linux; `Septum` owns platform abstraction; macOS behavior must be re-verified on a Mac).
-- **`_PidfdChildWatcher` fallback** on kernels < 5.3 — `UNVERIFIED` here (modern kernel). Custos must not depend on pidfd specifics; the `proc.wait()` API is identical under the threaded-watcher fallback.
-- **Free-threaded build (3.14t)** — `UNVERIFIED`; the architecture pins the GIL build (architecture §14), and this design targets it.
-- **Windows Proactor loop** — out of scope (Linux/macOS dev targets).
+| Queue | Producer | Consumer | Bound / policy |
+|---|---|---|---|
+| Event store | loop `put_nowait` | writer thread | 10,000; non-critical drop, critical timeout put. |
+| Subscriber stream | writer via `call_soon_threadsafe` | loop consumer | configured `asyncio.Queue`. |
+| Worker stdin | loop `StreamWriter` | subprocess | OS pipe; `drain()` awaited. |
 
----
+The writer applied redaction before SQLite serialization, inserted a row, batched
+`PRAGMA wal_checkpoint(TRUNCATE)` and `os.fsync(wal_fd)` every second, and performed the
+same fsync synchronously for a dequeued critical event before publishing it. A subscriber
+could therefore observe a critical record only after the DB row was durable. A queue-full
+non-critical event emitted one bounded `drop` marker rather than recursively logging
+every drop. Critical admission waited at most 100 ms through `asyncio.to_thread`; the
+design treated that short wait as a backpressure valve, not an unbounded disk stall.
 
-## 8. Sources
+`WorkerHandle` had one mutation site per field. The stdout reader updated
+`last_heartbeat` and `state=RUNNING` together; watchdogs read but did not mutate except
+through transition helpers. The stale-observation sequence (watchdog wakes, process
+already exits, reader has not run) was handled by `proc.poll()` immediately before kill;
+`ProcessLookupError` from a reaped process was treated as already dead. This was the
+source-level DS-M2 guard, not a timing assumption.
 
-- `/home/ubuntu/cambium/docs/architecture/reviews/review-distributed-systems.md` — DS-C1 (§1, §2), DS-M2 (§3), DS-M3 (§2.4).
-- `/home/ubuntu/cambium/docs/architecture/system-design.md` §M4 (lines 397–643) — the reviewed `Supervisor` (this doc replaces its I/O and liveness model).
-- `docs/architecture/architecture.md` (v2.0.0, now merged in main) — §5.3 liveness model, §6 event-log writer (§6.2) and durability contract (§6.5), §7.1 state machine, §7.2 spawn, §7.3 fencing, §7.4 restart, §7.5 worktree recovery, §7.7 shutdown, §7.8 Unio publish, §13 logging, §14 Python stance (`asyncio.to_thread`).
-- `docs/architecture/module-template/architecture.md` §9 — the test-strategy template this doc's §6 extends (now in `main`).
-- `/tmp/opencode/cambium-csp/src/cambium/orchestrator.py`, `src/cambium/events.py` — the merged skeleton this design must grow into (§5).
+## Appendix B — shutdown ordering proof
+
+The ten-step shutdown was designed to be observable and bounded:
+
+1. Set `_shutdown` and stop Architectus admission.
+2. Send cooperative `cancel` to RUNNING/READY/SPAWNING handles.
+3. Wait `graceful_s` for authoritative `exit`.
+4. SIGTERM remaining process groups and wait `term_grace_s`.
+5. SIGKILL, `proc.kill()` belt-and-braces, wait/reap, catch `ProcessLookupError`.
+6. Cancel and drain reader/watchdog/EOF tasks.
+7. Stop subscriber intake and flush bounded queues.
+8. Enqueue critical `session_ended`; drain writer and final WAL fsync.
+9. Prune stale worktree administration and quarantine failures.
+10. Atomically write cancelled `result.json`, final status, and stop logging.
+
+The postconditions were every child reaped, `session_ended` in SQLite, no subscriber
+left waiting, and cancellation represented as status `cancelled`, exit code `4`. The
+worktree prune was allowed before step 8 only when its result was itself logged; the
+default ordering kept the event durable first.
+
+## Appendix C — scaffold replacement inventory
+
+The 59-line orchestrator skeleton had a counter task ID and serial callback drain. The
+proposed replacement introduced: ULID + generation identity; `TaskGroup` one-for-one
+supervision; ready handshake (`ready_timeout=60`); partial-line/over-limit stdout and
+stderr readers; heartbeat, EOF-grace, and drain-deadline monitors; jittered restart;
+Surculus create/recover/prune; `__aenter__`/`__aexit__`, `cancel`, `events`, `query`; Unio
+gate/merge/update-ref; and canonical event envelope fields. This was a design delta, not
+an assertion that the scaffold already had those components.
+
+## Appendix D — verification command log
+
+Historical checks ran from `/tmp/opencode/cambium-csp` with
+`uv run --python 3.14.7` (`cpython-3.14.7-linux-aarch64-gnu`):
+
+```text
+hasattr(asyncio,'create_subprocess_exec') → True
+hasattr(asyncio,'to_thread') → True
+partial final readline → ready, heartbeat, tool_event; rc=0
+default 64KiB line → ValueError; limit=1_000_000 → 200,001 bytes read
+terminate/wait → -15; kill reaped process → ProcessLookupError
+start_new_session → pgid==pid; killpg → -9; wait_for(0.5) → TimeoutError
+Queue(maxsize=2).put_nowait → QueueFull; thread→loop callback → delivered
+stderr torn tail → same behavior as stdout; Linux child watcher → _PidfdChildWatcher
+```
+
+UNVERIFIED platform notes were macOS group semantics, old-kernel watcher fallback,
+free-threaded 3.14t, and Windows Proactor. Those notes and all numeric defaults remain
+historical evidence, not current source claims.
+
+## Appendix G — focused scenario assertions
+
+The historical fake-worker suite also tested a reader receiving a 200,000-byte line,
+then the same line with the default 64 KiB limit. The first path proved the explicit
+spawn limit; the second proved `ValueError` was caught and the reader remained alive.
+Another canary sent a valid result followed by a burst of non-critical tool events and
+asserted that the critical DB row existed before a `Session.events()` subscriber saw it.
+This tied queue admission, writer fsync, and subscriber publication into one observable
+contract.
+
+The watchdog race canary exited immediately after `ready`, leaving a stale heartbeat.
+It asserted `poll()` prevented a kill of an already-dead process, and that an attempted
+`proc.kill()` raising `ProcessLookupError` did not terminate the monitor task. The
+shutdown canary called `shutdown()` mid-tool and checked cancel/group signals, reaping,
+critical `session_ended`, pruning, and cancelled result JSON within a bound. A restart
+canary crashed deterministically enough times to exercise both the five-in-60 burst cap
+and ten-attempt absolute cap, then checked the typed failure reason.
+
+## Appendix E — liveness escalation and reader behavior
+
+Reader behavior was deliberately layered. `StreamReader.readline()` buffered a partial
+line until newline; at EOF it returned a torn tail, which JSON parsing classified as
+`parse_error`. A line over the configured 1 MiB limit was consumed to the next newline
+and dropped. stderr was read separately, capped and rate-limited, and could never block
+stdout protocol or determine task state. A worker's stdout EOF started a grace timer,
+then a process poll; only a live process with no pong escalated to group kill. A process
+that emitted an authoritative exit was not restarted merely because a reader saw EOF.
+
+The drain-deadline monitor watched the supervisor side, not a worker heartbeat. If CPU,
+subscriber backpressure, or a stalled callback prevented the loop from draining a pipe,
+it emitted `supervisor_stall` and suspended heartbeat enforcement for that worker. This
+was the causal fix for DS-C1/DS-C2's false-kill cascade: workers should not be blamed for
+the supervisor failing to read.
+
+Restart delays used full jitter over `[0, base*2**attempt]`, bounded by a five-in-60
+second burst cap and absolute ten-attempt cap. A generation bump happened before every
+respawn; a stale worker's process group was killed at startup and worktree generation
+file checked before any git operation. Provider outage (`AllProvidersFailed`) stayed
+inside the worker patience path and never consumed this restart budget.
+
+## Appendix F — thread ownership checklist
+
+The writer thread owned the SQLite connection, WAL checkpoint, fsync, and event publish;
+the loop owned process handles, timers, and `WorkerHandle` fields. `asyncio.to_thread`
+callables were forbidden from touching handles or shared mutable state. Only immutable
+event values crossed the boundary, already redacted. The logging QueueListener was a
+separate advisory thread and never shared the event-store connection. These ownership
+rules were intended to make race review mechanical: every field had one mutation context,
+and every durable record had one writer.
+
+## Appendix H — worktree boundary and task-group behavior
+
+Every spawn used a private worktree path and process group. Git create/recover/prune
+calls ran through `asyncio.to_thread`; a thread never received `WorkerHandle`. The
+supervisor's `TaskGroup` owned one supervise task per worker, but a child failure was
+handled one-for-one: sibling tasks stayed alive while the failed tree consumed its own
+restart policy. A gate or merge failure therefore could not cancel unrelated workers.
+
+The loop's task admission was bounded before process creation. A worker stdout flood
+could fill its pipe only if the loop stopped reading; the drain-deadline monitor flagged
+that as a supervisor stall. Event queue drops were counted and bounded; no DLQ or durable
+overflow sink was assumed. A critical event that could not be admitted within its bound
+entered a fatal store path rather than being silently lost.
+
+These constraints were intended to be checked with fake workers and a real temporary
+Git repository. They do not assert an OS sandbox, per-worker approval callback, or
+dynamic task decomposition in the current source.
+
+Custos admission was deliberately separate from Architectus planning. Architectus
+submitted a validated node and received an admission token; Custos then created/recovered
+the worktree, started the process group, sent `init`, and waited for `ready`. A process
+could not self-admit through a stdout message, and a `task_decomposed` line could not
+create a worker without a new tree validation wave. This was the deterministic boundary
+that kept dynamic model output from changing process ownership.
+
+## Appendix I — cancellation and shutdown order
+
+The proposed shutdown sequence was intentionally ordered. First stop new admission and
+mark the session draining. Second send protocol `shutdown` to live workers, wait the
+grace interval, then terminate their process groups and escalate to `SIGKILL` after the
+term interval. Third drain stdout/stderr until the deadline, reap every process, and
+fence the generation. Fourth flush critical events and close the writer thread. Only
+after those steps could worktrees be pruned and `result.json` published. A cancellation
+flag did not bypass reaping or durable `session_ended` evidence.
+
+The loop treated `CancelledError` as control flow. A worker cancellation emitted a
+typed cancelled result and preserved the supervisor task's cancellation for its caller;
+it did not convert cancellation into a successful envelope. A callback failure in a
+subscriber was isolated from process supervision, while a writer failure was fatal for
+critical admission. These distinctions prevented cleanup exceptions from masquerading
+as worker crashes.
+
+The task-group plan was one-for-one at the tree boundary. A failed supervise task
+reported its task and generation, consumed only that node's bounded restart budget, and
+left siblings running. A root-level shutdown cancelled the group deliberately and
+waited for all child tasks. This behavior was a proposal tied to DS-C1/DS-C2 and did not
+claim that the current flat `run_plan` has task-tree scheduling.
+
+## Appendix J — source gaps kept explicit
+
+The draft identified missing or unverified seams instead of filling them with fallbacks:
+the merged scaffold did not yet have a single writer, bounded event admission,
+generation fencing, or complete shutdown choreography; `Session.events()` and worktree
+recovery were design surfaces; and platform-specific child-watchers were untested.
+The historical verification used CPython 3.14.7 on Linux only. A future implementation
+must rerun line-limit, process-group, cancellation, and writer-failure checks on the
+actual source revision before promoting any numeric default or portability claim.
+
+## Appendix K — ownership of blocking operations
+
+Git status, worktree creation, recovery, pruning, merge inspection, and WAL checkpoint
+were all classified as blocking operations. The proposal routed them through
+`asyncio.to_thread` and passed immutable paths/SHAs, never live process handles. Pipe
+reads stayed on the loop with explicit byte limits; provider calls stayed in workers.
+This split was the causal response to DS-C1: a synchronous disk or Git call could stop
+reads, fill stdout, trigger a false heartbeat failure, and then cause an unnecessary
+restart. The source and tests remained the authority for which calls still block.
+
+The event loop also owned timer callbacks for ready, heartbeat, EOF grace, drain, wall,
+and shutdown deadlines. Timer callbacks re-read process state before acting, so a late
+heartbeat or stale callback could not kill a reaped generation. This was a proposed
+loop-affinity invariant alongside single-writer persistence; it was not a guarantee that
+the current runtime implements every timer.
+
+No timer callback was allowed to call an LLM or make a workflow decision.
+
+Timer callbacks emitted typed observations or requested deterministic process actions;
+Architectus remained the owner of task-content policy.
+
+Custos never inferred policy from model text.
+
+The writer thread published only redacted immutable events. Subscribers could observe a
+critical record only after its durable append boundary.
+
+The current runtime remains the authority.
+
+This document records proposed ownership only.
+
+Platform claims remain unverified.
+
+Numeric defaults are historical.
+
+Recheck on source change.
+
+Loop ownership stays narrow.
+
+Historical only.
+
+Historical review identifier retained: `C2`.
