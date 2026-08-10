@@ -33,6 +33,12 @@ _ENVELOPE_KEYS = (
 _ENVELOPE_KEY_SET = frozenset(_ENVELOPE_KEYS)
 CORE_DIRECTIVE_MAX = 200
 _CORE_DIRECTIVE_TRUNCATION_MARKER = "... [truncated]"
+_RETRY_REMAINING_FIELDS = ("retries_remaining", "retries_left", "attempts_remaining")
+_RESET_RETRY_ATTEMPTED_FIELDS = (
+    "reset_retry_attempted",
+    "reset_attempted",
+    "step_back_attempted",
+)
 
 
 class ActionKind(StrEnum):
@@ -43,6 +49,7 @@ class ActionKind(StrEnum):
     AGGREGATE = "aggregate"
     REPLAN = "replan"
     RESET_RETRY = "reset_retry"
+    ABORT_SUBTREE = "abort_subtree"
 
 
 class FailureDecision(StrEnum):
@@ -153,10 +160,9 @@ def _event_fields(event: Mapping[str, Any]) -> dict[str, Any]:
 
 def _positive_retries(fields: Mapping[str, Any]) -> bool:
     """Return whether a failure event explicitly has a retry available."""
-    for key in ("retries_left", "retries_remaining", "attempts_remaining"):
-        value = fields.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value > 0
+    remaining = _retry_remaining(fields)
+    if remaining is not None:
+        return remaining > 0
     retryable = fields.get("retryable")
     if isinstance(retryable, bool):
         return retryable
@@ -172,9 +178,18 @@ def _positive_retries(fields: Mapping[str, Any]) -> bool:
     return False
 
 
+def _retry_remaining(fields: Mapping[str, Any]) -> int | None:
+    """Return the canonical retry count from the supported field aliases."""
+    for key in _RETRY_REMAINING_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
 def _reset_retry_attempted(fields: Mapping[str, Any]) -> bool:
     """Return whether the one step-back retry already ran."""
-    return fields.get("reset_retry_attempted") is True
+    return any(fields.get(key) is True for key in _RESET_RETRY_ATTEMPTED_FIELDS)
 
 
 def decide_failure(event: Mapping[str, Any]) -> str:
@@ -242,7 +257,7 @@ def decide_failure(event: Mapping[str, Any]) -> str:
     if kind in {"gate_failed", "gate_failure"} or "gate" in kind and "fail" in kind:
         if _positive_retries(fields):
             return FailureDecision.RESOLVE.value
-        if fields.get("retries_remaining") == 0:
+        if _retry_remaining(fields) == 0:
             if _reset_retry_attempted(fields):
                 return FailureDecision.ABORT_SUBTREE.value
             return FailureDecision.RESET_RETRY.value
@@ -291,9 +306,13 @@ class ArchitectusCore:
         self._tree = tree
         self._store = store
         self._max_width = max_width
-        if core_directive is None:
-            core_directive = self._root_goal(tree)
-        self._core_directive = self._normalise_core_directive(core_directive)
+        root_goal = self._root_goal(tree)
+        if root_goal is not None and core_directive is not None and core_directive != root_goal:
+            raise ValueError("core_directive must match the root goal")
+        directive = root_goal if root_goal is not None else core_directive
+        self._core_directive = self._normalise_core_directive(directive)
+        if self._core_directive is None:
+            raise ValueError("root directive is required")
         self._topological = topological_order(tree)
         self._nodes = {node.task_id: node for node in tree.nodes}
         self._children: dict[str, list[str]] = {node.task_id: [] for node in tree.nodes}
@@ -305,6 +324,7 @@ class ArchitectusCore:
         self._finished: dict[str, dict[str, Any]] = {}
         self._in_flight: set[str] = set()
         self._failed_subtrees: set[str] = set()
+        self._reset_retry_tasks: set[str] = set()
         self._action_history: list[dict[str, Any]] = []
 
     @property
@@ -327,10 +347,20 @@ class ArchitectusCore:
         """A defensive copy of actions accepted from the LLM."""
         return copy.deepcopy(self._action_history)
 
+    @property
+    def reset_retry_tasks(self) -> frozenset[str]:
+        """Task ids that have consumed their one architecture-owned reset retry."""
+        return frozenset(self._reset_retry_tasks)
+
     async def step(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Run one scheduling wave and return actions for the execution edge."""
         if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
             raise TypeError("events must be a list of dictionaries")
+
+        failure_action = self._failure_action(events)
+        if failure_action is not None:
+            self._record_action(failure_action)
+            return [copy.deepcopy(failure_action)]
 
         blocked = self._blocked_task_ids()
         ready = [
@@ -348,9 +378,7 @@ class ArchitectusCore:
             self._record_action(action)
         return copy.deepcopy(actions)
 
-    def compose_context(
-        self, task_id: str, core_directive: str | None = None
-    ) -> dict[str, Any]:
+    def compose_context(self, task_id: str) -> dict[str, Any]:
         """Compose a static prefix followed by an info-hidden dynamic tail.
 
         The returned shape is deliberately JSON-friendly:
@@ -365,16 +393,13 @@ class ArchitectusCore:
             dynamic ordering.  The static prefix is never evicted; dynamic
             records are evicted from their least-recent ends first.
 
-        ``core_directive`` is used only when no root directive was supplied at
-        construction. The root directive is the unalterable goal shared by all
-        sub-agent contexts; it is capped at :data:`CORE_DIRECTIVE_MAX` chars.
+        The root directive is compiled at construction and is the unalterable
+        goal shared by all sub-agent contexts. Its deterministic token count is
+        capped at :data:`CORE_DIRECTIVE_MAX`.
         """
         node = self._node(task_id)
         config = self._config_for(node)
-        directive = self._core_directive
-        if directive is None:
-            directive = self._normalise_core_directive(core_directive)
-        static_prefix = self._static_prefix(config, directive)
+        static_prefix = self._static_prefix(config, self._core_directive)
         dynamic_tail = self._dynamic_tail(node, config)
         max_tokens = self._context_budget(config)
         truncated = False
@@ -431,6 +456,41 @@ class ArchitectusCore:
         """Apply the pure failure table without reading core state."""
         return decide_failure(event)
 
+    def _failure_action(self, events: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+        """Route exhausted gate failures through the stateful failure edge."""
+        for event in events:
+            try:
+                decision = decide_failure(event)
+            except ValueError:
+                continue
+            if decision not in {
+                FailureDecision.RESET_RETRY.value,
+                FailureDecision.ABORT_SUBTREE.value,
+            }:
+                continue
+            fields = _event_fields(event)
+            task_id = fields.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError(f"{decision} failure event requires a non-empty task_id")
+            self._node(task_id)
+
+            if (
+                decision == FailureDecision.RESET_RETRY.value
+                and task_id not in self._reset_retry_tasks
+                and not _reset_retry_attempted(fields)
+            ):
+                self._reset_retry_tasks.add(task_id)
+                return {"action": ActionKind.RESET_RETRY.value, "task_id": task_id}
+
+            self._mark_subtree_failed(task_id)
+            return {"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id}
+        return None
+
+    def _mark_subtree_failed(self, task_id: str) -> None:
+        """Record an abort and release the failed task's execution slot."""
+        self._failed_subtrees.add(task_id)
+        self._in_flight.discard(task_id)
+
     def _admit_actions(
         self,
         proposed: Sequence[Mapping[str, Any]],
@@ -460,8 +520,24 @@ class ArchitectusCore:
                 spawn_positions.append(raw_index)
                 continue
 
-            if kind in {ActionKind.STEER, ActionKind.AGGREGATE, ActionKind.RESET_RETRY}:
-                self._node(self._action_task_id(action))
+            if kind in {
+                ActionKind.STEER,
+                ActionKind.AGGREGATE,
+                ActionKind.RESET_RETRY,
+                ActionKind.ABORT_SUBTREE,
+            }:
+                task_id = self._action_task_id(action)
+                self._node(task_id)
+                if kind is ActionKind.RESET_RETRY:
+                    if task_id in self._reset_retry_tasks:
+                        action = {
+                            "action": ActionKind.ABORT_SUBTREE.value,
+                            "task_id": task_id,
+                        }
+                    else:
+                        self._reset_retry_tasks.add(task_id)
+                elif kind is ActionKind.ABORT_SUBTREE:
+                    self._mark_subtree_failed(task_id)
             non_spawn.append((raw_index, action))
 
         accepted_spawn_ids.sort(key=ready_rank.__getitem__)
@@ -654,24 +730,21 @@ class ArchitectusCore:
 
     @staticmethod
     def _normalise_core_directive(core_directive: str | None) -> str | None:
-        """Validate and cap a core directive without mutating caller data.
-
-        The cap is measured in characters. A truncated directive retains its
-        prefix and ends with ``... [truncated]`` while staying within the cap.
-        """
+        """Validate and cap a core directive without mutating caller data."""
         if core_directive is None:
             return None
         if not isinstance(core_directive, str):
             raise TypeError("core_directive must be a string")
-        if not core_directive:
+        tokens = core_directive.split()
+        if not tokens:
             return None
-        if len(core_directive) <= CORE_DIRECTIVE_MAX:
+        if ArchitectusCore._estimate_tokens(core_directive) <= CORE_DIRECTIVE_MAX:
             return core_directive
-        marker_length = len(_CORE_DIRECTIVE_TRUNCATION_MARKER)
-        return (
-            core_directive[: CORE_DIRECTIVE_MAX - marker_length]
-            + _CORE_DIRECTIVE_TRUNCATION_MARKER
+        marker_tokens = _CORE_DIRECTIVE_TRUNCATION_MARKER.split()
+        keep = CORE_DIRECTIVE_MAX - ArchitectusCore._estimate_tokens(
+            _CORE_DIRECTIVE_TRUNCATION_MARKER
         )
+        return " ".join([*tokens[:keep], *marker_tokens])
 
     @staticmethod
     def _context_budget(config: Mapping[str, Any]) -> int | None:

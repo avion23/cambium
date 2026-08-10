@@ -18,17 +18,20 @@ from cambium.tasktree import build_tree, topological_order
 
 
 def _plan(tasks: list[tuple[str, str, list[str], dict | None]]) -> dict:
-    return {
-        "tasks": [
+    planned: list[dict] = []
+    for task_id, kind, depends_on, spec in tasks:
+        task_spec = dict(spec or {})
+        if not depends_on and "goal" not in task_spec:
+            task_spec["goal"] = "ROOT GOAL"
+        planned.append(
             {
                 "task_id": task_id,
                 "kind": kind,
                 "depends_on": depends_on,
-                "spec": spec or {},
+                "spec": task_spec,
             }
-            for task_id, kind, depends_on, spec in tasks
-        ]
-    }
+        )
+    return {"tasks": planned}
 
 
 def _envelope(parent_task_id: str | None, *, summary: str = "", status: str = "done") -> dict:
@@ -134,8 +137,8 @@ def test_context_is_static_first_dynamic_last_and_evicts_old_tail(tmp_path) -> N
     core.aggregate("leaf", _envelope("child", summary="CHILD"))
 
     context = core.compose_context("child")
-    assert context["static_prefix"] == ["SYSTEM", "MODULE"]
-    assert context["prompt"].splitlines()[:2] == ["SYSTEM", "MODULE"]
+    assert context["static_prefix"] == ["ROOT GOAL", "SYSTEM", "MODULE"]
+    assert context["prompt"].splitlines()[:3] == ["ROOT GOAL", "SYSTEM", "MODULE"]
     assert [segment["kind"] for segment in context["dynamic_tail"]] == [
         "parent_summary",
         "child_envelope",
@@ -157,7 +160,7 @@ def test_context_is_static_first_dynamic_last_and_evicts_old_tail(tmp_path) -> N
                         {
                             "system": "SYSTEM",
                             "module_instructions": "MODULE",
-                            "max_tokens": 4,
+                            "max_tokens": 6,
                         },
                     ),
                 ]
@@ -169,7 +172,7 @@ def test_context_is_static_first_dynamic_last_and_evicts_old_tail(tmp_path) -> N
     finally:
         store.close()
 
-    assert budget_context["static_prefix"] == ["SYSTEM", "MODULE"]
+    assert budget_context["static_prefix"] == ["ROOT GOAL", "SYSTEM", "MODULE"]
     assert budget_context["truncated"] is True
     assert "OLD" not in repr(budget_context)
     assert "NEW" in repr(budget_context)
@@ -206,22 +209,11 @@ def test_compose_context_core_directive_is_truncated_to_hard_cap() -> None:
             ]
         )
     )
-    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
-    directive = "D" * (CORE_DIRECTIVE_MAX + 20)
-
-    context = core.compose_context("child", core_directive=directive)
-
-    prefix = context["static_prefix"][0]
-    assert len(prefix) == CORE_DIRECTIVE_MAX
-    assert prefix.startswith("D" * (CORE_DIRECTIVE_MAX - len("... [truncated]")))
-    assert prefix.endswith("... [truncated]")
-
-
-def test_compose_context_without_core_directive_keeps_prefix_absent() -> None:
+    directive = " ".join(["D"] * (CORE_DIRECTIVE_MAX + 20))
     tree = build_tree(
         _plan(
             [
-                ("root", "FEATURE", [], None),
+                ("root", "FEATURE", [], {"goal": directive}),
                 ("child", "TEST", ["root"], {"system": "SYSTEM"}),
             ]
         )
@@ -230,7 +222,58 @@ def test_compose_context_without_core_directive_keeps_prefix_absent() -> None:
 
     context = core.compose_context("child")
 
-    assert context["static_prefix"] == ["SYSTEM"]
+    prefix = context["static_prefix"][0]
+    assert ArchitectusCore._estimate_tokens(prefix) == CORE_DIRECTIVE_MAX
+    assert prefix.startswith("D " * (CORE_DIRECTIVE_MAX - 2))
+    assert prefix.endswith("... [truncated]")
+
+
+def test_root_directive_is_mandatory() -> None:
+    tree = build_tree(
+        {
+            "tasks": [
+                {"task_id": "root", "kind": "FEATURE", "depends_on": [], "spec": {}},
+                {
+                    "task_id": "child",
+                    "kind": "TEST",
+                    "depends_on": ["root"],
+                    "spec": {"system": "SYSTEM"},
+                },
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="root directive is required"):
+        ArchitectusCore(ScriptedLLM([]), tree=tree)
+
+
+def test_root_directive_is_immutable_after_construction() -> None:
+    tree = build_tree(_plan([("root", "FEATURE", [], None), ("child", "TEST", ["root"], None)]))
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+
+    first = core.compose_context("child")
+
+    with pytest.raises(TypeError):
+        core.compose_context("child", core_directive="MUTATED ROOT GOAL")  # type: ignore[call-arg]
+    assert core.compose_context("child") == first
+
+
+@pytest.mark.parametrize("token_count", [199, 200, 201])
+def test_root_directive_budget_uses_token_estimator(token_count: int) -> None:
+    directive = " ".join(["token"] * token_count)
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], {"goal": directive}),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+    prefix = core.compose_context("child")["static_prefix"][0]
+
+    assert ArchitectusCore._estimate_tokens(prefix) == min(token_count, CORE_DIRECTIVE_MAX)
+    assert prefix.endswith("... [truncated]") is (token_count == 201)
 
 
 def test_scripted_llm_drives_a_three_task_wave() -> None:
@@ -388,3 +431,40 @@ def test_callable_scripted_llm_receives_ready_state() -> None:
         {"action": "spawn", "task_id": "root"}
     ]
     assert seen == [(["root"], [{"kind": "tick"}])]
+
+
+@pytest.mark.parametrize("field", ["retries_left", "retries_remaining", "attempts_remaining"])
+def test_gate_retry_aliases_share_one_failure_policy(field: str) -> None:
+    assert decide_failure({"kind": "gate_failed", field: 1}) == "resolve"
+    assert decide_failure({"kind": "gate_failed", field: 0}) == "reset_retry"
+
+
+def test_step_back_reset_rerun_and_replayed_second_failure_abort() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(ScriptedLLM(_spawn_ready), tree=tree)
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+
+    first_failure = {"kind": "gate_failed", "task_id": "root", "retries_left": 0}
+    assert asyncio.run(core.step([first_failure])) == [
+        {"action": "reset_retry", "task_id": "root"}
+    ]
+    assert core.reset_retry_tasks == frozenset({"root"})
+    assert core.in_flight == {"root"}
+
+    replayed_failure = {
+        "kind": "gate_failed",
+        "task_id": "root",
+        "attempts_remaining": 0,
+    }
+    assert asyncio.run(core.step([replayed_failure])) == [
+        {"action": "abort_subtree", "task_id": "root"}
+    ]
+    assert core.in_flight == set()
+    assert asyncio.run(core.step([])) == []

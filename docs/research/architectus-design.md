@@ -284,12 +284,13 @@ provider's exact-prefix KV cache can hit (D8c item 1-2; feedback-2-deltas.md lin
 
 1. **Core Directive** — the root plan's unalterable `goal`, injected as the first static
    prefix line for every sub-agent. This is the adopted critique-5 rule (provenance:
-   `feedback-5-assessment.md`; the assessment is directive-provided and its repository
-   presence is recorded as **UNVERIFIED** in §9). `ArchitectusCore` receives the value at
-   construction; a child task cannot replace it. The norm is a ≤200-token root goal. The
-   pure context seam applies the concrete hard cap `CORE_DIRECTIVE_MAX = 200` to
-   `len(core_directive)`; a longer value is truncated to 200 characters and ends with the
-   marker `... [truncated]`. The marker is part of the cap.
+   `feedback-5-assessment.md`; the assessment is merged on current `main`). `ArchitectusCore`
+   requires the root goal (or an equivalent constructor directive) and normalizes it once at
+   construction; a child task and later `compose_context` call cannot replace it. The norm is
+   a ≤200-token root goal. The pure context seam applies the concrete hard cap
+   `CORE_DIRECTIVE_MAX = 200` using Architectus's deterministic `_estimate_tokens` helper;
+   a longer value keeps the leading tokens and ends with the two-token marker
+   `... [truncated]`. The marker is part of the cap.
 2. **System prompt** — role and capability framing for the node's worker kind.
 3. **AGENTS.md-derived guidelines** — repo-constitution rules (citation: the `AGENTS.md`
    convention referenced by D8c item 1, feedback-2-deltas.md line 144; the guideline file
@@ -704,11 +705,16 @@ a retry counts as distinct only if the content changes (D4 item 1 — a byte-ide
 retry is a no-op; gate verdicts are content-addressed, arch §7.9).
 
 Gate failures therefore have three deterministic phases. The supervisor owns
-`gate_max_retries` and supplies `retries_remaining`; Architectus does not extend that
-budget. While retries remain, the rule steers the node with gate evidence (row 3). On the
-first exhausted event, Architectus steps back to the task's base worktree and emits the
-single `reset_retry` action (row 4). If that retry also produces a gate failure, the event
-is marked `reset_retry_attempted:true` and the existing abort-subtree policy applies (row 5).
+`gate_max_retries` and supplies one of the accepted retry-count aliases:
+`retries_remaining`, `retries_left`, or `attempts_remaining`; Architectus does not extend
+that budget. While retries remain, the rule steers the node with gate evidence (row 3). On
+the first exhausted event, `ArchitectusCore.step()` consumes the failure event, records the
+task id in its architecture-owned one-shot reset set, and emits the single `reset_retry`
+action (row 4). Custos resets the base worktree and reruns the task and gate. If the same
+failure is replayed, or the rerun produces a second exhausted failure under any retry alias,
+the core emits `abort_subtree` and blocks descendants (row 5). The persisted
+`reset_retry_attempted`, `reset_attempted`, and `step_back_attempted` fields remain input
+compatibility markers; they do not own the one-shot state.
 
 ---
 
@@ -728,7 +734,7 @@ the final status.
 | 2 | **Cyclic / multi-parent / over-depth / over-width rejection** | I2.2, I2.3, row 12 | Zero workers dispatched; typed rejection evidence emitted (M5 AC2) |
 | 3 | **Replan on `merge_failed` (conflict)** | row 7 | A resolver subtask spawns under the parent; `replan` event with trigger `merge_failed`; subtree requeued |
 | 4 | **Subtree abort on cap-exhausted** | row 6 | `subtree_failed` (critical) emitted; descendant dispatch stops; siblings unaffected |
-| 5 | **Gate fail → steering retries → exhausted → reset/retry once → abort** | rows 3-5, D4 | Worker receives gate evidence as `steer` turns; the supervisor-owned bound is honored; the exhausted event triggers one base-worktree reset retry; a second failure emits `subtree_failed` |
+| 5 | **Gate fail → steering retries → exhausted → reset/retry once → abort** | rows 3-5, D4 | `ArchitectusCore.step()` emits reset, the execution edge reruns the task, and a replayed or second exhausted failure emits `abort_subtree`; descendants do not dispatch |
 | 6 | **Crash → bounded restart with generation bump** | row 1, arch §7.3 | Fake worker exits without `exit_message`; Custos restarts, generation increments, fencing accepted |
 | 7 | **Context composition correctness** | I2.4, D8c | Parent context = static prefix + own bounded turns + parent summary + child envelopes; order and truncation per §3; prefix contains no volatile tokens (prompt-lint) |
 | 8 | **Info-hiding enforcement** | I2.7, D8b | A canary scratchpad string written by a child never appears in parent context; an envelope with an unknown top-level field is rejected (M5 AC3) |
@@ -737,10 +743,11 @@ the final status.
 | 11 | **Deterministic wave order** | `tasktree.py:400-403` | Two runs with identical scripted LLM input produce byte-identical event trails (modulo timestamps) |
 | 12 | **Steer routing + sibling isolation** | D3 item 4 | Parent→child steer routes by `session_id`; sibling→sibling steer is rejected (parent-mediated only) |
 | 13 | **Scripted-LLM replan decision** | §4.3, row 7/8 | A scripted response forces `replan(merge_failed)`; the loop's action sequence matches the script; no network |
+| 14 | **Directive and reset boundary/replay checks** | critique-5, rows 4-5 | Missing root directive is rejected; 199/200/201 estimated-token goals hit the exact boundary; per-call mutation is rejected; retry aliases share policy; reset/rerun/second-failure replay aborts once |
 
 Scenarios 7-10 are the M5 acceptance criteria 3-4 in executable form (`v2-1-review.md`
-lines 396-399). Scenario count 13 = the 10-12 requested plus the deterministic-replay
-pair; any can be dropped without weakening the set.
+lines 396-399). Scenario count 14 covers the original set plus the directive, boundary,
+reset, and replay checks; any can be dropped only with equivalent coverage retained.
 
 ---
 
@@ -825,7 +832,7 @@ is implemented at the worker's envelope-emit boundary (S6) per the normative arc
 | `docs/research/compaction-design.md` exists | merged via `b50ba71`; file read (469 lines, DRAFT non-normative) | **VERIFIED** — exists on `main`; DRAFT status, not normative |
 | arch §3.4 `include_diff` note (normative per review) | commit `16e61cf` on branch `wt-doc-difflag` (read via `git show 16e61cf`) | **VERIFIED as committed** — but **NOT merged**: `16e61cf` is not an ancestor of `main` HEAD `baeb9a0` (`git merge-base --is-ancestor` failed); treated as normative per the batch review |
 | `feedback-4-assessment.md` #21 (`include_diff` payload semantics) | — | **UNVERIFIED** — file not in repo (bench-harness-design.md:457 references it); directive-provided |
-| `feedback-5-assessment.md` (Core Directive and step-back rule) | — | **UNVERIFIED** — file not in repo; adopted critique-5 provenance is directive-provided |
+| `feedback-5-assessment.md` (Core Directive and step-back rule) | merged on current `main` | **VERIFIED** — the pure core requires and compiles the root directive once; `ArchitectusCore.step()` owns reset/replay state and the boundary/replay scenarios cover it |
 | Token-budget ratios / compaction constants | — | **UNVERIFIED** — M5 calibration inputs (compaction-design.md §7 default ≥60% is a proposal, not a measurement) |
 | Worker-side steer content consumption | — | **UNVERIFIED** — `worker.py:468` is a placeholder hook |
 | arch §5.2 `steer.context` vs worker `steer.payload` | lines 314-316 vs 460-469 | **DIVERGENT** — reconciliation required (§5.2) |
