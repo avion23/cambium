@@ -24,6 +24,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 CHILD_RESULT_KEYS: tuple[str, ...] = (
@@ -136,10 +137,10 @@ def _token(value: Any) -> str | None:
 
 
 def _text(value: Any) -> str:
-    if value is None:
+    if value is _MISSING:
         return ""
-    if not isinstance(value, str):
-        raise TypeError("result text fields must be strings")
+    if value is None or not isinstance(value, str):
+        raise TypeError("summary must be a string")
     return value
 
 
@@ -433,7 +434,26 @@ def _copy_sequence(value: Any) -> list[Any]:
         return []
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise TypeError("commits and files_changed must be sequences")
-    return list(value)
+    items = list(value)
+    if not all(isinstance(item, str) for item in items):
+        raise TypeError("commits and files_changed must contain strings")
+    return items
+
+
+def _final_bool(value: Any) -> bool:
+    if value is _MISSING:
+        return False
+    if not isinstance(value, bool):
+        raise TypeError("diff_truncated must be a boolean")
+    return value
+
+
+def _final_exit_code(value: Any) -> int | None:
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("exit_code must be an integer")
+    return value
 
 
 def _metrics_from_wire(wire: Mapping[str, Any]) -> tuple[Any, Any]:
@@ -464,7 +484,9 @@ def wire_to_child_result(
 
     Only :data:`CHILD_RESULT_KEYS` are emitted.  ``diff`` is the worker wire
     spelling for ``unified_diff``; ``include_diff=False`` (or an omitted diff)
-    produces the required empty string while preserving the key.
+    produces the required empty string while preserving the key.  An explicit
+    ``None`` diff is rejected even when ``include_diff=False``: the field is
+    always a string.
     """
     if not isinstance(wire, Mapping):
         raise TypeError("worker result must be a mapping")
@@ -481,26 +503,33 @@ def wire_to_child_result(
     diff = _wire_value(wire, "unified_diff")
     if diff is _MISSING:
         diff = _wire_value(wire, "diff")
-    if not include_diff or diff is _MISSING or diff is None:
+    if diff is _MISSING:
+        unified_diff = ""
+    elif not isinstance(diff, str):
+        raise TypeError("unified_diff must be a string")
+    elif not include_diff:
         unified_diff = ""
     else:
-        unified_diff = _text(diff)
+        unified_diff = diff
 
     metric_score, metric_breakdown = _metrics_from_wire(wire)
-    diff_truncated = _wire_value(wire, "diff_truncated")
     summary = _wire_value(wire, "summary")
+    status = status_from_wire(wire)
+    exit_code = _final_exit_code(_wire_value(wire, "exit_code"))
+    if exit_code is not None and status == "done" and exit_code != 0:
+        raise ValueError(
+            f"worker exit_code {exit_code} does not match status {status!r}"
+        )
     values = {
         "parent_task_id": parent_task_id,
         "unified_diff": unified_diff,
-        "diff_truncated": (
-            bool(diff_truncated) if diff_truncated not in (_MISSING, None) else False
-        ),
-        "summary": _text(summary if summary is not _MISSING else None),
-        "metric_score": metric_score,
-        "metric_breakdown": metric_breakdown,
+        "diff_truncated": _final_bool(_wire_value(wire, "diff_truncated")),
+        "summary": _text(summary),
+        "metric_score": _unit_metric_score(metric_score),
+        "metric_breakdown": _final_metric_breakdown(metric_breakdown),
         "commits": _copy_sequence(_wire_value(wire, "commits")),
         "files_changed": _copy_sequence(_wire_value(wire, "files_changed")),
-        "status": status_from_wire(wire),
+        "status": status,
     }
     return {key: values[key] for key in CHILD_RESULT_KEYS}
 
@@ -523,6 +552,25 @@ def _final_metric_score(value: Any) -> float:
     return score
 
 
+def _final_timestamp(value: Any) -> float:
+    if value is _MISSING or value is None:
+        raise TypeError("timestamps must be numbers")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("timestamps must be numbers")
+    timestamp = float(value)
+    if not math.isfinite(timestamp):
+        raise ValueError("timestamps must be finite")
+    return timestamp
+
+
+def _unit_metric_score(value: Any) -> float:
+    """Coerce a metric score and enforce the public [0.0, 1.0] contract."""
+    score = _final_metric_score(value)
+    if not 0.0 <= score <= 1.0:
+        raise ValueError(f"metric_score must be in [0.0, 1.0], got {score!r}")
+    return score
+
+
 def _final_metric_breakdown(value: Any) -> dict[str, float]:
     if value is _MISSING or value is None:
         return {}
@@ -532,7 +580,7 @@ def _final_metric_breakdown(value: Any) -> dict[str, float]:
     for key, item in value.items():
         if not isinstance(key, str):
             raise TypeError("metric_breakdown keys must be strings")
-        result[key] = _final_metric_score(item)
+        result[key] = _unit_metric_score(item)
     return result
 
 
@@ -564,7 +612,7 @@ class Result:
     diff_truncated: bool
     summary: str
     metric_score: float
-    metric_breakdown: dict[str, float]
+    metric_breakdown: Mapping[str, float]
     parent_task_id: str | None
     event_log_ref: str
     session_id: str
@@ -596,14 +644,20 @@ class Result:
             raise TypeError("summary must be a string")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise TypeError("failure_reason must be a string or None")
-        started_at = _final_metric_score(self.started_at)
-        ended_at = _final_metric_score(self.ended_at)
+        if not isinstance(self.diff_truncated, bool):
+            raise TypeError("diff_truncated must be a boolean")
+        started_at = _final_timestamp(self.started_at)
+        ended_at = _final_timestamp(self.ended_at)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "commits", _final_sequence(self.commits))
         object.__setattr__(self, "files_changed", _final_sequence(self.files_changed))
-        object.__setattr__(self, "diff_truncated", bool(self.diff_truncated))
-        object.__setattr__(self, "metric_score", _final_metric_score(self.metric_score))
-        object.__setattr__(self, "metric_breakdown", _final_metric_breakdown(self.metric_breakdown))
+        object.__setattr__(self, "diff_truncated", self.diff_truncated)
+        object.__setattr__(self, "metric_score", _unit_metric_score(self.metric_score))
+        object.__setattr__(
+            self,
+            "metric_breakdown",
+            MappingProxyType(_final_metric_breakdown(self.metric_breakdown)),
+        )
         object.__setattr__(self, "started_at", started_at)
         object.__setattr__(self, "ended_at", ended_at)
 
@@ -637,7 +691,7 @@ class Result:
 def _timestamp(value: Any, default: float) -> float:
     if value is _MISSING or value is None:
         value = default
-    return _final_metric_score(value)
+    return _final_timestamp(value)
 
 
 def _failure_reason(wire: Mapping[str, Any], status: str) -> str | None:
@@ -667,15 +721,23 @@ def _root_from_child(
     event_log_ref = f"sqlite:{session_root / '.cambium' / 'events.db'}"
     status = status_from_wire(child)
     now = time.time()
+    unified_diff = child.get("unified_diff", "")
+    if not isinstance(unified_diff, str):
+        raise TypeError("unified_diff must be a string")
+    exit_code = _final_exit_code(child.get("exit_code", _MISSING))
+    if exit_code is not None and status == "done" and exit_code != 0:
+        raise ValueError(
+            f"exit_code {exit_code} does not match status {status!r}"
+        )
     return Result(
         status=status,
         exit_code=EXIT_CODES[status],
         commits=_final_sequence(child.get("commits", _MISSING)),
         files_changed=_final_sequence(child.get("files_changed", _MISSING)),
-        unified_diff=_text(child.get("unified_diff", "")),
-        diff_truncated=bool(child.get("diff_truncated", False)),
+        unified_diff=unified_diff,
+        diff_truncated=_final_bool(child.get("diff_truncated", _MISSING)),
         summary=_text(child.get("summary", "")),
-        metric_score=_final_metric_score(child.get("metric_score", None)),
+        metric_score=_unit_metric_score(child.get("metric_score", None)),
         metric_breakdown=_final_metric_breakdown(child.get("metric_breakdown", {})),
         parent_task_id=None,
         event_log_ref=event_log_ref,
@@ -750,7 +812,8 @@ def result_to_dict(result: Result) -> dict[str, Any]:
     record = {key: getattr(result, key) for key in ROOT_RESULT_KEYS}
     record["commits"] = list(result.commits)
     record["files_changed"] = list(result.files_changed)
-    record["metric_breakdown"] = dict(result.metric_breakdown)
+    record["metric_score"] = _unit_metric_score(result.metric_score)
+    record["metric_breakdown"] = dict(_final_metric_breakdown(result.metric_breakdown))
     return record
 
 

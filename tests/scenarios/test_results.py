@@ -17,6 +17,7 @@ from cambium.results import (
     ROOT_RESULT_KEYS,
     Result,
     result_to_dict,
+    root_result_from_child,
     root_result_from_wire,
     status_from_wire,
     wire_to_child_result,
@@ -31,7 +32,7 @@ def _wire(**overrides: object) -> dict[str, object]:
         "request_id": "request-1",
         "generation": 4,
         "status": "succeeded",
-        "exit_code": 99,
+        "exit_code": 0,
         "commits": ["abc123"],
         "files_changed": ["src/example.py"],
         "diff": "diff --git a/src/example.py b/src/example.py",
@@ -108,9 +109,148 @@ def test_child_mapper_always_emits_empty_diff_when_omitted() -> None:
 
     no_diff = wire_to_child_result({"status": "succeeded"})
     assert tuple(no_diff) == CHILD_RESULT_KEYS
-    child_without_diff = wire_to_child_result(_wire(diff=None))
-    assert tuple(child_without_diff) == CHILD_RESULT_KEYS
-    assert child_without_diff["unified_diff"] == ""
+    assert no_diff["unified_diff"] == ""
+
+
+def test_child_mapper_rejects_explicit_none_diff() -> None:
+    with pytest.raises(TypeError, match="unified_diff"):
+        wire_to_child_result(_wire(diff=None))
+
+
+def test_child_mapper_rejects_out_of_range_metrics() -> None:
+    with pytest.raises(ValueError, match="metric_score"):
+        wire_to_child_result(_wire(metric_score=2))
+    with pytest.raises(ValueError, match="metric_score"):
+        wire_to_child_result(_wire(metric_breakdown={"x": 2}))
+    with pytest.raises(ValueError, match="metric_score"):
+        wire_to_child_result(
+            _wire(metrics={"metric_score": 0.5, "metric_breakdown": {"x": 2}})
+        )
+    child = wire_to_child_result(_wire(metric_score=0.9, metric_breakdown={"x": 0.7}))
+    assert child["metric_score"] == 0.9
+    assert child["metric_breakdown"] == {"x": 0.7}
+
+
+def test_child_mapper_rejects_non_string_sequence_elements_and_none_summary() -> None:
+    for value in ({"commits": [42]}, {"files_changed": [42]}):
+        with pytest.raises(TypeError, match="contain strings"):
+            wire_to_child_result(_wire(**value))
+    with pytest.raises(TypeError, match="summary"):
+        wire_to_child_result(_wire(summary=None))
+    child = wire_to_child_result({"status": "succeeded"})
+    assert child["summary"] == ""
+    assert child["commits"] == []
+    assert child["files_changed"] == []
+
+
+def test_root_result_rejects_none_unified_diff(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="unified_diff"):
+        _root(tmp_path, status="succeeded", unified_diff=None)
+    result = _root(tmp_path, status="succeeded", unified_diff="")
+    assert result.unified_diff == ""
+    with pytest.raises(TypeError, match="unified_diff"):
+        replace(result, unified_diff=None)
+
+
+def test_child_mapper_rejects_explicit_none_diff_when_excluded() -> None:
+    with pytest.raises(TypeError, match="unified_diff"):
+        wire_to_child_result(
+            {"status": "succeeded", "include_diff": False, "unified_diff": None}
+        )
+    with pytest.raises(TypeError, match="unified_diff"):
+        wire_to_child_result(_wire(include_diff=False, diff=None))
+    excluded = wire_to_child_result({"status": "succeeded", "include_diff": False})
+    assert excluded["unified_diff"] == ""
+
+
+def test_child_mapper_rejects_non_string_diff_when_excluded() -> None:
+    for value in (1, 0.5, ["a"], b"bytes"):
+        with pytest.raises(TypeError, match="unified_diff"):
+            wire_to_child_result(
+                {"status": "succeeded", "include_diff": False, "unified_diff": value}
+            )
+    excluded = wire_to_child_result(
+        {"status": "succeeded", "include_diff": False, "unified_diff": "ignored"}
+    )
+    assert excluded["unified_diff"] == ""
+
+
+def test_root_result_rejects_non_string_diff_when_excluded(tmp_path: Path) -> None:
+    for value in (1, 0.5, ["a"], b"bytes"):
+        with pytest.raises(TypeError, match="unified_diff"):
+            root_result_from_wire(
+                {"status": "succeeded", "include_diff": False, "unified_diff": value},
+                tmp_path,
+                session_id="session-1",
+            )
+    result = root_result_from_wire(
+        {"status": "succeeded", "include_diff": False, "unified_diff": "ignored"},
+        tmp_path,
+        session_id="session-1",
+    )
+    assert result.unified_diff == ""
+    missing = root_result_from_wire(
+        {"status": "succeeded", "include_diff": False},
+        tmp_path,
+        session_id="session-1",
+    )
+    assert missing.unified_diff == ""
+
+
+def test_child_mapper_rejects_non_bool_diff_truncated() -> None:
+    for value in (1, 0, "yes", 0.5, None):
+        with pytest.raises(TypeError, match="diff_truncated"):
+            wire_to_child_result({"status": "succeeded", "diff_truncated": value})
+    child = wire_to_child_result(_wire(diff_truncated=True))
+    assert child["diff_truncated"] is True
+
+
+def test_root_result_rejects_non_bool_diff_truncated(tmp_path: Path) -> None:
+    for value in (1, 0, "yes", 0.5, None):
+        with pytest.raises(TypeError, match="diff_truncated"):
+            root_result_from_child(
+                {"status": "succeeded", "diff_truncated": value},
+                tmp_path,
+                session_id="session-1",
+            )
+    with pytest.raises(TypeError, match="diff_truncated"):
+        _root(tmp_path, status="succeeded", diff_truncated=1)
+    with pytest.raises(TypeError, match="diff_truncated"):
+        _root(tmp_path, status="succeeded", diff_truncated=None)
+    result = _root(tmp_path, status="succeeded", diff_truncated=True)
+    assert result.diff_truncated is True
+
+
+def test_child_mapper_rejects_nonzero_exit_code_on_success() -> None:
+    with pytest.raises(ValueError, match="exit_code"):
+        wire_to_child_result({"status": "succeeded", "exit_code": 99})
+    child = wire_to_child_result({"status": "succeeded", "exit_code": 0})
+    assert child["status"] == "done"
+
+
+def test_root_result_rejects_nonzero_exit_code_on_success(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exit_code"):
+        root_result_from_wire(
+            {"status": "succeeded", "exit_code": 99},
+            tmp_path,
+            session_id="session-1",
+        )
+    with pytest.raises(ValueError, match="exit_code"):
+        root_result_from_child(
+            {"status": "succeeded", "exit_code": 99},
+            tmp_path,
+            session_id="session-1",
+        )
+
+
+def test_failed_wire_may_carry_nonzero_exit_code(tmp_path: Path) -> None:
+    result = root_result_from_wire(
+        {"status": "failed", "exit_code": 99},
+        tmp_path,
+        session_id="session-1",
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 1
 
 
 @pytest.mark.parametrize(
@@ -194,15 +334,45 @@ def test_success_reason_is_advisory_not_cancellation(tmp_path: Path) -> None:
 
 
 def test_result_has_exact_fifteen_root_fields_and_finalized_values(tmp_path: Path) -> None:
-    result = _root(tmp_path, status="succeeded", metric_score=7)
+    result = _root(tmp_path, status="succeeded", metric_score=0.7)
     assert tuple(field.name for field in fields(Result)) == ROOT_RESULT_KEYS
     assert tuple(result_to_dict(result)) == ROOT_RESULT_KEYS
     assert len(fields(Result)) == 15
     assert result.parent_task_id is None
     assert isinstance(result.metric_score, float)
-    assert result.metric_score == 7.0
+    assert result.metric_score == 0.7
     assert result.exit_code == 0
     assert result.event_log_ref == f"sqlite:{tmp_path}/.cambium/events.db"
+
+
+@pytest.mark.parametrize("score", [7, -0.5, 1.5, float("nan"), float("inf")])
+def test_metric_score_out_of_contract_range_is_rejected(tmp_path: Path, score: float) -> None:
+    with pytest.raises(ValueError):
+        _root(tmp_path, status="succeeded", metric_score=score)
+
+
+def test_metric_breakdown_values_are_range_checked(tmp_path: Path) -> None:
+    result = _root(
+        tmp_path,
+        status="succeeded",
+        metric_breakdown={"tests": 0.9, "spec_adherence": 1.0},
+    )
+    assert result.metric_breakdown == {"tests": 0.9, "spec_adherence": 1.0}
+    with pytest.raises(ValueError):
+        _root(tmp_path, status="succeeded", metric_breakdown={"tests": 1.5})
+
+
+def test_result_metric_breakdown_is_immutable_after_construction(
+    tmp_path: Path,
+) -> None:
+    result = _root(tmp_path, status="succeeded", metric_breakdown={"tests": 0.9})
+    with pytest.raises(TypeError):
+        result.metric_breakdown["tests"] = 2.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.metric_breakdown["extra"] = 2.0  # type: ignore[index]
+    object.__setattr__(result, "metric_breakdown", {"tests": 2.0})
+    with pytest.raises(ValueError, match="metric_score"):
+        result_to_dict(result)
 
 
 def test_result_exit_codes_are_canonical(tmp_path: Path) -> None:
@@ -215,6 +385,66 @@ def test_result_exit_codes_are_canonical(tmp_path: Path) -> None:
     ):
         result = _root(tmp_path, status=status)
         assert result.exit_code == exit_code
+
+
+def test_result_rejects_unknown_status_and_mismatched_exit_code(tmp_path: Path) -> None:
+    result = _root(tmp_path, status="failed")
+    with pytest.raises(ValueError):
+        replace(result, status="swept_away")
+    with pytest.raises(ValueError, match="exit_code"):
+        replace(result, exit_code=0)
+    with pytest.raises(TypeError):
+        replace(result, exit_code="1")
+
+
+def test_result_commits_and_files_changed_are_string_tuples(tmp_path: Path) -> None:
+    result = _root(
+        tmp_path,
+        status="succeeded",
+        commits=["abc123"],
+        files_changed=["src/example.py"],
+    )
+    assert result.commits == ("abc123",)
+    assert result.files_changed == ("src/example.py",)
+    assert isinstance(result.commits, tuple)
+    assert isinstance(result.files_changed, tuple)
+    with pytest.raises(TypeError, match="contain strings"):
+        _root(tmp_path, status="succeeded", commits=["abc123", 42])
+    with pytest.raises(TypeError, match="must be sequences"):
+        _root(tmp_path, status="succeeded", files_changed="src/example.py")
+
+
+def test_result_rejects_non_bool_diff_truncated_and_non_string_summary(
+    tmp_path: Path,
+) -> None:
+    result = _root(tmp_path, status="succeeded")
+    with pytest.raises(TypeError, match="diff_truncated"):
+        replace(result, diff_truncated=1)
+    with pytest.raises(TypeError, match="summary"):
+        replace(result, summary=42)
+
+
+def test_result_rejects_non_finite_timestamps(tmp_path: Path) -> None:
+    result = _root(tmp_path, status="succeeded")
+    with pytest.raises(ValueError, match="finite"):
+        replace(result, started_at=float("inf"))
+    with pytest.raises(ValueError, match="finite"):
+        replace(result, ended_at=float("nan"))
+
+
+def test_result_timestamps_reject_numeric_strings_and_none(tmp_path: Path) -> None:
+    result = _root(tmp_path, status="succeeded")
+    for value in ("12.5", None):
+        with pytest.raises(TypeError, match="timestamps"):
+            replace(result, started_at=value)
+    with pytest.raises(TypeError, match="timestamps"):
+        replace(result, ended_at="12.5")
+    with pytest.raises(TypeError, match="timestamps"):
+        root_result_from_wire(
+            {"status": "succeeded", "started_at": "12.5"},
+            tmp_path,
+            session_id="session-1",
+        )
 
 
 def test_result_writer_uses_atomic_replace_and_leaves_no_temp(tmp_path: Path, monkeypatch) -> None:
