@@ -36,6 +36,8 @@ _GENERATION_FIELDS = (
     "n",
     "logprobs",
     "response_format",
+    "reasoning",
+    "tool_choice",
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
 _NON_FORWARDABLE_FIELDS = _CACHE_FIELDS | frozenset({"num_retries"})
@@ -134,13 +136,21 @@ def _require_exact_keyword_keys(kwargs: Mapping[Any, Any]) -> None:
             raise TypeError("CambiumLM keyword keys must use exact builtin strings")
 
 
+def _contains_secret_marker(key: Any) -> bool:
+    if type(key) is bytes:
+        key = key.decode("latin-1")
+    if type(key) is not str:
+        return False
+    normalized = "".join(character for character in str.lower(key) if str.isalnum(character))
+    return any(marker in normalized for marker in _SECRET_MARKERS)
+
+
 def _reject_unknown_keyword_keys(kwargs: Mapping[str, Any], allowed: frozenset[str]) -> None:
     unknown = sorted(key for key in kwargs if key not in allowed)
     if not unknown:
         return
     for key in unknown:
-        normalized = "".join(character for character in str.lower(key) if str.isalnum(character))
-        if any(marker in normalized for marker in _SECRET_MARKERS):
+        if _contains_secret_marker(key):
             raise ValueError(
                 "provider credentials belong to Diffundo configuration, not CambiumLM kwargs"
             )
@@ -556,17 +566,13 @@ class _CambiumLMMixin:
                     continue
                 visited.add(id(value))
                 for key, nested_value in value.items():
-                    if type(key) is str and key not in _GENERATION_FIELDS:
-                        normalized = "".join(
-                            character
-                            for character in str.lower(key)
-                            if str.isalnum(character)
+                    if _contains_secret_marker(key) and not (
+                        type(key) is str and key in _GENERATION_FIELDS
+                    ):
+                        raise ValueError(
+                            "provider credentials belong to Diffundo configuration, "
+                            "not CambiumLM kwargs"
                         )
-                        if any(marker in normalized for marker in _SECRET_MARKERS):
-                            raise ValueError(
-                                "provider credentials belong to Diffundo configuration, "
-                                "not CambiumLM kwargs"
-                            )
                     pending.append(nested_value)
                 continue
             if isinstance(value, list | tuple):

@@ -398,6 +398,24 @@ def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> No
     assert not state_path.exists()
 
 
+def test_predict_json_save_rejects_byte_credential_keys(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    predict = dspy.Predict("question -> answer")
+    state_path = tmp_path / "state.json"
+
+    with pytest.raises(ValueError, match="provider credentials"):
+        predict.lm = CambiumLM(  # type: ignore[arg-type]
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            extensions={b"api_key": "SENSITIVE_CANARY"},
+        )
+        predict.save(state_path)
+
+    assert not state_path.exists()
+
+
 def test_predict_failed_json_save_preserves_existing_state(tmp_path: Path) -> None:
     _require_dspy()
     import dspy
@@ -1026,6 +1044,24 @@ def test_per_call_max_tokens_reaches_diffundo() -> None:
         "completion text"
     ]
     assert diffundo.calls[0]["prompt"]["max_tokens"] == 1
+
+
+def test_reasoning_and_tool_choice_reach_diffundo() -> None:
+    _require_dspy()
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+
+    lm(
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning={"effort": "high"},
+        tool_choice="none",
+    )
+
+    assert diffundo.calls[0]["prompt"] == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "reasoning": {"effort": "high"},
+        "tool_choice": {"mode": "none"},
+    }
 
 
 def test_concurrent_dspy_loads_preserve_cache_environment() -> None:
