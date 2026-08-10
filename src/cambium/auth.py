@@ -330,81 +330,70 @@ def _validate_file_stat(value: os.stat_result) -> None:
         raise AuthStoreError("auth store file has an invalid link count")
 
 
-def _ensure_directory(path: Path) -> None:
-    """Create the fixed auth directory without following any symlink component.
-
-    ``Path.mkdir(parents=True)`` would silently follow a symlinked
-    intermediate (e.g. a ``~/.local`` symlink pointing outside the home), so
-    the fixed path is built component-by-component and each existing or newly
-    created component is verified with a realpath check plus an ``O_NOFOLLOW``
-    open before descending.  A symlink anywhere in the path is rejected with a
-    clear error before anything can be written through it.
-    """
+def _open_directory(path: Path, *, create: bool) -> int | None:
+    """Open ``path`` without resolving or releasing an intermediate component."""
     target = Path(path)
     if not target.is_absolute():
         target = Path.cwd() / target
-    anchor = target.anchor or "."
-    real_parent = os.path.realpath(anchor)
-    current = Path(anchor)
-    names = target.parts[1:] if target.anchor else target.parts
-    for name in names:
-        current = current / name
-        try:
-            os.mkdir(current, AUTH_DIRECTORY_MODE)
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            raise AuthStoreError("could not create the auth store directory") from exc
-        expected = os.path.join(real_parent, name)
-        try:
-            actual = os.path.realpath(current)
-        except OSError as exc:
-            raise AuthStoreError("could not verify the auth store directory path") from exc
-        if actual != expected:
-            raise AuthStoreError(
-                "auth store directory path must not contain a symlink"
-            ) from None
-        real_parent = actual
-        _validate_directory_component(current)
+    names = target.parts[1:]
+    if any(name in {".", ".."} for name in names):
+        raise AuthStoreError("auth store directory path contains traversal")
 
-
-def _validate_directory_component(path: Path) -> None:
-    """Verify one auth-path component is a real directory (never a symlink).
-
-    The ``O_DIRECTORY | O_NOFOLLOW`` open is the check: a symlink yields
-    ``ELOOP`` and a non-directory yields ``ENOTDIR``.  Ownership and exact
-    mode of the final auth directory are enforced separately by
-    :func:`_validate_directory_stat` via :func:`_open_directory`.
-    """
-    try:
-        fd = os.open(path, _directory_flags())
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise AuthStoreError(
-                "auth store directory path must not contain a symlink"
-            ) from exc
-        raise AuthStoreError("could not open the auth store directory") from exc
-    os.close(fd)
-
-
-def _open_directory(path: Path, *, create: bool) -> int | None:
-    if create:
-        _ensure_directory(path)
     flags = _directory_flags()
+    opened: list[int] = []
+    links: list[tuple[int, str, int]] = []
     try:
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise AuthStoreError("auth store directory must not be a symlink") from exc
-        raise AuthStoreError("could not open the auth store directory") from exc
-    try:
-        _validate_directory_stat(os.fstat(fd))
-    except Exception:
-        os.close(fd)
+        parent_fd = os.open(target.anchor, flags)
+        opened.append(parent_fd)
+        for name in names:
+            if create:
+                try:
+                    os.mkdir(name, AUTH_DIRECTORY_MODE, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise AuthStoreError(
+                        "could not create the auth store directory"
+                    ) from exc
+            try:
+                child_fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                raise AuthStoreError("could not open the auth store directory") from None
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise AuthStoreError(
+                        "auth store directory path must not contain a symlink "
+                        "or non-directory component"
+                    ) from exc
+                raise AuthStoreError("could not open the auth store directory") from exc
+            opened.append(child_fd)
+            links.append((parent_fd, name, child_fd))
+            parent_fd = child_fd
+
+        _validate_directory_stat(os.fstat(parent_fd))
+        for ancestor_fd, name, child_fd in links:
+            current = os.stat(name, dir_fd=ancestor_fd, follow_symlinks=False)
+            opened_stat = os.fstat(child_fd)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_dev != opened_stat.st_dev
+                or current.st_ino != opened_stat.st_ino
+            ):
+                raise AuthStoreError(
+                    "auth store directory path changed during validation"
+                )
+
+        opened.pop()
+        return parent_fd
+    except AuthError:
         raise
-    return fd
+    except OSError as exc:
+        raise AuthStoreError("could not open the auth store directory") from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
 
 
 def _open_secure_file(dir_fd: int, name: str) -> int:
@@ -527,44 +516,6 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
     file_nlink: int | None = None
 
     try:
-        directory_stat = os.lstat(directory)
-    except FileNotFoundError:
-        return StoreMetadata(
-            path=target, directory_exists=False, directory_secure=False,
-            directory_uid=None, directory_mode=None, file_exists=False,
-            file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
-        )
-    except OSError:
-        return StoreMetadata(
-            path=target, directory_exists=False, directory_secure=False,
-            directory_uid=None, directory_mode=None, file_exists=False,
-            file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
-            issue="could not inspect the auth store directory",
-        )
-
-    directory_uid = directory_stat.st_uid
-    directory_mode = stat.S_IMODE(directory_stat.st_mode)
-    directory_secure = (
-        stat.S_ISDIR(directory_stat.st_mode)
-        and directory_uid == os.geteuid()
-        and directory_mode == AUTH_DIRECTORY_MODE
-    )
-    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
-        return StoreMetadata(
-            path=target, directory_exists=True, directory_secure=False,
-            directory_uid=directory_uid, directory_mode=directory_mode, file_exists=False,
-            file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
-            issue="auth store directory is not a secure directory",
-        )
-    if not directory_secure:
-        return StoreMetadata(
-            path=target, directory_exists=True, directory_secure=False,
-            directory_uid=directory_uid, directory_mode=directory_mode, file_exists=False,
-            file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
-            issue="auth store directory metadata is invalid",
-        )
-
-    try:
         directory_fd = _open_directory(directory, create=False)
     except AuthError as exc:
         return StoreMetadata(
@@ -579,6 +530,10 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
             file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
         )
 
+    directory_stat = os.fstat(directory_fd)
+    directory_uid = directory_stat.st_uid
+    directory_mode = stat.S_IMODE(directory_stat.st_mode)
+
     try:
         try:
             file_fd = _open_secure_file(directory_fd, target.name)
@@ -590,7 +545,9 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
             )
         except AuthError as exc:
             try:
-                file_stat = os.lstat(target)
+                file_stat = os.stat(
+                    target.name, dir_fd=directory_fd, follow_symlinks=False
+                )
             except OSError:
                 file_stat = None
             if file_stat is not None:

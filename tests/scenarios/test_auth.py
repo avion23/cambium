@@ -223,6 +223,75 @@ def test_auth_directory_creation_rejects_symlinked_final_component(tmp_path: Pat
     assert not list(outside.iterdir())
 
 
+def test_read_rejects_symlinked_intermediate_component(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside_directory = outside / "share" / "cambium"
+    outside_directory.mkdir(parents=True, mode=0o700)
+    outside_path = outside_directory / "auth.json"
+    outside_path.write_bytes(
+        auth.serialize_document(
+            auth.AuthDocument(1, (auth.ProviderCredential("openai", SECRET),))
+        )
+    )
+    outside_path.chmod(0o600)
+    (home / ".local").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(auth.AuthStoreError, match="symlink"):
+        auth.AuthStore(_store_path(home)).read()
+
+
+def test_doctor_rejects_symlinked_intermediate_component(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside_directory = outside / "share" / "cambium"
+    outside_directory.mkdir(parents=True, mode=0o700)
+    outside_path = outside_directory / "auth.json"
+    outside_path.write_bytes(auth.serialize_document(auth.AuthDocument.empty()))
+    outside_path.chmod(0o600)
+    (home / ".local").symlink_to(outside, target_is_directory=True)
+
+    status, detail = doctor.check_auth_metadata(_store_path(home))
+
+    assert status is doctor.Status.FAIL
+    assert "symlink" in detail
+
+
+def test_directory_swap_during_validation_does_not_write_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside_directory = outside / "share" / "cambium"
+    outside_directory.mkdir(parents=True, mode=0o700)
+    path = _store_path(home)
+    moved_local = home / ".local-original"
+    real_open = auth.os.open
+    swapped = False
+
+    def swap_after_final_directory_open(
+        file: os.PathLike[str] | str, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal swapped
+        fd = real_open(file, *args, **kwargs)
+        if not swapped and (Path(file) == path.parent or file == "cambium"):
+            swapped = True
+            (home / ".local").rename(moved_local)
+            (home / ".local").symlink_to(outside, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr(auth.os, "open", swap_after_final_directory_open)
+
+    with pytest.raises(auth.AuthStoreError):
+        auth.AuthStore(path).set_provider("openai", SECRET)
+
+    assert swapped
+    assert not (outside_directory / "auth.json").exists()
+
+
 def test_launch_environment_scrubs_inherited_credentials() -> None:
     document = auth.AuthDocument(1, (auth.ProviderCredential("foo-bar", SECRET),))
     base = {
