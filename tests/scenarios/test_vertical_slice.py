@@ -21,6 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cambium.results import ROOT_RESULT_KEYS
 from cambium.supervisor import read_events, run_session
 
 WORKER = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
@@ -236,6 +237,51 @@ def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     assert any(
         e["kind"] == "timeout" and e["payload"].get("phase") == "ready" for e in events
     )
+
+
+def test_result_json_has_exact_root_keys_and_success_verdict(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "succeeded"
+    record = json.loads((session_dir / ".cambium" / "result.json").read_text())
+    assert set(record) == set(ROOT_RESULT_KEYS)
+    assert record["status"] == "done"
+    assert record["exit_code"] == 0
+    assert record["commits"] and record["files_changed"] == ["hello.txt"]
+    assert record["unified_diff"]
+    assert record["parent_task_id"] is None
+    assert record["session_id"] == str(session_dir.resolve())
+
+
+def test_result_json_failed_gate_overrides_worker_status(tmp_path) -> None:
+    # The worker envelope says succeeded, but the gate fails: the supervisor
+    # verdict is authoritative and result.json must report failed/1 while the
+    # envelope still contributes its sanitized commits/files.
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+    spec["gate"] = "false"
+
+    result = asyncio.run(run_session(session_dir, spec))
+
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    record = json.loads((session_dir / ".cambium" / "result.json").read_text())
+    assert set(record) == set(ROOT_RESULT_KEYS)
+    assert record["status"] == "failed"
+    assert record["exit_code"] == 1
+    assert record["commits"], "terminal envelope commits must be retained"
+    assert record["failure_reason"] == "gate_failed"
+    tip = subprocess.run(
+        ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert tip == base  # no merge
 
 
 def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:

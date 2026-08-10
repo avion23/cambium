@@ -48,6 +48,7 @@ from cambium.provider_config import DEFAULT_PROVIDER_PATH
 from .auth import scrub_environment
 from .merge import MergeConflictError, MergeSequencer, NonFastForwardError
 from .redact import Redactor, build_session_redactor, is_secret_name
+from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
 
 PROTO = 1
@@ -126,7 +127,15 @@ class SliceResult:
     timeout_phase: str | None = None  # "ready" | "run" | "gate" | "wall"
 
 
-_TIMEOUT_PHASES = ("ready", "wall", "heartbeat", "pong", "stdin", "gate", "merge")
+_TIMEOUT_PHASES = ("ready", "wall", "heartbeat", "pong", "stdin")
+
+
+def _status_line_is_fence(line: str) -> bool:
+    """Whether a porcelain status line only touches the supervisor's fence dir."""
+    if len(line) < 4 or line[2] != " ":
+        return False
+    path = line[3:].strip()
+    return path == ".cambium" or path.startswith(".cambium/")
 
 
 def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) -> float:
@@ -607,6 +616,23 @@ class _Runtime:
         self._worktree_lock = asyncio.Lock()
         self._merge_lock = asyncio.Lock()
         self._rid = 0
+        self._last_envelope: dict[str, Any] | None = None
+
+    @property
+    def last_envelope(self) -> dict[str, Any] | None:
+        """The terminal correlated worker envelope, redacted before retention.
+
+        Retained from ``_GenOutcome.envelope`` until after shutdown so the
+        session result can reuse its sanitized commits/files/diff/summary
+        while the supervisor verdict stays authoritative.
+        """
+        return self._last_envelope
+
+    def _redact_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        if self._redactor is None:
+            return dict(envelope)
+        redacted = self._redactor.redact_mapping(envelope)
+        return dict(redacted)
 
     # -- event path ---------------------------------------------------------
 
@@ -765,8 +791,12 @@ class _Runtime:
     async def _ensure_worktree_locked(
         self, spec: dict[str, Any], generation: int | None = None
     ) -> int:
-        repo = Path(spec["repo"])
+        repo = Path(spec["repo"]).resolve()
         worktree = Path(spec["worktree_path"]).resolve()
+        if worktree == repo:
+            raise WorktreeRecoveryError(
+                f"worktree_path must not be the repo itself: {worktree}"
+            )
         branch = spec["branch"]
         base = spec["base_commit"]
         await self._git(repo, "worktree", "prune", check=False)
@@ -801,8 +831,12 @@ class _Runtime:
         self, spec: dict[str, Any], generation: int | None = None
     ) -> int:
         """Worktree recovery before a respawn (arch §7.5): reset + clean."""
-        repo = Path(spec["repo"])
+        repo = Path(spec["repo"]).resolve()
         worktree = Path(spec["worktree_path"]).resolve()
+        if worktree == repo:
+            raise WorktreeRecoveryError(
+                f"worktree_path must not be the repo itself: {worktree}"
+            )
         await self._git(repo, "worktree", "prune", check=False)
         if not worktree.exists():
             return await self._ensure_worktree_locked(spec, generation)
@@ -1049,7 +1083,20 @@ class _Runtime:
                 heartbeat_timeout=heartbeat_timeout,
                 wall_budget=wall_budget,
             )
+            if outcome.envelope is not None and outcome.correlated:
+                self._last_envelope = self._redact_envelope(outcome.envelope)
             if outcome.clean:
+                integrity = await self._worker_success_integrity(spec, worktree)
+                if integrity is not None:
+                    await self.emit(
+                        "worker_failed", task_id=task_id, generation=generation,
+                        reason=integrity,
+                    )
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason=integrity, gate_exit_code=None, restarts=restarts,
+                    )
+                    return
                 gate_rc = await self._run_gate(spec, worktree)
                 verdict_ok = bool(
                     outcome.envelope and outcome.envelope.get("status") == "succeeded"
@@ -1538,6 +1585,35 @@ class _Runtime:
 
     # -- gate ----------------------------------------------------------------
 
+    async def _worker_success_integrity(
+        self, spec: dict[str, Any], worktree: Path
+    ) -> str | None:
+        """Reject an unpublishable worker verdict before the gate runs.
+
+        Returns a failure reason when the worker's success claim is not
+        backed by a clean, attached worktree: a detached HEAD means the
+        worker's commits may be lost, and tracked/untracked modifications
+        mean the gate would not be gating the worker's actual state. The
+        supervisor-owned ``.cambium`` fence directory is exempt.
+        """
+        worktree = Path(worktree)
+        symbolic = await self._git_stdout(
+            worktree, "symbolic-ref", "--quiet", "HEAD", check=False
+        )
+        if not symbolic:
+            return "worker_detached_head"
+        status = await self._git(
+            worktree, "status", "--porcelain=v1", "--untracked-files=all", check=False
+        )
+        if status.returncode != 0:
+            return "worker_status_failed"
+        if any(
+            not _status_line_is_fence(line)
+            for line in status.stdout.splitlines()
+        ):
+            return "worker_tree_dirty"
+        return None
+
     async def _run_gate(self, spec: dict[str, Any], worktree: Path) -> int:
         """Run the task's gate command in the worktree (30s, bounded capture);
         skip a rerun when the worktree tree hash is unchanged since the last run."""
@@ -1801,7 +1877,7 @@ class _Runtime:
                     )
             else:
                 await self._flush_sequencer_events(seq)
-        if cleanup_failed:
+        if cleanup_failed and not committed_persisted:
             return None
         return staging_tip
 
@@ -1842,6 +1918,10 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         )
     spec["repo"] = str(Path(spec["repo"]).resolve())
     spec["worktree_path"] = str(worktree)
+    if Path(spec["repo"]).resolve() == worktree:
+        raise ValueError(
+            f"task {task_id}: worktree_path must not be the repo itself ({worktree})"
+        )
     provider_env_keys = spec.get("provider_env_keys", ())
     if isinstance(provider_env_keys, (str, bytes)):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
@@ -1866,6 +1946,102 @@ def _reject_duplicate_task_ids(tasks: list[dict[str, Any]]) -> None:
             seen.add(task_id)
 
 
+def _envelope_sequence(value: Any) -> tuple[str, ...]:
+    """Return string members of a worker envelope sequence, else empty."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _task_canonical_status(result: TaskResult) -> str:
+    """Map one supervisor TaskResult verdict to a canonical root status.
+
+    The supervisor verdict is authoritative: a worker ``succeeded`` maps to
+    ``done`` only after the gate and merge passed (the caller records the
+    merged TaskResult); any failed TaskResult is ``failed`` unless its reason
+    identifies a drive-phase timeout.
+    """
+    if result.status == "succeeded":
+        return "done"
+    reason = result.reason or ""
+    if any(phase in reason for phase in _TIMEOUT_PHASES):
+        return "timeout"
+    return "failed"
+
+
+def _aggregate_reason(results: list[TaskResult]) -> str | None:
+    failures = [f"{r.task_id}: {r.reason or 'failed'}" for r in results if r.status != "succeeded"]
+    if not failures:
+        return None
+    return "; ".join(failures)
+
+
+def _build_session_result(
+    runtime: _Runtime,
+    session_dir: Path,
+    started_at: float,
+    *,
+    cancelled: bool,
+) -> Result:
+    """Construct the canonical root result for one finished session.
+
+    One task combines the retained sanitized terminal envelope fields with
+    the authoritative supervisor verdict; flat multi-task sessions write an
+    aggregate status record without inventing a root.
+    """
+    session_dir = Path(session_dir)
+    results = list(runtime.plan_result().results)
+    ended_at = time.time()
+    if cancelled:
+        status = "cancelled"
+        failure_reason = "cancelled"
+        envelope = None
+    elif len(results) == 1:
+        task_result = results[0]
+        status = _task_canonical_status(task_result)
+        failure_reason = None if status == "done" else task_result.reason
+        envelope = runtime.last_envelope
+    else:
+        canonical = [_task_canonical_status(result) for result in results]
+        if any(item == "failed" for item in canonical):
+            status = "failed"
+        elif any(item == "timeout" for item in canonical):
+            status = "timeout"
+        else:
+            status = "done"
+        failure_reason = None if status == "done" else _aggregate_reason(results)
+        envelope = None
+    if envelope is not None:
+        commits = _envelope_sequence(envelope.get("commits"))
+        files_changed = _envelope_sequence(envelope.get("files_changed"))
+        unified_diff = envelope.get("diff") or ""
+        diff_truncated = bool(envelope.get("diff_truncated", False))
+        summary = envelope.get("summary") or ""
+    else:
+        commits = ()
+        files_changed = ()
+        unified_diff = ""
+        diff_truncated = False
+        summary = ""
+    return Result(
+        status=status,
+        exit_code=EXIT_CODES[status],
+        commits=commits,
+        files_changed=files_changed,
+        unified_diff=unified_diff,
+        diff_truncated=diff_truncated,
+        summary=summary,
+        metric_score=0.0,
+        metric_breakdown={},
+        parent_task_id=None,
+        event_log_ref=f"sqlite:{session_dir / '.cambium' / 'events.db'}",
+        session_id=str(session_dir.resolve()),
+        started_at=started_at,
+        ended_at=ended_at,
+        failure_reason=failure_reason,
+    )
+
+
 async def run_plan(
     session_dir: str | Path,
     plan: dict[str, Any] | list[dict[str, Any]],
@@ -1878,7 +2054,9 @@ async def run_plan(
     Publication is ref-only: ``refs/heads/main`` advances via atomic
     ``update-ref`` and no checkout is refreshed.
     Returns a PlanResult; the session's event log is durable in
-    ``<session_dir>/.cambium/events.db`` (readable via ``read_events``).
+    ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
+    canonical root result is written atomically to
+    ``<session_dir>/.cambium/result.json`` before this coroutine returns.
     """
     session_dir = Path(session_dir)
     tasks = _plan_tasks(plan)
@@ -1887,6 +2065,7 @@ async def run_plan(
     if not specs:
         raise ValueError("plan contains no tasks")
 
+    started_at = time.time()
     redactor = _session_redactor(specs)
     store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
     runtime = _Runtime(session_dir, store, on_event=on_event, redactor=redactor)
@@ -1899,13 +2078,17 @@ async def run_plan(
                 tg.create_task(runtime.supervise_task(spec))
     except asyncio.CancelledError:
         cancelled = True
-        raise
     except BaseExceptionGroup as exc_group:
         await runtime.emit(
             "log", task_id=None, message=f"task group exception: {exc_group}"
         )
     finally:
         await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
+    result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
+    session_id = str(session_dir.resolve())
+    await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)
+    if cancelled:
+        raise asyncio.CancelledError
     return runtime.plan_result()
 
 
