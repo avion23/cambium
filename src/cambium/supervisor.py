@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -31,6 +32,7 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -44,10 +46,13 @@ from typing import Any
 from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
 from cambium.provider_config import DEFAULT_PROVIDER_PATH
+from cambium.resources import DEFAULT_ACQUIRE_TIMEOUT_S, CompileGate
+from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
-from .merge import MergeConflictError, MergeSequencer, NonFastForwardError
-from .redact import Redactor, build_session_redactor, is_secret_name
+from .merge import MergeSequencer
+from .modules.base import _is_secret_shaped
+from .redact import Redactor, build_session_redactor
 from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
 
@@ -494,26 +499,28 @@ def _strip_sensitive_env(
 
 
 def _session_redactor(specs: list[dict[str, Any]]) -> Redactor:
-    """Build one session redactor from every worker-forwardable secret value.
+    """Build one session redactor from every worker-forwardable declared value.
 
     The registry must cover every value ``_worker_environment`` can forward to
-    a worker from the declared ``provider_env_keys``: for each declared key
-    present in the host environment whose NAME is secret-bearing (the canonical
-    ``CAMBIUM_PROVIDER_*_API_KEY`` shape), its exact value is registered so the
-    complete event record is redacted before truncation. Non-secret declared
-    names (probe paths, proxy overrides) are intentionally not registered: their
-    values are not credentials, and registering them would corrupt event text
-    via substring replacement.
+    a worker from the declared ``provider_env_keys``. The declaration is the
+    authority boundary; the variable name does not determine whether its value
+    is sensitive. Compact machine-token values (``_is_secret_shaped``) are
+    registered for substring redaction wherever they appear; prose-like
+    declared values are registered as whole strings only, so a benign
+    diagnostic that merely contains the value is not corrupted.
     """
-    values: list[str] = []
+    secret_values: list[str] = []
+    whole_values: list[str] = []
     for spec in specs:
         for key in _provider_env_keys(spec):
-            if not is_secret_name(key):
-                continue
             value = os.environ.get(key)
-            if isinstance(value, str) and value:
-                values.append(value)
-    return build_session_redactor(values)
+            if not isinstance(value, str) or not value:
+                continue
+            if _is_secret_shaped(value):
+                secret_values.append(value)
+            else:
+                whole_values.append(value)
+    return build_session_redactor(secret_values, whole_values=whole_values)
 
 
 def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
@@ -523,6 +530,11 @@ def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, A
         return store.events_after(after_seq)
     finally:
         store.close()
+
+
+def _open_store(session_dir: Path, *, redactor: Redactor | None = None) -> EventStore:
+    """Open the canonical session event store."""
+    return EventStore(Path(session_dir) / ".cambium" / "events.db", redactor=redactor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,6 +573,44 @@ class InvalidBaseCommitError(ValueError):
 
 class WorktreeRecoveryError(RuntimeError):
     """A destructive worktree recovery command failed."""
+
+
+class SessionAlreadyRunningError(RuntimeError):
+    """Another supervisor already owns the requested session."""
+
+
+class _SessionAdmission:
+    """Process-wide and cross-process ownership of one session directory."""
+
+    def __init__(self, session_dir: Path) -> None:
+        self._path = session_dir.resolve() / ".cambium" / "session.lock"
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise SessionAlreadyRunningError(
+                f"session is already running: {self._path.parent.parent}"
+            ) from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd = self._fd
+        self._fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 @dataclass(slots=True)
@@ -602,12 +652,23 @@ class _Runtime:
         session_dir: Path,
         store: Any,
         on_event: EventSink | None = None,
+        *,
         redactor: Redactor | None = None,
+        resource_thresholds: dict[str, Any] | None = None,
+        compile_gate_max_concurrent: int | None = None,
+        compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
         self._on_event = on_event
         self._redactor = redactor
+        self._resource_thresholds = (
+            None if resource_thresholds is None else dict(resource_thresholds)
+        )
+        self._gate = CompileGate(
+            max_concurrent=compile_gate_max_concurrent,
+            timeout_s=compile_gate_acquire_timeout_s,
+        )
         self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._writer_task: asyncio.Task[None] | None = None
         self._handles: dict[str, WorkerHandle] = {}
@@ -643,6 +704,7 @@ class _Runtime:
     async def emit(
         self, kind: str, *, task_id: str | None = None, generation: int | None = None,
         request_id: str | None = None, _observer_failure_is_fatal: bool | None = None,
+        _deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
         **payload: Any,
     ) -> None:
         record = {
@@ -658,29 +720,56 @@ class _Runtime:
         if self._redactor is not None:
             record = self._redactor.redact_mapping(record)
             kind = record["kind"]
+        durable_record = self._copy_event(record)
         if kind in CRITICAL_KINDS:
-            await asyncio.to_thread(self._store.append, record)
+            await asyncio.to_thread(self._store.append, durable_record)
         else:
-            self._queue.put_nowait(record)
-        if self._on_event is not None:
-            observer_failure_is_fatal = (
-                _observer_failure_is_fatal
-                if _observer_failure_is_fatal is not None
-                else kind not in CRITICAL_KINDS
-            )
-            try:
-                result = self._on_event(record)
-                if asyncio.iscoroutine(result):
-                    await result
-            except asyncio.CancelledError:
-                task = asyncio.current_task()
-                if task is not None and task.cancelling():
-                    raise
-                if observer_failure_is_fatal:
-                    raise
-            except BaseException:
-                if observer_failure_is_fatal:
-                    raise
+            self._queue.put_nowait(durable_record)
+        if self._on_event is None:
+            return
+        observer_failure_is_fatal = (
+            _observer_failure_is_fatal
+            if _observer_failure_is_fatal is not None
+            else kind not in CRITICAL_KINDS
+        )
+        observer_record = self._copy_event(record)
+        if _deferred_observers is not None:
+            _deferred_observers.append((observer_record, observer_failure_is_fatal))
+            return
+        await self._notify_observer(observer_record, observer_failure_is_fatal)
+
+    @staticmethod
+    def _copy_event(record: dict[str, Any]) -> dict[str, Any]:
+        copied = dict(record)
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            copied["payload"] = dict(payload)
+        return copied
+
+    async def _notify_observer(
+        self, record: dict[str, Any], observer_failure_is_fatal: bool
+    ) -> None:
+        if self._on_event is None:
+            return
+        try:
+            result = self._on_event(record)
+            if asyncio.iscoroutine(result):
+                await result
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            if observer_failure_is_fatal:
+                raise
+        except BaseException:
+            if observer_failure_is_fatal:
+                raise
+
+    async def _notify_deferred_observers(
+        self, deferred: list[tuple[dict[str, Any], bool]]
+    ) -> None:
+        for record, observer_failure_is_fatal in deferred:
+            await self._notify_observer(record, observer_failure_is_fatal)
 
     async def _writer_loop(self) -> None:
         while True:
@@ -738,10 +827,7 @@ class _Runtime:
                 await asyncio.wait_for(self._writer_task, 10.0)
             except BaseException:
                 pass
-        try:
-            await asyncio.to_thread(self._store.close)
-        except BaseException:
-            pass
+        await asyncio.to_thread(self._store.close)
 
     def plan_result(self) -> PlanResult:
         return PlanResult(results=tuple(self._results.values()))
@@ -878,92 +964,105 @@ class _Runtime:
         worktree = Path(spec["worktree_path"]).resolve()
         branch = spec["branch"]
 
-        async with self._worktree_lock:
-            await self._git(repo, "worktree", "prune", check=False)
-            listing = await self._git(repo, "worktree", "list", "--porcelain", check=False)
-            if listing.returncode != 0:
-                await self.emit(
-                    "worktree_cleanup_deferred", task_id=task_id, reason="list_failed"
-                )
-                return
-            registered = any(
-                line.startswith("worktree ")
-                and Path(line[len("worktree "):].strip()).resolve() == worktree
-                for line in listing.stdout.splitlines()
-            )
-            if not registered:
-                return
-            if worktree == repo:
-                await self.emit(
-                    "worktree_cleanup_deferred", task_id=task_id, reason="repo_path"
-                )
-                return
-            if branch != "main":
-                branch_ref = f"branch refs/heads/{branch}"
-                for block in listing.stdout.split("\n\n"):
-                    lines = block.splitlines()
-                    path_line = next(
-                        (line for line in lines if line.startswith("worktree ")), None
-                    )
-                    if path_line is None:
-                        continue
-                    registered_path = Path(path_line[len("worktree "):].strip()).resolve()
-                    if registered_path != worktree and branch_ref in lines:
-                        await self.emit(
-                            "worktree_cleanup_deferred", task_id=task_id,
-                            reason="branch_in_use",
-                        )
-                        return
-
-            status = await self._git(
-                worktree,
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-                "--ignored=matching",
-                check=False,
-            )
-            if status.returncode != 0:
-                await self.emit(
-                    "worktree_cleanup_deferred", task_id=task_id, reason="status_failed"
-                )
-                return
-            if any(
-                not _status_line_is_fence(line)
-                for line in status.stdout.splitlines()
-            ):
-                await self.emit(
-                    "worktree_cleanup_deferred", task_id=task_id, reason="dirty"
-                )
-                return
-
-            fence_dir = worktree / ".cambium"
-            if fence_dir.is_dir():
-                shutil.rmtree(fence_dir, ignore_errors=True)
-            removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
-            if removed.returncode != 0:
-                await self.emit(
-                    "worktree_cleanup_deferred", task_id=task_id, reason="remove_failed"
-                )
-                return
-            if branch != "main":
-                deleted = await self._git(repo, "branch", "-D", branch, check=False)
-                if deleted.returncode != 0:
-                    restored = await self._git(
-                        repo, "worktree", "add", str(worktree), branch, check=False
-                    )
-                    if restored.returncode != 0:
-                        restored = await self._git(
-                            repo, "worktree", "add", "--detach", str(worktree), branch,
-                            check=False,
-                        )
+        deferred: list[tuple[dict[str, Any], bool]] = []
+        try:
+            async with self._worktree_lock:
+                await self._git(repo, "worktree", "prune", check=False)
+                listing = await self._git(repo, "worktree", "list", "--porcelain", check=False)
+                if listing.returncode != 0:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id,
-                        reason="branch_delete_failed", restored=restored.returncode == 0,
+                        "worktree_cleanup_deferred", task_id=task_id, reason="list_failed",
+                        _deferred_observers=deferred,
                     )
                     return
-            await self._git(repo, "worktree", "prune", check=False)
-            await self.emit("worktree_pruned", task_id=task_id, branch=branch)
+                registered = any(
+                    line.startswith("worktree ")
+                    and Path(line[len("worktree "):].strip()).resolve() == worktree
+                    for line in listing.stdout.splitlines()
+                )
+                if not registered:
+                    return
+                if worktree == repo:
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id, reason="repo_path",
+                        _deferred_observers=deferred,
+                    )
+                    return
+                if branch != "main":
+                    branch_ref = f"branch refs/heads/{branch}"
+                    for block in listing.stdout.split("\n\n"):
+                        lines = block.splitlines()
+                        path_line = next(
+                            (line for line in lines if line.startswith("worktree ")), None
+                        )
+                        if path_line is None:
+                            continue
+                        registered_path = Path(path_line[len("worktree "):].strip()).resolve()
+                        if registered_path != worktree and branch_ref in lines:
+                            await self.emit(
+                                "worktree_cleanup_deferred", task_id=task_id,
+                                reason="branch_in_use", _deferred_observers=deferred,
+                            )
+                            return
+
+                status = await self._git(
+                    worktree,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    check=False,
+                )
+                if status.returncode != 0:
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id, reason="status_failed",
+                        _deferred_observers=deferred,
+                    )
+                    return
+                if any(
+                    not _status_line_is_fence(line)
+                    for line in status.stdout.splitlines()
+                ):
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id, reason="dirty",
+                        _deferred_observers=deferred,
+                    )
+                    return
+
+                fence_dir = worktree / ".cambium"
+                if fence_dir.is_dir():
+                    shutil.rmtree(fence_dir, ignore_errors=True)
+                removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
+                if removed.returncode != 0:
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id, reason="remove_failed",
+                        _deferred_observers=deferred,
+                    )
+                    return
+                if branch != "main":
+                    deleted = await self._git(repo, "branch", "-D", branch, check=False)
+                    if deleted.returncode != 0:
+                        restored = await self._git(
+                            repo, "worktree", "add", str(worktree), branch, check=False
+                        )
+                        if restored.returncode != 0:
+                            restored = await self._git(
+                                repo, "worktree", "add", "--detach", str(worktree), branch,
+                                check=False,
+                            )
+                        await self.emit(
+                            "worktree_cleanup_deferred", task_id=task_id,
+                            reason="branch_delete_failed", restored=restored.returncode == 0,
+                            _deferred_observers=deferred,
+                        )
+                        return
+                await self._git(repo, "worktree", "prune", check=False)
+                await self.emit(
+                    "worktree_pruned", task_id=task_id, branch=branch,
+                    _deferred_observers=deferred,
+                )
+        finally:
+            await self._notify_deferred_observers(deferred)
 
     # -- spawn environment ---------------------------------------------------
 
@@ -1076,6 +1175,27 @@ class _Runtime:
             "task_assigned", task_id=task_id, repo=str(repo), branch=spec["branch"],
             base_commit=spec["base_commit"], task=spec.get("task", ""),
         )
+        thresholds = (
+            spec["resource_thresholds"]
+            if "resource_thresholds" in spec
+            else self._resource_thresholds
+        )
+        if thresholds is not None:
+            allowed, reasons = await asyncio.to_thread(can_run_heavy, thresholds)
+            if not allowed:
+                await self.emit(
+                    "resource_denied",
+                    task_id=task_id,
+                    resource_denied=True,
+                    reasons=reasons,
+                )
+                self._results[task_id] = TaskResult(
+                    task_id=task_id,
+                    status="failed",
+                    exit_code=126,
+                    reason="resource_denied",
+                )
+                return
         generation = await self._ensure_worktree(spec)
 
         restarts = 0
@@ -1230,6 +1350,8 @@ class _Runtime:
             async for raw in proc.stderr:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 if line.strip():
+                    if self._redactor is not None:
+                        line = self._redactor.redact_escaped(line)
                     await self.emit(
                         "log", task_id=task_id, generation=generation, stream="stderr",
                         message=line[:512],
@@ -1608,6 +1730,8 @@ class _Runtime:
         )
         if not symbolic:
             return "worker_detached_head"
+        if symbolic != f"refs/heads/{spec['branch']}":
+            return "worker_wrong_branch"
         status = await self._git(
             worktree, "status", "--porcelain=v1", "--untracked-files=all", check=False
         )
@@ -1637,51 +1761,81 @@ class _Runtime:
             rc = gates[tree]
             await self.emit("gate", task_id=task_id, exit_code=rc, skipped=True, tree=tree)
             return rc
-        proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", gate, cwd=str(worktree),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
-            start_new_session=True,
-            pass_fds=(),
-            close_fds=True,
-        )
+        command_tokens = shlex.split(gate)
+        is_heavy = self._gate.is_heavy(command_tokens)
+        token = await self._gate.acquire(command_tokens) if is_heavy else None
+        if token is False:
+            await self.emit(
+                "gate", task_id=task_id, exit_code=126, tree=tree,
+                timed_out=False, resource_denied=True, heavy=is_heavy,
+            )
+            return 126
+        proc = None
         try:
+            proc = await asyncio.create_subprocess_exec(
+                "sh", "-c", gate, cwd=str(worktree),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
+                start_new_session=True,
+                pass_fds=(),
+                close_fds=True,
+            )
             out, err = await _communicate_gate_bounded(proc, timeout)
             rc = proc.returncode if proc.returncode is not None else 1
         except _GateOutputOverflow as exc:
             rc = 125
             await self.emit(
                 "gate", task_id=task_id, exit_code=rc, tree=tree,
-                timed_out=False, output_overflow=True,
+                timed_out=False, output_overflow=True, heavy=is_heavy,
             )
             output = exc.stdout + exc.stderr
             if output:
+                message = output.decode("utf-8", "replace")
+                if self._redactor is not None:
+                    message = self._redactor.redact_escaped(message)
                 await self.emit(
                     "log", task_id=task_id, stream="gate",
-                    message=output.decode("utf-8", "replace")[:2048],
+                    message=message[:2048],
                 )
         except TimeoutError:
-            await _kill_process_group_and_reap(proc)
+            if proc is not None:
+                await _kill_process_group_and_reap(proc)
             rc = 124
-            await self.emit("gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=True)
+            await self.emit(
+                "gate", task_id=task_id, exit_code=rc, tree=tree,
+                timed_out=True, heavy=is_heavy,
+            )
         except asyncio.CancelledError:
-            await _kill_process_group_and_reap(proc)
+            if proc is not None:
+                await _kill_process_group_and_reap(proc)
             raise
         else:
             if tree is not None:
                 gates[tree] = rc
-            await self.emit("gate", task_id=task_id, exit_code=rc, tree=tree, timed_out=False)
+            await self.emit(
+                "gate", task_id=task_id, exit_code=rc, tree=tree,
+                timed_out=False, heavy=is_heavy,
+            )
             output = (out or b"") + (err or b"")
             if output:
+                message = output.decode("utf-8", "replace")
+                if self._redactor is not None:
+                    message = self._redactor.redact_escaped(message)
                 await self.emit(
                     "log", task_id=task_id, stream="gate",
-                    message=output.decode("utf-8", "replace")[:2048],
+                    message=message[:2048],
                 )
+        finally:
+            self._gate.release(token)
         return rc
 
     # -- merge ---------------------------------------------------------------
 
-    def _make_sequencer(self, task_id: str) -> MergeSequencer:
+    def _make_sequencer(
+        self,
+        task_id: str,
+        deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
+    ) -> MergeSequencer:
         loop = asyncio.get_running_loop()
 
         def persist_terminal(kind: str, payload: dict[str, Any]) -> None:
@@ -1690,6 +1844,7 @@ class _Runtime:
             future = asyncio.run_coroutine_threadsafe(
                 self.emit(
                     kind, task_id=event_task_id, _observer_failure_is_fatal=False,
+                    _deferred_observers=deferred_observers,
                     **event_payload,
                 ),
                 loop,
@@ -1701,7 +1856,10 @@ class _Runtime:
         )
 
     async def _flush_sequencer_events(
-        self, seq: Any, task_keys: dict[str, str] | None = None
+        self,
+        seq: Any,
+        task_keys: dict[str, str] | None = None,
+        deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
     ) -> set[str]:
         if not hasattr(seq, "drain_events"):
             return set()
@@ -1722,7 +1880,9 @@ class _Runtime:
                 match = re.match(r"merge/task-([0-9a-f]{16})/", quarantine_id)
                 if match:
                     task_id = task_keys.get(match.group(1))
-            await self.emit(kind, task_id=task_id, **payload)
+            await self.emit(
+                kind, task_id=task_id, _deferred_observers=deferred_observers, **payload
+            )
             recovered = kind == "merge_committed" and payload.get("reason") == (
                 "recovered-ref-advance"
             )
@@ -1821,10 +1981,12 @@ class _Runtime:
         )
         task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
         throwaway = self._session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
-        seq = self._make_sequencer(task_id)
+        deferred: list[tuple[dict[str, Any], bool]] = []
+        seq = self._make_sequencer(task_id, deferred)
         ref_published = False
         committed_persisted = False
         cleanup_failed = False
+        merge_failed = False
         staging_tip: str | None = None
         try:
             async with self._merge_lock:  # Unio single-writer: serialized merges
@@ -1843,30 +2005,31 @@ class _Runtime:
                 # did not mutate the main working tree. Do not reset or
                 # checkout here: that would violate ref-only publication and
                 # could destroy caller-owned edits.
-                await self._flush_sequencer_events(seq)
+                await self._flush_sequencer_events(seq, deferred_observers=deferred)
                 if hasattr(seq, "ensure_staging_clean"):
                     await asyncio.to_thread(seq.ensure_staging_clean, repo)
-                    await self._flush_sequencer_events(seq)
+                    await self._flush_sequencer_events(seq, deferred_observers=deferred)
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
                 ref_published = True
                 await self.emit(
                     "merge_committed", task_id=task_id, old=current_main, new=staging_tip,
                     repo=str(repo), branch=branch, generation=handle.generation,
+                    _deferred_observers=deferred,
                 )
                 committed_persisted = True
-        except (NonFastForwardError, MergeConflictError) as exc:
-            error_type = exc.__class__.__name__
-            await self.emit(
-                "merge_failed", task_id=task_id, merge_error=error_type,
-                message=str(exc)[:512], generation=handle.generation,
-            )
-            return None
         except Exception as exc:
-            await self.emit(
-                "merge_failed", task_id=task_id, merge_error=exc.__class__.__name__,
-                message=str(exc)[:512], generation=handle.generation, internal=True,
-            )
-            return None
+            merge_failed = True
+            error_type = exc.__class__.__name__
+            if error_type in ("NonFastForwardError", "MergeConflictError"):
+                await self.emit(
+                    "merge_failed", task_id=task_id, merge_error=error_type,
+                    message=str(exc)[:512], generation=handle.generation,
+                )
+            else:
+                await self.emit(
+                    "merge_failed", task_id=task_id, merge_error=error_type,
+                    message=str(exc)[:512], generation=handle.generation, internal=True,
+                )
         finally:
             try:
                 if hasattr(seq, "cleanup_staging") and not (
@@ -1875,15 +2038,25 @@ class _Runtime:
                     await asyncio.to_thread(seq.cleanup_staging, repo)
             except Exception as exc:
                 cleanup_failed = True
-                emitted = await self._flush_sequencer_events(seq)
+                emitted = await self._flush_sequencer_events(
+                    seq, deferred_observers=deferred
+                )
                 if committed_persisted and "merge_staging_cleanup_failed" not in emitted:
                     await self.emit(
                         "merge_staging_cleanup_failed", task_id=task_id,
                         staging_sha=staging_tip, reason=exc.__class__.__name__,
                     )
             else:
-                await self._flush_sequencer_events(seq)
-        if cleanup_failed and not committed_persisted:
+                await self._flush_sequencer_events(seq, deferred_observers=deferred)
+        try:
+            await self._notify_deferred_observers(deferred)
+        except Exception as exc:
+            await self.emit(
+                "merge_failed", task_id=task_id, merge_error=exc.__class__.__name__,
+                message=str(exc)[:512], generation=handle.generation, internal=True,
+            )
+            return None
+        if merge_failed or cleanup_failed:
             return None
         return staging_tip
 
@@ -1952,13 +2125,6 @@ def _reject_duplicate_task_ids(tasks: list[dict[str, Any]]) -> None:
             seen.add(task_id)
 
 
-def _envelope_sequence(value: Any) -> tuple[str, ...]:
-    """Return string members of a worker envelope sequence, else empty."""
-    if not isinstance(value, (list, tuple)):
-        return ()
-    return tuple(item for item in value if isinstance(item, str))
-
-
 def _task_canonical_status(result: TaskResult) -> str:
     """Map one supervisor TaskResult verdict to a canonical root status.
 
@@ -2018,11 +2184,11 @@ def _build_session_result(
         failure_reason = None if status == "done" else _aggregate_reason(results)
         envelope = None
     if envelope is not None:
-        commits = _envelope_sequence(envelope.get("commits"))
-        files_changed = _envelope_sequence(envelope.get("files_changed"))
-        unified_diff = envelope.get("diff") or ""
-        diff_truncated = bool(envelope.get("diff_truncated", False))
-        summary = envelope.get("summary") or ""
+        commits = envelope.get("commits", ())
+        files_changed = envelope.get("files_changed", ())
+        unified_diff = envelope.get("diff", "")
+        diff_truncated = envelope.get("diff_truncated", False)
+        summary = envelope.get("summary", "")
     else:
         commits = ()
         files_changed = ()
@@ -2052,6 +2218,10 @@ async def run_plan(
     session_dir: str | Path,
     plan: dict[str, Any] | list[dict[str, Any]],
     on_event: EventSink | None = None,
+    *,
+    resource_thresholds: dict[str, Any] | None = None,
+    compile_gate_max_concurrent: int | None = None,
+    compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -2071,31 +2241,44 @@ async def run_plan(
     if not specs:
         raise ValueError("plan contains no tasks")
 
-    started_at = time.time()
-    redactor = _session_redactor(specs)
-    store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
-    runtime = _Runtime(session_dir, store, on_event=on_event, redactor=redactor)
-    await runtime.start()
-    cancelled = False
+    admission = _SessionAdmission(session_dir)
+    admission.acquire()
     try:
-        await runtime.reconcile(specs)
-        async with asyncio.TaskGroup() as tg:
-            for spec in specs:
-                tg.create_task(runtime.supervise_task(spec))
-    except asyncio.CancelledError:
-        cancelled = True
-    except BaseExceptionGroup as exc_group:
-        await runtime.emit(
-            "log", task_id=None, message=f"task group exception: {exc_group}"
+        started_at = time.time()
+        redactor = _session_redactor(specs)
+        store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
+        runtime = _Runtime(
+            session_dir,
+            store,
+            on_event=on_event,
+            redactor=redactor,
+            resource_thresholds=resource_thresholds,
+            compile_gate_max_concurrent=compile_gate_max_concurrent,
+            compile_gate_acquire_timeout_s=compile_gate_acquire_timeout_s,
         )
+        await runtime.start()
+        cancelled = False
+        try:
+            await runtime.reconcile(specs)
+            async with asyncio.TaskGroup() as tg:
+                for spec in specs:
+                    tg.create_task(runtime.supervise_task(spec))
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseExceptionGroup as exc_group:
+            await runtime.emit(
+                "log", task_id=None, message=f"task group exception: {exc_group}"
+            )
+        finally:
+            await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
+        result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
+        session_id = str(session_dir.resolve())
+        await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)
+        if cancelled:
+            raise asyncio.CancelledError
+        return runtime.plan_result()
     finally:
-        await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
-    result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
-    session_id = str(session_dir.resolve())
-    await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)
-    if cancelled:
-        raise asyncio.CancelledError
-    return runtime.plan_result()
+        admission.release()
 
 
 def _ensure_repo_initialized(repo: Path) -> None:

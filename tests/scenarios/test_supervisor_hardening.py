@@ -1215,12 +1215,7 @@ def test_slice_heavy_gate_passes_through_session_gate(tmp_path: Path) -> None:
     assert result.status == "succeeded"
     assert result.exit_code == 0
     assert result.gate_exit_code == 0
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    gate_events = [event for event in events if event["kind"] == "gate"]
+    gate_events = _kinds(read_events(session_dir), "gate")
     assert gate_events
     assert all(event["payload"].get("heavy") is True for event in gate_events)
     assert not any(event["payload"].get("resource_denied") for event in gate_events)
