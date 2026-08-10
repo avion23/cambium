@@ -35,10 +35,10 @@ test that sleeps 100s) while not false-failing unchanged code under load. The
 plugin path behavior is unchanged, and ``--bench-wall-ratio`` overrides the
 standalone default.
 
-Credential hygiene: every child process spawned by the harness (including the
-timing subprocess and, transitively, the module's own CLI tests) gets a
-scrubbed environment via :func:`cambium.auth.scrub_environment`; ``os.environ``
-is never copied wholesale into a subprocess.
+Credential hygiene: every child process spawned by the harness — the module
+evaluation CLI, the timing subprocess, and, transitively, the module's own CLI
+tests — gets a scrubbed environment via :func:`cambium.auth.scrub_environment`;
+``os.environ`` is never copied wholesale into a subprocess.
 """
 
 from __future__ import annotations
@@ -512,7 +512,9 @@ def compare_against_anchor(
 
     Metric means only fail when they fall by more than ``metric_mean_delta``;
     wall p90 fails when it exceeds ``anchor * wall_p90_ratio +
-    wall_p90_abs_slack``; duplicate ids
+    wall_p90_abs_slack``, and a missing or zero live wall p90 against a
+    positive anchor is itself a regression (the comparison is never silently
+    skipped); duplicate ids
     or cross-split leaks of any size and missing canaries always fail; a
     canary failure is a regression when it exceeds the anchor's count by more
     than ``canary_failed_delta``; unavailable split metrics are regressions.
@@ -561,7 +563,14 @@ def compare_against_anchor(
 
     r_wall = (report.get("tests") or {}).get("wall_seconds") or {}
     a_wall = (anchor.get("tests") or {}).get("wall_seconds") or {}
-    if a_wall.get("p90") and r_wall.get("p90"):
+    if a_wall.get("p90") and not r_wall.get("p90"):
+        regressions.append(
+            (
+                "tests.wall_seconds.p90",
+                "live wall timing unavailable; wall comparison cannot run",
+            )
+        )
+    elif a_wall.get("p90") and r_wall.get("p90"):
         wall_ratio = merged["wall_p90_ratio"]
         wall_slack = merged["wall_p90_abs_slack"]
         if r_wall["p90"] > a_wall["p90"] * wall_ratio + wall_slack:
@@ -840,18 +849,19 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
     therefore populated in the CLI report/gate path instead of silently
     comparing ``0.0`` against the anchor.
 
-    Empty timings are returned only when the module has no tests directory or
-    the run cannot produce a baseline (its own tests fail to collect or pass);
-    the metric/dataset/canary checks still run, and the wall-time comparison
-    stays disabled for that module.
+    Only a genuinely empty module — one with no ``tests/`` directory at all —
+    is tolerated: it has no wall timings, so both the report and the anchor
+    carry ``tests.count == 0`` and the wall comparison is skipped for it by
+    design. Every other failure (the timing subprocess cannot run or exceeds
+    the 600s timeout, its tests fail, it writes no baseline, or the baseline
+    carries no usable timings) raises :class:`ModuleBoundaryError`, which
+    aborts the standalone report/gate with a diagnostic instead of silently
+    disabling the wall-time check.
     """
     tests_dir = MODULES_DIR / pkg_name / "tests"
     if not tests_dir.is_dir() or tests_dir.is_symlink():
         return {}
-    try:
-        manifest = _module_manifest(pkg_name)
-    except (ModuleBoundaryError, DatasetError):
-        return {}
+    manifest = _module_manifest(pkg_name)
     with tempfile.TemporaryDirectory(prefix="cambium-bench-timings-") as root:
         # Credential scrubbing is mandatory: the timing subprocess re-runs the
         # module's own tests, whose CLI tests spawn further subprocesses from
@@ -882,23 +892,48 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
                 check=False,
                 timeout=600,
             )
-        except (OSError, subprocess.SubprocessError):
-            return {}
+        except subprocess.TimeoutExpired as exc:
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing run timed out after 600 seconds"
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing run could not start: {exc}"
+            ) from exc
         baseline_path = Path(root) / manifest.module_name / "baseline.json"
-        if result.returncode != 0 or not baseline_path.is_file():
-            return {}
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or b"no diagnostic output").decode(
+                errors="replace"
+            ).strip()
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing run exited {result.returncode}: "
+                f"{detail[:500]}"
+            )
+        if not baseline_path.is_file():
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing run wrote no baseline at {baseline_path}"
+            )
         try:
             baseline = json.loads(baseline_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing baseline is unreadable: {exc}"
+            ) from exc
         timings = (baseline.get("tests") or {}).get("by_nodeid")
         if not isinstance(timings, dict):
-            return {}
-        return {
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing baseline has no tests.by_nodeid timings"
+            )
+        measured = {
             str(nodeid): float(duration)
             for nodeid, duration in timings.items()
             if isinstance(duration, (int, float)) and not isinstance(duration, bool)
         }
+        if not measured:
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: timing run produced no usable wall timings"
+            )
+        return measured
 
 
 def _cli_parser() -> argparse.ArgumentParser:

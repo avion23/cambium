@@ -983,6 +983,44 @@ def test_module_timing_subprocess_env_scrubs_credentials(tmp_path, monkeypatch) 
     assert "synthetic-openai-secret" not in captured_env.values()
 
 
+def test_evaluation_child_env_scrubs_provider_keys(monkeypatch) -> None:
+    """The bench evaluation CLI subprocess must never receive provider keys.
+
+    ``build_module_report`` evaluates every dataset record through the
+    module's neutral CLI subprocess. That child environment is built with
+    ``scrub_environment`` (``run_module_cli`` never copies ``os.environ``
+    wholesale), so ``CAMBIUM_PROVIDER_*_API_KEY`` / ``OPENAI_API_KEY`` set in
+    the parent must not reach the evaluated module, while PATH and PYTHONPATH
+    (including the source root the CLI is imported from) must survive.
+    """
+    import cambium.bench as bench
+
+    eval_envs: list[dict[str, str]] = []
+    real_run = bench.subprocess.run
+
+    def spy_run(command, **kwargs):
+        env = kwargs.get("env")
+        if env is not None and "cambium.modules." in " ".join(command):
+            eval_envs.append(env)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(bench.subprocess, "run", spy_run)
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "synthetic-provider-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai-secret")
+
+    bench.build_module_report("example")
+
+    assert eval_envs  # the module CLI evaluation subprocess actually ran
+    for env in eval_envs:
+        assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "synthetic-provider-secret" not in env.values()
+        assert "synthetic-openai-secret" not in env.values()
+        assert "PATH" in env
+        assert "PYTHONPATH" in env
+        assert str(REPO_ROOT / "src") in env["PYTHONPATH"].split(os.pathsep)
+
+
 def test_standalone_cli_gate_detects_wall_time_regression(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1026,6 +1064,44 @@ def test_standalone_cli_immediate_gate_does_not_false_fail_under_load(tmp_path) 
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
+
+
+def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A failed timing subprocess must fail the standalone report and gate.
+
+    A module with a ``tests/`` directory has mandatory wall timings: when its
+    timing pytest run exits nonzero, the standalone CLI must fail with a
+    diagnostic instead of writing a ``tests.count == 0`` baseline and letting
+    the gate skip the wall comparison. Only a genuinely empty module (no
+    ``tests/`` directory) is tolerated.
+    """
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(
+        tmp_path,
+        manifest={
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        },
+    )
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    (modules_dir / "fixture" / "tests").mkdir()
+    (modules_dir / "fixture" / "tests" / "test_failing.py").write_text(
+        "def test_always_fails():\n    assert False\n"
+    )
+    bench_root = tmp_path / "baselines"
+
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 1
+    assert "timing run exited" in capsys.readouterr().err
+    assert not (bench_root / "fixture_module" / "baseline.json").exists()
+
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+    assert "timing run exited" in capsys.readouterr().err
 
 
 def test_gate_passes_without_drift(tmp_path) -> None:
@@ -1112,6 +1188,27 @@ def test_compare_stale_dataset_version_fails_closed() -> None:
     assert "1.0.0" in regressions[0][1] and "1.1.0" in regressions[0][1]
     # same version, no drift -> no regressions
     assert compare_against_anchor(report, report) == []
+
+
+def test_compare_wall_regression_when_live_p90_unavailable() -> None:
+    """A missing/zero live wall p90 against a positive anchor is a regression.
+
+    The wall comparison must never be silently skipped: if the live run
+    produced no usable wall timings while the anchor has a p90, the gate
+    fails closed instead of passing without a wall check.
+    """
+    from cambium.bench import compare_against_anchor
+
+    anchor = _fake_report(wall_p90=0.02)
+    report = _fake_report()
+    report["tests"]["wall_seconds"] = {"p50": 0.0, "p90": 0.0, "max": 0.0}
+
+    assert compare_against_anchor(report, anchor) == [
+        (
+            "tests.wall_seconds.p90",
+            "live wall timing unavailable; wall comparison cannot run",
+        )
+    ]
 
 
 def test_compare_metric_delta_default_and_run_override() -> None:
