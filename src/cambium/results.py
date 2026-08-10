@@ -437,7 +437,7 @@ def _copy_sequence(value: Any) -> list[Any]:
 
 
 def _final_bool(value: Any) -> bool:
-    if value is _MISSING or value is None:
+    if value is _MISSING:
         return False
     if not isinstance(value, bool):
         raise TypeError("diff_truncated must be a boolean")
@@ -499,12 +499,12 @@ def wire_to_child_result(
     diff = _wire_value(wire, "unified_diff")
     if diff is _MISSING:
         diff = _wire_value(wire, "diff")
-    if diff is None:
-        raise TypeError("unified_diff must be a string")
-    if not include_diff or diff is _MISSING:
+    if diff is _MISSING:
         unified_diff = ""
     elif not isinstance(diff, str):
         raise TypeError("unified_diff must be a string")
+    elif not include_diff:
+        unified_diff = ""
     else:
         unified_diff = diff
 
