@@ -38,6 +38,7 @@ _GENERATION_FIELDS = (
     "response_format",
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
+_NON_FORWARDABLE_FIELDS = _CACHE_FIELDS | frozenset({"num_retries"})
 _FORBIDDEN_FIELDS = frozenset({"callbacks"})
 _CONSTRUCTOR_FIELDS = frozenset(
     {
@@ -320,6 +321,7 @@ class CambiumLM:
     """Lazily construct a concrete subclass of ``dspy.LM``."""
 
     def __new__(cls, /, *args: Any, **kwargs: Any) -> CambiumLM:
+        _require_exact_keyword_keys(kwargs)
         if cls is not CambiumLM:
             return super().__new__(cls)
         del args, kwargs
@@ -475,7 +477,11 @@ class _CambiumLMMixin:
         safe_kwargs = self._safe_kwargs(
             {key: value for key, value in kwargs.items() if key not in adapter_overrides}
         )
+        safe_kwargs["cache"] = False
+        safe_kwargs["num_retries"] = 0
         copied = super().copy(**safe_kwargs)
+        copied.cache = False
+        copied.num_retries = 0
         copied.launch_kwargs = safe_kwargs.get("launch_kwargs", launch_kwargs)
         copied.train_kwargs = safe_kwargs.get("train_kwargs", train_kwargs)
         if "diffundo" in adapter_overrides:
@@ -537,7 +543,7 @@ class _CambiumLMMixin:
         for key, value in frozen_kwargs.items():
             if key in _FORBIDDEN_FIELDS:
                 forbidden.append(key)
-            elif key not in _CACHE_FIELDS:
+            elif key not in _NON_FORWARDABLE_FIELDS:
                 safe[key] = value
         if forbidden:
             raise ValueError(f"CambiumLM does not accept {', '.join(sorted(forbidden))}")

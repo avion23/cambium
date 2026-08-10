@@ -126,6 +126,22 @@ def test_identical_calls_are_not_cached() -> None:
     assert all("cache" not in call["prompt"] for call in diffundo.calls)
 
 
+def test_copy_keeps_zero_retry_invariant_across_state_round_trip() -> None:
+    _require_dspy()
+    import dspy
+
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    copied = lm.copy(num_retries=5)
+
+    assert copied.num_retries == 0
+    assert copied.cache is False
+    state = copied.dump_state()
+    loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
+
+    assert loaded.num_retries == 0
+    assert loaded.cache is False
+
+
 def test_same_prompt_to_two_provider_endpoints_reaches_each_once() -> None:
     _require_dspy()
     first = FakeDiffundo("https://provider-a.invalid")
@@ -182,6 +198,73 @@ import cambium.diffundo
 import cambium.lm
 import cambium.orchestrator
 assert 'dspy' not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(source)],
+        env=os.environ.copy(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_cold_hostile_constructor_key_rejects_before_dspy_load() -> None:
+    source = Path(__file__).resolve().parents[2] / "src"
+    script = """
+import builtins
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import cambium.lm as lm_module
+from cambium.diffundo import ProviderTier
+
+assert "dspy" not in sys.modules
+real_import = builtins.__import__
+real_load = lm_module._load_dspy
+load_calls = 0
+
+
+def reject_dspy(name, *args, **kwargs):
+    if name == "dspy" or name.startswith("dspy."):
+        raise ImportError("blocked for cold-key regression")
+    return real_import(name, *args, **kwargs)
+
+
+def tracked_load():
+    global load_calls
+    load_calls += 1
+    return real_load()
+
+
+builtins.__import__ = reject_dspy
+lm_module._load_dspy = tracked_load
+
+
+class HostileKey(str):
+    def __str__(self):
+        return self
+
+
+fake_diffundo = type("FakeDiffundo", (), {"call": lambda *args, **kwargs: None})()
+outcome = None
+try:
+    lm_module.CambiumLM(
+        fake_diffundo,
+        ProviderTier.FAST,
+        **{HostileKey("unexpected"): object()},
+    )
+except BaseException as exc:
+    outcome = (type(exc).__name__, str(exc))
+
+assert outcome == (
+    "TypeError",
+    "CambiumLM keyword keys must use exact builtin strings",
+)
+assert load_calls == 0
+assert "dspy" not in sys.modules
+assert lm_module._DSPY is None
+assert "_CambiumLMImplementation" not in lm_module.__dict__
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", script, str(source)],
