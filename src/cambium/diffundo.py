@@ -51,7 +51,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -150,7 +150,11 @@ class ProviderConfig:
 
 @dataclass(frozen=True, slots=True)
 class CallResult:
-    """A successful completion plus provenance."""
+    """A successful completion plus provenance.
+
+    ``tool_calls`` carries the raw OpenAI-shaped tool-call dicts when the
+    provider returned them; a text completion leaves it ``None``.
+    """
 
     provider: str
     model: str
@@ -159,6 +163,7 @@ class CallResult:
     latency_s: float
     usage: dict[str, Any] | None = None
     estimated_cost_usd: float = 0.0
+    tool_calls: tuple[dict[str, Any], ...] | None = None
 
 
 class DiffundoError(Exception):
@@ -352,10 +357,31 @@ class _RawResponse:
                 provider.name, ProviderOutcome.REFUSAL, "model refusal marker in response"
             )
         content = message.get("content")
+        raw_tool_calls = message.get("tool_calls")
+        tool_calls: tuple[dict[str, Any], ...] | None = None
+        if isinstance(raw_tool_calls, list) and raw_tool_calls:
+            for tool_call in raw_tool_calls:
+                if _tool_call_name(tool_call) is None:
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: tool call without a function name",
+                    )
+                try:
+                    _tool_call_arguments(tool_call)
+                except ValueError as exc:
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        f"malformed response: {exc}",
+                    ) from exc
+            tool_calls = tuple(raw_tool_calls)
         if not isinstance(content, str):
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
-            )
+            if tool_calls is None:
+                raise ProviderError(
+                    provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
+                )
+            content = ""
         if _CONTENT_REFUSAL_RE.search(content):
             # A 200 completion whose text is a model refusal: fall through to the
             # next provider (documented heuristic, see module docstring). Like any
@@ -376,6 +402,7 @@ class _RawResponse:
             latency_s=self.latency_s,
             usage=usage,
             estimated_cost_usd=_estimate_cost(provider, usage),
+            tool_calls=tool_calls,
         )
 
 
@@ -390,12 +417,60 @@ def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> fl
     )
 
 
+def _tool_call_name(tool_call: Any) -> str | None:
+    """Return the function name of an OpenAI-shaped tool call, else None."""
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if isinstance(function, dict) and type(function.get("name")) is str:
+        name = function["name"]
+    elif type(tool_call.get("name")) is str:
+        name = tool_call["name"]
+    else:
+        return None
+    return name if name.strip() else None
+
+
+def _tool_call_arguments(tool_call: Any) -> dict[str, Any] | None:
+    """Return parsed tool-call arguments, or None when empty or missing.
+
+    Only genuinely empty/missing arguments map to ``{}`` at the DSPy boundary;
+    present-but-malformed arguments raise ``ValueError`` so the caller rejects
+    the tool call fail-closed instead of silently dropping them.
+    """
+    if not isinstance(tool_call, Mapping):
+        raise ValueError("tool call must be an object")
+    function = tool_call.get("function")
+    function = function if isinstance(function, Mapping) else {}
+    raw = function.get("arguments", tool_call.get("arguments", ""))
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"tool call arguments are not valid JSON: {raw[:80]!r}"
+            ) from exc
+    elif isinstance(raw, Mapping):
+        parsed = dict(raw)
+    else:
+        raise ValueError(
+            f"tool call arguments must be a JSON object, got {type(raw).__name__}"
+        )
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"tool call arguments must be a JSON object, got {type(parsed).__name__}"
+        )
+    return parsed
+
+
 def _default_quality_gate(result: CallResult) -> bool:
-    return bool(result.content.strip())
+    return bool((result.content or "").strip() or result.tool_calls)
 
 
 def _default_score(result: CallResult) -> float:
-    return float(len(result.content))
+    return float(len(result.content or "") + len(result.tool_calls or ()))
 
 
 def _redact_error_text(message: str, api_key: str) -> str:
