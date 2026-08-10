@@ -263,9 +263,9 @@ def test_tasktree_invalid_json_exits_one() -> None:
 def test_module_test_runs_reference_module() -> None:
     result = _run("module-test", "example")
 
-    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
     output = result.stdout + result.stderr
-    assert "test nodeid does not belong to this module's tests" in output, output
+    assert "example: passed=40 failed=0 skipped=0" in output, output
 
 
 def test_module_test_unknown_module_exits_two() -> None:
