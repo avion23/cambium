@@ -39,6 +39,48 @@ _GENERATION_FIELDS = (
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
 _FORBIDDEN_FIELDS = frozenset({"callbacks"})
+_CONSTRUCTOR_FIELDS = frozenset(
+    {
+        "diffundo",
+        "tier",
+        "model",
+        "budget_usd",
+        "temperature",
+        "max_tokens",
+        "model_type",
+        "provider",
+        "finetuning_model",
+        "launch_kwargs",
+        "train_kwargs",
+        "use_developer_role",
+        "extensions",
+        "cache",
+        "callbacks",
+        "num_retries",
+    }
+)
+_CALL_FIELDS = frozenset(
+    {
+        "prompt",
+        "messages",
+        "request",
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "stop",
+        "n",
+        "logprobs",
+        "response_format",
+        "reasoning",
+        "tool_choice",
+        "extensions",
+        "cache",
+        "rollout_id",
+        "prompt_cache",
+        "prompt_cache_key",
+        "callbacks",
+    }
+)
 _ADAPTER_PRIVATE_FIELDS = frozenset(
     {"_diffundo", "_tier", "_provider_model", "_budget_usd", "_diffundo_reference"}
 )
@@ -89,6 +131,19 @@ def _require_exact_keyword_keys(kwargs: Mapping[Any, Any]) -> None:
     for key in kwargs:
         if type(key) is not str:
             raise TypeError("CambiumLM keyword keys must use exact builtin strings")
+
+
+def _reject_unknown_keyword_keys(kwargs: Mapping[str, Any], allowed: frozenset[str]) -> None:
+    unknown = sorted(key for key in kwargs if key not in allowed)
+    if not unknown:
+        return
+    for key in unknown:
+        normalized = "".join(character for character in str.lower(key) if str.isalnum(character))
+        if any(marker in normalized for marker in _SECRET_MARKERS):
+            raise ValueError(
+                "provider credentials belong to Diffundo configuration, not CambiumLM kwargs"
+            )
+    raise TypeError(f"CambiumLM unknown keyword argument: {unknown[0]}")
 
 
 class _ImmutableCallbacks(list[Any]):
@@ -286,18 +341,28 @@ class _CambiumLMMixin:
         """Discard DSPy callback assignments at the instance boundary."""
         del value
 
-    def __init__(
-        self,
-        /,
-        diffundo: Diffundo,
-        tier: ProviderTier | str,
-        *,
-        model: str | None = None,
-        budget_usd: float | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, /, *args: Any, **kwargs: Any) -> None:
+        _require_exact_keyword_keys(kwargs)
+        _reject_unknown_keyword_keys(kwargs, _CONSTRUCTOR_FIELDS)
+        if len(args) > 2:
+            raise TypeError(f"CambiumLM expected at most 2 positional arguments, got {len(args)}")
+        constructor_values: dict[str, Any] = {}
+        for index, name in enumerate(("diffundo", "tier")):
+            if index < len(args):
+                if name in kwargs:
+                    raise TypeError(f"CambiumLM got multiple values for argument {name!r}")
+                constructor_values[name] = args[index]
+                continue
+            if name not in kwargs:
+                raise TypeError(f"CambiumLM missing required argument: {name!r}")
+            constructor_values[name] = kwargs.pop(name)
+
+        diffundo = constructor_values["diffundo"]
+        tier = constructor_values["tier"]
+        model = kwargs.pop("model", None)
+        budget_usd = kwargs.pop("budget_usd", None)
+        temperature = kwargs.pop("temperature", None)
+        max_tokens = kwargs.pop("max_tokens", None)
         if not isinstance(diffundo, Diffundo) and not callable(getattr(diffundo, "call", None)):
             raise TypeError("diffundo must provide async call(tier, prompt, ...)")
         self._diffundo = diffundo
@@ -318,20 +383,17 @@ class _CambiumLMMixin:
         self.train_kwargs = _freeze(self.train_kwargs)
         self._diffundo_reference = _register_diffundo(diffundo)
 
-    def __call__(
-        self,
-        /,
-        *items: Any,
-        prompt: str | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        request: Any = None,
-        **kwargs: Any,
-    ) -> Any:
+    def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
         """Call synchronously with session-local, non-retaining settings."""
+        _require_exact_keyword_keys(kwargs)
+        _reject_unknown_keyword_keys(kwargs, _CALL_FIELDS)
+        prompt = kwargs.pop("prompt", None)
+        messages = kwargs.pop("messages", None)
+        request = kwargs.pop("request", None)
         dspy = _load_dspy()
         with self._session_context(dspy):
             return super().__call__(
-                *items,
+                *args,
                 prompt=prompt,
                 messages=messages,
                 request=request,
@@ -339,20 +401,17 @@ class _CambiumLMMixin:
                 **self._call_kwargs(kwargs),
             )
 
-    async def acall(
-        self,
-        /,
-        *items: Any,
-        prompt: str | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        request: Any = None,
-        **kwargs: Any,
-    ) -> Any:
+    async def acall(self, /, *args: Any, **kwargs: Any) -> Any:
         """Call asynchronously with session-local, non-retaining settings."""
+        _require_exact_keyword_keys(kwargs)
+        _reject_unknown_keyword_keys(kwargs, _CALL_FIELDS)
+        prompt = kwargs.pop("prompt", None)
+        messages = kwargs.pop("messages", None)
+        request = kwargs.pop("request", None)
         dspy = _load_dspy()
         with self._session_context(dspy):
             return await super().acall(
-                *items,
+                *args,
                 prompt=prompt,
                 messages=messages,
                 request=request,

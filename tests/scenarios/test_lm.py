@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import os
 import subprocess
 import sys
@@ -674,8 +675,26 @@ def test_copy_rejects_hostile_key_before_equality_can_change_provider_reference(
     assert provider_b.calls == []
 
 
-@pytest.mark.parametrize("entry_point", ["constructor", "call", "acall"])
-def test_hostile_hash_collision_cannot_change_provider_reference(entry_point: str) -> None:
+@pytest.mark.parametrize(
+    ("entry_point", "key"),
+    [
+        ("constructor", "diffundo"),
+        ("constructor", "tier"),
+        ("constructor", "model"),
+        ("constructor", "budget_usd"),
+        ("constructor", "temperature"),
+        ("constructor", "max_tokens"),
+        ("call", "prompt"),
+        ("call", "messages"),
+        ("call", "request"),
+        ("acall", "prompt"),
+        ("acall", "messages"),
+        ("acall", "request"),
+    ],
+)
+def test_hostile_former_parameter_key_cannot_change_provider(
+    entry_point: str, key: str
+) -> None:
     _require_dspy()
     import dspy
 
@@ -687,14 +706,15 @@ def test_hostile_hash_collision_cannot_change_provider_reference(entry_point: st
 
     class HostileKey(str):
         def __hash__(self) -> int:
-            return hash("self")
+            return hash(key)
 
         def __eq__(self, other_key: object) -> bool:
-            if type(other_key) is str and other_key == "self":
+            if type(other_key) is str and other_key == key:
+                lm._diffundo = provider_b
                 lm._diffundo_reference = other._diffundo_reference
             return str.__eq__(self, other_key)
 
-    hostile_kwargs = {HostileKey("_diffundo_reference"): other._diffundo_reference}
+    hostile_kwargs = {HostileKey(key): object()}
     with pytest.raises(TypeError, match="exact builtin string"):
         if entry_point == "constructor":
             CambiumLM(provider_a, ProviderTier.FAST, **hostile_kwargs)  # type: ignore[arg-type]
@@ -716,6 +736,34 @@ def test_hostile_hash_collision_cannot_change_provider_reference(entry_point: st
         "https://provider-a.invalid",
     ]
     assert provider_b.calls == []
+
+
+def test_kwargs_entry_points_have_no_bindable_named_parameters() -> None:
+    _require_dspy()
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    expected = [
+        ("self", inspect.Parameter.POSITIONAL_ONLY),
+        ("args", inspect.Parameter.VAR_POSITIONAL),
+        ("kwargs", inspect.Parameter.VAR_KEYWORD),
+    ]
+
+    for entry_point in (type(lm).__init__, type(lm).__call__, type(lm).acall):
+        parameters = inspect.signature(entry_point).parameters.values()
+        assert [(parameter.name, parameter.kind) for parameter in parameters] == expected
+
+
+@pytest.mark.parametrize("entry_point", ["constructor", "call", "acall"])
+def test_kwargs_entry_points_reject_unknown_exact_keyword(entry_point: str) -> None:
+    _require_dspy()
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="unknown keyword argument: unexpected"):
+        if entry_point == "constructor":
+            CambiumLM(FakeDiffundo(), ProviderTier.FAST, unexpected=True)  # type: ignore[arg-type]
+        elif entry_point == "call":
+            lm(unexpected=True)
+        else:
+            asyncio.run(lm.acall(unexpected=True))
 
 
 def test_copy_model_override_routes_through_diffundo() -> None:
