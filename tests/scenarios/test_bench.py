@@ -110,16 +110,22 @@ def _write_fixture_module(
     records = {
         "train": {
             "id": "fixture-train-1",
+            "schema_version": 1,
+            "dataset_version": "fixture-1",
             "input": {"task": "Fixture train", "context": ""},
             "expected": {"decompose": False, "reason": "atomic"},
         },
         "eval": {
             "id": "fixture-eval-1",
+            "schema_version": 1,
+            "dataset_version": "fixture-1",
             "input": {"task": "Fixture eval", "context": ""},
             "expected": {"decompose": True, "reason": "parallel"},
         },
         "canaries": {
             "id": "fixture-canary-1",
+            "schema_version": 1,
+            "dataset_version": "fixture-1",
             "input": {"task": "Fixture canary", "context": ""},
             "expected": {"decompose": False, "reason": "atomic"},
             "canary": True,
@@ -259,8 +265,8 @@ def test_invalid_module_name_fails_closed_before_baseline_write(
     assert not (tmp_path / "target" / "baseline.json").exists()
 
 
-def test_invalid_split_schema_falls_back_to_combined_report_and_gate(
-    tmp_path, monkeypatch
+def test_split_version_drift_fallback_fails_gate(
+    tmp_path, monkeypatch, capsys
 ) -> None:
     import cambium.bench as bench
 
@@ -278,8 +284,10 @@ def test_invalid_split_schema_falls_back_to_combined_report_and_gate(
     datasets_dir = modules_dir / "fixture" / "datasets"
     invalid_split = {
         "id": "invalid-train-1",
+        "schema_version": 999,
+        "dataset_version": "0.0.0",
         "input": {"task": "Invalid split", "context": ""},
-        "expected": {"decompose": False},
+        "expected": {"decompose": False, "reason": "atomic"},
     }
     (datasets_dir / "train.jsonl").write_text(json.dumps(invalid_split) + "\n")
     combined = [
@@ -310,7 +318,11 @@ def test_invalid_split_schema_falls_back_to_combined_report_and_gate(
     assert baseline["dataset"]["records"] == 2
     assert baseline["canaries"]["total"] == 1
     assert "fell back to the combined file" in baseline["note"]
-    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+    output = capsys.readouterr().out
+    for split in bench.SPLITS:
+        assert f"DRIFT fixture_module: metric.{split}" in output
+    assert "legacy combined fallback was scored" in output
 
 
 def test_cli_timeout_fails_without_combined_fallback(tmp_path, monkeypatch, capsys) -> None:
@@ -658,7 +670,10 @@ def test_compare_combined_metric_delta_is_gated_for_fallback_reports() -> None:
     }
 
     assert compare_against_anchor(report, anchor) == [
-        ("metric.combined.mean", "1.0 -> 0.0 (drop 1.0000 > 0.05)")
+        ("metric.train", "split metric unavailable; legacy combined fallback was scored"),
+        ("metric.eval", "split metric unavailable; legacy combined fallback was scored"),
+        ("metric.canaries", "split metric unavailable; legacy combined fallback was scored"),
+        ("metric.combined.mean", "1.0 -> 0.0 (drop 1.0000 > 0.05)"),
     ]
 
 

@@ -25,6 +25,7 @@ from cambium.modules.base import load_module_manifest, run_module_cli  # noqa: E
 MODULE_DIR = ROOT / "src" / "cambium" / "modules" / "example"
 MANIFEST = load_module_manifest(MODULE_DIR, "example")
 DATASETS = MODULE_DIR / "datasets"
+META = DATASETS / "meta.json"
 FILES = {
     "train": DATASETS / "train.jsonl",
     "eval": DATASETS / "eval.jsonl",
@@ -149,6 +150,17 @@ def load_records(path: Path) -> list[dict]:
 
 
 def main() -> int:
+    meta = json.loads(META.read_text(encoding="utf-8"))
+    assert isinstance(meta, dict), "meta.json: not an object"
+    meta_schema_version = meta.get("schema_version")
+    meta_dataset_version = meta.get("dataset_version")
+    assert isinstance(meta_schema_version, int) and not isinstance(meta_schema_version, bool), (
+        "meta.json: schema_version must be an integer"
+    )
+    assert isinstance(meta_dataset_version, str) and meta_dataset_version, (
+        "meta.json: dataset_version must be a non-empty string"
+    )
+
     all_records: dict[str, list[dict]] = {}
     for split, path in FILES.items():
         records = load_records(path)
@@ -168,8 +180,13 @@ def main() -> int:
             rid = r["id"]
             for key, typ in ENVELOPE.items():
                 assert isinstance(r.get(key), typ), f"{split} {rid}: envelope.{key} bad/missing"
-            assert r["schema_version"] == 1, f"{rid}: schema_version != 1"
-            assert r["dataset_version"] == "1.0.0", f"{rid}: dataset_version != 1.0.0"
+            assert not isinstance(r["schema_version"], bool), f"{rid}: schema_version is boolean"
+            assert r["schema_version"] == meta_schema_version, (
+                f"{rid}: schema_version != meta.json ({meta_schema_version})"
+            )
+            assert r["dataset_version"] == meta_dataset_version, (
+                f"{rid}: dataset_version != meta.json ({meta_dataset_version})"
+            )
             assert r["split"] == split, f"{rid}: split field mismatch"
             assert r["license"] == "internal", f"{rid}: license"
             assert r["redacted"] is False, f"{rid}: redacted"
@@ -198,7 +215,10 @@ def main() -> int:
                     and len(rng) == 2
                     and all(isinstance(x, (int, float)) for x in rng)
                 )
-    print("envelope + module-schema checks passed")
+    print(
+        "envelope + module-schema checks passed "
+        f"(schema_version={meta_schema_version}, dataset_version={meta_dataset_version})"
+    )
 
     # --- uniqueness + cross-split leak check ---------------------------------
     task_ids: dict[tuple[str, str], str] = {}

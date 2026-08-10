@@ -171,6 +171,38 @@ def _is_canary(record: dict[str, Any]) -> bool:
     return record.get("canary", False) is True
 
 
+def _validate_split_versions(
+    split: str,
+    records: list[dict[str, Any]],
+    *,
+    schema_version: int | None,
+    dataset_version: object,
+) -> None:
+    """Reject split records whose versions do not match dataset metadata."""
+    if schema_version is None and dataset_version is None:
+        return
+    for index, record in enumerate(records, start=1):
+        record_schema = record.get("schema_version")
+        record_dataset = record.get("dataset_version")
+        schema_matches = (
+            schema_version is None
+            or (
+                isinstance(record_schema, int)
+                and not isinstance(record_schema, bool)
+                and record_schema == schema_version
+            )
+        )
+        dataset_matches = dataset_version is None or (
+            isinstance(record_dataset, str) and record_dataset == dataset_version
+        )
+        if schema_matches and dataset_matches:
+            continue
+        raise ModuleSplitError(
+            f"{split}.jsonl record {index}: version drift from meta.json "
+            f"(schema_version={record_schema!r}, dataset_version={record_dataset!r})"
+        )
+
+
 async def _predict(manifest: ModuleManifest, records: list[dict]) -> list[ScoredRecord]:
     """Evaluate raw records through the module's neutral subprocess boundary."""
     output = run_module_cli(
@@ -297,6 +329,12 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         for split in SPLITS:
             path = datasets_dir / f"{split}.jsonl"
             raw[split] = load_jsonl(path)
+            _validate_split_versions(
+                split,
+                raw[split],
+                schema_version=meta_schema,
+                dataset_version=dataset_version,
+            )
         for split in SPLITS:
             scored[split] = asyncio.run(_predict(manifest, raw[split]))
             metric[split] = score_examples(manifest, scored[split])
@@ -383,6 +421,8 @@ def compare_against_anchor(
     differs from the report's, so the two are not comparable and the caller
     must record a new anchor instead of failing (design §3: "the drift check
     compares only against the last baseline with the same dataset_version").
+    A report with unavailable split metrics still fails closed, even when its
+    dataset version is stale.
 
     Threshold precedence: run-level ``thresholds`` (e.g. from
     ``--bench-metric-delta``) override the anchor's stored
@@ -392,16 +432,27 @@ def compare_against_anchor(
     wall p90 fails when it exceeds ``anchor * wall_p90_ratio``; duplicate ids
     or cross-split leaks of any size and missing canaries always fail; a
     canary failure is a regression when it exceeds the anchor's count by more
-    than ``canary_failed_delta``.
+    than ``canary_failed_delta``; unavailable split metrics are regressions.
     """
+    report_metrics = report.get("metric") or {}
+    missing_split_regressions = [
+        (
+            f"metric.{split}",
+            "split metric unavailable; legacy combined fallback was scored",
+        )
+        for split in SPLITS
+        if not isinstance(report_metrics.get(split), dict)
+    ]
     if report.get("dataset_version") != anchor.get("dataset_version"):
+        if missing_split_regressions:
+            return missing_split_regressions
         return None  # stale anchor — re-anchor instead of comparing
 
     merged = dict(DEFAULT_THRESHOLDS)
     merged.update(anchor.get("drift_thresholds") or {})
     if thresholds:
         merged.update(thresholds)
-    regressions: list[tuple[str, str]] = []
+    regressions: list[tuple[str, str]] = missing_split_regressions
 
     metric_delta = merged["metric_mean_delta"]
     for split in SPLITS + ("combined",):
