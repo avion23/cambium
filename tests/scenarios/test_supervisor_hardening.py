@@ -325,6 +325,37 @@ def test_generation_survives_crash_after_worktree_clean(
     assert not validate_worker_generation(worktree, 1)
 
 
+def test_worktree_registration_requires_an_exact_path_match(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    registered_extra = session_dir / "wt-task-extra"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-task-extra",
+         str(registered_extra), base],
+        check=True,
+        capture_output=True,
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "task",
+        worker=CRASH_ONCE_WORKER,
+        gate="true",
+        max_restarts=1,
+        max_wall_s=5.0,
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    assert result.results[0].status == "succeeded"
+    assert result.results[0].restarts == 1
+    events = read_events(session_dir)
+    assert [event["generation"] for event in _kinds(events, "spawned")] == [1, 2]
+    assert (registered_extra / "hello.txt").read_text(encoding="utf-8") == "hello\n"
+
+
 def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

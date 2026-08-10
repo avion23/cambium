@@ -1167,6 +1167,16 @@ class _Runtime:
         result = await self._git(path, *args, check=check)
         return result.stdout.strip() or None
 
+    @staticmethod
+    def _registered_worktree_paths(listing: str) -> set[Path]:
+        paths: set[Path] = set()
+        for entry in listing.split("\n\n"):
+            for line in entry.splitlines():
+                if line.startswith("worktree "):
+                    paths.add(Path(line.removeprefix("worktree ")).resolve())
+                    break
+        return paths
+
     # -- worktree lifecycle --------------------------------------------------
 
     async def _ensure_worktree(self, spec: dict[str, Any]) -> int:
@@ -1182,7 +1192,7 @@ class _Runtime:
         base = spec["base_commit"]
         await self._git(repo, "worktree", "prune", check=False)
         listing = await self._git_stdout(repo, "worktree", "list", "--porcelain") or ""
-        if str(worktree) in listing:
+        if worktree in self._registered_worktree_paths(listing):
             return await self._recover_worktree_locked(spec, generation)
         stale_generation = 0
         if worktree.exists():
