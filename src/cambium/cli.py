@@ -63,16 +63,9 @@ def _build_parser() -> argparse.ArgumentParser:
         mode_parser.add_argument("--bench-metric-delta", type=float, metavar="FLOAT")
         mode_parser.add_argument("--bench-wall-ratio", type=float, metavar="FLOAT")
 
-    tasktree = commands.add_parser(
+    commands.add_parser(
         "tasktree",
         help="read a plan from a file or stdin and print its topological order",
-        description="Read one task plan JSON object from PLAN or stdin and run tasktree.",
-    )
-    tasktree.add_argument(
-        "plan",
-        nargs="?",
-        metavar="PLAN",
-        help="path to a plan JSON file; omit or use '-' to read stdin",
     )
     commands.add_parser("version", help="print the Cambium version")
     return parser
@@ -132,7 +125,13 @@ def _run_bench(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Dispatch one unified Cambium CLI invocation and return its exit code."""
-    args = _build_parser().parse_args(argv)
+    command_line = sys.argv[1:] if argv is None else argv
+    if command_line and command_line[0] == "tasktree":
+        from . import tasktree
+
+        return tasktree.main(command_line[1:])
+
+    args = _build_parser().parse_args(command_line)
 
     if args.command == "supervisor":
         return _run_supervisor(args)
@@ -140,10 +139,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_doctor(args)
     if args.command == "bench":
         return _run_bench(args)
-    if args.command == "tasktree":
-        from . import tasktree
-
-        return tasktree.main([] if args.plan is None else [args.plan])
     if args.command == "version":
         print(__version__)
         return 0

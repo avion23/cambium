@@ -503,12 +503,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the tasktree CLI from a JSON file or stdin.
 
-    With no plan argument, an empty stdin stream prints help so a package-level
-    module smoke invocation is useful. A non-empty stdin stream remains the
-    D8a pipe contract used by ``cambium tasktree`` and existing callers.
+    With no plan argument and a TTY stdin, print help without reading stdin. A
+    non-TTY stdin remains the D8a pipe contract used by ``cambium tasktree``
+    and existing callers; an empty piped stream also prints help. ``-`` always
+    reads stdin explicitly.
     """
     parser = _build_cli_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.plan is None and sys.stdin.isatty():
+        parser.print_help()
+        return 0
 
     if args.plan is None or args.plan == "-":
         payload = sys.stdin.buffer.read()

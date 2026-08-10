@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import pty
 import subprocess
 import sys
 from pathlib import Path
@@ -431,6 +432,20 @@ def _run_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _run_unified_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
+    return subprocess.run(
+        [sys.executable, "-m", "cambium.cli", "tasktree", *args],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+        timeout=120,
+    )
+
+
 def test_cli_prints_topological_order_json_lines() -> None:
     plan = _plan([
         ("r", "FEATURE", []),
@@ -465,6 +480,67 @@ def test_cli_no_args_prints_help_for_empty_stdin() -> None:
     assert result.stdout.startswith("usage: python -m cambium.tasktree")
     assert "PLAN" in result.stdout
     assert result.stderr == ""
+
+
+def test_cli_no_args_prints_help_without_waiting_on_tty() -> None:
+    master_fd, slave_fd = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "cambium.tasktree"],
+            stdin=slave_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    filter(None, [SRC_DIR, os.environ.get("PYTHONPATH")])
+                ),
+            },
+            cwd=str(REPO_ROOT),
+        )
+    finally:
+        os.close(slave_fd)
+
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            pytest.fail("no-argument tasktree CLI blocked on TTY stdin")
+    finally:
+        os.close(master_fd)
+
+    assert process.returncode == 0
+    assert stdout.startswith("usage: python -m cambium.tasktree")
+    assert "PLAN" in stdout
+    assert stderr == ""
+
+
+def test_cli_entry_points_share_help_and_extra_argument_errors() -> None:
+    module_help = _run_cli("", "--help")
+    unified_help = _run_unified_cli("", "--help")
+
+    assert unified_help.returncode == module_help.returncode == 0
+    assert unified_help.stdout == module_help.stdout
+    assert unified_help.stderr == module_help.stderr == ""
+
+    module_extra = _run_cli("", "plan.json", "extra")
+    unified_extra = _run_unified_cli("", "plan.json", "extra")
+
+    assert unified_extra.returncode == module_extra.returncode == 2
+    assert unified_extra.stdout == module_extra.stdout == ""
+    assert unified_extra.stderr == module_extra.stderr
+    assert "unrecognized arguments: extra" in unified_extra.stderr
+
+
+def test_cli_rejects_invalid_json_from_stdin() -> None:
+    result = _run_cli("{")
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "tasktree: invalid JSON in stdin" in result.stderr
 
 
 def test_cli_bad_plan_argument_exits_two_with_stderr(tmp_path: Path) -> None:
