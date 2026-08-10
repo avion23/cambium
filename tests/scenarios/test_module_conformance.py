@@ -218,6 +218,45 @@ def test_offline_child_denies_shell_network_client() -> None:
     assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "p=/usr/bin/curl;$p -fsS {url}",
+        (
+            "p={python};flag=-I;a=ur;b=llib.request;"
+            "$p $flag -c \"import $a$b;$a$b.urlopen('{url}')\""
+        ),
+    ],
+    ids=["expanded-curl", "reconstructed-python-urllib"],
+)
+def test_offline_shell_expansion_cannot_reach_network(command: str) -> None:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/"
+    shell_command = command.format(url=url, python=sys.executable)
+    probe = (
+        "import subprocess; "
+        f"subprocess.run({shell_command!r}, shell=True, check=True)"
+    )
+    try:
+        with module_conformance.module_offline_environment() as env:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                env=env,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.returncode != 0
+
+
 def test_offline_child_inherits_provider_import_blocker() -> None:
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
@@ -233,7 +272,27 @@ def test_offline_child_inherits_provider_import_blocker() -> None:
     assert "provider import blocked by module conformance: cambium.provider_config" in result.stderr
 
 
-@pytest.mark.parametrize("flag", ["-E", "-S"])
+def test_offline_grandchild_cannot_remove_provider_blocker_with_empty_env() -> None:
+    probe = (
+        "import subprocess, sys; "
+        "subprocess.run([sys.executable, '-c', 'import cambium.provider_config'], "
+        "env={}, check=True)"
+    )
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    assert "provider import blocked by module conformance: cambium.provider_config" in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["-E", "-S", "-I"])
 def test_offline_child_rejects_python_flags_that_bypass_provider_blocker(flag: str) -> None:
     probe = (
         "import subprocess, sys; "
@@ -366,19 +425,53 @@ def test_baseline_rejects_foreign_test_nodeid(monkeypatch) -> None:
     assert "test nodeid does not belong to this module's tests" in message
 
 
+def test_baseline_rejects_foreign_path_containing_module_prefix(monkeypatch) -> None:
+    name = _one_discovered_module()
+
+    def change(baseline: dict) -> None:
+        baseline["tests"]["by_nodeid"] = {
+            f"foreign/modules/{name}/tests/test_{name}_module.py::test_injected": 0.1
+        }
+        baseline["tests"]["count"] = 1
+
+    message = _validate_with_baseline_change(monkeypatch, change)
+
+    assert "test nodeid does not belong to this module's tests" in message
+
+
 def test_installed_package_ignores_unrelated_git_and_normalizes_nodeids(
     tmp_path: Path,
 ) -> None:
     checkout = tmp_path / "unrelated"
     checkout.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
-    site = checkout / ".venv" / "lib" / "python3.14" / "site-packages"
-    package = site / "cambium"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    shutil.copy2(module_conformance.PACKAGE_ROOT / "module_conformance.py", package)
-    shutil.copy2(module_conformance.PACKAGE_ROOT / "bench.py", package)
-    shutil.copytree(module_conformance.MODULES_DIR, package / "modules")
+    site = tmp_path / "site-packages"
+    dist = tmp_path / "dist"
+    uv = shutil.which("uv")
+    assert uv is not None
+    subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(dist)],
+        cwd=module_conformance.REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheel = next(dist.glob("cambium-*.whl"))
+    subprocess.run(
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            str(site),
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     probe = """
 import json
 from cambium import module_conformance as m
@@ -438,6 +531,7 @@ print(json.dumps({
     assert result.returncode == 0, result.stderr
     observed = json.loads(result.stdout)
     assert observed["repo_root"] == observed["package_root"]
+    assert Path(observed["package_root"]).is_relative_to(site)
     assert observed["tracked_are_wheel_paths"] is True
     assert observed["resources_exist"] is True
     assert observed["committed_foreign_count"] == 182

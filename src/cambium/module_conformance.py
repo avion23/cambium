@@ -561,11 +561,12 @@ def _baseline_fact_findings(
 
 def _module_relative_path(path: Path, spec: ModuleSpec) -> str | None:
     """Normalize source and wheel paths relative to one module package."""
-    parts = path.parts
-    for index, part in enumerate(parts[:-1]):
-        if part == "modules" and parts[index + 1] == spec.name:
-            relative = parts[index + 2 :]
-            return Path(*relative).as_posix() if relative else "."
+    prefixes = (_module_prefix(spec.name), Path("src/cambium/modules") / spec.name)
+    for prefix in prefixes:
+        try:
+            return path.relative_to(prefix).as_posix()
+        except ValueError:
+            continue
     try:
         return _resource_path(path).relative_to(spec.path).as_posix()
     except ValueError:
@@ -1286,9 +1287,10 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
 
     The parent pytest process uses an audit hook, but audit hooks do not cross
     ``fork``/``exec``.  A temporary ``sitecustomize`` blocks Python socket
-    clients in child interpreters, and command shims reject common external
-    clients such as ``curl``.  The temporary directory is removed as soon as
-    the subprocess tree exits.
+    clients and provider imports in child interpreters.  It starts each native
+    subprocess tree under ``strace`` syscall injection so shells and their
+    expanded commands cannot connect either.  The temporary directory is
+    removed as soon as the subprocess tree exits.
     """
     with tempfile.TemporaryDirectory(prefix="cambium-module-offline-") as root:
         offline_root = Path(root)
@@ -1303,6 +1305,10 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "import sys\n"
             "\n"
             f"_PROVIDERS = {provider_imports}\n"
+            "_REQUIRED_ENV = {key: os.environ[key] for key in (\n"
+            "    'CAMBIUM_MODULE_OFFLINE', 'PATH', 'PYTHONPATH'\n"
+            ") if key in os.environ}\n"
+            "_STRACE = shutil.which('strace')\n"
             "_NETWORK_CLIENTS = frozenset((\n"
             "    'curl', 'wget', 'http', 'https', 'nc', 'netcat', 'ncat', 'ssh'\n"
             "))\n"
@@ -1367,6 +1373,27 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "                return argument\n"
             "    return None\n"
             "\n"
+            "def _traced_command(args, executable, shell):\n"
+            "    if _STRACE is None:\n"
+            "        raise RuntimeError('strace is required for module conformance isolation')\n"
+            "    if shell:\n"
+            "        target = [executable or '/bin/sh', '-c']\n"
+            "        if isinstance(args, (list, tuple)):\n"
+            "            target.extend(os.fsdecode(value) for value in args)\n"
+            "        else:\n"
+            "            target.append(os.fsdecode(args))\n"
+            "    elif isinstance(args, (list, tuple)):\n"
+            "        target = list(args)\n"
+            "        if executable is not None:\n"
+            "            target[0] = executable\n"
+            "    else:\n"
+            "        target = [executable or args]\n"
+            "    return [\n"
+            "        _STRACE, '-f', '-qq', '-o', os.devnull,\n"
+            "        '-e', 'trace=connect', '-e', 'inject=connect:error=EPERM',\n"
+            "        '--', *target,\n"
+            "    ]\n"
+            "\n"
             "_popen_init = subprocess.Popen.__init__\n"
             "def _offline_popen(self, args, *pargs, **kwargs):\n"
             "    tokens = _command_tokens(args, kwargs.get('executable'))\n"
@@ -1380,6 +1407,14 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "        raise PermissionError(\n"
             "            'isolated Python flag denied during module conformance: ' + unsafe_flag\n"
             "        )\n"
+            "    child_env = dict(kwargs.get('env') or os.environ)\n"
+            "    child_env.update(_REQUIRED_ENV)\n"
+            "    if os.environ.get('CAMBIUM_MODULE_TRACED') != '1':\n"
+            "        args = _traced_command(\n"
+            "            args, kwargs.pop('executable', None), kwargs.pop('shell', False)\n"
+            "        )\n"
+            "        child_env['CAMBIUM_MODULE_TRACED'] = '1'\n"
+            "    kwargs['env'] = child_env\n"
             "    return _popen_init(self, args, *pargs, **kwargs)\n"
             "\n"
             "sys.meta_path.insert(0, _ProviderBlocker())\n"
