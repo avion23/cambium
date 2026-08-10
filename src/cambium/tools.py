@@ -8,18 +8,25 @@ approval, linting, and resource controls out of process-global state.
 from __future__ import annotations
 
 import asyncio
+import json
+import keyword
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from concurrent.futures import Executor, Future
+from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Lock, Thread, current_thread
 from typing import Any
 
+from . import ast_tools
 from .approval import ApprovalGate
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
@@ -33,6 +40,7 @@ except ImportError:  # pragma: no cover - supports reduced installations.
 MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
+GET_SIGNATURE_READ_TIMEOUT_S = 1.0
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
 
@@ -45,9 +53,40 @@ class ToolContext:
     approval: ApprovalGate | None = None
     lint: LintDiag | None = None
     compile_gate: Any | None = None
+    _root: Path = field(init=False, repr=False)
+    _root_fd: int | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
-        self.cwd = Path(self.cwd).resolve()
+        root = Path(self.cwd).resolve()
+        self.cwd = root
+        self._root = root
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        self._root_fd = os.open(root, flags)
+
+    def close(self) -> None:
+        root_fd = self._root_fd
+        self._root_fd = None
+        if root_fd is not None:
+            os.close(root_fd)
+
+    def __enter__(self) -> ToolContext:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        root_fd = getattr(self, "_root_fd", None)
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +111,77 @@ class _ToolFailure(Exception):
 
 
 ToolImplementation = Callable[[dict[str, Any], ToolContext], Awaitable[_Outcome]]
+_DaemonWorkItem = tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]] | None
+
+
+class _DaemonSingleThreadExecutor(Executor):
+    """Run one blocking operation without joining it during loop shutdown.
+
+    The executor is one-shot and owns a daemon worker.  A timed-out read calls
+    ``shutdown(wait=False)``, so ``asyncio.run`` does not wait for a blocked
+    system call and the worker cannot consume the event loop's shared default
+    executor.  The daemon thread can remain until the underlying call returns;
+    this is the deliberate tradeoff for protecting the caller from an
+    uninterruptible regular-file read.
+    """
+
+    def __init__(self) -> None:
+        self._work_queue: Queue[_DaemonWorkItem] = Queue()
+        self._shutdown_lock = Lock()
+        self._shutdown = False
+        self._thread = Thread(
+            target=self._worker,
+            name="cambium-get-signature-read",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule work after executor shutdown")
+            self._work_queue.put((future, fn, args, kwargs))
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            work_item = self._work_queue.get()
+            if work_item is None:
+                return
+            future, fn, args, kwargs = work_item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        work_item = self._work_queue.get_nowait()
+                    except Empty:
+                        break
+                    if work_item is not None:
+                        work_item[0].cancel()
+            self._work_queue.put(None)
+
+        if wait and current_thread() is not self._thread:
+            self._thread.join()
 
 
 def _duration_ms(started_ns: int) -> int:
@@ -91,16 +201,83 @@ def _truncate_text(text: str, limit: int, marker: str) -> str:
     return _truncate_bytes(text.encode("utf-8"), limit, marker)
 
 
+def _serialize_signature_result(result: dict[str, Any]) -> str:
+    def serialize(value: dict[str, Any]) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    output = serialize(result)
+    if len(output.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return output
+
+    envelope = {**result, "signature": "", "truncated": True}
+    if len(serialize(envelope).encode("utf-8")) > MAX_OUTPUT_BYTES:
+        return serialize(
+            {"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True}
+        )
+
+    signature = result["signature"]
+    low = 0
+    high = len(signature)
+    best_signature = ""
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = signature[:midpoint] + OUTPUT_TRUNCATION_MARKER
+        envelope["signature"] = candidate
+        if len(serialize(envelope).encode("utf-8")) <= MAX_OUTPUT_BYTES:
+            best_signature = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+
+    if not best_signature:
+        return serialize(
+            {"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True}
+        )
+    envelope["signature"] = best_signature
+    return serialize(envelope)
+
+
 def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
-    root = Path(ctx.cwd).resolve()
+    root = ctx._root
     candidate = (root / raw_path).resolve()
     if not candidate.is_relative_to(root):
         raise _ToolFailure(f"path escapes worktree: {raw_path!r}")
     return candidate
 
 
+def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
+    """Open a resolved worktree path without following a replacement symlink."""
+    root = ctx._root
+    try:
+        components = path.relative_to(root).parts
+    except ValueError as exc:
+        raise _ToolFailure(f"path escapes worktree: {path!r}") from exc
+    if not components:
+        raise IsADirectoryError(path)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblocking = getattr(os, "O_NONBLOCK", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_flags = os.O_RDONLY | nofollow | directory | close_on_exec
+    file_flags = os.O_RDONLY | nofollow | nonblocking | close_on_exec
+
+    root_fd = ctx._root_fd
+    if root_fd is None:
+        raise _ToolFailure("worktree context is closed")
+    directory_fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            next_directory_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_directory_fd
+        return os.open(components[-1], file_flags, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _display_path(ctx: ToolContext, path: Path) -> str:
-    relative = path.relative_to(Path(ctx.cwd).resolve())
+    relative = path.relative_to(ctx._root)
     return relative.as_posix() or "."
 
 
@@ -287,6 +464,81 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=True, output=result.stdout)
 
 
+def _read_and_extract_signature(
+    ctx: ToolContext, path: Path, display_path: str, symbol: str
+) -> dict[str, Any] | None:
+    descriptor: int | None = None
+    try:
+        descriptor = _open_confined_read_fd(ctx, path)
+        mode = os.fstat(descriptor).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(path)
+        if not stat.S_ISREG(mode):
+            raise _ToolFailure(f"path is not a regular file: {display_path}")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_READ_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise _ToolFailure(f"file not found: {display_path}") from exc
+    except IsADirectoryError as exc:
+        raise _ToolFailure(f"path is a directory: {display_path}") from exc
+    except OSError as exc:
+        raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if len(raw) > MAX_READ_BYTES:
+        raise _ToolFailure(
+            f"get_signature source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): "
+            f"{display_path}"
+        )
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ToolFailure(f"file is not valid UTF-8: {display_path}") from exc
+    return ast_tools.extract_signature(source, symbol)
+
+
+async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    raw_path = args["path"]
+    if not raw_path.strip() or "\x00" in raw_path:
+        raise _ToolFailure("get_signature path must be a non-empty path")
+    path = _confined_path(ctx, raw_path)
+
+    symbol = args["symbol"]
+    if not symbol.isidentifier() or keyword.iskeyword(symbol):
+        raise _ToolFailure("get_signature symbol must be a Python identifier")
+
+    display_path = _display_path(ctx, path)
+    executor = _DaemonSingleThreadExecutor()
+    try:
+        signature = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                executor,
+                _read_and_extract_signature, ctx, path, display_path, symbol
+            ),
+            timeout=GET_SIGNATURE_READ_TIMEOUT_S,
+        )
+    except TimeoutError as exc:
+        raise _ToolFailure(
+            f"get_signature read timed out after {GET_SIGNATURE_READ_TIMEOUT_S}s: "
+            f"{display_path}"
+        ) from exc
+    except SyntaxError as exc:
+        location = f" at line {exc.lineno}" if exc.lineno is not None else ""
+        raise _ToolFailure(
+            f"could not parse {display_path}{location}: {exc.msg}"
+        ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    if signature is None:
+        raise _ToolFailure(f"symbol not found: {symbol!r} in {display_path}")
+
+    result = {"path": display_path, **signature}
+    return _Outcome(ok=True, output=_serialize_signature_result(result))
+
+
 def _process_output(stdout: Any, stderr: Any) -> str:
     standard_output = (
         stdout.decode("utf-8", errors="replace")
@@ -427,6 +679,7 @@ TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "write_file": _write_file,
     "edit_file": _edit_file,
     "grep_code": _grep_code,
+    "get_signature": _get_signature,
     "git_op": _git_op,
     "run_shell": _run_shell,
 }

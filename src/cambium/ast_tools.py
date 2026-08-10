@@ -19,6 +19,7 @@ That index belongs to the workspace-aware v2.1 tooling layer.
 from __future__ import annotations
 
 import ast as _stdlib_ast
+import unicodedata
 from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -157,6 +158,21 @@ def _tree_parser() -> Any:
     return _TreeSitterParser(_TREE_SITTER_LANGUAGE)
 
 
+def _tree_root(index: _SourceIndex) -> Any:
+    root = _tree_parser().parse(index.encoded).root_node
+    if root.has_error:
+        try:
+            _stdlib_ast.parse(index.source)
+        except SyntaxError:
+            raise
+        raise SyntaxError("tree-sitter reported a parse error")
+    return root
+
+
+def _normalize_name(name: str) -> str:
+    return unicodedata.normalize("NFKC", name)
+
+
 def _tree_walk(node: Any) -> Iterator[Any]:
     stack = list(reversed(node.named_children))
     while stack:
@@ -179,7 +195,7 @@ def _tree_definition(index: _SourceIndex, node: Any) -> _Definition:
     name_node = node.child_by_field_name("name")
     if name_node is None:
         raise ValueError(f"definition has no name: {node.type}")
-    name = index.decode(name_node.start_byte, name_node.end_byte)
+    name = _normalize_name(index.decode(name_node.start_byte, name_node.end_byte))
     kind = "class" if node.type == "class_definition" else "function"
     body_node = node.child_by_field_name("body")
     if body_node is None:
@@ -205,7 +221,7 @@ def _tree_definitions(root: Any, index: _SourceIndex) -> list[_Definition]:
 
 def _find_definitions_tree(source: str, path: str = "") -> list[dict[str, Any]]:
     index = _SourceIndex.from_source(source)
-    root = _tree_parser().parse(index.encoded).root_node
+    root = _tree_root(index)
     definitions: list[dict[str, Any]] = []
     for node in root.named_children:
         definition_node = _tree_definition_node(node)
@@ -220,26 +236,28 @@ def _find_definitions_tree(source: str, path: str = "") -> list[dict[str, Any]]:
 
 def _find_references_tree(source: str, name: str) -> list[dict[str, Any]]:
     index = _SourceIndex.from_source(source)
-    root = _tree_parser().parse(index.encoded).root_node
+    root = _tree_root(index)
+    normalized_name = _normalize_name(name)
     references: list[dict[str, Any]] = []
     for node in _tree_walk(root):
         if node.type != "identifier":
             continue
-        if index.decode(node.start_byte, node.end_byte) != name:
+        if _normalize_name(index.decode(node.start_byte, node.end_byte)) != normalized_name:
             continue
         line, column = index.position(node.start_byte)
-        references.append({"name": name, "line": line, "col": column})
+        references.append({"name": normalized_name, "line": line, "col": column})
     references.sort(key=lambda reference: (reference["line"], reference["col"]))
     return references
 
 
 def _extract_signature_tree(source: str, name: str) -> dict[str, Any] | None:
     index = _SourceIndex.from_source(source)
-    root = _tree_parser().parse(index.encoded).root_node
+    root = _tree_root(index)
+    normalized_name = _normalize_name(name)
     definitions = _tree_definitions(root, index)
     definitions.sort(key=lambda definition: definition.start_byte)
     for definition in definitions:
-        if definition.name == name:
+        if definition.name == normalized_name:
             return _signature_result(index, definition)
     return None
 
@@ -270,7 +288,7 @@ def _ast_definition(index: _SourceIndex, node: _stdlib_ast.AST) -> _Definition:
         signature = _line_text(index, node.lineno).strip()  # type: ignore[attr-defined]
         body_lines = 0
     return _Definition(
-        node.name,  # type: ignore[attr-defined]
+        _normalize_name(node.name),  # type: ignore[attr-defined]
         kind,
         start_byte,
         index.byte_offset(node.end_lineno, node.end_col_offset),  # type: ignore[attr-defined]
@@ -319,15 +337,19 @@ def _attribute_position(index: _SourceIndex, node: _stdlib_ast.Attribute) -> tup
 def _find_references_stdlib(source: str, name: str) -> list[dict[str, Any]]:
     index = _SourceIndex.from_source(source)
     tree = _stdlib_ast.parse(source)
+    normalized_name = _normalize_name(name)
     references: list[dict[str, Any]] = []
     for node in _stdlib_ast.walk(tree):
-        if isinstance(node, _stdlib_ast.Name) and node.id == name:
+        if isinstance(node, _stdlib_ast.Name) and _normalize_name(node.id) == normalized_name:
             line, column = index.position(_ast_start_byte(index, node))
-        elif isinstance(node, _stdlib_ast.Attribute) and node.attr == name:
+        elif (
+            isinstance(node, _stdlib_ast.Attribute)
+            and _normalize_name(node.attr) == normalized_name
+        ):
             line, column = _attribute_position(index, node)
         else:
             continue
-        references.append({"name": name, "line": line, "col": column})
+        references.append({"name": normalized_name, "line": line, "col": column})
     references.sort(key=lambda reference: (reference["line"], reference["col"]))
     return references
 
@@ -335,8 +357,9 @@ def _find_references_stdlib(source: str, name: str) -> list[dict[str, Any]]:
 def _extract_signature_stdlib(source: str, name: str) -> dict[str, Any] | None:
     index = _SourceIndex.from_source(source)
     tree = _stdlib_ast.parse(source)
+    normalized_name = _normalize_name(name)
     for definition in _ast_all_definitions(tree, index):
-        if definition.name == name:
+        if definition.name == normalized_name:
             return _signature_result(index, definition)
     return None
 
