@@ -3,7 +3,9 @@
 ``DEFAULT_SAMPLE`` documents the JSON shape without creating or writing a
 configuration file. Provider files contain API-key environment variable names
 only. The values are deliberately not inspected while loading; Diffundo reads
-them from the environment when it makes a call.
+them from the environment when it makes a call. The optional ``required`` flag
+is doctor metadata: it defaults to ``False`` so a missing key is a warning;
+``cambium doctor`` reports a missing key as a failure only when it is ``True``.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -28,6 +30,7 @@ _PROVIDER_FIELDS = frozenset(
         "tier",
         "base_url",
         "api_key_env",
+        "required",
         "timeout_s",
         "max_retries",
         "rpm",
@@ -43,6 +46,7 @@ _DEFAULTS: dict[str, object] = {
     "max_retries": 2,
     "rpm": 60,
     "enabled": True,
+    "required": False,
     "model": "",
     "priority": 0,
     "cooldown_s": 60.0,
@@ -57,6 +61,7 @@ DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
             "tier": "strong",
             "base_url": "https://api.openai.com/v1",
             "api_key_env": "OPENAI_API_KEY",
+            "required": False,
             "timeout_s": 30.0,
             "max_retries": 2,
             "rpm": 60,
@@ -71,6 +76,7 @@ DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
             "tier": "fast",
             "base_url": "http://127.0.0.1:8080/v1",
             "api_key_env": "LOCAL_LLM_API_KEY",
+            "required": False,
             "timeout_s": 30.0,
             "max_retries": 0,
             "rpm": 120,
@@ -82,6 +88,17 @@ DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
         },
     ]
 }
+
+_VALID_TIERS = frozenset({"fast", "balanced", "strong", "reasoning"})
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEnvSpec:
+    """Validated provider fields needed by environment diagnostics."""
+
+    name: str
+    api_key_env: str
+    required: bool
 
 
 def _error(location: str, message: str) -> ValueError:
@@ -133,8 +150,7 @@ def _diffundo_types() -> tuple[type[ProviderConfig], type[ProviderTier]]:
     return ProviderConfig, ProviderTier
 
 
-def _provider_from_mapping(raw: object, index: int) -> ProviderConfig:
-    ProviderConfig, ProviderTier = _diffundo_types()
+def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     location = f"providers[{index}]"
     if not isinstance(raw, dict):
         raise _error(location, "must be an object")
@@ -156,13 +172,9 @@ def _provider_from_mapping(raw: object, index: int) -> ProviderConfig:
     tier_value = raw["tier"]
     if not isinstance(tier_value, str):
         raise _error(f"{location}.tier", "must be a tier name")
-    try:
-        tier = ProviderTier(tier_value)
-    except ValueError as exc:
-        choices = ", ".join(member.value for member in ProviderTier)
-        raise _error(
-            f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}"
-        ) from exc
+    if tier_value not in _VALID_TIERS:
+        choices = ", ".join(sorted(_VALID_TIERS))
+        raise _error(f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}")
 
     base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
     api_key_env = _validate_api_key_env(raw["api_key_env"], f"{location}.api_key_env")
@@ -184,6 +196,10 @@ def _provider_from_mapping(raw: object, index: int) -> ProviderConfig:
     if not isinstance(enabled, bool):
         raise _error(f"{location}.enabled", "must be a boolean")
 
+    required = values["required"]
+    if not isinstance(required, bool):
+        raise _error(f"{location}.required", "must be a boolean")
+
     model = _require_string(values["model"], f"{location}.model")
     priority = _require_integer(values["priority"], f"{location}.priority")
 
@@ -195,11 +211,12 @@ def _provider_from_mapping(raw: object, index: int) -> ProviderConfig:
     if price < 0:
         raise _error(f"{location}.price", "must not be negative")
 
-    config_values: dict[str, object] = {
+    return {
         "name": name,
-        "tier": tier,
+        "tier": tier_value,
         "base_url": base_url,
         "api_key_env": api_key_env,
+        "required": required,
         "timeout_s": timeout_s,
         "max_retries": max_retries,
         "rpm": rpm,
@@ -207,7 +224,75 @@ def _provider_from_mapping(raw: object, index: int) -> ProviderConfig:
         "model": model,
         "priority": priority,
         "cooldown_s": cooldown_s,
+        "price": price,
     }
+
+
+def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, dict):
+        raise _error("root", "must be an object with a 'providers' field")
+
+    unknown = sorted(set(raw) - _TOP_LEVEL_FIELDS)
+    if unknown:
+        raise _error("root", f"unknown field(s): {', '.join(map(repr, unknown))}")
+
+    entries = raw.get("providers")
+    if not isinstance(entries, list):
+        raise _error("providers", "must be a list")
+
+    mappings: list[dict[str, object]] = []
+    names: set[str] = set()
+    for index, entry in enumerate(entries):
+        mapping = _validate_provider_mapping(entry, index)
+        name = mapping["name"]
+        if not isinstance(name, str):  # _validate_provider_mapping guarantees this.
+            raise TypeError("validated provider name is not a string")
+        if name in names:
+            raise _error(f"providers[{index}].name", f"duplicate provider name {name!r}")
+        names.add(name)
+        mappings.append(mapping)
+    return mappings
+
+
+def validate_provider_specs(raw: object) -> tuple[ProviderEnvSpec, ...]:
+    """Validate a provider document without importing the Diffundo router."""
+
+    return tuple(
+        ProviderEnvSpec(
+            name=mapping["name"],
+            api_key_env=mapping["api_key_env"],
+            required=mapping["required"],
+        )
+        for mapping in _validated_provider_mappings(raw)
+    )
+
+
+def _provider_from_values(values: dict[str, object], index: int) -> ProviderConfig:
+    ProviderConfig, ProviderTier = _diffundo_types()
+    location = f"providers[{index}]"
+    tier_value = values["tier"]
+    try:
+        tier = ProviderTier(tier_value)
+    except ValueError as exc:
+        choices = ", ".join(member.value for member in ProviderTier)
+        raise _error(
+            f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}"
+        ) from exc
+
+    config_values: dict[str, object] = {
+        "name": values["name"],
+        "tier": tier,
+        "base_url": values["base_url"],
+        "api_key_env": values["api_key_env"],
+        "timeout_s": values["timeout_s"],
+        "max_retries": values["max_retries"],
+        "rpm": values["rpm"],
+        "enabled": values["enabled"],
+        "model": values["model"],
+        "priority": values["priority"],
+        "cooldown_s": values["cooldown_s"],
+    }
+    price = values["price"]
     provider_fields = {field.name for field in fields(ProviderConfig)}
     if "price" in provider_fields:
         config_values["price"] = price
@@ -240,6 +325,12 @@ def _read_config(source: str | Path | None) -> object:
         raise ValueError(f"invalid provider config JSON in {path}: {exc}") from exc
 
 
+def load_provider_specs(source: str | Path | None = None) -> tuple[ProviderEnvSpec, ...]:
+    """Load and validate provider environment metadata without Diffundo."""
+
+    return validate_provider_specs(_read_config(source))
+
+
 def load_providers(source: str | Path | None = None) -> list[ProviderConfig]:
     """Load and strictly validate providers from a JSON configuration file.
 
@@ -248,31 +339,18 @@ def load_providers(source: str | Path | None = None) -> list[ProviderConfig]:
     presence of each ``api_key_env`` variable is intentionally not checked;
     Diffundo resolves key values at call time.
     """
-    raw = _read_config(source)
-    if not isinstance(raw, dict):
-        raise _error("root", "must be an object with a 'providers' field")
-
-    unknown = sorted(set(raw) - _TOP_LEVEL_FIELDS)
-    if unknown:
-        raise _error("root", f"unknown field(s): {', '.join(map(repr, unknown))}")
-
-    entries = raw.get("providers")
-    if not isinstance(entries, list):
-        raise _error("providers", "must be a list")
-
+    mappings = _validated_provider_mappings(_read_config(source))
     providers: list[ProviderConfig] = []
-    names: set[str] = set()
-    for index, entry in enumerate(entries):
-        provider = _provider_from_mapping(entry, index)
-        if provider.name in names:
-            raise _error(f"providers[{index}].name", f"duplicate provider name {provider.name!r}")
-        names.add(provider.name)
-        providers.append(provider)
+    for index, mapping in enumerate(mappings):
+        providers.append(_provider_from_values(mapping, index))
 
     return providers
 
 
-def env_report(providers: list[ProviderConfig] | tuple[ProviderConfig, ...]) -> dict[str, bool]:
+def env_report(
+    providers: list[ProviderConfig | ProviderEnvSpec]
+    | tuple[ProviderConfig | ProviderEnvSpec, ...]
+) -> dict[str, bool]:
     """Return whether each provider's key environment variable is present.
 
     The report contains only provider names and booleans. It never returns an
@@ -291,4 +369,13 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["DEFAULT_SAMPLE", "ProviderConfig", "ProviderTier", "env_report", "load_providers"]
+__all__ = [
+    "DEFAULT_SAMPLE",
+    "ProviderConfig",
+    "ProviderEnvSpec",
+    "ProviderTier",
+    "env_report",
+    "load_provider_specs",
+    "load_providers",
+    "validate_provider_specs",
+]
