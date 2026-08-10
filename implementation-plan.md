@@ -1,17 +1,17 @@
 # Implementation Plan (TRANSIENT — delete when implementation is done)
 
-Status: 2026-08-10 (pre-compaction snapshot). Orchestrator-owned. This file is the DECISION LOG + CONTEXT MAP.
+Status: 2026-08-10 (post-main-merge baseline refresh). Orchestrator-owned. This file is the DECISION LOG + CONTEXT MAP.
 Orientation: docs/research/README.md (tiered index) → docs/architecture/architecture.md (final v2) → agents.md.
 
 ## Context map (where everything lives)
 - Final design: docs/architecture/architecture.md (v2, deltas D1-D8 folded, §21 adoption record; Septum removed, no local cache, task tree, gates, refinement loop, include_diff note)
 - v0.1 origin + 3 adversarial reviews: docs/architecture/system-design.md, docs/architecture/reviews/
 - Module templates: docs/architecture/module-template/{architecture,dataset-format,example-spec}.md
-- Evidence/research: docs/research/ (42 docs; TIER 1 = python-3.14, sqlite-wal-durability, worktree-concurrency, ipc-protocol-draft, event-schema-draft, custos-asyncio-design, design-deltas, coding-constitution)
+- Evidence/research: docs/research/ (44 research docs; TIER 1 = python-3.14, sqlite-wal-durability, worktree-concurrency, ipc-protocol-draft, event-schema-draft, custos-asyncio-design, design-deltas, coding-constitution)
 - Roadmap: docs/research/v2-1-review.md (M1-M9), v2-1-status.md (living tracker), m1-canonicalization-plan.md, architectus-design.md, compaction-design.md
 - Naming map: docs/research/glossary.md
-- Code: src/cambium/ — store, merge, ipc, worker, supervisor, orchestrator, tasktree, diffundo*, bench, redact*, doctor, cli, conversations, dlq, resources, approval, fencing, system_health, lint_diag, ast_tools, schemas, eval_cache, provider_config, architectus, events (to be deleted per M1), modules/example (Decision enum v2.1)
-- * = not yet merged to main (diffundo in review; redact in flight)
+- Code: src/cambium/ — store, merge, ipc, worker, supervisor, orchestrator, tasktree, diffundo, bench, doctor, cli, conversations, dlq, resources, approval, fencing, system_health, lint_diag, ast_tools, schemas, eval_cache, provider_config, architectus, events (to be deleted per M1), modules/example (Decision enum v2.1)
+- Redaction is still absent from main; Diffundo and the M6 fake-provider staging path are merged.
 - Orientation norms: agents.md (sections 1-11; constitution subsection; module inventory §3; lookup table §9)
 - Tests: harness in tests/scenarios/; MODULE tests colocated: src/cambium/modules/<name>/tests/ (+ baselines) — removability rule
 
@@ -30,10 +30,10 @@ Orientation: docs/research/README.md (tiered index) → docs/architecture/archit
 12. Critiques 1-4 dispositions: docs/research/feedback-4-assessment.md (21 claims: 6 reject/3 adopt/6 lite/6 already).
 
 ## Merged state (main, clean)
-- Test suite: ~218 passed, 5 skipped (skips = diffundo/redact-dependent, activate on merge)
-- Bench: pytest plugin with committed baseline (module-colocated), drift gate, dataset-version re-anchor (fix in flight)
-- doctor: full diagnostics incl. provider env + session artifacts (extension in flight)
-- Recent merges: architectus core (9fa0d96), status tracker (4ba5f34), glossary (646b34b), agents inventory (0f652a0), hygiene (804e4fa), decision enum (4bbc7cf), index (2fc98c0), m6 staging test (a9cda37, skips until diffundo)
+- Test suite: 307 tests are collected; the verified full run reports 305 passed and 2 skipped; the committed baseline records all 307 node IDs.
+- Bench: pytest plugin with a committed module-local baseline, drift gate, dataset-version re-anchor, and fail-closed missing-anchor behavior.
+- M6: Diffundo, provider configuration, fake-provider staging, and M6-hygiene quota/publish-scope assertions are merged; real-provider acceptance remains unverified.
+- Recent merges: status tracker, glossary, agents inventory, decision enum, research index, Diffundo, M6 staging, M6-hygiene (`4c4065f`), and the current pure worker-pool state seed.
 
 ## In flight (worktrees)
 - wt-impl-super: supervisor review-fix RELAUNCHED fresh (env stripping everywhere, write deadlines, fencing, ping/pong, race test) — CRITICAL PATH
