@@ -213,11 +213,12 @@ def test_offline_child_denies_shell_network_client(client: str) -> None:
 def test_offline_child_resolves_network_client_realpath(tmp_path: Path, api: str) -> None:
     curl = shutil.which("curl")
     assert curl is not None
-    alias = tmp_path / "ordinary-command"
+    alias = tmp_path / "ordinary command"
     alias.symlink_to(curl)
     probe = (
-        "import subprocess; "
-        f"subprocess.{api}([{str(alias)!r}, '--fail', 'http://127.0.0.1:9/'])"
+        "import subprocess, sys; "
+        f"result = subprocess.{api}([{str(alias)!r}, '--fail', 'http://127.0.0.1:9/']); "
+        "sys.exit(result.wait() if hasattr(result, 'wait') else result.returncode)"
     )
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
@@ -230,6 +231,7 @@ def test_offline_child_resolves_network_client_realpath(tmp_path: Path, api: str
         )
 
     assert result.returncode != 0
+    assert result.returncode != 7
     denied = f"network client denied during module conformance: {os.path.realpath(curl)}"
     assert denied in result.stderr
 
@@ -303,6 +305,26 @@ def test_offline_child_rejects_python_flags_that_bypass_provider_blocker(flag: s
 
     assert result.returncode != 0
     assert f"isolated Python flag denied during module conformance: {flag}" in result.stderr
+
+
+def test_offline_child_rejects_python_flag_after_option_argument() -> None:
+    probe = (
+        "import subprocess, sys; "
+        "subprocess.run([sys.executable, '-W', 'ignore', '-I', '-c', "
+        "'import cambium.provider_config'], check=True)"
+    )
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    assert "isolated Python flag denied during module conformance: -I" in result.stderr
 
 
 def test_provider_finder_rejects_every_provider_root() -> None:
