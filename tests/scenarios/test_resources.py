@@ -1,4 +1,4 @@
-"""Scenarios for supervisor-owned compile resources and task budgets."""
+"""Scenarios for supervisor-owned compile resources."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from cambium.resources import CompileGate, ResourceBudget
+from cambium.resources import CompileGate
 
 
 def test_is_heavy_uses_exact_command_token_prefixes() -> None:
@@ -126,22 +126,3 @@ def test_release_rejects_unknown_duplicate_and_command_tokens() -> None:
             gate.release(token)
 
     asyncio.run(scenario())
-
-
-def test_resource_budget_exhausts_heavy_operation_allowance() -> None:
-    budget = ResourceBudget(max_wall_s=10.0, max_heavy_ops=2)
-
-    assert budget.can_start_heavy()
-    assert budget.consume_heavy_op()
-    assert budget.consume_heavy_op()
-    assert budget.heavy_ops == 2
-    assert budget.can_start_heavy() is False
-    assert budget.consume_heavy_op() is False
-
-
-def test_resource_budget_wall_limit_blocks_operations() -> None:
-    budget = ResourceBudget(max_wall_s=0.0, max_heavy_ops=1)
-
-    assert budget.wall_remaining_s == 0.0
-    assert budget.can_start_heavy() is False
-    assert budget.consume_heavy_op() is False
