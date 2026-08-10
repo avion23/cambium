@@ -690,11 +690,16 @@ default. Allocated storage is `st_blocks * 512`, including the worktree git admi
 directory and without following symlinks. Entries expire after seven days;
 startup and insertion prune expired entries first and then the oldest entries to
 meet count, byte, and 1 GiB minimum-free-space bounds. An operator can delete an
-artifact sooner. If the newest artifact alone exceeds a cap, or bounds cannot be
-met, it remains registered and merge processing fails closed. Forensic content is
-not redacted. Events contain only task identity, staging SHA, relative quarantine
-ID, allocated bytes, reason, and expiry; they never contain evidence filenames or
-content.
+artifact sooner with `git worktree remove --force`. On startup, reconciliation
+first restores an artifact found at another path by its recorded device and inode.
+If the inode is absent, reconciliation treats this as the documented operator
+removal, durably appends a `merge_staging_pruned` tombstone with reason
+`operator-removed`, and continues startup. A path that exists with the wrong
+identity still fails closed. If the newest artifact alone exceeds a cap, or bounds
+cannot be met, it remains registered and merge processing fails closed. Forensic
+content is not redacted. Events contain only task identity, staging SHA, relative
+quarantine ID, allocated bytes, reason, and expiry; they never contain evidence
+filenames or content.
 
 ### 7.6 Per-tool heartbeat (resolves DS-C3)
 

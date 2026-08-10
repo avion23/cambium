@@ -38,7 +38,7 @@ from cambium.merge import (
     StagingCleanupError,
 )
 from cambium.store import EventStore
-from cambium.supervisor import _Runtime
+from cambium.supervisor import _Runtime, read_events, run_plan
 
 SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 
@@ -764,6 +764,68 @@ def test_quarantine_is_durable_before_cleanup_returns_and_reconciles_rename(tmp_
     assert (destination / "evidence.bin").read_bytes() == (
         b"must be recorded before descriptors close"
     )
+
+
+def test_operator_removes_quarantine_then_restart_records_removal_and_spawns(tmp_path) -> None:
+    session = tmp_path / "session"
+    repo = session / "repo"
+    base = _init_repo(repo)
+    _worker_commit(
+        repo, "artifact-source", session / "artifact-source",
+        {"artifact.txt": "artifact\n"}, base,
+    )
+
+    async def quarantine() -> tuple[str, Path]:
+        store = EventStore(session / ".cambium" / "events.db")
+        runtime = _Runtime(session, store)
+        await runtime.start()
+        seq = runtime._make_sequencer("artifact-owner")
+        staging = session / "artifact-staging"
+        seq.prepare_staging(repo, staging, "artifact-source", "main")
+        (staging / "evidence.bin").write_bytes(b"operator may remove this evidence")
+        await asyncio.to_thread(seq.cleanup_staging, repo)
+        event = next(
+            event for event in store.events_after(0)
+            if event["kind"] == "merge_staging_quarantined"
+        )
+        quarantine_id = event["payload"]["quarantine_id"]
+        artifact = session / ".cambium" / "quarantine" / quarantine_id
+        await runtime.shutdown()
+        return quarantine_id, artifact
+
+    quarantine_id, artifact = asyncio.run(quarantine())
+    _run(repo, "worktree", "remove", "--force", str(artifact))
+    assert not artifact.exists()
+
+    worker = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
+    plan = {"tasks": [{
+        "task_id": "restart-worker",
+        "task": "edit base.txt",
+        "repo": str(repo),
+        "worktree_path": str(session / "restart-worker"),
+        "branch": "restart-worker",
+        "worker": str(worker),
+        "target_file": "base.txt",
+        "marker": "// restarted",
+        "write_marker": True,
+        "gate": "grep -q '// restarted' base.txt",
+        "base_commit": base,
+    }]}
+
+    result = asyncio.run(run_plan(session, plan))
+    events = read_events(session)
+
+    assert result.exit_code == 0
+    assert result.results[0].status == "succeeded"
+    spawned = next(event for event in events if event["kind"] == "spawned")
+    removals = [
+        event for event in events
+        if event["kind"] == "merge_staging_pruned"
+        and event["payload"].get("quarantine_id") == quarantine_id
+        and event["payload"].get("reason") == "operator-removed"
+    ]
+    assert len(removals) == 1
+    assert removals[0]["seq"] < spawned["seq"]
 
 
 def test_observer_failure_after_durable_append_does_not_restore_staging(tmp_path) -> None:

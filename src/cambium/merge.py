@@ -982,7 +982,19 @@ class MergeSequencer:
                 if displaced is not None:
                     break
             if displaced is None:
-                raise StagingCleanupError("recorded quarantine evidence cannot be located")
+                task_key = Path(quarantine_id).parts[1].removeprefix("task-")
+                allocated_bytes = payload.get("allocated_bytes")
+                if not isinstance(allocated_bytes, int) or allocated_bytes < 0:
+                    allocated_bytes = 0
+                self._event(
+                    "merge_staging_pruned",
+                    task=self._task_id if task_key == self._task_key else None,
+                    quarantine_id=quarantine_id,
+                    entries=1,
+                    allocated_bytes=allocated_bytes,
+                    reason="operator-removed",
+                )
+                continue
 
             task_name = Path(quarantine_id).parts[1]
             task_dir = self._secure_directory(root, task_name, root)
