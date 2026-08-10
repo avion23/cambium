@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 **Scope:** read-only audit of `main@3d27ba3` against `threat-model.md` R1–R10/M1–M7 and D7's
-containment policy (worktree isolation + permission allowlists (approval gates removed by decision); no sandbox).
+containment policy (worktree isolation + permission allowlists + approval gates; no sandbox).
 **Worktree:** `/tmp/opencode/cambium-audit-security` (`wt-audit-security`).
 **Audited:** supervisor/store/merge/ipc/worker/tasktree/doctor/orchestrator/events, module
 code, scripts, architecture §§4/7/11/12, threat/research, and scenarios.
@@ -90,7 +90,7 @@ F-18) · PASS 6 (F-10–F-15) · INFO 4 (F-17, F-19, F-21, F-22) — 22 findings
 ### Secret path (F-01/F-02/R4/R7)
 
 The highest-risk chain is concrete: `env={**os.environ}` makes provider keys readable by a
-worker; worker stderr are written into JSONL/event payloads without a redaction
+worker; worker stderr and gate output are written into JSONL/event payloads without a redaction
 filter; a secret can therefore travel from `os.environ` to stderr, durable event log, and CLI
 output. D7's intended fix is a constructed environment (`PATH`, `PYTHONUNBUFFERED`, Cambium
 identity, and only names from `provider_env_keys`) plus one versioned redactor at enqueue and a

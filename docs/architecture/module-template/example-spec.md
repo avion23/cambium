@@ -234,8 +234,10 @@ uv run --extra test cambium module-test example
 
 It validates tracked layout, manifest, dataset and baseline schema/digests,
 imports, CLI, offline subprocess behavior, and module-scoped tests. The gate
-rejects provider/network use and sibling/reverse imports. The probe runs from the
-source layout; there is no wheel delivery. The module is removable by deleting its package,
+rejects provider/network use and sibling/reverse imports. The wheel acceptance
+probe runs outside the checkout. The tool is developed and run directly from
+source; the Hatch wheel target and wheel acceptance tests remain for packaging,
+which is not the primary delivery path. The module is removable by deleting its package,
 including tests, datasets, baselines, CLI, architecture, and freeze metadata.
 
 ### 9.1 Verification commands and recorded state
@@ -382,15 +384,14 @@ CANNOT prevent a hostile same-UID module from bypassing the check with
 os.system, posix_spawn, raw sockets, subprocess monkey-patching, or by killing
 a same-UID tracer. The harness does not start such a tracer or provide an
 in-harness sandbox. Real containment is the deployment-layer boundary.**
-`module-test` verification runs from the source checkout; no installed-wheel
-probe exists. Complete removal includes
+Wheel verification runs
+`cambium module-test example` outside the checkout. Complete removal includes
 the package code, CLI, architecture, datasets, tests, baseline, and metadata.
 
 ### A.6 Acceptance status boundaries
 
 The deterministic engine, loader, metric, split files, baseline schema, JSON
-CLI, offline checks, import prohibitions, and removability checks (wheel delivery
-removed) are
+CLI, offline checks, import prohibitions, and wheel/removability checks are
 implemented surfaces. A production `Architectus.execute` caller, DSPy class,
 standalone module eval command, sibling stubs, optimized prompt artifacts,
 and end-to-end orchestrator exercise remain future work. The live checker
@@ -464,5 +465,5 @@ old/new rule, bumps the dataset version as required, regenerates exact split
 digests, reruns the colocated suite and conformance gate, and updates the
 baseline only after review. A documentation-only wording change must not alter
 dataset bytes or imply a new score. A package-name change is an interface
-change: update the `module-test` selector and every neutral CLI
+change: update the `module-test` selector, wheel probe, and every neutral CLI
 boundary before merge.

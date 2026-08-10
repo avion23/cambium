@@ -9,8 +9,8 @@ the [`src/cambium`](../../src/cambium) implementation and tests, and
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; the provider cascade is source-defined and
 honors `Retry-After`; worker stdout/event admission is bounded; there is no
-per-worker OS sandbox or production approval service. Approval was removed by
-product decision; `run_shell`/`git_op` execute without it. DLQ and
+per-worker OS sandbox or production approval service. `ToolContext` accepts an
+optional `ApprovalGate`, but the run-plan worker path does not inject one. DLQ and
 eval cache are absent.
 
 **Scope:** M1 in `docs/research/v2-1-review.md` §4 (v2.1 roadmap and acceptance gates): integrate one Custos runtime,
