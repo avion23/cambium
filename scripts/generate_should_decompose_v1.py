@@ -29,15 +29,37 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cambium.modules.base import load_module_manifest, run_module_cli  # noqa: E402
+from cambium.modules.base import (  # noqa: E402
+    ModuleBoundaryError,
+    load_module_manifest,
+    run_module_cli,
+)
 
 ADDED_AT = "2026-08-09"
 ADDED_BY = "agent:data-builder-v1"
 DATASET_VERSION = "1.1.0"
 SCHEMA_VERSION = 1
+DEFAULT_LOGICAL_MODULE = "should_decompose"
 
-MODULE_DIR = ROOT / "src" / "cambium" / "modules" / "example"
-MANIFEST = load_module_manifest(MODULE_DIR, "example")
+
+def _resolve_manifest(logical_name: str = DEFAULT_LOGICAL_MODULE):
+    """Resolve the owning module through its module.json, never a package path."""
+    modules_dir = ROOT / "src" / "cambium" / "modules"
+    if not modules_dir.is_dir():
+        return None
+    for child in sorted(modules_dir.iterdir()):
+        if not child.is_dir() or not (child / "module.json").is_file():
+            continue
+        try:
+            manifest = load_module_manifest(child, child.name)
+        except ModuleBoundaryError:
+            continue
+        if manifest.module_name == logical_name:
+            return manifest
+    return None
+
+
+MANIFEST = _resolve_manifest()
 
 T = True
 F = False
@@ -690,7 +712,14 @@ def main() -> int:
             )
         )
 
-    datasets = ROOT / "src" / "cambium" / "modules" / "example" / "datasets"
+    if MANIFEST is None:
+        print(
+            f"no module with manifest module_name={DEFAULT_LOGICAL_MODULE!r} "
+            "found; nothing to generate"
+        )
+        return 0
+
+    datasets = MANIFEST.package_dir / "datasets"
     emit(train, datasets / "train.jsonl")
     emit(eval_records, datasets / "eval.jsonl")
     emit(canary_records, datasets / "canaries.jsonl")

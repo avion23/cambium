@@ -27,6 +27,12 @@ from typing import Any
 
 import pytest
 
+from cambium.modules.base import (
+    ModuleBoundaryError,
+    ModuleManifest,
+    load_module_manifest,
+)
+
 
 def _find_repo_root() -> Path:
     source = Path(__file__).resolve().parent
@@ -107,6 +113,7 @@ class ModuleSpec:
     test_files: tuple[Path, ...]
     baseline_files: tuple[Path, ...]
     dataset_files: tuple[Path, ...]
+    manifest: ModuleManifest | None = None
 
     @property
     def tests_dir(self) -> Path:
@@ -573,7 +580,9 @@ def _module_relative_path(path: Path, spec: ModuleSpec) -> str | None:
         return None
 
 
-def _validate_dataset_integrity(spec: ModuleSpec) -> None:
+def _validate_dataset_integrity(
+    spec: ModuleSpec, manifest: ModuleManifest | None = None
+) -> None:
     """Validate the frozen split contract without importing the decision package."""
     findings: list[AuditFinding] = []
     datasets = spec.path / "datasets"
@@ -921,6 +930,17 @@ def _validate_dataset_integrity(spec: ModuleSpec) -> None:
                     "must be a non-empty logical module name",
                 )
             )
+        elif manifest is not None and baseline["module"] != manifest.module_name:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "module",
+                    f"must match module.json module_name "
+                    f"({manifest.module_name!r})",
+                )
+            )
         if baseline.get("dataset_version") != meta.get("dataset_version"):
             findings.append(
                 AuditFinding(
@@ -1160,7 +1180,7 @@ def validate_module(name: str) -> ModuleSpec:
     tracked_set = set(tracked)
     errors: list[str] = []
 
-    required_files = ("__init__.py", "__main__.py", "architecture.md")
+    required_files = ("__init__.py", "__main__.py", "architecture.md", "module.json")
     for filename in required_files:
         relative = prefix / filename
         if relative not in tracked_set or not _is_regular_file(REPO_ROOT / relative):
@@ -1215,6 +1235,10 @@ def validate_module(name: str) -> ModuleSpec:
 
     if errors:
         raise ModuleConformanceError(f"{name}:\n" + "\n".join(errors))
+    try:
+        manifest = load_module_manifest(module_path, name)
+    except ModuleBoundaryError as exc:
+        raise ModuleConformanceError(f"{name}: invalid module.json: {exc}") from exc
     _validate_json_files(name, baseline_files, dataset_files)
     spec = ModuleSpec(
         name=name,
@@ -1224,8 +1248,9 @@ def validate_module(name: str) -> ModuleSpec:
         test_files=test_files,
         baseline_files=baseline_files,
         dataset_files=dataset_files,
+        manifest=manifest,
     )
-    _validate_dataset_integrity(spec)
+    _validate_dataset_integrity(spec, manifest)
     return spec
 
 
@@ -1317,6 +1342,7 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "_NETWORK_CLIENTS = frozenset((\n"
             "    'curl', 'wget', 'http', 'https', 'nc', 'netcat', 'ncat', 'ssh'\n"
             "))\n"
+            "_PROBE_LOG = os.environ.get('CAMBIUM_MODULE_PROBE_IMPORT_LOG')\n"
             "\n"
             "class _ProviderBlocker(importlib.abc.MetaPathFinder):\n"
             "    def find_spec(self, fullname, path=None, target=None):\n"
@@ -1325,6 +1351,16 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "            raise ModuleNotFoundError(\n"
             "                'provider import blocked by module conformance: ' + fullname\n"
             "            )\n"
+            "        return None\n"
+            "\n"
+            "class _ProbeImporter(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, fullname, path=None, target=None):\n"
+            "        if _PROBE_LOG and fullname.startswith('cambium.modules.'):\n"
+            "            try:\n"
+            "                with open(_PROBE_LOG, 'a', encoding='utf-8') as handle:\n"
+            "                    handle.write(fullname + '\\n')\n"
+            "            except OSError:\n"
+            "                pass\n"
             "        return None\n"
             "\n"
             "def _deny_network(*args, **kwargs):\n"
@@ -1425,6 +1461,7 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "    return _popen_init(self, args, *pargs, **kwargs)\n"
             "\n"
             "sys.meta_path.insert(0, _ProviderBlocker())\n"
+            "sys.meta_path.insert(1, _ProbeImporter())\n"
             "subprocess.Popen.__init__ = _offline_popen\n"
             "socket.socket.connect = _deny_network\n"
             "socket.socket.connect_ex = _deny_network\n"
@@ -1451,13 +1488,22 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
 
 
 def probe_module_cli(spec: ModuleSpec) -> None:
-    """Run the module CLI from an empty cwd with no import-path injection."""
+    """Run the module CLI from an empty cwd with no import-path injection.
+
+    The CLI subprocess also runs the sibling/import runtime check: every
+    ``cambium.modules.*`` import it performs is recorded, and a sibling
+    decision package loaded inside the probe fails the gate.
+    """
+    cli_module = spec.manifest.cli_module if spec.manifest is not None else spec.package_name
     payload = json.dumps(_dataset_input(spec), separators=(",", ":")) + "\n"
-    command = [sys.executable, "-m", spec.package_name]
+    command = [sys.executable, "-m", cli_module]
+    loaded_imports: set[str] = set()
     try:
         with module_offline_environment() as env, tempfile.TemporaryDirectory(
             prefix="cambium-module-"
         ) as cwd:
+            import_log = Path(cwd) / "probe-imports.log"
+            env["CAMBIUM_MODULE_PROBE_IMPORT_LOG"] = str(import_log)
             result = subprocess.run(
                 command,
                 cwd=cwd,
@@ -1468,6 +1514,7 @@ def probe_module_cli(spec: ModuleSpec) -> None:
                 check=False,
                 timeout=10,
             )
+            loaded_imports = _probe_loaded_imports(import_log)
     except subprocess.TimeoutExpired as exc:
         raise ModuleConformanceError(f"{spec.name}: JSON CLI timed out after 10 seconds") from exc
     except OSError as exc:
@@ -1494,6 +1541,36 @@ def probe_module_cli(spec: ModuleSpec) -> None:
         )
     if not isinstance(value, dict):
         raise ModuleConformanceError(f"{spec.name}: JSON CLI stdout must be a JSON object")
+    _check_probe_siblings(spec, loaded_imports)
+
+
+def _probe_loaded_imports(import_log: Path) -> set[str]:
+    """Return the unique ``cambium.modules.*`` imports recorded by a probe."""
+    try:
+        if not import_log.is_file():
+            return set()
+        return {
+            line.strip()
+            for line in import_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return set()
+
+
+def _check_probe_siblings(spec: ModuleSpec, loaded_imports: set[str]) -> None:
+    """Fail when the CLI probe subprocess loaded a sibling decision package."""
+    siblings = sorted(
+        name
+        for name in loaded_imports
+        if (child := name.removeprefix("cambium.modules.").split(".")[0]) in module_names()
+        and child != spec.name
+    )
+    if siblings:
+        raise ModuleConformanceError(
+            f"{spec.name}: sibling modules loaded inside the JSON CLI probe: "
+            + ", ".join(siblings)
+        )
 
 
 def _relative_package(path: Path, spec: ModuleSpec) -> list[str]:
@@ -1534,11 +1611,60 @@ def _is_sibling_target(target: str, spec: ModuleSpec) -> bool:
     return child in module_names() and child != spec.name
 
 
+def _is_harness_target(target: str, spec: ModuleSpec) -> bool:
+    """Reject cambium harness imports that are not the shared base or own package.
+
+    A decision module may import the shared module base, its own package, and
+    the enclosing package markers; importing any other ``cambium.*`` module
+    (``cambium.supervisor``, ``cambium.bench``, ...) crosses the module
+    boundary and is a static gate failure.
+    """
+    if not target.startswith("cambium."):
+        return False
+    if target == "cambium.modules":
+        return False
+    if target.startswith("cambium.modules."):
+        child = target[len("cambium.modules.") :].split(".")[0]
+        return child not in {spec.name, "base"}
+    return True
+
+
+def _literal_import_target(node: ast.Call) -> str | None:
+    """Return a dynamic-import target only when it is a literal string.
+
+    ``None`` means the call cannot be statically resolved (variable, keyword
+    override, or missing argument); callers fail closed on it.
+    """
+    if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
+        node.args[0].value, str
+    ):
+        return node.args[0].value
+    for keyword in node.keywords:
+        if keyword.arg == "name":
+            if isinstance(keyword.value, ast.Constant) and isinstance(
+                keyword.value.value, str
+            ):
+                return keyword.value.value
+            return None
+    return None
+
+
+def _is_module_test_file(path: Path, spec: ModuleSpec) -> bool:
+    """Return whether *path* lives under the module's colocated tests dir."""
+    try:
+        path.resolve().relative_to(spec.tests_dir.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def _check_import_target(target: str, path: Path, node: ast.AST, spec: ModuleSpec) -> str | None:
     if _is_provider_import(target):
         return f"{path}:{node.lineno}: provider import is forbidden: {target}"
     if _is_sibling_target(target, spec):
         return f"{path}:{node.lineno}: sibling import is forbidden: {target}"
+    if _is_harness_target(target, spec) and not _is_module_test_file(path, spec):
+        return f"{path}:{node.lineno}: cambium harness import is forbidden: {target}"
     return None
 
 
@@ -1613,12 +1739,18 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
                 is_import_call = isinstance(function.value, ast.Name) and function.value.id in {
                     *builtin_module_names,
                 }
-            if is_import_call and node.args and isinstance(node.args[0], ast.Constant):
-                target = node.args[0].value
-                if isinstance(target, str):
-                    issue = _check_import_target(target, path, node, spec)
-                    if issue:
-                        issues.append(issue)
+            if not is_import_call:
+                continue
+            target = _literal_import_target(node)
+            if target is None:
+                issues.append(
+                    f"{path}:{node.lineno}: dynamic import with a non-literal target "
+                    "is forbidden (fail closed)"
+                )
+                continue
+            issue = _check_import_target(target, path, node, spec)
+            if issue:
+                issues.append(issue)
     return issues
 
 
@@ -1683,19 +1815,27 @@ def _reverse_relative_target(node: ast.ImportFrom, path: Path) -> list[str] | No
     return target
 
 
-def _reverse_importlib_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
+def _reverse_importlib_aliases(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
     importlib_names = {"importlib"}
     import_module_names = {"import_module"}
+    builtin_import_names = {"__import__"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "importlib":
                     importlib_names.add(alias.asname or "importlib")
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "importlib":
-            for alias in node.names:
-                if alias.name == "import_module":
-                    import_module_names.add(alias.asname or "import_module")
-    return importlib_names, import_module_names
+                if alias.name == "builtins":
+                    builtin_import_names.add(alias.asname or "builtins")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            if node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        import_module_names.add(alias.asname or "import_module")
+            if node.module == "builtins":
+                for alias in node.names:
+                    if alias.name == "__import__":
+                        builtin_import_names.add(alias.asname or "__import__")
+    return importlib_names, import_module_names, builtin_import_names
 
 
 def _reverse_importlib_targets(node: ast.expr, names: set[str]) -> tuple[tuple[str, str], ...]:
@@ -1730,7 +1870,9 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
                 parents[child] = parent
-        importlib_names, import_module_names = _reverse_importlib_aliases(tree)
+        importlib_names, import_module_names, builtin_import_names = (
+            _reverse_importlib_aliases(tree)
+        )
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -1779,25 +1921,58 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
                             )
                         )
                 continue
-            if not isinstance(node, ast.Call) or not node.args:
+            if not isinstance(node, ast.Call):
                 continue
             function = node.func
-            is_import_module = isinstance(function, ast.Name) and function.id in import_module_names
+            is_dynamic_import = isinstance(function, ast.Name) and (
+                function.id in import_module_names or function.id in builtin_import_names
+            )
             if isinstance(function, ast.Attribute) and function.attr == "import_module":
-                is_import_module = (
+                is_dynamic_import = (
                     isinstance(function.value, ast.Name)
                     and function.value.id in importlib_names
                 )
-            if not is_import_module:
+            if isinstance(function, ast.Attribute) and function.attr == "__import__":
+                is_dynamic_import = (
+                    isinstance(function.value, ast.Name)
+                    and function.value.id in builtin_import_names
+                )
+            if not is_dynamic_import:
                 continue
-            for _, target in _reverse_importlib_targets(node.args[0], names):
+            symbol = _reverse_enclosing_symbol(node, parents)
+            relative = path.relative_to(REPO_ROOT)
+            if not node.args:
                 findings.append(
                     AuditFinding(
                         "reverse-import",
-                        path.relative_to(REPO_ROOT),
+                        relative,
                         node.lineno,
-                        _reverse_enclosing_symbol(node, parents),
-                        f"importlib.import_module loads decision package {target}",
+                        symbol,
+                        "dynamic import with no target is forbidden (fail closed)",
+                    )
+                )
+                continue
+            resolved = _reverse_importlib_targets(node.args[0], names)
+            if resolved:
+                for _, target in resolved:
+                    findings.append(
+                        AuditFinding(
+                            "reverse-import",
+                            relative,
+                            node.lineno,
+                            symbol,
+                            f"dynamic import loads decision package {target}",
+                        )
+                    )
+            elif _literal_import_target(node) is None:
+                findings.append(
+                    AuditFinding(
+                        "reverse-import",
+                        relative,
+                        node.lineno,
+                        symbol,
+                        "dynamic import with a non-literal target may load a "
+                        "decision package (fail closed)",
                     )
                 )
     return tuple(

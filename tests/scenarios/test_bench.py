@@ -26,6 +26,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+EXAMPLE_MODULE_DIR = REPO_ROOT / "src" / "cambium" / "modules" / "example"
+REQUIRES_EXAMPLE = pytest.mark.skipif(
+    not EXAMPLE_MODULE_DIR.is_dir(),
+    reason="reference module cambium.modules.example is absent",
+)
+
 SCHEMA_KEYS = {
     "schema_version",
     "module",
@@ -180,6 +186,8 @@ def run_bench(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``pytest -p cambium.bench --bench=<mode>`` as a subprocess."""
+    if not EXAMPLE_MODULE_DIR.is_dir():
+        pytest.skip("reference module cambium.modules.example is absent")
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
@@ -261,6 +269,7 @@ def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypat
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
 
 
+@REQUIRES_EXAMPLE
 def test_real_combined_dataset_reports_only_flagged_canaries(monkeypatch) -> None:
     import cambium.bench as bench
 
@@ -854,6 +863,7 @@ def test_module_contract_violation_fails_closed_with_module_diagnostic(
     assert not bench_root.exists()
 
 
+@REQUIRES_EXAMPLE
 def test_scripts_use_the_neutral_module_boundary() -> None:
     check = subprocess.run(
         [sys.executable, "scripts/check_dataset_v1.py"],
@@ -911,6 +921,7 @@ def test_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
     assert not (bench_root / "should_decompose" / "baseline.json").exists()
 
 
+@REQUIRES_EXAMPLE
 def test_standalone_cli_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
     bench_root = tmp_path / "baselines"
     bench_root.mkdir()
@@ -935,6 +946,7 @@ def test_standalone_cli_gate_fails_closed_without_pre_existing_anchor(tmp_path) 
     assert not (bench_root / "should_decompose" / "baseline.json").exists()
 
 
+@REQUIRES_EXAMPLE
 def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
     """The standalone CLI report must populate real wall timings, not empty ones."""
     import cambium.bench as bench
@@ -952,6 +964,7 @@ def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
     )
 
 
+@REQUIRES_EXAMPLE
 def test_module_timing_subprocess_env_scrubs_credentials(tmp_path, monkeypatch) -> None:
     """The timing subprocess env must never receive credential variables.
 
@@ -983,6 +996,7 @@ def test_module_timing_subprocess_env_scrubs_credentials(tmp_path, monkeypatch) 
     assert "synthetic-openai-secret" not in captured_env.values()
 
 
+@REQUIRES_EXAMPLE
 def test_evaluation_child_env_scrubs_provider_keys(monkeypatch) -> None:
     """The bench evaluation CLI subprocess must never receive provider keys.
 
@@ -1021,6 +1035,7 @@ def test_evaluation_child_env_scrubs_provider_keys(monkeypatch) -> None:
         assert str(REPO_ROOT / "src") in env["PYTHONPATH"].split(os.pathsep)
 
 
+@REQUIRES_EXAMPLE
 def test_standalone_cli_gate_detects_wall_time_regression(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1048,6 +1063,7 @@ def test_standalone_cli_gate_detects_wall_time_regression(
     assert "DRIFT should_decompose: tests.wall_seconds.p90" in capsys.readouterr().out
 
 
+@REQUIRES_EXAMPLE
 def test_standalone_cli_immediate_gate_does_not_false_fail_under_load(tmp_path) -> None:
     """An immediate report->gate on unchanged code must not fail under load.
 
@@ -1389,6 +1405,7 @@ def test_standalone_cli_empty_modules_dir_fails_closed(tmp_path, monkeypatch, ca
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
 
 
+@REQUIRES_EXAMPLE
 def test_cli_report_protects_committed_baseline(tmp_path) -> None:
     """CLI report without --bench-root writes to .cambium/, never the
     committed baseline, and leaves the tree clean."""
@@ -1437,6 +1454,7 @@ def test_cli_report_protects_committed_baseline(tmp_path) -> None:
     assert status_after == status_before, status_after  # only gitignored writes
 
 
+@REQUIRES_EXAMPLE
 def test_cli_full_drift_report_writes_artifact(tmp_path) -> None:
     """``report --full --drift-report`` writes a drift artifact to the root."""
     bench_root = tmp_path / "baselines"
@@ -1465,6 +1483,7 @@ def test_cli_full_drift_report_writes_artifact(tmp_path) -> None:
     assert artifact["modules"]["should_decompose"]["dataset_version"] == "1.1.0"
 
 
+@REQUIRES_EXAMPLE
 def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> None:
     """``gate --drift-report`` still fails on drift and records it."""
     import cambium.bench as bench
@@ -1483,6 +1502,7 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     assert any(field == "metric.train.mean" for field, _detail in regressions)
 
 
+@REQUIRES_EXAMPLE
 def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1506,6 +1526,7 @@ def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     assert artifact.is_symlink()  # artifact never materialized over the link
 
 
+@REQUIRES_EXAMPLE
 def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1533,6 +1554,7 @@ def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
     assert anchor_path.stat().st_nlink == 2  # hard link never unlinked
 
 
+@REQUIRES_EXAMPLE
 def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1590,6 +1612,7 @@ def _build_and_install_wheel(site_dir: Path) -> Path:
     return wheel
 
 
+@REQUIRES_EXAMPLE
 def test_installed_package_discovery_from_unrelated_cwd(tmp_path) -> None:
     """A wheel install discovers modules from its own resources, not the repo."""
     uv = shutil.which("uv")

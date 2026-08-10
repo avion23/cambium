@@ -5,6 +5,11 @@ validates the dataset-format.md envelope, checks counts/balance/duplicates/
 cross-split leaks/secrets, evaluates every record through the module's neutral
 JSON CLI, and asserts the metric is perfect.
 
+The module directory, manifest, and dataset paths are discovered from each
+module's own ``module.json``; nothing is hardcoded to a package path. Split
+count expectations come from the module's committed baseline, so removing a
+module directory removes the whole check with it.
+
 Run: python3.12 scripts/check_dataset_v1.py
 """
 
@@ -20,18 +25,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cambium.modules.base import load_module_manifest, run_module_cli  # noqa: E402
-
-MODULE_DIR = ROOT / "src" / "cambium" / "modules" / "example"
-MANIFEST = load_module_manifest(MODULE_DIR, "example")
-DATASETS = MODULE_DIR / "datasets"
-META = DATASETS / "meta.json"
-FILES = {
-    "train": DATASETS / "train.jsonl",
-    "eval": DATASETS / "eval.jsonl",
-    "canary": DATASETS / "canaries.jsonl",
-}
-EXPECTED_COUNTS = {"train": 200, "eval": 50, "canary": 10}
+from cambium.modules.base import (  # noqa: E402
+    ModuleBoundaryError,
+    load_module_manifest,
+    run_module_cli,
+)
 
 ENVELOPE = {
     "id": str,
@@ -149,8 +147,43 @@ def load_records(path: Path) -> list[dict]:
     return records
 
 
-def main() -> int:
-    meta = json.loads(META.read_text(encoding="utf-8"))
+def discover_manifests() -> list:
+    """Return validated module.json manifests for every module package."""
+    modules_dir = ROOT / "src" / "cambium" / "modules"
+    if not modules_dir.is_dir():
+        return []
+    manifests = []
+    for child in sorted(modules_dir.iterdir()):
+        if not child.is_dir() or not (child / "module.json").is_file():
+            continue
+        try:
+            manifests.append(load_module_manifest(child, child.name))
+        except ModuleBoundaryError:
+            continue
+    return manifests
+
+
+def expected_split_counts(manifest) -> dict[str, int]:
+    """Split record counts from the module's committed baseline, never a guess."""
+    baseline_path = manifest.package_dir / "tests" / "baselines" / "baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    return {
+        "train": baseline["metric"]["train"]["count"],
+        "eval": baseline["metric"]["eval"]["count"],
+        "canary": baseline["metric"]["canaries"]["count"],
+    }
+
+
+def check_module(manifest) -> None:
+    module_name = manifest.module_name
+    datasets = manifest.package_dir / "datasets"
+    meta = json.loads((datasets / "meta.json").read_text(encoding="utf-8"))
+    files = {
+        "train": datasets / "train.jsonl",
+        "eval": datasets / "eval.jsonl",
+        "canary": datasets / "canaries.jsonl",
+    }
+    expected = expected_split_counts(manifest)
     assert isinstance(meta, dict), "meta.json: not an object"
     meta_schema_version = meta.get("schema_version")
     meta_dataset_version = meta.get("dataset_version")
@@ -162,10 +195,10 @@ def main() -> int:
     )
 
     all_records: dict[str, list[dict]] = {}
-    for split, path in FILES.items():
+    for split, path in files.items():
         records = load_records(path)
-        assert len(records) == EXPECTED_COUNTS[split], (
-            f"{split}: expected {EXPECTED_COUNTS[split]}, got {len(records)}"
+        assert len(records) == expected[split], (
+            f"{split}: expected {expected[split]}, got {len(records)}"
         )
         ids = [r["id"] for r in records]
         assert ids == sorted(ids), f"{split}: records not sorted by id"
@@ -278,10 +311,10 @@ def main() -> int:
 
     # --- engine consistency through the neutral JSON module boundary ---------
     total = 0
-    for split, _path in FILES.items():
+    for split, _path in files.items():
         records = all_records[split]
         response = run_module_cli(
-            MANIFEST.cli_module,
+            manifest.cli_module,
             {"operation": "evaluate", "records": records},
             cwd=ROOT,
             source_root=ROOT / "src",
@@ -302,9 +335,19 @@ def main() -> int:
         assert not bad, f"{split}: {len(bad)} engine mismatches: {bad[:3]}"
         total += len(records)
     print(
-        f"engine consistency: module metric == 1.0 on all {total} records "
+        f"engine consistency: module {module_name} metric == 1.0 on all {total} records "
         "through the neutral CLI"
     )
+
+
+def main() -> int:
+    manifests = discover_manifests()
+    if not manifests:
+        print("no dataset-bearing modules found under src/cambium/modules; nothing to check")
+        return 0
+    for manifest in manifests:
+        print(f"checking module {manifest.module_name} ({manifest.package_dir})")
+        check_module(manifest)
 
     print("ALL CHECKS PASSED")
     return 0
