@@ -736,7 +736,9 @@ def test_abort_subtree_clears_same_wave_descendant_spawn_and_quiesces() -> None:
 
     actions = asyncio.run(core.step([]))
 
-    assert {"action": "abort_subtree", "task_id": "root"} in actions
+    assert actions == [{"action": "abort_subtree", "task_id": "root"}]
+    assert {"action": "spawn", "task_id": "child"} not in actions
+    assert core.action_history == [{"action": "abort_subtree", "task_id": "root"}]
     assert "child" not in core.in_flight
     assert asyncio.run(core.step([])) == []
 

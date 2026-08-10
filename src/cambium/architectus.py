@@ -539,6 +539,12 @@ class ArchitectusCore:
         ready: Sequence[Any],
     ) -> list[dict[str, Any]]:
         proposed_actions = self._validate_actions(proposed)
+        explicitly_aborted: set[str] = set()
+        for action in proposed_actions:
+            if ActionKind(action["action"]) is ActionKind.ABORT_SUBTREE:
+                explicitly_aborted.update(
+                    self._subtree_task_ids(self._action_task_id(action))
+                )
         ready_ids = [node.task_id for node in ready]
         ready_rank = {task_id: index for index, task_id in enumerate(ready_ids)}
         capacity = max(self._max_width - len(self._in_flight), 0)
@@ -556,6 +562,7 @@ class ArchitectusCore:
                     task_id not in ready_rank
                     or task_id in accepted_spawn_ids
                     or task_id in aborted_spawn_ids
+                    or task_id in explicitly_aborted
                     or len(accepted_spawn_ids) >= capacity
                 ):
                     continue
