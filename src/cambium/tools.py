@@ -19,8 +19,11 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Lock, Thread, current_thread
 from typing import Any
 
 from . import ast_tools
@@ -108,6 +111,77 @@ class _ToolFailure(Exception):
 
 
 ToolImplementation = Callable[[dict[str, Any], ToolContext], Awaitable[_Outcome]]
+_DaemonWorkItem = tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]] | None
+
+
+class _DaemonSingleThreadExecutor(Executor):
+    """Run one blocking operation without joining it during loop shutdown.
+
+    The executor is one-shot and owns a daemon worker.  A timed-out read calls
+    ``shutdown(wait=False)``, so ``asyncio.run`` does not wait for a blocked
+    system call and the worker cannot consume the event loop's shared default
+    executor.  The daemon thread can remain until the underlying call returns;
+    this is the deliberate tradeoff for protecting the caller from an
+    uninterruptible regular-file read.
+    """
+
+    def __init__(self) -> None:
+        self._work_queue: Queue[_DaemonWorkItem] = Queue()
+        self._shutdown_lock = Lock()
+        self._shutdown = False
+        self._thread = Thread(
+            target=self._worker,
+            name="cambium-get-signature-read",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule work after executor shutdown")
+            self._work_queue.put((future, fn, args, kwargs))
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            work_item = self._work_queue.get()
+            if work_item is None:
+                return
+            future, fn, args, kwargs = work_item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        work_item = self._work_queue.get_nowait()
+                    except Empty:
+                        break
+                    if work_item is not None:
+                        work_item[0].cancel()
+            self._work_queue.put(None)
+
+        if wait and current_thread() is not self._thread:
+            self._thread.join()
 
 
 def _duration_ms(started_ns: int) -> int:
@@ -437,9 +511,11 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         raise _ToolFailure("get_signature symbol must be a Python identifier")
 
     display_path = _display_path(ctx, path)
+    executor = _DaemonSingleThreadExecutor()
     try:
         signature = await asyncio.wait_for(
-            asyncio.to_thread(
+            asyncio.get_running_loop().run_in_executor(
+                executor,
                 _read_and_extract_signature, ctx, path, display_path, symbol
             ),
             timeout=GET_SIGNATURE_READ_TIMEOUT_S,
@@ -454,6 +530,8 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         raise _ToolFailure(
             f"could not parse {display_path}{location}: {exc.msg}"
         ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     if signature is None:
         raise _ToolFailure(f"symbol not found: {symbol!r} in {display_path}")
 

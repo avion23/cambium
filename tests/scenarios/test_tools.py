@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -302,6 +303,78 @@ def test_get_signature_read_and_parse_do_not_block_dispatcher(
 
     assert yielded_before_completion
     assert result.ok
+
+
+def test_get_signature_timeout_does_not_wait_for_blocked_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
+    original_read = tools._read_and_extract_signature
+
+    def slow_read(*args):
+        time.sleep(2)
+        return original_read(*args)
+
+    monkeypatch.setattr(tools, "_read_and_extract_signature", slow_read)
+    started = time.monotonic()
+    result = _run(
+        "get_signature",
+        {"path": "sample.py", "symbol": "build"},
+        ToolContext(tmp_path),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert not result.ok
+    assert result.error == (
+        "get_signature read timed out after 1.0s: sample.py"
+    )
+
+
+def test_get_signature_repeated_blocked_reads_do_not_use_shared_executor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
+    original_read = tools._read_and_extract_signature
+
+    def slow_read(*args):
+        time.sleep(2)
+        return original_read(*args)
+
+    monkeypatch.setattr(tools, "_read_and_extract_signature", slow_read)
+    started = time.monotonic()
+
+    async def invoke_repeatedly():
+        return await asyncio.gather(
+            *(
+                run_tool(
+                    "get_signature",
+                    {"path": "sample.py", "symbol": "build"},
+                    ToolContext(tmp_path),
+                )
+                for _ in range(3)
+            )
+        )
+    results = asyncio.run(invoke_repeatedly())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert all(not result.ok for result in results)
+    assert all("timed out" in (result.error or "") for result in results)
+    signature_threads = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "cambium-get-signature-read"
+    ]
+    assert signature_threads
+    assert all(thread.daemon for thread in signature_threads)
+
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline and any(
+        thread.is_alive() for thread in signature_threads
+    ):
+        time.sleep(0.01)
+    assert not any(thread.is_alive() for thread in signature_threads)
 
 
 def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
