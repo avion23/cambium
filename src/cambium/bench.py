@@ -5,8 +5,13 @@ entry point (``cambium_bench``). It is inert unless ``--bench`` is passed.
 
 Modes::
 
-    pytest -p cambium.bench --bench=report   # measure + write baseline JSON
-    pytest -p cambium.bench --bench=gate     # fail (exit 1) on drift
+    pytest -p cambium.bench --bench=report      # measure + write baseline JSON
+    pytest -p cambium.bench --bench=gate        # fail (exit 1) on drift
+    pytest -p cambium.bench --bench=re-anchor   # explicitly record a new baseline
+
+A ``gate`` run never writes a baseline: a dataset_version change is a hard
+regression that fails the gate and preserves the old anchor. Recording a new
+baseline is an explicit, separate operation (``report`` or ``re-anchor``).
 
 The report writes ``src/cambium/modules/<name>/tests/baselines/baseline.json``
 per the schema in ``docs/research/bench-harness-design.md``: schema_version, module,
@@ -26,6 +31,7 @@ import datetime as _dt
 import hashlib
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
@@ -470,15 +476,15 @@ def compare_against_anchor(
     report: dict[str, Any],
     anchor: dict[str, Any],
     thresholds: dict[str, Any] | None = None,
-) -> list[tuple[str, str]] | None:
+) -> list[tuple[str, str]]:
     """Return ``[(field, detail)]`` regressions of ``report`` vs ``anchor``.
 
-    Returns ``None`` when the anchor is stale — its ``dataset_version``
-    differs from the report's, so the two are not comparable and the caller
-    must record a new anchor instead of failing (design §3: "the drift check
-    compares only against the last baseline with the same dataset_version").
-    A report with unavailable split metrics still fails closed, even when its
-    dataset version is stale.
+    Returns an empty list when there is no drift. It never returns a re-anchor
+    sentinel: a stale anchor — one whose ``dataset_version`` differs from the
+    report's — is itself a ``dataset_version`` regression, so callers fail
+    closed and preserve the anchor. Recording a new baseline is an explicit,
+    separate operation (``report`` or ``re-anchor`` mode), never a gate side
+    effect. A report with unavailable split metrics also fails closed.
 
     Threshold precedence: run-level ``thresholds`` (e.g. from
     ``--bench-metric-delta``) override the anchor's stored
@@ -500,9 +506,15 @@ def compare_against_anchor(
         if not isinstance(report_metrics.get(split), dict)
     ]
     if report.get("dataset_version") != anchor.get("dataset_version"):
+        version_regression = (
+            "dataset_version",
+            f"dataset_version changed: anchor {anchor.get('dataset_version')!r} != "
+            f"report {report.get('dataset_version')!r}; run report/re-anchor mode "
+            "to record a new baseline",
+        )
         if missing_split_regressions:
-            return missing_split_regressions
-        return None  # stale anchor — re-anchor instead of comparing
+            return missing_split_regressions + [version_regression]
+        return [version_regression]
 
     merged = dict(DEFAULT_THRESHOLDS)
     merged.update(anchor.get("drift_thresholds") or {})
@@ -631,6 +643,22 @@ class BenchPlugin:
             anchor_path = _baseline_path(pkg_name, report["module"], self.root)
             if self.mode == "report":
                 _write_baseline(report, anchor_path)
+            elif self.mode == "re-anchor":
+                if not anchor_path.exists():
+                    self.regressions[report["module"]] = [
+                        (
+                            "anchor",
+                            f"missing pre-existing anchor at {anchor_path}; "
+                            f"run --bench=report to create one",
+                        )
+                    ]
+                    session.exitstatus = 1
+                else:
+                    anchor = json.loads(anchor_path.read_text())
+                    self.reanchored[report["module"]] = (
+                        f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
+                    )
+                    _write_baseline(report, anchor_path)
             elif not anchor_path.exists():
                 self.regressions[report["module"]] = [
                     ("anchor", f"missing pre-existing anchor at {anchor_path}")
@@ -639,13 +667,7 @@ class BenchPlugin:
             else:
                 anchor = json.loads(anchor_path.read_text())
                 regressions = compare_against_anchor(report, anchor, self.thresholds)
-                if regressions is None:
-                    # dataset_version changed: record a new anchor, do not fail
-                    self.reanchored[report["module"]] = (
-                        f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
-                    )
-                    _write_baseline(report, anchor_path)
-                elif regressions:
+                if regressions:
                     self.regressions[report["module"]] = regressions
                     session.exitstatus = 1
 
@@ -695,9 +717,11 @@ def pytest_addoption(parser: Any) -> None:
     group = parser.getgroup("cambium-bench")
     group.addoption(
         "--bench",
-        choices=("report", "gate"),
+        choices=("report", "gate", "re-anchor"),
         default=None,
-        help="run cambium bench: report writes the baseline, gate fails on drift",
+        help="run cambium bench: report writes the baseline, gate fails on drift "
+        "(and preserves the anchor on dataset_version change), re-anchor records "
+        "a new baseline over an existing anchor",
     )
     group.addoption(
         "--bench-root",
@@ -740,7 +764,17 @@ def _write_drift_report(
     mode: str,
     full: bool,
 ) -> Path:
-    """Write a drift artifact summarizing each module against its anchor."""
+    """Write a drift artifact summarizing each module against its anchor.
+
+    The artifact must never alias a baseline anchor, so ``drift-report.json``
+    is not allowed to pre-exist: a symlink could redirect the write onto an
+    anchor, and a hard link would let a truncating write clobber the anchor in
+    place, violating "gate never writes the baseline". The path is rejected if
+    it exists and is then created with ``O_CREAT|O_EXCL|O_NOFOLLOW``, so a
+    pre-existing file (regular or hard-linked) or symlink fails the run
+    atomically instead of being opened or followed. The file is created mode
+    ``0o600`` so the drift artifact stays private.
+    """
     artifact: dict[str, Any] = {
         "schema_version": 1,
         "date": _utc_now_iso(),
@@ -758,17 +792,34 @@ def _write_drift_report(
         },
     }
     path = root / "drift-report.json"
+    if os.path.lexists(path):
+        kind = "a symlink" if path.is_symlink() else "a file"
+        raise OSError(
+            f"refusing to write drift report: {path} already exists ({kind}); "
+            "remove it and rerun to allow the artifact to be written"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(artifact, indent=2) + "\n")
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(artifact, indent=2) + "\n")
     return path
 
 
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m cambium.bench",
-        description="Run the Cambium benchmark report or drift gate.",
+        description="Run the Cambium benchmark report, drift gate, or explicit re-anchor.",
     )
-    parser.add_argument("mode", nargs="?", default="report", metavar="{report,gate}")
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default="report",
+        metavar="{report,gate,re-anchor}",
+    )
     parser.add_argument(
         "--full",
         action="store_true",
@@ -802,11 +853,11 @@ def _cli_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI form: ``python -m cambium.bench report|gate``."""
+    """CLI form: ``python -m cambium.bench report|gate|re-anchor``."""
     args = _cli_parser().parse_args(sys.argv[1:] if argv is None else argv)
     mode = args.mode
-    if mode not in ("report", "gate"):
-        print("usage: python -m cambium.bench report|gate", file=sys.stderr)
+    if mode not in ("report", "gate", "re-anchor"):
+        print("usage: python -m cambium.bench report|gate|re-anchor", file=sys.stderr)
         return 2
     thresholds = dict(DEFAULT_THRESHOLDS)
     if args.bench_metric_delta is not None:
@@ -836,19 +887,27 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "report":
             _write_baseline(report, path)
             print(f"cambium bench: wrote {path}")
+        elif mode == "re-anchor":
+            if not path.exists():
+                failures += 1
+                print(
+                    f"cambium bench: missing pre-existing anchor for {report['module']}: "
+                    f"{path}; run `report` to create one"
+                )
+            else:
+                anchor = json.loads(path.read_text())
+                _write_baseline(report, path)
+                print(
+                    f"cambium bench: re-anchored {report['module']}: "
+                    f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
+                )
         elif not path.exists():
             failures += 1
             print(f"cambium bench: missing pre-existing anchor for {report['module']}: {path}")
         else:
             anchor = json.loads(path.read_text())
             module_drift = compare_against_anchor(report, anchor, thresholds)
-            if module_drift is None:
-                _write_baseline(report, path)
-                print(
-                    f"cambium bench: re-anchored {report['module']}: "
-                    f"{anchor.get('dataset_version')} -> {report['dataset_version']}"
-                )
-            elif module_drift:
+            if module_drift:
                 failures += 1
                 drift[report["module"]] = module_drift
                 for field, detail in module_drift:
@@ -856,14 +915,19 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"cambium bench: gate passed: {report['module']}")
     if args.drift_report:
-        written = _write_drift_report(
-            root,
-            module_reports,
-            drift,
-            mode=mode,
-            full=args.full,
-        )
-        print(f"cambium bench: wrote drift report {written}")
+        try:
+            written = _write_drift_report(
+                root,
+                module_reports,
+                drift,
+                mode=mode,
+                full=args.full,
+            )
+        except OSError as exc:
+            print(f"cambium bench: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"cambium bench: wrote drift report {written}")
     return 1 if failures else 0
 
 

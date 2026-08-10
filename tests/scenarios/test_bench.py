@@ -644,12 +644,17 @@ def _fake_report(
     }
 
 
-def test_compare_stale_dataset_version_returns_reanchor_sentinel() -> None:
+def test_compare_stale_dataset_version_fails_closed() -> None:
+    """A stale anchor (different dataset_version) is a hard regression, never a
+    re-anchor sentinel: the gate must fail and preserve the anchor."""
     from cambium.bench import compare_against_anchor
 
     report = _fake_report(dataset_version="1.1.0")
     stale = _fake_report(dataset_version="1.0.0")
-    assert compare_against_anchor(report, stale) is None
+    regressions = compare_against_anchor(report, stale)
+    assert regressions is not None
+    assert [field for field, _detail in regressions] == ["dataset_version"]
+    assert "1.0.0" in regressions[0][1] and "1.1.0" in regressions[0][1]
     # same version, no drift -> no regressions
     assert compare_against_anchor(report, report) == []
 
@@ -702,9 +707,10 @@ def test_compare_canary_failed_delta_is_wired() -> None:
     assert compare_against_anchor(_fake_report(failed=2), _fake_report(failed=1)) != []
 
 
-def test_gate_reanchors_on_dataset_version_change(tmp_path) -> None:
-    """A baseline for an older dataset_version must not fail the gate:
-    it is replaced by a new anchor for the current version (design §3)."""
+def test_gate_fails_and_preserves_anchor_on_dataset_version_change(tmp_path) -> None:
+    """A dataset_version change must fail the gate and preserve the old anchor:
+    the gate never re-anchors (agents.md:42). Recording the new baseline
+    requires the explicit ``--bench=re-anchor`` operation."""
     bench_root = tmp_path / "baselines"
     report = run_bench(bench_root, "report")
     assert report.returncode == 0, report.stdout + report.stderr
@@ -715,10 +721,26 @@ def test_gate_reanchors_on_dataset_version_change(tmp_path) -> None:
     anchor_path.write_text(json.dumps(anchor))
 
     gate = run_bench(bench_root, "gate")
-    assert gate.returncode == 0, gate.stdout + gate.stderr
-    assert "RE-ANCHOR should_decompose: 1.0.0 -> 1.1.0" in gate.stdout
+    assert gate.returncode == 1, gate.stdout + gate.stderr
+    assert "DRIFT dataset_version" in gate.stdout
+    assert "RE-ANCHOR" not in gate.stdout
+    fresh = json.loads(anchor_path.read_text())
+    assert fresh["dataset_version"] == "1.0.0"  # old anchor preserved
+
+    reanchor = run_bench(bench_root, "re-anchor")
+    assert reanchor.returncode == 0, reanchor.stdout + reanchor.stderr
+    assert "RE-ANCHOR should_decompose: 1.0.0 -> 1.1.0" in reanchor.stdout
     fresh = json.loads(anchor_path.read_text())
     assert fresh["dataset_version"] == "1.1.0"
+
+
+def test_reanchor_mode_requires_pre_existing_anchor(tmp_path) -> None:
+    """Explicit re-anchor is a review operation: it needs an anchor to replace."""
+    bench_root = tmp_path / "baselines"
+    result = run_bench(bench_root, "re-anchor")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "missing pre-existing anchor" in result.stdout
+    assert not (bench_root / "should_decompose" / "baseline.json").exists()
 
 
 def test_gate_honors_cli_metric_delta_override(tmp_path) -> None:
@@ -904,8 +926,86 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     )
     assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
     artifact = json.loads((bench_root / "drift-report.json").read_text())
+    assert os.stat(bench_root / "drift-report.json").st_mode & 0o077 == 0
     regressions = artifact["modules"]["should_decompose"]["regressions"]
     assert any(field == "metric.train.mean" for field, _detail in regressions)
+
+
+def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A symlinked drift-report.json must not redirect the gate's drift write
+    onto a baseline anchor: the gate never writes the baseline, and a rejected
+    artifact write fails the run instead of clobbering the anchor."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_before = anchor_path.read_bytes()
+    artifact = bench_root / "drift-report.json"
+    artifact.symlink_to(anchor_path)
+
+    assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
+
+    captured = capsys.readouterr()
+    assert "symlink" in captured.err
+    assert anchor_path.read_bytes() == anchor_before  # anchor bytes unchanged
+    assert artifact.is_symlink()  # artifact never materialized over the link
+
+
+def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A drift-report.json hard-linked to a baseline anchor must not be
+    overwritten by the gate: the write fails closed on the pre-existing file,
+    preserving the anchor, and the run fails."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_before = anchor_path.read_bytes()
+    anchor_ino = anchor_path.stat().st_ino
+    artifact = bench_root / "drift-report.json"
+    os.link(anchor_path, artifact)
+    assert anchor_path.stat().st_nlink == 2
+
+    assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
+
+    captured = capsys.readouterr()
+    assert "already exists" in captured.err
+    assert anchor_path.stat().st_ino == anchor_ino  # same inode, never replaced
+    assert anchor_path.read_bytes() == anchor_before  # anchor bytes unchanged
+    assert artifact.stat().st_ino == anchor_ino  # artifact still aliases the anchor
+    assert anchor_path.stat().st_nlink == 2  # hard link never unlinked
+
+
+def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The standalone CLI shares the fail-closed re-anchor rule: a dataset_version
+    change fails the gate and preserves the anchor; ``re-anchor`` records it."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor = json.loads(anchor_path.read_text())
+    assert anchor["dataset_version"] == "1.1.0"
+    anchor["dataset_version"] = "1.0.0"  # simulate a pre-bump anchor
+    anchor_path.write_text(json.dumps(anchor))
+
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+    out = capsys.readouterr().out
+    assert "DRIFT should_decompose: dataset_version" in out
+    fresh = json.loads(anchor_path.read_text())
+    assert fresh["dataset_version"] == "1.0.0"  # old anchor preserved
+
+    assert bench.main(["re-anchor", "--bench-root", str(bench_root)]) == 0
+    assert "re-anchored should_decompose: 1.0.0 -> 1.1.0" in capsys.readouterr().out
+    fresh = json.loads(anchor_path.read_text())
+    assert fresh["dataset_version"] == "1.1.0"
 
 
 def _build_and_install_wheel(site_dir: Path) -> Path:
