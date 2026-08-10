@@ -218,6 +218,43 @@ def test_writer_dead_on_locked_db_critical_append_raises(tmp_path) -> None:
         store.close()
 
 
+def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        assert store.append({"kind": "log", "payload": {}}) == 1
+        store._thread.join(7.0)
+        assert not store._thread.is_alive()
+        assert store.dropped == 1
+
+        blocker.rollback()
+        blocker.close()
+        blocker = None
+        assert store.events_after(0) == []
+        with pytest.raises(StoreError):
+            store.close()
+    finally:
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {}}) == 2
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [2]
+
+
 def test_invalid_queue_and_deadline_config_raise(tmp_path) -> None:
     with pytest.raises(ValueError):
         EventStore(tmp_path / "a.db", max_queue_size=0)
@@ -900,6 +937,104 @@ def test_writer_death_during_blocked_eviction_persistence_burns_sequence(
                 store.close()
             except StoreError:
                 pass
+
+    monkeypatch.undo()
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert reopened.append({"kind": "log", "payload": {"i": 2}}) == 3
+    finally:
+        reopened.close()
+
+    assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
+
+
+def test_close_retries_pending_sequence_persistence_after_reservation_lock(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.3)
+    fsync_started = threading.Event()
+    fsync_release = threading.Event()
+    reservation_started = threading.Event()
+    persistence_started = threading.Event()
+    append_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    real_reserve = store._reserve_evicted_sequence
+    real_persist = store._persist_pending_sequence_high_water
+
+    def fail_fsync(self) -> None:
+        fsync_started.set()
+        fsync_release.wait(5.0)
+        raise OSError("writer failed during close persistence")
+
+    def reserve_eviction(item, deadline) -> None:
+        reservation_started.set()
+        real_reserve(item, deadline)
+
+    def persist_sequence(*args, **kwargs):
+        persistence_started.set()
+        return real_persist(*args, **kwargs)
+
+    def append_event(kind: str, value: int) -> None:
+        try:
+            store.append({"kind": kind, "payload": {"i": value}})
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
+    monkeypatch.setattr(store, "_reserve_evicted_sequence", reserve_eviction)
+    monkeypatch.setattr(store, "_persist_pending_sequence_high_water", persist_sequence)
+    first = threading.Thread(target=append_event, args=("result", 0))
+    critical = threading.Thread(target=append_event, args=("result", 1))
+    closer = threading.Thread(target=close_store)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        first.start()
+        assert fsync_started.wait(1.0)
+        assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
+        blocker.execute("BEGIN IMMEDIATE")
+
+        critical.start()
+        assert reservation_started.wait(1.0)
+        fsync_release.set()
+        store._thread.join(2.0)
+        assert not store._thread.is_alive()
+
+        closer.start()
+        assert persistence_started.wait(1.0)
+        time.sleep(0.45)  # let the blocked eviction reservation reach its deadline
+        blocker.rollback()
+        blocker.close()
+        blocker = None
+
+        closer.join(2.0)
+        critical.join(2.0)
+        first.join(2.0)
+        assert not closer.is_alive()
+        assert not critical.is_alive()
+        assert not first.is_alive()
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], StoreError)
+        assert store.dropped == 1
+        assert store._pending_sequence_high_water is None
+    finally:
+        fsync_release.set()
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        closer.join(2.0)
+        critical.join(2.0)
+        first.join(2.0)
+        if store._thread.is_alive():
+            store._stop_requested.set()
+            store._queue.wake()
+            store._thread.join(2.0)
 
     monkeypatch.undo()
     reopened = EventStore(path, fsync_interval_s=60.0)

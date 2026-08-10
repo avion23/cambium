@@ -105,6 +105,7 @@ _WRITER_BUSY_TIMEOUT_MS = 5000
 # loop (and the critical-append deadline) in control of total wait time.
 _CHECKPOINT_BUSY_TIMEOUT_MS = 20
 _CHECKPOINT_RETRY_SLEEP_S = 0.02
+_SEQUENCE_PERSIST_RETRY_SLEEP_S = 0.01
 _CLOSE_JOIN_TIMEOUT_S = 1.0
 _CLOSE_STOP_JOIN_TIMEOUT_S = 0.1
 
@@ -486,34 +487,48 @@ class EventStore:
             ):
                 self._pending_sequence_high_water = next_seq
 
-    def _persist_pending_sequence_high_water(self) -> None:
-        with self._lock:
-            next_seq = self._pending_sequence_high_water
-        if next_seq is None:
-            return
+    def _persist_pending_sequence_high_water(self, deadline: float | None = None) -> bool:
+        if deadline is None:
+            deadline = time.monotonic() + _CLOSE_JOIN_TIMEOUT_S
 
-        conn = sqlite3.connect(self._path, isolation_level=None, timeout=0.0)
-        try:
-            conn.execute("PRAGMA busy_timeout=0").fetchall()
-            conn.execute("PRAGMA synchronous=FULL").fetchall()
-            cursor = conn.execute(_UPDATE_NEXT_SEQ, (next_seq,))
-            if cursor.rowcount != 1:
-                raise StoreError("event store sequence counter is missing")
-            cursor.close()
-        except sqlite3.OperationalError as exc:
-            message = str(exc).lower()
-            if "locked" not in message and "busy" not in message:
-                raise
-            return
-        finally:
-            conn.close()
+        while True:
+            with self._lock:
+                next_seq = self._pending_sequence_high_water
+            if next_seq is None:
+                return True
 
-        with self._lock:
-            if (
-                self._pending_sequence_high_water is not None
-                and self._pending_sequence_high_water <= next_seq
-            ):
-                self._pending_sequence_high_water = None
+            conn = None
+            try:
+                conn = sqlite3.connect(self._path, isolation_level=None, timeout=0.0)
+                conn.execute("PRAGMA busy_timeout=0").fetchall()
+                conn.execute("PRAGMA synchronous=FULL").fetchall()
+                cursor = conn.execute(_UPDATE_NEXT_SEQ, (next_seq,))
+                if cursor.rowcount != 1:
+                    raise StoreError("event store sequence counter is missing")
+                cursor.close()
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(
+                    min(
+                        _SEQUENCE_PERSIST_RETRY_SLEEP_S,
+                        max(deadline - time.monotonic(), 0.0),
+                    )
+                )
+                continue
+            finally:
+                if conn is not None:
+                    conn.close()
+
+            with self._lock:
+                if (
+                    self._pending_sequence_high_water is not None
+                    and self._pending_sequence_high_water <= next_seq
+                ):
+                    self._pending_sequence_high_water = None
 
     def _reserve_evicted_sequence(self, item: Any, deadline: float) -> None:
         evicted_seq = item[0]
@@ -583,15 +598,15 @@ class EventStore:
 
         if already_closed:
             if failure is not None:
-                self._request_stop(failure)
+                self._request_stop(failure, deadline=close_deadline)
                 self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
-                self._raise_close_failure(failure)
+                self._raise_close_failure(self._close_failure())
             return
 
         if failure is not None:
-            self._request_stop(failure)
+            self._request_stop(failure, deadline=close_deadline)
             self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
-            self._raise_close_failure(failure)
+            self._raise_close_failure(self._close_failure())
 
         with self._lock:
             while self._active_admissions:
@@ -625,14 +640,14 @@ class EventStore:
 
         if failure is not None:
             failure = self._set_close_failure(failure)
-            self._request_stop(failure)
+            self._request_stop(failure, deadline=close_deadline)
             self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
             if self._thread.is_alive():
-                self._request_stop(failure)
+                self._request_stop(failure, deadline=close_deadline)
                 self._thread.join(_CLOSE_STOP_JOIN_TIMEOUT_S)
                 if self._thread.is_alive():
                     failure = self._set_writer_stop_failure(failure)
-                    self._request_stop(failure)
+                    self._request_stop(failure, deadline=close_deadline)
             self._raise_close_failure(self._close_failure())
 
         self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
@@ -640,14 +655,15 @@ class EventStore:
             failure = self._set_close_failure(
                 StoreTimeout("event store close: writer did not stop within the close deadline")
             )
-            self._request_stop(failure)
+            self._request_stop(failure, deadline=close_deadline)
             self._thread.join(_CLOSE_STOP_JOIN_TIMEOUT_S)
             if self._thread.is_alive():
                 self._set_writer_stop_failure(failure)
 
         failure = self._close_failure()
         if failure is not None:
-            self._raise_close_failure(failure)
+            self._request_stop(failure, deadline=close_deadline)
+            self._raise_close_failure(self._close_failure())
 
     def _close_failure(self) -> BaseException | None:
         with self._lock:
@@ -670,11 +686,21 @@ class EventStore:
                 self._dead = failure
         return failure
 
-    def _request_stop(self, exc: BaseException) -> None:
+    def _request_stop(self, exc: BaseException, *, deadline: float | None = None) -> None:
         self._stop_requested.set()
         self._queue.wake()
         self._fail_pending(exc)
-        self._persist_pending_sequence_high_water()
+        if not self._persist_pending_sequence_high_water(deadline):
+            failure = StoreTimeout(
+                "event store close: sequence reservation was not persisted before "
+                "the close deadline"
+            )
+            failure.__cause__ = exc
+            with self._lock:
+                if self._close_error is None:
+                    self._close_error = failure
+                if self._dead is None:
+                    self._dead = failure
 
     def _raise_close_failure(self, exc: BaseException | None) -> None:
         if exc is None:
@@ -729,7 +755,9 @@ class EventStore:
 
         dirty = False
         next_fsync = time.monotonic() + self._fsync_interval_s
+        cur_item = None
         cur_pending = None
+        cur_inserted = False
         dead_exc = None
         try:
             while not self._stop_requested.is_set():
@@ -751,32 +779,45 @@ class EventStore:
                     next_fsync = time.monotonic() + self._fsync_interval_s
                     continue
                 seq, kind, row, pending = item
+                cur_item = item
                 cur_pending = pending
+                cur_inserted = False
                 if self._stop_requested.is_set():
+                    self._account_failed_item(item, inserted=cur_inserted)
                     cur_pending.exc = self._termination_error()
                     cur_pending.event.set()
+                    cur_item = None
                     cur_pending = None
                     break
                 conn.execute(_INSERT, (seq, kind, *row))
+                cur_inserted = True
                 dirty = True
                 if kind in CRITICAL_KINDS:
                     if self._stop_requested.is_set():
+                        self._account_failed_item(item, inserted=cur_inserted)
                         cur_pending.exc = self._termination_error()
                         cur_pending.event.set()
+                        cur_item = None
                         cur_pending = None
                         break
                     self._fsync_now()
                     dirty = False
                     next_fsync = time.monotonic() + self._fsync_interval_s
                 if self._stop_requested.is_set():
+                    self._account_failed_item(item, inserted=cur_inserted)
                     cur_pending.exc = self._termination_error()
                     cur_pending.event.set()
+                    cur_item = None
                     cur_pending = None
                     break
                 pending.event.set()
+                cur_item = None
                 cur_pending = None
+                cur_inserted = False
         except BaseException as exc:
             dead_exc = exc
+            if cur_item is not None:
+                self._account_failed_item(cur_item, inserted=cur_inserted)
             self._record_writer_failure(exc)
             self._fail_pending(exc)
             if cur_pending is not None:
@@ -790,6 +831,8 @@ class EventStore:
                     self._record_writer_failure(exc, close_error=True)
                     self._fail_pending(exc)
                     if cur_pending is not None:
+                        if cur_item is not None:
+                            self._account_failed_item(cur_item, inserted=cur_inserted)
                         cur_pending.exc = exc
                         cur_pending.event.set()
             if wal_fd is not None:
@@ -810,6 +853,20 @@ class EventStore:
     def _termination_error(self) -> BaseException:
         with self._lock:
             return self._close_error or self._dead or StoreError("event store writer stopped")
+
+    def _account_failed_item(self, item: tuple, *, inserted: bool) -> None:
+        if inserted:
+            return
+        seq, kind, _, _ = item
+        self._remember_sequence_high_water(seq + 1)
+        if kind in CRITICAL_KINDS:
+            return
+        self._record_dropped(1)
+        logger.warning(
+            "event store shutdown: dropped non-critical event seq %d kind=%r",
+            seq,
+            kind,
+        )
 
     def _fail_pending(self, exc: BaseException) -> None:
         dropped = 0
