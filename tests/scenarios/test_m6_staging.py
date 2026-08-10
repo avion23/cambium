@@ -17,7 +17,7 @@ import pytest
 
 pytest.importorskip("cambium.diffundo")
 
-from cambium.diffundo import Diffundo, ProviderTier  # noqa: E402
+from cambium.diffundo import Diffundo, ProviderError, ProviderOutcome, ProviderTier  # noqa: E402
 from cambium.provider_config import load_providers  # noqa: E402
 from cambium.supervisor import read_events, run_plan  # noqa: E402
 
@@ -33,6 +33,18 @@ DYNAMIC_TAIL = (
     "request_id=m6-request-001\n"
     "requested_decision=append a marker to target.txt"
 )
+FAKE_API_KEY = "test-only-not-a-network-key"
+_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+)
+_LOOPBACK_NO_PROXY = "127.0.0.1,localhost"
 
 # The handler returns this module-level payload. A scenario can replace it to
 # exercise another scripted completion without changing the HTTP adapter.
@@ -49,7 +61,8 @@ SCRIPTED_COMPLETION: dict[str, Any] = {
     ],
     "usage": {"prompt_tokens": 18, "completion_tokens": 11, "total_tokens": 29},
 }
-FAKE_REQUESTS: dict[str, Any] = {"count": 0, "bodies": []}
+SCRIPTED_STATUS_CODES: list[int] = []
+FAKE_REQUESTS: dict[str, Any] = {"count": 0, "bodies": [], "statuses": []}
 _FAKE_LOCK = threading.Lock()
 
 
@@ -59,6 +72,9 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
         if self.path != "/chat/completions":
             self.send_error(404)
+            return
+        if self.headers.get("Authorization") != f"Bearer {FAKE_API_KEY}":
+            self.send_error(401, "invalid Authorization header")
             return
 
         length = int(self.headers.get("Content-Length") or 0)
@@ -71,12 +87,23 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
             body = {}
 
         with _FAKE_LOCK:
+            request_index = FAKE_REQUESTS["count"]
             FAKE_REQUESTS["count"] += 1
             FAKE_REQUESTS["bodies"].append(body)
-            response = copy.deepcopy(SCRIPTED_COMPLETION)
+            status = (
+                SCRIPTED_STATUS_CODES[request_index]
+                if request_index < len(SCRIPTED_STATUS_CODES)
+                else 200
+            )
+            FAKE_REQUESTS["statuses"].append(status)
+            response = (
+                copy.deepcopy(SCRIPTED_COMPLETION)
+                if status == 200
+                else {"error": {"message": f"forced HTTP {status}"}}
+            )
 
         encoded = json.dumps(response).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Connection", "close")
@@ -109,15 +136,22 @@ def _reset_fake_server() -> None:
     with _FAKE_LOCK:
         FAKE_REQUESTS["count"] = 0
         FAKE_REQUESTS["bodies"] = []
+        FAKE_REQUESTS["statuses"] = []
+        SCRIPTED_STATUS_CODES.clear()
 
 
-def _write_provider_config(path: Path, base_url: str) -> None:
+def _write_provider_config(
+    path: Path,
+    base_url: str,
+    *,
+    provider_names: tuple[str, ...] = ("m6-fake-fast",),
+) -> None:
     path.write_text(
         json.dumps(
             {
                 "providers": [
                     {
-                        "name": "m6-fake-fast",
+                        "name": name,
                         "tier": "fast",
                         "base_url": base_url,
                         "api_key_env": "M6_FAKE_OPENAI_KEY",
@@ -126,10 +160,11 @@ def _write_provider_config(path: Path, base_url: str) -> None:
                         "rpm": 120,
                         "enabled": True,
                         "model": "m6-fake-model",
-                        "priority": 0,
+                        "priority": priority,
                         "cooldown_s": 1.0,
                         "price": 0.0,
                     }
+                    for priority, name in enumerate(provider_names)
                 ]
             }
         ),
@@ -197,6 +232,14 @@ def _set_absolute_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHONPATH", pythonpath)
 
 
+def _isolate_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep urllib calls to the fake server on loopback, never through a proxy."""
+    for variable in _PROXY_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("NO_PROXY", _LOOPBACK_NO_PROXY)
+    monkeypatch.setenv("no_proxy", _LOOPBACK_NO_PROXY)
+
+
 def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatch) -> None:
     """Run two uncached provider calls, then publish the second decision once."""
     _reset_fake_server()
@@ -207,7 +250,8 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
     branch = "wt-m6-staging"
 
     try:
-        monkeypatch.setenv("M6_FAKE_OPENAI_KEY", "test-only-not-a-network-key")
+        _isolate_proxy_environment(monkeypatch)
+        monkeypatch.setenv("M6_FAKE_OPENAI_KEY", FAKE_API_KEY)
         _set_absolute_pythonpath(monkeypatch)
         config_path = tmp_path / "providers.json"
         _write_provider_config(config_path, server.base_url)
@@ -290,9 +334,14 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
         assert main_sha == task_result.merge_sha
         assert _git(repo, "merge-base", "--is-ancestor", base, main_sha).returncode == 0
         assert _git(repo, "rev-list", "--count", f"{base}..{main_sha}").stdout.strip() == "1"
+        changed_files = _git(repo, "diff", "--name-only", f"{base}..{main_sha}").stdout.splitlines()
+        assert changed_files == [target_file]
         diff = _git(repo, "diff", f"{base}..{main_sha}").stdout
         assert f"+{marker}" in diff
-        assert marker in _git(repo, "show", f"{main_sha}:{target_file}").stdout
+        base_target = _git(repo, "show", f"{base}:{target_file}").stdout
+        published_target = _git(repo, "show", f"{main_sha}:{target_file}").stdout
+        assert published_target == base_target.rstrip("\n") + f"\n{marker}\n"
+        assert published_target.splitlines().count(marker) == 1
 
         events = read_events(session_dir)
         task_events = [event for event in events if event["task_id"] == "m6-staging"]
@@ -311,4 +360,98 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
         assert events[-1]["kind"] == "session_ended"
     finally:
         _remove_worker_worktree(repo, worktree, branch)
+        server.close()
+
+
+def test_m6_failing_gate_does_not_publish(tmp_path: Path, monkeypatch) -> None:
+    """A failed gate leaves main at the base commit and emits no merge event."""
+    _set_absolute_pythonpath(monkeypatch)
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    worktree = session_dir / "worker-wt"
+    branch = "wt-m6-gate-fail"
+    target_file = "target.txt"
+    marker = "// m6-gate-marker"
+    task_id = "m6-gate-fail"
+    base = _make_repo(repo)
+    plan = {
+        "tasks": [
+            {
+                "task_id": task_id,
+                "task": f"append marker line to file {target_file}: {marker}",
+                "repo": str(repo),
+                "worktree_path": str(worktree),
+                "branch": branch,
+                "worker": "cambium.worker",
+                "target_file": target_file,
+                "marker": marker,
+                "write_marker": True,
+                "gate": "false",
+                "base_commit": base,
+                "ready_timeout_s": 5.0,
+                "gate_timeout_s": 5.0,
+                "max_wall_s": 20.0,
+            }
+        ]
+    }
+
+    try:
+        result = asyncio.run(run_plan(session_dir, plan))
+        assert result.exit_code == 1
+        assert len(result.results) == 1
+        task_result = result.results[0]
+        assert task_result.task_id == task_id
+        assert task_result.status == "failed"
+        assert task_result.reason == "gate_failed"
+        assert task_result.gate_exit_code != 0
+        assert task_result.merge_sha is None
+        assert _git(repo, "rev-parse", "refs/heads/main").stdout.strip() == base
+        assert marker not in _git(repo, "show", f"{base}:{target_file}").stdout
+
+        task_events = [event for event in read_events(session_dir) if event["task_id"] == task_id]
+        assert any(event["kind"] == "gate" for event in task_events)
+        assert not any(event["kind"] == "merge_committed" for event in task_events)
+    finally:
+        _remove_worker_worktree(repo, worktree, branch)
+
+
+def test_m6_forced_429_falls_back_to_next_provider(tmp_path: Path, monkeypatch) -> None:
+    """A forced quota response falls through to the next local fake provider."""
+    _isolate_proxy_environment(monkeypatch)
+    _reset_fake_server()
+    server = _FakeOpenAIServer()
+    try:
+        with _FAKE_LOCK:
+            SCRIPTED_STATUS_CODES[:] = [429, 200]
+        monkeypatch.setenv("M6_FAKE_OPENAI_KEY", FAKE_API_KEY)
+        config_path = tmp_path / "providers.json"
+        _write_provider_config(
+            config_path,
+            server.base_url,
+            provider_names=("m6-fake-429", "m6-fake-fallback"),
+        )
+        providers = load_providers(config_path)
+        router = Diffundo(providers, call_budget_s=5.0, pause_timeout_s=0.1)
+
+        failed_outcomes: list[ProviderOutcome] = []
+        original_attempt = router._attempt
+
+        async def record_attempt(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await original_attempt(*args, **kwargs)
+            except ProviderError as exc:
+                failed_outcomes.append(exc.outcome)
+                raise
+
+        monkeypatch.setattr(router, "_attempt", record_attempt)
+
+        prompt = {"messages": [{"role": "user", "content": "hello"}]}
+        result = asyncio.run(router.call(ProviderTier.FAST, prompt))
+
+        assert result.provider == "m6-fake-fallback"
+        assert result.content == DECISION
+        assert failed_outcomes == [ProviderOutcome.QUOTA]
+        assert FAKE_REQUESTS["statuses"] == [429, 200]
+        assert FAKE_REQUESTS["count"] == 2
+    finally:
         server.close()
