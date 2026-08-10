@@ -84,8 +84,8 @@ the implementation.
 ## Coverage
 
 - TIER 1: **8 tracked research documents**.
-- TIER 2: **22 tracked research documents**.
-- TIER 3: **14 tracked research documents**.
+- TIER 2: **21 tracked research documents**.
+- TIER 3: **15 tracked research documents**.
 - Total: **44 research documents**, each listed exactly once above. The index
   itself is not a tier item.
 
