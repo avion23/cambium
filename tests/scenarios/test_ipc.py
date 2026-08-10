@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from cambium.fencing import read_generation, write_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
@@ -88,6 +89,7 @@ class WorkerSupervisor:
         self.stderr_lines: list[str] = []
         self._stderr_task: asyncio.Task | None = None
         self._env = env
+        self._generation = 1
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
@@ -110,6 +112,20 @@ class WorkerSupervisor:
 
     async def send(self, msg: dict) -> None:
         assert self.proc is not None
+        if msg.get("type") == "init":
+            self._generation = int(msg.get("generation", 1))
+        if msg.get("type") == "run_task":
+            scratch = Path(msg["scratch_repo"]).resolve()
+            worktree = Path(msg["worktree_path"]).resolve()
+            if not worktree.exists():
+                subprocess.run(
+                    ["git", "-C", str(scratch), "worktree", "add", "-b",
+                     msg["branch"], str(worktree), "main"],
+                    check=True,
+                    capture_output=True,
+                )
+            if read_generation(worktree) < self._generation:
+                write_generation(worktree, self._generation)
         self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
         await self.proc.stdin.drain()
 
@@ -572,6 +588,65 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             assert exit_msg["reason"] == "done"
             rc = await w.proc.wait()
             assert rc == 0
+        finally:
+            await w.stop()
+
+    asyncio.run(scenario())
+
+
+def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-ping-1",
+                          "task_id": "ipc-ping", "generation": 1})
+            assert (await w.recv())["type"] == "ready"
+            await w.send({"type": "ping", "request_id": "ping-exact-1"})
+            pong = await w.recv()
+            assert pong == {
+                "type": "pong",
+                "request_id": "ping-exact-1",
+                "task_id": "ipc-ping",
+                "generation": 1,
+                "monotonic_ms": pong["monotonic_ms"],
+            }
+            await w.send({"type": "shutdown", "request_id": "shutdown-ping"})
+            assert (await w.recv())["type"] == "ok"
+            assert (await w.recv())["reason"] == "shutdown"
+            assert await w.proc.wait() == 0
+        finally:
+            await w.stop()
+
+    asyncio.run(scenario())
+
+
+def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    _make_scratch(session_dir / "scratch")
+    worktree = session_dir / "wt"
+
+    async def scenario() -> None:
+        w = WorkerSupervisor()
+        await w.start()
+        try:
+            await w.send({"type": "init", "request_id": "init-fence-1",
+                          "task_id": "ipc-fence", "generation": 2})
+            assert (await w.recv())["type"] == "ready"
+            await w.send(_run_task_msg(
+                session_dir, run_rid="run-fence-1", work_delay_s=1.0,
+                task_id="ipc-fence", generation=2,
+            ))
+            assert (await w.recv())["type"] == "heartbeat"
+            write_generation(worktree, 3)
+            result, _ = await w.recv_result()
+            assert result["status"] == "failed"
+            assert "generation mismatch" in result["failure_reason"]
+            assert "// cambium-ipc" not in (worktree / "hello.txt").read_text()
+            assert await w.proc.wait() == 1
         finally:
             await w.stop()
 

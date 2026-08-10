@@ -74,6 +74,7 @@ def _task(
         "write_marker": True,
         "gate": f"grep -q '{marker}' {target_file}",
         "base_commit": base,
+        "provider_env_keys": ["FAKE_MODE"],
     }
 
 

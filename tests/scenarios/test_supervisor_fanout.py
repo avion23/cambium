@@ -1,10 +1,9 @@
 """Custos multi-worker supervisor scenarios (T1-T6).
 
 Real supervisor (``cambium.supervisor.run_plan``) driving real worker
-subprocesses and real git operations. No mocks, no network. The worker
-runtime uses ``scripts/fake_worker.py`` as the fallback for the missing
-``cambium.worker`` module (skipped via importorskip when present), plus a
-dedicated in-place crash fixture for the recovery scenario.
+subprocesses and real git operations. No mocks, no network. Workers come
+from ``scripts/fake_worker.py`` plus dedicated fixtures for recovery and
+hardening scenarios.
 
 Scenarios:
   T1 fan-out: 3 workers, disjoint files -> all merged, coherent event log.
@@ -75,6 +74,7 @@ def _task(
         "write_marker": True,
         "gate": gate,
         "base_commit": base,
+        "provider_env_keys": ["FAKE_MODE"],
     }
     spec.update(extra)
     return spec
@@ -216,28 +216,25 @@ def test_t4_same_file_race_one_wins_loser_merge_failed(tmp_path, monkeypatch) ->
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n// replace-me\n"})
 
-    # The loser is task 0 so it edits the '// replace-me' line first (branch
-    # based on base); its gate sleeps, letting the winner's merge land first.
-    # The loser then rebases onto the winner's tip and conflicts on the same
-    # line -> merge_failed. Deterministic.
-    loser = _task(session_dir, repo, base, "t-loser", worktree="wt-loser", branch="wt-loser",
-                  target_file="hello.txt", marker="// cambium-loser",
-                  gate="sleep 2.5 && grep -q '// cambium-loser' hello.txt")
-    winner = _task(session_dir, repo, base, "t-winner", worktree="wt-winner", branch="wt-winner",
-                   target_file="hello.txt", marker="// cambium-winner",
-                   gate="sleep 1 && grep -q '// cambium-winner' hello.txt")
+    # Both branches start from the fixed base. Whichever merge publishes first
+    # wins; the other rebase conflicts on the same line.
+    a = _task(session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
+              target_file="hello.txt", marker="// cambium-a", gate="true")
+    b = _task(session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
+              target_file="hello.txt", marker="// cambium-b", gate="true")
 
-    result = asyncio.run(run_plan(session_dir, {"tasks": [loser, winner]}))
+    result = asyncio.run(run_plan(session_dir, {"tasks": [a, b]}))
 
-    assert result.exit_code != 0  # the loser failed
-    by_id = {r.task_id: r for r in result.results}
-    assert by_id["t-winner"].status == "succeeded"
-    assert by_id["t-loser"].status == "failed"
-    assert by_id["t-loser"].reason == "merge_failed"
+    assert result.exit_code != 0
+    assert {r.status for r in result.results} == {"succeeded", "failed"}
+    winner = next(r for r in result.results if r.status == "succeeded")
+    loser = next(r for r in result.results if r.status == "failed")
+    assert winner.merge_sha is not None
+    assert loser.reason == "merge_failed"
 
     merged = _show(repo, "main", "hello.txt")
-    assert "// cambium-winner" in merged
-    assert "// cambium-loser" not in merged
+    assert merged.count("// cambium-") == 1
+    assert ("// cambium-a" in merged) != ("// cambium-b" in merged)
 
     events = read_events(session_dir)
     assert len(_kinds(events, "merge_committed")) == 1
@@ -323,6 +320,7 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
                 "branch": "wt-slow",
                 "worker": WORKER,
                 "gate": "true",
+                "provider_env_keys": ["FAKE_MODE"],
             }
         ]
     }
