@@ -129,6 +129,12 @@ def _build_parser() -> argparse.ArgumentParser:
     bench_commands = bench.add_subparsers(dest="bench_command", required=True)
     for mode in ("report", "gate"):
         mode_parser = bench_commands.add_parser(mode, help=f"run the bench {mode}")
+        mode_parser.add_argument("--full", action="store_true", help="full run")
+        mode_parser.add_argument(
+            "--drift-report",
+            action="store_true",
+            help="write a drift artifact to the baseline root",
+        )
         mode_parser.add_argument("--bench-root", type=Path, metavar="PATH")
         mode_parser.add_argument("--bench-metric-delta", type=float, metavar="FLOAT")
         mode_parser.add_argument("--bench-wall-ratio", type=float, metavar="FLOAT")
@@ -256,6 +262,10 @@ def _run_bench(args: argparse.Namespace) -> int:
         raise
 
     delegated = [args.bench_command]
+    if args.full:
+        delegated.append("--full")
+    if args.drift_report:
+        delegated.append("--drift-report")
     for option in ("bench_root", "bench_metric_delta", "bench_wall_ratio"):
         value = getattr(args, option)
         if value is not None:

@@ -6,6 +6,9 @@ requires-python = ">=3.14"
 name = "cambium"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "pytest" },
+]
 
 [package.optional-dependencies]
 ast = [
@@ -13,21 +16,18 @@ ast = [
     { name = "tree-sitter-python" },
 ]
 dev = [
-    { name = "pytest" },
     { name = "ruff" },
     { name = "tree-sitter" },
     { name = "tree-sitter-python" },
 ]
 test = [
-    { name = "pytest" },
     { name = "tree-sitter" },
     { name = "tree-sitter-python" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=9" },
+    { name = "pytest", specifier = ">=9" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "tree-sitter", marker = "extra == 'ast'", specifier = ">=0.26" },
     { name = "tree-sitter", marker = "extra == 'dev'", specifier = ">=0.26" },

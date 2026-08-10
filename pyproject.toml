@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Multi-agent coding-agent harness"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+# pytest is a runtime dependency: `cambium bench` and `cambium module-test`
+# import pytest (bench.py, module_conformance.py) in a plain wheel install.
+dependencies = ["pytest>=9"]
 
 [project.scripts]
 cambium = "cambium.cli:main"
@@ -17,14 +19,13 @@ cambium = "cambium.cli:main"
 # ast: focused alias for consumers that need only the optional tree-sitter
 # Python parser; the stdlib ast backend remains the core fallback.
 ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
-# test: what CI runs — pytest plus the AST backend, so AST tests do not skip.
-test = ["pytest>=9", "tree-sitter>=0.26", "tree-sitter-python>=0.25"]
+# test: what CI runs — the AST backend on top of the runtime pytest dependency.
+test = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
 # dev: superset of test — everything a contributor needs locally. Keep the
 # AST dependencies here as well so `--extra dev` exercises the same backend.
 # ruff>=0.12, not ruff>=0.9: ruff<0.12 rejects `target-version = "py314"`
 # (verified 0.9.10/0.11.0: "unknown variant `py314`"); 0.12.0 accepts it.
 dev = [
-    "pytest>=9",
     "ruff>=0.12",
     "tree-sitter>=0.26",
     "tree-sitter-python>=0.25",
