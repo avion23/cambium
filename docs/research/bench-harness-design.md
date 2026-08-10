@@ -167,6 +167,37 @@ anchor for the drift gate; the `.cambium/` copies are forensic history.
      `Dataset.dataset_version` (`dataset-format.md` §9).
 - `git_sha` makes the recorded number attributable to a concrete tree.
 
+### Static module-conformance content anchors
+
+The module-isolation gate treats the split bytes as frozen content, not only
+as metric input.  Each module's `datasets/meta.json` and committed
+`tests/baselines/baseline.json` must carry the same
+`split_digests.{train,eval,canaries}` SHA-256 map.  The gate hashes the exact
+UTF-8 JSONL bytes, validates record IDs and split labels, and rejects an
+`eval.jsonl` or `canaries.jsonl` edit when `dataset_version` did not change.
+
+The separate bench follow-up must make these exact changes in
+`src/cambium/bench.py`:
+
+1. Change `_read_meta()` from a nullable best-effort reader to a fail-closed
+   validator.  Require `schema_version == 1`, a semantic `dataset_version`,
+   `eval_frozen_at`, `canary_frozen_at`, and three lowercase SHA-256
+   `split_digests`; never use a missing-meta default.
+2. In `build_module_report()`, hash the exact `train.jsonl`, `eval.jsonl`, and
+   `canaries.jsonl` bytes and return `split_digests` with the report body.  Do
+   not fall back to the combined dataset when the split-aware metadata exists
+   but a required split is unreadable.
+3. In `_assemble_baseline()`, copy `split_digests` into every generated
+   baseline report.  The committed baseline must contain the same map as
+   `meta.json`.
+4. In `compare_against_anchor()`, compare `dataset_version` and all three
+   split digests before metric drift.  A version change may create a new
+   anchor; a digest change with the same version is a hard regression and
+   must not be re-anchored.
+5. Apply the same validation in `BenchPlugin.pytest_sessionfinish()` and
+   `main()` before writing or accepting an anchor, so pytest-plugin and CLI
+   paths have identical freeze/version behavior.
+
 ## 4. What to run when
 
 | Gate | When | Command | Contents | Fail on |

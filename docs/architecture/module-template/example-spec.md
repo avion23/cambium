@@ -25,11 +25,19 @@ The merge sequencer was considered as an alternative. It is **not** the right pi
 | Field | Value |
 |---|---|
 | Code | M6.A (submodule of Architectus, M6) |
-| Name | `should_decompose` |
+| Logical module name | `should_decompose` |
+| Python package name | `cambium.modules.example` |
+| Package directory / module-test selector | `src/cambium/modules/example/` / `example` |
 | Layer | Orchestrator |
 | Owner | TBD (assigned at build time) |
 | Status | Spec'd; scaffold merged into `main` |
 | Reference code path | `src/cambium/modules/example/` |
+
+`should_decompose` is the logical module name used by the metric, dataset
+reports, and baseline. `cambium.modules.example` is the Python package name;
+`example` is the package-directory and `module-test` selector. These names are
+intentionally separate and must not be normalized by a caller or a wheel
+loader.
 
 ---
 
@@ -141,6 +149,30 @@ A future DSPy-backed `decide` may raise:
 - `MalformedLLMResponse` — unparseable output after `MAX_RETRIES`. Same fallback.
 
 These are **v2.1**; the v2 rule engine does not raise them.
+
+### 3.5 JSON CLI
+
+The package's `__main__.py` is the implemented JSON wire adapter. It accepts
+one JSON object on stdin and emits one JSON object plus one trailing newline on
+stdout. The input contract is `{"task": str, "context": str}` with required,
+non-empty `task`, optional `context`, and no unknown or duplicate fields. A
+successful response has the stable wire shape:
+
+```json
+{"confidence": 0.7, "decompose": false, "reason": "task is atomic or already scoped"}
+```
+
+Malformed JSON, invalid input, and module errors emit one JSON `error` object
+on stdout, a one-line diagnostic on stderr, and exit 1. No logs are allowed on
+stdout. The probe is:
+
+```console
+printf '%s\n' '{"task":"Fix the typo.","context":""}' \
+  | python -m cambium.modules.example
+```
+
+The probe must work from an empty working directory without the checkout on
+`sys.path`; it does not contact a provider or the network.
 
 ---
 
@@ -308,6 +340,20 @@ with the original v2 records. It is not the current source of the train/eval
 metrics. All formats retain the same JSON wire field:
 `expected.decompose: true|false`; the in-memory domain value is `Decision`.
 
+The conformance gate also requires the frozen-content contract: SHA-256
+digests in `datasets/meta.json` cover the exact bytes of `train.jsonl`,
+`eval.jsonl`, and `canaries.jsonl`; the baseline carries the same three
+digests; and every split record's `dataset_version` matches `meta.json`.
+`eval_frozen_at` and `canary_frozen_at` are required ISO dates. A frozen split
+edit without a version bump, or a digest change with the same version, fails
+the gate.
+
+**Current dataset-owner reconciliation:** the committed split records still
+say `dataset_version: "1.0.0"`, while `meta.json` and the baseline say
+`"1.1.0"`. This mismatch must remain a visible failing conformance gate in
+this change. Do not rewrite the dataset records here; the dataset owner must
+reconcile them separately.
+
 **Dataset-format compliance.** The split files use the full envelope (`id`,
 `schema_version`, `dataset_version`, `split`, `added_at`, `added_by`, `source`,
 `license`, `redacted`, `input`, `expected`, and optional canary metadata). The
@@ -380,7 +426,42 @@ integration gate for `should_decompose`.
 
 N/A. `should_decompose` is the first module; no siblings to pin. The `siblings-stub.yaml` is absent; the optimization harness (when it lands in v2.1) skips sibling-stub loading for this module.
 
-### 9.6 Verification commands (per `agents.md` §5)
+### 9.6 Module conformance, isolation, and distribution
+
+The implemented gate is run with the package-directory selector:
+
+```console
+uv run --extra test cambium module-test example
+```
+
+It collects only `src/cambium/modules/example/tests/`, validates the tracked
+module layout and baseline JSON schema, checks the JSON CLI, and then runs the
+colocated tests. The baseline must contain the required schema, logical module
+name, dataset version, three exact split digests, per-split metrics, canary
+summary, dataset counts, test timings, and drift thresholds. Its version and
+digests must agree with `datasets/meta.json` and the current split bytes.
+
+The gate is offline. It strips credentials and pytest/plugin injection, blocks
+Python socket connections and common command-line network clients, and passes
+that environment to child subprocesses. Module tests must not use providers,
+network access, or external services.
+
+The module has a sibling-import prohibition: it may use the shared base and its
+own package, but not another `cambium.modules.<sibling>` package, including
+dynamic imports. The reverse-import prohibition also applies to harness
+production code, `src/cambium/bench.py`, `scripts/`, and `tools/`; these paths
+must not import this decision package. The gate reports each violation with
+file, line, and symbol. The current bench/scripts findings are reported
+separately and are not hidden by fallback imports.
+
+The wheel must include `__main__.py`, `architecture.md`, all split files,
+`meta.json`, colocated tests, and `tests/baselines/baseline.json`. An installed
+wheel is probed outside the checkout with `cambium module-test example`. The
+module is removable only by deleting the complete `example/` directory,
+including code, CLI, tests, datasets, baselines, architecture, and freeze
+metadata; shared harness tests remain.
+
+### 9.7 Verification commands (per `agents.md` §5)
 
 ```
 # Run from repo root, on a Python 3.14 interpreter:
@@ -388,7 +469,10 @@ uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests -v
 uv run --python 3.14.7 --extra test pytest -q          # whole suite
 ```
 
-A passing run is the gate. The reference scaffold on `main` runs green against these commands.
+A passing run is the module test gate once the dataset-owner version
+reconciliation is complete. The current conformance gate correctly fails
+before the colocated tests because split records say `1.0.0` while metadata and
+the baseline say `1.1.0`; this change does not rewrite those records.
 
 ---
 
@@ -427,6 +511,7 @@ src/cambium/modules/example/
 │                              #          should_decompose,
 │                              #          should_decompose_metric,
 │                              #          ExampleDatasetLoader
+├── __main__.py                # one-object JSON stdin/stdout CLI
 ├── architecture.md            # the in-tree per-module architecture doc
 │                              #   (this spec is the canonical version; the
 │                              #   in-tree doc is a shorter reference)
@@ -441,7 +526,7 @@ src/cambium/modules/example/
     ├── train.jsonl            # 200 records
     ├── eval.jsonl              # 50 frozen records
     ├── canaries.jsonl          # 10 canaries
-    ├── meta.json               # schema_version 1, dataset_version 1.1.0
+    ├── meta.json               # schema/version, freeze dates, split digests
     └── example_pairs.jsonl     # legacy 9-record fallback
 ```
 
@@ -452,16 +537,17 @@ src/cambium/modules/example/
 - `siblings-stub.yaml` — empty placeholder; added when this module becomes siblings with another.
 - `optimized/should_decompose/v<N>/` — promoted-prompt artifacts, written by `Ascensus`.
 
-**Acceptance gate (per `agents.md` §9) — already met by the merged scaffold:**
+**Acceptance gate status (per `agents.md` §9):**
 
 1. ✅ `architecture.md` committed (in-tree).
-2. ✅ Split dataset committed (`datasets/train.jsonl`, `datasets/eval.jsonl`, `datasets/canaries.jsonl`, and `datasets/meta.json`); legacy combined data remains as a fallback.
+2. ⚠️ Split dataset and freeze metadata are committed, but the dataset-owner reconciliation is pending: records say `1.0.0` while `meta.json` and the baseline say `1.1.0`; the gate must fail and this change does not edit records.
 3. ✅ Loader maps the stable wire boolean to `Decision`; `DatasetError` is raised on malformed records.
 4. ✅ Rule-engine `decide()` scores 1.0 over all 260 split records, including canaries.
 5. ✅ Colocated suite passes: `uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests -v` exits 0.
 6. ⏳ End-to-end orchestrator exercise — pending `Architectus.execute` wiring.
 7. ⏳ Adversarial review of this module — this spec is the reviewed artifact; re-review on any contract change.
-8. ✅ All verifiable items above marked VERIFIED with the cited command from §9.6.
+8. ✅ JSON CLI, offline subprocess rule, import prohibitions, baseline schema, wheel inclusion, and removability are enforced by the module conformance implementation.
+9. ⏳ The full `cambium module-test example` gate remains blocked by the dataset-version mismatch and separately reported reverse imports.
 
 ---
 
@@ -472,3 +558,4 @@ src/cambium/modules/example/
 | 0.1.0 | 2026-08-09 | Initial spec; described a custom `ShouldDecompose` DSPy module. |
 | 1.0.0 | 2026-08-09 | Aligned to the merged scaffold: `ShouldDecomposeModule(Module)` ABC, `TaskInput`/`DecomposeOutput` dataclasses, `should_decompose_metric` exact-match, single-file dataset with inline canaries, rule-engine primary with DSPy as a documented v2.1 seam. |
 | 1.1.0 | 2026-08-10 | Aligned to the colocated split-aware tests, `Decision` domain enum, stable boolean wire format, and current module dataset. |
+| 1.2.0 | 2026-08-10 | Documented the JSON CLI, module-test isolation gate, import prohibitions, baseline/digest/freeze checks, wheel probe, removability, and logical/package names. |

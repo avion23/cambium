@@ -9,13 +9,18 @@ must work without the checkout on ``sys.path``.
 from __future__ import annotations
 
 import ast
+import datetime as _dt
+import hashlib
 import json
+import math
 import os
 import re
 import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,11 +46,16 @@ def _find_repo_root() -> Path:
         result = None
     if result is not None and result.returncode == 0:
         return Path(result.stdout.strip()).resolve()
-    return source.parents[1]
+    # A wheel has no repository root.  Keep all resource-relative operations
+    # inside the installed package instead of guessing from the caller's cwd.
+    return source
 
 
+PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = _find_repo_root()
-MODULES_DIR = REPO_ROOT / "src" / "cambium" / "modules"
+# ``cambium`` is under ``src`` in a checkout and under site-packages in a
+# wheel.  The package resource is the stable boundary in both layouts.
+MODULES_DIR = PACKAGE_ROOT / "modules"
 
 PROVIDER_IMPORTS = (
     "cambium.diffundo",
@@ -59,6 +69,19 @@ PROVIDER_IMPORTS = (
     "openai",
 )
 
+DECISION_SPLITS = {
+    "train": "train.jsonl",
+    "eval": "eval.jsonl",
+    "canaries": "canaries.jsonl",
+}
+SUPPORTED_DATASET_SCHEMA_VERSION = 1
+SEMVER_RE = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SENSITIVE_ENV_RE = re.compile(
     r"(?:api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
 )
@@ -68,6 +91,20 @@ _AUDIT_HOOK_INSTALLED = False
 
 class ModuleConformanceError(ValueError):
     """Raised when a module violates the conformance contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFinding:
+    """A static finding with a stable file, line, and symbol."""
+
+    rule: str
+    path: Path
+    line: int
+    symbol: str
+    detail: str
+
+    def format(self) -> str:
+        return f"{self.rule}: {self.path}:{self.line}:{self.symbol}: {self.detail}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +143,36 @@ def _is_regular_file(path: Path) -> bool:
         return False
 
 
+def _repository_available() -> bool:
+    """Return whether this installation has a git checkout beside it."""
+    return (REPO_ROOT / ".git").exists()
+
+
+def _module_prefix(name: str) -> Path:
+    """Return the tracked/resource prefix for one installed package module."""
+    try:
+        return MODULES_DIR.relative_to(REPO_ROOT) / name
+    except ValueError:
+        return Path("modules") / name
+
+
+def _package_files(name: str) -> tuple[Path, ...]:
+    """List regular files from an installed module when git is unavailable."""
+    module_path = MODULES_DIR / name
+    if not module_path.is_dir() or module_path.is_symlink():
+        return ()
+    return tuple(
+        sorted(
+            path.relative_to(REPO_ROOT)
+            for path in module_path.rglob("*")
+            if _is_regular_file(path)
+        )
+    )
+
+
 def _git_ls_files(pathspec: str) -> tuple[Path, ...]:
+    if not _repository_available():
+        return ()
     try:
         result = subprocess.run(
             ["git", "ls-files", "-z", "--", pathspec],
@@ -121,6 +187,12 @@ def _git_ls_files(pathspec: str) -> tuple[Path, ...]:
         detail = result.stderr.decode(errors="replace").strip()
         raise ModuleConformanceError(f"git ls-files failed for {pathspec}: {detail}")
     return tuple(Path(os.fsdecode(part)) for part in result.stdout.split(b"\0") if part)
+
+
+def _module_files(name: str, prefix: Path) -> tuple[Path, ...]:
+    if _repository_available():
+        return _git_ls_files(prefix.as_posix())
+    return _package_files(name)
 
 
 def module_names() -> list[str]:
@@ -158,6 +230,11 @@ def _load_json(path: Path) -> Any:
     )
 
 
+def _resource_path(path: Path) -> Path:
+    """Resolve a tracked relative path in a checkout or installed wheel."""
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 def _validate_json_files(
     module_name: str,
     baseline_files: tuple[Path, ...],
@@ -167,8 +244,9 @@ def _validate_json_files(
     for path in baseline_files:
         if path.suffix.lower() != ".json":
             continue
+        resource = _resource_path(path)
         try:
-            value = _load_json(path)
+            value = _load_json(resource)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"{path}: invalid baseline JSON: {exc}")
             continue
@@ -179,12 +257,13 @@ def _validate_json_files(
         if path.suffix.lower() not in {".json", ".jsonl"}:
             continue
         current_line = 0
+        resource = _resource_path(path)
         try:
             if path.suffix.lower() == ".json":
-                _load_json(path)
+                _load_json(resource)
                 continue
             for line_number, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), start=1
+                resource.read_text(encoding="utf-8").splitlines(), start=1
             ):
                 current_line = line_number
                 if not line.strip():
@@ -199,18 +278,716 @@ def _validate_json_files(
         raise ModuleConformanceError(f"{module_name}:\n" + "\n".join(errors))
 
 
+def _valid_semver(value: object) -> bool:
+    return isinstance(value, str) and SEMVER_RE.fullmatch(value) is not None
+
+
+def _valid_sha256(value: object) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+
+
+def _valid_freeze_date(value: object) -> bool:
+    if not isinstance(value, str) or ISO_DATE_RE.fullmatch(value) is None:
+        return False
+    try:
+        _dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _load_jsonl_records(path: Path) -> list[tuple[int, dict[str, Any]]]:
+    records: list[tuple[int, dict[str, Any]]] = []
+
+    def reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON field {key!r}")
+            result[key] = value
+        return result
+
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line, object_pairs_hook=reject_duplicate)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ModuleConformanceError(f"{path}:{line_number}: invalid JSONL: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ModuleConformanceError(f"{path}:{line_number}: record must be a JSON object")
+        records.append((line_number, value))
+    return records
+
+
+def _canonical_record_hash(record: dict[str, Any]) -> str | None:
+    input_data = record.get("input")
+    if not isinstance(input_data, dict):
+        return None
+    task = input_data.get("task")
+    context = input_data.get("context")
+    if not isinstance(task, str) or not isinstance(context, str):
+        return None
+    payload = json.dumps((task, context), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _git_file(revision: str, relative: Path) -> bytes | None:
+    if not _repository_available():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{revision}:{relative.as_posix()}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[AuditFinding]:
+    """Reject eval/canary edits without a dataset-version bump."""
+    if not _repository_available():
+        return []
+    version = meta.get("dataset_version")
+    if not _valid_semver(version):
+        return []
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        status = None
+    revisions = ["HEAD^"]
+    if status is not None and status.stdout:
+        revisions.insert(0, "HEAD")
+    findings: list[AuditFinding] = []
+    meta_relative = (spec.path / "datasets" / "meta.json").relative_to(REPO_ROOT)
+    for split, filename in (("eval", "eval.jsonl"), ("canary", "canaries.jsonl")):
+        path = spec.path / "datasets" / filename
+        try:
+            current = path.read_bytes()
+        except OSError:
+            continue
+        relative = path.relative_to(REPO_ROOT)
+        for revision in revisions:
+            previous = _git_file(revision, relative)
+            previous_meta = _git_file(revision, meta_relative)
+            if previous is None or previous == current or previous_meta is None:
+                continue
+            try:
+                old_meta = json.loads(previous_meta)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(old_meta, dict) and old_meta.get("dataset_version") == version:
+                findings.append(
+                    AuditFinding(
+                        "freeze-version",
+                        path,
+                        0,
+                        split,
+                        f"{split} content changed from {revision} without dataset_version "
+                        f"bump ({version})",
+                    )
+                )
+                break
+    return findings
+
+
+def _validate_dataset_integrity(spec: ModuleSpec) -> None:
+    """Validate the frozen split contract without importing the decision package."""
+    findings: list[AuditFinding] = []
+    datasets = spec.path / "datasets"
+    meta_path = datasets / "meta.json"
+    tracked = set(spec.tracked_files)
+    if meta_path.relative_to(REPO_ROOT) not in tracked or not _is_regular_file(meta_path):
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                meta_path,
+                0,
+                "meta.json",
+                "valid meta.json is required; missing metadata is never defaulted",
+            )
+        )
+        message = "{}:\n{}".format(spec.name, "\n".join(f.format() for f in findings))
+        raise ModuleConformanceError(message)
+
+    try:
+        meta = _load_json(meta_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        findings.append(AuditFinding("dataset-integrity", meta_path, 0, "meta.json", str(exc)))
+        message = f"{spec.name}:\n" + "\n".join(f.format() for f in findings)
+        raise ModuleConformanceError(message) from exc
+    if not isinstance(meta, dict):
+        findings.append(
+            AuditFinding("dataset-integrity", meta_path, 0, "meta.json", "must be a JSON object")
+        )
+        raise ModuleConformanceError(f"{spec.name}:\n" + "\n".join(f.format() for f in findings))
+
+    schema_version = meta.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != SUPPORTED_DATASET_SCHEMA_VERSION:
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                meta_path,
+                0,
+                "schema_version",
+                f"must be integer {SUPPORTED_DATASET_SCHEMA_VERSION}",
+            )
+        )
+    if not _valid_semver(meta.get("dataset_version")):
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                meta_path,
+                0,
+                "dataset_version",
+                "must be a valid semantic version",
+            )
+        )
+    for field in ("eval_frozen_at", "canary_frozen_at"):
+        if not _valid_freeze_date(meta.get(field)):
+            findings.append(
+                AuditFinding(
+                    "dataset-integrity",
+                    meta_path,
+                    0,
+                    field,
+                    "must be an ISO-8601 date in YYYY-MM-DD form",
+                )
+            )
+
+    raw_digests = meta.get("split_digests")
+    if not isinstance(raw_digests, dict):
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                meta_path,
+                0,
+                "split_digests",
+                "must contain one SHA-256 digest for train, eval, and canaries",
+            )
+        )
+        raw_digests = {}
+    actual_digests: dict[str, str] = {}
+    for split, filename in DECISION_SPLITS.items():
+        path = datasets / filename
+        relative = path.relative_to(REPO_ROOT)
+        if relative not in tracked or not _is_regular_file(path):
+            findings.append(
+                AuditFinding("dataset-integrity", path, 0, split, "required split is not tracked")
+            )
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        actual_digests[split] = digest
+        recorded = raw_digests.get(split)
+        if not _valid_sha256(recorded):
+            findings.append(
+                AuditFinding(
+                    "dataset-integrity",
+                    meta_path,
+                    0,
+                    f"split_digests.{split}",
+                    "must be a lowercase SHA-256 hex digest",
+                )
+            )
+        elif recorded != digest:
+            findings.append(
+                AuditFinding(
+                    "dataset-integrity",
+                    path,
+                    0,
+                    f"split_digests.{split}",
+                    f"metadata digest does not match content ({digest})",
+                )
+            )
+
+    seen_ids: dict[str, tuple[str, int]] = {}
+    seen_hashes: dict[str, tuple[str, int]] = {}
+    records_by_split: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for split, filename in DECISION_SPLITS.items():
+        path = datasets / filename
+        if not path.is_file():
+            continue
+        try:
+            records = _load_jsonl_records(path)
+        except ModuleConformanceError as exc:
+            findings.append(AuditFinding("dataset-integrity", path, 0, split, str(exc)))
+            continue
+        records_by_split[split] = records
+        previous_id: str | None = None
+        for line_number, record in records:
+            record_id = record.get("id")
+            if not isinstance(record_id, str) or not record_id.strip():
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity", path, line_number, "id", "must be non-empty string"
+                    )
+                )
+            elif record_id in seen_ids:
+                first_split, first_line = seen_ids[record_id]
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        record_id,
+                        f"duplicate id; first seen at {first_split}:{first_line}",
+                    )
+                )
+            else:
+                seen_ids[record_id] = (split, line_number)
+            if previous_id is not None and isinstance(record_id, str) and record_id < previous_id:
+                findings.append(
+                    AuditFinding("dataset-integrity", path, line_number, "id", "ids must be sorted")
+                )
+            if isinstance(record_id, str):
+                previous_id = record_id
+            if not isinstance(record.get("input"), dict):
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "input",
+                        "top-level input object is required (the current wire schema is not data)",
+                    )
+                )
+            if not isinstance(record.get("expected"), dict):
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "expected",
+                        "top-level expected object is required (current wire schema is not data)",
+                    )
+                )
+            if record.get("schema_version") != schema_version:
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "schema_version",
+                        "record schema_version must match meta.json",
+                    )
+                )
+            record_version = record.get("dataset_version")
+            if not _valid_semver(record_version):
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "dataset_version",
+                        "record dataset_version must be semantic version",
+                    )
+                )
+            elif record_version != meta.get("dataset_version"):
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "dataset_version",
+                        "record dataset_version must match meta.json "
+                        f"({record_version!r} != {meta.get('dataset_version')!r})",
+                    )
+                )
+            expected_split = "canary" if split == "canaries" else split
+            if record.get("split") != expected_split:
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "split",
+                        f"must be {expected_split!r}",
+                    )
+                )
+            if split == "canaries" and record.get("canary") is not True:
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "canary",
+                        "canaries.jsonl records must set canary=true",
+                    )
+                )
+            if split != "canaries" and record.get("canary", False) is not False:
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "canary",
+                        "train/eval records must not set canary=true",
+                    )
+                )
+            canonical_hash = _canonical_record_hash(record)
+            if canonical_hash is not None:
+                if canonical_hash in seen_hashes:
+                    first_split, first_line = seen_hashes[canonical_hash]
+                    findings.append(
+                        AuditFinding(
+                            "dataset-integrity",
+                            path,
+                            line_number,
+                            "cross_split_hash",
+                            f"canonical input collides with {first_split}:{first_line}",
+                        )
+                    )
+                else:
+                    seen_hashes[canonical_hash] = (split, line_number)
+
+    baseline_required = {
+        "schema_version",
+        "module",
+        "dataset_version",
+        "split_digests",
+        "git_sha",
+        "date",
+        "python",
+        "pytest",
+        "metric",
+        "canaries",
+        "dataset",
+        "tests",
+        "drift_thresholds",
+    }
+    split_counts = {
+        split: len(records) for split, records in records_by_split.items()
+    }
+    total_records = sum(split_counts.values())
+    canary_records = records_by_split.get("canaries", [])
+    labels = {
+        True: sum(
+            record.get("expected", {}).get("decompose") is True
+            for records in records_by_split.values()
+            for _, record in records
+            if isinstance(record.get("expected"), dict)
+        ),
+        False: sum(
+            record.get("expected", {}).get("decompose") is False
+            for records in records_by_split.values()
+            for _, record in records
+            if isinstance(record.get("expected"), dict)
+        ),
+    }
+    canary_kinds = sorted(
+        {
+            info.get("kind")
+            for _, record in canary_records
+            if isinstance(info := record.get("canary_info"), dict)
+            and isinstance(info.get("kind"), str)
+        }
+    )
+
+    for baseline_path in spec.baseline_files:
+        if baseline_path.suffix.lower() != ".json":
+            continue
+        baseline_file = REPO_ROOT / baseline_path
+        try:
+            baseline = _load_json(baseline_file)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            findings.append(
+                AuditFinding("baseline-integrity", baseline_file, 0, "baseline", str(exc))
+            )
+            continue
+        if not isinstance(baseline, dict):
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "baseline",
+                    "must be a JSON object",
+                )
+            )
+            continue
+
+        missing = sorted(baseline_required - set(baseline))
+        if missing:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "schema",
+                    "missing required fields: " + ", ".join(missing),
+                )
+            )
+        if baseline.get("schema_version") != SUPPORTED_DATASET_SCHEMA_VERSION:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "schema_version",
+                    f"must be integer {SUPPORTED_DATASET_SCHEMA_VERSION}",
+                )
+            )
+        if not isinstance(baseline.get("module"), str) or not baseline["module"].strip():
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "module",
+                    "must be a non-empty logical module name",
+                )
+            )
+        if baseline.get("dataset_version") != meta.get("dataset_version"):
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "dataset_version",
+                    "baseline dataset_version must match metadata",
+                )
+            )
+        if baseline.get("split_digests") != meta.get("split_digests"):
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "split_digests",
+                    "baseline split_digests must match metadata",
+                )
+            )
+        if baseline.get("split_digests") != actual_digests:
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "split_digests",
+                    "baseline split_digests must match current split content",
+                )
+            )
+
+        metric = baseline.get("metric")
+        if not isinstance(metric, dict):
+            findings.append(
+                AuditFinding("baseline-integrity", baseline_file, 0, "metric", "must be an object")
+            )
+        else:
+            for split in DECISION_SPLITS:
+                fact = metric.get(split)
+                if not isinstance(fact, dict):
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            f"metric.{split}",
+                            "must be an object",
+                        )
+                    )
+                    continue
+                if fact.get("count") != split_counts.get(split, 0):
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            f"metric.{split}.count",
+                            "must match the dataset record count",
+                        )
+                    )
+                for field in ("mean", "std"):
+                    value = fact.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                        or value < 0
+                        or (field == "mean" and value > 1)
+                    ):
+                        findings.append(
+                            AuditFinding(
+                                "baseline-integrity",
+                                baseline_file,
+                                0,
+                                f"metric.{split}.{field}",
+                                "must be a finite non-negative metric value",
+                            )
+                        )
+
+        dataset = baseline.get("dataset")
+        if not isinstance(dataset, dict):
+            findings.append(
+                AuditFinding("baseline-integrity", baseline_file, 0, "dataset", "must be an object")
+            )
+        else:
+            expected_dataset = {
+                "records": total_records,
+                "duplicate_ids": 0,
+                "cross_split_leaks": 0,
+                "decompose_true": labels[True],
+                "decompose_false": labels[False],
+                "canaries": len(canary_records),
+            }
+            for field, expected in expected_dataset.items():
+                if dataset.get(field) != expected:
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            f"dataset.{field}",
+                            f"must match current datasets ({expected!r})",
+                        )
+                    )
+
+        canaries = baseline.get("canaries")
+        if not isinstance(canaries, dict):
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity", baseline_file, 0, "canaries", "must be an object"
+                )
+            )
+        else:
+            for field, expected in (
+                ("total", len(canary_records)),
+                ("kinds_present", canary_kinds),
+                ("failed", 0),
+            ):
+                if canaries.get(field) != expected:
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            f"canaries.{field}",
+                            f"must match current datasets ({expected!r})",
+                        )
+                    )
+            coverage = canaries.get("taxonomy_coverage")
+            if (
+                isinstance(coverage, bool)
+                or not isinstance(coverage, (int, float))
+                or not math.isfinite(coverage)
+                or not 0 <= coverage <= 1
+            ):
+                findings.append(
+                    AuditFinding(
+                        "baseline-integrity",
+                        baseline_file,
+                        0,
+                        "canaries.taxonomy_coverage",
+                        "must be a finite value in [0, 1]",
+                    )
+                )
+
+        tests = baseline.get("tests")
+        if not isinstance(tests, dict):
+            findings.append(
+                AuditFinding("baseline-integrity", baseline_file, 0, "tests", "must be an object")
+            )
+        else:
+            nodeids = tests.get("by_nodeid")
+            if not isinstance(nodeids, dict) or not nodeids:
+                findings.append(
+                    AuditFinding(
+                        "baseline-integrity",
+                        baseline_file,
+                        0,
+                        "tests.by_nodeid",
+                        "must contain module-scoped test timings",
+                    )
+                )
+            else:
+                for nodeid, duration in nodeids.items():
+                    if not isinstance(nodeid, str) or not nodeid:
+                        findings.append(
+                            AuditFinding(
+                                "baseline-integrity",
+                                baseline_file,
+                                0,
+                                str(nodeid),
+                                "baseline test nodeid must be a non-empty string",
+                            )
+                        )
+                    if (
+                        isinstance(duration, bool)
+                        or not isinstance(duration, (int, float))
+                        or not math.isfinite(duration)
+                        or duration < 0
+                    ):
+                        findings.append(
+                            AuditFinding(
+                                "baseline-integrity",
+                                baseline_file,
+                                0,
+                                str(nodeid),
+                                "test timing must be a finite non-negative number",
+                            )
+                        )
+                if tests.get("count") != len(nodeids):
+                    findings.append(
+                        AuditFinding(
+                            "baseline-integrity",
+                            baseline_file,
+                            0,
+                            "tests.count",
+                            "must equal tests.by_nodeid count",
+                        )
+                    )
+            wall_seconds = tests.get("wall_seconds")
+            if not isinstance(wall_seconds, dict) or set(wall_seconds) != {"p50", "p90", "max"}:
+                findings.append(
+                    AuditFinding(
+                        "baseline-integrity",
+                        baseline_file,
+                        0,
+                        "tests.wall_seconds",
+                        "must contain p50, p90, and max",
+                    )
+                )
+
+        drift_thresholds = baseline.get("drift_thresholds")
+        if not isinstance(drift_thresholds, dict):
+            findings.append(
+                AuditFinding(
+                    "baseline-integrity",
+                    baseline_file,
+                    0,
+                    "drift_thresholds",
+                    "must be an object",
+                )
+            )
+
+    findings.extend(_frozen_content_findings(spec, meta))
+    if findings:
+        raise ModuleConformanceError(f"{spec.name}:\n" + "\n".join(f.format() for f in findings))
+
+
 def validate_module(name: str) -> ModuleSpec:
     """Discover and validate one module's tracked shape and JSON files."""
     if name not in module_names():
         raise ModuleConformanceError(f"unknown module {name!r}")
 
     module_path = MODULES_DIR / name
-    prefix = Path("src/cambium/modules") / name
-    tracked = _git_ls_files(prefix.as_posix())
+    prefix = _module_prefix(name)
+    tracked = _module_files(name, prefix)
     tracked_set = set(tracked)
     errors: list[str] = []
 
-    required_files = ("__init__.py", "__main__.py")
+    required_files = ("__init__.py", "__main__.py", "architecture.md")
     for filename in required_files:
         relative = prefix / filename
         if relative not in tracked_set or not _is_regular_file(REPO_ROOT / relative):
@@ -266,7 +1043,7 @@ def validate_module(name: str) -> ModuleSpec:
     if errors:
         raise ModuleConformanceError(f"{name}:\n" + "\n".join(errors))
     _validate_json_files(name, baseline_files, dataset_files)
-    return ModuleSpec(
+    spec = ModuleSpec(
         name=name,
         path=module_path,
         tracked_files=tuple(sorted(tracked)),
@@ -275,6 +1052,8 @@ def validate_module(name: str) -> ModuleSpec:
         baseline_files=baseline_files,
         dataset_files=dataset_files,
     )
+    _validate_dataset_integrity(spec)
+    return spec
 
 
 def _dataset_input(spec: ModuleSpec) -> dict[str, Any]:
@@ -304,24 +1083,85 @@ def _dataset_input(spec: ModuleSpec) -> dict[str, Any]:
     raise ModuleConformanceError(f"{spec.name}: no non-empty dataset JSONL available for CLI probe")
 
 
+_SAFE_MODULE_ENV_KEYS = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "SystemRoot",
+        "WINDIR",
+    }
+)
+
+
 def _module_test_env() -> dict[str, str]:
+    """Return the minimal inherited environment for module test processes."""
     return {
         key: value
         for key, value in os.environ.items()
-        if key != "PYTHONPATH" and not _SENSITIVE_ENV_RE.search(key)
+        if key in _SAFE_MODULE_ENV_KEYS
+        or (key.startswith("LC_") and not _SENSITIVE_ENV_RE.search(key))
     }
+
+
+@contextmanager
+def module_offline_environment() -> Iterator[dict[str, str]]:
+    """Yield a credential-free environment with network clients denied.
+
+    The parent pytest process uses an audit hook, but audit hooks do not cross
+    ``fork``/``exec``.  A temporary ``sitecustomize`` blocks Python socket
+    clients in child interpreters, and command shims reject common external
+    clients such as ``curl``.  The temporary directory is removed as soon as
+    the subprocess tree exits.
+    """
+    with tempfile.TemporaryDirectory(prefix="cambium-module-offline-") as root:
+        offline_root = Path(root)
+        (offline_root / "sitecustomize.py").write_text(
+            "import socket\n"
+            "\n"
+            "def _deny_network(*args, **kwargs):\n"
+            "    raise PermissionError('network access is forbidden during module conformance')\n"
+            "\n"
+            "socket.socket.connect = _deny_network\n"
+            "socket.socket.connect_ex = _deny_network\n"
+            "socket.socket.sendto = _deny_network\n"
+            "socket.create_connection = _deny_network\n",
+            encoding="utf-8",
+        )
+        command_dir = offline_root / "bin"
+        command_dir.mkdir()
+        for command in ("curl", "wget", "http", "https"):
+            wrapper = command_dir / command
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'network client denied during module conformance' >&2\n"
+                "exit 126\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+        env = _module_test_env()
+        env["CAMBIUM_MODULE_OFFLINE"] = "1"
+        env["PATH"] = f"{command_dir}{os.pathsep}{env.get('PATH', os.defpath)}"
+        env["PYTHONPATH"] = os.pathsep.join((str(offline_root), str(PACKAGE_ROOT.parent)))
+        yield env
 
 
 def probe_module_cli(spec: ModuleSpec) -> None:
     """Run the module CLI from an empty cwd with no import-path injection."""
     payload = json.dumps(_dataset_input(spec), separators=(",", ":")) + "\n"
-    command = [sys.executable, "-I", "-m", spec.package_name]
+    command = [sys.executable, "-m", spec.package_name]
     try:
-        with tempfile.TemporaryDirectory(prefix="cambium-module-") as cwd:
+        with module_offline_environment() as env, tempfile.TemporaryDirectory(
+            prefix="cambium-module-"
+        ) as cwd:
             result = subprocess.run(
                 command,
                 cwd=cwd,
-                env=_module_test_env(),
+                env=env,
                 input=payload,
                 capture_output=True,
                 text=True,
@@ -409,6 +1249,7 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
         return [f"{path}: cannot parse tracked Python file: {exc}"]
 
     importlib_names = {"importlib"}
+    builtin_module_names = {"builtins"}
     import_module_names = {"import_module"}
     builtin_import_names = {"__import__"}
     for node in ast.walk(tree):
@@ -416,6 +1257,8 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
             for alias in node.names:
                 if alias.name == "importlib":
                     importlib_names.add(alias.asname or "importlib")
+                if alias.name == "builtins":
+                    builtin_module_names.add(alias.asname or "builtins")
         elif isinstance(node, ast.ImportFrom):
             if node.module == "importlib":
                 for alias in node.names:
@@ -468,8 +1311,7 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
                 )
             if isinstance(function, ast.Attribute) and function.attr == "__import__":
                 is_import_call = isinstance(function.value, ast.Name) and function.value.id in {
-                    "builtins",
-                    *builtin_import_names,
+                    *builtin_module_names,
                 }
             if is_import_call and node.args and isinstance(node.args[0], ast.Constant):
                 target = node.args[0].value
@@ -489,6 +1331,235 @@ def scan_module_imports(spec: ModuleSpec) -> None:
     ]
     if issues:
         raise ModuleConformanceError(f"{spec.name}:\n" + "\n".join(issues))
+
+
+def _reverse_scan_paths() -> tuple[Path, ...]:
+    """Return the production-harness and repository-tooling Python scope."""
+    paths = [
+        path
+        for path in sorted(PACKAGE_ROOT.glob("*.py"))
+        if path.name not in {"module_conformance.py", "cli.py"}
+    ]
+    for directory_name in (("scripts", "tools") if _repository_available() else ()):
+        directory = REPO_ROOT / directory_name
+        if directory.is_dir():
+            paths.extend(sorted(path for path in directory.rglob("*.py") if _is_regular_file(path)))
+    return tuple(dict.fromkeys(paths))
+
+
+def _reverse_enclosing_symbol(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return current.name
+        current = parents.get(current)
+    return "<module>"
+
+
+def _reverse_target(parts: list[str], names: set[str]) -> tuple[str, str] | None:
+    if len(parts) < 3 or parts[:2] != ["cambium", "modules"]:
+        return None
+    package = parts[2]
+    if package not in names:
+        return None
+    return package, ".".join(parts[:3])
+
+
+def _reverse_relative_target(node: ast.ImportFrom, path: Path) -> list[str] | None:
+    """Resolve relative imports from top-level ``cambium`` modules."""
+    try:
+        relative = path.relative_to(REPO_ROOT / "src" / "cambium")
+    except ValueError:
+        return None
+    if relative.parent != Path("."):
+        return None
+    package = ["cambium"]
+    remove = node.level - 1
+    if remove > len(package):
+        return None
+    target = package[: len(package) - remove]
+    if node.module:
+        target.extend(node.module.split("."))
+    return target
+
+
+def _reverse_importlib_aliases(tree: ast.AST) -> tuple[set[str], set[str]]:
+    importlib_names = {"importlib"}
+    import_module_names = {"import_module"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib":
+                    importlib_names.add(alias.asname or "importlib")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_module_names.add(alias.asname or "import_module")
+    return importlib_names, import_module_names
+
+
+def _reverse_importlib_targets(node: ast.expr, names: set[str]) -> tuple[tuple[str, str], ...]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        target = _reverse_target(node.value.split("."), names)
+        return (target,) if target else ()
+    if isinstance(node, ast.JoinedStr):
+        prefix = ""
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                prefix += value.value
+            else:
+                break
+        if prefix == "cambium.modules.":
+            return tuple((name, f"cambium.modules.{name}") for name in sorted(names))
+    return ()
+
+
+def scan_reverse_imports() -> tuple[AuditFinding, ...]:
+    """Enumerate every concrete reverse import in harness and tooling scope."""
+    names = set(module_names())
+    findings: list[AuditFinding] = []
+    for path in _reverse_scan_paths():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError) as exc:
+            findings.append(
+                AuditFinding("reverse-import", path, 0, "ast.parse", f"cannot parse file: {exc}")
+            )
+            continue
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        importlib_names, import_module_names = _reverse_importlib_aliases(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    target = _reverse_target(alias.name.split("."), names)
+                    if target is not None:
+                        findings.append(
+                            AuditFinding(
+                                "reverse-import",
+                                path.relative_to(REPO_ROOT),
+                                node.lineno,
+                                alias.asname or alias.name,
+                                f"imports decision package {target[1]}",
+                            )
+                        )
+                continue
+            if isinstance(node, ast.ImportFrom):
+                targets: list[tuple[str, str]] = []
+                if node.level == 0 and node.module:
+                    direct = _reverse_target(node.module.split("."), names)
+                    if direct is not None:
+                        targets.append(direct)
+                    elif node.module == "cambium.modules":
+                        targets.extend(
+                            target
+                            for alias in node.names
+                            if (target := _reverse_target(
+                                ["cambium", "modules", alias.name], names
+                            ))
+                            is not None
+                        )
+                elif node.level:
+                    relative = _reverse_relative_target(node, path)
+                    if relative is not None:
+                        target = _reverse_target(relative, names)
+                        if target is not None:
+                            targets.append(target)
+                for target in targets:
+                    for alias in node.names:
+                        findings.append(
+                            AuditFinding(
+                                "reverse-import",
+                                path.relative_to(REPO_ROOT),
+                                node.lineno,
+                                alias.asname or alias.name,
+                                f"imports decision package {target[1]}",
+                            )
+                        )
+                continue
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            is_import_module = isinstance(function, ast.Name) and function.id in import_module_names
+            if isinstance(function, ast.Attribute) and function.attr == "import_module":
+                is_import_module = (
+                    isinstance(function.value, ast.Name)
+                    and function.value.id in importlib_names
+                )
+            if not is_import_module:
+                continue
+            for _, target in _reverse_importlib_targets(node.args[0], names):
+                findings.append(
+                    AuditFinding(
+                        "reverse-import",
+                        path.relative_to(REPO_ROOT),
+                        node.lineno,
+                        _reverse_enclosing_symbol(node, parents),
+                        f"importlib.import_module loads decision package {target}",
+                    )
+                )
+    return tuple(
+        sorted(findings, key=lambda finding: (str(finding.path), finding.line, finding.symbol))
+    )
+
+
+def scan_external_module_files() -> tuple[AuditFinding, ...]:
+    """Find module-specific test/data/generator files outside their package."""
+    findings: list[AuditFinding] = []
+    paths = {relative: REPO_ROOT / relative for relative in _git_ls_files(".")}
+    for directory_name in ("scripts", "tools", "tests"):
+        directory = REPO_ROOT / directory_name
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if _is_regular_file(path):
+                paths[path.relative_to(REPO_ROOT)] = path
+    for relative, path in sorted(paths.items(), key=lambda item: item[0].as_posix()):
+        lower = relative.as_posix().lower()
+        if lower in {
+            "src/cambium/module_conformance.py",
+            "src/cambium/cli.py",
+            "tests/scenarios/test_module_conformance.py",
+        }:
+            continue
+        if not lower.startswith(("scripts/", "tools/", "tests/")):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for module_name in module_names():
+            if path.suffix == ".py":
+                reference = re.compile(
+                    rf"^[ \t]*(?:from|import)[ \t]+cambium\.modules\.{re.escape(module_name)}\b",
+                    re.MULTILINE,
+                )
+            else:
+                reference = re.compile(
+                    rf"(?<![\w.])cambium\.modules\.{re.escape(module_name)}\b"
+                )
+            match = reference.search(text)
+            if match is None:
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            package_dir = REPO_ROOT / "src" / "cambium" / "modules" / module_name
+            if package_dir in path.parents:
+                continue
+            findings.append(
+                AuditFinding(
+                    "layout",
+                    relative,
+                    line,
+                    module_name,
+                    f"module-specific file references cambium.modules.{module_name} outside "
+                    f"{package_dir.relative_to(REPO_ROOT).as_posix()}/",
+                )
+            )
+    return tuple(
+        sorted(findings, key=lambda finding: (str(finding.path), finding.line, finding.symbol))
+    )
 
 
 class ProviderImportBlocker:
@@ -566,12 +1637,28 @@ class ModuleConformancePlugin:
                 returncode=1,
             )
         _install_socket_audit_hook()
+        reverse_imports = scan_reverse_imports()
+        external_module_files = scan_external_module_files()
         try:
             self.spec = validate_module(self.name)
             scan_module_imports(self.spec)
+            if reverse_imports or external_module_files:
+                findings = [*reverse_imports, *external_module_files]
+                raise ModuleConformanceError(
+                    "static module-isolation findings:\n"
+                    + "\n".join(finding.format() for finding in findings)
+                )
             probe_module_cli(self.spec)
         except ModuleConformanceError as exc:
-            pytest.exit(str(exc), returncode=1)
+            message = str(exc)
+            if (reverse_imports or external_module_files) and not message.startswith(
+                "static module-isolation findings:"
+            ):
+                findings = [*reverse_imports, *external_module_files]
+                message += "\nstatic module-isolation findings:\n" + "\n".join(
+                    finding.format() for finding in findings
+                )
+            pytest.exit(message, returncode=1)
 
     def pytest_collection_modifyitems(
         self, session: pytest.Session, config: pytest.Config, items: list[pytest.Item]

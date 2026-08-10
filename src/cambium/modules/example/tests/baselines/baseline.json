@@ -2,6 +2,11 @@
   "schema_version": 1,
   "module": "should_decompose",
   "dataset_version": "1.1.0",
+  "split_digests": {
+    "train": "e2f72c5ec10d9f7723e5064825d65ec3382943556a76a8f7eeaeecc97b1f407b",
+    "eval": "ce2b6a304e3b93ce7450b258828fd0eb1b11afd72f2827021a0aef61a1dedbf0",
+    "canaries": "07d334d1488c415efef65c977efb8bbafea028f3913f5baef0d8a419bf5d058b"
+  },
   "git_sha": "ce85a592f0d5b9078f20fe7a7d3f9e62429ce1ca",
   "date": "2026-08-10T02:06:55Z",
   "python": "3.14.7",

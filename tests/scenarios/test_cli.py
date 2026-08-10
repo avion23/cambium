@@ -87,8 +87,11 @@ def test_tasktree_cyclic_plan_exits_one() -> None:
 def test_module_test_runs_reference_module() -> None:
     result = _run("module-test", "example")
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "cambium module conformance" in result.stdout
+    assert result.returncode == 1, result.stdout + result.stderr
+    output = result.stdout + result.stderr
+    assert "static module-isolation findings" in output, output
+    assert "src/cambium/bench.py:223:build_module_report" in output
+    assert "scripts/check_dataset_v1.py:25:ExampleDatasetLoader" in output
 
 
 def test_module_test_unknown_module_exits_two() -> None:
@@ -103,3 +106,19 @@ def test_module_test_rejects_arbitrary_pytest_arguments() -> None:
 
     assert result.returncode == 2
     assert "usage:" in result.stderr
+
+
+def test_module_test_propagates_child_failure(monkeypatch) -> None:
+    from cambium import cli
+
+    child = subprocess.CompletedProcess(args=["pytest"], returncode=1)
+    monkeypatch.setenv("EXAMPLE_API_TOKEN", "must-not-leak")
+
+    def fail_child(command, **kwargs):
+        assert "-I" not in command
+        assert "EXAMPLE_API_TOKEN" not in kwargs["env"]
+        return child
+
+    monkeypatch.setattr(cli.subprocess, "run", fail_child)
+
+    assert cli.main(["module-test", "example"]) == 1

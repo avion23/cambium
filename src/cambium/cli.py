@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -142,7 +141,6 @@ def _run_module_test(args: argparse.Namespace) -> int:
     tests_dir = module_conformance.MODULES_DIR / args.name / "tests"
     command = [
         sys.executable,
-        "-I",
         "-m",
         "pytest",
         "-p",
@@ -154,13 +152,16 @@ def _run_module_test(args: argparse.Namespace) -> int:
         "-q",
         str(tests_dir.resolve()),
     ]
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {"PYTHONPATH", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"}
-    }
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    result = subprocess.run(command, cwd=module_conformance.REPO_ROOT, env=env, check=False)
+    with module_conformance.module_offline_environment() as env:
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        env.pop("PYTEST_ADDOPTS", None)
+        env.pop("PYTEST_PLUGINS", None)
+        result = subprocess.run(
+            command,
+            cwd=module_conformance.REPO_ROOT,
+            env=env,
+            check=False,
+        )
     return 0 if result.returncode == 0 else 1
 
 
