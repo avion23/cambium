@@ -1,26 +1,17 @@
 # Dataset Format — JSONL Schema, Versioning, Splits, Canaries
 
-**Status:** Normative. Every decision module's datasets conform to this format. A
-legacy v2 module may ship a single combined `<name>_pairs.jsonl` with inline
-`canary: true` markers (see `docs/architecture/module-template/example-spec.md`
-§7.1); current split-aware modules ship the `{train,eval,canaries}.jsonl`
-three-file layout. A loader may retain the combined file as an explicit
-backward-compatibility fallback.
-
----
+**Status: NORMATIVE TARGET.** Every decision module follows this format. A v2
+interim module may retain one combined `<name>_pairs.jsonl` with inline
+`canary: true`; current split-aware modules use `train.jsonl`, `eval.jsonl`,
+and `canaries.jsonl`. A loader may use the combined file only as an explicit
+backward-compatible fallback.
 
 ## 1. Container format
 
-- **File:** newline-delimited JSON (JSONL), UTF-8, no BOM.
-- **One record per line.** Lines are independently parsed, but a malformed line
-  is a hard `DatasetError`; loaders and the conformance gate never continue
-  with a partially valid dataset.
-- **Trailing newline** at end of file (POSIX convention; `git diff` clean).
-- **No trailing whitespace** within lines.
-- **No comments.** JSONL has no comment syntax.
-- **Sort:** records are sorted by `id` (lexicographic) for deterministic diffs.
-
-A reader:
+Files are UTF-8 JSONL without a BOM: one independently parsed record per line,
+trailing newline, no trailing whitespace or comments, sorted lexicographically
+by `id`. A malformed line, duplicate `id`, or partially valid file is a hard
+`DatasetError`; the loader never continues with a partial dataset.
 
 ```python
 import json
@@ -30,100 +21,72 @@ def load(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 ```
 
----
-
 ## 2. Record schema
 
-Every record shares a common envelope. Module-specific fields live under `data`.
+The normative v2.1 envelope is:
 
 ```jsonc
 {
-  "id": "should_decompose-0001",          // stable, unique, sort-key
-  "schema_version": 1,                     // integer, monotonic per module
-  "dataset_version": "1.0.0",              // semver of the dataset file
-  "split": "train",                        // "train" | "eval" | "canary"
-  "added_at": "2026-08-09",                // ISO date
-  "added_by": "agent:name" or "human:name",
-  "source": "hand-authored" | "mined" | "synthetic" | "imported",
-  "license": "apache-2.0" | "internal" | "...",
-  "redacted": false,                       // true if any PII/secret was scrubbed
-  "data": {
-    // module-specific fields; see §3
-  },
-  "notes": ""                              // optional free-form, ≤500 chars
+  "id": "should_decompose-0001",
+  "schema_version": 1,
+  "dataset_version": "1.0.0",
+  "split": "train",                 // train | eval | canary
+  "added_at": "2026-08-09",
+  "added_by": "agent:name",
+  "source": "hand-authored",         // hand-authored | mined | synthetic | imported
+  "license": "apache-2.0",
+  "redacted": false,
+  "data": {},
+  "notes": ""                        // optional, at most 500 chars
 }
 ```
 
-Invariants:
+`id` is unique within the module dataset directory. Bump `schema_version` for
+an incompatible data-shape change and migrate old records explicitly. Bump
+`dataset_version` whenever evaluation changes (record, label, or split).
+`split` is fixed when written; moving a record requires a version bump.
 
-- `id` is unique within the module's dataset directory. Duplicate `id`s are a hard error in the loader.
-- `schema_version` is **bumped** whenever the `data` schema changes in a backwards-incompatible way. Old records are migrated explicitly (see §5).
-- `dataset_version` is bumped on every change that affects evaluation: adding records, fixing a label, re-splitting.
-- `split` is fixed at file time. Records do not migrate between splits without a dataset_version bump.
+The implemented v1 reference wire shape keeps `input` and `expected` at the
+top level, not under `data`:
 
-The implemented v1 wire envelope keeps `input` and `expected` at the top
-level, as shown by the reference module. The `data` wrapper described in §3 is
-the typed v2.1 target and must not be inferred by a v1 loader. For the current
-split-aware gate, every record must also carry `id`, `schema_version`,
-`dataset_version`, and `split`; the record `dataset_version` must equal the
-sidecar metadata version.
-
----
-
-## 3. Module-specific `data` schema
-
-Each module defines its own `data` shape and documents it in `src/cambium/modules/<name>/architecture.md` §7. The shape must be a frozen, typed dataclass in the module's primary implementation file (`decide.py` — the rule engine today; a future DSPy program implements the same interface behind it). For the v2 combined dataset the record shape is the scaffold's minimal `{input, expected, canary?}`; the extended envelope below is the v2.1 target:
-
-```python
-@dataclass(frozen=True)
-class ShouldDecomposeDatum:
-    task: str                    # v2: input.task
-    context: str                 # v2: input.context
-    decision: Decision           # domain value; wire expected.decompose is bool
-    reason: str                  # v2: expected.reason
-    expected_confidence: float   # v2.1 extension
-    rationale_keywords: tuple[str, ...]   # v2.1 extension; must appear in a good rationale
+```json
+{"input":{"task":"...","context":""},
+ "expected":{"decompose":false,"reason":"..."},"canary":false}
 ```
 
-The JSONL `data` field is the JSON serialization of this dataclass after the
-explicit domain-to-wire mapping. The JSON record carries the stable boolean
-`expected.decompose`; loaders use `cattrs` or hand-written `from_dict`/`to_dict`
-at that boundary.
+The current split gate additionally requires `id`, `schema_version`,
+`dataset_version`, and `split`, with record version equal to
+`datasets/meta.json`. Do not infer the v2.1 `data` wrapper in a v1 loader.
 
-For the reference module, `Decision` is the domain enum defined in
-`src/cambium/modules/example/decide.py`. The JSON wire field remains
-`expected.decompose: true|false`; `ExampleDatasetLoader` maps `true` to
-`Decision.DECOMPOSE` and `false` to `Decision.DO_NOT_DECOMPOSE`. Domain code
-compares enum members, not the serialized boolean.
+## 3. Module-specific data
 
----
+Each module documents a frozen typed dataclass in its own `architecture.md`
+§7. For `should_decompose`, the domain fields are `task`, `context`,
+`Decision`, `reason`, optional `expected_confidence`, and
+`rationale_keywords`. The JSON boundary maps `Decision.DECOMPOSE` to the
+stable boolean `expected.decompose: true` and
+`Decision.DO_NOT_DECOMPOSE` to `false`; domain code compares enum members.
 
-## 4. Splits
+## 4. Splits and freezing
 
-Three files per module:
-
-```
-src/cambium/modules/<name>/datasets/
-├── train.jsonl       # used by SIMBA/GEPA to fit prompts
-├── eval.jsonl        # frozen held-out; never used for training
-└── canaries.jsonl    # reward-hacking traps; never used for training
+```text
+datasets/
+├── train.jsonl       # optimizer input
+├── eval.jsonl        # frozen held-out set
+└── canaries.jsonl    # frozen reward-hacking traps
 ```
 
 Rules:
 
-- **`eval.jsonl` is immutable once frozen.** A frozen marker (`eval.frozen_at` in a sidecar `meta.json`) records the freeze date. Changes require a dataset_version bump and re-running every module that pins this one.
-- **`canaries.jsonl` is also frozen.** Canary additions are allowed (more traps are always welcome) but require dataset_version bump and a documented reason.
-- **`train.jsonl` may grow.** Each addition is a commit; deletions are not permitted (deprecate via a `deprecated: true` flag instead).
-- **No record exists in two splits.** A canonical hash of `data` (excluding metadata) is computed at load time; collisions across splits are a hard error.
-- **Target sizes** (defaults; module may override with justification):
-  - train: 200 records
-  - eval: 50 records
-  - canary: 15 records
+- `eval.jsonl` and `canaries.jsonl` are frozen. Additions or edits require a
+  `dataset_version` bump, reason, and re-validation of every pinned module.
+- `train.jsonl` is grow-only; do not delete records (deprecate explicitly).
+- No canonical input may occur in two splits. Duplicate IDs and cross-split
+  canonical-hash collisions are hard errors.
+- Default targets are train 200, eval 50, canary 15; a module may override
+  with a documented reason (the reference has 10 canaries).
 
-### 4.1 Freeze dates and split digests
-
-The implemented conformance contract freezes split content with exact-byte
-SHA-256 digests. `datasets/meta.json` must contain:
+`datasets/meta.json` records exact-byte SHA-256 digests and freeze dates:
 
 ```json
 {
@@ -135,234 +98,192 @@ SHA-256 digests. `datasets/meta.json` must contain:
     "train": "<64 lowercase hex characters>",
     "eval": "<64 lowercase hex characters>",
     "canaries": "<64 lowercase hex characters>"
-  }
+  },
+  "sibling_pins": {"TaskDecomposer": "0.3.1"}
 }
 ```
 
-Each digest is SHA-256 over the exact UTF-8 bytes of its corresponding JSONL
-file, including line endings. The gate validates all three files, record IDs,
-split labels, duplicate/cross-split canonical inputs, and the record
-`dataset_version`. `eval_frozen_at` and `canary_frozen_at` are required
-`YYYY-MM-DD` dates. A frozen split edit without a dataset-version bump is a
-hard failure; a digest change with the same version is never silently
-re-anchored.
+Each digest covers the exact UTF-8 bytes, including line endings. The gate
+checks IDs, split labels, versions, duplicate/cross-split inputs, and freeze
+dates. A frozen edit with no version bump is a hard failure; a digest change
+under the same version is never silently re-anchored.
 
-Splits are produced deterministically:
+Partitions must be deterministic and documented per module. An illustrative
+seeded procedure is:
 
 ```python
-# deterministic split procedure (illustrative)
-import random, json
-records = load("datasets/raw.jsonl")
 records.sort(key=lambda r: r["id"])
-random.seed(42)  # module-specific seeds; documented per module
+random.seed(42)                 # module-specific seed
 random.shuffle(records)
-# train = records[:200], eval = records[200:250], canary = hand-picked 15
+train, eval_ = records[:200], records[200:250]
+canaries = hand_picked(records[250:])
 ```
-
----
 
 ## 5. Versioning
 
-Two orthogonal versions:
+`schema_version` is an integer shape version. Migrations are pure, tested, and
+committed with the bump. `dataset_version` is semver:
 
-- **`schema_version`** (integer): the shape of `data`. Bump on incompatible change. Migration:
-  ```python
-  def migrate(record: dict, from_v: int, to_v: int) -> dict:
-      if from_v == 1 and to_v == 2:
-          # v1 used `expected_decision`; v2 standardizes on `decompose`
-          # (matching the scaffold's expected.decompose field).
-          record["data"]["decompose"] = bool(record["data"].pop("expected_decision"))
-          record["schema_version"] = 2
-      return record
-  ```
-  Migrations are pure functions, tested, and committed alongside the schema bump.
+- patch (`1.0.0` → `1.0.1`): typo or metadata-only change;
+- minor (`1.0.0` → `1.1.0`): added records/canaries while frozen sets stay fixed;
+- major (`1.0.0` → `2.0.0`): label change, re-split, schema bump, or frozen-set change.
 
-- **`dataset_version`** (semver): the contents of the dataset.
-  - **Patch** (`1.0.0` → `1.0.1`): typo fixes, metadata-only changes, no label changes.
-  - **Minor** (`1.0.0` → `1.1.0`): added records, added canaries. Frozen splits stay frozen.
-  - **Major** (`1.0.0` → `2.0.0`): label changes, re-splits, schema bumps, frozen-set changes.
+Changing a domain enum representation does not change the JSON boolean shape,
+so `schema_version` remains 1; bump `dataset_version` if scoring or loader
+semantics change. The reference metadata currently records `1.1.0`.
 
-A sidecar `meta.json` records the current versions and the frozen-at timestamp:
-
-```jsonc
-// src/cambium/modules/<name>/datasets/meta.json
-{
-  "schema_version": 1,
-  "dataset_version": "1.0.0",
-  "eval_frozen_at": "2026-08-09",
-  "canary_frozen_at": "2026-08-09",
-  "split_digests": {
-    "train": "<sha256 of exact train.jsonl bytes>",
-    "eval": "<sha256 of exact eval.jsonl bytes>",
-    "canaries": "<sha256 of exact canaries.jsonl bytes>"
-  },
-  "sibling_pins": {
-    "TaskDecomposer": "0.3.1",
-    "Opifex": "1.2.0"
-  }
-}
-```
-
-`sibling_pins` records the production versions of sibling modules against which this dataset was last validated. Optimization uses these to load matching stubs (see `architecture.md` §17.2).
-
-### 5.1 Domain-enum compatibility
-
-The `Decision` migration is domain-side. It leaves the JSON record shape and
-the wire boolean `expected.decompose` unchanged, so `schema_version` remains
-`1`. The reference module's current `src/cambium/modules/example/datasets/meta.json`
-records `dataset_version: "1.1.0"`, which is the post-migration dataset and
-baseline anchor. `dataset_version` identifies the evaluation dataset and its
-scoring anchor; it is not an enum serialization. Bump it under the semver rules
-above when records, labels, splits, loader semantics, or scoring change, and
-keep the wire boolean stable when only the domain representation changes. A
-domain-only migration may still re-anchor the dataset version, as the reference
-module does here, without changing `schema_version` or rewriting any records.
-
-### 5.2 Implemented gate and baseline agreement
-
-The conformance gate requires one dataset version across the complete chain:
+The conformance chain is one version and one digest map:
 
 ```text
-JSONL record.dataset_version == meta.json.dataset_version
-baseline.dataset_version == meta.json.dataset_version
-baseline.split_digests == meta.json.split_digests == SHA256(current split bytes)
+record.dataset_version == meta.dataset_version == baseline.dataset_version
+baseline.split_digests == meta.split_digests == SHA256(current split bytes)
 ```
 
-The baseline JSON is validated as a schema-bearing object, not treated as an
-opaque benchmark artifact. It must contain `schema_version`, the logical
-`module` name, `dataset_version`, all three `split_digests`, provenance and
-runtime fields, per-split metrics, canary summary, dataset counts, test
-timings, and drift thresholds. Missing fields, invalid types, stale counts,
-or stale digests fail the gate.
+The baseline is schema-bearing, not opaque: it includes version, logical
+module, digests, provenance/runtime fields, per-split metrics, canary summary,
+dataset counts, test timings, and drift thresholds. Missing fields or stale
+counts/digests fail the gate. If records and metadata disagree, report the
+owner reconciliation failure; do not rewrite records as a documentation fix.
 
-At the current tree, the split records still say `1.0.0` while
-`meta.json` and the committed baseline say `1.1.0`. That is a deliberate,
-visible dataset-owner reconciliation failure. The module-conformance change
-must report it and must not rewrite the dataset records.
+## 6. Canaries
 
----
+Canaries are frozen records that defeat metric-gaming prompts. A record carries
+`canary: true` at the implemented wire boundary and a `canary_info`/`data`
+object with `kind`, `anti_expected`, confidence range when relevant, and a
+description of the trap. The taxonomy is extensible:
 
-## 6. Canaries (reward-hacking traps)
+| Kind | Trap | Pass condition |
+|---|---|---|
+| `trivially_atomic` | over-decomposition | `Decision.DO_NOT_DECOMPOSE` / `false` |
+| `must_decompose` | under-decomposition | `Decision.DECOMPOSE` / `true` |
+| `ambiguous_calibration` | over-confidence | confidence ≤ 0.6 |
+| `format_only_hack` | valid format, bad content | module-specific content check |
+| `keyword_hack` | surface-keyword memorization | gold decision, not keyword count |
+| module-specific | documented failure mode | documented condition |
 
-Canaries are records that should **not** pass trivially under a metric-gaming prompt. They are the brakes on the flywheel (`docs/architecture/architecture.md` §17.4 step 8).
-
-Each canary record carries a `canary` field under `data`:
-
-```jsonc
-{
-  "id": "should_decompose-canary-01",
-  "schema_version": 1,
-  "split": "canary",
-  "data": {
-    "task": "Refactor function `foo` to use list comprehension. Single file, single function.",
-    "context": "",
-    "decompose": false,
-    "reason": "trivially atomic",
-    "expected_confidence": 0.9,        // v2.1 extension
-    "canary": {
-      "kind": "trivially_atomic",                    // see taxonomy below
-      "anti_expected": true,                          // what a hacked prompt would say
-      "anti_expected_confidence_range": [0.5, 1.0],   // and how confident it would be
-      "description": "A prompt that decomposes this is over-decomposing; trap rewards 'no'."
-    }
-  }
-}
-```
-
-### Canary taxonomy (extend per module)
-
-| Kind | What it traps | Trigger | Pass condition |
-|---|---|---|---|
-| `trivially_atomic` | Over-decomposition | A spec that should clearly NOT be decomposed. | Domain output `Decision.DO_NOT_DECOMPOSE` (wire `false`). |
-| `must_decompose` | Under-decomposition | A spec with ≥3 distinct subtasks. | Domain output `Decision.DECOMPOSE` (wire `true`). |
-| `ambiguous_calibration` | Over-confident on ambiguous input | A spec with no clear answer. | `confidence ≤ 0.6`. |
-| `format_only_hack` | Format-valid but content-empty | Output with empty rationale. | `len(rationale) ≥ 50`. |
-| `keyword_hack` | Rationale keyword-stuffed | Rationale includes gold keywords but wrong decision. | Decision must match; keyword match alone fails. |
-
-Add module-specific kinds as needed. Every canary has a `description` explaining what gaming behavior it detects.
-
-A canary fails if its `pass condition` is not met. **One failed canary = the optimized prompt is rejected.**
-
----
+Canaries are scored with ordinary records; dropping them is an integrity
+failure. A canary suite has a 100% pass gate for promotion.
 
 ## 7. Data hygiene
 
-- **No secrets.** The loader scans for common secret patterns (`sk-...`, `AIza...`, `ghp_...`) and refuses to load a record containing them. The repository check (`scripts/check_dataset_v1.py`) performs the dataset secret scan and integrity gate.
-- **No PII** (names, emails, phone numbers, real repo URLs that imply an author). Real specs are paraphrased.
-- **Redaction log:** if a record was redacted, `redacted: true` and a `redaction_notes` field describe what was scrubbed.
-- **Licensing:** every record carries a `license`. Internal-only datasets use `"internal"`; shareable datasets use an OSI license. Mixed-license datasets are not permitted in a single file.
-
----
+Do not store credentials, secrets, or unnecessary PII. Every record has a
+license and provenance. If redaction occurs, set `redacted: true` and record
+`redaction_notes`; mixed licenses in one file require an explicit policy.
 
 ## 8. Review and contribution
 
-- New records are added by PR. The PR template requires:
-  - Source (hand-authored / mined / synthetic / imported).
-  - For mined records: a link to the production event-log entry they were derived from (or a justification if redacted).
-  - Schema and dataset versions, with bumps if required.
-- **Two-reviewer rule** for the frozen `eval.jsonl`: changes require sign-off from both the module owner and the orchestrator owner.
-- Canary additions require sign-off from at least one reviewer who did not author the canary.
-- The dataset's `meta.json` is checked by `scripts/check_dataset_v1.py`, which fails the CI gate on inconsistencies (split leaks, duplicate IDs, missing fields, schema mismatches).
-
----
+Record author, date, source, and reason for every addition. A second reviewer
+approves frozen eval changes; a reviewer who did not author a canary approves
+canary additions. Dataset checks must report counts, labels, duplicate IDs,
+cross-split collisions, secret scans, and digest/version agreement.
 
 ## 9. Loader contract (normative)
 
-```python
-# cambium.datasets.load — used by eval harnesses and Ascensus
-from pathlib import Path
-from dataclasses import dataclass
-
-@dataclass(frozen=True)
-class Dataset:
-    name: str
-    schema_version: int
-    dataset_version: str
-    train: tuple[dict, ...]
-    eval: tuple[dict, ...]
-    canaries: tuple[dict, ...]
-    sibling_pins: dict[str, str]
-
-def load(module_name: str, root: Path = DEFAULT_ROOT) -> Dataset:
-    """Load all three splits for a module; validate; return frozen Dataset."""
-```
-
-The loader raises `DatasetError` on any inconsistency: duplicate IDs, cross-split leaks, missing `meta.json`, schema mismatch, secret-pattern hit. Eval harnesses do not catch `DatasetError`; a broken dataset is a hard gate. A concrete loader may map stable wire scalars to domain enums after validating the wire schema; that mapping does not change the dataset's JSON format.
-
----
+`DatasetLoader` (the reference is `ExampleDatasetLoader`) loads UTF-8 JSONL and
+validates all required types. Split-aware loaders expose `load_split()` and
+`load_all()`, exclude canaries from train/eval, and reject duplicate IDs,
+version drift, invalid metadata, malformed JSON, non-object records, and
+canonical cross-split collisions. A missing split may use
+`example_pairs.jsonl` only when the fallback is explicit and the split-aware
+metadata does not silently get ignored.
 
 ## 10. Conformance, packaging, and removal
 
-The dataset gate is run for the package-directory name, not the logical
-dataset name:
+The live command is:
 
 ```console
 uv run --extra test cambium module-test <package_name>
 ```
 
-For example, the reference dataset is logically `should_decompose`, but the
-package directory and selector are `example`. Baselines use the logical name;
-imports and wheel paths use `cambium.modules.example`.
+It checks tracked module layout, manifest, schema/digests, imports, JSON CLI,
+offline subprocess behavior, and colocated tests. The wheel includes code,
+`__main__.py`, this architecture document, datasets, `meta.json`, tests, and
+baselines. A module is removable by deleting its complete package directory;
+shared harness scenarios remain.
 
-Module tests run in an offline subprocess environment. Credentials and pytest
-plugin injection are removed, normal Python socket clients and common literal
-command-line network clients are denied, and normal Python child subprocesses
-inherit the same rule.
+## Appendix A. Implemented reference details
 
-This offline guard is a **BEST-EFFORT, deterministic lint-style check for common
-forms of accidental network use; it is not a security boundary. It CANNOT
-prevent a hostile same-UID module from bypassing the check with `os.system`,
-`posix_spawn`, raw sockets, subprocess monkey-patching, or by killing a same-UID
-tracer. The harness does not start such a tracer or provide an in-harness
-sandbox. Real containment is the deployment-layer boundary.**
+### A.1 Envelope compatibility
 
-The module cannot import a sibling decision package. Harness production code,
-`bench.py`, `scripts/`, and `tools/` cannot reverse-import a decision package;
-the gate reports any violation with its file, line, and symbol.
+The minimal v2 record used by the reference loader is intentionally smaller
+than the target envelope. It validates `input.task` as a string,
+`input.context` as a string, `expected.decompose` as a boolean, and
+`expected.reason` as a string. The optional `canary` marker is a boolean. A
+split-aware record adds non-empty `id`, `schema_version`, `dataset_version`,
+and `split`; all four version/split values must agree with `meta.json` and the
+file being loaded. A legacy record without the envelope is accepted only by
+the explicit `example_pairs.jsonl` fallback. Do not use that fallback to hide a
+missing or unreadable required split when valid split metadata exists.
 
-The wheel must carry the module's code, JSON CLI, architecture document, all
-three split files, `meta.json`, colocated tests, and baselines. The installed
-wheel is probed outside the checkout with the same `module-test` command. A
-module is removable only as a complete directory deletion: no dataset,
-baseline, test, architecture, or package file may remain outside that module
-directory as a hidden dependency.
+The domain mapping is deliberately one-way at the boundary: loaders turn
+`expected.decompose: true` into `Decision.DECOMPOSE` and `false` into
+`Decision.DO_NOT_DECOMPOSE`; metric code compares enum members. A domain-only
+enum migration can leave `schema_version` at 1, but a changed label, split,
+loader interpretation, or score requires a dataset-version bump and a new
+baseline anchor.
+
+### A.2 Digests and baseline agreement
+
+The gate hashes bytes, not parsed objects. It includes the final newline and
+does not normalize `\r\n`, whitespace, key order, or Unicode. It validates all
+three split digests, record IDs, labels, metadata versions, freeze dates, and
+canonical `(input, expected)` collisions. The exact agreement rule is:
+
+```text
+record.dataset_version == meta.dataset_version == baseline.dataset_version
+meta.split_digests == baseline.split_digests == SHA256(exact split bytes)
+```
+
+A same-version digest change is a failure even if the mean metric improves. A
+new dataset version may create an anchor only after its owner records the
+reason, frozen dates, and sibling re-validation. Baseline counts are checked
+against loaded records; a stale count is not informational.
+
+### A.3 Canary record and review example
+
+An implemented top-level canary record may look like:
+
+```jsonc
+{
+  "id": "should_decompose-canary-01",
+  "schema_version": 1,
+  "dataset_version": "1.1.0",
+  "split": "canary",
+  "input": {"task": "Refactor one function in one file.", "context": ""},
+  "expected": {"decompose": false, "reason": "trivially atomic"},
+  "canary": true,
+  "canary_info": {
+    "kind": "trivially_atomic",
+    "anti_expected": true,
+    "description": "A keyword-greedy prompt would over-decompose this record."
+  }
+}
+```
+
+Canaries are not a separate scoring algorithm: they use the module metric and
+are additionally subject to the 100% promotion gate. A canary author records
+the failure mode and expected output. A different reviewer checks the text,
+label, confidence range where relevant, and that the canary is not a duplicate
+of train/eval content. Adding a canary is a minor dataset-version change even
+when the aggregate score remains unchanged.
+
+### A.4 Loader and packaging checks
+
+`load_split()` returns only the requested split; train/eval exclude canaries,
+and `load_all()` performs cross-split collision checks. Loader errors include
+file and line context. Tests must exercise malformed JSON, a non-object record,
+missing required keys, invalid field types, duplicate IDs, invalid metadata,
+record/version drift, and a cross-split collision. The module conformance gate
+also checks that every declared dataset, baseline, architecture file, test,
+and manifest is tracked and included in the wheel. Removal means deleting the
+entire module directory, including its freeze metadata; no shared loader may
+silently resurrect it.
+
+### A.5 Authority and migration note
+
+When this normative target and a live loader differ, the loader and its tests
+establish current behavior, while this document establishes the intended
+future boundary. Record the difference in the module architecture and in the
+dataset owner issue. A migration must be a pure, reviewable function with a
+fixture for every old version; editing records in place to make a check green
+loses the evidence needed to compare scores across versions.
