@@ -34,6 +34,8 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -715,7 +717,7 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
     ).stdout
 
 
-def test_worker_fence_advance_during_post_commit_removes_stale_commit(
+def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"
@@ -759,69 +761,149 @@ def test_worker_fence_advance_during_post_commit_removes_stale_commit(
 
     asyncio.run(scenario())
 
-    commits_after_fence = int(subprocess.run(
+    # The stale worker owns no recovery operations after fence invalidation.
+    # Its commit remains only on the disposable task branch until supervisor
+    # recovery resets that branch; refs/heads/main is never published.
+    commits_before_recovery = int(subprocess.run(
         ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout)
-    stale_committed = MARKER in subprocess.run(
+    assert commits_before_recovery == 1
+    assert MARKER in subprocess.run(
         ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    assert commits_after_fence == 0
-    assert stale_committed is False
-
-
-def test_stale_generation_does_not_roll_back_newer_generations_only_commit(
-    tmp_path: Path,
-) -> None:
-    session_dir = tmp_path / "session"
-    scratch = session_dir / "scratch"
-    rollback_base = _make_scratch(scratch)
-    worktree = session_dir / "wt"
-    subprocess.run(
-        [
-            "git", "-C", str(scratch), "worktree", "add", "-b", "wt-stale",
-            str(worktree), rollback_base,
-        ],
-        check=True,
-        capture_output=True,
-    )
-    write_generation(worktree, 1)
-
-    # Generation 1 recorded rollback_base. The fence then advances and generation 2
-    # makes the sole commit after that base before generation 1 handles staleness.
-    write_generation(worktree, 2)
-    (worktree / "generation-2.txt").write_text("generation 2\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "-C", str(worktree), "add", "generation-2.txt"], check=True
-    )
-    subprocess.run(
-        ["git", "-C", str(worktree), "commit", "-m", "generation 2"],
-        check=True,
-        capture_output=True,
-    )
-    generation_2_head = subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+    assert MARKER not in subprocess.run(
+        ["git", "-C", str(scratch), "show", "refs/heads/main:hello.txt"],
         check=True,
         capture_output=True,
         text=True,
-    ).stdout.strip()
+    ).stdout
+    assert read_generation(worktree) == 3
 
-    from cambium.worker import _rollback_owned_state
+    from cambium import supervisor as supervisor_module
 
-    assert _rollback_owned_state(worktree, 1, rollback_base, "generation-1") is False
+    runtime = supervisor_module._Runtime(session_dir, None)
+    recovered_generation = asyncio.run(runtime._recover_worktree({
+        "repo": str(scratch),
+        "worktree_path": str(worktree),
+        "branch": "wt-ipc-001",
+        "base_commit": base,
+        "task_id": "ipc-post-commit-fence",
+    }))
 
+    assert recovered_generation == 4
+    assert read_generation(worktree) == 4
     assert subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
-    ).stdout.strip() == generation_2_head
-    assert (worktree / "generation-2.txt").read_text(encoding="utf-8") == "generation 2\n"
+    ).stdout.strip() == base
+    assert MARKER not in (worktree / "hello.txt").read_text(encoding="utf-8")
+
+
+def test_stale_worker_never_mutates_newer_generations_staged_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    base = _make_scratch(scratch)
+    worktree = session_dir / "wt"
+    subprocess.run(
+        [
+            "git", "-C", str(scratch), "worktree", "add", "-b", "wt-stale",
+            str(worktree), base,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    write_generation(worktree, 1)
+    hook_started = tmp_path / "post-commit-started"
+    hook_release = tmp_path / "post-commit-release"
+    hook = scratch / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_started))}\n"
+        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    from cambium import worker as worker_module
+
+    allow_stale_detection = threading.Event()
+    real_validate = worker_module.validate_worker_generation
+
+    def controlled_validate(path: Path, generation: int) -> bool:
+        if generation == 1 and read_generation(path) == 2:
+            return not allow_stale_detection.is_set()
+        return real_validate(path, generation)
+
+    monkeypatch.setattr(worker_module, "validate_worker_generation", controlled_validate)
+    result_holder: list[dict] = []
+    worker_thread = threading.Thread(
+        target=lambda: result_holder.append(worker_module.do_work({
+            "scratch_repo": str(scratch),
+            "worktree_path": str(worktree),
+            "target_file": "hello.txt",
+            "marker": MARKER,
+            "write_marker": True,
+            "task_id": "stale-generation-1",
+            "generation": 1,
+        }, threading.Event())),
+        daemon=True,
+    )
+    worker_thread.start()
+    deadline = time.monotonic() + 5.0
+    while not hook_started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert hook_started.exists()
+
+    # Generation 2 takes ownership and stages in-progress work before generation
+    # 1 observes the invalidated fence.
+    write_generation(worktree, 2)
+    generation_2_file = worktree / "generation-2.txt"
+    generation_2_file.write_text("generation 2 in progress\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "generation-2.txt"], check=True)
+    head_before_stale_detection = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    staged_before_stale_detection = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
+    allow_stale_detection.set()
+    hook_release.touch()
+    worker_thread.join(timeout=5.0)
+
+    assert not worker_thread.is_alive()
+    assert result_holder[0]["status"] == "failed"
+    assert "generation mismatch" in result_holder[0]["failure_reason"]
+    assert read_generation(worktree) == 2
+    assert subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == head_before_stale_detection
+    assert subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines() == staged_before_stale_detection == ["generation-2.txt"]
+    assert generation_2_file.read_text(encoding="utf-8") == "generation 2 in progress\n"
 
 
 def test_worker_shutdown_graceful_exit(tmp_path) -> None:

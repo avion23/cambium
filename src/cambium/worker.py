@@ -154,41 +154,6 @@ def _write_worktree_state(
     path.write_text(content)
 
 
-def _rollback_owned_state(
-    worktree: Path,
-    generation: int,
-    rollback_base: str,
-    worker_identity: str,
-) -> bool:
-    """Discard only this stale generation's state without moving newer work."""
-    if validate_worker_generation(worktree, generation):
-        return False
-    rc, current_head, _err = git("rev-parse", "HEAD", cwd=worktree)
-    if rc != 0 or current_head == rollback_base:
-        return False
-    rc, parent, _err = git("rev-parse", f"{current_head}^", cwd=worktree)
-    if rc != 0 or parent != rollback_base:
-        return False
-    rc, message, _err = git("show", "-s", "--format=%B", current_head, cwd=worktree)
-    ownership_markers = {
-        f"Cambium-Worker-Generation: {generation}",
-        f"Cambium-Worker-Identity: {worker_identity}",
-    }
-    if rc != 0 or not ownership_markers.issubset(message.splitlines()):
-        return False
-    if validate_worker_generation(worktree, generation):
-        return False
-    rc, _out, _err = git(
-        "update-ref", "HEAD", rollback_base, current_head, cwd=worktree
-    )
-    if rc != 0:
-        return False
-    if validate_worker_generation(worktree, generation):
-        return False
-    rc, _out, _err = git("reset", "--hard", "HEAD", cwd=worktree)
-    return rc == 0
-
-
 def cap_diff(diff: str) -> tuple[str, bool]:
     """Cap ``diff`` to ``MAX_DIFF_BYTES`` UTF-8 bytes, never splitting a
     codepoint; returns ``(diff, truncated)``."""
@@ -225,8 +190,6 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         "diff_truncated": False,
         "summary": "",
     }
-    rollback_base: str | None = None
-    worker_identity: str | None = None
     try:
         scratch = Path(run["scratch_repo"]).resolve()
         worktree = Path(run["worktree_path"]).resolve()
@@ -268,7 +231,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         if not worktree.exists():
             outcome["failure_reason"] = f"worker worktree is missing: {worktree}"
             return outcome
-        rc, rollback_base, err = guarded_git("rev-parse", "HEAD", cwd=worktree)
+        rc, _out, err = guarded_git("rev-parse", "HEAD", cwd=worktree)
         if rc != 0:
             outcome["failure_reason"] = f"cannot resolve worktree HEAD: {err}"
             return outcome
@@ -337,16 +300,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         )
         return outcome
     except GenerationFenceError as exc:
-        rolled_back = (
-            rollback_base is not None
-            and worker_identity is not None
-            and _rollback_owned_state(
-                worktree, generation, rollback_base, worker_identity
-            )
-        )
         outcome["failure_reason"] = str(exc)
-        if rollback_base is not None and not rolled_back:
-            outcome["failure_reason"] += "; rollback skipped because branch HEAD moved"
         return outcome
     except Exception as exc:  # let-it-crash: report as a failure, not a hang
         outcome["failure_reason"] = f"task crashed: {exc}"
