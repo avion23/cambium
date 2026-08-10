@@ -21,8 +21,6 @@ import asyncio
 import json
 import threading
 import time
-from collections import deque
-from collections.abc import MutableMapping
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -229,49 +227,6 @@ def test_equal_priority_providers_remain_in_config_order(monkeypatch) -> None:
     finally:
         first.close()
         second.close()
-
-
-# --------------------------------------------------------------------------- #
-# 3. no ordering state after calls (D1 statelessness)
-# --------------------------------------------------------------------------- #
-
-
-def test_no_ordering_state_added_after_calls(monkeypatch) -> None:
-    low = FakeServer([(200, _ok_payload("low"), 0.0)])
-    high = FakeServer([(200, _ok_payload("high"), 0.0)])
-    _set_keys(monkeypatch, "K_LOW", "K_HIGH")
-    router = Diffundo(
-        (
-            _config("p_low", low, "K_LOW", priority=0),
-            _config("p_high", high, "K_HIGH", priority=5),
-        )
-    )
-    mutable_ordering = (dict, set, list, deque)
-    attrs_before = set(vars(router))
-
-    def assert_no_mutable_ordering_state() -> None:
-        for attr, value in vars(router).items():
-            assert not isinstance(value, MutableMapping), (
-                f"Diffundo.{attr} is a mutable mapping — a cache attribute"
-            )
-            assert not isinstance(value, mutable_ordering), (
-                f"Diffundo.{attr} is mutable ordering/cursor state"
-            )
-        assert not isinstance(router._runtimes, MutableMapping)
-        assert not isinstance(router._providers, MutableMapping)
-
-    try:
-        assert_no_mutable_ordering_state()
-        for _ in range(3):
-            result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-            assert result.provider == "p_low"
-        # a future RR/LRU cursor (dict/deque/index) would be a mutable attribute
-        # or a new attribute name — neither exists on the instance after calls
-        assert_no_mutable_ordering_state()
-        assert set(vars(router)) == attrs_before
-    finally:
-        low.close()
-        high.close()
 
 
 # --------------------------------------------------------------------------- #

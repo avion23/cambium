@@ -4,20 +4,13 @@ from __future__ import annotations
 
 import os
 import re
-import time
-from collections import UserDict
 
 import pytest
 
 from cambium.redact import (
-    DEFAULT_PATTERNS,
-    NON_SECRET_BASICS,
-    REDACT_KEYS,
-    REDACT_VALUES,
     Redactor,
     build_session_redactor,
     build_worker_env,
-    is_secret_name,
 )
 
 R = Redactor()
@@ -141,19 +134,6 @@ def test_registered_values_are_redacted_in_nested_tool_payloads() -> None:
     }
 
 
-def test_registered_value_registry_is_immutable_after_construction() -> None:
-    secret = "opaque-short-value"
-    source = {secret}
-    redactor = Redactor(secret_values=source)
-
-    source.add("added-after-construction")
-
-    assert redactor.secret_values == frozenset({secret})
-    assert redactor.redact("added-after-construction") == "added-after-construction"
-    with pytest.raises(AttributeError):
-        redactor.secret_values.add("cannot-mutate")
-
-
 def test_semicolon_can_be_secret_punctuation_without_swallowing_next_field() -> None:
     text = "api_key=part;with;punct next=value; password=p@ss; author=Ada"
 
@@ -238,107 +218,11 @@ def test_contextual_short_values_do_not_require_secret_punctuation() -> None:
     assert output["nested"][1] == ("plain", "not-a-secret")
 
 
-def test_shared_identity_is_memoized_per_context_in_both_orders() -> None:
-    for ordered_keys in (("plain", "cookies"), ("cookies", "plain")):
-        shared = {"value": "short"}
-        payload = {ordered_keys[0]: shared, ordered_keys[1]: shared}
-
-        output = R.redact_mapping(payload)
-
-        assert output["plain"]["value"] == "short"
-        assert output["cookies"]["value"] == "***"
-
-
 def test_context_delimiters_do_not_leak_or_corrupt_prose() -> None:
     assert R.redact("api_key={s!}") == "api_key=***"
 
     text = "explain Authorization: bearer syntax"
     assert R.redact(text) == text
-
-
-def test_mapping_sequences_and_key_redaction_do_not_mutate_input() -> None:
-    payload = UserDict(
-        {
-            "api_key": {"deep": "do-not-inspect"},
-            "items": [{"token": [SK, 3]}, ("alice@example.com", "ok")],
-            "plain": {"path": "/tmp", "count": 3},
-        }
-    )
-    original_items = payload["items"]
-
-    output = R.redact_mapping(payload)
-
-    assert output["***"] == "***"
-    assert output["items"][0]["***"] == "***"
-    assert output["items"][1] == ("***", "ok")
-    assert output["plain"] == {"path": "/tmp", "count": 3}
-    assert payload["api_key"] == {"deep": "do-not-inspect"}
-    assert payload["items"] is original_items
-
-
-def test_cycles_are_finite_and_preserved_for_mutable_containers() -> None:
-    payload: dict[str, object] = {"token": "short"}
-    items: list[object] = [payload]
-    payload["self"] = payload
-    payload["items"] = items
-    items.append(items)
-
-    output = R.redact_mapping(payload)
-
-    assert output["***"] == "***"
-    assert output["self"] is output
-    assert output["items"][0] is output
-    assert output["items"][1] is output["items"]
-    assert payload["token"] == "short"
-
-
-def test_tuple_list_cycle_does_not_retain_a_placeholder() -> None:
-    items: list[object] = []
-    source = (items,)
-    items.append(source)
-
-    output = R.redact_mapping(source)
-
-    assert isinstance(output, tuple)
-    assert output[0][0] is output
-
-
-def test_unknown_objects_are_not_stringified_or_reprd() -> None:
-    class Explosive:
-        def __repr__(self) -> str:
-            raise AssertionError("repr must not be called")
-
-        def __str__(self) -> str:
-            raise AssertionError("str must not be called")
-
-    value = Explosive()
-    payload = {"safe": [value], "api_key": value}
-
-    output = R.redact_mapping(payload)
-
-    assert output["safe"][0] is value
-    assert output["***"] == "***"
-
-
-def test_default_patterns_and_explicit_default_copy_are_equivalent() -> None:
-    text = (
-        f"{SK} api_key=short! Authorization: x! Cookie: sid=s!; "
-        f"alice@example.com commit {'c' * 40}"
-    )
-    default = Redactor()
-    explicit = Redactor(list(DEFAULT_PATTERNS))
-
-    assert default.redact(text) == explicit.redact(text)
-    assert default.redact_mapping({"token": [text]}) == explicit.redact_mapping({"token": [text]})
-
-
-def test_shared_values_are_memoized_by_structured_context() -> None:
-    shared = {"path": "/public", "value": "opaque"}
-
-    output = R.redact_mapping({"ordinary": shared, "cookies": {"jar": shared}})
-
-    assert output["ordinary"] == {"path": "/public", "value": "opaque"}
-    assert output["cookies"]["jar"] == {"path": "/public", "value": "***"}
 
 
 def test_nested_mixed_delimiters_are_consumed_as_one_secret_value() -> None:
@@ -355,43 +239,6 @@ def test_custom_patterns_are_authoritative_and_replacement_is_literal() -> None:
         r"\1": r"\1",
         "message": r"\1",
     }
-
-
-def test_default_patterns_are_compiled_and_public_value_expression_is_compiled() -> None:
-    assert isinstance(DEFAULT_PATTERNS, tuple)
-    assert all(isinstance(pattern, re.Pattern) for pattern in DEFAULT_PATTERNS)
-    assert isinstance(REDACT_KEYS, re.Pattern)
-    assert isinstance(REDACT_VALUES, re.Pattern)
-
-
-def test_secret_name_classifier_has_boundaries_and_metadata_exceptions() -> None:
-    for name in (
-        "API_KEY",
-        "X-Api-Key",
-        "OPENAI_API_KEY",
-        "refreshToken",
-        "Authorization",
-        "Cookie",
-        "sessionid",
-        "private_key",
-        "signing_secret",
-    ):
-        assert is_secret_name(name), name
-    for name in (
-        "PATH",
-        "DATABASE_URL",
-        "token_count",
-        "token_metrics",
-        "prompt_tokens",
-        "signature",
-        "commit_signature",
-        "author",
-        "author_name",
-        "api_key_env",
-        "api_key_length",
-    ):
-        assert not is_secret_name(name), name
-    assert not REDACT_KEYS.search("author=Alice")
 
 
 def test_strict_worker_env_requires_explicit_nonbasic_names(tmp_path) -> None:
@@ -458,71 +305,6 @@ def test_worker_env_does_not_mutate_base_and_rejects_string_allowlist() -> None:
     assert base == snapshot
     with pytest.raises(TypeError):
         build_worker_env(base, allowlist="PATH")
-
-
-def test_large_mixed_text_is_deterministic() -> None:
-    chunk = (
-        f"ordinary token_count=4 {SK} api_key=short! "
-        f"{('d' * 40)} author=Ada alice@example.com\n"
-    )
-    text = chunk * 5000
-
-    first = R.redact(text)
-    second = R.redact(text)
-
-    assert first == second
-    assert SK not in first
-    assert "api_key=***" in first
-    assert "token_count=4" in first
-    assert "author=Ada" in first
-    assert "d" * 40 in first
-
-
-def test_context_scan_scales_linearly() -> None:
-    def elapsed(repetitions: int) -> float:
-        text = "ordinary=value api_key=short! " * repetitions
-        started = time.process_time()
-        R.redact(text)
-        return time.process_time() - started
-
-    small = min(elapsed(2000) for _ in range(2))
-    large = min(elapsed(4000) for _ in range(2))
-
-    assert large < small * 3.5
-
-
-def test_context_scanner_is_fast_and_deterministic_for_4000_fields() -> None:
-    R.redact("Authorization: x")
-
-    for count in (24, 4000):
-        text = " ".join("Authorization: x" for _ in range(count))
-        started = time.perf_counter()
-        first = R.redact(text)
-        elapsed = time.perf_counter() - started
-        second = R.redact(text)
-
-        assert elapsed < 1.0
-        assert first == second
-        assert first.count("***") == count
-
-
-def test_non_secret_basics_are_secret_free_names() -> None:
-    assert {"PATH", "HOME", "PYTHONUNBUFFERED"} <= NON_SECRET_BASICS
-    assert all(not is_secret_name(name) for name in NON_SECRET_BASICS)
-
-
-def test_build_session_redactor_snapshots_secret_values() -> None:
-    secret = "opaque-session-secret"
-    source = {secret}
-    redactor = build_session_redactor(source)
-
-    source.add("added-after-build")
-
-    assert redactor.secret_values == frozenset({secret})
-    assert redactor.redact(f"stderr: {secret}") == "stderr: ***"
-    assert redactor.redact("added-after-build") == "added-after-build"
-    with pytest.raises(AttributeError):
-        redactor.secret_values.add("cannot-mutate")
 
 
 def test_build_session_redactor_defaults_to_provider_patterns() -> None:

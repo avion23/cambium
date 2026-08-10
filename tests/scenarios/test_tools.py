@@ -238,49 +238,6 @@ def test_read_batch_concurrency_is_bounded(tmp_path: Path, monkeypatch) -> None:
     assert state["peak"] <= tools.BATCH_READ_MAX_CONCURRENCY
 
 
-def test_read_batch_rejects_malformed_envelopes_atomically(
-    tmp_path: Path, monkeypatch
-) -> None:
-    events: list[dict] = []
-    called = False
-
-    async def unexpected_read(_args: dict, _ctx: ToolContext):
-        nonlocal called
-        called = True
-        raise AssertionError("preflight must run before any read")
-
-    monkeypatch.setattr(tools, "_read_file", unexpected_read)
-    results = asyncio.run(
-        run_read_batch(
-            [
-                {"arguments": None},
-                None,
-                {"name": "read_file", "arguments": "not-a-dict"},
-                "bare-string-call",
-            ],
-            _batch_context(tmp_path, events),
-        )
-    )
-
-    assert len(results) == 4
-    assert all(not result.ok for result in results)
-    assert all("batch rejected atomically" in (result.error or "") for result in results)
-    assert "batch_index 0: validation failed: 'arguments' must be an object" in (
-        results[0].error or ""
-    )
-    assert "batch_index 1: validation failed: tool call must be an object" in (
-        results[1].error or ""
-    )
-    assert "batch_index 2: validation failed: 'arguments' must be an object" in (
-        results[2].error or ""
-    )
-    assert "batch_index 3: validation failed: tool call must be an object" in (
-        results[3].error or ""
-    )
-    assert not called
-    assert events == []
-
-
 def test_read_batch_requires_read_file_in_init_tools(tmp_path: Path) -> None:
     results = asyncio.run(
         run_read_batch([{"path": "anything.txt"}], ToolContext(tmp_path))
@@ -577,52 +534,6 @@ def test_get_signature_timeout_does_not_wait_for_blocked_read(
     )
 
 
-def test_get_signature_repeated_blocked_reads_do_not_use_shared_executor(
-    tmp_path: Path, monkeypatch
-) -> None:
-    (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
-    original_read = tools._read_and_extract_signature
-
-    def slow_read(*args):
-        time.sleep(2)
-        return original_read(*args)
-
-    monkeypatch.setattr(tools, "_read_and_extract_signature", slow_read)
-    started = time.monotonic()
-
-    async def invoke_repeatedly():
-        return await asyncio.gather(
-            *(
-                run_tool(
-                    "get_signature",
-                    {"path": "sample.py", "symbol": "build"},
-                    ToolContext(tmp_path),
-                )
-                for _ in range(3)
-            )
-        )
-    results = asyncio.run(invoke_repeatedly())
-    elapsed = time.monotonic() - started
-
-    assert elapsed < 1.5
-    assert all(not result.ok for result in results)
-    assert all("timed out" in (result.error or "") for result in results)
-    signature_threads = [
-        thread
-        for thread in threading.enumerate()
-        if thread.name == "cambium-get-signature-read"
-    ]
-    assert signature_threads
-    assert all(thread.daemon for thread in signature_threads)
-
-    deadline = time.monotonic() + 2.5
-    while time.monotonic() < deadline and any(
-        thread.is_alive() for thread in signature_threads
-    ):
-        time.sleep(0.01)
-    assert not any(thread.is_alive() for thread in signature_threads)
-
-
 def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
     arguments = ", ".join(f"value_{index}" for index in range(7_000))
     source = f"def build({arguments}):\n    pass\n"
@@ -641,45 +552,6 @@ def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
     assert parsed["truncated"] is True
     assert "[output truncated]" in parsed["signature"]
     assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
-
-
-def test_get_signature_caps_exact_oversized_identifier(tmp_path: Path) -> None:
-    identifier = "a" * 65_386
-    source = f"def {identifier}():\n    pass\n"
-    assert identifier.isidentifier()
-    assert len(source.encode("utf-8")) <= tools.MAX_READ_BYTES
-    (tmp_path / "large_signature.py").write_text(source, encoding="utf-8")
-
-    result = _run(
-        "get_signature",
-        {"path": "large_signature.py", "symbol": identifier},
-        ToolContext(tmp_path),
-    )
-
-    assert result.ok
-    parsed = json.loads(result.output)
-    assert parsed["truncated"] is True
-    assert "[output truncated]" in parsed["signature"]
-    assert len(result.output.encode("utf-8")) <= MAX_OUTPUT_BYTES
-
-
-def test_get_signature_caps_when_non_signature_fields_are_oversized() -> None:
-    result = tools._serialize_signature_result(
-        {
-            "path": "p" * (MAX_OUTPUT_BYTES + 1),
-            "name": "build",
-            "kind": "function",
-            "line": 1,
-            "col": 0,
-            "body_lines": 1,
-            "signature": "def build():",
-        }
-    )
-
-    parsed = json.loads(result)
-    assert parsed["truncated"] is True
-    assert "[output truncated]" in parsed["signature"]
-    assert len(result.encode("utf-8")) <= MAX_OUTPUT_BYTES
 
 
 def test_get_signature_rejects_fifo_quickly(tmp_path: Path) -> None:

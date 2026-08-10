@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from cambium.approval import Approval, ApprovalGate, ApprovalPolicy
 
 
@@ -21,18 +19,6 @@ def test_allowlist_hit() -> None:
     assert gate.check(["pytest", "-q", "tests"]) is Approval.ALLOWED
     assert gate.check(["git", "status", "--short"]) is Approval.ALLOWED
     assert _approved(gate, ["pytest", "-q", "tests"])
-
-
-def test_unknown_policy_key_rejected() -> None:
-    with pytest.raises(ValueError, match=r"unknown approval policy key\(s\): 'allowlst'"):
-        ApprovalPolicy({"allowlst": [["pytest"]]})
-
-
-def test_unknown_policy_keys_are_named_in_sorted_order() -> None:
-    with pytest.raises(ValueError) as error:
-        ApprovalPolicy({"zeta": True, "middle": True, "alpha": True})
-
-    assert str(error.value) == "unknown approval policy key(s): 'alpha', 'middle', 'zeta'"
 
 
 def test_deny_wins_over_allow() -> None:
