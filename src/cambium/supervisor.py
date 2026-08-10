@@ -1004,6 +1004,8 @@ class _Runtime:
     # -- per-task supervision ------------------------------------------------
 
     async def supervise_task(self, spec: dict[str, Any]) -> None:
+        if spec["task_id"] in self._results:
+            return
         try:
             await self._supervise(spec)
         except asyncio.CancelledError:
@@ -1471,6 +1473,11 @@ class _Runtime:
                 if match:
                     task_id = task_keys.get(match.group(1))
             await self.emit(kind, task_id=task_id, **payload)
+            if kind == "merge_reconciled" and task_id is not None:
+                self._results[task_id] = TaskResult(
+                    task_id=task_id, status="succeeded", exit_code=0,
+                    reason=None, merge_sha=payload.get("new"),
+                )
             emitted.add(kind)
         return emitted
 
@@ -1519,6 +1526,10 @@ class _Runtime:
                     "merge_reconciled", task_id=owner, new=current, repo=str(repo),
                     reason="ref-advanced-before-event",
                 )
+                self._results[owner] = TaskResult(
+                    task_id=owner, status="succeeded", exit_code=0,
+                    reason=None, merge_sha=current,
+                )
 
     async def _merge_task(self, spec: dict[str, Any], handle: WorkerHandle) -> str | None:
         """Stage and atomically publish the worker branch onto refs/heads/main.
@@ -1536,8 +1547,10 @@ class _Runtime:
         task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
         throwaway = self._session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
         seq = self._make_sequencer(task_id)
-        published = False
+        ref_published = False
+        committed_persisted = False
         cleanup_failed = False
+        staging_tip: str | None = None
         try:
             async with self._merge_lock:  # Unio single-writer: serialized merges
                 current_main = await self._git_stdout(
@@ -1553,11 +1566,12 @@ class _Runtime:
                     await asyncio.to_thread(seq.ensure_staging_clean, repo)
                     await self._flush_sequencer_events(seq)
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
+                ref_published = True
                 await self.emit(
                     "merge_committed", task_id=task_id, old=current_main, new=staging_tip,
                     repo=str(repo), branch=branch, generation=handle.generation,
                 )
-                published = True
+                committed_persisted = True
         except Exception as exc:
             error_type = exc.__class__.__name__
             if error_type in ("NonFastForwardError", "MergeConflictError"):
@@ -1573,12 +1587,14 @@ class _Runtime:
             return None
         finally:
             try:
-                if hasattr(seq, "cleanup_staging"):
+                if hasattr(seq, "cleanup_staging") and not (
+                    ref_published and not committed_persisted
+                ):
                     await asyncio.to_thread(seq.cleanup_staging, repo)
             except Exception as exc:
                 cleanup_failed = True
                 emitted = await self._flush_sequencer_events(seq)
-                if published and "merge_staging_cleanup_failed" not in emitted:
+                if committed_persisted and "merge_staging_cleanup_failed" not in emitted:
                     await self.emit(
                         "merge_staging_cleanup_failed", task_id=task_id,
                         staging_sha=staging_tip, reason=exc.__class__.__name__,

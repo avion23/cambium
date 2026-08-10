@@ -215,19 +215,26 @@ class MergeSequencer:
     def _event(self, kind: str, **payload: Any) -> None:
         self._events.append((kind, payload))
 
+    def _secure_directory(self, parent: Path, name: str, root: Path) -> Path:
+        candidate = parent / name
+        if candidate.is_symlink():
+            raise StagingCleanupError("quarantine path contains a symlink")
+        candidate.mkdir(mode=0o700, exist_ok=True)
+        if candidate.is_symlink():
+            raise StagingCleanupError("quarantine path contains a symlink")
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(root):
+            raise StagingCleanupError("quarantine path escapes the session directory")
+        os.chmod(resolved, 0o700)
+        return resolved
+
     def _quarantine_root(self) -> Path:
         if self._session_dir is None:
             raise StagingCleanupError("dirty staging requires a session quarantine directory")
-        root = self._session_dir / ".cambium" / "quarantine" / "merge"
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        current = root
-        stop = self._session_dir / ".cambium"
-        while current.is_relative_to(stop):
-            os.chmod(current, 0o700)
-            if current == stop:
-                break
-            current = current.parent
-        return root
+        session_root = self._session_dir.resolve(strict=True)
+        cambium = self._secure_directory(session_root, ".cambium", session_root)
+        quarantine = self._secure_directory(cambium, "quarantine", session_root)
+        return self._secure_directory(quarantine, "merge", session_root)
 
     @staticmethod
     def _allocated_bytes(path: Path) -> int:
@@ -310,21 +317,29 @@ class MergeSequencer:
             if line.startswith("worktree ")
         }
 
-    def _delete_quarantine_entry(self, repo: Path, entry: Path) -> None:
-        registered = entry.resolve() in self._registered_paths(repo)
-        branch = ""
-        if registered:
-            branch = self._run(
-                entry, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+    def _owning_repo(self, entry: Path) -> Path:
+        common_dir = Path(
+            self._run(
+                entry, "rev-parse", "--path-format=absolute", "--git-common-dir"
             ).stdout.strip()
-        if registered:
-            result = self._run_repo(
-                repo, "worktree", "remove", "--force", str(entry), check=False
-            )
-            if result.returncode != 0:
-                raise StagingCleanupError("cannot prune registered quarantine worktree")
-        elif entry.exists():
-            raise StagingCleanupError("quarantine worktree is not registered in this repository")
+        ).resolve()
+        if common_dir.name != ".git":
+            raise StagingCleanupError("quarantine worktree owner is not a repository")
+        repo = common_dir.parent
+        if entry.resolve() not in self._registered_paths(repo):
+            raise StagingCleanupError("quarantine worktree is not registered in its repository")
+        return repo
+
+    def _delete_quarantine_entry(self, entry: Path) -> None:
+        repo = self._owning_repo(entry)
+        branch = self._run(
+            entry, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+        ).stdout.strip()
+        result = self._run_repo(
+            repo, "worktree", "remove", "--force", str(entry), check=False
+        )
+        if result.returncode != 0:
+            raise StagingCleanupError("cannot prune registered quarantine worktree")
         if branch.startswith("cambium-merge/"):
             suffix = branch.removeprefix("cambium-merge/")
             self._run_repo(repo, "branch", "-D", branch, check=False)
@@ -375,7 +390,7 @@ class MergeSequencer:
             if newest is not None and entry == newest:
                 continue
             size = measured[entry][1]
-            self._delete_quarantine_entry(repo, entry)
+            self._delete_quarantine_entry(entry)
             removed += 1
             removed_bytes += size
         remaining = [item for item in entries if item.exists()]
@@ -395,10 +410,10 @@ class MergeSequencer:
         self, repo: Path, worktree_path: Path, reasons: list[str]
     ) -> Path:
         root = self._quarantine_root()
-        task_dir = root / f"task-{self._task_key}"
-        task_dir.mkdir(mode=0o700, exist_ok=True)
-        os.chmod(task_dir, 0o700)
+        task_dir = self._secure_directory(root, f"task-{self._task_key}", root)
         destination = task_dir / f"{time.time_ns()}-{secrets.token_hex(8)}"
+        if not destination.resolve(strict=False).is_relative_to(root):
+            raise StagingCleanupError("quarantine destination escapes the quarantine root")
         staging_sha = self._rev_parse(worktree_path, "HEAD")
         result = self._run_repo(
             repo, "worktree", "move", str(worktree_path), str(destination), check=False
@@ -410,7 +425,8 @@ class MergeSequencer:
             )
             raise StagingCleanupError("cannot move dirty staging worktree to quarantine")
         allocated = self._artifact_bytes(repo, destination)
-        relative_id = destination.relative_to(self._session_dir / ".cambium" / "quarantine")
+        quarantine_root = (self._session_dir / ".cambium" / "quarantine").resolve(strict=True)
+        relative_id = destination.resolve(strict=True).relative_to(quarantine_root)
         self._event(
             "merge_staging_quarantined", task=self._task_id, staging_sha=staging_sha,
             quarantine_id=relative_id.as_posix(), allocated_bytes=allocated,
@@ -759,6 +775,8 @@ class MergeSequencer:
         the ref advanced without one (architecture §7.8 crash gap).
         """
         repo = Path(repo)
+        reconciled_tip: str | None = None
+        reconciled_ref: str | None = None
         if self._session_dir is not None and scan_quarantine:
             root = self._quarantine_root()
             for entry in self._quarantine_entries(root):
@@ -787,15 +805,24 @@ class MergeSequencer:
             if reasons:
                 self._quarantine_staging(repo, worktree_path, reasons)
             else:
+                if self._staging_ref is not None:
+                    reconciled_ref = self._staging_ref
+                    reconciled_tip = self._rev_parse(repo, reconciled_ref)
                 self._remove_clean_staging(repo, worktree_path)
                 self._drop_staging_refs(repo)
                 self._worktree_path = None
                 self._staging_branch = None
                 self._staging_ref = None
         try:
-            return self._rev_parse(repo, MAIN_REF)
+            current = self._rev_parse(repo, MAIN_REF)
         except GitError:
             return None
+        if reconciled_tip == current:
+            self._event(
+                "merge_reconciled", task=self._task_id, new=current, repo=str(repo),
+                staging_ref=reconciled_ref, reason="ref-advanced-before-event",
+            )
+        return current
 
     def _remove_clean_staging(self, repo: Path, worktree_path: Path) -> None:
         if self._dirty_reasons(worktree_path):

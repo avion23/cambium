@@ -576,6 +576,30 @@ def test_symlink_target_is_not_counted(tmp_path) -> None:
     assert payload["allocated_bytes"] < outside.stat().st_size
 
 
+def test_precreated_quarantine_task_symlink_is_refused(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    task_id = "symlink-escape"
+    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must stay here")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    quarantine = tmp_path / ".cambium" / "quarantine" / "merge"
+    quarantine.mkdir(parents=True)
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    (quarantine / f"task-{task_key}").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StagingCleanupError, match="symlink"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must stay here"
+    assert not list(outside.iterdir())
+
+
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
@@ -639,6 +663,39 @@ def test_count_and_aggregate_byte_caps_prune_oldest(tmp_path) -> None:
     second.prepare_staging(repo, second_path, "worker", "main")
     (second_path / "dirty").write_bytes(b"b" * 4096)
     second.cleanup_staging(repo)
+    events = second.drain_events()
+    second_payload = next(
+        payload for kind, payload in events if kind == "merge_staging_quarantined"
+    )
+    second_destination = tmp_path / ".cambium" / "quarantine" / second_payload["quarantine_id"]
+
+    assert not first_destination.exists()
+    assert second_destination.exists()
+    assert any(kind == "merge_staging_pruned" for kind, _ in events)
+
+
+def test_count_cap_prunes_quarantine_entry_from_owning_repo(tmp_path) -> None:
+    repo_a = tmp_path / "repo-a"
+    base_a = _init_repo(repo_a)
+    _worker_commit(repo_a, "worker-a", tmp_path / "worker-a", {"a.txt": "a\n"}, base_a)
+    first = MergeSequencer(task_id="repo-a", session_dir=tmp_path, quarantine_min_free_bytes=0)
+    first_staging = tmp_path / "staging-a"
+    first.prepare_staging(repo_a, first_staging, "worker-a", "main")
+    (first_staging / "dirty").write_text("repo a evidence")
+    first.cleanup_staging(repo_a)
+    _, first_destination = _quarantined(first)
+
+    repo_b = tmp_path / "repo-b"
+    base_b = _init_repo(repo_b)
+    _worker_commit(repo_b, "worker-b", tmp_path / "worker-b", {"b.txt": "b\n"}, base_b)
+    second = MergeSequencer(
+        task_id="repo-b", session_dir=tmp_path, quarantine_max_entries=1,
+        quarantine_min_free_bytes=0,
+    )
+    second_staging = tmp_path / "staging-b"
+    second.prepare_staging(repo_b, second_staging, "worker-b", "main")
+    (second_staging / "dirty").write_text("repo b evidence")
+    second.cleanup_staging(repo_b)
     events = second.drain_events()
     second_payload = next(
         payload for kind, payload in events if kind == "merge_staging_quarantined"

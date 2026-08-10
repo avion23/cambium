@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from cambium.merge import MergeSequencer
+from cambium.store import EventStore
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -424,3 +425,91 @@ def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) ->
     payloads = json.dumps([event["payload"] for event in quarantined])
     assert secret_name not in payloads
     assert "secret kill-window content" not in payloads
+
+
+def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-clean-publish-gap"
+    worker_tree = session_dir / "wt-clean-gap"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-clean-gap", str(worker_tree), base],
+        check=True, capture_output=True,
+    )
+    (worker_tree / "precrash.txt").write_text("committed\n")
+    subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
+        check=True, capture_output=True,
+    )
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    seq = MergeSequencer(task_id=task_id, session_dir=session_dir)
+    staged = seq.prepare_staging(repo, staging, "wt-clean-gap", "main")
+    seq.publish_merge(repo, staged, base)
+
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-clean-gap", branch="wt-clean-gap",
+                target_file="a.txt", marker="// must-not-rerun",
+                gate="grep -q '// must-not-rerun' a.txt",
+            )
+        ]
+    }
+    result = asyncio.run(run_plan(session_dir, plan))
+    events = read_events(session_dir)
+
+    assert result.exit_code == 0
+    assert result.results[0].merge_sha == staged
+    assert not staging.exists()
+    assert not _kinds(events, "spawned")
+    assert not _kinds(events, "merge_committed")
+    reconciled = _kinds(events, "merge_reconciled")
+    assert len(reconciled) == 1
+    assert reconciled[0]["task_id"] == task_id
+    assert reconciled[0]["payload"]["new"] == staged
+
+
+def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypatch) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    task_id = "t-store-failure"
+    original_append = EventStore.append
+
+    def fail_merge_committed(self, event):
+        if event.get("kind") == "merge_committed":
+            raise RuntimeError("injected merge_committed persistence failure")
+        return original_append(self, event)
+
+    monkeypatch.setattr(EventStore, "append", fail_merge_committed)
+    plan = {
+        "tasks": [
+            _task(
+                session_dir, repo, base, task_id, worktree="wt-store", branch="wt-store",
+                target_file="a.txt", marker="// published-before-store-failure",
+                gate="grep -q '// published-before-store-failure' a.txt",
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+    events = read_events(session_dir)
+
+    assert result.exit_code != 0
+    assert result.results[0].status == "failed"
+    assert not _kinds(events, "merge_committed")
+    assert _kinds(events, "merge_failed")
+    assert staging.exists()
+    assert (staging / "a.txt").read_text().endswith("// published-before-store-failure\n")
+    assert _show(repo, "main", "a.txt").endswith("// published-before-store-failure\n")
+    refs = subprocess.run(
+        ["git", "-C", str(repo), "for-each-ref", "--format=%(refname)",
+         f"refs/cambium/staging/{task_key}-*"],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(refs) == 1
