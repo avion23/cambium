@@ -25,6 +25,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -153,6 +154,10 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert not deferred
     for tid in ("t-a", "t-b", "t-c"):
         assert _protocol(events, tid) == ["init", "ready", "run_task", "result", "exit"]
+        task_events = [event for event in events if event["task_id"] == tid]
+        init = next(event for event in task_events if event["kind"] == "init")
+        ready = next(event for event in task_events if event["kind"] == "ready")
+        assert ready["request_id"] == init["request_id"]
     assert events[-1]["kind"] == "session_ended"
     with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
         terminal = connection.execute(
@@ -302,6 +307,95 @@ def test_dirty_gate_artifact_defers_cleanup_and_keeps_tree_registered(tmp_path) 
         ).fetchall()
     assert "worktree_cleanup_deferred" in {kind for kind, _task_id in terminal}
     assert "worktree_pruned" not in {kind for kind, _task_id in terminal}
+
+
+# ---------------------------------------------------------------------------
+# Ready correlation — a wrong ready request_id is a protocol violation and must
+# not admit the worker to run_task.
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
+    worker = tmp_path / "wrong-ready-worker.py"
+    worker.write_text(textwrap.dedent("""
+        import json
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        def send(message):
+            sys.stdout.write(json.dumps(message) + "\\n")
+            sys.stdout.flush()
+
+        init = json.loads(sys.stdin.readline())
+        generation = init.get("generation", 1)
+        send({
+            "type": "ready",
+            "request_id": init["request_id"] if generation > 1 else "wrong-request-id",
+            "task_id": init["task_id"],
+            "pid": 0,
+            "generation": generation,
+            "proto": 1,
+        })
+        run = json.loads(sys.stdin.readline())
+        worktree = Path(run["worktree_path"])
+        target = worktree / run["target_file"]
+        target.write_text(target.read_text().rstrip("\\n") + "\\n" + run["marker"] + "\\n")
+        subprocess.run(["git", "add", run["target_file"]], cwd=worktree, check=True)
+        subprocess.run(["git", "commit", "-m", "wrong-ready"], cwd=worktree, check=True)
+        send({
+            "type": "result_envelope",
+            "request_id": run["request_id"],
+            "task_id": init["task_id"],
+            "status": "succeeded",
+        })
+        send({
+            "type": "exit_message",
+            "task_id": init["task_id"],
+            "generation": generation,
+            "reason": "done",
+        })
+    """), encoding="utf-8")
+
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+    plan = {
+        "tasks": [
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-wrong-ready",
+                worktree="wt-wrong-ready",
+                branch="wt-wrong-ready",
+                target_file="a.txt",
+                marker="// wrong-ready-must-not-run",
+                gate="grep -q '// wrong-ready-must-not-run' a.txt",
+                worker=str(worker),
+            )
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan))
+
+    (task,) = result.results
+    assert result.exit_code != 0
+    assert task.status == "failed"
+    assert task.restarts == 0
+    assert "ready_request_id_mismatch" in (task.reason or "")
+    events = read_events(session_dir)
+    assert len(_kinds(events, "spawned")) == 1
+    assert {event["generation"] for event in _kinds(events, "spawned")} == {1}
+    assert not _kinds(events, "restart_scheduled")
+    protocol = _kinds(events, "protocol")
+    assert len(protocol) == 1
+    assert protocol[0]["payload"]["code"] == "PROTO_UNKNOWN_REQUEST_ID"
+    assert protocol[0]["payload"]["expected"] != protocol[0]["payload"]["got"]
+    assert not _kinds(events, "run_task")
+    assert not _kinds(events, "gate")
+    assert not _kinds(events, "merge_committed")
+    assert _show(repo, "main", "a.txt") == "file a\n"
 
 
 # ---------------------------------------------------------------------------
