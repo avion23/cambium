@@ -201,6 +201,7 @@ def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[s
         "ready_timeout_s": 5.0,
         "gate_timeout_s": 5.0,
         "max_wall_s": 20.0,
+        "heartbeat_interval_s": 0.05,
     }
     assert config_path.is_absolute()
     assert "target_file" not in task
@@ -336,6 +337,7 @@ async def _drive_worker(
 def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
     return {
         "fanout_config": {"tier": "fast", "model": "loopback-model"},
+        "heartbeat": {"interval_s": 0.05},
         **extra,
     }
 
