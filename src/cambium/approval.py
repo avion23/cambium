@@ -61,17 +61,6 @@ def _boolean(config: Mapping[str, Any], name: str, default: bool) -> bool:
     return value
 
 
-def _deny_patterns(config: Mapping[str, Any]) -> tuple[CommandPattern, ...]:
-    """Read the deny-list key while accepting its common spelling variants."""
-    keys = ("deny", "denylist", "deny_list")
-    present = [key for key in keys if key in config]
-    if len(present) > 1:
-        first = config[present[0]]
-        if any(config[key] != first for key in present[1:]):
-            raise ValueError("deny, denylist, and deny_list must not disagree")
-    return _patterns(config.get(present[0], ()), "deny") if present else ()
-
-
 @dataclass(frozen=True, slots=True, init=False)
 class ApprovalPolicy:
     """Immutable command policy built from a configuration mapping.
@@ -82,8 +71,7 @@ class ApprovalPolicy:
         A list of list-form command prefixes.  For example,
         ``[["git", "checkout"], ["pytest"]]``.
     ``deny``
-        A list of list-form prefixes checked before the allowlist.  The
-        aliases ``denylist`` and ``deny_list`` are accepted as well.
+        A list of list-form prefixes checked before the allowlist.
     ``interactive``
         Whether the composition root intends to provide a human callback.
     ``fail_open``
@@ -100,7 +88,7 @@ class ApprovalPolicy:
         if not isinstance(config, Mapping):
             raise TypeError("approval policy config must be a mapping")
         allowlist = _patterns(config.get("allowlist", ()), "allowlist")
-        denylist = _deny_patterns(config)
+        denylist = _patterns(config.get("deny", ()), "deny")
         interactive = _boolean(config, "interactive", False)
         fail_open = _boolean(config, "fail_open", False)
 
@@ -122,11 +110,6 @@ class ApprovalPolicy:
     @property
     def denylist(self) -> tuple[CommandPattern, ...]:
         """The frozen denylist command prefixes."""
-        return self._denylist
-
-    @property
-    def deny_list(self) -> tuple[CommandPattern, ...]:
-        """Alias for callers that spell the field with an underscore."""
         return self._denylist
 
     @property
