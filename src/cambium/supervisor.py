@@ -278,10 +278,13 @@ async def run_session(
         if msg is None:
             break  # EOF before ready
         if msg.get("type") == "ready":
-            saw_ready = True
             if msg.get("request_id") != init_rid:
                 log.emit("protocol", task_id=task_id, note="ready request_id mismatch",
-                         expected=init_rid, got=msg.get("request_id"))
+                         code=PROTO_UNKNOWN_REQUEST_ID, expected=init_rid,
+                         got=msg.get("request_id"))
+                await _kill_worker(proc)
+                break
+            saw_ready = True
             log.emit("ready", task_id=task_id, request_id=msg.get("request_id"),
                      pid=msg.get("pid"))
             run_rid = make_request_id(2)
@@ -412,6 +415,7 @@ EOF_GRACE_S = 5.0
 WORKER_EXIT_WAIT_S = 10.0
 TERM_GRACE_S = 5.0
 MAX_PARSE_ERRORS = 500
+PROTO_UNKNOWN_REQUEST_ID = "PROTO_UNKNOWN_REQUEST_ID"
 
 CRITICAL_KINDS = frozenset({
     "result", "checkpoint", "worker_exit", "task_failed",
@@ -1212,6 +1216,7 @@ class _Runtime:
         exit_reason: str | None = None
         correlated = False
         timeout_phase: str | None = None
+        protocol_reason: str | None = None
 
         async def _cancel_and_kill() -> None:
             try:
@@ -1264,14 +1269,19 @@ class _Runtime:
                     break
                 mtype = msg.get("type")
                 if mtype == "ready":
+                    if msg.get("request_id") != init_rid:
+                        protocol_reason = "ready_request_id_mismatch"
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            request_id=msg.get("request_id"), code=PROTO_UNKNOWN_REQUEST_ID,
+                            note="ready request_id mismatch", expected=init_rid,
+                            got=msg.get("request_id"),
+                        )
+                        await _kill_worker(proc)
+                        break
                     phase = "run"
                     last_heartbeat = loop.time()
                     handle.state = "RUNNING"
-                    if msg.get("request_id") != init_rid:
-                        await self.emit(
-                            "protocol", task_id=task_id, note="ready request_id mismatch",
-                            expected=init_rid, got=msg.get("request_id"),
-                        )
                     await self.emit(
                         "ready", task_id=task_id, request_id=msg.get("request_id"),
                         generation=generation, pid=msg.get("pid"), proto=msg.get("proto"),
@@ -1378,6 +1388,8 @@ class _Runtime:
             reason: str | None = None
         elif timeout_phase is not None:
             reason = timeout_phase
+        elif protocol_reason is not None:
+            reason = protocol_reason
         elif exit_code != 0:
             reason = f"worker_exit_{exit_code}"
         elif exit_reason is None:
