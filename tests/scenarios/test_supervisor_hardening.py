@@ -592,7 +592,11 @@ def test_gate_overflow_after_leader_exit_is_bounded_and_kills_process_group(
     assert any(event["payload"].get("output_overflow") for event in gate_events)
 
 
-def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Path) -> None:
+def test_generation_seven_advances_and_never_rolls_back_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
+    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
@@ -634,6 +638,8 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(tmp_path: Pat
 def test_generation_survives_crash_after_worktree_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
+    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
@@ -686,7 +692,11 @@ def test_generation_survives_crash_after_worktree_clean(
     assert not worktree.exists()
 
 
-def test_worktree_registration_requires_an_exact_path_match(tmp_path: Path) -> None:
+def test_worktree_registration_requires_an_exact_path_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
+    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
@@ -1231,7 +1241,10 @@ def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
     }
 
 
-def test_oversized_stdout_line_fails_slice_reader(tmp_path: Path) -> None:
+def test_oversized_stdout_line_fails_slice_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
 
@@ -1330,7 +1343,10 @@ def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
     assert not any(event["kind"] in {"run_task", "gate", "merge"} for event in events)
 
 
-def test_oversized_stdout_line_fails_custos_reader(tmp_path: Path) -> None:
+def test_oversized_stdout_line_fails_custos_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})

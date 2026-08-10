@@ -20,6 +20,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import cambium.supervisor as supervisor_module
 from cambium.results import ROOT_RESULT_KEYS
 from cambium.supervisor import read_events, run_session
 
@@ -148,6 +149,7 @@ def test_worker_nonzero_exit_fails(tmp_path, monkeypatch) -> None:
 def test_missing_exit_message_fails(tmp_path, monkeypatch) -> None:
     # Reviewer case worker_noexit.py: envelope succeeded, exit_message omitted.
     monkeypatch.setenv("FAKE_MODE", "noexit")
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
     base = _make_scratch(scratch)
@@ -219,7 +221,7 @@ def test_result_envelope_echoes_run_task_request_id(tmp_path) -> None:
 def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     # A worker that never sends ready must be killed within the (env-configured) budget.
     monkeypatch.setenv("FAKE_MODE", "noready")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "2")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
     _make_scratch(scratch)
