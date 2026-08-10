@@ -81,6 +81,8 @@ $ ls -la /home/ubuntu/.local/bin/opencode
 146909328 bytes (140 MB), Aug 7 20:00
 ```
 
+The loader is `/lib/ld-linux-aarch64.so.1`; this local binary and its measured sizes are point-in-time evidence. The separate TUI config is `~/.config/opencode/tui.json`, while `opencode run --format json` and `serve` remain automation surfaces.
+
 `~/.opencode/` contains 15 skill dirs, dependencies, lockfile, and `.env`; effective config is `~/.config/opencode/opencode.json` (809 lines), with `tui.json`, 12 config commits, and `openai-compact/checkpoints.db` (1.8 MB WAL). `opencode agent list` showed built-ins build/compaction/explore/general/plan/summary/title plus deepseek/glm/kimi/luna/reviewer/sol; config defines 10 agents, 11 providers, and 28 named models. Default is build on `opencode-go/deepseek-v4-flash`.
 
 Database command (point-in-time, live and growing):
