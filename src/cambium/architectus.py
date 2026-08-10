@@ -31,6 +31,15 @@ _ENVELOPE_KEYS = (
     "status",
 )
 _ENVELOPE_KEY_SET = frozenset(_ENVELOPE_KEYS)
+CORE_DIRECTIVE_MAX = 200
+_CORE_DIRECTIVE_TRUNCATION_MARKER = "... [truncated]"
+_RETRY_REMAINING_FIELDS = ("retries_remaining", "retries_left", "attempts_remaining")
+_RESET_RETRY_ATTEMPTED_FIELDS = (
+    "reset_retry_attempted",
+    "reset_attempted",
+    "step_back_attempted",
+)
+_RESET_RETRY_CONSUMED_KEY = "reset_retry_consumed"
 
 
 class ActionKind(StrEnum):
@@ -40,6 +49,8 @@ class ActionKind(StrEnum):
     STEER = "steer"
     AGGREGATE = "aggregate"
     REPLAN = "replan"
+    RESET_RETRY = "reset_retry"
+    ABORT_SUBTREE = "abort_subtree"
 
 
 class FailureDecision(StrEnum):
@@ -50,6 +61,7 @@ class FailureDecision(StrEnum):
     ABORT_SUBTREE = "abort-subtree"
     REPLAN = "replan"
     MERGE_RESOLVE = "merge-resolve"
+    RESET_RETRY = "reset_retry"
 
 
 @runtime_checkable
@@ -149,10 +161,9 @@ def _event_fields(event: Mapping[str, Any]) -> dict[str, Any]:
 
 def _positive_retries(fields: Mapping[str, Any]) -> bool:
     """Return whether a failure event explicitly has a retry available."""
-    for key in ("retries_left", "retries_remaining", "attempts_remaining"):
-        value = fields.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value > 0
+    remaining = _retry_remaining(fields)
+    if remaining is not None:
+        return remaining > 0
     retryable = fields.get("retryable")
     if isinstance(retryable, bool):
         return retryable
@@ -168,11 +179,29 @@ def _positive_retries(fields: Mapping[str, Any]) -> bool:
     return False
 
 
+def _retry_remaining(fields: Mapping[str, Any]) -> int | None:
+    """Return the canonical retry count from the supported field aliases."""
+    for key in _RETRY_REMAINING_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _reset_retry_attempted(fields: Mapping[str, Any]) -> bool:
+    """Return whether the one step-back retry already ran."""
+    return any(fields.get(key) is True for key in _RESET_RETRY_ATTEMPTED_FIELDS)
+
+
 def decide_failure(event: Mapping[str, Any]) -> str:
-    """Apply the twelve-row deterministic Architectus failure table.
+    """Apply the deterministic Architectus failure table.
 
     The function consumes only the event and returns a plain string so it can
-    be used by a rule engine or by an injected LLM policy without state.
+    be used by a rule engine or by an injected LLM policy without state. A gate
+    failure with ``retries_remaining == 0`` returns ``reset_retry`` on its first
+    exhaustion. The executor maps that decision to ``{"action": "reset_retry",
+    "task_id": ...}``; a later gate failure marked
+    ``reset_retry_attempted=True`` returns ``abort-subtree``.
     """
     fields = _event_fields(event)
     raw_kind = fields.get("kind", fields.get("type", fields.get("event", "")))
@@ -229,6 +258,10 @@ def decide_failure(event: Mapping[str, Any]) -> str:
     if kind in {"gate_failed", "gate_failure"} or "gate" in kind and "fail" in kind:
         if _positive_retries(fields):
             return FailureDecision.RESOLVE.value
+        if _retry_remaining(fields) == 0:
+            if _reset_retry_attempted(fields):
+                return FailureDecision.ABORT_SUBTREE.value
+            return FailureDecision.RESET_RETRY.value
         if fields.get("retries_left") == 0 or fields.get("exhausted"):
             return FailureDecision.ABORT_SUBTREE.value
         return FailureDecision.RESOLVE.value
@@ -261,6 +294,8 @@ class ArchitectusCore:
         tree: TaskTree,
         store: ConversationStore | None = None,
         max_width: int = 8,
+        core_directive: str | None = None,
+        durable_state: Mapping[str, Any] | None = None,
     ) -> None:
         if not isinstance(tree, TaskTree):
             raise TypeError("tree must be a TaskTree")
@@ -273,6 +308,13 @@ class ArchitectusCore:
         self._tree = tree
         self._store = store
         self._max_width = max_width
+        root_goal = self._root_goal(tree)
+        if root_goal is not None and core_directive is not None and core_directive != root_goal:
+            raise ValueError("core_directive must match the root goal")
+        directive = root_goal if root_goal is not None else core_directive
+        self._core_directive = self._normalise_core_directive(directive)
+        if self._core_directive is None:
+            raise ValueError("root directive is required")
         self._topological = topological_order(tree)
         self._nodes = {node.task_id: node for node in tree.nodes}
         self._children: dict[str, list[str]] = {node.task_id: [] for node in tree.nodes}
@@ -284,6 +326,7 @@ class ArchitectusCore:
         self._finished: dict[str, dict[str, Any]] = {}
         self._in_flight: set[str] = set()
         self._failed_subtrees: set[str] = set()
+        self._reset_retry_tasks = self._restore_reset_retry_tasks(durable_state)
         self._action_history: list[dict[str, Any]] = []
 
     @property
@@ -306,25 +349,45 @@ class ArchitectusCore:
         """A defensive copy of actions accepted from the LLM."""
         return copy.deepcopy(self._action_history)
 
+    @property
+    def reset_retry_tasks(self) -> frozenset[str]:
+        """Task ids that have consumed their one architecture-owned reset retry."""
+        return frozenset(self._reset_retry_tasks)
+
+    @property
+    def durable_state(self) -> dict[str, Any]:
+        """Return the JSON-friendly state required to reconstruct this core."""
+        return {_RESET_RETRY_CONSUMED_KEY: sorted(self._reset_retry_tasks)}
+
     async def step(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Run one scheduling wave and return actions for the execution edge."""
         if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
             raise TypeError("events must be a list of dictionaries")
 
-        blocked = self._blocked_task_ids()
+        wave = self._copy_for_wave()
+        failure_actions, deferred_events = wave._failure_actions(events)
+        if failure_actions and not deferred_events:
+            for action in failure_actions:
+                wave._record_action(action)
+            self._commit_wave(wave)
+            return copy.deepcopy(failure_actions)
+
+        blocked = wave._blocked_task_ids()
         ready = [
             node
-            for node in ready_tasks(self._tree, set(self._finished) | blocked)
-            if node.task_id not in self._in_flight and node.task_id not in blocked
+            for node in ready_tasks(wave._tree, set(wave._finished) | blocked)
+            if node.task_id not in wave._in_flight and node.task_id not in blocked
         ]
-        state = self._tree_state(ready, blocked)
+        state = wave._tree_state(ready, blocked)
         proposed = await self._llm.decide(copy.deepcopy(state), copy.deepcopy(events))
         if isinstance(proposed, (str, bytes)) or not isinstance(proposed, Sequence):
             raise TypeError("LLM decide must return a sequence of action mappings")
 
-        actions = self._admit_actions(proposed, ready)
+        admitted_actions = wave._admit_actions(proposed, ready)
+        actions = [*failure_actions, *admitted_actions]
         for action in actions:
-            self._record_action(action)
+            wave._record_action(action)
+        self._commit_wave(wave)
         return copy.deepcopy(actions)
 
     def compose_context(self, task_id: str) -> dict[str, Any]:
@@ -341,10 +404,14 @@ class ArchitectusCore:
             A deterministic text rendering with the same static-before-
             dynamic ordering.  The static prefix is never evicted; dynamic
             records are evicted from their least-recent ends first.
+
+        The root directive is compiled at construction and is the unalterable
+        goal shared by all sub-agent contexts. Its deterministic token count is
+        capped at :data:`CORE_DIRECTIVE_MAX`.
         """
         node = self._node(task_id)
         config = self._config_for(node)
-        static_prefix = self._static_prefix(config)
+        static_prefix = self._static_prefix(config, self._core_directive)
         dynamic_tail = self._dynamic_tail(node, config)
         max_tokens = self._context_budget(config)
         truncated = False
@@ -401,48 +468,169 @@ class ArchitectusCore:
         """Apply the pure failure table without reading core state."""
         return decide_failure(event)
 
+    def _failure_actions(
+        self, events: Sequence[Mapping[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Apply deterministic failure actions and retain deferred failures for the LLM."""
+        classified: list[tuple[str, dict[str, Any], str]] = []
+        deferred_events: list[dict[str, Any]] = []
+        for event in events:
+            try:
+                decision = decide_failure(event)
+            except ValueError:
+                deferred_events.append(copy.deepcopy(dict(event)))
+                continue
+            if decision not in {
+                FailureDecision.RESET_RETRY.value,
+                FailureDecision.ABORT_SUBTREE.value,
+            }:
+                deferred_events.append(copy.deepcopy(dict(event)))
+                continue
+            fields = _event_fields(event)
+            task_id = fields.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError(f"{decision} failure event requires a non-empty task_id")
+            self._node(task_id)
+            classified.append((decision, fields, task_id))
+
+        actions: list[dict[str, Any]] = []
+        for decision, fields, task_id in classified:
+            blocked = self._blocked_task_ids()
+            if (
+                decision == FailureDecision.RESET_RETRY.value
+                and task_id not in self._reset_retry_tasks
+                and task_id not in blocked
+                and not _reset_retry_attempted(fields)
+            ):
+                self._consume_fresh_reset(task_id)
+                actions.append({"action": ActionKind.RESET_RETRY.value, "task_id": task_id})
+                continue
+
+            if decision == FailureDecision.ABORT_SUBTREE.value and _reset_retry_attempted(fields):
+                self._reset_retry_tasks.add(task_id)
+            self._mark_subtree_failed(task_id)
+            actions.append({"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id})
+        return actions, deferred_events
+
+    def _mark_subtree_failed(self, task_id: str) -> set[str]:
+        """Record an abort, block its subtree, and release all subtree slots."""
+        subtree = self._subtree_task_ids(task_id)
+        self._failed_subtrees.add(task_id)
+        self._in_flight.difference_update(subtree)
+        return subtree
+
+    def _restore_reset_retry_tasks(
+        self, durable_state: Mapping[str, Any] | None
+    ) -> set[str]:
+        """Restore reset consumption from the durable construction snapshot."""
+        if durable_state is None:
+            return set()
+        if not isinstance(durable_state, Mapping):
+            raise TypeError("durable_state must be a mapping")
+
+        consumed = durable_state.get(_RESET_RETRY_CONSUMED_KEY, ())
+        if isinstance(consumed, (str, bytes)) or not isinstance(
+            consumed, (list, tuple, set, frozenset)
+        ):
+            raise TypeError("durable_state.reset_retry_consumed must be a sequence")
+
+        restored: set[str] = set()
+        for task_id in consumed:
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("durable_state.reset_retry_consumed must contain task ids")
+            self._node(task_id)
+            restored.add(task_id)
+        return restored
+
     def _admit_actions(
         self,
         proposed: Sequence[Mapping[str, Any]],
         ready: Sequence[Any],
     ) -> list[dict[str, Any]]:
+        proposed_actions = self._validate_actions(proposed)
+        explicitly_aborted: set[str] = set()
+        for action in proposed_actions:
+            if ActionKind(action["action"]) is ActionKind.ABORT_SUBTREE:
+                explicitly_aborted.update(
+                    self._subtree_task_ids(self._action_task_id(action))
+                )
         ready_ids = [node.task_id for node in ready]
         ready_rank = {task_id: index for index, task_id in enumerate(ready_ids)}
         capacity = max(self._max_width - len(self._in_flight), 0)
         accepted_spawn_ids: list[str] = []
+        aborted_spawn_ids: set[str] = set()
+        aborted_descendant_spawn_ids: set[str] = set()
+        suppressed_spawn_ids: set[str] = set()
         non_spawn: list[tuple[int, dict[str, Any]]] = []
-        spawn_positions: list[int] = []
+        accepted_spawns: list[tuple[int, str, int]] = []
+        spawn_segment = 0
 
-        for raw_index, raw_action in enumerate(proposed):
-            if not isinstance(raw_action, Mapping):
-                raise TypeError("each LLM action must be a mapping")
-            action = self._normalise_action(raw_action)
+        for raw_index, action in enumerate(proposed_actions):
             kind = ActionKind(action["action"])
             if kind is ActionKind.SPAWN:
                 task_id = self._action_task_id(action)
                 if (
                     task_id not in ready_rank
                     or task_id in accepted_spawn_ids
+                    or task_id in aborted_spawn_ids
+                    or task_id in explicitly_aborted
+                    or task_id in suppressed_spawn_ids
                     or len(accepted_spawn_ids) >= capacity
                 ):
                     continue
                 accepted_spawn_ids.append(task_id)
-                spawn_positions.append(raw_index)
+                accepted_spawns.append((raw_index, task_id, spawn_segment))
                 continue
 
-            if kind in {ActionKind.STEER, ActionKind.AGGREGATE}:
-                self._node(self._action_task_id(action))
+            if kind in {
+                ActionKind.STEER,
+                ActionKind.AGGREGATE,
+                ActionKind.REPLAN,
+                ActionKind.RESET_RETRY,
+                ActionKind.ABORT_SUBTREE,
+            }:
+                task_id = self._action_task_id(action)
+                self._node(task_id)
+                if kind is ActionKind.RESET_RETRY:
+                    if task_id in self._reset_retry_tasks or task_id in self._blocked_task_ids():
+                        action = {
+                            "action": ActionKind.ABORT_SUBTREE.value,
+                            "task_id": task_id,
+                        }
+                        subtree = self._mark_subtree_failed(task_id)
+                        aborted_spawn_ids.update(subtree)
+                        aborted_descendant_spawn_ids.update(subtree - {task_id})
+                        spawn_segment += 1
+                    else:
+                        suppressed_spawn_ids.update(self._consume_fresh_reset(task_id))
+                elif kind is ActionKind.ABORT_SUBTREE:
+                    subtree = self._mark_subtree_failed(task_id)
+                    aborted_spawn_ids.update(subtree)
+                    aborted_descendant_spawn_ids.update(subtree - {task_id})
+                    spawn_segment += 1
             non_spawn.append((raw_index, action))
 
-        accepted_spawn_ids.sort(key=ready_rank.__getitem__)
-        spawn_iter = iter(accepted_spawn_ids)
+        spawn_assignments: dict[int, str] = {}
+        spawn_segments: dict[int, list[tuple[int, str]]] = {}
+        for raw_index, task_id, segment in accepted_spawns:
+            spawn_segments.setdefault(segment, []).append((raw_index, task_id))
+        for segment_spawns in spawn_segments.values():
+            positions = sorted(raw_index for raw_index, _task_id in segment_spawns)
+            task_ids = sorted(
+                (task_id for _raw_index, task_id in segment_spawns),
+                key=ready_rank.__getitem__,
+            )
+            spawn_assignments.update(dict(zip(positions, task_ids, strict=True)))
+
         actions: list[dict[str, Any]] = []
-        spawn_position_set = set(spawn_positions)
-        for raw_index, _raw_action in enumerate(proposed):
-            if raw_index in spawn_position_set:
-                task_id = next(spawn_iter)
-                action = {"action": ActionKind.SPAWN.value, "task_id": task_id}
-                actions.append(action)
+        for raw_index, _raw_action in enumerate(proposed_actions):
+            task_id = spawn_assignments.get(raw_index)
+            if task_id is not None:
+                if (
+                    task_id not in aborted_descendant_spawn_ids
+                    and task_id not in suppressed_spawn_ids
+                ):
+                    actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
                 continue
             for index, action in non_spawn:
                 if index == raw_index:
@@ -450,11 +638,62 @@ class ArchitectusCore:
                     break
 
         for task_id in accepted_spawn_ids:
-            self._in_flight.add(task_id)
+            if task_id not in aborted_spawn_ids and task_id not in suppressed_spawn_ids:
+                self._in_flight.add(task_id)
+        return actions
+
+    def _validate_actions(
+        self, proposed: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Validate and normalize a complete action wave before applying it."""
+        task_actions = {
+            ActionKind.SPAWN,
+            ActionKind.STEER,
+            ActionKind.AGGREGATE,
+            ActionKind.REPLAN,
+            ActionKind.RESET_RETRY,
+            ActionKind.ABORT_SUBTREE,
+        }
+        actions: list[dict[str, Any]] = []
+        for raw_action in proposed:
+            if not isinstance(raw_action, Mapping):
+                raise TypeError("each LLM action must be a mapping")
+            action = self._normalise_action(raw_action)
+            kind = ActionKind(action["action"])
+            if kind in task_actions:
+                self._node(self._action_task_id(action))
+            actions.append(action)
         return actions
 
     def _record_action(self, action: dict[str, Any]) -> None:
         self._action_history.append(copy.deepcopy(action))
+
+    def _copy_for_wave(self) -> ArchitectusCore:
+        """Return an isolated mutable state for validating one scheduling wave."""
+        wave = copy.copy(self)
+        wave._finished = copy.deepcopy(self._finished)
+        wave._in_flight = set(self._in_flight)
+        wave._failed_subtrees = set(self._failed_subtrees)
+        wave._reset_retry_tasks = set(self._reset_retry_tasks)
+        wave._action_history = copy.deepcopy(self._action_history)
+        return wave
+
+    def _commit_wave(self, wave: ArchitectusCore) -> None:
+        """Commit a fully validated wave's mutable state."""
+        self._finished = wave._finished
+        self._in_flight = wave._in_flight
+        self._failed_subtrees = wave._failed_subtrees
+        self._reset_retry_tasks = wave._reset_retry_tasks
+        self._action_history = wave._action_history
+
+    def _consume_fresh_reset(self, task_id: str) -> set[str]:
+        """Consume a fresh reset and invalidate any finished result for its task."""
+        self._reset_retry_tasks.add(task_id)
+        if task_id not in self._finished:
+            return set()
+        self._finished.pop(task_id)
+        self._in_flight.add(task_id)
+        return self._subtree_task_ids(task_id) - {task_id}
 
     def _normalise_action(self, raw_action: Mapping[str, Any]) -> dict[str, Any]:
         action = copy.deepcopy(dict(raw_action))
@@ -512,14 +751,19 @@ class ArchitectusCore:
     def _blocked_task_ids(self) -> set[str]:
         blocked: set[str] = set()
         for root in self._failed_subtrees:
-            pending = [root]
-            while pending:
-                task_id = pending.pop()
-                if task_id in blocked:
-                    continue
-                blocked.add(task_id)
-                pending.extend(self._children.get(task_id, ()))
+            blocked.update(self._subtree_task_ids(root))
         return blocked
+
+    def _subtree_task_ids(self, root: str) -> set[str]:
+        subtree: set[str] = set()
+        pending = [root]
+        while pending:
+            task_id = pending.pop()
+            if task_id in subtree:
+                continue
+            subtree.add(task_id)
+            pending.extend(self._children.get(task_id, ()))
+        return subtree
 
     def _dynamic_tail(self, node: Any, config: Mapping[str, Any]) -> list[dict[str, Any]]:
         segments: list[dict[str, Any]] = []
@@ -579,7 +823,9 @@ class ArchitectusCore:
         return merged
 
     @staticmethod
-    def _static_prefix(config: Mapping[str, Any]) -> list[str]:
+    def _static_prefix(
+        config: Mapping[str, Any], core_directive: str | None = None
+    ) -> list[str]:
         static = config.get("static", {})
         static_config = static if isinstance(static, Mapping) else {}
         system = static_config.get(
@@ -598,6 +844,8 @@ class ArchitectusCore:
             ),
         )
         values: list[str] = []
+        if core_directive is not None:
+            values.append(core_directive)
         for label, value in (("system", system), ("module_instructions", module)):
             if value is None:
                 continue
@@ -606,6 +854,35 @@ class ArchitectusCore:
             if value:
                 values.append(value)
         return values
+
+    @staticmethod
+    def _root_goal(tree: TaskTree) -> str | None:
+        """Read an optional root ``goal`` carried in the root task spec."""
+        root = next(node for node in tree.nodes if node.parent_task_id is None)
+        goal = root.spec.get("goal")
+        if goal is None:
+            config = root.spec.get("config")
+            if isinstance(config, Mapping):
+                goal = config.get("goal")
+        return goal
+
+    @staticmethod
+    def _normalise_core_directive(core_directive: str | None) -> str | None:
+        """Validate and cap a core directive without mutating caller data."""
+        if core_directive is None:
+            return None
+        if not isinstance(core_directive, str):
+            raise TypeError("core_directive must be a string")
+        tokens = core_directive.split()
+        if not tokens:
+            return None
+        if ArchitectusCore._estimate_tokens(core_directive) <= CORE_DIRECTIVE_MAX:
+            return core_directive
+        marker_tokens = _CORE_DIRECTIVE_TRUNCATION_MARKER.split()
+        keep = CORE_DIRECTIVE_MAX - ArchitectusCore._estimate_tokens(
+            _CORE_DIRECTIVE_TRUNCATION_MARKER
+        )
+        return " ".join([*tokens[:keep], *marker_tokens])
 
     @staticmethod
     def _context_budget(config: Mapping[str, Any]) -> int | None:
@@ -701,6 +978,7 @@ class ArchitectusCore:
 __all__ = [
     "ActionKind",
     "ArchitectusCore",
+    "CORE_DIRECTIVE_MAX",
     "FailureDecision",
     "LLM",
     "ScriptedLLM",

@@ -282,13 +282,22 @@ Compiled once per (module, session) and reused unchanged across turns — this i
 provider's exact-prefix KV cache can hit (D8c item 1-2; feedback-2-deltas.md lines
 144-146). Contents, in order:
 
-1. **System prompt** — role and capability framing for the node's worker kind.
-2. **AGENTS.md-derived guidelines** — repo-constitution rules (citation: the `AGENTS.md`
+1. **Core Directive** — the root plan's unalterable `goal`, injected as the first static
+   prefix line for every sub-agent. This is the adopted critique-5 rule (provenance:
+   `feedback-5-assessment.md`; the assessment is merged on current `main`). `ArchitectusCore`
+   requires the root goal (or an equivalent constructor directive) and normalizes it once at
+   construction; a child task and later `compose_context` call cannot replace it. The norm is
+   a ≤200-token root goal. The pure context seam applies the concrete hard cap
+   `CORE_DIRECTIVE_MAX = 200` using Architectus's deterministic `_estimate_tokens` helper;
+   a longer value keeps the leading tokens and ends with the two-token marker
+   `... [truncated]`. The marker is part of the cap.
+2. **System prompt** — role and capability framing for the node's worker kind.
+3. **AGENTS.md-derived guidelines** — repo-constitution rules (citation: the `AGENTS.md`
    convention referenced by D8c item 1, feedback-2-deltas.md line 144; the guideline file
    itself lives in the repo root — **UNVERIFIED**: not re-read for this design).
-3. **Tool definitions** — the `tools` allowlist semantics sent in `init` (arch §5.2, line
+4. **Tool definitions** — the `tools` allowlist semantics sent in `init` (arch §5.2, line
    304).
-4. **Module instructions** — the node's decision-module instructions
+5. **Module instructions** — the node's decision-module instructions
    (`should_decompose` / `TaskRouter` / worker ReAct module instructions), which are the
    module's harness state (D5; feedback-2-deltas.md D8c line 144).
 
@@ -675,15 +684,16 @@ Two distinct classes, kept deliberately separate:
 | 1 | Node crash (no `exit_message`, or `reason:"crash"`) | Bounded restart (burst 5/60 s, absolute 10, generation bump, jitter) | — (automatic) | none; observe `restart_scheduled` |
 | 2 | Node `failed` result envelope, retries left | gate/run again | **resolve in place** | `steer` turn with failure evidence (D4), bounded `gate_max_retries` |
 | 3 | Gate `GATE_FAILED`, evidence as steering turn | run gate again (content-addressed verdict skip, D4) | **resolve in place → fail** | steer with gate output; then `FAILED` after bound |
-| 4 | Node failed, retries exhausted | — | **abort subtree** | `subtree_failed` (critical event); stop descendant dispatch; inform parent |
-| 5 | Budget exceeded (`max_turns`/`max_tokens`/`timeout_ms`) | kills process group, marks failed (supervisor-owned, D4) | **abort subtree** | `subtree_failed`; M5 AC: subtree abort on cap-exhausted |
-| 6 | `merge_failed` (reason `conflict`) — Unio | — | **replan: resolver task** | new resolver subtask under the parent; requeue the affected subtree (critique's orchestrator feedback loop) |
-| 7 | `merge_failed` (reason `test_failure`) | — | **resolve once → abort** | steering turn with test evidence, bounded; then `subtree_failed` |
-| 8 | `merge_failed` (reason `non_fast_forward`) | — | **re-merge** | re-verify & merge on the moved base (arch §7.8; event-schema-draft.md §3.13) |
-| 9 | Provider exhaustion (all providers down) | queue-pause + recovery monitor (D8f) | **pause dispatch** | no respawn/retry-loop; await recovery (arch §7.4 line 649) |
-| 10 | Spec/config error (`recoverable:false`) | fail immediately, no restart | **fail node** | no retry (arch §7.4; ipc-protocol-draft.md §4.2 lines 405-406) |
-| 11 | Cyclic / multi-parent / over-depth / over-width plan | none dispatched | **reject & re-prompt decomposer** | typed rejection evidence (M5 AC2), bounded re-prompt (I2.2; design-deltas.md D2 line 107) |
-| 12 | Worker generation-mismatch fencing violation | `exit_message reason:"fatal"` (arch §7.3) | **fail node** | no retry (non-recoverable) |
+| 4 | Gate `GATE_FAILED`, supervisor `gate_max_retries` exhausted (`retries_remaining == 0`), first exhaustion | reset task worktree to its base | **step back: retry once** | `{"action": "reset_retry", "task_id": "..."}`; rerun the task and gate once |
+| 5 | Node failed, retries exhausted; or gate fails after `reset_retry_attempted:true` | — | **abort subtree** | `subtree_failed` (critical event); stop descendant dispatch; inform parent |
+| 6 | Budget exceeded (`max_turns`/`max_tokens`/`timeout_ms`) | kills process group, marks failed (supervisor-owned, D4) | **abort subtree** | `subtree_failed`; M5 AC: subtree abort on cap-exhausted |
+| 7 | `merge_failed` (reason `conflict`) — Unio | — | **replan: resolver task** | new resolver subtask under the parent; requeue the affected subtree (critique's orchestrator feedback loop) |
+| 8 | `merge_failed` (reason `test_failure`) | — | **resolve once → abort** | steering turn with test evidence, bounded; then `subtree_failed` |
+| 9 | `merge_failed` (reason `non_fast_forward`) | — | **re-merge** | re-verify & merge on the moved base (arch §7.8; event-schema-draft.md §3.13) |
+| 10 | Provider exhaustion (all providers down) | queue-pause + recovery monitor (D8f) | **pause dispatch** | no respawn/retry-loop; await recovery (arch §7.4 line 649) |
+| 11 | Spec/config error (`recoverable:false`) | fail immediately, no restart | **fail node** | no retry (arch §7.4; ipc-protocol-draft.md §4.2 lines 405-406) |
+| 12 | Cyclic / multi-parent / over-depth / over-width plan | none dispatched | **reject & re-prompt decomposer** | typed rejection evidence (M5 AC2), bounded re-prompt (I2.2; design-deltas.md D2 line 107) |
+| 13 | Worker generation-mismatch fencing violation | `exit_message reason:"fatal"` (arch §7.3) | **fail node** | no retry (non-recoverable) |
 
 The table is the **deterministic default policy** — the rule engine behind the §4.2 seam.
 The LLM seam may propose deviations; the table is the offline-testable fallback and the
@@ -693,6 +703,18 @@ The causal-chain rule from the coding constitution applies: a "resolve" decision
 prompted by *evidence* (gate output, test output, conflict list from `merge_failed`), and
 a retry counts as distinct only if the content changes (D4 item 1 — a byte-identical
 retry is a no-op; gate verdicts are content-addressed, arch §7.9).
+
+Gate failures therefore have three deterministic phases. The supervisor owns
+`gate_max_retries` and supplies one of the accepted retry-count aliases:
+`retries_remaining`, `retries_left`, or `attempts_remaining`; Architectus does not extend
+that budget. While retries remain, the rule steers the node with gate evidence (row 3). On
+the first exhausted event, `ArchitectusCore.step()` consumes the failure event, records the
+task id in its architecture-owned one-shot reset set, and emits the single `reset_retry`
+action (row 4). Custos resets the base worktree and reruns the task and gate. If the same
+failure is replayed, or the rerun produces a second exhausted failure under any retry alias,
+the core emits `abort_subtree` and blocks descendants (row 5). The persisted
+`reset_retry_attempted`, `reset_attempted`, and `step_back_attempted` fields remain input
+compatibility markers; they do not own the one-shot state.
 
 ---
 
@@ -709,22 +731,23 @@ the final status.
 | # | Scenario | Decision-table row / invariant exercised | Key assertions |
 |---|---|---|---|
 | 1 | **Three-level fixture, dependency-gated dispatch** | I2.1-I2.5 | Only dependency-ready nodes dispatch; `max_width` honored per wave; root DONE only after all descendants' envelopes + gates (M5 AC1) |
-| 2 | **Cyclic / multi-parent / over-depth / over-width rejection** | I2.2, I2.3, row 11 | Zero workers dispatched; typed rejection evidence emitted (M5 AC2) |
-| 3 | **Replan on `merge_failed` (conflict)** | row 6 | A resolver subtask spawns under the parent; `replan` event with trigger `merge_failed`; subtree requeued |
-| 4 | **Subtree abort on cap-exhausted** | row 5 | `subtree_failed` (critical) emitted; descendant dispatch stops; siblings unaffected |
-| 5 | **Gate fail → steering retry → exhausted → fail** | row 3, D4 | Worker receives gate evidence as a `steer` turn; retries bounded; then FAILED with evidence |
+| 2 | **Cyclic / multi-parent / over-depth / over-width rejection** | I2.2, I2.3, row 12 | Zero workers dispatched; typed rejection evidence emitted (M5 AC2) |
+| 3 | **Replan on `merge_failed` (conflict)** | row 7 | A resolver subtask spawns under the parent; `replan` event with trigger `merge_failed`; subtree requeued |
+| 4 | **Subtree abort on cap-exhausted** | row 6 | `subtree_failed` (critical) emitted; descendant dispatch stops; siblings unaffected |
+| 5 | **Gate fail → steering retries → exhausted → reset/retry once → abort** | rows 3-5, D4 | `ArchitectusCore.step()` emits reset, the execution edge reruns the task, and a replayed or second exhausted failure emits `abort_subtree`; descendants do not dispatch |
 | 6 | **Crash → bounded restart with generation bump** | row 1, arch §7.3 | Fake worker exits without `exit_message`; Custos restarts, generation increments, fencing accepted |
 | 7 | **Context composition correctness** | I2.4, D8c | Parent context = static prefix + own bounded turns + parent summary + child envelopes; order and truncation per §3; prefix contains no volatile tokens (prompt-lint) |
 | 8 | **Info-hiding enforcement** | I2.7, D8b | A canary scratchpad string written by a child never appears in parent context; an envelope with an unknown top-level field is rejected (M5 AC3) |
-| 9 | **Dead-end propagation** | §2.3, row 4 | Child fails with no retries → `subtree_failed`; parent informed; sibling subtree completes normally |
+| 9 | **Dead-end propagation** | §2.3, row 5 | Child fails with no retries → `subtree_failed`; parent informed; sibling subtree completes normally |
 | 10 | **Conversations.db queries + reconstruction** | §6.6, D8g | `last_turns`/`cost_by_node`/`context_for` use indexed query plans; deleting the projection and replaying durable protocol events reconstructs it (M5 AC4) |
 | 11 | **Deterministic wave order** | `tasktree.py:400-403` | Two runs with identical scripted LLM input produce byte-identical event trails (modulo timestamps) |
 | 12 | **Steer routing + sibling isolation** | D3 item 4 | Parent→child steer routes by `session_id`; sibling→sibling steer is rejected (parent-mediated only) |
-| 13 | **Scripted-LLM replan decision** | §4.3, row 6/7 | A scripted response forces `replan(merge_failed)`; the loop's action sequence matches the script; no network |
+| 13 | **Scripted-LLM replan decision** | §4.3, row 7/8 | A scripted response forces `replan(merge_failed)`; the loop's action sequence matches the script; no network |
+| 14 | **Directive and reset boundary/replay checks** | critique-5, rows 4-5 | Missing root directive is rejected; 199/200/201 estimated-token goals hit the exact boundary; per-call mutation is rejected; retry aliases share policy; reset/rerun/second-failure replay aborts once |
 
 Scenarios 7-10 are the M5 acceptance criteria 3-4 in executable form (`v2-1-review.md`
-lines 396-399). Scenario count 13 = the 10-12 requested plus the deterministic-replay
-pair; any can be dropped without weakening the set.
+lines 396-399). Scenario count 14 covers the original set plus the directive, boundary,
+reset, and replay checks; any can be dropped only with equivalent coverage retained.
 
 ---
 
@@ -809,6 +832,7 @@ is implemented at the worker's envelope-emit boundary (S6) per the normative arc
 | `docs/research/compaction-design.md` exists | merged via `b50ba71`; file read (469 lines, DRAFT non-normative) | **VERIFIED** — exists on `main`; DRAFT status, not normative |
 | arch §3.4 `include_diff` note (normative per review) | commit `16e61cf` on branch `wt-doc-difflag` (read via `git show 16e61cf`) | **VERIFIED as committed** — but **NOT merged**: `16e61cf` is not an ancestor of `main` HEAD `baeb9a0` (`git merge-base --is-ancestor` failed); treated as normative per the batch review |
 | `feedback-4-assessment.md` #21 (`include_diff` payload semantics) | — | **UNVERIFIED** — file not in repo (bench-harness-design.md:457 references it); directive-provided |
+| `feedback-5-assessment.md` (Core Directive and step-back rule) | merged on current `main` | **VERIFIED** — the pure core requires and compiles the root directive once; `ArchitectusCore.step()` owns reset/replay state and the boundary/replay scenarios cover it |
 | Token-budget ratios / compaction constants | — | **UNVERIFIED** — M5 calibration inputs (compaction-design.md §7 default ≥60% is a proposal, not a measurement) |
 | Worker-side steer content consumption | — | **UNVERIFIED** — `worker.py:468` is a placeholder hook |
 | arch §5.2 `steer.context` vs worker `steer.payload` | lines 314-316 vs 460-469 | **DIVERGENT** — reconciliation required (§5.2) |
