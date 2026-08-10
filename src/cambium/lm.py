@@ -682,7 +682,7 @@ class _CambiumLMMixin:
         if request.tools:
             prompt["tools"] = [self._tool(tool) for tool in request.tools]
 
-        self._safe_kwargs(prompt)
+        prompt = self._safe_kwargs(prompt)
 
         model = self._validate_model(self._provider_model)
         budget_usd = self._validate_budget(self._budget_usd)

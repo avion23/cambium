@@ -1108,6 +1108,55 @@ def test_explicit_request_response_format_credentials_are_rejected(entry_point: 
     assert diffundo.calls == []
 
 
+@pytest.mark.parametrize("entry_point", ["call", "acall"])
+def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
+    entry_point: str,
+) -> None:
+    _require_dspy()
+    import dspy
+
+    class DelayedCredentialMapping(Mapping[str, Any]):
+        def __init__(self) -> None:
+            self._data: dict[str, str] = {"type": "json_object"}
+            self.reads = 0
+
+        def __getitem__(self, key: str) -> str:
+            return self._data[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self._data)
+
+        def __len__(self) -> int:
+            return len(self._data)
+
+        def items(self) -> Any:
+            self.reads += 1
+            items = tuple(self._data.items())
+            if self.reads == 1:
+                self._data = {"api_key": "SENSITIVE_CANARY"}
+            return items
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    response_format = DelayedCredentialMapping()
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"response_format": response_format},
+    )
+
+    if entry_point == "call":
+        lm(request=request)
+    else:
+        asyncio.run(lm.acall(request=request))
+
+    assert len(diffundo.calls) == 1
+    assert dict(diffundo.calls[0]["prompt"]["response_format"].items()) == {
+        "type": "json_object"
+    }
+    assert response_format.reads == 1
+
+
 def test_reasoning_and_tool_choice_reach_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -1120,7 +1169,7 @@ def test_reasoning_and_tool_choice_reach_diffundo() -> None:
     )
 
     assert diffundo.calls[0]["prompt"] == {
-        "messages": [{"role": "user", "content": "hello"}],
+        "messages": ({"role": "user", "content": "hello"},),
         "reasoning": {"effort": "high"},
         "tool_choice": {"mode": "none"},
     }
