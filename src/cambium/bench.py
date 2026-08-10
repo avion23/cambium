@@ -432,7 +432,10 @@ class BenchPlugin:
             if self.mode == "report":
                 _write_baseline(report, anchor_path)
             elif not anchor_path.exists():
-                _write_baseline(report, anchor_path)  # first run anchors + passes
+                self.regressions[report["module"]] = [
+                    ("anchor", f"missing pre-existing anchor at {anchor_path}")
+                ]
+                session.exitstatus = 1
             else:
                 anchor = json.loads(anchor_path.read_text())
                 regressions = compare_against_anchor(report, anchor, self.thresholds)
@@ -576,8 +579,8 @@ def main(argv: list[str] | None = None) -> int:
             _write_baseline(report, path)
             print(f"cambium bench: wrote {path}")
         elif not path.exists():
-            _write_baseline(report, path)
-            print(f"cambium bench: first run wrote {path}")
+            failures += 1
+            print(f"cambium bench: missing pre-existing anchor for {report['module']}: {path}")
         else:
             anchor = json.loads(path.read_text())
             regressions = compare_against_anchor(report, anchor, thresholds)
