@@ -442,9 +442,16 @@ summary, dataset counts, test timings, and drift thresholds. Its version and
 digests must agree with `datasets/meta.json` and the current split bytes.
 
 The gate is offline. It strips credentials and pytest/plugin injection, blocks
-Python socket connections and common command-line network clients, and passes
-that environment to child subprocesses. Module tests must not use providers,
-network access, or external services.
+normal Python socket connections and common literal command-line network
+clients, and passes that environment to normal Python child subprocesses.
+Module tests must not use providers, network access, or external services.
+
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for common
+forms of accidental network use; it is not a security boundary. It CANNOT
+prevent a hostile same-UID module from bypassing the check with `os.system`,
+`posix_spawn`, raw sockets, subprocess monkey-patching, or by killing a same-UID
+tracer. The harness does not start such a tracer or provide an in-harness
+sandbox. Real containment is the deployment-layer boundary.**
 
 The module has a sibling-import prohibition: it may use the shared base and its
 own package, but not another `cambium.modules.<sibling>` package, including

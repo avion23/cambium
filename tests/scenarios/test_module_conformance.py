@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import http.server
 import json
 import os
 import shutil
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import pytest
@@ -21,6 +19,15 @@ EXPECTED_SPLIT_DIGESTS = {
     "eval": "ce2b6a304e3b93ce7450b258828fd0eb1b11afd72f2827021a0aef61a1dedbf0",
     "canaries": "07d334d1488c415efef65c977efb8bbafea028f3913f5baef0d8a419bf5d058b",
 }
+
+OFFLINE_LIMITATION = (
+    "This offline guard is a BEST-EFFORT, deterministic lint-style check for common forms of "
+    "accidental network use; it is not a security boundary. It CANNOT prevent a hostile "
+    "same-UID module from bypassing the check with os.system, posix_spawn, raw sockets, "
+    "subprocess monkey-patching, or by killing a same-UID tracer. The harness does not start "
+    "such a tracer or provide an in-harness sandbox. Real containment is the deployment-layer "
+    "boundary."
+)
 
 
 def _one_discovered_module() -> str:
@@ -162,105 +169,14 @@ def test_offline_subprocess_environment_strips_credentials_and_denies_network(
 
 
 def test_offline_child_denies_absolute_network_client_path() -> None:
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/"
     probe = (
         "import subprocess, sys; "
-        f"subprocess.run(['/usr/bin/curl', '--fail', {url!r}], check=False); "
+        "subprocess.run(['/usr/bin/curl', '--fail', 'http://127.0.0.1:9/'], check=False); "
         "sys.exit('absolute curl unexpectedly started')"
     )
-    try:
-        with module_conformance.module_offline_environment() as env:
-            result = subprocess.run(
-                [sys.executable, "-c", probe],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-                env=env,
-            )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert result.returncode != 0
-    assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
-
-
-def test_offline_child_denies_shell_network_client() -> None:
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/"
-    probe = (
-        "import subprocess; "
-        f"subprocess.run('/usr/bin/curl --fail {url}', shell=True, check=False)"
-    )
-    try:
-        with module_conformance.module_offline_environment() as env:
-            result = subprocess.run(
-                [sys.executable, "-c", probe],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-                env=env,
-            )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert result.returncode != 0
-    assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "p=/usr/bin/curl;$p -fsS {url}",
-        (
-            "p={python};flag=-I;a=ur;b=llib.request;"
-            "$p $flag -c \"import $a$b;$a$b.urlopen('{url}')\""
-        ),
-    ],
-    ids=["expanded-curl", "reconstructed-python-urllib"],
-)
-def test_offline_shell_expansion_cannot_reach_network(command: str) -> None:
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/"
-    shell_command = command.format(url=url, python=sys.executable)
-    probe = (
-        "import subprocess; "
-        f"subprocess.run({shell_command!r}, shell=True, check=True)"
-    )
-    try:
-        with module_conformance.module_offline_environment() as env:
-            result = subprocess.run(
-                [sys.executable, "-c", probe],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-                env=env,
-            )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-    assert result.returncode != 0
-
-
-def test_offline_child_inherits_provider_import_blocker() -> None:
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
-            [sys.executable, "-c", "import cambium.provider_config"],
+            [sys.executable, "-c", probe],
             capture_output=True,
             text=True,
             check=False,
@@ -269,18 +185,94 @@ def test_offline_child_inherits_provider_import_blocker() -> None:
         )
 
     assert result.returncode != 0
-    assert "provider import blocked by module conformance: cambium.provider_config" in result.stderr
+    assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
 
 
-def test_offline_grandchild_cannot_remove_provider_blocker_with_empty_env() -> None:
+@pytest.mark.parametrize("client", ["curl", "wget", "nc", "ssh"])
+def test_offline_child_denies_shell_network_client(client: str) -> None:
     probe = (
-        "import subprocess, sys; "
-        "subprocess.run([sys.executable, '-c', 'import cambium.provider_config'], "
-        "env={}, check=True)"
+        "import subprocess; "
+        f"subprocess.run({client + ' --version'!r}, shell=True, check=False)"
     )
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
             [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    assert "network client denied during module conformance:" in result.stderr
+    assert f"/{client}" in result.stderr
+
+
+@pytest.mark.parametrize("api", ["run", "Popen"])
+def test_offline_child_resolves_network_client_realpath(tmp_path: Path, api: str) -> None:
+    curl = shutil.which("curl")
+    assert curl is not None
+    alias = tmp_path / "ordinary-command"
+    alias.symlink_to(curl)
+    probe = (
+        "import subprocess; "
+        f"subprocess.{api}([{str(alias)!r}, '--fail', 'http://127.0.0.1:9/'])"
+    )
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode != 0
+    denied = f"network client denied during module conformance: {os.path.realpath(curl)}"
+    assert denied in result.stderr
+
+
+def test_offline_guard_does_not_require_strace(monkeypatch) -> None:
+    monkeypatch.setenv("PATH", "/nonexistent")
+    probe = (
+        "import subprocess, sys; "
+        "subprocess.run([sys.executable, '-c', 'print(42)'], check=True)"
+    )
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=env,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "42\n"
+
+
+def test_offline_guard_documents_same_uid_limitations() -> None:
+    docstring = " ".join((module_conformance.module_offline_environment.__doc__ or "").split())
+    assert OFFLINE_LIMITATION in docstring.replace("`", "")
+
+    docs = (
+        "docs/architecture/module-template/architecture.md",
+        "docs/architecture/module-template/example-spec.md",
+        "docs/architecture/module-template/dataset-format.md",
+    )
+    for relative_path in docs:
+        text = (module_conformance.REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        normalized = " ".join(text.replace("**", "").replace("`", "").split())
+        assert OFFLINE_LIMITATION in normalized
+
+
+def test_offline_child_inherits_provider_import_blocker() -> None:
+    with module_conformance.module_offline_environment() as env:
+        result = subprocess.run(
+            [sys.executable, "-c", "import cambium.provider_config"],
             capture_output=True,
             text=True,
             check=False,

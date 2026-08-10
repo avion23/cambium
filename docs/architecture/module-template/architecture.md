@@ -345,10 +345,18 @@ module set before running the colocated tests.
 ### 9.7 Offline subprocess and import isolation
 
 The module-test environment is offline by contract. It strips credentials and
-pytest/plugin injection from the child environment, denies Python socket
-connections, and rejects common command-line network clients. A module test
-that starts a subprocess inherits the same offline environment and must not
-depend on network access, provider credentials, or an external service.
+pytest/plugin injection from the child environment, denies normal Python socket
+connections, and rejects common literal command-line network clients. A module
+test that starts a normal Python subprocess inherits the same offline
+environment and must not depend on network access, provider credentials, or an
+external service.
+
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for common
+forms of accidental network use; it is not a security boundary. It CANNOT
+prevent a hostile same-UID module from bypassing the check with `os.system`,
+`posix_spawn`, raw sockets, subprocess monkey-patching, or by killing a same-UID
+tracer. The harness does not start such a tracer or provide an in-harness
+sandbox. Real containment is the deployment-layer boundary.**
 
 Two import directions are prohibited:
 

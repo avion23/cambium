@@ -345,8 +345,17 @@ package directory and selector are `example`. Baselines use the logical name;
 imports and wheel paths use `cambium.modules.example`.
 
 Module tests run in an offline subprocess environment. Credentials and pytest
-plugin injection are removed, Python socket clients and common command-line
-network clients are denied, and child subprocesses inherit the same rule.
+plugin injection are removed, normal Python socket clients and common literal
+command-line network clients are denied, and normal Python child subprocesses
+inherit the same rule.
+
+This offline guard is a **BEST-EFFORT, deterministic lint-style check for common
+forms of accidental network use; it is not a security boundary. It CANNOT
+prevent a hostile same-UID module from bypassing the check with `os.system`,
+`posix_spawn`, raw sockets, subprocess monkey-patching, or by killing a same-UID
+tracer. The harness does not start such a tracer or provide an in-harness
+sandbox. Real containment is the deployment-layer boundary.**
+
 The module cannot import a sibling decision package. Harness production code,
 `bench.py`, `scripts/`, and `tools/` cannot reverse-import a decision package;
 the gate reports any violation with its file, line, and symbol.

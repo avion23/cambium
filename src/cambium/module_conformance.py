@@ -1283,14 +1283,20 @@ def _module_test_env() -> dict[str, str]:
 
 @contextmanager
 def module_offline_environment() -> Iterator[dict[str, str]]:
-    """Yield a credential-free environment with network clients denied.
+    """Yield a credential-free environment with common network forms denied.
 
     The parent pytest process uses an audit hook, but audit hooks do not cross
     ``fork``/``exec``.  A temporary ``sitecustomize`` blocks Python socket
-    clients and provider imports in child interpreters.  It starts each native
-    subprocess tree under ``strace`` syscall injection so shells and their
-    expanded commands cannot connect either.  The temporary directory is
-    removed as soon as the subprocess tree exits.
+    clients and provider imports in normal child interpreters.  Command shims
+    and ``subprocess.Popen`` checks reject common literal network clients.
+
+    This offline guard is a BEST-EFFORT, deterministic lint-style check for
+    common forms of accidental network use; it is not a security boundary. It
+    CANNOT prevent a hostile same-UID module from bypassing the check with
+    ``os.system``, ``posix_spawn``, raw sockets, subprocess monkey-patching, or
+    by killing a same-UID tracer. The harness does not start such a tracer or
+    provide an in-harness sandbox. Real containment is the deployment-layer
+    boundary.
     """
     with tempfile.TemporaryDirectory(prefix="cambium-module-offline-") as root:
         offline_root = Path(root)
@@ -1308,7 +1314,6 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "_REQUIRED_ENV = {key: os.environ[key] for key in (\n"
             "    'CAMBIUM_MODULE_OFFLINE', 'PATH', 'PYTHONPATH'\n"
             ") if key in os.environ}\n"
-            "_STRACE = shutil.which('strace')\n"
             "_NETWORK_CLIENTS = frozenset((\n"
             "    'curl', 'wget', 'http', 'https', 'nc', 'netcat', 'ncat', 'ssh'\n"
             "))\n"
@@ -1351,8 +1356,10 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "\n"
             "def _network_executable(tokens):\n"
             "    for token in tokens:\n"
-            "        if os.path.basename(token) in _NETWORK_CLIENTS:\n"
-            "            return _resolved_command(token)\n"
+            "        resolved = _resolved_command(token)\n"
+            "        if (os.path.basename(token) in _NETWORK_CLIENTS or\n"
+            "                os.path.basename(resolved) in _NETWORK_CLIENTS):\n"
+            "            return resolved\n"
             "    for index, token in enumerate(tokens):\n"
             "        if os.path.basename(token).startswith('python') and any(\n"
             "            'urllib' in argument for argument in tokens[index + 1:]\n"
@@ -1373,27 +1380,6 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "                return argument\n"
             "    return None\n"
             "\n"
-            "def _traced_command(args, executable, shell):\n"
-            "    if _STRACE is None:\n"
-            "        raise RuntimeError('strace is required for module conformance isolation')\n"
-            "    if shell:\n"
-            "        target = [executable or '/bin/sh', '-c']\n"
-            "        if isinstance(args, (list, tuple)):\n"
-            "            target.extend(os.fsdecode(value) for value in args)\n"
-            "        else:\n"
-            "            target.append(os.fsdecode(args))\n"
-            "    elif isinstance(args, (list, tuple)):\n"
-            "        target = list(args)\n"
-            "        if executable is not None:\n"
-            "            target[0] = executable\n"
-            "    else:\n"
-            "        target = [executable or args]\n"
-            "    return [\n"
-            "        _STRACE, '-f', '-qq', '-o', os.devnull,\n"
-            "        '-e', 'trace=connect', '-e', 'inject=connect:error=EPERM',\n"
-            "        '--', *target,\n"
-            "    ]\n"
-            "\n"
             "_popen_init = subprocess.Popen.__init__\n"
             "def _offline_popen(self, args, *pargs, **kwargs):\n"
             "    tokens = _command_tokens(args, kwargs.get('executable'))\n"
@@ -1409,11 +1395,6 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "        )\n"
             "    child_env = dict(kwargs.get('env') or os.environ)\n"
             "    child_env.update(_REQUIRED_ENV)\n"
-            "    if os.environ.get('CAMBIUM_MODULE_TRACED') != '1':\n"
-            "        args = _traced_command(\n"
-            "            args, kwargs.pop('executable', None), kwargs.pop('shell', False)\n"
-            "        )\n"
-            "        child_env['CAMBIUM_MODULE_TRACED'] = '1'\n"
             "    kwargs['env'] = child_env\n"
             "    return _popen_init(self, args, *pargs, **kwargs)\n"
             "\n"
