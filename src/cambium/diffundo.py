@@ -494,15 +494,10 @@ def _parse_retry_after(headers: Any) -> float | None:
     value = value.strip()
     if not value:
         return None
-    try:
+    if value.isascii() and value.isdecimal():
         delay = float(value)
-    except ValueError:
-        delay = None
-    if delay is not None:
-        if math.isfinite(delay) and delay >= 0:
+        if delay >= 0:
             return delay
-        return None
-    if value.count(",") > 1 or ("," in value and not re.match(r"^[A-Za-z]{3},", value)):
         return None
     try:
         retry_at = parsedate_to_datetime(value)

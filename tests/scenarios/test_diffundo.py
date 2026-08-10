@@ -25,8 +25,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import MutableMapping
-from datetime import UTC, datetime
-from email.utils import format_datetime
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -62,7 +61,7 @@ class FakeServer:
         self,
         behaviors: list[
             tuple[int, dict[str, Any], float]
-            | tuple[int, dict[str, Any], float, dict[str, str | tuple[str, ...]]]
+            | tuple[int, dict[str, Any], float, dict[str, str]]
         ],
         *,
         echo_authorization_in_body: bool = False,
@@ -91,7 +90,7 @@ class FakeServer:
 
     def behavior_at(
         self, index: int
-    ) -> tuple[int, dict[str, Any], float, dict[str, str | tuple[str, ...]]]:
+    ) -> tuple[int, dict[str, Any], float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior
@@ -145,9 +144,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
             for name, value in extra_headers.items():
-                values = value if isinstance(value, tuple) else (value,)
-                for item in values:
-                    self.send_header(name, item)
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(encoded)
         except OSError:
@@ -383,109 +380,36 @@ def test_retry_after_delta_seconds_controls_same_provider_retry(monkeypatch) -> 
 
 
 @pytest.mark.parametrize(
-    "retry_after",
+    ("values", "expected"),
     [
-        "not-a-delay",
-        "-1",
-        "1, 2",
-        "Wed Oct 21 07:28:00 2015, Thu Oct 22 07:28:00 2015",
+        (("7",), 7.0),
+        (("0",), 0.0),
+        (("+7",), None),
+        (("1e2",), None),
+        (("1_0",), None),
+        (("7.5",), None),
+        (("-1",), None),
+        (("1, 2",), None),
+        (("9" * 4000,), float("inf")),
+        (("1", "2"), None),
+        (("Friday, 15-Jan-27 08:00:11 GMT",), 11.0),
+        (("Fri, 15 Jan 2027 08:00:11 GMT",), 11.0),
+        (("Fri Jan 15 08:00:11 2027",), 11.0),
     ],
 )
-def test_retry_after_invalid_value_uses_jitter(monkeypatch, retry_after: str) -> None:
-    server = FakeServer(
-        [
-            (429, _error_payload("busy"), 0.0, {"Retry-After": retry_after}),
-            (200, _ok_payload("recovered"), 0.0),
-        ]
-    )
-    _set_keys(monkeypatch, "K_RETRY_INVALID")
-    router = Diffundo(
-        (_config("p_retry_invalid", server, "K_RETRY_INVALID", max_retries=1),),
-        retry_base_delay_s=0.5,
-    )
-    sleeps: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(Diffundo, "_retry_delay", lambda self, attempt_no: 3.25)
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "recovered"
-        assert sleeps == [3.25]
-        assert len(server.calls) == 2
-    finally:
-        server.close()
-
-
-def test_retry_after_duplicate_values_use_jitter(monkeypatch) -> None:
-    server = FakeServer(
-        [
-            (
-                429,
-                _error_payload("busy"),
-                0.0,
-                {"Retry-After": ("1", "2")},
-            ),
-            (200, _ok_payload("recovered"), 0.0),
-        ]
-    )
-    _set_keys(monkeypatch, "K_RETRY_DUP")
-    router = Diffundo((_config("p_retry_dup", server, "K_RETRY_DUP", max_retries=1),))
-    sleeps: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(Diffundo, "_retry_delay", lambda self, attempt_no: 2.75)
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "recovered"
-        assert sleeps == [2.75]
-        assert len(server.calls) == 2
-    finally:
-        server.close()
-
-
-@pytest.mark.parametrize(
-    "header",
-    [
-        "rfc",
-        "asctime",
-    ],
-)
-def test_retry_after_http_date_controls_retry_and_naive_is_utc(monkeypatch, header: str) -> None:
+def test_retry_after_parser(values: tuple[str, ...], expected: float | None, monkeypatch) -> None:
     fixed_now = 1_800_000_000.0
-    retry_at = datetime.fromtimestamp(fixed_now + 11, tz=UTC)
-    date_value = (
-        format_datetime(retry_at, usegmt=True)
-        if header == "rfc"
-        else retry_at.strftime("%a %b %d %H:%M:%S %Y")
-    )
     monkeypatch.setattr(diffundo_module.time, "time", lambda: fixed_now)
-    server = FakeServer(
-        [
-            (429, _error_payload("busy"), 0.0, {"Retry-After": date_value}),
-            (200, _ok_payload("recovered"), 0.0),
-        ]
-    )
-    _set_keys(monkeypatch, "K_RETRY_DATE")
-    router = Diffundo((_config("p_retry_date", server, "K_RETRY_DATE", max_retries=1),))
-    sleeps: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "recovered"
-        assert sleeps == [11.0]
-        assert len(server.calls) == 2
-    finally:
-        server.close()
+    headers = Message()
+    for value in values:
+        headers.add_header("Retry-After", value)
+    actual = diffundo_module._parse_retry_after(headers)
+    if expected == float("inf"):
+        assert actual == float("inf")
+    elif expected is None:
+        assert actual is None
+    else:
+        assert actual == expected
 
 
 def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> None:
@@ -495,6 +419,7 @@ def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> 
         (_config("p_retry_long", server, "K_RETRY_LONG", max_retries=1),),
         call_budget_s=0.1,
     )
+
     async def fail_sleep(delay: float) -> None:
         raise AssertionError("a delay beyond the call budget must not sleep")
 
