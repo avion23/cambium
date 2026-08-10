@@ -674,6 +674,50 @@ def test_copy_rejects_hostile_key_before_equality_can_change_provider_reference(
     assert provider_b.calls == []
 
 
+@pytest.mark.parametrize("entry_point", ["constructor", "call", "acall"])
+def test_hostile_hash_collision_cannot_change_provider_reference(entry_point: str) -> None:
+    _require_dspy()
+    import dspy
+
+    provider_a = FakeDiffundo("https://provider-a.invalid")
+    provider_b = FakeDiffundo("https://provider-b.invalid")
+    lm = CambiumLM(provider_a, ProviderTier.FAST)  # type: ignore[arg-type]
+    other = CambiumLM(provider_b, ProviderTier.FAST)  # type: ignore[arg-type]
+    provider_a_reference = lm._diffundo_reference
+
+    class HostileKey(str):
+        def __hash__(self) -> int:
+            return hash("self")
+
+        def __eq__(self, other_key: object) -> bool:
+            if type(other_key) is str and other_key == "self":
+                lm._diffundo_reference = other._diffundo_reference
+            return str.__eq__(self, other_key)
+
+    hostile_kwargs = {HostileKey("_diffundo_reference"): other._diffundo_reference}
+    with pytest.raises(TypeError, match="exact builtin string"):
+        if entry_point == "constructor":
+            CambiumLM(provider_a, ProviderTier.FAST, **hostile_kwargs)  # type: ignore[arg-type]
+        elif entry_point == "call":
+            lm(**hostile_kwargs)
+        else:
+            async def invoke() -> None:
+                await lm.acall(**hostile_kwargs)
+
+            asyncio.run(invoke())
+
+    assert lm._diffundo_reference == provider_a_reference
+    state = lm.dump_state()
+    assert _call(lm, "live prompt") == ["completion text"]
+    loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
+    assert _call(loaded, "loaded prompt") == ["completion text"]
+    assert [call["endpoint"] for call in provider_a.calls] == [
+        "https://provider-a.invalid",
+        "https://provider-a.invalid",
+    ]
+    assert provider_b.calls == []
+
+
 def test_copy_model_override_routes_through_diffundo() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()

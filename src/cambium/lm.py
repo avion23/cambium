@@ -94,7 +94,7 @@ def _require_exact_keyword_keys(kwargs: Mapping[Any, Any]) -> None:
 class _ImmutableCallbacks(list[Any]):
     """Disposable DSPy-compatible callback view that rejects normal mutation."""
 
-    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
+    def _reject_mutation(self, /, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         raise TypeError("CambiumLM callbacks are immutable")
 
@@ -264,7 +264,7 @@ def _load_dspy() -> Any:
 class CambiumLM:
     """Lazily construct a concrete subclass of ``dspy.LM``."""
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> CambiumLM:
+    def __new__(cls, /, *args: Any, **kwargs: Any) -> CambiumLM:
         if cls is not CambiumLM:
             return super().__new__(cls)
         del args, kwargs
@@ -288,6 +288,7 @@ class _CambiumLMMixin:
 
     def __init__(
         self,
+        /,
         diffundo: Diffundo,
         tier: ProviderTier | str,
         *,
@@ -319,6 +320,7 @@ class _CambiumLMMixin:
 
     def __call__(
         self,
+        /,
         *items: Any,
         prompt: str | None = None,
         messages: list[dict[str, Any]] | None = None,
@@ -339,6 +341,7 @@ class _CambiumLMMixin:
 
     async def acall(
         self,
+        /,
         *items: Any,
         prompt: str | None = None,
         messages: list[dict[str, Any]] | None = None,
