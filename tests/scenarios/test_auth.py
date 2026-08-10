@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cambium import auth, cli, doctor
+from cambium import auth, cli, doctor, supervisor
 
 SECRET = "key-value-must-never-appear-in-diagnostics"
 
@@ -162,9 +162,24 @@ def test_symlink_hardlink_and_directory_mode_are_rejected(tmp_path: Path) -> Non
     path.symlink_to(target)
     with pytest.raises(auth.AuthStoreError):
         store.read()
+    with pytest.raises(auth.AuthStoreError):
+        store.set_provider("openai", SECRET)
     path.unlink()
 
     path.parent.chmod(0o755)
+    with pytest.raises(auth.AuthStoreError):
+        store.read()
+
+
+def test_foreign_file_owner_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _store_path(tmp_path)
+    store = auth.AuthStore(path)
+    store.set_provider("openai", SECRET)
+    actual_uid = path.stat().st_uid
+    monkeypatch.setattr(auth.os, "geteuid", lambda: actual_uid + 1)
+
     with pytest.raises(auth.AuthStoreError):
         store.read()
 
@@ -187,6 +202,26 @@ def test_launch_environment_scrubs_inherited_credentials() -> None:
     assert "OPENAI_API_KEY" not in environment
     assert "GITHUB_TOKEN" not in environment
     assert "CAMBIUM_PROVIDER_OLD_API_KEY" not in environment
+
+
+def test_supervisor_worker_env_allows_only_canonical_provider_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", SECRET)
+    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_bad_API_KEY", "noncanonical-secret")
+    monkeypatch.setenv("PATH", "/bin")
+
+    environment = supervisor._Runtime._worker_env(
+        None, {"task_id": "task"}, generation=3
+    )
+
+    assert environment["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == SECRET
+    assert environment["PATH"] == "/bin"
+    assert environment["CAMBIUM_TASK_ID"] == "task"
+    assert environment["CAMBIUM_GENERATION"] == "3"
+    assert "OPENAI_API_KEY" not in environment
+    assert "CAMBIUM_PROVIDER_bad_API_KEY" not in environment
 
 
 def test_stdin_key_removes_only_line_ending() -> None:

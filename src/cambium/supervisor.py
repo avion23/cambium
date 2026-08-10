@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .auth import is_provider_env_name, scrub_environment
+
 PROTO = 1
 WORKER_STDIN_LIMIT = 1_048_576
 
@@ -970,7 +972,13 @@ class _Runtime:
         return [sys.executable, "-u", str(worker)]
 
     def _worker_env(self, spec: dict[str, Any], generation: int) -> dict[str, str]:
-        env = _strip_sensitive_env(dict(os.environ))
+        source = dict(os.environ)
+        env = scrub_environment(source)
+        env.update(
+            (name, value)
+            for name, value in source.items()
+            if is_provider_env_name(name)
+        )
         env["PYTHONUNBUFFERED"] = "1"
         env["CAMBIUM_TASK_ID"] = spec["task_id"]
         env["CAMBIUM_GENERATION"] = str(generation)

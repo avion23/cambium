@@ -32,6 +32,7 @@ AUTH_FILE_MODE = 0o600
 PROVIDER_ID_PATTERN = r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?"
 
 _PROVIDER_ID_RE = re.compile(PROVIDER_ID_PATTERN + r"\Z")
+_PROVIDER_ENV_RE = re.compile(r"CAMBIUM_PROVIDER_[A-Z0-9]+(?:_[A-Z0-9]+)*_API_KEY\Z")
 _CREDENTIAL_NAME_RE = re.compile(
     r"(?:api|key|token|secret|password|passwd|credential|authorization)",
     re.IGNORECASE,
@@ -185,6 +186,11 @@ def derived_env_name(provider: str) -> str:
 def provider_env_name(provider: str) -> str:
     """Compatibility spelling for :func:`derived_env_name`."""
     return derived_env_name(provider)
+
+
+def is_provider_env_name(value: object) -> bool:
+    """Return whether ``value`` is in the canonical provider-key namespace."""
+    return isinstance(value, str) and _PROVIDER_ENV_RE.fullmatch(value) is not None
 
 
 def validate_derived_env_name(provider: str, env_name: object) -> str:
@@ -693,15 +699,20 @@ def build_launch_environment(
     else:
         raise AuthSchemaError("auth store document is invalid")
 
+    environment = scrub_environment(base)
+    for credential in document.providers:
+        environment[derived_env_name(credential.provider)] = credential.api_key
+    return environment
+
+
+def scrub_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Remove credential-like variables from a subprocess environment."""
     source = os.environ if base is None else base
-    environment = {
+    return {
         name: value
         for name, value in source.items()
         if not name.startswith("CAMBIUM_PROVIDER_") and not _CREDENTIAL_NAME_RE.search(name)
     }
-    for credential in document.providers:
-        environment[derived_env_name(credential.provider)] = credential.api_key
-    return environment
 
 
 def read_stdin_key(stream: TextIO | None = None) -> str:
@@ -749,10 +760,12 @@ __all__ = [
     "derived_env_name",
     "effective_home",
     "inspect_metadata",
+    "is_provider_env_name",
     "parse_document",
     "provider_env_name",
     "read_stdin_key",
     "serialize_document",
+    "scrub_environment",
     "validate_derived_env_name",
     "validate_provider_id",
 ]

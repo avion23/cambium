@@ -189,6 +189,22 @@ def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     assert len(result.output.encode()) <= MAX_OUTPUT_BYTES
 
 
+def test_tool_subprocesses_do_not_inherit_provider_credentials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "tool-secret")
+    command = [
+        sys.executable,
+        "-c",
+        "import os; print('CAMBIUM_PROVIDER_OPENAI_API_KEY' in os.environ)",
+    ]
+
+    result = _run("run_shell", {"cmd": command}, ToolContext(tmp_path))
+
+    assert result.ok
+    assert result.output == "False\n"
+
+
 def test_run_tool_validates_before_dispatch_and_rejects_unknown_tools(tmp_path: Path) -> None:
     invalid = _run("read_file", {}, ToolContext(tmp_path))
     assert not invalid.ok
