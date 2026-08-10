@@ -1006,7 +1006,6 @@ class _Runtime:
             "scratch_repo": str(repo),
             "worktree_path": str(Path(spec["worktree_path"]).resolve()),
             "branch": spec["branch"],
-            "gate": spec.get("gate", ""),
             "base_commit": spec["base_commit"],
             "generation": generation,
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
@@ -2209,7 +2208,7 @@ async def _amain_plan(session_dir: Path, plan: dict[str, Any]) -> int:
     for r in plan_result.results:
         print(
             f"task {r.task_id}: status={r.status} exit_code={r.exit_code} "
-            f"reason={r.reason} merge={r.merge_sha} gate={r.gate_exit_code} "
+            f"reason={r.reason} merge={r.merge_sha} "
             f"restarts={r.restarts}",
             flush=True,
         )
@@ -2223,7 +2222,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--plan",
         help="path to plan JSON {\"tasks\": [{\"task_id\", \"task\", \"repo\", "
-        "\"worktree_path\", \"branch\", \"gate\", \"base_commit\", ...}]} "
+        "\"worktree_path\", \"branch\", \"base_commit\", ...}]} "
         "(multi-worker mode)",
     )
     parser.add_argument(

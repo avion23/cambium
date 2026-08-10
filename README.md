@@ -38,8 +38,10 @@ are in [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 ## Quickstart
 
 Cambium is a local development tool run directly from source. Requires Python
-3.14 and the project dependencies installed for pytest. There is no wheel or
-package delivery: point `PYTHONPATH` at `src` and run the module.
+3.14 and the project dependencies installed for pytest. Development runs
+directly from source and no wheel install is required (pyproject.toml still
+defines a wheel target, exercised by `tests/scenarios/test_wheel_cli.py`):
+point `PYTHONPATH` at `src` and run the module.
 
 ```sh
 PYTHONPATH=src python3.14 -m pytest -q
@@ -48,8 +50,8 @@ PYTHONPATH=src python3.14 -m pytest -q
 Run the deterministic demo:
 
 ```sh
-PYTHONPATH=src python3.14 -m cambium.supervisor --session-dir demo
-python3.14 -m cambium.cli --help
+PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
+PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 Plan publication advances `refs/heads/main` only. Read that ref or explicitly
