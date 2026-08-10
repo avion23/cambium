@@ -350,24 +350,78 @@ def test_launch_environment_scrubs_inherited_credentials() -> None:
     assert "CAMBIUM_PROVIDER_OLD_API_KEY" not in environment
 
 
-def test_supervisor_worker_env_allows_only_canonical_provider_credentials(
+def test_supervisor_worker_env_allows_only_declared_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", SECRET)
+    monkeypatch.setenv("CAMBIUM_PROVIDER_ANTHROPIC_API_KEY", "undeclared-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
     monkeypatch.setenv("CAMBIUM_PROVIDER_bad_API_KEY", "noncanonical-secret")
     monkeypatch.setenv("PATH", "/bin")
 
     environment = supervisor._Runtime._worker_env(
-        None, {"task_id": "task"}, generation=3
+        None,
+        {
+            "task_id": "task",
+            "provider_env_keys": ["CAMBIUM_PROVIDER_OPENAI_API_KEY"],
+        },
+        generation=3,
     )
 
     assert environment["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == SECRET
-    assert environment["PATH"] == "/bin"
+    assert environment["PATH"] == os.defpath
     assert environment["CAMBIUM_TASK_ID"] == "task"
     assert environment["CAMBIUM_GENERATION"] == "3"
+    assert "CAMBIUM_PROVIDER_ANTHROPIC_API_KEY" not in environment
     assert "OPENAI_API_KEY" not in environment
     assert "CAMBIUM_PROVIDER_bad_API_KEY" not in environment
+
+
+def test_worker_environment_default_provider_path_is_absolute_under_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    spec = {
+        "task_id": "task",
+        "worktree_path": str(tmp_path / "wt"),
+        "fanout_config": {"tier": "fast", "model": "loopback-model"},
+    }
+
+    env = supervisor._worker_environment(spec, 1)
+
+    assert env["CAMBIUM_PROVIDERS"] == str((cwd / ".cambium" / "providers.json").resolve())
+
+
+def test_worker_environment_relative_provider_path_resolves_against_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", "conf/providers.json")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    spec = {
+        "task_id": "task",
+        "worktree_path": str(tmp_path / "wt"),
+        "fanout_config": {"tier": "fast", "model": "loopback-model"},
+    }
+
+    env = supervisor._worker_environment(spec, 1)
+
+    assert env["CAMBIUM_PROVIDERS"] == str((cwd / "conf" / "providers.json").resolve())
+
+
+def test_worker_environment_non_provider_worker_gets_no_provider_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", "host-providers.json")
+    spec = {"task_id": "task", "worktree_path": str(tmp_path / "wt")}
+
+    env = supervisor._worker_environment(spec, 1)
+
+    assert "CAMBIUM_PROVIDERS" not in env
 
 
 def test_stdin_key_removes_only_line_ending() -> None:

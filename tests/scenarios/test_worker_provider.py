@@ -118,6 +118,7 @@ def _make_repo(repo: Path) -> str:
 
 
 def _provider_config(path: Path, base_url: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -160,7 +161,7 @@ def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[s
             "call_budget_s": 5.0,
             "pause_timeout_s": 0.1,
         },
-        "provider_env_keys": [PROVIDER_KEY],
+        "provider_env_keys": [PROVIDER_KEY, "NO_PROXY", "no_proxy"],
         "ready_timeout_s": 5.0,
         "gate_timeout_s": 5.0,
         "max_wall_s": 20.0,
@@ -207,14 +208,24 @@ def _run_case(
 def test_worker_provider_completion_drives_one_gated_merge_and_canary(
     tmp_path, monkeypatch
 ) -> None:
-    """The worker, not the parent, parses the completion that selects the edit."""
+    """The worker, not the parent, parses the completion that selects the edit.
+
+    The provider config lives at the default ``.cambium/providers.json`` under
+    the supervisor cwd; ``CAMBIUM_PROVIDERS`` is unset so the supervisor
+    resolves the default path before the worker spawns.
+    """
     with REQUEST_LOCK:
         REQUESTS.clear()
         REQUEST_AUTHORIZATION.clear()
     server = _FakeOpenAIServer()
     try:
-        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
+        project = tmp_path / "project"
+        project.mkdir()
+        config_path = _provider_config(
+            project / ".cambium" / "providers.json", server.base_url
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
         monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")

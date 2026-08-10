@@ -40,15 +40,16 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
+from cambium.provider_config import DEFAULT_PROVIDER_PATH
 
-from .auth import is_provider_env_name, scrub_environment
+from .auth import scrub_environment
 
 PROTO = 1
 WORKER_STDIN_LIMIT = 1_048_576
@@ -404,7 +405,13 @@ async def run_session(
             raise ValueError("run_session provider mode requires a non-empty task")
     log = EventLog(session_dir / ".cambium" / "events.jsonl", on_event)
     task_id = task_spec["task_id"]
-    worker_script = str(task_spec["worker"])
+    worker = task_spec.get("worker")
+    if worker is None or worker == "cambium.worker":
+        worker_label = "cambium.worker"
+        worker_command = [sys.executable, "-u", "-m", "cambium.worker"]
+    else:
+        worker_label = str(worker)
+        worker_command = [sys.executable, "-u", worker_label]
 
     ready_timeout = _cfg_float(task_spec, "ready_timeout_s", "CAMBIUM_READY_TIMEOUT_S", 10.0)
     gate_timeout = _cfg_float(task_spec, "gate_timeout_s", "CAMBIUM_GATE_TIMEOUT_S", 30.0)
@@ -432,9 +439,9 @@ async def run_session(
             raise RuntimeError(f"worktree add failed for {task_spec['branch']}: {detail}")
     await asyncio.to_thread(write_generation, worktree_path, 1)
 
-    log.emit("spawned", task_id=task_id, worker=worker_script)
+    log.emit("spawned", task_id=task_id, worker=worker_label)
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", worker_script,
+        *worker_command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -810,40 +817,40 @@ def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
     )
 
 
+def _provider_config_path(source: Mapping[str, str]) -> str:
+    """Resolve the absolute provider-config path a provider-mode worker loads."""
+    configured = source.get("CAMBIUM_PROVIDERS")
+    if configured:
+        path = Path(configured).expanduser()
+    else:
+        path = DEFAULT_PROVIDER_PATH
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return str(path.resolve())
+
+
 def _worker_environment(
     spec: dict[str, Any], generation: int, *, session_dir: Path | None = None
 ) -> dict[str, str]:
     """Build a strict worker env with authorized provider credentials."""
     source = dict(os.environ)
-    if "worktree_path" not in spec:
-        env = scrub_environment(source)
-        env.update((name, value) for name, value in source.items() if is_provider_env_name(name))
-        env["CAMBIUM_TASK_ID"] = spec["task_id"]
-        env["CAMBIUM_GENERATION"] = str(generation)
-        return env
-    allowed = set(_provider_env_keys(spec))
-    allowed.update(name for name in source if is_provider_env_name(name))
-    allowed.update(("CAMBIUM_PROVIDERS", "ENV_DUMP_PATH", "NO_PROXY", "no_proxy"))
     overrides = {
         "CAMBIUM_TASK_ID": spec["task_id"],
         "CAMBIUM_GENERATION": str(generation),
     }
     if session_dir is not None:
         overrides["CAMBIUM_SESSION_ID"] = str(session_dir.resolve())
+    worktree = (
+        Path(spec["worktree_path"]).resolve() if "worktree_path" in spec else None
+    )
     env = _strip_sensitive_env(
         source,
-        allowed_keys=allowed,
-        worktree=Path(spec["worktree_path"]).resolve(),
+        allowed_keys=_provider_env_keys(spec),
+        worktree=worktree,
         overrides=overrides,
     )
-
-    configured_path = source.get("CAMBIUM_PROVIDERS")
-    if configured_path:
-        path = Path(configured_path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        env["CAMBIUM_PROVIDERS"] = str(path.resolve())
-
+    if spec.get("fanout_config"):
+        env["CAMBIUM_PROVIDERS"] = _provider_config_path(source)
     return env
 
 
@@ -2480,6 +2487,9 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     task_id = spec.get("task_id")
     if not isinstance(task_id, str) or not task_id:
         raise ValueError("plan task requires 'task_id'")
+    task = spec.get("task")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError(f"task {task_id} requires a non-empty 'task'")
     if "repo" not in spec:
         raise ValueError(f"task {task_id} requires 'repo'")
     if "worktree_path" not in spec:
@@ -2575,10 +2585,9 @@ def _ensure_repo_initialized(repo: Path) -> None:
 
 
 def _default_spec(session_dir: Path) -> dict[str, Any]:
-    root = Path(__file__).resolve().parents[2]
     return {
         "task_id": "slice-001",
-        "worker": str(root / "scripts" / "fake_worker.py"),
+        "worker": "cambium.worker",
         "scratch_repo": str(session_dir / "scratch"),
         "worktree_path": str(session_dir / "wt"),
         "branch": "wt-slice-001",

@@ -23,7 +23,7 @@ from .auth import validate_derived_env_name, validate_provider_id
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
 
-_DEFAULT_PATH = Path(".cambium/providers.json")
+DEFAULT_PROVIDER_PATH = Path(".cambium/providers.json")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _TOP_LEVEL_FIELDS = frozenset({"providers"})
 _PROVIDER_FIELDS = frozenset(
@@ -328,7 +328,7 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
 def _read_config(source: str | Path | None) -> object:
     if source is None:
         configured = os.environ.get("CAMBIUM_PROVIDERS")
-        path = Path(configured) if configured else _DEFAULT_PATH
+        path = Path(configured) if configured else DEFAULT_PROVIDER_PATH
     else:
         path = Path(source)
 
@@ -399,6 +399,7 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "DEFAULT_PROVIDER_PATH",
     "DEFAULT_SAMPLE",
     "ProviderConfig",
     "ProviderEnvSpec",
