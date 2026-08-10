@@ -250,6 +250,22 @@ def test_nested_extension_credential_keys_cannot_reach_dump_state(key: str) -> N
         )  # type: ignore[arg-type]
 
 
+def test_post_construction_nested_mutation_cannot_reach_dump_state() -> None:
+    _require_dspy()
+    extensions: dict[str, Any] = {"nested": {}}
+    lm = CambiumLM(
+        FakeDiffundo(), ProviderTier.FAST, extensions=extensions
+    )  # type: ignore[arg-type]
+
+    extensions["nested"]["api_key"] = "SENSITIVE_CANARY"
+
+    assert "SENSITIVE_CANARY" not in repr(lm.dump_state())
+    assert "api_key" not in repr(lm.dump_state())
+    copied_state = lm.copy().dump_state()
+    assert "SENSITIVE_CANARY" not in repr(copied_state)
+    assert "api_key" not in repr(copied_state)
+
+
 def test_copy_rejects_credential_keys_and_keeps_dump_state_clean() -> None:
     _require_dspy()
     lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
@@ -260,6 +276,30 @@ def test_copy_rejects_credential_keys_and_keeps_dump_state_clean() -> None:
     copied = lm.copy(temperature=0.5)
     assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
     assert "api.key" not in repr(copied.dump_state())
+
+
+def test_copy_rejects_prompt_observing_callbacks() -> None:
+    _require_dspy()
+    import dspy
+
+    observed: list[dict[str, Any]] = []
+
+    class PromptCallback(dspy.utils.callback.BaseCallback):
+        def on_lm_start(self, call_id: str, instance: Any, inputs: dict[str, Any]) -> None:
+            del call_id, instance
+            observed.append(inputs)
+
+    callback = PromptCallback()
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="callbacks"):
+        lm.copy(callbacks=[callback])
+
+    lm.callbacks = [callback]
+    copied = lm.copy()
+    assert _call(copied, "PROMPT-CANARY") == ["completion text"]
+    assert copied.callbacks == []
+    assert observed == []
 
 
 def test_dump_and_load_state_round_trip_routes_through_diffundo() -> None:
@@ -278,6 +318,22 @@ def test_dump_and_load_state_round_trip_routes_through_diffundo() -> None:
 
     assert _call(loaded, "reloaded prompt") == ["completion text"]
     assert diffundo.calls[0]["prompt"]["messages"][0]["content"] == "reloaded prompt"
+
+
+def test_predict_json_save_and_load_round_trip_routes_through_diffundo(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    predict = dspy.Predict("question -> answer")
+    predict.lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    state_path = tmp_path / "state.json"
+
+    predict.save(state_path)
+    predict.load(state_path, allow_unsafe_lm_state=True)
+
+    assert _call(predict.lm, "JSON round-trip prompt") == ["completion text"]
+    assert diffundo.calls[0]["prompt"]["messages"][0]["content"] == "JSON round-trip prompt"
 
 
 def test_per_call_max_tokens_reaches_diffundo() -> None:

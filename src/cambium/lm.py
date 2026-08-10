@@ -8,6 +8,8 @@ import os
 import sysconfig
 import tempfile
 import threading
+import uuid
+import weakref
 from collections.abc import Mapping
 from typing import Any
 
@@ -31,6 +33,7 @@ _GENERATION_FIELDS = (
     "response_format",
 )
 _CACHE_FIELDS = frozenset({"cache", "rollout_id", "prompt_cache", "prompt_cache_key"})
+_FORBIDDEN_FIELDS = frozenset({"callbacks"})
 _SECRET_MARKERS = frozenset(
     {
         "apikey",
@@ -49,7 +52,74 @@ _SECRET_MARKERS = frozenset(
 )
 _DSPY_LOAD_LOCK = threading.Lock()
 _IMPLEMENTATION_LOCK = threading.Lock()
+_DIFFUNDO_REGISTRY_LOCK = threading.Lock()
+_DIFFUNDO_REGISTRY: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _DSPY: Any | None = None
+
+
+class _ImmutableDict(dict[Any, Any]):
+    """JSON-serializable mapping snapshot that rejects later mutation."""
+
+    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("CambiumLM configuration snapshots are immutable")
+
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    __setitem__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __copy__(self) -> _ImmutableDict:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _ImmutableDict:
+        del memo
+        return self
+
+
+def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Take a recursive immutable snapshot of JSON-shaped configuration."""
+    if memo is None:
+        memo = {}
+    if isinstance(value, Mapping):
+        if id(value) in memo:
+            raise ValueError("CambiumLM kwargs must not contain reference cycles")
+        memo[id(value)] = None
+        frozen = _ImmutableDict(
+            {_freeze(key, memo): _freeze(item, memo) for key, item in value.items()}
+        )
+        memo.pop(id(value))
+        return frozen
+    if isinstance(value, list | tuple):
+        if id(value) in memo:
+            raise ValueError("CambiumLM kwargs must not contain reference cycles")
+        memo[id(value)] = None
+        frozen = tuple(_freeze(item, memo) for item in value)
+        memo.pop(id(value))
+        return frozen
+    return value
+
+
+def _register_diffundo(diffundo: Any) -> str:
+    reference = uuid.uuid4().hex
+    try:
+        with _DIFFUNDO_REGISTRY_LOCK:
+            _DIFFUNDO_REGISTRY[reference] = diffundo
+    except TypeError as exc:
+        raise TypeError("diffundo must support weak references for DSPy state persistence") from exc
+    return reference
+
+
+def _resolve_diffundo(reference: str) -> Any:
+    with _DIFFUNDO_REGISTRY_LOCK:
+        diffundo = _DIFFUNDO_REGISTRY.get(reference)
+    if diffundo is None:
+        raise RuntimeError(f"Diffundo reference {reference!r} is not available in this process")
+    return diffundo
 
 
 def _load_dspy() -> Any:
@@ -134,6 +204,7 @@ class _CambiumLMMixin:
         self._tier = ProviderTier(tier)
         self._provider_model = model
         self._budget_usd = budget_usd
+        self._diffundo_reference = _register_diffundo(diffundo)
         kwargs = self._safe_kwargs(kwargs)
         super().__init__(
             model=f"cambium/{self._tier.value}",
@@ -201,7 +272,9 @@ class _CambiumLMMixin:
 
     def copy(self, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
-        return super().copy(**self._safe_kwargs(kwargs))
+        copied = super().copy(**self._safe_kwargs(kwargs))
+        copied.callbacks = []
+        return copied
 
     def dump_state(self) -> dict[str, Any]:
         """Return enough trusted runtime state to reconstruct this adapter."""
@@ -211,7 +284,7 @@ class _CambiumLMMixin:
         state.pop("num_retries", None)
         state.update(
             {
-                "diffundo": self._diffundo,
+                "diffundo_reference": self._diffundo_reference,
                 "tier": self._tier.value,
                 "model": self._provider_model,
                 "budget_usd": self._budget_usd,
@@ -226,14 +299,19 @@ class _CambiumLMMixin:
         *,
         allow_custom_lm_class: bool = False,
     ) -> Any:
-        """Reconstruct a trusted adapter state through its Diffundo instance."""
+        """Reconstruct a trusted adapter state through its Diffundo reference."""
         del allow_custom_lm_class
         constructor_state = dict(state)
         constructor_state.pop("_dspy_lm_class", None)
+        reference = constructor_state.pop("diffundo_reference")
+        constructor_state["diffundo"] = _resolve_diffundo(reference)
         return cls(**constructor_state)
 
     @staticmethod
     def _safe_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        forbidden = _FORBIDDEN_FIELDS.intersection(kwargs)
+        if forbidden:
+            raise ValueError(f"CambiumLM does not accept {', '.join(sorted(forbidden))}")
         safe = {key: value for key, value in kwargs.items() if key not in _CACHE_FIELDS}
         pending: list[Any] = [safe]
         visited: set[int] = set()
@@ -260,7 +338,7 @@ class _CambiumLMMixin:
                     continue
                 visited.add(id(value))
                 pending.extend(value)
-        return safe
+        return {key: _freeze(value) for key, value in safe.items()}
 
     @classmethod
     def _call_kwargs(cls, kwargs: Mapping[str, Any]) -> dict[str, Any]:
