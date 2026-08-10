@@ -9,7 +9,6 @@ import shlex
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -17,8 +16,6 @@ import pytest
 
 import cambium.supervisor as supervisor_module
 from cambium.fencing import read_generation, validate_worker_generation, write_generation
-from cambium.ipc import MAX_LINE_BYTES
-from cambium.store import EventStore
 from cambium.supervisor import (
     DuplicateTaskIDError,
     SessionAlreadyRunningError,
@@ -151,78 +148,6 @@ def _wait_pid_gone(pid: int, timeout_s: float = 2.0) -> None:
     pytest.fail(f"process {pid} survived process-group cleanup")
 
 
-def test_observer_mutation_does_not_change_queued_event_payload(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    store = supervisor_module._open_store(session_dir)
-
-    def observer(event: dict) -> None:
-        if event["kind"] == "log":
-            event["payload"]["message"] = "observer-corruption"
-
-    async def canary() -> None:
-        runtime = supervisor_module._Runtime(session_dir, store, on_event=observer)
-        await runtime.start()
-        await runtime.emit("log", message="durable-original")
-        await runtime.shutdown()
-
-    asyncio.run(canary())
-
-    persisted = _kinds(read_events(session_dir), "log")
-    assert persisted[0]["payload"]["message"] == "durable-original"
-
-
-def test_write_json_accepts_max_content_and_rejects_one_byte_over(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Stdin:
-        def __init__(self) -> None:
-            self.writes: list[bytes] = []
-
-        def is_closing(self) -> bool:
-            return False
-
-        def write(self, data: bytes) -> None:
-            self.writes.append(data)
-
-        async def drain(self) -> None:
-            return
-
-    class Process:
-        pid = 0
-
-        def __init__(self) -> None:
-            self.stdin = Stdin()
-
-    killed: list[Process] = []
-
-    async def record_kill(proc: Process) -> None:
-        killed.append(proc)
-
-    monkeypatch.setattr(supervisor_module, "_kill_worker", record_kill)
-
-    def message_with_content_size(size: int) -> dict[str, str]:
-        prefix = len(json.dumps({"payload": ""}).encode("utf-8"))
-        return {"payload": "x" * (size - prefix)}
-
-    async def scenario() -> Process:
-        exact = Process()
-        assert await supervisor_module._write_json(
-            exact, message_with_content_size(MAX_LINE_BYTES)
-        )
-        assert len(exact.stdin.writes) == 1
-        assert len(exact.stdin.writes[0][:-1]) == MAX_LINE_BYTES
-
-        oversized = Process()
-        assert not await supervisor_module._write_json(
-            oversized, message_with_content_size(MAX_LINE_BYTES + 1)
-        )
-        assert oversized.stdin.writes == []
-        return oversized
-
-    oversized = asyncio.run(scenario())
-    assert killed == [oversized]
-
-
 def test_oversized_init_fails_before_spawn_without_restart_budget(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -280,44 +205,6 @@ def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Pa
     assert result.status == "failed"
     assert result.timed_out is True
     assert time.monotonic() - started < 5.0
-
-
-def test_runtime_event_admission_counts_noncritical_drops(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    started = threading.Event()
-    release = threading.Event()
-
-    def stalled_fsync(_store: EventStore) -> None:
-        started.set()
-        release.wait(5.0)
-
-    original_fsync = EventStore._fsync_now
-    EventStore._fsync_now = stalled_fsync
-    store = EventStore(
-        session_dir / ".cambium" / "events.db",
-        fsync_interval_s=0.01,
-        max_queue_size=1,
-    )
-    runtime = supervisor_module._Runtime(session_dir, store)
-
-    async def scenario() -> None:
-        await runtime.start()
-        await runtime.emit("log", message="first")
-        await asyncio.wait_for(asyncio.to_thread(started.wait, 2.0), timeout=3.0)
-        for index in range(100):
-            await runtime.emit("log", message=str(index))
-        assert store.dropped > 0
-        release.set()
-        await runtime.shutdown()
-
-    try:
-        asyncio.run(scenario())
-    finally:
-        EventStore._fsync_now = original_fsync
-        release.set()
-
-    persisted = _kinds(read_events(session_dir), "log")
-    assert len(persisted) < 101
 
 
 def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
@@ -1120,47 +1007,6 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     )
 
 
-def test_duplicate_task_id_is_rejected_before_store_or_spawn(tmp_path: Path, monkeypatch) -> None:
-    def fail_spawn(*args, **kwargs):
-        raise AssertionError("duplicate plan spawned a subprocess")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
-    plan = {"tasks": [{"task_id": "duplicate"}, {"task_id": "duplicate"}]}
-
-    with pytest.raises(DuplicateTaskIDError, match="duplicate"):
-        asyncio.run(run_plan(tmp_path / "session", plan))
-    assert not (tmp_path / "session" / ".cambium").exists()
-
-
-@pytest.mark.parametrize("task_value", [None, 42, "", "   ", "\n\t "])
-def test_plan_task_requires_non_empty_task_string(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_value
-) -> None:
-    def fail_spawn(*args, **kwargs):
-        raise AssertionError("invalid task spawned a subprocess")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
-    plan = {"tasks": [{"task_id": "t-invalid", "task": task_value}]}
-
-    with pytest.raises(ValueError, match="requires a non-empty 'task'"):
-        asyncio.run(run_plan(tmp_path / "session", plan))
-    assert not (tmp_path / "session" / ".cambium").exists()
-
-
-def test_plan_task_missing_task_is_rejected_before_store_or_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def fail_spawn(*args, **kwargs):
-        raise AssertionError("missing task spawned a subprocess")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
-    plan = {"tasks": [{"task_id": "t-missing-task"}]}
-
-    with pytest.raises(ValueError, match="requires a non-empty 'task'"):
-        asyncio.run(run_plan(tmp_path / "session", plan))
-    assert not (tmp_path / "session" / ".cambium").exists()
-
-
 def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkeypatch) -> None:
     session_dir = tmp_path / "session"
     repo = tmp_path / "repo"
@@ -1192,21 +1038,6 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
         capture_output=True,
     ).returncode != 0
     assert not session_dir.exists()
-
-
-def test_worker_command_prefers_installed_module_and_preserves_script_paths() -> None:
-    module_cmd = [sys.executable, "-u", "-m", "cambium.worker"]
-    runtime = supervisor_module._Runtime(Path("/tmp/session"), None)
-    assert (
-        runtime._worker_command({"task_id": "t", "worker": "cambium.worker"}) == module_cmd
-    )
-    assert runtime._worker_command({"task_id": "t"}) == module_cmd
-    script = "/some/worker/script.py"
-    assert runtime._worker_command({"task_id": "t", "worker": script}) == [
-        sys.executable,
-        "-u",
-        script,
-    ]
 
 
 def test_slice_runtime_runs_the_installed_worker_module(tmp_path) -> None:

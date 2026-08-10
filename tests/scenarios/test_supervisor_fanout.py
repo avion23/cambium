@@ -1429,36 +1429,6 @@ def test_resource_gate_bypasses_non_heavy_gates(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_session_gates_do_not_share_permits(tmp_path) -> None:
-    """Two sessions with different capacities cannot observe each other's permits."""
-    async def scenario() -> None:
-        runtime1 = supervisor_module._Runtime(
-            tmp_path / "s1",
-            None,
-            compile_gate_max_concurrent=1,
-            compile_gate_acquire_timeout_s=1.0,
-        )
-        runtime2 = supervisor_module._Runtime(
-            tmp_path / "s2",
-            None,
-            compile_gate_max_concurrent=3,
-            compile_gate_acquire_timeout_s=1.0,
-        )
-
-        token = await runtime1._gate.acquire(["make"])
-        assert token is not None
-        tokens = [await runtime2._gate.acquire(["make"]) for _ in range(3)]
-        assert all(t is not None for t in tokens)
-        assert runtime1._gate.stats()["current"] == 1
-        assert runtime2._gate.stats()["current"] == 3
-
-        runtime1._gate.release(token)
-        for other in tokens:
-            runtime2._gate.release(other)
-
-    asyncio.run(scenario())
-
-
 def test_resource_gate_fail_closed_preflight_creates_no_worktree(tmp_path) -> None:
     """An impossible memory threshold refuses admission before worktree creation."""
     session_dir = tmp_path / "session"

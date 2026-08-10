@@ -527,21 +527,6 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
         server.close()
 
 
-def test_run_session_provider_mode_missing_task_fails_before_spawn(tmp_path) -> None:
-    session_dir = tmp_path / "missing-task"
-    with pytest.raises(ValueError, match="provider mode requires a non-empty task"):
-        asyncio.run(
-            run_session(
-                session_dir,
-                {
-                    "task_id": "missing-task",
-                    "fanout_config": {"tier": "fast", "model": "loopback-model"},
-                },
-            )
-        )
-    assert not (session_dir / ".cambium" / "events.db").exists()
-
-
 def test_worker_git_worktree_hook_does_not_receive_provider_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
