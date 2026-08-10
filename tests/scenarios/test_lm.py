@@ -46,7 +46,13 @@ class FakeDiffundo:
         import dspy
 
         self.calls.append(
-            {"endpoint": self.endpoint, "tier": tier, "prompt": prompt, "model": model}
+            {
+                "endpoint": self.endpoint,
+                "tier": tier,
+                "prompt": prompt,
+                "model": model,
+                "budget_usd": budget_usd,
+            }
         )
         self.session_markers.append(dspy.settings.cambium_session)
         content = "completion text"
@@ -298,12 +304,10 @@ def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> No
     predict = dspy.Predict("question -> answer")
     state_path = tmp_path / "state.json"
 
+    predict.lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    predict.lm.kwargs["auth"] = "Bearer SENSITIVE_CANARY"
+
     with pytest.raises(ValueError, match="provider credentials"):
-        predict.lm = CambiumLM(
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            auth="Bearer SENSITIVE_CANARY",
-        )  # type: ignore[arg-type]
         predict.save(state_path)
 
     assert not state_path.exists()
@@ -321,6 +325,27 @@ def test_copy_does_not_share_mutable_launch_kwargs() -> None:
     assert "api_key" not in repr(lm.dump_state())
     assert "SENSITIVE_CANARY" not in repr(copied.dump_state())
     assert "api_key" not in repr(copied.dump_state())
+
+
+def test_copy_freezes_bytearrays_in_launch_and_train_kwargs() -> None:
+    _require_dspy()
+    launch_value = bytearray(b"launch")
+    train_value = bytearray(b"train")
+    lm = CambiumLM(  # type: ignore[arg-type]
+        FakeDiffundo(),
+        ProviderTier.FAST,
+        launch_kwargs={"nested": {"value": launch_value}},
+        train_kwargs={"nested": {"value": train_value}},
+    )
+    copied = lm.copy()
+
+    launch_value[:] = b"changed"
+    train_value[:] = b"changed"
+
+    assert lm.launch_kwargs["nested"]["value"] == b"launch"
+    assert copied.launch_kwargs["nested"]["value"] == b"launch"
+    assert lm.train_kwargs["nested"]["value"] == b"train"
+    assert copied.train_kwargs["nested"]["value"] == b"train"
 
 
 def test_copy_model_override_routes_through_diffundo() -> None:
@@ -394,6 +419,23 @@ def test_predict_json_save_and_load_round_trip_routes_through_diffundo(tmp_path:
 
     assert _call(predict.lm, "JSON round-trip prompt") == ["completion text"]
     assert diffundo.calls[0]["prompt"]["messages"][0]["content"] == "JSON round-trip prompt"
+
+
+def test_copied_budget_round_trip_routes_with_override(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    predict = dspy.Predict("question -> answer")
+    lm = CambiumLM(diffundo, ProviderTier.FAST, budget_usd=1.0)  # type: ignore[arg-type]
+    predict.lm = lm.copy(budget_usd=2.0)
+    state_path = tmp_path / "state.json"
+
+    predict.save(state_path)
+    predict.load(state_path, allow_unsafe_lm_state=True)
+    assert _call(predict.lm, "budget round-trip prompt") == ["completion text"]
+
+    assert diffundo.calls[0]["budget_usd"] == 2.0
 
 
 def test_per_call_max_tokens_reaches_diffundo() -> None:

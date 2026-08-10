@@ -111,7 +111,14 @@ def _freeze(value: Any, memo: dict[int, Any] | None = None) -> Any:
         frozen = tuple(_freeze(item, memo) for item in value)
         memo.pop(id(value))
         return frozen
-    return value
+    if isinstance(value, bytearray | memoryview):
+        return bytes(value)
+    if value is None or isinstance(value, str | bytes | int | float | bool):
+        return value
+    raise TypeError(
+        f"CambiumLM configuration values must be immutable JSON-shaped data, not "
+        f"{type(value).__name__}"
+    )
 
 
 def _register_diffundo(diffundo: Any) -> str:
@@ -284,9 +291,28 @@ class _CambiumLMMixin:
 
     def copy(self, **kwargs: Any) -> Any:
         """Copy this LM without bypassing the Diffundo credential boundary."""
-        copied = super().copy(**self._safe_kwargs(kwargs))
-        if "model" in kwargs:
-            copied._provider_model = kwargs["model"]
+        adapter_overrides = {
+            key: kwargs[key]
+            for key in ("diffundo", "tier", "model", "budget_usd")
+            if key in kwargs
+        }
+        safe_kwargs = self._safe_kwargs(
+            {key: value for key, value in kwargs.items() if key not in adapter_overrides}
+        )
+        copied = super().copy(**safe_kwargs)
+        if "diffundo" in adapter_overrides:
+            diffundo = adapter_overrides["diffundo"]
+            if not isinstance(diffundo, Diffundo) and not callable(getattr(diffundo, "call", None)):
+                raise TypeError("diffundo must provide async call(tier, prompt, ...)")
+            copied._diffundo = diffundo
+            copied._diffundo_reference = _register_diffundo(diffundo)
+        if "tier" in adapter_overrides:
+            copied._tier = ProviderTier(adapter_overrides["tier"])
+            copied.model = f"cambium/{copied._tier.value}"
+        if "model" in adapter_overrides:
+            copied._provider_model = adapter_overrides["model"]
+        if "budget_usd" in adapter_overrides:
+            copied._budget_usd = adapter_overrides["budget_usd"]
         copied.callbacks = []
         return copied
 
@@ -304,6 +330,7 @@ class _CambiumLMMixin:
                 "budget_usd": self._budget_usd,
             }
         )
+        self._safe_kwargs(state)
         return state
 
     @classmethod
