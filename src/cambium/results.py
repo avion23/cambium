@@ -436,6 +436,22 @@ def _copy_sequence(value: Any) -> list[Any]:
     return list(value)
 
 
+def _final_bool(value: Any) -> bool:
+    if value is _MISSING or value is None:
+        return False
+    if not isinstance(value, bool):
+        raise TypeError("diff_truncated must be a boolean")
+    return value
+
+
+def _final_exit_code(value: Any) -> int | None:
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("exit_code must be an integer")
+    return value
+
+
 def _metrics_from_wire(wire: Mapping[str, Any]) -> tuple[Any, Any]:
     score = _wire_value(wire, "metric_score")
     breakdown = _wire_value(wire, "metric_breakdown")
@@ -465,7 +481,8 @@ def wire_to_child_result(
     Only :data:`CHILD_RESULT_KEYS` are emitted.  ``diff`` is the worker wire
     spelling for ``unified_diff``; ``include_diff=False`` (or an omitted diff)
     produces the required empty string while preserving the key.  An explicit
-    ``None`` diff is rejected: the field is always a string.
+    ``None`` diff is rejected even when ``include_diff=False``: the field is
+    always a string.
     """
     if not isinstance(wire, Mapping):
         raise TypeError("worker result must be a mapping")
@@ -482,6 +499,8 @@ def wire_to_child_result(
     diff = _wire_value(wire, "unified_diff")
     if diff is _MISSING:
         diff = _wire_value(wire, "diff")
+    if diff is None:
+        raise TypeError("unified_diff must be a string")
     if not include_diff or diff is _MISSING:
         unified_diff = ""
     elif not isinstance(diff, str):
@@ -490,20 +509,23 @@ def wire_to_child_result(
         unified_diff = diff
 
     metric_score, metric_breakdown = _metrics_from_wire(wire)
-    diff_truncated = _wire_value(wire, "diff_truncated")
     summary = _wire_value(wire, "summary")
+    status = status_from_wire(wire)
+    exit_code = _final_exit_code(_wire_value(wire, "exit_code"))
+    if exit_code is not None and status == "done" and exit_code != 0:
+        raise ValueError(
+            f"worker exit_code {exit_code} does not match status {status!r}"
+        )
     values = {
         "parent_task_id": parent_task_id,
         "unified_diff": unified_diff,
-        "diff_truncated": (
-            bool(diff_truncated) if diff_truncated not in (_MISSING, None) else False
-        ),
+        "diff_truncated": _final_bool(_wire_value(wire, "diff_truncated")),
         "summary": _text(summary if summary is not _MISSING else None),
         "metric_score": metric_score,
         "metric_breakdown": metric_breakdown,
         "commits": _copy_sequence(_wire_value(wire, "commits")),
         "files_changed": _copy_sequence(_wire_value(wire, "files_changed")),
-        "status": status_from_wire(wire),
+        "status": status,
     }
     return {key: values[key] for key in CHILD_RESULT_KEYS}
 
@@ -683,13 +705,18 @@ def _root_from_child(
     unified_diff = child.get("unified_diff", "")
     if not isinstance(unified_diff, str):
         raise TypeError("unified_diff must be a string")
+    exit_code = _final_exit_code(child.get("exit_code", _MISSING))
+    if exit_code is not None and status == "done" and exit_code != 0:
+        raise ValueError(
+            f"exit_code {exit_code} does not match status {status!r}"
+        )
     return Result(
         status=status,
         exit_code=EXIT_CODES[status],
         commits=_final_sequence(child.get("commits", _MISSING)),
         files_changed=_final_sequence(child.get("files_changed", _MISSING)),
         unified_diff=unified_diff,
-        diff_truncated=bool(child.get("diff_truncated", False)),
+        diff_truncated=_final_bool(child.get("diff_truncated", _MISSING)),
         summary=_text(child.get("summary", "")),
         metric_score=_unit_metric_score(child.get("metric_score", None)),
         metric_breakdown=_final_metric_breakdown(child.get("metric_breakdown", {})),

@@ -15,6 +15,7 @@ from cambium.results import (
     ROOT_RESULT_KEYS,
     Result,
     result_to_dict,
+    root_result_from_child,
     root_result_from_wire,
     status_from_wire,
     wire_to_child_result,
@@ -29,7 +30,7 @@ def _wire(**overrides: object) -> dict[str, object]:
         "request_id": "request-1",
         "generation": 4,
         "status": "succeeded",
-        "exit_code": 99,
+        "exit_code": 0,
         "commits": ["abc123"],
         "files_changed": ["src/example.py"],
         "diff": "diff --git a/src/example.py b/src/example.py",
@@ -121,6 +122,71 @@ def test_root_result_rejects_none_unified_diff(tmp_path: Path) -> None:
     assert result.unified_diff == ""
     with pytest.raises(TypeError, match="unified_diff"):
         replace(result, unified_diff=None)
+
+
+def test_child_mapper_rejects_explicit_none_diff_when_excluded() -> None:
+    with pytest.raises(TypeError, match="unified_diff"):
+        wire_to_child_result(
+            {"status": "succeeded", "include_diff": False, "unified_diff": None}
+        )
+    with pytest.raises(TypeError, match="unified_diff"):
+        wire_to_child_result(_wire(include_diff=False, diff=None))
+    excluded = wire_to_child_result({"status": "succeeded", "include_diff": False})
+    assert excluded["unified_diff"] == ""
+
+
+def test_child_mapper_rejects_non_bool_diff_truncated() -> None:
+    for value in (1, 0, "yes", 0.5):
+        with pytest.raises(TypeError, match="diff_truncated"):
+            wire_to_child_result({"status": "succeeded", "diff_truncated": value})
+    child = wire_to_child_result(_wire(diff_truncated=True))
+    assert child["diff_truncated"] is True
+
+
+def test_root_result_rejects_non_bool_diff_truncated(tmp_path: Path) -> None:
+    for value in (1, 0, "yes", 0.5):
+        with pytest.raises(TypeError, match="diff_truncated"):
+            root_result_from_child(
+                {"status": "succeeded", "diff_truncated": value},
+                tmp_path,
+                session_id="session-1",
+            )
+    with pytest.raises(TypeError, match="diff_truncated"):
+        _root(tmp_path, status="succeeded", diff_truncated=1)
+    result = _root(tmp_path, status="succeeded", diff_truncated=True)
+    assert result.diff_truncated is True
+
+
+def test_child_mapper_rejects_nonzero_exit_code_on_success() -> None:
+    with pytest.raises(ValueError, match="exit_code"):
+        wire_to_child_result({"status": "succeeded", "exit_code": 99})
+    child = wire_to_child_result({"status": "succeeded", "exit_code": 0})
+    assert child["status"] == "done"
+
+
+def test_root_result_rejects_nonzero_exit_code_on_success(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exit_code"):
+        root_result_from_wire(
+            {"status": "succeeded", "exit_code": 99},
+            tmp_path,
+            session_id="session-1",
+        )
+    with pytest.raises(ValueError, match="exit_code"):
+        root_result_from_child(
+            {"status": "succeeded", "exit_code": 99},
+            tmp_path,
+            session_id="session-1",
+        )
+
+
+def test_failed_wire_may_carry_nonzero_exit_code(tmp_path: Path) -> None:
+    result = root_result_from_wire(
+        {"status": "failed", "exit_code": 99},
+        tmp_path,
+        session_id="session-1",
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 1
 
 
 @pytest.mark.parametrize(
