@@ -47,6 +47,20 @@ table.
 The dspy and fork-dspy rows were re-measured on 2026-08-09; the table keeps
 the resulting medians/p90s. Earlier figures without raw data are superseded.
 
+Representative raw samples (median run of each), retained inline so the
+percentiles and outliers remain recomputable without the external artifact.
+These samples are displayed at their recorded precision, so recomputation can
+differ from the table's final displayed digit where unrounded samples were used:
+
+- `uv run --python 3.14.7 python -c "pass"`: `[35.4, 39.0, 35.7, 38.0, 44.0, 32.4, 37.4, 37.2, 41.3, 33.1, 34.6, 42.6, 35.3, 45.0, 46.6, 41.5, 34.3, 43.0, 37.3, 37.8]`
+- `uv run` + Orchestrator: `[148.5, 125.5, 137.2, 126.2, 113.3, 122.3, 122.8, 118.2, 112.9, 128.1, 138.2, 114.4, 114.7, 118.6, 115.6, 147.0, 126.9, 113.3, 115.1, 116.1]`
+- `venv/bin/python` + ShouldDecomposeModule: `[53.6, 54.8, 57.1, 65.8, 63.4, 54.6, 53.7, 52.3, 51.7, 52.5, 57.4, 59.0, 59.3, 83.1, 60.8, 62.6, 56.5, 61.5, 58.6, 58.9]`
+- `import dspy` only (re-measured): `[2108.3, 2142.6, 2257.3, 2304.4, 2188.7]`
+- `uv run --with dspy python -c "import dspy"` (re-measured): `[2736.0, 2345.8, 2248.3, 2260.7, 2214.6]`
+- subprocess worker, dspy + cambium.decide (re-measured): `[2221.2, 2404.3, 2266.5, 2210.7, 2201.2]`
+- fork, warmed (cambium): `[2.18, 2.98, 1.72, 2.95, 1.84, 1.52, 1.78, 2.17, 1.86, 2.31, 1.63, 1.82, 1.92, 1.73, 1.89, 1.83, 1.85, 1.82, 1.63, 1.38, 2.58, 2.12, 1.69, 1.88, 1.71, 1.76, 1.74, 1.78, 1.43, 1.88]`
+- fork, warmed (cambium + dspy), re-measured: `[6.81, 5.94, 5.66, 5.86, 5.54, 3.80, 7.42, 4.03, 3.92, 3.80]`
+
 ### Derived costs (venv-based, no dspy)
 
 - Pure python 3.14.7 interpreter floor: **16.9 ms** median.
@@ -103,24 +117,14 @@ per worker / ~178 ms fan-out** vs **~1.8 ms per fork / ~7.2 ms fan-out**.
 5.6 ms).** dspy's import dominates everything else in the worker path, so the
 decision hinges on whether that 2.2 s is paid once or per task.
 
-Caveat — pooling mechanism is a separate choice. The numbers support *not*
-paying 2.2 s per task, but:
-- `os.fork` from the supervisor contradicts architecture v2.0 invariants: the
-  deterministic layer (Custos) must never import a DSPy module, workers must
-  stay isolated (sandbox, own FDs), and fork-after-threads (asyncio supervisor,
-  provider clients) is unsafe.
-- The same win is available while keeping the existing subprocess + stdio IPC
-  (`Nuntius` JSON-Lines/`request_id`) design: **pre-spawn a pool of subprocesses
-  once (~2.2 s each, amortized over their lifetime) and reuse them across
-  tasks**, so the marginal per-task cost is an IPC round-trip, not a process
-  spawn. This is the v2.1 persistent-worker-pool direction.
+Caveat: supervisor `os.fork` violates v2.0 isolation and fork-after-threads
+invariants. Keep Nuntius stdio IPC and pre-spawn subprocess workers once
+(~2.2 s each), then reuse them so each task pays an IPC round-trip; this is the
+v2.1 persistent-worker-pool direction.
 
-Numbers not independently re-measured and therefore not used: none; every figure
-above is a measured sample on this host. All measurements were taken under
-concurrent third-party load (`loadavg` ranged 2.6–8.7 across batches); the fork
-figures are the most robust (min 1.38 ms, tight distribution), the dspy fan-out
-figures the noisiest (±~1 s), and the dspy fork figures are COW/load sensitive
-(first-touch page faults spike the p90: 6.87–34.5 ms across batches).
+Every figure is a host measurement under concurrent load (`loadavg` 2.6–8.7).
+Fork timings are tight (min 1.38 ms); dspy fan-out is noisy (±~1 s), and dspy
+fork p90 is COW/load-sensitive (6.87–34.5 ms across batches).
 
 ## Appendix: re-measured evidence (dspy rows, fork-dspy, fan-outs)
 
@@ -136,6 +140,21 @@ The dspy scenarios used the dspy ephemeral env
 `/home/ubuntu/.cache/uv/archive-v0/z2NVN2upFNYcb8-P/bin/python` with
 `PYTHONPATH=/home/ubuntu/cambium/src`; no-dspy scenarios used
 `/tmp/opencode/exp-coldstart-venv/bin/python`.
+
+The records backing the updated table rows (verbatim from
+`measurements2.jsonl`, rounded to 3 decimals) are retained here because the
+external file may be unavailable:
+
+```
+{"mode": "cmd", "name": "uv-run-with-dspy", "n": 5, "loadavg": [6.93, 6.28, 6.25], "raw_ms": [2735.953, 2345.846, 2248.33, 2260.676, 2214.642], "median_ms": 2260.676, "p90_ms": 2579.91}
+{"mode": "cmd", "name": "import-dspy-only", "n": 5, "loadavg": [7.39, 6.29, 6.25], "raw_ms": [2108.284, 2142.599, 2257.314, 2304.44, 2188.701], "median_ms": 2188.701, "p90_ms": 2285.589}
+{"mode": "cmd", "name": "worker-subprocess-dspy-cambium", "n": 5, "loadavg": [6.81, 6.21, 6.22], "raw_ms": [2221.198, 2404.341, 2266.549, 2210.725, 2201.206], "median_ms": 2221.198, "p90_ms": 2349.224}
+{"mode": "fork", "name": "fork-warmed-cambium-dspy", "n": 10, "loadavg": [5.59, 5.74, 6.08], "raw_ms": [6.806, 5.942, 5.655, 5.859, 5.541, 3.798, 7.419, 4.033, 3.92, 3.8], "median_ms": 5.598, "p90_ms": 6.868}
+{"mode": "fansub", "name": "fanout-subprocess-10-nodspy", "n": 5, "loadavg": [5.19, 5.65, 6.04], "raw_ms": [168.961, 177.612, 186.613, 204.233, 166.892], "median_ms": 177.612, "p90_ms": 197.185}
+{"mode": "fansub", "name": "fanout-subprocess-10-dspy", "n": 5, "loadavg": [8.69, 6.48, 6.31], "raw_ms": [8784.265, 8039.852, 6713.122, 7034.259, 6993.54], "median_ms": 7034.259, "p90_ms": 8486.5}
+{"mode": "fanfork", "name": "fanout-fork-10-nodspy", "n": 5, "loadavg": [5.59, 5.74, 6.08], "raw_ms": [8.01, 6.873, 7.184, 7.956, 7.052], "median_ms": 7.184, "p90_ms": 7.989}
+{"mode": "fanfork", "name": "fanout-fork-10-dspy", "n": 5, "loadavg": [5.46, 5.71, 6.06], "raw_ms": [35.438, 36.358, 38.908, 44.504, 46.008], "median_ms": 38.908, "p90_ms": 45.406}
+```
 
 The `-X importtime` verification:
 `/home/ubuntu/.cache/uv/archive-v0/z2NVN2upFNYcb8-P/bin/python -X importtime -c "import dspy" 2>&1 | tail -1`

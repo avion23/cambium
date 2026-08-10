@@ -8,6 +8,8 @@ a command result; unchecked items are **UNVERIFIED**.
 Environment: uv 0.12.2 (`aarch64-unknown-linux-gnu`), Linux aarch64; `uv run` in
 `/tmp/opencode/exp-dspy` (not `/tmp/opencode/cambium-dspy`); interpreters are
 `cpython-3.14.7` and `cpython-3.14.7+freethreaded` from `uv python list`.
+The experiment's empty-dependency project is historical; it is not the current
+repository packaging.
 
 ## Bottom line
 
@@ -22,10 +24,6 @@ Environment: uv 0.12.2 (`aarch64-unknown-linux-gnu`), Linux aarch64; `uv run` in
   Explicitly classified for Python 3.14 on PyPI.
 - **Free-threaded 3.14 build: NO.** dspy 3.3.0 fails to build because its
   dependency `orjson 3.11.9` does not support free-threaded Python.
-- **Recommendation for Cambium:** add dspy as an **optional extra**, pin
-  `dspy>=3.3.0,<3.4` (minimum that declares 3.14 support: `>=3.1.0`), and run
-  DSPy programs on the **GIL** 3.14 build only (same conclusion as
-  `docs/research/python-3.14.md`).
 
 ## Verified: dspy latest (3.3.0) installs and imports on 3.14.7
 
@@ -190,18 +188,12 @@ any dspy version installs there is **UNVERIFIED** (not probed further).
 
 ## Recommendation for Cambium
 
-1. **Add dspy as an optional extra**, not a hard dependency, so the scaffold
-   keeps its dspy-free baseline (`pyproject.toml` has `dependencies = []`):
-
-   ```toml
-   [project.optional-dependencies]
-   dspy = ["dspy>=3.3.0,<3.4"]
-   ```
-
-   - Pin `dspy>=3.3.0,<3.4` for reproducibility (newest release and only one
-     verified end-to-end here). A lower bound of `dspy>=3.1.0` is the metadata
-     floor; 3.0.x/2.6.x declare 3.14 unsupported despite the 3.0.4 smoke pass.
-2. **Per-module DSPy programs must run on the GIL 3.14 build.** The
+1. **Current repository packaging:** `pyproject.toml` declares runtime
+   `dependencies = ["pytest>=9"]`, optional `dspy = ["dspy>=3.3.0,<3.4"]`,
+   and repeats that pin in `test`/`dev` extras. The experiment's
+   `dependencies = []` was historical, not current.
+2. **Historical runtime recommendation:** per-module DSPy programs must run on
+   the GIL 3.14 build. The
    freethreaded build cannot install dspy (orjson blocker). This matches the
    existing `docs/research/python-3.14.md` recommendation to target the regular
    build and keep free-threading optional/additive. The Cambium module

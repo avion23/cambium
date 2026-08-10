@@ -54,7 +54,9 @@ accessing value -> NameError: name 'NonExistentNameAtDefTime' is not defined
 ```
 
 The traceback for the access error shows evaluation happens inside a lazily
-created `__annotate__` function (the PEP 649 mechanism):
+created `__annotate__` function (the PEP 649 mechanism). The evaluated
+`f.__annotations__` remains a normal dict; `f.__annotate__` is the separate
+lazy evaluator:
 
 ```
 Traceback (most recent call last):
@@ -196,14 +198,9 @@ https://docs.python.org/3.14/whatsnew/3.14.html#whatsnew314-jit-compiler).
 All claims below are from https://docs.python.org/3.14/whatsnew/3.14.html
 unless a real output is pasted.
 
-- **PEP 649/749 deferred annotations (default).** Forward references no longer
-  need string quoting; annotations cost nothing at definition time. Verified
-  above. Relevant: DSPy/LiteLLM and any type-heavy agent code can drop
-  `from __future__ import annotations` unless a dependency requires it.
-  Migration caveat: code that evaluates `__annotations__` values at runtime
-  (e.g. Pydantic/DSPy signature introspection) will now get lazy
-  `AnnotateFunction` objects; use `annotationlib.get_annotations()` for
-  explicit control.
+- **PEP 649/749 deferred annotations (default).** Forward references need no
+  quoting; see the verified behavior above. Runtime introspection should use
+  `annotationlib.get_annotations()` for explicit format control.
 - **PEP 734 subinterpreters + `concurrent.interpreters`.** Multiple
   interpreters in one process, each with its own GIL since 3.12 (PEP 684),
   exposed as a stdlib module in 3.14. Verified:
@@ -213,31 +210,25 @@ unless a real output is pasted.
   $ python3.14 -c "from concurrent.futures import InterpreterPoolExecutor; print('InterpreterPoolExecutor OK')"
   InterpreterPoolExecutor OK
   ```
-  Subinterpreters are opt-in, not the default execution model. They could
-  reduce spawn cost, but process isolation remains stronger.
+  Subinterpreters are opt-in; process isolation remains stronger for workers.
 - **`python -m asyncio ps|pstree PID`** — introspect running tasks in a
   process. Verified present:
   ```
   $ python3.14 -m asyncio --help
   usage: python3 -m asyncio [-h] {ps,pstree} ...
   ```
-  Useful for diagnosing a wedged orchestrator; it uses the new per-thread task
-  list (standard asyncio benchmarks are reported 10-20% faster).
-- **asyncio free-threading support.** Multiple event loops can now run in
-  parallel threads on the FT build (linear scaling). Only matters if Cambium
-  runs parallel loops in threads, not across its subprocess workers.
+  Useful for diagnosing a wedged orchestrator; standard asyncio benchmarks are
+  reported 10-20% faster.
+- **asyncio free-threading support.** Multiple event loops can run in parallel
+  threads on the FT build; this does not affect subprocess-worker parallelism.
 - **asyncio `create_task()` kwargs.** `asyncio.create_task()` and
   `TaskGroup.create_task()` pass arbitrary kwargs to the Task factory.
-- **`multiprocessing` / `concurrent.futures`.** `forkserver` is now the default
-  start method for `ProcessPoolExecutor`/`multiprocessing` on Unix (non-macOS)
-  — a real behavior change for any process-pool code. New
-  `terminate_workers()`/`kill_workers()` on `ProcessPoolExecutor` and
-  `Process.interrupt()` (SIGINT to a child) — directly useful for an
-  orchestrator that must stop worker processes.
+- **`multiprocessing` / `concurrent.futures`.** `forkserver` is now default on
+  non-macOS Unix; 3.14 adds `terminate_workers()`, `kill_workers()`, and
+  `Process.interrupt()`.
 - **PEP 768 remote debugging.** `sys.remote_exec(pid, script)` and
-  `python -m pdb -p PID` attach to a running process; gated by
-  `-X disable-remote-debug` / `PYTHON_DISABLE_REMOTE_DEBUG`. Useful for
-  debugging subprocess workers in place.
+  `python -m pdb -p PID` attach to a process; `-X disable-remote-debug` /
+  `PYTHON_DISABLE_REMOTE_DEBUG` gates it.
 - **GC note:** 3.14.0–3.14.4 shipped an incremental GC, reverted to the 3.13
   generational GC in 3.14.5+ after production memory-pressure reports.
   Verified on this 3.14.7 build (3-tuple = generational):
@@ -245,11 +236,10 @@ unless a real output is pasted.
   $ python3.14 -c "import gc; print('gc.get_threshold():', gc.get_threshold())"
   gc.get_threshold(): (2000, 10, 10)
   ```
-- **Improved error messages** (keyword typo suggestions, `elif` after `else`,
-  unhashable type messages, `async with`/`with` protocol mismatch).
+- **Improved error messages** (keyword typos, `elif` after `else`, unhashable
+  types, and context-manager mismatches).
 - **Tail-call interpreter** (opt-in `--with-tail-call-interp`): documented
-  3-5% faster on pyperformance, but only for specific compiler/platform combos.
-  Not relevant to a stock install.
+  3-5% pyperformance gain on selected builds; not stock-install relevant.
 
 ## GIL / free-threading: the precise truth
 
@@ -305,16 +295,21 @@ the default build**. The precise truth, verified:
 **Pin: `requires-python = ">=3.14,<3.15"` on the regular (GIL) build. Do not
 target the free-threaded build by default.**
 
-Reasoning (see `docs/architecture/reviews/`; review M5/M1):
+Reasoning (see `docs/architecture/reviews/`; review M5/M1). This is a
+historical design recommendation, not a claim that the current repository has
+only I/O-bound LLM threads:
 
-- Cambium uses subprocess workers plus async I/O, so process isolation already
-  gives multi-core parallelism. The only in-process threads are I/O-bound LLM
-  calls (`asyncio.to_thread`); the GIL is not a constraint there.
+- The historical design used subprocess workers plus async I/O, so process
+  isolation already gave multi-core parallelism. Current source also has an
+  `EventStore` SQLite writer thread (`src/cambium/store.py`) and uses
+  `asyncio.to_thread` for event-store append/close, git, worker, tool, file,
+  and LLM boundary work (`src/cambium/supervisor.py`, `src/cambium/worker.py`,
+  `src/cambium/tools.py`); reassess GIL impact at those boundaries.
 - The FT build would add only risk for Cambium: ~5-10% single-threaded
   overhead, no JIT, and C-extension compatibility exposure (DSPy, LiteLLM,
   tokenizers, torch, numpy, orjson). Whether those wheels are FT-safe on this
-  platform is **UNVERIFIED** — none are installed in this repo (no
-  `pyproject.toml` exists), and no FT stress test was run.
+  platform is **UNVERIFIED**. This historical run did not install them or run
+  an FT stress test; current optional extras are declared in `pyproject.toml`.
 - Free-threading is officially supported in 3.14 (PEP 779) but optional;
   plain `python3.14` remains a GIL build.
 - Keep free-threading **optional and additive**, gated by
