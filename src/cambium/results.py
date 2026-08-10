@@ -400,35 +400,6 @@ def status_from_wire(
     return "failed"
 
 
-def convert_status(
-    wire_or_status: Mapping[str, Any] | str,
-    **signals: Any,
-) -> str:
-    """Compatibility spelling for :func:`status_from_wire`.
-
-    Keeping this small adapter lets callers provide the same named gate,
-    merge, and evaluator signals without adding a second status table.
-    """
-    accepted = {
-        "gate_exit_code",
-        "gate_ok",
-        "gate_status",
-        "merge_ok",
-        "merge_status",
-        "evaluator_rejected",
-        "evaluator_status",
-    }
-    unknown = set(signals) - accepted
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise TypeError(f"unknown status signal(s): {names}")
-    return status_from_wire(wire_or_status, **signals)
-
-
-canonical_status = status_from_wire
-map_status = status_from_wire
-
-
 def _copy_sequence(value: Any) -> list[Any]:
     if value is _MISSING or value is None:
         return []
@@ -532,10 +503,6 @@ def wire_to_child_result(
         "status": status,
     }
     return {key: values[key] for key in CHILD_RESULT_KEYS}
-
-
-child_result_from_wire = wire_to_child_result
-map_wire_to_child_result = wire_to_child_result
 
 
 def _final_metric_score(value: Any) -> float:
@@ -801,10 +768,6 @@ def root_result_from_child(
     )
 
 
-build_root_result = root_result_from_wire
-finalize_result = root_result_from_wire
-
-
 def result_to_dict(result: Result) -> dict[str, Any]:
     """Serialize only a canonical :class:`Result` to its exact root keys."""
     if not isinstance(result, Result):
@@ -815,9 +778,6 @@ def result_to_dict(result: Result) -> dict[str, Any]:
     record["metric_score"] = _unit_metric_score(result.metric_score)
     record["metric_breakdown"] = dict(_final_metric_breakdown(result.metric_breakdown))
     return record
-
-
-serialize_result = result_to_dict
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -893,29 +853,15 @@ def write_result(
     return target
 
 
-write_result_json = write_result
-persist_result = write_result
-
-
 __all__ = [
     "CHILD_RESULT_KEYS",
     "EXIT_CODES",
     "ROOT_RESULT_KEYS",
     "Result",
-    "build_root_result",
-    "canonical_status",
-    "child_result_from_wire",
-    "convert_status",
-    "finalize_result",
-    "map_status",
-    "map_wire_to_child_result",
-    "persist_result",
     "result_to_dict",
     "root_result_from_child",
     "root_result_from_wire",
-    "serialize_result",
     "status_from_wire",
     "wire_to_child_result",
     "write_result",
-    "write_result_json",
 ]
