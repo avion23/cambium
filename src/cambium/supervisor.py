@@ -31,6 +31,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import random
 import re
@@ -82,6 +83,30 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
     if msg.get("type") == "ready":
         return msg.get("proto") != PROTO
     return "proto" in msg and msg["proto"] != PROTO
+
+
+_TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size")
+_TOOL_EVENT_DURATION_FIELDS = ("duration_ms",)
+
+
+def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
+    """Return worker tool_event fields whose values must not enter durable events.
+
+    Only field names are reported; invalid values are never echoed back.
+    """
+    invalid: list[str] = []
+    for field in _TOOL_EVENT_INT_FIELDS:
+        if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
+            invalid.append(field)
+    if "ok" in msg and type(msg["ok"]) is not bool:
+        invalid.append("ok")
+    for field in _TOOL_EVENT_DURATION_FIELDS:
+        value = msg.get(field)
+        if field in msg and not (
+            type(value) in (int, float) and value >= 0 and math.isfinite(value)
+        ):
+            invalid.append(field)
+    return invalid
 
 
 def _stdin_deadline(wall_deadline: float) -> float:
@@ -2143,13 +2168,27 @@ class _Runtime:
                 elif mtype in ("tool_event", "pong"):
                     forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
                     if mtype == "tool_event":
-                        for field in ("batch_index", "batch_size", "ok", "duration_ms"):
-                            if field in msg:
-                                forwarded[field] = msg[field]
-                    await self.emit(
-                        "tool_event" if mtype == "tool_event" else "log",
-                        task_id=task_id, generation=generation, **forwarded,
-                    )
+                        invalid_fields = _invalid_tool_event_fields(msg)
+                        if invalid_fields:
+                            await self.emit(
+                                "protocol", task_id=task_id, generation=generation,
+                                note="tool_event rejected: invalid field(s)",
+                                fields=invalid_fields,
+                            )
+                        else:
+                            for field in (
+                                "batch_index", "batch_size", "ok", "duration_ms"
+                            ):
+                                if field in msg:
+                                    forwarded[field] = msg[field]
+                            await self.emit(
+                                "tool_event", task_id=task_id, generation=generation,
+                                **forwarded,
+                            )
+                    else:
+                        await self.emit(
+                            "log", task_id=task_id, generation=generation, **forwarded,
+                        )
                 elif mtype == "error":
                     await self.emit(
                         "log", task_id=task_id, generation=generation, stream="worker-error",

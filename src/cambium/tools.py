@@ -802,7 +802,12 @@ async def run_read_batch(
             f"batch_index {batch_index}: {error}" for error in errors
         )
     for batch_index, call in enumerate(batch):
-        raw_path = _read_batch_arguments(call).get("path")
+        if not isinstance(call, dict):
+            continue
+        arguments = _read_batch_arguments(call)
+        if not isinstance(arguments, dict):
+            continue
+        raw_path = arguments.get("path")
         if not isinstance(raw_path, str) or not raw_path:
             continue
         try:

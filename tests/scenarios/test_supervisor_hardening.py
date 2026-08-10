@@ -755,6 +755,67 @@ def test_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge
     ).stdout.strip() == base
 
 
+def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "tool-event-worker.py"
+    worker.write_text(
+        "import json, sys\n"
+        "def send(message):\n"
+        "    print(json.dumps(message), flush=True)\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "send({'type': 'ready', 'request_id': init['request_id'], "
+        "'task_id': init['task_id'], 'generation': init['generation'], 'proto': 1})\n"
+        "run = json.loads(sys.stdin.readline())\n"
+        "if run.get('type') == 'run_task':\n"
+        "    send({'type': 'tool_event', 'tool': 'read_file', "
+        "'batch_index': 'CREDENTIAL-IN-BATCH-INDEX', 'batch_size': '1', "
+        "'ok': 'yes', 'duration_ms': -12.5})\n"
+        "    send({'type': 'tool_event', 'tool': 'read_file', "
+        "'batch_index': 0, 'batch_size': 1, 'ok': True, 'duration_ms': 12})\n"
+        "    with open(run['target_file'], 'a', encoding='utf-8') as handle:\n"
+        "        handle.write('\\n// tool-event-validated\\n')\n"
+        "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
+        "'status': 'succeeded'})\n"
+        "    send({'type': 'exit_message', 'reason': 'done'})\n",
+        encoding="utf-8",
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-tool-event",
+        worker=str(worker),
+        gate="grep -q '// tool-event-validated' hello.txt",
+        max_restarts=1,
+        max_wall_s=10.0,
+        marker="// tool-event-validated",
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+
+    task_result = result.results[0]
+    assert task_result.status == "succeeded"
+    events = read_events(session_dir)
+    tool_events = _kinds(events, "tool_event")
+    assert len(tool_events) == 1
+    assert tool_events[0]["payload"]["batch_index"] == 0
+    assert tool_events[0]["payload"]["batch_size"] == 1
+    assert tool_events[0]["payload"]["ok"] is True
+    assert tool_events[0]["payload"]["duration_ms"] == 12
+    assert "CREDENTIAL-IN-BATCH-INDEX" not in json.dumps(events)
+    assert any(
+        event["kind"] == "protocol"
+        and event["payload"].get("note") == "tool_event rejected: invalid field(s)"
+        and set(event["payload"].get("fields", []))
+        == {"batch_index", "batch_size", "ok", "duration_ms"}
+        for event in events
+    )
+
+
 def test_duplicate_task_id_is_rejected_before_store_or_spawn(tmp_path: Path, monkeypatch) -> None:
     def fail_spawn(*args, **kwargs):
         raise AssertionError("duplicate plan spawned a subprocess")

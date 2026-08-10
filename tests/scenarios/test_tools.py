@@ -238,6 +238,49 @@ def test_read_batch_concurrency_is_bounded(tmp_path: Path, monkeypatch) -> None:
     assert state["peak"] <= tools.BATCH_READ_MAX_CONCURRENCY
 
 
+def test_read_batch_rejects_malformed_envelopes_atomically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    events: list[dict] = []
+    called = False
+
+    async def unexpected_read(_args: dict, _ctx: ToolContext):
+        nonlocal called
+        called = True
+        raise AssertionError("preflight must run before any read")
+
+    monkeypatch.setattr(tools, "_read_file", unexpected_read)
+    results = asyncio.run(
+        run_read_batch(
+            [
+                {"arguments": None},
+                None,
+                {"name": "read_file", "arguments": "not-a-dict"},
+                "bare-string-call",
+            ],
+            _batch_context(tmp_path, events),
+        )
+    )
+
+    assert len(results) == 4
+    assert all(not result.ok for result in results)
+    assert all("batch rejected atomically" in (result.error or "") for result in results)
+    assert "batch_index 0: validation failed: 'arguments' must be an object" in (
+        results[0].error or ""
+    )
+    assert "batch_index 1: validation failed: tool call must be an object" in (
+        results[1].error or ""
+    )
+    assert "batch_index 2: validation failed: 'arguments' must be an object" in (
+        results[2].error or ""
+    )
+    assert "batch_index 3: validation failed: tool call must be an object" in (
+        results[3].error or ""
+    )
+    assert not called
+    assert events == []
+
+
 def test_read_batch_requires_read_file_in_init_tools(tmp_path: Path) -> None:
     results = asyncio.run(
         run_read_batch([{"path": "anything.txt"}], ToolContext(tmp_path))
