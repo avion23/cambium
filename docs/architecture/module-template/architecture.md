@@ -216,8 +216,10 @@ Each baseline JSON must contain `schema_version`, logical `module`,
 `metric`, `canaries`, `dataset`, `tests`, and `drift_thresholds`. Its digests
 and version must match `datasets/meta.json` and exact split bytes. The wheel
 includes package code, `__main__.py`, `architecture.md`, datasets, metadata,
-colocated tests, and baseline; the installed probe runs
-`cambium module-test <package_name>` outside the checkout.
+colocated tests, and baseline; the wheel acceptance probe runs
+`cambium module-test <package_name>` outside the checkout. The tool is
+developed and run directly from source; the Hatch wheel target and wheel
+acceptance tests remain for packaging, which is not the primary delivery path.
 
 ## 10. Optimization plan
 
@@ -306,8 +308,10 @@ check. It validates tracked files, manifest, dataset versions/digests, imports,
 CLI subprocess behavior, and the loaded module set. Offline checks are
 best-effort lint-style checks, not same-UID containment. Sibling imports and
 reverse imports are static failures and must be reported by file, line, and
-symbol. The wheel probe must work outside the repository; a repository-relative
-fallback is not a packaging solution.
+symbol. The wheel acceptance probe must work outside the repository; a
+repository-relative fallback is not a packaging solution. The tool is developed
+and run directly from source; the Hatch wheel target and wheel acceptance tests
+remain for packaging, which is not the primary delivery path.
 
 ### A.4 Target-state labels
 

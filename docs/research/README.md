@@ -24,8 +24,7 @@ that a module is present or wired.
 - [`python-3.14.md`](python-3.14.md) — runtime assumptions.
 - [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — measured store behavior.
 - [`worktree-concurrency.md`](worktree-concurrency.md) — measured Git behavior.
-- [`vertical-slice-report.md`](vertical-slice-report.md) — deterministic worker,
-  gate, and merge evidence.
+- [`vertical-slice-report.md`](vertical-slice-report.md) — historical worker/IPC/merge evidence (gate removed by decision).
 - [`test-strategy.md`](test-strategy.md), [`security-audit.md`](security-audit.md),
   [`conformance-report.md`](conformance-report.md), and
   [`constitution-compliance.md`](constitution-compliance.md) — point-in-time

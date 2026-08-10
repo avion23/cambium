@@ -18,15 +18,15 @@ session API.
 `cambium.supervisor.run_plan` accepts a mapping with `tasks` or a task list. It
 validates supplied task records, rejects duplicate IDs and unsafe worktree
 paths, then supervises the supplied tasks concurrently in one
-`asyncio.TaskGroup`. A task worker runs in a Git worktree and process group; a
-gate runs before merge. Successful publication uses an expected-old atomic
+`asyncio.TaskGroup`. A task worker runs in a Git worktree and process group. A
+clean worker whose envelope reports `succeeded` publishes; there is no pre-merge
+gate. Successful publication uses an expected-old atomic
 update of `refs/heads/main`. It is ref-only and never refreshes the caller's
 checkout or index.
 
 There is no worker-count semaphore: an 11-task canary observed 11 concurrent
-supervisions. `resource_thresholds` only checks host health;
-`resources.CompileGate` limits heavy gate commands, so neither bounds worker
-admission.
+supervisions. `resource_thresholds` remains the only host-health pre-flight;
+`CompileGate` was removed by product decision.
 
 The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
 records through it, and writes `.cambium/result.json` after shutdown. The
@@ -63,9 +63,8 @@ responses carry a parsed `Retry-After` delay into the same-provider retry path.
 Weighted routing and a production provider token, cost, and account-quota
 observability contract are not implemented.
 
-The bench canary currently fails at the module diagnostic boundary: mixed
-raw/Unicode-escaped free-form stderr retains `\u005c` through
-`modules/base.py` → `redact.py`. This is a current defect, not live-safety proof.
+The escaped-secret bench canary was deleted by product decision; it is no
+longer a live blocker.
 
 ### Trees, diagnostics, and modules
 
@@ -80,8 +79,9 @@ that path; `orchestrator.py` is a skeleton. Persistent worker reuse is absent.
 
 `doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
 auth coverage, optional event and conversation databases, module datasets, and
-advisory host health. `resources.CompileGate` limits configured heavy gate
-commands. There is no `ResourceBudget` class. `module_conformance` provides an
+advisory host health. `resources.CompileGate` is a standalone reusable
+primitive; `run_plan` no longer runs gate commands. There is no `ResourceBudget`
+class. `module_conformance` provides an
 isolated module-test gate. `modules/example` has deterministic decision logic,
 train/eval/canary data, split metrics, and a JSON CLI with `decide` and
 `evaluate` operations. There is no `eval_cache.py`.
@@ -93,12 +93,12 @@ Do not use those names as current architecture components.
 
 1. The caller owns the session directory and supplies plan records.
 2. The supervisor owns validation, worker handles, generations, event
-   admission, gates, restart decisions, and publication order.
+   admission, restart decisions, and publication order.
 3. A worker owns its worktree edits, provider calls, tool context, and commit;
    it cannot publish `main` directly.
 4. The merge sequencer owns staging, expected-old checks, quarantine, and
-   cleanup. A conflict, non-fast-forward, failed gate, or cleanup violation
-   does not advance `main`.
+   cleanup. A conflict, non-fast-forward, or cleanup violation does not
+   advance `main` (gate failure is no longer a condition).
 5. The event store owns durable rows and its writer thread. Observer copies
    cannot mutate persisted records.
 
@@ -108,20 +108,18 @@ IPC is bounded and correlated by request ID and worker generation. Fatal
    malformed lines are logged or skipped. Tool schemas reject malformed calls.
 
 Provider credentials are allowlisted environment values. They must not enter
-task specs, prompts persisted as events, gate commands/output, logs, or result
-artifacts. Worktree and process-group isolation is not an OS sandbox. The
-`ApprovalGate` primitive is defined in `approval.py` and consumed by `tools.py`,
-but the `run_plan` worker context does not provide a production approval
-service; `fail_open` is an explicit dangerous policy option.
+task specs, prompts persisted as events, logs, or result
+artifacts. Worktree and process-group isolation is not an OS sandbox.
+`approval.py:ApprovalGate` is a standalone reusable primitive; `tools.py`
+`run_shell`/`git_op` execute without it by product decision.
 
-External live use is blocked until worker admission, escaped free-form
-redaction, deployment credentials/configuration, and per-worker OS containment
-are verified. A loopback smoke does not prove them.
+Live-use blockers were removed by product decision; this is a local development
+tool run directly from source.
 
 ## 3. Target contracts and delivery order
 
-These are open contracts, not current interfaces. Stabilize live-run
-prerequisites before adding hierarchy or dynamic admission.
+These are open contracts, not current interfaces. Hierarchy and dynamic
+admission are follow-on work; gates/containment are not prerequisites.
 
 ### Production hierarchy and admission
 
@@ -141,11 +139,8 @@ required acceptance measures for the provider path.
 
 ### Per-worker containment and approval
 
-Add an explicit host boundary for per-worker OS containment, resource limits,
-and process cleanup. Compose it with a production approval callback/policy at
-the tool boundary. Prove denied commands, unavailable approval, containment
-failure, and teardown behavior. A systemd or cgroup smoke wrapper is evidence
-for that wrapper, not proof that every production worker is contained.
+Per-worker OS containment and production approval were removed by product
+decision; worktree/process-group isolation is the only worker boundary.
 
 ### Provider accounting before routing policy
 
@@ -159,7 +154,7 @@ ordering remains the current policy.
 ### External-provider acceptance
 
 Run a disposable credentialed smoke through the worker loop, tool event,
-checkpoint, gate, and ref-only merge. Keep credentials in the environment and
+checkpoint, and ref-only merge. Keep credentials in the environment and
 network opt-in. Deployment credentials/configuration are external and
 ephemeral; doctor currently reports no runnable configured provider.
 
@@ -171,13 +166,12 @@ ephemeral; doctor currently reports no runnable configured provider.
 | Task tree | `build_tree` rejects missing dependencies, multiple roots/parents, cycles, and bounds. | A future scheduler dispatches only a validated graph with snapshotted specs. |
 | IPC | Framing limits, request IDs, generations, heartbeat deadlines, and correlated result checks are enforced in `_Runtime._drive_generation`. | Stale or missing worker messages cannot complete a task. |
 | Worker | Provider/tool failures, missing results, non-zero exits, and wall/token limits fail the generation; recoverable failures may restart it. | A worker verdict is accepted only for its active generation. |
-| Gate | Non-zero exit, timeout, output overflow, or resource-acquire failure fails before merge. | A failed gate never reaches publication. |
 | Merge | Conflict, non-fast-forward, unsafe quarantine, or cleanup failure stops publication. | `main` advances only through the expected-old ref contract. |
 | Store | Critical event admission waits for the writer; writer death raises; non-critical overflow follows the bounded queue policy. | Durable failure is visible; no silent success after store failure. |
 
 The table describes checks on paths that call these modules. A helper's
-existence is not proof of integration: approval, redaction, resource admission,
-hierarchy, and containment remain targets where the plan path has no caller.
+existence is not proof of integration: Redaction, resource admission, and
+hierarchy remain targets; approval and containment were removed by decision.
 
 ## 5. Source map
 
@@ -189,7 +183,7 @@ hierarchy, and containment remain targets where the plan path has no caller.
 | Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
 | Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; no run-plan hierarchy wiring |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
-| Controls | `tools.py`, `schemas.py`, `approval.py`, `resources.py`, `redact.py` | Primitives; production approval/containment gaps |
+| Controls | `tools.py`, `schemas.py`, `approval.py`, `resources.py`, `redact.py` | Primitives; approval/containment removed from the tool path by decision |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` | CLI diagnostics and example evaluation exist |
 
 Any target moves to current only after a caller and focused failure test

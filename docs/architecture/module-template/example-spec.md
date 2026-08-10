@@ -27,8 +27,7 @@ reference because it is deterministic and has no dataset or DSPy seam.
 | Status | Spec'd; scaffold present |
 | Reference path | `src/cambium/modules/example/` |
 
-These names are intentionally separate and must not be normalized by a caller
-or wheel loader.
+These names are intentionally separate and must not be normalized by a caller.
 
 ## 2. Purpose
 
@@ -235,8 +234,10 @@ uv run --extra test cambium module-test example
 
 It validates tracked layout, manifest, dataset and baseline schema/digests,
 imports, CLI, offline subprocess behavior, and module-scoped tests. The gate
-rejects provider/network use and sibling/reverse imports. The wheel probe runs
-outside the checkout. The module is removable by deleting its package,
+rejects provider/network use and sibling/reverse imports. The wheel acceptance
+probe runs outside the checkout. The tool is developed and run directly from
+source; the Hatch wheel target and wheel acceptance tests remain for packaging,
+which is not the primary delivery path. The module is removable by deleting its package,
 including tests, datasets, baselines, CLI, architecture, and freeze metadata.
 
 ### 9.1 Verification commands and recorded state
