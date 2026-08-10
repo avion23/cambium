@@ -56,11 +56,24 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from . import __version__
+
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
 _VOLATILE_MARKERS = ("request_id", "request-id")
 _REFUSAL_MARKERS = re.compile(r"content.?filter|refus|moderat|safety", re.IGNORECASE)
+_URL_CREDENTIALS_RE = re.compile(
+    r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/\s?#@]*@",
+    re.IGNORECASE,
+)
+_REDACTED = "[REDACTED]"
+_CLOUDFLARE_1010_RE = re.compile(
+    r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
+    r"error\s*(?:code\s*)?[:#-]?\s*1010|browser(?:['’]s)?\s+signature))",
+    re.IGNORECASE | re.DOTALL,
+)
+USER_AGENT = f"cambium/{__version__}"
 # Light content scan for model refusals returned as a 200 completion (issue 4).
 # Documented heuristic: exact refusal phrases in the completion text are treated
 # as a REFUSAL fall-through so a refusing model never wins the cascade.
@@ -381,6 +394,20 @@ def _default_quality_gate(result: CallResult) -> bool:
 
 def _default_score(result: CallResult) -> float:
     return float(len(result.content))
+
+
+def _redact_error_text(message: str, api_key: str) -> str:
+    """Remove credentials while retaining safe provider diagnostics."""
+    redacted = message.replace(api_key, _REDACTED)
+    return _URL_CREDENTIALS_RE.sub(r"\g<scheme>" + _REDACTED + "@", redacted)
+
+
+class _SanitizedHTTPError(Exception):
+    """HTTP failure cause without a request URL or response body."""
+
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(f"HTTP Error {status}: {reason}")
+        self.status = status
 
 
 # --------------------------------------------------------------------------- #
@@ -819,9 +846,12 @@ class Diffundo:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
+                "User-Agent": USER_AGENT,
             },
         )
         start = time.monotonic()
+        http_error: ProviderError | None = None
+        http_cause: _SanitizedHTTPError | None = None
         try:
             with urllib.request.urlopen(request, timeout=timeout_s) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -831,7 +861,13 @@ class Diffundo:
                 error_body = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 error_body = ""
-            raise self._classify_http(provider, status, error_body[:500]) from exc
+            safe_body = _redact_error_text(error_body, api_key)[:500]
+            http_cause = _SanitizedHTTPError(
+                status, _redact_error_text(str(exc.reason), api_key)
+            )
+            http_error = self._classify_http(
+                provider, status, safe_body, cause=http_cause
+            )
         except urllib.error.URLError as exc:
             reason = exc.reason
             if isinstance(reason, TimeoutError):
@@ -852,22 +888,47 @@ class Diffundo:
             raise ProviderError(
                 provider.name, ProviderOutcome.ERROR, f"request failed: {exc}", exc
             ) from exc
+        if http_error is not None:
+            assert http_cause is not None
+            raise http_error from http_cause
         if not isinstance(payload, dict):
             raise ProviderError(
                 provider.name, ProviderOutcome.ERROR, "malformed response: not a JSON object"
             )
         return _RawResponse(payload, time.monotonic() - start)
 
-    def _classify_http(self, provider: ProviderConfig, status: int, message: str) -> ProviderError:
+    def _classify_http(
+        self,
+        provider: ProviderConfig,
+        status: int,
+        message: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> ProviderError:
         if status == 429:
-            return ProviderError(provider.name, ProviderOutcome.QUOTA, f"HTTP 429: {message}")
+            return ProviderError(
+                provider.name, ProviderOutcome.QUOTA, f"HTTP 429: {message}", cause
+            )
+        # Cloudflare's browser-signature block is a provider/network error, not
+        # evidence that the configured API credential is invalid.
+        if status == 403 and _CLOUDFLARE_1010_RE.search(message):
+            return ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                f"HTTP 403 Cloudflare 1010: {message}",
+                cause,
+            )
         if status in (401, 403):
             return ProviderError(
-                provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}"
+                provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
             )
         if status == 400 and _REFUSAL_MARKERS.search(message):
-            return ProviderError(provider.name, ProviderOutcome.REFUSAL, f"HTTP 400: {message}")
-        return ProviderError(provider.name, ProviderOutcome.ERROR, f"HTTP {status}: {message}")
+            return ProviderError(
+                provider.name, ProviderOutcome.REFUSAL, f"HTTP 400: {message}", cause
+            )
+        return ProviderError(
+            provider.name, ProviderOutcome.ERROR, f"HTTP {status}: {message}", cause
+        )
 
     # -- health bookkeeping -------------------------------------------------- #
 
