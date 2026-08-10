@@ -2141,10 +2141,14 @@ class _Runtime:
                         state_ref=msg.get("state_ref"), generation=generation,
                     )
                 elif mtype in ("tool_event", "pong"):
+                    forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
+                    if mtype == "tool_event":
+                        for field in ("batch_index", "batch_size", "ok", "duration_ms"):
+                            if field in msg:
+                                forwarded[field] = msg[field]
                     await self.emit(
                         "tool_event" if mtype == "tool_event" else "log",
-                        task_id=task_id, generation=generation, tool=msg.get("tool"),
-                        cmd=msg.get("cmd"),
+                        task_id=task_id, generation=generation, **forwarded,
                     )
                 elif mtype == "error":
                     await self.emit(
