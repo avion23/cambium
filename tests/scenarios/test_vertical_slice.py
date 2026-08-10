@@ -1,12 +1,13 @@
 """Vertical-slice end-to-end scenario: real supervisor + real worker process.
 
 Drives the real spawn path (asyncio subprocess + pipes + git) through
-the public ``cambium.supervisor.run_session`` API, with the fake worker
-script as the worker process. No mocks, no network.
+the public ``cambium.supervisor.run_session`` adapter (a one-task
+``run_plan``), with the fake worker script as the worker process. No
+mocks, no network.
 
 S01-aligned happy path: ready -> run_task -> result_envelope
-(status=succeeded) -> exit_message, gate passes, ff-only merge lands the
-edit on ``main``, supervisor exits 0.
+(status=succeeded) -> exit_message, gate passes, the canonical sequencer
+publishes the edit onto ``refs/heads/main``, supervisor exits 0.
 
 Negative path: the worker is told not to write the marker; the gate
 fails, the result is failed, and nothing is merged.
@@ -20,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cambium.supervisor import run_session
+from cambium.supervisor import read_events, run_session
 
 WORKER = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
 MARKER = "// cambium-slice"
@@ -60,14 +61,22 @@ def _spec(session_dir: Path, *, write_marker: bool) -> dict:
     }
 
 
-def _load_events(session_dir: Path) -> list[dict]:
-    path = session_dir / ".cambium" / "events.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
 def _protocol_sequence(events: list[dict]) -> list[str]:
     kinds = {"init", "ready", "run_task", "result", "exit"}
     return [e["kind"] for e in events if e["kind"] in kinds]
+
+
+def _show_main(repo: Path, path: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", f"refs/heads/main:{path}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _assert_no_events_jsonl(session_dir: Path) -> None:
+    assert not (session_dir / ".cambium" / "events.jsonl").exists()
 
 
 def test_vertical_slice_happy_path(tmp_path) -> None:
@@ -80,17 +89,16 @@ def test_vertical_slice_happy_path(tmp_path) -> None:
 
     assert result.status == "succeeded"
     assert result.exit_code == 0
-    assert result.worker_exit_code == 0
-    assert result.worker_status == "succeeded"
     assert result.gate_exit_code == 0
     assert result.merge_sha is not None
-    assert (scratch / "hello.txt").read_text() == (
+    assert _show_main(scratch, "hello.txt") == (
         "hello from the vertical slice\n"
         "// cambium-slice\n"
     )
-
-    events = _load_events(session_dir)
-    assert _protocol_sequence(events) == ["init", "ready", "run_task", "result", "exit"]
+    _assert_no_events_jsonl(session_dir)
+    assert _protocol_sequence(read_events(session_dir)) == [
+        "init", "ready", "run_task", "result", "exit",
+    ]
 
 
 def test_vertical_slice_gate_failure_no_merge(tmp_path) -> None:
@@ -103,8 +111,6 @@ def test_vertical_slice_gate_failure_no_merge(tmp_path) -> None:
 
     assert result.status == "failed"
     assert result.exit_code == 1
-    assert result.worker_exit_code == 0
-    assert result.worker_status == "failed"
     assert result.gate_exit_code is not None and result.gate_exit_code != 0
     assert result.merge_sha is None
     assert MARKER not in (scratch / "hello.txt").read_text()
@@ -112,14 +118,15 @@ def test_vertical_slice_gate_failure_no_merge(tmp_path) -> None:
         ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
     ).stdout.strip()
     assert tip == base  # main never advanced; no merge
-
-    events = _load_events(session_dir)
-    assert _protocol_sequence(events) == ["init", "ready", "run_task", "result", "exit"]
+    _assert_no_events_jsonl(session_dir)
+    assert _protocol_sequence(read_events(session_dir)) == [
+        "init", "ready", "run_task", "result", "exit",
+    ]
 
 
 def test_worker_nonzero_exit_fails(tmp_path, monkeypatch) -> None:
     # Reviewer case worker_exit5.py: envelope says succeeded, exit_message present,
-    # but the worker process exits 5. Must FAIL and the exit code must reflect 5.
+    # but the worker process exits 5. Must FAIL with the canonical exit code 1.
     monkeypatch.setenv("FAKE_MODE", "exit5")
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
@@ -129,9 +136,8 @@ def test_worker_nonzero_exit_fails(tmp_path, monkeypatch) -> None:
     result = asyncio.run(run_session(session_dir, spec))
 
     assert result.status == "failed"
-    assert result.exit_code == 5  # reflects the worker's real exit code
-    assert result.worker_exit_code == 5
-    assert result.worker_status == "succeeded"  # envelope's status was overridden
+    assert result.exit_code == 1  # canonical supervisor verdict
+    assert result.worker_exit_code is None  # not retained by the canonical runtime
     assert result.merge_sha is None
     tip = subprocess.run(
         ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
@@ -151,8 +157,6 @@ def test_missing_exit_message_fails(tmp_path, monkeypatch) -> None:
 
     assert result.status == "failed"
     assert result.exit_code == 1
-    assert result.worker_exit_code == 0
-    assert result.worker_status == "succeeded"
     assert result.merge_sha is None
     tip = subprocess.run(
         ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
@@ -171,7 +175,6 @@ def test_missing_result_envelope_fails(tmp_path, monkeypatch) -> None:
 
     assert result.status == "failed"
     assert result.exit_code == 1
-    assert result.worker_status is None
     assert result.merge_sha is None
 
 
@@ -192,7 +195,7 @@ def test_misrouted_result_envelope_fails(tmp_path, monkeypatch) -> None:
         ["git", "-C", str(scratch), "rev-parse", "main"], check=True, capture_output=True, text=True
     ).stdout.strip()
     assert tip == base
-    assert any(e["kind"] == "protocol" for e in _load_events(session_dir))
+    assert any(e["kind"] == "protocol" for e in read_events(session_dir))
 
 
 def test_result_envelope_echoes_run_task_request_id(tmp_path) -> None:
@@ -204,13 +207,13 @@ def test_result_envelope_echoes_run_task_request_id(tmp_path) -> None:
     result = asyncio.run(run_session(session_dir, spec))
 
     assert result.status == "succeeded"
-    events = _load_events(session_dir)
-    by_kind = {e["kind"]: e["payload"] for e in events}
+    events = read_events(session_dir)
+    by_kind = {e["kind"]: e for e in events}
     init_rid = by_kind["init"]["request_id"]
     run_rid = by_kind["run_task"]["request_id"]
     assert by_kind["ready"]["request_id"] == init_rid  # ready echoes init
     assert by_kind["result"]["request_id"] == run_rid  # envelope echoes run_task
-    assert "request_id" not in by_kind["exit"]  # exit_message carries no request_id
+    assert by_kind["exit"]["request_id"] is None  # exit_message carries no request_id
 
 
 def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
@@ -225,13 +228,14 @@ def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     result = asyncio.run(run_session(session_dir, spec))
 
     assert result.status == "failed"
-    assert result.exit_code == 3  # timeout per arch §16.4
+    assert result.exit_code == 1  # canonical exit code (timeout is a failed verdict)
     assert result.timed_out is True
     assert result.timeout_phase == "ready"
-    assert result.worker_exit_code is not None and result.worker_exit_code != 0  # killed
     assert result.merge_sha is None
-    events = _load_events(session_dir)
-    assert any(e["kind"] == "timeout" for e in events)
+    events = read_events(session_dir)
+    assert any(
+        e["kind"] == "timeout" and e["payload"].get("phase") == "ready" for e in events
+    )
 
 
 def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:

@@ -1019,12 +1019,6 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
     assert not session_dir.exists()
 
 
-def test_default_spec_selects_installed_worker_module() -> None:
-    spec = supervisor_module._default_spec(Path("/tmp/session"))
-
-    assert spec["worker"] == "cambium.worker"
-
-
 def test_worker_command_prefers_installed_module_and_preserves_script_paths() -> None:
     module_cmd = [sys.executable, "-u", "-m", "cambium.worker"]
     runtime = supervisor_module._Runtime(Path("/tmp/session"), None)
@@ -1051,13 +1045,7 @@ def test_slice_runtime_runs_the_installed_worker_module(tmp_path) -> None:
 
     assert result.status == "succeeded"
     assert result.exit_code == 0
-    assert result.worker_exit_code == 0
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    spawned = [event for event in events if event["kind"] == "spawned"]
+    spawned = [event for event in read_events(session_dir) if event["kind"] == "spawned"]
     assert spawned
     assert "cambium.worker" in spawned[0]["payload"]["worker"]
 
@@ -1073,6 +1061,7 @@ def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
         "marker": "// slice-too-long",
         "write_marker": True,
         "gate": "true",
+        "spec": "edit hello.txt",
         "provider_env_keys": [],
     }
 
@@ -1085,13 +1074,9 @@ def test_oversized_stdout_line_fails_slice_reader(tmp_path: Path) -> None:
 
     assert result.status == "failed"
     assert result.exit_code == 1
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-    ]
     assert any(
         event["kind"] == "protocol" and event["payload"].get("note") == "MessageTooLong"
-        for event in events
+        for event in read_events(session_dir)
     )
 
 
@@ -1137,10 +1122,7 @@ def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without
 
     assert result.status == "failed"
     assert result.merge_sha is None
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-    ]
+    events = read_events(session_dir)
     protocol = [event for event in events if event["kind"] == "protocol"]
     assert len(protocol) == 1
     assert protocol[0]["payload"]["code"] == supervisor_module.PROTO_UNKNOWN_REQUEST_ID
@@ -1173,10 +1155,7 @@ def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
 
     assert result.status == "failed"
     assert result.merge_sha is None
-    events = [
-        json.loads(line)
-        for line in (session_dir / ".cambium" / "events.jsonl").read_text().splitlines()
-    ]
+    events = read_events(session_dir)
     assert any(
         event["kind"] == "protocol"
         and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"

@@ -537,7 +537,7 @@ def test_run_session_provider_mode_missing_task_fails_before_spawn(tmp_path) -> 
                 },
             )
         )
-    assert not (session_dir / ".cambium" / "events.jsonl").exists()
+    assert not (session_dir / ".cambium" / "events.db").exists()
 
 
 def test_worker_git_worktree_hook_does_not_receive_provider_key(
