@@ -395,6 +395,8 @@ def test_retry_after_delta_seconds_controls_same_provider_retry(monkeypatch) -> 
         (("Friday, 15-Jan-27 08:00:11 GMT",), 11.0),
         (("Fri, 15 Jan 2027 08:00:11 GMT",), 11.0),
         (("Fri Jan 15 08:00:11 2027",), 11.0),
+        (("Fri, 15 Jan 2027 08:00:11 GMT, 2",), None),
+        (("Fri Jan 15 08:00:11 2027, 2",), None),
     ],
 )
 def test_retry_after_parser(values: tuple[str, ...], expected: float | None, monkeypatch) -> None:

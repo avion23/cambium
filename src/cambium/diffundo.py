@@ -499,6 +499,9 @@ def _parse_retry_after(headers: Any) -> float | None:
         if delay >= 0:
             return delay
         return None
+    comma_count = value.count(",")
+    if comma_count > 1 or (comma_count == 1 and not re.match(r"^[A-Za-z]+,\s", value)):
+        return None
     try:
         retry_at = parsedate_to_datetime(value)
     except (IndexError, OverflowError, TypeError, ValueError):
@@ -834,6 +837,8 @@ class Diffundo:
                             if exc.retry_after_s is not None
                             else self._retry_delay(attempt_no)
                         )
+                        # Keep even an arbitrarily large provider delay: the
+                        # call deadline check below skips it without jitter.
                         remaining = self._remaining(deadline)
                         if remaining is not None and remaining <= delay:
                             break
