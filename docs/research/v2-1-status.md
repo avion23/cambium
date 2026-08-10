@@ -4,21 +4,24 @@
 > is blocked, or changes evidence. Do not treat a branch-local green test as a
 > merged milestone.
 >
-> **Baseline:** `main@b709375` on 2026-08-10. A commit counts as merged only when
+> **Baseline:** `main@63a0110` on 2026-08-10. A commit counts as merged only when
 > it is reachable from that baseline. Branch names and branch-local SHAs below
 > are in-flight evidence only.
 
+Note: the Feedback-7 accepted-action register (`F7-01..F7-09`) was appended to
+`implementation-plan.md` (repo root) and is on this baseline via `cb8c434`.
+
 ## Status summary
 
-| Scope | Definition | STATUS | Evidence at `main@b709375` |
+| Scope | Definition | STATUS | Evidence at `main@63a0110` |
 |---|---|---|---|
 | **v2 base** | The complete v2 stack is one authoritative, integrated runtime from deterministic substrate through provider execution and release evidence. | **IN-FLIGHT** | The deterministic substrate and Custos seed are merged, but the canonical runtime still has slice/fallback paths and no real provider-to-merge run is evidenced. |
-| **M1** | Canonical runtime and audit baseline. | **IN-FLIGHT** | Store, merge, IPC, worker, task-tree, doctor, and a Custos seed are merged; canonicalization, redaction wiring, and post-integration audits are not complete. |
+| **M1** | Canonical runtime and audit baseline. | **IN-FLIGHT** | Store, merge, IPC, worker, task-tree, doctor, and a Custos seed are merged; the M1 deletion set still sits on main and the M1 executor is in-flight unmerged, so canonicalization and post-integration audits are not complete. |
 | **M2** | Protocol and pipe hardening. | **IN-FLIGHT** | IPC/worker and DLQ parts are merged, and write deadlines are now in the supervisor; FD 3, bounded runtime queues, and overflow death are not integrated. |
 | **M3** | Security boundary and fencing. | **IN-FLIGHT** | Approval, fencing, redaction, and env-keyed provider modules are merged; strict spawn policy, durable approval, ref validation, and runtime fencing are incomplete. |
 | **M4** | Gate, resource, and deep-budget hardening. | **IN-FLIGHT** | Resource and health helpers are merged; GateRunner, budget enforcement, and bounded store durability are not wired. |
 | **M5** | Architectus task-tree execution and conversations. | **IN-FLIGHT** | Conversation storage, Architectus design, and an Architectus execution core are merged; the core is not wired into the supervisor and the orchestrator remains a skeleton. |
-| **M6** | First real LLM end-to-end task. | **IN-FLIGHT** | Provider configuration and Diffundo routing are merged; CambiumLM is branch-local and the real provider-to-gate-to-Unio proof is not complete. |
+| **M6** | First real LLM end-to-end task. | **IN-FLIGHT** | Provider configuration, Diffundo routing, and CambiumLM are merged, and provider staging is real; the real-provider provider-to-gate-to-Unio proof is not complete. |
 | **M7** | Persistent worker pool. | **BLOCKED** | A worker-pool state-machine seed is merged (explicitly not M7 acceptance); acceptance is gated by incomplete M2-M6. |
 | **M8** | DSPy `should_decompose` refinement. | **IN-FLIGHT** | Bench, eval-cache, and the `Decision` enum migration are merged; package rename and SIMBA evidence are absent. |
 | **M9** | Tree-sitter context-compression research and falsifiable adoption trial. | **DONE** for the research deliverable | The tree-sitter feasibility/prototype report is merged. Runtime adoption remains explicitly deferred because the compile-success trial is unverified. |
@@ -27,7 +30,7 @@
 
 - **Definition:** One authoritative v2 stack must connect the deterministic substrate, orchestration, provider path, gates, atomic merge, and release evidence.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** `3d27ba3` merged `EventStore`; `c7e19b0` merged `MergeSequencer`; `38e1d43` merged Nuntius/Opifex IPC and worker; `06ce0dc` merged Task Tree validation; `2822139` merged doctor; and `0867572` merged the Custos multi-worker seed. Later v2.1 parts are also present through `b709375`.
+- **Evidence:** `3d27ba3` merged `EventStore`; `c7e19b0` merged `MergeSequencer`; `38e1d43` merged Nuntius/Opifex IPC and worker; `06ce0dc` merged Task Tree validation; `2822139` merged doctor; and `0867572` merged the Custos multi-worker seed. Later v2.1 parts are also present through `63a0110`.
 - **Blocker:** `src/cambium/supervisor.py` still contains the old slice `EventLog`, `_FallbackEventStore`, and `_FallbackSequencer`. The review's full-stack warning still applies: there is no aggregate release test or post-integration audit proving the whole stack.
 
 ## M1 — Canonical runtime and audit baseline
@@ -39,7 +42,7 @@
   3. The full scenario suite passes on Python 3.14; scenario count and commit SHA are recorded.
   4. Fresh security, conformance, and constitution audits contain no N-A caused by unmerged modules.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** The M1 substrate is merged in `3d27ba3` (`store`), `c7e19b0` (`merge`), `38e1d43` (`ipc`/`worker`), `06ce0dc` (`tasktree`), and `2822139` (`doctor`). Custos is present through `0867572`; the pipeline proof was merged by `c219edd`. The redactor is merged in `39005fa` (`src/cambium/redact.py` and `tests/scenarios/test_redact.py`) but is not wired into the supervisor: `_redacted_provider_metadata` only scrubs `provider_metadata` in the event payload, with no enqueue/INSERT redaction. The current supervisor still exposes `EventLog`, both fallback classes, and the slice `run_session`. `docs/research/m1-canonicalization-plan.md` records the canonicalization steps and explicitly marks execution of those steps as unverified. No fresh three-audit result exists for this baseline.
+- **Evidence:** The M1 substrate is merged in `3d27ba3` (`store`), `c7e19b0` (`merge`), `38e1d43` (`ipc`/`worker`), `06ce0dc` (`tasktree`), and `2822139` (`doctor`). Custos is present through `0867572`; the pipeline proof was merged by `c219edd`. The redactor is merged in `39005fa` (`src/cambium/redact.py` and `tests/scenarios/test_redact.py`) but is not wired into the supervisor: `_redacted_provider_metadata` only scrubs `provider_metadata` in the event payload, with no enqueue/INSERT redaction. The current supervisor still exposes `EventLog`, both fallback classes, and the slice `run_session`, so the M1 deletion set remains on main. The M1 executor is in-flight on `wt-m1-executor` (tip `6244edd`) and unmerged; it carries the canonicalization and `events.py`-deletion work. `docs/research/m1-canonicalization-plan.md` records the canonicalization steps and explicitly marks execution of those steps as unverified. No fresh three-audit result exists for this baseline.
 
 ## M2 — Protocol and pipe hardening
 
@@ -94,7 +97,7 @@
   3. A forced 429 falls through to a second `FAST` provider; total exhaustion pauses and then resumes after recovery without worker restart.
   4. The same task with a failing gate cannot publish to main. This is the first release evidence that joins LLM, Diffundo, Opifex, Custos, GateRunner, store, and Unio.
 - **STATUS: IN-FLIGHT**
-- **Evidence:** Strict provider configuration is merged in `228a4e1` from `edd0e60`, with the guarded import fix in `ed0c51a`. Diffundo is merged in `77f3d52` (worker-provider): `src/cambium/diffundo.py` is on the baseline and `worker.py` builds the provider router at `worker.py:48,239-258`. The M6-hygiene staging path and quota/publish-scope assertions are merged (`test_m6_staging.py` drives `run_plan` against a loopback fake provider). `CambiumLM` is still branch-local (`wt-dspy-cambiumlm`; no `src/cambium/lm.py` on the baseline). There is no `CambiumLM` real-provider run (`cambium auth run supervisor` with a real key), and no provider-to-worker-to-gate-to-Unio acceptance proof. M2-M5 are hard predecessors.
+- **Evidence:** Strict provider configuration is merged in `228a4e1` from `edd0e60`, with the guarded import fix in `ed0c51a`. Diffundo is merged in `77f3d52` (worker-provider): `src/cambium/diffundo.py` is on the baseline and `worker.py` builds the provider router at `worker.py:253,1069`. `CambiumLM` is merged in `c69ec92` (`src/cambium/lm.py` and `tests/scenarios/test_lm.py` are on the baseline; nothing in `src/cambium/` imports it yet), and the provider-backed worker agent loop is merged in `d0568a9` (`worker.py:931`). Provider staging is real: `test_m6_staging.py` drives `run_plan` against a loopback fake provider with M6-hygiene quota/publish-scope assertions. Real-provider E2E is unverified: there is no `CambiumLM` real-provider run (`cambium auth run supervisor` with a real key) and no provider-to-worker-to-gate-to-Unio acceptance proof on the baseline. M2-M5 are hard predecessors.
 
 ## M7 — Persistent worker pool
 
