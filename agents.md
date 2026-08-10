@@ -21,7 +21,7 @@ Trace callers and tests; a failed name search is not proof of absence.
 
 Current code is a deterministic Python harness. `src/cambium/__init__.py` exports only `__version__`; no public `Cambium`/`Session`/`Result` API exists.
 `worker.do_work` is a deterministic marker/commit seed; no DSPy ReAct loop is present.
-There is no example eval harness, smoke module, or example `__main__.py` on `main`; these are targets only.
+There is no example eval harness, smoke module, or example `__main__.py` in the tracked source; these are targets only.
 Custos, Opifex, Nuntius, Surculus, and Unio are architecture target names mapped to current supervisor, worker, ipc, worktree, and merge portions and symbols.
 Matching role modules are not proof. No TUI exists.
 
@@ -29,7 +29,7 @@ Matching role modules are not proof. No TUI exists.
 
 - Keep scope tight. Report required file-scope expansion before editing.
 - Work in an isolated worktree. Verify `git rev-parse --show-toplevel` and `git worktree list`; never work or commit on `main` or in a shared integration checkout.
-- Children never merge; the root supervisor owns verified, serialized merges.
+- Children never merge other branches into their own worktree. Committing to the integration branch and merging child branches are forbidden for children; all merges are root-owned, verified, and ordered.
 - Read-only reports state `files changed: none, commit: none`.
 - Do not force-push, rewrite shared history, reset another worktree, or delete work to hide a failure.
 - Secrets are environment-only. Never log or send credentials.
@@ -47,7 +47,13 @@ Matching role modules are not proof. No TUI exists.
 Current hazards: DLQ writes records unchanged when `cambium.redact` is absent; the supervisor uses a deny-by-name regex, not a strict environment allowlist. Never place credentials/sensitive content in task specs, events, gate commands/output, or DLQ records.
 
 `supervisor.run_plan` concurrently fans out supplied tasks under one `asyncio.TaskGroup`; `tasktree.py` validates but does not schedule. The architecture DAG is target only.
-Boundary failure policy: task-tree validation rejects malformed/cyclic plans; IPC protocol violations, missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged and skipped; a nonzero/timeout gate fails before merge; merge conflict or non-fast-forward emits `merge_failed` and publishes nothing; approval defaults deny and schema validation reports errors for malformed tool calls.
+Boundary failure policy:
+- `PLAN`: task-tree validation rejects malformed or cyclic plans.
+- `IPC`: protocol violations, missing correlated results, nonzero exits, and timeouts fail/restart workers; malformed advisory lines are logged and skipped.
+- `GATE`: the supervisor gate path treats a nonzero exit or timeout as failure before merge.
+- `MERGE`: a conflict or non-fast-forward emits `merge_failed`; nothing is published.
+- `APPROVAL`: missing, rejected, or unavailable approval fails closed (deny).
+- `SCHEMA`: malformed tool calls are rejected with validation errors.
 
 ## Module map
 
@@ -68,7 +74,7 @@ Coding principles pointer: `docs/research/coding-constitution.md`.
 
 ## Commands
 
-Run from the repository root. The full suite is not verified-green: the IPC fuzz timing test flakes under load; the flake exists and is under repair. Use only real checks:
+Run from the repository root. The full suite is deterministic except for the known load-sensitive IPC fuzz timing test under repair; do not report it as unconditionally green. Use only real checks:
 
 | Check | Command |
 |---|---|
@@ -81,14 +87,14 @@ Run from the repository root. The full suite is not verified-green: the IPC fuzz
 | CLI version | `uv run --python 3.14.7 cambium version` |
 | Patch check | `git diff --check` |
 
-A module CLI is allowed only when its `__main__.py` exists. None exists on `main` for the example package.
+A module CLI is allowed only when its `__main__.py` exists. None exists in the tracked example package.
 
 ## Workflow
 
 Before editing, state scope, authority, entry points, baseline, and the check that distinguishes the diagnosis from alternatives.
 Search the execution path before concluding that a symbol or command does not exist.
 Keep child worktrees disjoint. The root owns orchestration, integration, verification, and cleanup.
-Merge only verified child commits; children never commit to the integration branch.
+The root merges only verified child commits, in order; children do not merge branches or commit to the integration branch.
 After editing, inspect the diff, run the narrowest real check, then run required boundary checks.
 Report facts separately from inferences.
 Before committing, verify the worktree path and `git diff --check`. Stage only intended files and leave the tree clean.
