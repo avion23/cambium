@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shlex
 import sqlite3
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -29,7 +27,6 @@ ENV_PROBE_WORKER = str(ROOT / "tests" / "fixtures" / "env_probe_worker.py")
 NOREAD_WORKER = str(ROOT / "tests" / "fixtures" / "noread_worker.py")
 EOF_QUIET_WORKER = str(ROOT / "tests" / "fixtures" / "eof_quiet_worker.py")
 EOF_STALE_PONG_WORKER = str(ROOT / "tests" / "fixtures" / "eof_pong_worker.py")
-GATE_DESCENDANT = str(ROOT / "tests" / "fixtures" / "gate_descendant.py")
 TOO_LONG_WORKER = str(ROOT / "tests" / "fixtures" / "too_long_worker.py")
 CRASH_ONCE_WORKER = str(ROOT / "tests" / "fixtures" / "crash_once_worker.py")
 FAKE_WORKER = str(ROOT / "scripts" / "fake_worker.py")
@@ -135,17 +132,6 @@ def _install_env_hooks(repo: Path, worker_report: Path, merge_report: Path) -> N
         path = hooks / name
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
-
-
-def _wait_pid_gone(pid: int, timeout_s: float = 2.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.02)
-    pytest.fail(f"process {pid} survived process-group cleanup")
 
 
 def test_oversized_init_fails_before_spawn_without_restart_budget(tmp_path: Path) -> None:
@@ -375,108 +361,6 @@ def test_stdin_write_deadline_kills_non_reader_group(tmp_path: Path, monkeypatch
         and event["payload"].get("phase") == "stdin"
         for event in events
     )
-
-
-def test_gate_timeout_kills_descendant_process_group(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"hello.txt": "hello\n"})
-    pid_file = tmp_path / "gate-child.pid"
-    gate = (
-        f"{shlex.quote(sys.executable)} {shlex.quote(GATE_DESCENDANT)} "
-        f"{shlex.quote(str(pid_file))}"
-    )
-    task = _task(
-        session_dir,
-        repo,
-        base,
-        "t-gate-tree",
-        worker=FAKE_WORKER,
-        gate=gate,
-        gate_timeout_s=0.2,
-        max_wall_s=5.0,
-        marker="// t-gate-tree",
-    )
-
-    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
-
-    assert result.results[0].status == "failed"
-    assert result.results[0].reason == "gate_failed"
-    child_pid = int(pid_file.read_text(encoding="ascii"))
-    _wait_pid_gone(child_pid)
-    assert any(event["payload"].get("timed_out") for event in read_events(session_dir)
-               if event["kind"] == "gate")
-
-
-def test_gate_output_overflow_is_bounded_and_kills_process_group(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"hello.txt": "hello\n"})
-    pid_file = tmp_path / "noisy-gate.pid"
-    program = (
-        "import os,sys; "
-        f"open({str(pid_file)!r},'w').write(str(os.getpid())); "
-        "chunk='x'*4096; "
-        "exec(\"while True:\\n sys.stdout.write(chunk)\\n sys.stdout.flush()\")"
-    )
-    gate = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}"
-    task = _task(
-        session_dir,
-        repo,
-        base,
-        "t-gate-overflow",
-        worker=FAKE_WORKER,
-        gate=gate,
-        gate_timeout_s=5.0,
-        max_wall_s=10.0,
-    )
-
-    started = time.monotonic()
-    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
-
-    assert time.monotonic() - started < 4.0
-    assert result.results[0].status == "failed"
-    assert result.results[0].reason == "gate_failed"
-    _wait_pid_gone(int(pid_file.read_text(encoding="ascii")))
-    gate_events = _kinds(read_events(session_dir), "gate")
-    assert any(event["payload"].get("output_overflow") for event in gate_events)
-
-
-def test_gate_overflow_after_leader_exit_is_bounded_and_kills_process_group(
-    tmp_path: Path,
-) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"hello.txt": "hello\n"})
-    pid_file = tmp_path / "background-noisy-gate.pid"
-    program = (
-        "import os,sys; "
-        f"open({str(pid_file)!r},'w').write(str(os.getpid())); "
-        "chunk='x'*4096; "
-        "exec(\"while True:\\n sys.stdout.write(chunk)\\n sys.stdout.flush()\")"
-    )
-    gate = f"{shlex.quote(sys.executable)} -c {shlex.quote(program)} &"
-    task = _task(
-        session_dir,
-        repo,
-        base,
-        "t-gate-background-overflow",
-        worker=FAKE_WORKER,
-        gate=gate,
-        gate_timeout_s=2.0,
-        max_wall_s=5.0,
-    )
-
-    started = time.monotonic()
-    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
-
-    assert time.monotonic() - started < 1.5
-    assert result.results[0].status == "failed"
-    assert result.results[0].reason == "gate_failed"
-    assert result.results[0].gate_exit_code == 125
-    _wait_pid_gone(int(pid_file.read_text(encoding="ascii")))
-    gate_events = _kinds(read_events(session_dir), "gate")
-    assert any(event["payload"].get("output_overflow") for event in gate_events)
 
 
 def test_generation_seven_advances_and_never_rolls_back_on_restart(
@@ -1199,22 +1083,3 @@ def test_oversized_stdout_line_fails_custos_reader(
         event["kind"] == "protocol" and event["payload"].get("note") == "MessageTooLong"
         for event in read_events(session_dir)
     )
-
-
-def test_slice_heavy_gate_passes_through_session_gate(tmp_path: Path) -> None:
-    """The slice path threads a session CompileGate through its gate runner."""
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-    spec = _slice_spec(session_dir, "cambium.worker")
-    spec["marker"] = "// slice-heavy-gate"
-    spec["gate"] = "make --version"
-
-    result = asyncio.run(run_session(session_dir, spec))
-
-    assert result.status == "succeeded"
-    assert result.exit_code == 0
-    assert result.gate_exit_code == 0
-    gate_events = _kinds(read_events(session_dir), "gate")
-    assert gate_events
-    assert all(event["payload"].get("heavy") is True for event in gate_events)
-    assert not any(event["payload"].get("resource_denied") for event in gate_events)

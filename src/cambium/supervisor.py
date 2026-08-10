@@ -4,9 +4,10 @@ Speaks the Nuntius JSON-Lines wire protocol (docs/architecture.md §5) with N
 worker subprocesses under one ``asyncio.TaskGroup``: spawn ``python -m
 cambium.worker`` (or a task's ``worker`` script) inside a git worktree,
 correlate ``init`` -> ``ready`` -> ``run_task`` -> ``result_envelope`` ->
-``exit_message`` by request_id, run each task's gate command, and publish the
-worker branch onto ``refs/heads/main`` atomically through
-``cambium.merge.MergeSequencer``.
+``exit_message`` by request_id, and publish the worker branch onto
+``refs/heads/main`` atomically through ``cambium.merge.MergeSequencer`` when
+the worker's envelope reports ``succeeded``. There is no pre-merge gate: the
+worker verdict alone decides merge eligibility.
 
 Every event is persisted to ``<session_dir>/.cambium/events.db`` through the
 canonical ``cambium.store.EventStore`` (readable via ``read_events``).
@@ -32,7 +33,6 @@ import math
 import os
 import random
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -46,7 +46,6 @@ from typing import Any
 from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
 from cambium.provider_config import DEFAULT_PROVIDER_PATH
-from cambium.resources import DEFAULT_ACQUIRE_TIMEOUT_S, CompileGate
 from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
@@ -65,7 +64,6 @@ OUTBOUND_MESSAGE_TOO_LONG = "outbound_message_too_long"
 STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
 PROCESS_REAP_TIMEOUT_S = 5.0
-GATE_OUTPUT_LIMIT_BYTES = 64 * 1024
 
 EventSink = Callable[[dict[str, Any]], None]
 
@@ -133,7 +131,7 @@ class SliceResult:
     gate_exit_code: int | None = None
     merge_sha: str | None = None
     timed_out: bool = False
-    timeout_phase: str | None = None  # "ready" | "run" | "gate" | "wall"
+    timeout_phase: str | None = None  # "ready" | "wall" | "heartbeat" | "pong" | "stdin"
 
 
 _TIMEOUT_PHASES = ("ready", "wall", "heartbeat", "pong", "stdin")
@@ -217,85 +215,6 @@ async def _kill_process_group_and_reap(proc: asyncio.subprocess.Process) -> None
         pass
 
 
-class _GateOutputOverflow(RuntimeError):
-    def __init__(self, stdout: bytes, stderr: bytes) -> None:
-        super().__init__("gate output exceeded capture limit")
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-async def _communicate_gate_bounded(
-    proc: asyncio.subprocess.Process, timeout: float
-) -> tuple[bytes, bytes]:
-    """Capture at most GATE_OUTPUT_LIMIT_BYTES across both gate streams."""
-    captured = {"stdout": bytearray(), "stderr": bytearray()}
-    total = 0
-    overflow = asyncio.Event()
-
-    async def drain(name: str, stream: asyncio.StreamReader | None) -> None:
-        nonlocal total
-        if stream is None:
-            return
-        while True:
-            chunk = await stream.read(8192)
-            if not chunk:
-                return
-            remaining = GATE_OUTPUT_LIMIT_BYTES - total
-            if remaining > 0:
-                kept = chunk[:remaining]
-                captured[name].extend(kept)
-                total += len(kept)
-            if len(chunk) > remaining:
-                overflow.set()
-                return
-
-    readers = [
-        asyncio.create_task(drain("stdout", proc.stdout)),
-        asyncio.create_task(drain("stderr", proc.stderr)),
-    ]
-
-    async def wait_for_readers() -> None:
-        await asyncio.gather(*readers)
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    readers_done = asyncio.create_task(wait_for_readers())
-    process_done = asyncio.create_task(proc.wait())
-    output_full = asyncio.create_task(overflow.wait())
-    try:
-        done, _pending = await asyncio.wait(
-            {readers_done, output_full}, timeout=max(0.0, deadline - loop.time()),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if not done:
-            await _kill_process_group_and_reap(proc)
-            await asyncio.gather(*readers, return_exceptions=True)
-            raise TimeoutError
-        if output_full in done and overflow.is_set():
-            await _kill_process_group_and_reap(proc)
-            await asyncio.gather(*readers, return_exceptions=True)
-            raise _GateOutputOverflow(bytes(captured["stdout"]), bytes(captured["stderr"]))
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            await _kill_process_group_and_reap(proc)
-            raise TimeoutError
-        try:
-            await asyncio.wait_for(process_done, remaining)
-        except TimeoutError:
-            await _kill_process_group_and_reap(proc)
-            raise
-        return bytes(captured["stdout"]), bytes(captured["stderr"])
-    except asyncio.CancelledError:
-        await _kill_process_group_and_reap(proc)
-        await asyncio.gather(*readers, return_exceptions=True)
-        raise
-    finally:
-        for task in (*readers, readers_done, process_done, output_full):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(readers_done, process_done, output_full, return_exceptions=True)
-
-
 async def run_session(
     session_dir: str | Path,
     task_spec: dict[str, Any],
@@ -366,7 +285,8 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
 # git worktree; liveness is the four-layer model (process exit, exit
 # message, heartbeat watchdog, EOF-as-advisory); restarts use full-jitter
 # backoff with a per-task cap; worktrees are hard-reset before every
-# respawn; results are gated and merged atomically onto refs/heads/main.
+# respawn; a clean worker whose envelope reports "succeeded" is merged
+# atomically onto refs/heads/main (no pre-merge gate).
 #
 # cambium.store and cambium.merge are runtime dependency contracts.
 # =====================================================================
@@ -374,7 +294,6 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
 DEFAULT_READY_TIMEOUT_S = 10.0
 DEFAULT_HEARTBEAT_INTERVAL_S = 15.0
 DEFAULT_HEARTBEAT_TIMEOUT_S = 90.0
-DEFAULT_GATE_TIMEOUT_S = 30.0
 DEFAULT_WALL_BUDGET_S = 300.0
 DEFAULT_MAX_RESTARTS = 3
 DEFAULT_MAX_TURNS = 20
@@ -670,8 +589,6 @@ class _Runtime:
         *,
         redactor: Redactor | None = None,
         resource_thresholds: dict[str, Any] | None = None,
-        compile_gate_max_concurrent: int | None = None,
-        compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -680,14 +597,9 @@ class _Runtime:
         self._resource_thresholds = (
             None if resource_thresholds is None else dict(resource_thresholds)
         )
-        self._gate = CompileGate(
-            max_concurrent=compile_gate_max_concurrent,
-            timeout_s=compile_gate_acquire_timeout_s,
-        )
         self._event_append_lock = asyncio.Lock()
         self._handles: dict[str, WorkerHandle] = {}
         self._results: dict[str, TaskResult] = {}
-        self._gates: dict[str, dict[str, int]] = {}
         self._worktree_lock = asyncio.Lock()
         self._merge_lock = asyncio.Lock()
         self._rid = 0
@@ -1224,28 +1136,23 @@ class _Runtime:
                         reason=integrity, gate_exit_code=None, restarts=restarts,
                     )
                     return
-                gate_rc = await self._run_gate(spec, worktree)
-                verdict_ok = bool(
-                    outcome.envelope and outcome.envelope.get("status") == "succeeded"
-                )
-                if verdict_ok and gate_rc == 0:
+                if outcome.envelope and outcome.envelope.get("status") == "succeeded":
                     merged = await self._merge_task(spec, handle)
                     if merged is not None:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
-                            reason=None, merge_sha=merged, gate_exit_code=gate_rc,
+                            reason=None, merge_sha=merged, gate_exit_code=0,
                             restarts=restarts,
                         )
                     else:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
-                            reason="merge_failed", gate_exit_code=gate_rc, restarts=restarts,
+                            reason="merge_failed", gate_exit_code=0, restarts=restarts,
                         )
                 else:
-                    reason = "gate_failed" if gate_rc != 0 else "worker_verdict_failed"
                     self._results[task_id] = TaskResult(
-                        task_id=task_id, status="failed", exit_code=1, reason=reason,
-                        gate_exit_code=gate_rc, restarts=restarts,
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason="worker_verdict_failed", gate_exit_code=0, restarts=restarts,
                     )
                 return
             if outcome.fatal:
@@ -1745,17 +1652,17 @@ class _Runtime:
             correlated=correlated,
         )
 
-    # -- gate ----------------------------------------------------------------
+    # -- publish eligibility --------------------------------------------------
 
     async def _worker_success_integrity(
         self, spec: dict[str, Any], worktree: Path
     ) -> str | None:
-        """Reject an unpublishable worker verdict before the gate runs.
+        """Reject an unpublishable worker verdict before merging.
 
         Returns a failure reason when the worker's success claim is not
         backed by a clean, attached worktree: a detached HEAD means the
         worker's commits may be lost, and tracked/untracked modifications
-        mean the gate would not be gating the worker's actual state. The
+        mean the merge would capture state the worker never claimed. The
         supervisor-owned ``.cambium`` fence directory is exempt.
         """
         worktree = Path(worktree)
@@ -1777,91 +1684,6 @@ class _Runtime:
         ):
             return "worker_tree_dirty"
         return None
-
-    async def _run_gate(self, spec: dict[str, Any], worktree: Path) -> int:
-        """Run the task's gate command in the worktree (30s, bounded capture);
-        skip a rerun when the worktree tree hash is unchanged since the last run."""
-        task_id = spec["task_id"]
-        gate = spec.get("gate", "true")
-        timeout = _cfg_float(
-            spec, "gate_timeout_s", "CAMBIUM_GATE_TIMEOUT_S", DEFAULT_GATE_TIMEOUT_S
-        )
-        if not Path(worktree).exists():
-            await self.emit("gate", task_id=task_id, exit_code=127, note="worktree missing")
-            return 127
-        tree = await self._git_stdout(Path(worktree), "write-tree", check=False)
-        gates = self._gates.setdefault(task_id, {})
-        if tree is not None and tree in gates:
-            rc = gates[tree]
-            await self.emit("gate", task_id=task_id, exit_code=rc, skipped=True, tree=tree)
-            return rc
-        command_tokens = shlex.split(gate)
-        is_heavy = self._gate.is_heavy(command_tokens)
-        token = await self._gate.acquire(command_tokens) if is_heavy else None
-        if token is False:
-            await self.emit(
-                "gate", task_id=task_id, exit_code=126, tree=tree,
-                timed_out=False, resource_denied=True, heavy=is_heavy,
-            )
-            return 126
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "sh", "-c", gate, cwd=str(worktree),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
-                start_new_session=True,
-                pass_fds=(),
-                close_fds=True,
-            )
-            out, err = await _communicate_gate_bounded(proc, timeout)
-            rc = proc.returncode if proc.returncode is not None else 1
-        except _GateOutputOverflow as exc:
-            rc = 125
-            await self.emit(
-                "gate", task_id=task_id, exit_code=rc, tree=tree,
-                timed_out=False, output_overflow=True, heavy=is_heavy,
-            )
-            output = exc.stdout + exc.stderr
-            if output:
-                message = output.decode("utf-8", "replace")
-                if self._redactor is not None:
-                    message = self._redactor.redact_escaped(message)
-                await self.emit(
-                    "log", task_id=task_id, stream="gate",
-                    message=message[:2048],
-                )
-        except TimeoutError:
-            if proc is not None:
-                await _kill_process_group_and_reap(proc)
-            rc = 124
-            await self.emit(
-                "gate", task_id=task_id, exit_code=rc, tree=tree,
-                timed_out=True, heavy=is_heavy,
-            )
-        except asyncio.CancelledError:
-            if proc is not None:
-                await _kill_process_group_and_reap(proc)
-            raise
-        else:
-            if tree is not None:
-                gates[tree] = rc
-            await self.emit(
-                "gate", task_id=task_id, exit_code=rc, tree=tree,
-                timed_out=False, heavy=is_heavy,
-            )
-            output = (out or b"") + (err or b"")
-            if output:
-                message = output.decode("utf-8", "replace")
-                if self._redactor is not None:
-                    message = self._redactor.redact_escaped(message)
-                await self.emit(
-                    "log", task_id=task_id, stream="gate",
-                    message=message[:2048],
-                )
-        finally:
-            self._gate.release(token)
-        return rc
 
     # -- merge ---------------------------------------------------------------
 
@@ -2163,8 +1985,8 @@ def _task_canonical_status(result: TaskResult) -> str:
     """Map one supervisor TaskResult verdict to a canonical root status.
 
     The supervisor verdict is authoritative: a worker ``succeeded`` maps to
-    ``done`` only after the gate and merge passed (the caller records the
-    merged TaskResult); any failed TaskResult is ``failed`` unless its reason
+    ``done`` only after the merge passed (the caller records the merged
+    TaskResult); any failed TaskResult is ``failed`` unless its reason
     identifies a drive-phase timeout.
     """
     if result.status == "succeeded":
@@ -2254,15 +2076,15 @@ async def run_plan(
     on_event: EventSink | None = None,
     *,
     resource_thresholds: dict[str, Any] | None = None,
-    compile_gate_max_concurrent: int | None = None,
-    compile_gate_acquire_timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
     Workers are spawned as ``python -m cambium.worker`` (or the task's
-    ``worker`` script); results are gated and merged onto ``refs/heads/main``.
-    Publication is ref-only: ``refs/heads/main`` advances via atomic
-    ``update-ref`` and no checkout is refreshed.
+    ``worker`` script); a clean worker whose envelope reports ``succeeded`` is
+    merged onto ``refs/heads/main``. There is no pre-merge gate: the worker
+    verdict alone decides merge eligibility. Publication is ref-only:
+    ``refs/heads/main`` advances via atomic ``update-ref`` and no checkout is
+    refreshed.
     Returns a PlanResult; the session's event log is durable in
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
     canonical root result is written atomically to
@@ -2287,8 +2109,6 @@ async def run_plan(
             on_event=on_event,
             redactor=redactor,
             resource_thresholds=resource_thresholds,
-            compile_gate_max_concurrent=compile_gate_max_concurrent,
-            compile_gate_acquire_timeout_s=compile_gate_acquire_timeout_s,
         )
         await runtime.start()
         cancelled = False
@@ -2343,7 +2163,6 @@ def _builtin_demo_spec(session_dir: Path) -> dict[str, Any]:
         "target_file": "hello.txt",
         "marker": "// cambium-slice",
         "write_marker": True,
-        "gate": "grep -q '// cambium-slice' hello.txt",
         "task": "append the cambium-slice marker line to the target file",
     }
 

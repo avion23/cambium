@@ -3,16 +3,16 @@
 Ordered work only. Source and tests decide when a step is complete; this file
 is not a branch ledger or merge log.
 
-## 1. Live-run prerequisites
+## 1. Live-run prerequisites — gates removed by decision
 
-- Bound worker admission in `run_plan`. Its flat `TaskGroup` starts one
-  lifecycle per task; an 11-task canary observed 11 concurrent supervisions.
-  Keep host-health `resource_thresholds` separate from heavy-command
-  `CompileGate` limits.
-- Fix free-form redaction so mixed raw/Unicode-escaped stderr cannot retain a
-  credential escape; the bench canary must pass. Keep live use blocked until
-  admission, redaction, credentials/configuration, and OS containment are
-  verified.
+- The pre-merge gate runner, its `CompileGate` concurrency bound, and the
+  escaped free-form redaction canary were removed by product decision: this is
+  a local development tool run directly from source, so there is no production
+  gating. The bench canary test no longer exists.
+- Observation that still stands: `run_plan`'s flat `TaskGroup` starts one
+  lifecycle per task with no worker-count semaphore; an 11-task canary observed
+  11 concurrent supervisions. `resource_thresholds` remains the only pre-run
+  host-health check.
 
 ## 2. Smallest production hierarchy slice: static waves
 
@@ -37,18 +37,12 @@ is not a branch ledger or merge log.
   over-width revisions spawn nothing; a valid child is admitted only at a ready
   wave and its envelope is visible only to its parent.
 
-## 4. Per-worker OS containment and approval
+## 4. Per-worker OS containment and approval — removed by decision
 
-- Select and implement the host boundary for each worker's process, filesystem,
-  CPU/memory/task limits, network policy, and teardown. Worktree/process-group
-  isolation alone is not sufficient.
-- Pass an `approval.py:ApprovalGate` policy and callback into the worker tool
-  context (consumed by `tools.py`). Keep denied commands fail-closed; treat
-  `fail_open` as development configuration only.
-- Add focused checks for containment setup/teardown, resource exhaustion,
-  denied and unavailable approval, and no publication after control failure.
-- Acceptance measures: a denied or unavailable approval cannot run the command;
-  a containment setup or teardown failure cannot publish a worker result.
+- OS containment and `approval.py:ApprovalGate` policy/callback wiring in the
+  worker tool context are removed by product decision. Worktree/process-group
+  isolation remains the only worker boundary; `tools.py` `run_shell`/`git_op`
+  execute without approval. The allowlist and argument validation stay.
 
 ## 5. Provider usage, prompt stability, and quota contract
 
@@ -70,16 +64,15 @@ is not a branch ledger or merge log.
 
 ## 6. External-provider smoke
 
-- After steps 1, 4, and 5 are verified and credentials exist, run one disposable
-  provider configuration through the custom worker loop, tool/checkpoint
-  events, deterministic gate, and ref-only merge under the selected
-  containment boundary.
+- After step 5 is verified and credentials exist, run one disposable provider
+  configuration through the custom worker loop, tool/checkpoint events, and
+  ref-only merge (no pre-merge gate).
 - Keep the run opt-in and networked only by explicit command. Record request
-  count, usage events, commit, gate result, merge ref, and the failure case that
-  leaves `main` unchanged without recording secrets.
+  count, usage events, commit, merge ref, and the failure case that leaves
+  `main` unchanged without recording secrets.
 - Acceptance measures: the credentialed run has a recorded provider response,
-  usage record, passing gate, one expected ref update, and an unchanged `main`
-  on the failure fixture.
+  usage record, one expected ref update, and an unchanged `main` on the
+  failure fixture.
 - Local fake-provider fixtures can support regression tests, but they do not
   substitute for an external-provider run or prove per-worker OS isolation.
 

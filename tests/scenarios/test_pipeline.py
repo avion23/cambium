@@ -175,11 +175,10 @@ def test_tasktree_plan_runs_supervisor_subprocess_to_three_merges(tmp_path) -> N
         task_events = [event["kind"] for event in events if event["task_id"] == task_id]
         positions = {
             kind: task_events.index(kind)
-            for kind in ("task_assigned", "gate", "merge_started", "merge_committed")
+            for kind in ("task_assigned", "merge_started", "merge_committed")
         }
         assert (
             positions["task_assigned"]
-            < positions["gate"]
             < positions["merge_started"]
             < positions["merge_committed"]
         )

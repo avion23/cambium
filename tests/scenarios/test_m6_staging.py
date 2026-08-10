@@ -1,4 +1,4 @@
-"""M6 staging: provider completion -> worker decision -> gate -> publish."""
+"""M6 staging: provider completion -> worker decision -> publish."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import copy
 import json
 import os
-import shlex
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -241,7 +240,7 @@ def _isolate_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("no_proxy", _LOOPBACK_NO_PROXY)
 
 
-def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatch) -> None:
+def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) -> None:
     """Run two uncached provider calls, then publish the second decision once."""
     _reset_fake_server()
     server = _FakeOpenAIServer()
@@ -300,7 +299,6 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
 
         target_file, marker = _decision_fields(second.content)
         base = _make_repo(repo)
-        gate = f"grep -Fqx -- {shlex.quote(marker)} {shlex.quote(target_file)}"
         plan = {
             "tasks": [
                 {
@@ -313,10 +311,8 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
                     "target_file": target_file,
                     "marker": marker,
                     "write_marker": True,
-                    "gate": gate,
                     "base_commit": base,
                     "ready_timeout_s": 5.0,
-                    "gate_timeout_s": 5.0,
                     "max_wall_s": 20.0,
                 }
             ]
@@ -348,9 +344,9 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
         task_events = [event for event in events if event["task_id"] == "m6-staging"]
         positions = {
             kind: next(index for index, event in enumerate(task_events) if event["kind"] == kind)
-            for kind in ("result", "gate", "merge_started", "merge_committed")
+            for kind in ("result", "merge_started", "merge_committed")
         }
-        assert positions["result"] < positions["gate"] < positions["merge_started"]
+        assert positions["result"] < positions["merge_started"]
         assert positions["merge_started"] < positions["merge_committed"]
         result_events = [event for event in task_events if event["kind"] == "result"]
         assert len(result_events) == 1
@@ -362,58 +358,6 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
     finally:
         _remove_worker_worktree(repo, worktree, branch)
         server.close()
-
-
-def test_m6_failing_gate_does_not_publish(tmp_path: Path, monkeypatch) -> None:
-    """A failed gate leaves main at the base commit and emits no merge event."""
-    _set_absolute_pythonpath(monkeypatch)
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    worktree = session_dir / "worker-wt"
-    branch = "wt-m6-gate-fail"
-    target_file = "target.txt"
-    marker = "// m6-gate-marker"
-    task_id = "m6-gate-fail"
-    base = _make_repo(repo)
-    plan = {
-        "tasks": [
-            {
-                "task_id": task_id,
-                "task": f"append marker line to file {target_file}: {marker}",
-                "repo": str(repo),
-                "worktree_path": str(worktree),
-                "branch": branch,
-                "worker": "cambium.worker",
-                "target_file": target_file,
-                "marker": marker,
-                "write_marker": True,
-                "gate": "false",
-                "base_commit": base,
-                "ready_timeout_s": 5.0,
-                "gate_timeout_s": 5.0,
-                "max_wall_s": 20.0,
-            }
-        ]
-    }
-
-    try:
-        result = asyncio.run(run_plan(session_dir, plan))
-        assert result.exit_code == 1
-        assert len(result.results) == 1
-        task_result = result.results[0]
-        assert task_result.task_id == task_id
-        assert task_result.status == "failed"
-        assert task_result.reason == "gate_failed"
-        assert task_result.gate_exit_code != 0
-        assert task_result.merge_sha is None
-        assert _git(repo, "rev-parse", "refs/heads/main").stdout.strip() == base
-        assert marker not in _git(repo, "show", f"{base}:{target_file}").stdout
-
-        task_events = [event for event in read_events(session_dir) if event["task_id"] == task_id]
-        assert any(event["kind"] == "gate" for event in task_events)
-        assert not any(event["kind"] == "merge_committed" for event in task_events)
-    finally:
-        _remove_worker_worktree(repo, worktree, branch)
 
 
 def test_m6_forced_429_falls_back_to_next_provider(tmp_path: Path, monkeypatch) -> None:
