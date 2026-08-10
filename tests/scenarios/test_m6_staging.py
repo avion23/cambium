@@ -17,7 +17,7 @@ import pytest
 
 pytest.importorskip("cambium.diffundo")
 
-from cambium.diffundo import Diffundo, ProviderTier  # noqa: E402
+from cambium.diffundo import Diffundo, ProviderError, ProviderOutcome, ProviderTier  # noqa: E402
 from cambium.provider_config import load_providers  # noqa: E402
 from cambium.supervisor import read_events, run_plan  # noqa: E402
 
@@ -334,9 +334,14 @@ def test_m6_provider_decision_gate_and_atomic_publish(tmp_path: Path, monkeypatc
         assert main_sha == task_result.merge_sha
         assert _git(repo, "merge-base", "--is-ancestor", base, main_sha).returncode == 0
         assert _git(repo, "rev-list", "--count", f"{base}..{main_sha}").stdout.strip() == "1"
+        changed_files = _git(repo, "diff", "--name-only", f"{base}..{main_sha}").stdout.splitlines()
+        assert changed_files == [target_file]
         diff = _git(repo, "diff", f"{base}..{main_sha}").stdout
         assert f"+{marker}" in diff
-        assert marker in _git(repo, "show", f"{main_sha}:{target_file}").stdout
+        base_target = _git(repo, "show", f"{base}:{target_file}").stdout
+        published_target = _git(repo, "show", f"{main_sha}:{target_file}").stdout
+        assert published_target == base_target.rstrip("\n") + f"\n{marker}\n"
+        assert published_target.splitlines().count(marker) == 1
 
         events = read_events(session_dir)
         task_events = [event for event in events if event["task_id"] == "m6-staging"]
@@ -428,11 +433,24 @@ def test_m6_forced_429_falls_back_to_next_provider(tmp_path: Path, monkeypatch) 
         providers = load_providers(config_path)
         router = Diffundo(providers, call_budget_s=5.0, pause_timeout_s=0.1)
 
+        failed_outcomes: list[ProviderOutcome] = []
+        original_attempt = router._attempt
+
+        async def record_attempt(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await original_attempt(*args, **kwargs)
+            except ProviderError as exc:
+                failed_outcomes.append(exc.outcome)
+                raise
+
+        monkeypatch.setattr(router, "_attempt", record_attempt)
+
         prompt = {"messages": [{"role": "user", "content": "hello"}]}
         result = asyncio.run(router.call(ProviderTier.FAST, prompt))
 
         assert result.provider == "m6-fake-fallback"
         assert result.content == DECISION
+        assert failed_outcomes == [ProviderOutcome.QUOTA]
         assert FAKE_REQUESTS["statuses"] == [429, 200]
         assert FAKE_REQUESTS["count"] == 2
     finally:
