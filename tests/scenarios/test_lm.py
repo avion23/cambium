@@ -416,6 +416,24 @@ def test_predict_json_save_rejects_byte_credential_keys(tmp_path: Path) -> None:
     assert not state_path.exists()
 
 
+def test_predict_json_save_rejects_tuple_credential_keys(tmp_path: Path) -> None:
+    _require_dspy()
+    import dspy
+
+    predict = dspy.Predict("question -> answer")
+    state_path = tmp_path / "state.json"
+
+    with pytest.raises(ValueError, match="provider credentials"):
+        predict.lm = CambiumLM(  # type: ignore[arg-type]
+            FakeDiffundo(),
+            ProviderTier.FAST,
+            extensions={("api_key",): "SENSITIVE_CANARY"},
+        )
+        predict.save(state_path)
+
+    assert not state_path.exists()
+
+
 def test_predict_failed_json_save_preserves_existing_state(tmp_path: Path) -> None:
     _require_dspy()
     import dspy

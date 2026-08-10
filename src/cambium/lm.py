@@ -139,10 +139,12 @@ def _require_exact_keyword_keys(kwargs: Mapping[Any, Any]) -> None:
 def _contains_secret_marker(key: Any) -> bool:
     if type(key) is bytes:
         key = key.decode("latin-1")
-    if type(key) is not str:
-        return False
-    normalized = "".join(character for character in str.lower(key) if str.isalnum(character))
-    return any(marker in normalized for marker in _SECRET_MARKERS)
+    if type(key) is str:
+        normalized = "".join(character for character in str.lower(key) if str.isalnum(character))
+        return any(marker in normalized for marker in _SECRET_MARKERS)
+    if isinstance(key, tuple | frozenset | list):
+        return any(_contains_secret_marker(element) for element in key)
+    return False
 
 
 def _reject_unknown_keyword_keys(kwargs: Mapping[str, Any], allowed: frozenset[str]) -> None:
