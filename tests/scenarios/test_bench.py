@@ -926,6 +926,7 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     )
     assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
     artifact = json.loads((bench_root / "drift-report.json").read_text())
+    assert os.stat(bench_root / "drift-report.json").st_mode & 0o077 == 0
     regressions = artifact["modules"]["should_decompose"]["regressions"]
     assert any(field == "metric.train.mean" for field, _detail in regressions)
 
@@ -951,6 +952,33 @@ def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     assert "symlink" in captured.err
     assert anchor_path.read_bytes() == anchor_before  # anchor bytes unchanged
     assert artifact.is_symlink()  # artifact never materialized over the link
+
+
+def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A drift-report.json hard-linked to a baseline anchor must not be
+    overwritten by the gate: the write fails closed on the pre-existing file,
+    preserving the anchor, and the run fails."""
+    import cambium.bench as bench
+
+    bench_root = tmp_path / "baselines"
+    assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
+    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_before = anchor_path.read_bytes()
+    anchor_ino = anchor_path.stat().st_ino
+    artifact = bench_root / "drift-report.json"
+    os.link(anchor_path, artifact)
+    assert anchor_path.stat().st_nlink == 2
+
+    assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
+
+    captured = capsys.readouterr()
+    assert "already exists" in captured.err
+    assert anchor_path.stat().st_ino == anchor_ino  # same inode, never replaced
+    assert anchor_path.read_bytes() == anchor_before  # anchor bytes unchanged
+    assert artifact.stat().st_ino == anchor_ino  # artifact still aliases the anchor
+    assert anchor_path.stat().st_nlink == 2  # hard link never unlinked
 
 
 def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(

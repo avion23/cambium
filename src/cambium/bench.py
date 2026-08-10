@@ -766,11 +766,14 @@ def _write_drift_report(
 ) -> Path:
     """Write a drift artifact summarizing each module against its anchor.
 
-    The artifact path must never be a symlink: a symlinked
-    ``drift-report.json`` could redirect the write onto a baseline anchor,
-    violating "gate never writes the baseline". The path is checked and then
-    opened with ``O_NOFOLLOW`` so a symlink is rejected atomically at write
-    time instead of being followed.
+    The artifact must never alias a baseline anchor, so ``drift-report.json``
+    is not allowed to pre-exist: a symlink could redirect the write onto an
+    anchor, and a hard link would let a truncating write clobber the anchor in
+    place, violating "gate never writes the baseline". The path is rejected if
+    it exists and is then created with ``O_CREAT|O_EXCL|O_NOFOLLOW``, so a
+    pre-existing file (regular or hard-linked) or symlink fails the run
+    atomically instead of being opened or followed. The file is created mode
+    ``0o600`` so the drift artifact stays private.
     """
     artifact: dict[str, Any] = {
         "schema_version": 1,
@@ -789,13 +792,18 @@ def _write_drift_report(
         },
     }
     path = root / "drift-report.json"
-    if path.is_symlink():
+    if os.path.lexists(path):
+        kind = "a symlink" if path.is_symlink() else "a file"
         raise OSError(
-            f"refusing to write drift report: {path} is a symlink; remove it "
-            "and rerun to allow the artifact to be written"
+            f"refusing to write drift report: {path} already exists ({kind}); "
+            "remove it and rerun to allow the artifact to be written"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW)
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(artifact, indent=2) + "\n")
     return path
