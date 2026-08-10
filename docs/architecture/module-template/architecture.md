@@ -17,6 +17,31 @@
 | Status | Draft \| In review \| Build-ready \| Done |
 | Version | semver of this module's primary implementation file (e.g., `decide.py`, `0.1.0`); a future DSPy replacement is versioned separately |
 
+### 1.1 Current module catalogue (reference)
+
+These are the current top-level implementation modules. They are references for
+module authors, not files to copy into every decision module.
+
+| Module | Current role and implementation reference |
+|---|---|
+| `bench` | Benchmark report and drift-gate plugin; `src/cambium/bench.py`. |
+| `redact` | Redaction integration used before dead-letter persistence; the current seam is `src/cambium/dlq.py`. |
+| `conversations` | Branchable SQLite-backed conversation history; `src/cambium/conversations.py`. |
+| `dlq` | Durable, bounded dead-letter records; `src/cambium/dlq.py`. |
+| `resources` | Supervisor-owned heavy-command and resource-budget controls; `src/cambium/resources.py`. |
+| `approval` | Command policy classification and approval boundary; `src/cambium/approval.py`. |
+| `fencing` | Worktree generation fencing for worker recovery; `src/cambium/fencing.py`. |
+| `system_health` | Point-in-time host memory, load, disk, and descriptor health checks; `src/cambium/system_health.py`. |
+| `lint_diag` | Ruff subprocess adapter and worker-context diagnostics; `src/cambium/lint_diag.py`. |
+| `ast_tools` | Python definition, reference, and signature search; `src/cambium/ast_tools.py`. |
+| `schemas` | JSON Schema generation and validation, including `TOOL_SCHEMAS`; `src/cambium/schemas.py`. |
+| `eval_cache` | Opt-in bounded disk cache for the frozen evaluation harness; `src/cambium/eval_cache.py`. |
+| `provider_config` | Strict environment-keyed Diffundo provider configuration; `src/cambium/provider_config.py`. |
+| `cli` | Unified `cambium` command-line adapter; `src/cambium/cli.py`. |
+
+The `redact` entry is anchored at its current DLQ integration seam because the
+checkout has no separate redaction implementation file.
+
 ---
 
 ## 2. Purpose
@@ -48,12 +73,12 @@ For each input: source (which module/caller produces it), validation rules (leng
 ```python
 @dataclass(frozen=True)
 class <Module>Output:
-    decision: Literal["yes", "no"]      # use enums for domain alternatives
+    decision: <DecisionEnum>              # domain enum; serialize at the wire boundary
     confidence: float                    # [0.0, 1.0]
     rationale: str
 ```
 
-For each output: consumer (which module reads it), invariants the consumer relies on, serialization rules (must be JSON-serializable for the event log).
+For each output: consumer (which module reads it), invariants the consumer relies on, serialization rules (must be JSON-serializable for the canonical event store).
 
 ### 3.3 Errors
 
@@ -64,6 +89,21 @@ class <Module>Error(Exception): ...
 class InvalidInput(<Module>Error): ...
 class ModelUnavailable(<Module>Error): ...   # raised only after Diffundo cascade exhausted
 ```
+
+### 3.4 Domain enums and tool surface
+
+Closed domain alternatives use enums, not string allowlists or booleans in
+domain logic. The `Decision` pattern at
+`src/cambium/modules/example/decide.py` is normative: keep the enum in the
+domain model and preserve the existing wire representation at the boundary.
+For `should_decompose`, the JSON `expected.decompose` boolean remains stable;
+the loader maps it to `Decision`, and the read-only boolean view exists only for
+compatibility.
+
+`TOOL_SCHEMAS` in `src/cambium/schemas.py` and the `tools.py` dispatch layer
+are the canonical tool surface. A new module that adds tools extends
+`TOOL_SCHEMAS` in `schemas.py`; it must not create a parallel schema registry
+or dispatch contract.
 
 ---
 
@@ -123,7 +163,9 @@ class <Module>DSPy(<Module>Module):
         pred = self._clf(task=input.task, context=input.context)
         # Attribute access on dspy.Prediction (pred.dict() does NOT exist):
         return <Module>Output(
-            decompose=bool(pred.decompose),
+            decision=(<DecisionEnum>.DECOMPOSE
+                      if bool(pred.decompose)
+                      else <DecisionEnum>.DO_NOT_DECOMPOSE),
             reason=str(pred.reason),
         )
 
@@ -155,10 +197,12 @@ def metric(example: Example) -> float:
     prediction = example.prediction
     if prediction is None:
         return 0.0
-    expected = example.expected.get("decompose")
-    if not isinstance(expected, bool):
+    expected = example.expected.get("decision")
+    if not isinstance(expected, <DecisionEnum>):
         return 0.0
-    return 1.0 if prediction.decompose == expected else 0.0
+    if not isinstance(prediction.decision, <DecisionEnum>):
+        return 0.0
+    return 1.0 if prediction.decision is expected else 0.0
 ```
 
 (Reference: `should_decompose_metric` in `src/cambium/modules/example/metric.py` — the canonical instance of this contract.)
@@ -175,7 +219,7 @@ State:
 
 Reference: `dataset-format.md` for schema and versioning. In this section, state:
 
-- Dataset path: **v2** — single combined `src/cambium/modules/<name>/datasets/<name>_pairs.jsonl` (with inline `canary: true` markers); **v2.1 target** — `src/cambium/modules/<name>/datasets/{train,eval,canaries}.jsonl`.
+- Dataset path: current split-aware modules use `src/cambium/modules/<name>/datasets/{train,eval,canaries}.jsonl`; a legacy v2 combined `src/cambium/modules/<name>/datasets/<name>_pairs.jsonl` may remain as an explicit loader fallback.
 - Train size, eval size (frozen, held-out), canary count.
 - Provenance: how were the examples collected? Hand-authored? Mined from production? Both?
 - Schema version (`schema_version` field, integer, monotonic).
@@ -201,12 +245,21 @@ List at least five. If you cannot think of five, the module is under-specified.
 
 ## 9. Test Strategy
 
-Module tests are colocated with the module in `src/cambium/modules/<name>/tests/`.
-Module baselines live in `src/cambium/modules/<name>/tests/baselines/`.
-Harness-level tests (supervisor, store, merge, ipc, worker, tasktree, diffundo, bench,
-redact, doctor, cli, conformance) live in `tests/scenarios/`. A module is removable by
-deleting its directory, including its code, tests, datasets, baselines, and
-`architecture.md`.
+This layout is normative. Module tests are colocated with the module in
+`src/cambium/modules/<name>/tests/`; module baselines live in
+`src/cambium/modules/<name>/tests/baselines/`; harness-level tests for shared
+runtime behavior live in `tests/scenarios/`. There is no module-specific test
+copy under `tests/scenarios/`.
+
+The module removability rule is normative: a module is removable by deleting
+its directory, including its code, colocated tests, datasets, baselines, and
+`architecture.md`. Shared harness scenarios stay because they test shared
+runtime contracts, not the removable module.
+
+The M1 deletion set removes the slice-only `EventLog`, `events.jsonl`, fallback stores and
+sequencers, and the direct slice merge path. Integration tests for the retained
+runtime target `EventStore`, `MergeSequencer`, and the supervisor plan path;
+they remain in `tests/scenarios/`.
 
 ### 9.1 Unit tests
 
@@ -232,7 +285,9 @@ deleting its directory, including its code, tests, datasets, baselines, and
 ### 9.4 Integration
 
 - **Scenario test (`src/cambium/modules/<name>/tests/test_<module>.py`, v2):** loads the real dataset, asserts schema validity (plus a negative case that raises `DatasetError`), runs `decide()` over every pair, attaches predictions, and asserts the aggregate metric is at threshold (for the `should_decompose` reference: 1.0 — see `docs/architecture/module-template/example-spec.md` §9.1). This is the v2 eval-harness substitute (§9.2).
-- **Smoke test (`cambium.tests.smoke`):** where this module is exercised end-to-end once the orchestrator is wired. If not exercised, justify.
+- **Harness scenario (`tests/scenarios/`):** exercise shared end-to-end runtime
+  behavior once the orchestrator is wired. If a module needs a module-specific
+  end-to-end check, keep it in the module's colocated `tests/` directory.
 
 ### 9.5 Sibling pinning
 
@@ -264,3 +319,4 @@ Example:
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | YYYY-MM-DD | Initial draft. |
+| 0.2.0 | 2026-08-10 | Normative colocated tests, enum/wire boundary, canonical tool surface, current module catalogue, and M1 runtime deletions. |

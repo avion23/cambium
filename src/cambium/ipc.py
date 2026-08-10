@@ -120,7 +120,7 @@ async def read_message(
             continue
         try:
             msg = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             logger.debug("skipping unparseable line: %s", exc)
             continue
         if not isinstance(msg, dict):

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
+import os
 import re
 import shutil
 import sqlite3
@@ -27,10 +29,21 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from .provider_config import (
+    DEFAULT_SAMPLE,
+    env_report,
+    load_provider_specs,
+    validate_provider_specs,
+)
+from .system_health import format_health, health
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIN_PYTHON = (3, 14)
 MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
+CONVERSATIONS_DB_REL = ".cambium/sessions/conversations.db"
+DLQ_REL = ".cambium/dlq"
+EVAL_CACHE_REL = ".cambium/eval-cache"
 DATASET_CHECK = REPO_ROOT / "scripts" / "check_dataset_v1.py"
 OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
 
@@ -42,6 +55,7 @@ class Status(enum.StrEnum):
     WARN = "warn"
     FAIL = "fail"
     SKIP = "skip"
+    INFO = "info"
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +179,151 @@ def check_event_store(session_dir: Path | None) -> tuple[Status, str]:
     return Status.PASS, f"{db}: integrity ok, {count} events"
 
 
+def _provider_config_path(cwd: Path) -> tuple[Path, bool]:
+    configured = os.environ.get("CAMBIUM_PROVIDERS")
+    if configured:
+        path = Path(configured)
+        return (path if path.is_absolute() else cwd / path), True
+    return cwd / ".cambium" / "providers.json", False
+
+
+def check_provider_env(cwd: Path) -> tuple[Status, str]:
+    """Check provider key presence without printing environment names or values.
+
+    A provider with a missing ``api_key_env`` is WARN by default. Configurations
+    may set ``required: true`` to make that missing key FAIL; ``required`` must
+    be a boolean and invalid provider configuration always FAILs.
+    """
+
+    path, explicit = _provider_config_path(cwd)
+    if path.exists():
+        if not path.is_file():
+            return Status.FAIL, f"{path}: provider config path is not a file"
+        try:
+            providers = load_provider_specs(path)
+        except (OSError, ValueError) as exc:
+            return Status.FAIL, f"{path}: provider config validation failed: {exc}"
+        source = str(path)
+    elif explicit:
+        return Status.FAIL, f"{path}: configured provider file does not exist"
+    else:
+        try:
+            providers = validate_provider_specs(DEFAULT_SAMPLE)
+        except ValueError as exc:  # The shipped sample is still a config input.
+            return Status.FAIL, f"default provider sample validation failed: {exc}"
+        source = "default sample"
+
+    presence = env_report(providers)
+    states = ", ".join(
+        f"{provider.name}={'set' if presence[provider.name] else 'missing'}"
+        for provider in providers
+    )
+    missing_required = [
+        provider.name
+        for provider in providers
+        if provider.required and not presence[provider.name]
+    ]
+    missing_optional = [
+        provider.name
+        for provider in providers
+        if not provider.required and not presence[provider.name]
+    ]
+    if missing_required:
+        return Status.FAIL, (
+            f"{source}: {states}; required provider key missing for "
+            f"{', '.join(missing_required)}"
+        )
+    if missing_optional:
+        return Status.WARN, (
+            f"{source}: {states}; missing provider key is WARN unless required=true "
+            f"({', '.join(missing_optional)})"
+        )
+    return Status.PASS, f"{source}: {states or 'no providers'}"
+
+
+def _sqlite_integrity(db: Path) -> list[str]:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return [row[0] for row in conn.execute("PRAGMA integrity_check") if row[0] != "ok"]
+    finally:
+        conn.close()
+
+
+def check_conversation_store(session_dir: Path | None) -> tuple[Status, str]:
+    if session_dir is None:
+        return Status.SKIP, "no --session-dir given"
+    db = session_dir / CONVERSATIONS_DB_REL
+    if not db.is_file():
+        return Status.SKIP, f"{db} does not exist"
+    try:
+        problems = _sqlite_integrity(db)
+    except sqlite3.Error as exc:
+        return Status.FAIL, f"{db}: {exc}"
+    if problems:
+        return Status.FAIL, f"{db}: integrity_check: {problems[:3]}"
+    return Status.PASS, f"{db}: integrity ok"
+
+
+def _json_files(directory: Path, *, recursive: bool) -> list[Path]:
+    candidates = directory.rglob("*.json") if recursive else directory.iterdir()
+    return sorted(path for path in candidates if path.is_file() and path.suffix == ".json")
+
+
+def check_json_directory(
+    session_dir: Path | None, relative: str, label: str, *, recursive: bool
+) -> tuple[Status, str]:
+    if session_dir is None:
+        return Status.SKIP, "no --session-dir given"
+    directory = session_dir / relative
+    if not directory.exists():
+        return Status.SKIP, f"{directory} does not exist"
+    if not directory.is_dir():
+        return Status.FAIL, f"{directory}: {label} path is not a directory"
+
+    try:
+        paths = _json_files(directory, recursive=recursive)
+    except OSError as exc:
+        return Status.FAIL, f"{directory}: cannot read {label} directory: {exc}"
+
+    corrupt: list[str] = []
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8") as stream:
+                value = json.load(stream)
+        except (OSError, UnicodeError, ValueError):
+            corrupt.append(path.name)
+            continue
+        if not isinstance(value, dict):
+            corrupt.append(path.name)
+
+    if corrupt:
+        shown = ", ".join(corrupt[:3])
+        suffix = "" if len(corrupt) <= 3 else f", +{len(corrupt) - 3} more"
+        return Status.WARN, (
+            f"{directory}: readable, {len(paths)} JSON entr{'y' if len(paths) == 1 else 'ies'}; "
+            f"{len(corrupt)} corrupt ({shown}{suffix})"
+        )
+    entry_word = "entry" if len(paths) == 1 else "entries"
+    return Status.PASS, f"{directory}: readable, {len(paths)} JSON {entry_word}"
+
+
+def check_dlq(session_dir: Path | None) -> tuple[Status, str]:
+    return check_json_directory(session_dir, DLQ_REL, "DLQ", recursive=False)
+
+
+def check_eval_cache(session_dir: Path | None) -> tuple[Status, str]:
+    return check_json_directory(session_dir, EVAL_CACHE_REL, "eval-cache", recursive=True)
+
+
+def check_system_health(path: Path) -> tuple[Status, str]:
+    """Return advisory host health; resource-probe failures never fail doctor."""
+
+    try:
+        return Status.INFO, format_health(health(path))
+    except Exception as exc:  # Advisory output must not change doctor exit status.
+        return Status.SKIP, f"system health unavailable: {exc}"
+
+
 def check_dataset() -> tuple[Status, str]:
     try:
         result = subprocess.run(
@@ -218,6 +377,11 @@ def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
         (5, "Event store integrity", check_event_store(session_dir)),
         (6, "Dataset integrity", check_dataset()),
         (7, "Secrets hygiene", check_secrets()),
+        (8, "Provider env", check_provider_env(cwd)),
+        (9, "Conversation store", check_conversation_store(session_dir)),
+        (10, "DLQ directory", check_dlq(session_dir)),
+        (11, "Eval-cache directory", check_eval_cache(session_dir)),
+        (12, "System health", check_system_health(cwd)),
     ]
     return [
         Check(number=number, name=name, status=status, detail=detail)
@@ -235,7 +399,8 @@ def format_report(checks: list[Check]) -> str:
     counts = Counter(check.status for check in checks)
     lines.append(
         f"Summary: {counts[Status.PASS]} pass · {counts[Status.WARN]} warn · "
-        f"{counts[Status.SKIP]} skip · {counts[Status.FAIL]} fail"
+        f"{counts[Status.SKIP]} skip · {counts[Status.INFO]} info · "
+        f"{counts[Status.FAIL]} fail"
     )
     return "\n".join(lines)
 
@@ -248,14 +413,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="cambium doctor",
         description="Harness diagnostics: python/uv/git availability, worktree "
-        "hygiene, event-store integrity, dataset integrity, secrets hygiene.",
+        "hygiene, provider environment, session artifacts, dataset integrity, "
+        "secrets hygiene, and advisory system health.",
     )
     parser.add_argument(
         "--session-dir",
         type=Path,
         default=None,
         metavar="DIR",
-        help="session dir whose .cambium/events.db is checked (optional)",
+        help="session dir whose Cambium artifacts are checked (optional)",
     )
     args = parser.parse_args(argv)
     checks = run_checks(args.session_dir, Path.cwd())

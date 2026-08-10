@@ -13,11 +13,18 @@ prefix by following ``parent_id`` links, so a branch from turn N starts with
 the rows through that turn and then its own marker/future messages.  The
 marker uses ``role="branch"`` and an empty content string because the schema
 requires message-shaped, non-null role and content columns.
+
+Schema version 2 stores an optional token estimate in ``tokens`` and a node
+kind in ``kind``. Summary envelope fields use one JSON ``meta`` column rather
+than separate cover columns; :meth:`history` and :meth:`path` return decoded
+metadata. Those methods include summary and system rows in the same chain as
+turn rows, so consumers that need only turns must filter on ``record["kind"]``.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import queue
 import sqlite3
@@ -29,8 +36,12 @@ from typing import Any
 
 _WRITER_BUSY_TIMEOUT_MS = 5000
 _STARTUP_TIMEOUT_S = 10.0
+_SCHEMA_VERSION = 2
 _SENTINEL = object()
 _BRANCH_ROLE = "branch"
+_SUMMARY_ROLE = "summary"
+_KIND_ORDER = ("turn", "summary", "system")
+_VALID_KINDS = frozenset(_KIND_ORDER)
 
 _CREATE_TABLE = """CREATE TABLE IF NOT EXISTS conversations (
     id       INTEGER PRIMARY KEY,
@@ -40,7 +51,10 @@ _CREATE_TABLE = """CREATE TABLE IF NOT EXISTS conversations (
     role     TEXT NOT NULL,
     content  TEXT NOT NULL,
     ts       TEXT NOT NULL,
-    seq      INTEGER NOT NULL
+    seq      INTEGER NOT NULL,
+    tokens   INTEGER NULL,
+    kind     TEXT NOT NULL DEFAULT 'turn',
+    meta     TEXT NULL
 )"""
 _CREATE_NODE_INDEX = (
     "CREATE INDEX IF NOT EXISTS conversations_node_id_idx "
@@ -52,12 +66,13 @@ _SELECT_HEAD = (
     "ORDER BY seq DESC, id DESC LIMIT 1"
 )
 _SELECT_ROW = (
-    "SELECT id, node_id, parent_id, turn, role, content, ts, seq "
+    "SELECT id, node_id, parent_id, turn, role, content, ts, seq, tokens, kind, meta "
     "FROM conversations WHERE id = ?"
 )
 _INSERT_ROW = (
-    "INSERT INTO conversations(node_id, parent_id, turn, role, content, ts, seq) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO conversations"
+    "(node_id, parent_id, turn, role, content, ts, seq, tokens, kind, meta) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -118,6 +133,9 @@ class ConversationStore:
         content: str,
         *,
         parent_id: int | None = None,
+        tokens: int | None = None,
+        kind: str = "turn",
+        meta: dict[str, Any] | None = None,
     ) -> int:
         """Append one message and return its row id.
 
@@ -125,6 +143,10 @@ class ConversationStore:
         head.  The first message for a node is a root.  Supplying ``parent_id``
         explicitly permits a cross-node parent and is how callers can attach a
         message to a branch point.
+
+        ``tokens`` is an optional non-negative token estimate.  ``kind`` must
+        be ``"turn"``, ``"summary"``, or ``"system"``.  ``meta`` is encoded
+        as JSON in the schema and decoded back to a dictionary by readers.
 
         The call waits for the SQLite commit, not for the periodic fsync.  This
         keeps readers coherent while retaining the store's advisory durability
@@ -134,7 +156,57 @@ class ConversationStore:
         self._validate_role(role)
         self._validate_content(content)
         self._validate_parent_id(parent_id)
-        return self._submit(node_id, role, content, parent_id)
+        self._validate_tokens(tokens)
+        self._validate_kind(kind)
+        self._validate_meta(meta)
+        return self._submit(
+            node_id,
+            role,
+            content,
+            parent_id,
+            tokens,
+            kind,
+            self._encode_meta(meta),
+        )
+
+    def add_summary(
+        self,
+        node_id: str,
+        content: str,
+        *,
+        covers_from: int,
+        covers_to: int,
+        tokens_before: int,
+        tokens_after: int,
+    ) -> int:
+        """Append a summary node covering the inclusive ``[from, to]`` range.
+
+        The summary's parent is ``covers_to`` and its stored token estimate is
+        ``tokens_after``. The full covered chain remains in the append-only
+        store; later turns continue after the new summary node.
+        """
+        self._validate_node_id(node_id)
+        self._validate_content(content)
+        self._validate_row_id(covers_from, "covers_from")
+        self._validate_row_id(covers_to, "covers_to")
+        if covers_from > covers_to:
+            raise ValueError("covers_from must not be greater than covers_to")
+        self._validate_tokens(tokens_before, name="tokens_before", allow_none=False)
+        self._validate_tokens(tokens_after, name="tokens_after", allow_none=False)
+        return self.append(
+            node_id,
+            _SUMMARY_ROLE,
+            content,
+            parent_id=covers_to,
+            tokens=tokens_after,
+            kind="summary",
+            meta={
+                "covers_from": covers_from,
+                "covers_to": covers_to,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+            },
+        )
 
     def branch(self, node_id: str, from_id: int) -> int:
         """Create a branch marker for ``node_id`` below conversation row ``from_id``.
@@ -146,7 +218,7 @@ class ConversationStore:
         """
         self._validate_node_id(node_id)
         self._validate_parent_id(from_id)
-        return self._submit(node_id, _BRANCH_ROLE, "", from_id)
+        return self._submit(node_id, _BRANCH_ROLE, "", from_id, None, "turn", None)
 
     def history(self, node_id: str, *, tail: int | None = None) -> list[dict[str, Any]]:
         """Return the current node head's chain from root to head.
@@ -182,6 +254,52 @@ class ConversationStore:
                 raise ValueError(f"node_id has no conversation rows: {node_id!r}")
             return self._chain(conn, int(head[0]), stop_id=to_id)
 
+    def token_accounting(self, node_id: str) -> dict[str, Any]:
+        """Return token totals and the latest summary's reduction envelope.
+
+        Totals cover the active head chain, with NULL token values omitted.
+        The returned dictionary has ``tokens_by_kind`` for the three supported
+        kinds, ``reduction`` for the latest summary, and ``covered_range`` with
+        ``from``/``to`` ids. Nodes without a summary return ``None`` for the
+        latter two values.
+        """
+        self._validate_node_id(node_id)
+        with closing(self._reader()) as conn:
+            head = conn.execute(_SELECT_HEAD, (node_id,)).fetchone()
+            records = [] if head is None else self._chain(conn, int(head[0]))
+
+        tokens_by_kind = dict.fromkeys(_KIND_ORDER, 0)
+        for record in records:
+            tokens = record["tokens"]
+            if tokens is not None:
+                tokens_by_kind[record["kind"]] = tokens_by_kind.get(record["kind"], 0) + int(
+                    tokens
+                )
+
+        latest_summary = next(
+            (record for record in reversed(records) if record["kind"] == "summary"),
+            None,
+        )
+        reduction: int | None = None
+        covered_range: dict[str, int] | None = None
+        if latest_summary is not None and isinstance(latest_summary["meta"], dict):
+            meta = latest_summary["meta"]
+            values = (
+                meta.get("covers_from"),
+                meta.get("covers_to"),
+                meta.get("tokens_before"),
+                meta.get("tokens_after"),
+            )
+            if all(isinstance(value, int) and not isinstance(value, bool) for value in values):
+                covered_range = {"from": values[0], "to": values[1]}
+                reduction = values[2] - values[3]
+
+        return {
+            "tokens_by_kind": tokens_by_kind,
+            "reduction": reduction,
+            "covered_range": covered_range,
+        }
+
     def close(self) -> None:
         """Drain queued writes, fsync the WAL/database, and stop the writer."""
         with self._lock:
@@ -196,6 +314,9 @@ class ConversationStore:
         role: str,
         content: str,
         parent_id: int | None,
+        tokens: int | None,
+        kind: str,
+        meta: str | None,
     ) -> int:
         pending = _Pending()
         with self._lock:
@@ -203,7 +324,7 @@ class ConversationStore:
                 raise ConversationStoreError("conversation store is dead") from self._dead
             if self._closed:
                 raise RuntimeError("ConversationStore is closed")
-            self._queue.put_nowait((node_id, role, content, parent_id, pending))
+            self._queue.put_nowait((node_id, role, content, parent_id, tokens, kind, meta, pending))
 
         pending.event.wait()
         if pending.exc is not None:
@@ -230,6 +351,7 @@ class ConversationStore:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA wal_autocheckpoint=0")
             conn.execute(_CREATE_TABLE)
+            self._migrate_schema(conn)
             conn.execute(_CREATE_NODE_INDEX)
 
             db_fd = os.open(self._path, os.O_RDWR)
@@ -274,10 +396,10 @@ class ConversationStore:
                 if item is _SENTINEL:
                     break
 
-                node_id, role, content, parent_id, pending = item
+                node_id, role, content, parent_id, tokens, kind, meta, pending = item
                 try:
                     pending.result = self._insert_row(
-                        conn, node_id, role, content, parent_id
+                        conn, node_id, role, content, parent_id, tokens, kind, meta
                     )
                 except ValueError as exc:
                     pending.exc = exc
@@ -320,6 +442,9 @@ class ConversationStore:
         role: str,
         content: str,
         parent_id: int | None,
+        tokens: int | None,
+        kind: str,
+        meta: str | None,
     ) -> int:
         if parent_id is None:
             parent = conn.execute(
@@ -341,13 +466,58 @@ class ConversationStore:
         ts = datetime.datetime.now(datetime.UTC).isoformat(timespec="microseconds")
         cursor = conn.execute(
             _INSERT_ROW,
-            (node_id, effective_parent_id, turn, role, content, ts, self._next_seq),
+            (
+                node_id,
+                effective_parent_id,
+                turn,
+                role,
+                content,
+                ts,
+                self._next_seq,
+                tokens,
+                kind,
+                meta,
+            ),
         )
         row_id = cursor.lastrowid
         if row_id is None:
             raise RuntimeError("SQLite did not return the conversation row id")
         self._next_seq += 1
         return int(row_id)
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported conversation schema version {version}; "
+                f"maximum supported version is {_SCHEMA_VERSION}"
+            )
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+        required = {
+            "tokens": "tokens INTEGER",
+            "kind": "kind TEXT NOT NULL DEFAULT 'turn'",
+            "meta": "meta TEXT",
+        }
+        missing = [
+            (name, definition)
+            for name, definition in required.items()
+            if name not in columns
+        ]
+        if version >= _SCHEMA_VERSION and missing:
+            names = ", ".join(name for name, _ in missing)
+            raise RuntimeError(f"conversation schema v2 is missing columns: {names}")
+
+        conn.execute("BEGIN")
+        try:
+            for _, definition in missing:
+                conn.execute(f"ALTER TABLE conversations ADD COLUMN {definition}")
+            conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _fail_pending(self, exc: BaseException) -> None:
         while True:
@@ -412,7 +582,7 @@ class ConversationStore:
 
     @staticmethod
     def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
-        row_id, node_id, parent_id, turn, role, content, ts, seq = row
+        row_id, node_id, parent_id, turn, role, content, ts, seq, tokens, kind, meta = row
         return {
             "id": int(row_id),
             "node_id": node_id,
@@ -422,7 +592,28 @@ class ConversationStore:
             "content": content,
             "ts": ts,
             "seq": int(seq),
+            "tokens": None if tokens is None else int(tokens),
+            "kind": kind,
+            "meta": ConversationStore._decode_meta(meta),
         }
+
+    @staticmethod
+    def _decode_meta(meta: Any) -> dict[str, Any] | None:
+        if meta is None:
+            return None
+        try:
+            decoded = json.loads(meta)
+        except (TypeError, ValueError) as exc:
+            raise ConversationStoreError("conversation row has invalid JSON metadata") from exc
+        if not isinstance(decoded, dict):
+            raise ConversationStoreError("conversation row metadata must be a JSON object")
+        return decoded
+
+    @staticmethod
+    def _encode_meta(meta: dict[str, Any] | None) -> str | None:
+        if meta is None:
+            return None
+        return json.dumps(meta, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def _validate_node_id(node_id: str) -> None:
@@ -441,10 +632,37 @@ class ConversationStore:
 
     @staticmethod
     def _validate_parent_id(parent_id: int | None) -> None:
-        if parent_id is not None and (
-            isinstance(parent_id, bool) or not isinstance(parent_id, int) or parent_id <= 0
-        ):
-            raise ValueError("parent_id must be a positive integer or None")
+        if parent_id is not None:
+            ConversationStore._validate_row_id(parent_id, "parent_id")
+
+    @staticmethod
+    def _validate_row_id(value: int, name: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    @staticmethod
+    def _validate_tokens(
+        tokens: int | None,
+        *,
+        name: str = "tokens",
+        allow_none: bool = True,
+    ) -> None:
+        if tokens is None:
+            if allow_none:
+                return
+            raise ValueError(f"{name} must be a non-negative integer")
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError(f"{name} must be a non-negative integer or None")
+
+    @staticmethod
+    def _validate_kind(kind: str) -> None:
+        if not isinstance(kind, str) or kind not in _VALID_KINDS:
+            raise ValueError(f"kind must be one of {sorted(_VALID_KINDS)!r}")
+
+    @staticmethod
+    def _validate_meta(meta: dict[str, Any] | None) -> None:
+        if meta is not None and not isinstance(meta, dict):
+            raise TypeError("meta must be a dictionary or None")
 
     @staticmethod
     def _validate_tail(tail: int | None) -> None:
