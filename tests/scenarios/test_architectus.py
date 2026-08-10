@@ -855,3 +855,78 @@ def test_malformed_later_failure_event_does_not_consume_prior_event() -> None:
     assert asyncio.run(core.step([first_failure])) == [
         {"action": "reset_retry", "task_id": "root"}
     ]
+
+
+def test_mixed_failure_batch_defers_merge_replan_to_llm() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("a", "TEST", ["root"], None),
+                ("b", "TEST", ["root"], None),
+            ]
+        )
+    )
+    llm = ScriptedLLM(
+        [
+            [{"action": "spawn", "task_id": "root"}],
+            [
+                {"action": "spawn", "task_id": "a"},
+                {"action": "spawn", "task_id": "b"},
+            ],
+            [{"action": "replan", "task_id": "b"}],
+        ]
+    )
+    core = ArchitectusCore(llm, tree=tree, max_width=2)
+
+    assert asyncio.run(core.step([])) == [{"action": "spawn", "task_id": "root"}]
+    core.aggregate("root", _envelope(None))
+    assert asyncio.run(core.step([])) == [
+        {"action": "spawn", "task_id": "a"},
+        {"action": "spawn", "task_id": "b"},
+    ]
+
+    events = [
+        {"kind": "gate_failed", "task_id": "a", "retries_remaining": 0},
+        {"kind": "merge_failed", "task_id": "b", "reason": "conflict"},
+    ]
+    actions = asyncio.run(core.step(events))
+
+    assert actions == [
+        {"action": "reset_retry", "task_id": "a"},
+        {"action": "replan", "task_id": "b"},
+    ]
+    assert len(llm.calls) == 3
+    assert llm.calls[-1][1] == events
+    assert core.action_history[-2:] == actions
+
+
+def test_fresh_reset_invalidates_finished_task_and_suppresses_descendant_spawn() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], None),
+            ]
+        )
+    )
+    core = ArchitectusCore(
+        ScriptedLLM(
+            [[
+                {"action": "spawn", "task_id": "child"},
+                {"action": "reset_retry", "task_id": "root"},
+            ]]
+        ),
+        tree=tree,
+    )
+    core.aggregate("root", _envelope(None, summary="stale"))
+
+    actions = asyncio.run(core.step([]))
+
+    assert actions == [{"action": "reset_retry", "task_id": "root"}]
+    assert core.finished == {}
+    assert "child" not in core.in_flight
+
+    core.aggregate("root", _envelope(None, summary="rerun"))
+    assert core.finished["root"]["summary"] == "rerun"
+    assert core.in_flight == set()

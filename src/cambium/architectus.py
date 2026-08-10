@@ -364,10 +364,11 @@ class ArchitectusCore:
         if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
             raise TypeError("events must be a list of dictionaries")
 
-        failure_actions = self._failure_actions(events)
+        failure_actions, deferred_events = self._failure_actions(events)
         if failure_actions:
             for action in failure_actions:
                 self._record_action(action)
+        if failure_actions and not deferred_events:
             return copy.deepcopy(failure_actions)
 
         blocked = self._blocked_task_ids()
@@ -381,8 +382,9 @@ class ArchitectusCore:
         if isinstance(proposed, (str, bytes)) or not isinstance(proposed, Sequence):
             raise TypeError("LLM decide must return a sequence of action mappings")
 
-        actions = self._admit_actions(proposed, ready)
-        for action in actions:
+        admitted_actions = self._admit_actions(proposed, ready)
+        actions = [*failure_actions, *admitted_actions]
+        for action in admitted_actions:
             self._record_action(action)
         return copy.deepcopy(actions)
 
@@ -464,18 +466,23 @@ class ArchitectusCore:
         """Apply the pure failure table without reading core state."""
         return decide_failure(event)
 
-    def _failure_actions(self, events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        """Route all exhausted gate failures through the stateful failure edge."""
+    def _failure_actions(
+        self, events: Sequence[Mapping[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Apply deterministic failure actions and retain deferred failures for the LLM."""
         classified: list[tuple[str, dict[str, Any], str]] = []
+        deferred_events: list[dict[str, Any]] = []
         for event in events:
             try:
                 decision = decide_failure(event)
             except ValueError:
+                deferred_events.append(copy.deepcopy(dict(event)))
                 continue
             if decision not in {
                 FailureDecision.RESET_RETRY.value,
                 FailureDecision.ABORT_SUBTREE.value,
             }:
+                deferred_events.append(copy.deepcopy(dict(event)))
                 continue
             fields = _event_fields(event)
             task_id = fields.get("task_id")
@@ -501,7 +508,7 @@ class ArchitectusCore:
                 self._reset_retry_tasks.add(task_id)
             self._mark_subtree_failed(task_id)
             actions.append({"action": ActionKind.ABORT_SUBTREE.value, "task_id": task_id})
-        return actions
+        return actions, deferred_events
 
     def _mark_subtree_failed(self, task_id: str) -> set[str]:
         """Record an abort, block its subtree, and release all subtree slots."""
@@ -551,6 +558,7 @@ class ArchitectusCore:
         accepted_spawn_ids: list[str] = []
         aborted_spawn_ids: set[str] = set()
         aborted_descendant_spawn_ids: set[str] = set()
+        suppressed_spawn_ids: set[str] = set()
         non_spawn: list[tuple[int, dict[str, Any]]] = []
         accepted_spawns: list[tuple[int, str, int]] = []
         spawn_segment = 0
@@ -564,6 +572,7 @@ class ArchitectusCore:
                     or task_id in accepted_spawn_ids
                     or task_id in aborted_spawn_ids
                     or task_id in explicitly_aborted
+                    or task_id in suppressed_spawn_ids
                     or len(accepted_spawn_ids) >= capacity
                 ):
                     continue
@@ -574,6 +583,7 @@ class ArchitectusCore:
             if kind in {
                 ActionKind.STEER,
                 ActionKind.AGGREGATE,
+                ActionKind.REPLAN,
                 ActionKind.RESET_RETRY,
                 ActionKind.ABORT_SUBTREE,
             }:
@@ -591,6 +601,12 @@ class ArchitectusCore:
                         spawn_segment += 1
                     else:
                         self._reset_retry_tasks.add(task_id)
+                        if task_id in self._finished:
+                            self._finished.pop(task_id)
+                            self._in_flight.add(task_id)
+                            suppressed_spawn_ids.update(
+                                self._subtree_task_ids(task_id) - {task_id}
+                            )
                 elif kind is ActionKind.ABORT_SUBTREE:
                     subtree = self._mark_subtree_failed(task_id)
                     aborted_spawn_ids.update(subtree)
@@ -614,7 +630,10 @@ class ArchitectusCore:
         for raw_index, _raw_action in enumerate(proposed_actions):
             task_id = spawn_assignments.get(raw_index)
             if task_id is not None:
-                if task_id not in aborted_descendant_spawn_ids:
+                if (
+                    task_id not in aborted_descendant_spawn_ids
+                    and task_id not in suppressed_spawn_ids
+                ):
                     actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
                 continue
             for index, action in non_spawn:
@@ -623,7 +642,7 @@ class ArchitectusCore:
                     break
 
         for task_id in accepted_spawn_ids:
-            if task_id not in aborted_spawn_ids:
+            if task_id not in aborted_spawn_ids and task_id not in suppressed_spawn_ids:
                 self._in_flight.add(task_id)
         return actions
 
@@ -635,6 +654,7 @@ class ArchitectusCore:
             ActionKind.SPAWN,
             ActionKind.STEER,
             ActionKind.AGGREGATE,
+            ActionKind.REPLAN,
             ActionKind.RESET_RETRY,
             ActionKind.ABORT_SUBTREE,
         }
