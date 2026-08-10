@@ -1495,7 +1495,9 @@ class _Runtime:
                 match = re.match(r"merge/task-([0-9a-f]{16})/", quarantine_id)
                 if match:
                     task_id = task_keys.get(match.group(1))
-            await self.emit(kind, task_id=task_id, **payload)
+            await self.emit(
+                kind, task_id=task_id, _observer_failure_is_fatal=False, **payload
+            )
             recovered = kind == "merge_committed" and payload.get("reason") == (
                 "recovered-ref-advance"
             )
