@@ -13,6 +13,7 @@ import importlib
 import os
 import subprocess
 import sys
+from importlib.util import find_spec
 from pathlib import Path
 
 from . import __version__
@@ -41,6 +42,23 @@ def _provider_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+_COMMAND_NAMES = frozenset(
+    {
+        "auth",
+        "supervisor",
+        "doctor",
+        "bench",
+        "tasktree",
+        "module-test",
+        "version",
+        "run",
+        "repl",
+        "tui",
+        "session",
+    }
+)
+
+
 def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-dir", required=True, metavar="DIR")
     plan = parser.add_mutually_exclusive_group()
@@ -56,6 +74,32 @@ def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repo",
+        metavar="PATH",
+        help="repository to work in (default: current directory)",
+    )
+    parser.add_argument("--session-dir", metavar="DIR", help="session directory")
+    parser.add_argument(
+        "--provider",
+        type=_provider_argument,
+        metavar="PROVIDER",
+        help="provider id",
+    )
+    parser.add_argument("--model", metavar="MODEL", help="model name")
+
+
+def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "prompt",
+        metavar="PROMPT",
+        help="prompt to run against the repository",
+    )
+    _add_agent_arguments(parser)
+    parser.add_argument("--json", action="store_true", help="print the result as JSON")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(
         prog="cambium",
@@ -63,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,tasktree,module-test,version}",
+        metavar="{auth,supervisor,doctor,bench,tasktree,module-test,version,run,repl,tui,session}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -138,6 +182,56 @@ def _build_parser() -> argparse.ArgumentParser:
         mode_parser.add_argument("--bench-root", type=Path, metavar="PATH")
         mode_parser.add_argument("--bench-metric-delta", type=float, metavar="FLOAT")
         mode_parser.add_argument("--bench-wall-ratio", type=float, metavar="FLOAT")
+
+    run = commands.add_parser(
+        "run",
+        help="run one prompt against a repository",
+        description="Run one Cambium oneshot turn against a repository.",
+    )
+    _add_run_arguments(run)
+
+    repl = commands.add_parser(
+        "repl",
+        help="start an interactive prompt session",
+        description="Start an interactive Cambium prompt session.",
+    )
+    _add_agent_arguments(repl)
+
+    tui = commands.add_parser(
+        "tui",
+        help="start the terminal dashboard",
+        description="Start the Cambium terminal dashboard.",
+    )
+    _add_agent_arguments(tui)
+
+    session = commands.add_parser(
+        "session",
+        help="list, inspect, or show sessions",
+        description="List, inspect, or show Cambium sessions.",
+    )
+    session_commands = session.add_subparsers(
+        dest="session_command",
+        required=True,
+        parser_class=_SafeArgumentParser,
+    )
+    session_list = session_commands.add_parser("list", help="list sessions")
+    session_list.add_argument("--session-dir", metavar="DIR", help="session directory")
+    session_latest = session_commands.add_parser(
+        "latest",
+        help="show the latest session",
+    )
+    session_latest.add_argument("--session-dir", metavar="DIR", help="session directory")
+    session_show = session_commands.add_parser(
+        "show",
+        help="show one session",
+        description="Show one Cambium session.",
+    )
+    session_show.add_argument("--session-dir", metavar="DIR", help="session directory")
+    session_show.add_argument(
+        "session_id",
+        metavar="SESSION",
+        help="session id to show",
+    )
 
     commands.add_parser(
         "tasktree",
@@ -307,6 +401,90 @@ def _run_module_test(args: argparse.Namespace) -> int:
     return 0 if result.returncode == 0 else 1
 
 
+def _import_or_fail(module_name: str, command: str):
+    """Import one staged module, or report it as not installed."""
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            print(f"cambium {command}: {module_name} is not installed", file=sys.stderr)
+            return None
+        raise
+
+
+def _oneshot_installed() -> bool:
+    return find_spec("cambium.oneshot") is not None
+
+
+def _looks_like_prompt(first: str) -> bool:
+    return bool(first) and not first.startswith("-") and first not in _COMMAND_NAMES
+
+
+def _run_bare_prompt(command_line: list[str]) -> int:
+    parser = _SafeArgumentParser(prog="cambium")
+    _add_run_arguments(parser)
+    return _run_oneshot(parser.parse_args(command_line))
+
+
+def _run_oneshot(args: argparse.Namespace) -> int:
+    oneshot = _import_or_fail("cambium.oneshot", "run")
+    if oneshot is None:
+        return 1
+    render = _import_or_fail("cambium.render", "run")
+    if render is None:
+        return 1
+    config = oneshot.OneShotConfig(
+        prompt=args.prompt,
+        repo=args.repo,
+        session_dir=args.session_dir,
+        provider=args.provider,
+        model=args.model,
+    )
+    result = oneshot.run_oneshot(config)
+    if args.json:
+        print(render.render_json_result(result))
+    else:
+        print(render.render_text_result(result))
+    return getattr(result, "exit_code", 0)
+
+
+def _run_repl(args: argparse.Namespace) -> int:
+    repl = _import_or_fail("cambium.repl", "repl")
+    if repl is None:
+        return 1
+    return repl.run_repl(
+        repo=args.repo,
+        session_dir=args.session_dir,
+        provider=args.provider,
+        model=args.model,
+    )
+
+
+def _run_tui(args: argparse.Namespace) -> int:
+    tui = _import_or_fail("cambium.tui", "tui")
+    if tui is None:
+        return 1
+    return tui.run_tui(
+        repo=args.repo,
+        session_dir=args.session_dir,
+        provider=args.provider,
+        model=args.model,
+    )
+
+
+def _run_session(args: argparse.Namespace) -> int:
+    session = _import_or_fail("cambium.session", "session")
+    if session is None:
+        return 1
+    if args.session_command == "list":
+        return session.list_sessions(session_dir=args.session_dir)
+    if args.session_command == "latest":
+        return session.latest_session(session_dir=args.session_dir)
+    if args.session_command == "show":
+        return session.show_session(args.session_id, session_dir=args.session_dir)
+    raise AssertionError(f"unhandled session command: {args.session_command!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch one unified Cambium CLI invocation and return its exit code."""
     command_line = sys.argv[1:] if argv is None else argv
@@ -314,6 +492,9 @@ def main(argv: list[str] | None = None) -> int:
         from . import tasktree
 
         return tasktree.main(command_line[1:])
+
+    if command_line and _looks_like_prompt(command_line[0]) and _oneshot_installed():
+        return _run_bare_prompt(command_line)
 
     args = _build_parser().parse_args(command_line)
 
@@ -327,6 +508,14 @@ def main(argv: list[str] | None = None) -> int:
         return _run_bench(args)
     if args.command == "module-test":
         return _run_module_test(args)
+    if args.command == "run":
+        return _run_oneshot(args)
+    if args.command == "repl":
+        return _run_repl(args)
+    if args.command == "tui":
+        return _run_tui(args)
+    if args.command == "session":
+        return _run_session(args)
     if args.command == "version":
         print(__version__)
         return 0
