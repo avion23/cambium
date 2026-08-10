@@ -45,7 +45,7 @@ MIN_PYTHON = (3, 14)
 MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
 CONVERSATIONS_DB_REL = ".cambium/sessions/conversations.db"
-DLQ_REL = ".cambium/dlq"
+DLQ_DB_REL = ".cambium/dlq.db"
 EVAL_CACHE_REL = ".cambium/eval-cache"
 MODULES_ROOT = Path(__file__).resolve().parent / "modules"
 OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
@@ -427,7 +427,26 @@ def check_json_directory(
 
 
 def check_dlq(session_dir: Path | None) -> tuple[Status, str]:
-    return check_json_directory(session_dir, DLQ_REL, "DLQ", recursive=False)
+    if session_dir is None:
+        return Status.SKIP, "no --session-dir given"
+    db = session_dir / DLQ_DB_REL
+    if not db.is_file():
+        return Status.SKIP, f"{db} does not exist"
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            integrity = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+            problems = [line for line in integrity if line != "ok"]
+            count = None
+            if not problems:
+                count = conn.execute("SELECT COUNT(*) FROM dlq_records").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Status.FAIL, f"{db}: {exc}"
+    if problems:
+        return Status.FAIL, f"{db}: integrity_check: {problems[:3]}"
+    return Status.PASS, f"{db}: integrity ok, {count} records"
 
 
 def check_eval_cache(session_dir: Path | None) -> tuple[Status, str]:
@@ -575,7 +594,7 @@ def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
         (10, "Auth schema", check_auth_schema()),
         (11, "Auth coverage", check_auth_coverage(cwd)),
         (12, "Conversation store", check_conversation_store(session_dir)),
-        (13, "DLQ directory", check_dlq(session_dir)),
+        (13, "DLQ store", check_dlq(session_dir)),
         (14, "Eval-cache directory", check_eval_cache(session_dir)),
         (15, "System health", check_system_health(cwd)),
     ]
