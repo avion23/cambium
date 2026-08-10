@@ -31,6 +31,8 @@ _ENVELOPE_KEYS = (
     "status",
 )
 _ENVELOPE_KEY_SET = frozenset(_ENVELOPE_KEYS)
+CORE_DIRECTIVE_MAX = 200
+_CORE_DIRECTIVE_TRUNCATION_MARKER = "... [truncated]"
 
 
 class ActionKind(StrEnum):
@@ -40,6 +42,7 @@ class ActionKind(StrEnum):
     STEER = "steer"
     AGGREGATE = "aggregate"
     REPLAN = "replan"
+    RESET_RETRY = "reset_retry"
 
 
 class FailureDecision(StrEnum):
@@ -50,6 +53,7 @@ class FailureDecision(StrEnum):
     ABORT_SUBTREE = "abort-subtree"
     REPLAN = "replan"
     MERGE_RESOLVE = "merge-resolve"
+    RESET_RETRY = "reset_retry"
 
 
 @runtime_checkable
@@ -168,11 +172,20 @@ def _positive_retries(fields: Mapping[str, Any]) -> bool:
     return False
 
 
+def _reset_retry_attempted(fields: Mapping[str, Any]) -> bool:
+    """Return whether the one step-back retry already ran."""
+    return fields.get("reset_retry_attempted") is True
+
+
 def decide_failure(event: Mapping[str, Any]) -> str:
-    """Apply the twelve-row deterministic Architectus failure table.
+    """Apply the deterministic Architectus failure table.
 
     The function consumes only the event and returns a plain string so it can
-    be used by a rule engine or by an injected LLM policy without state.
+    be used by a rule engine or by an injected LLM policy without state. A gate
+    failure with ``retries_remaining == 0`` returns ``reset_retry`` on its first
+    exhaustion. The executor maps that decision to ``{"action": "reset_retry",
+    "task_id": ...}``; a later gate failure marked
+    ``reset_retry_attempted=True`` returns ``abort-subtree``.
     """
     fields = _event_fields(event)
     raw_kind = fields.get("kind", fields.get("type", fields.get("event", "")))
@@ -229,6 +242,10 @@ def decide_failure(event: Mapping[str, Any]) -> str:
     if kind in {"gate_failed", "gate_failure"} or "gate" in kind and "fail" in kind:
         if _positive_retries(fields):
             return FailureDecision.RESOLVE.value
+        if fields.get("retries_remaining") == 0:
+            if _reset_retry_attempted(fields):
+                return FailureDecision.ABORT_SUBTREE.value
+            return FailureDecision.RESET_RETRY.value
         if fields.get("retries_left") == 0 or fields.get("exhausted"):
             return FailureDecision.ABORT_SUBTREE.value
         return FailureDecision.RESOLVE.value
@@ -261,6 +278,7 @@ class ArchitectusCore:
         tree: TaskTree,
         store: ConversationStore | None = None,
         max_width: int = 8,
+        core_directive: str | None = None,
     ) -> None:
         if not isinstance(tree, TaskTree):
             raise TypeError("tree must be a TaskTree")
@@ -273,6 +291,9 @@ class ArchitectusCore:
         self._tree = tree
         self._store = store
         self._max_width = max_width
+        if core_directive is None:
+            core_directive = self._root_goal(tree)
+        self._core_directive = self._normalise_core_directive(core_directive)
         self._topological = topological_order(tree)
         self._nodes = {node.task_id: node for node in tree.nodes}
         self._children: dict[str, list[str]] = {node.task_id: [] for node in tree.nodes}
@@ -327,7 +348,9 @@ class ArchitectusCore:
             self._record_action(action)
         return copy.deepcopy(actions)
 
-    def compose_context(self, task_id: str) -> dict[str, Any]:
+    def compose_context(
+        self, task_id: str, core_directive: str | None = None
+    ) -> dict[str, Any]:
         """Compose a static prefix followed by an info-hidden dynamic tail.
 
         The returned shape is deliberately JSON-friendly:
@@ -341,10 +364,17 @@ class ArchitectusCore:
             A deterministic text rendering with the same static-before-
             dynamic ordering.  The static prefix is never evicted; dynamic
             records are evicted from their least-recent ends first.
+
+        ``core_directive`` is used only when no root directive was supplied at
+        construction. The root directive is the unalterable goal shared by all
+        sub-agent contexts; it is capped at :data:`CORE_DIRECTIVE_MAX` chars.
         """
         node = self._node(task_id)
         config = self._config_for(node)
-        static_prefix = self._static_prefix(config)
+        directive = self._core_directive
+        if directive is None:
+            directive = self._normalise_core_directive(core_directive)
+        static_prefix = self._static_prefix(config, directive)
         dynamic_tail = self._dynamic_tail(node, config)
         max_tokens = self._context_budget(config)
         truncated = False
@@ -430,7 +460,7 @@ class ArchitectusCore:
                 spawn_positions.append(raw_index)
                 continue
 
-            if kind in {ActionKind.STEER, ActionKind.AGGREGATE}:
+            if kind in {ActionKind.STEER, ActionKind.AGGREGATE, ActionKind.RESET_RETRY}:
                 self._node(self._action_task_id(action))
             non_spawn.append((raw_index, action))
 
@@ -579,7 +609,9 @@ class ArchitectusCore:
         return merged
 
     @staticmethod
-    def _static_prefix(config: Mapping[str, Any]) -> list[str]:
+    def _static_prefix(
+        config: Mapping[str, Any], core_directive: str | None = None
+    ) -> list[str]:
         static = config.get("static", {})
         static_config = static if isinstance(static, Mapping) else {}
         system = static_config.get(
@@ -598,6 +630,8 @@ class ArchitectusCore:
             ),
         )
         values: list[str] = []
+        if core_directive is not None:
+            values.append(core_directive)
         for label, value in (("system", system), ("module_instructions", module)):
             if value is None:
                 continue
@@ -606,6 +640,38 @@ class ArchitectusCore:
             if value:
                 values.append(value)
         return values
+
+    @staticmethod
+    def _root_goal(tree: TaskTree) -> str | None:
+        """Read an optional root ``goal`` carried in the root task spec."""
+        root = next(node for node in tree.nodes if node.parent_task_id is None)
+        goal = root.spec.get("goal")
+        if goal is None:
+            config = root.spec.get("config")
+            if isinstance(config, Mapping):
+                goal = config.get("goal")
+        return goal
+
+    @staticmethod
+    def _normalise_core_directive(core_directive: str | None) -> str | None:
+        """Validate and cap a core directive without mutating caller data.
+
+        The cap is measured in characters. A truncated directive retains its
+        prefix and ends with ``... [truncated]`` while staying within the cap.
+        """
+        if core_directive is None:
+            return None
+        if not isinstance(core_directive, str):
+            raise TypeError("core_directive must be a string")
+        if not core_directive:
+            return None
+        if len(core_directive) <= CORE_DIRECTIVE_MAX:
+            return core_directive
+        marker_length = len(_CORE_DIRECTIVE_TRUNCATION_MARKER)
+        return (
+            core_directive[: CORE_DIRECTIVE_MAX - marker_length]
+            + _CORE_DIRECTIVE_TRUNCATION_MARKER
+        )
 
     @staticmethod
     def _context_budget(config: Mapping[str, Any]) -> int | None:
@@ -701,6 +767,7 @@ class ArchitectusCore:
 __all__ = [
     "ActionKind",
     "ArchitectusCore",
+    "CORE_DIRECTIVE_MAX",
     "FailureDecision",
     "LLM",
     "ScriptedLLM",

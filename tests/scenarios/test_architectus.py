@@ -6,7 +6,13 @@ import asyncio
 
 import pytest
 
-from cambium.architectus import ActionKind, ArchitectusCore, ScriptedLLM, decide_failure
+from cambium.architectus import (
+    CORE_DIRECTIVE_MAX,
+    ActionKind,
+    ArchitectusCore,
+    ScriptedLLM,
+    decide_failure,
+)
 from cambium.conversations import ConversationStore
 from cambium.tasktree import build_tree, topological_order
 
@@ -169,6 +175,64 @@ def test_context_is_static_first_dynamic_last_and_evicts_old_tail(tmp_path) -> N
     assert "NEW" in repr(budget_context)
 
 
+def test_core_directive_is_first_static_prefix_line() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], {"goal": "ROOT GOAL"}),
+                (
+                    "child",
+                    "TEST",
+                    ["root"],
+                    {"system": "SYSTEM", "module_instructions": "MODULE"},
+                ),
+            ]
+        )
+    )
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+
+    context = core.compose_context("child")
+
+    assert context["static_prefix"] == ["ROOT GOAL", "SYSTEM", "MODULE"]
+    assert context["prompt"].splitlines()[:3] == ["ROOT GOAL", "SYSTEM", "MODULE"]
+
+
+def test_compose_context_core_directive_is_truncated_to_hard_cap() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], {"system": "SYSTEM"}),
+            ]
+        )
+    )
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+    directive = "D" * (CORE_DIRECTIVE_MAX + 20)
+
+    context = core.compose_context("child", core_directive=directive)
+
+    prefix = context["static_prefix"][0]
+    assert len(prefix) == CORE_DIRECTIVE_MAX
+    assert prefix.startswith("D" * (CORE_DIRECTIVE_MAX - len("... [truncated]")))
+    assert prefix.endswith("... [truncated]")
+
+
+def test_compose_context_without_core_directive_keeps_prefix_absent() -> None:
+    tree = build_tree(
+        _plan(
+            [
+                ("root", "FEATURE", [], None),
+                ("child", "TEST", ["root"], {"system": "SYSTEM"}),
+            ]
+        )
+    )
+    core = ArchitectusCore(ScriptedLLM([]), tree=tree)
+
+    context = core.compose_context("child")
+
+    assert context["static_prefix"] == ["SYSTEM"]
+
+
 def test_scripted_llm_drives_a_three_task_wave() -> None:
     tree = build_tree(
         _plan(
@@ -206,6 +270,23 @@ def test_scripted_llm_drives_a_three_task_wave() -> None:
         ({"kind": "node_failed", "status": "failed", "retries_left": 1}, "resolve"),
         ({"kind": "gate_failed", "retries_left": 1}, "resolve"),
         ({"kind": "node_failed", "status": "failed", "retries_left": 0}, "abort-subtree"),
+        (
+            {
+                "kind": "gate_failed",
+                "task_id": "task",
+                "retries_remaining": 0,
+            },
+            "reset_retry",
+        ),
+        (
+            {
+                "kind": "gate_failed",
+                "task_id": "task",
+                "retries_remaining": 0,
+                "reset_retry_attempted": True,
+            },
+            "abort-subtree",
+        ),
         ({"kind": "budget_exceeded"}, "abort-subtree"),
         ({"kind": "merge_failed", "reason": "conflict"}, "replan"),
         ({"kind": "merge_failed", "reason": "test_failure"}, "merge-resolve"),
