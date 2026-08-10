@@ -110,9 +110,10 @@ def _validate_paths(session_dir: Path, task_spec: dict[str, Any]) -> tuple[Path,
     if not worktree_path.is_relative_to(session_root):
         raise ValueError(
             f"worktree_path {worktree_path} is outside the session dir {session_root}")
-    target_path = (worktree_path / task_spec["target_file"]).resolve()
-    if not target_path.is_relative_to(worktree_path):
-        raise ValueError(f"target_file {task_spec['target_file']!r} escapes the worktree")
+    if not task_spec.get("fanout_config"):
+        target_path = (worktree_path / task_spec["target_file"]).resolve()
+        if not target_path.is_relative_to(worktree_path):
+            raise ValueError(f"target_file {task_spec['target_file']!r} escapes the worktree")
     return scratch_repo, worktree_path
 
 
@@ -193,13 +194,18 @@ async def run_session(
 ) -> SliceResult:
     """Run one worker end to end and return the slice outcome.
 
-    task_spec keys: task_id, worker (script path), scratch_repo,
+    task_spec keys: task_id, task, worker (script path), scratch_repo,
     worktree_path, branch, target_file, marker, write_marker, gate
-    (shell command run in the worker's worktree), spec (optional),
+    (shell command run in the worker's worktree), spec (optional), fanout_config
+    (provider mode; requires a non-empty task),
     ready_timeout_s / gate_timeout_s / wall_budget_s (optional; else env
     CAMBIUM_READY_TIMEOUT_S / CAMBIUM_GATE_TIMEOUT_S / CAMBIUM_WALL_BUDGET_S).
     """
     session_dir = Path(session_dir)
+    if task_spec.get("fanout_config"):
+        task = task_spec.get("task")
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("run_session provider mode requires a non-empty task")
     log = EventLog(session_dir / ".cambium" / "events.jsonl", on_event)
     task_id = task_spec["task_id"]
     worker_script = str(task_spec["worker"])
@@ -219,8 +225,9 @@ async def run_session(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=WORKER_STDIN_LIMIT,
-        env=_strip_sensitive_env({**os.environ, "PYTHONUNBUFFERED": "1",
-                                  "CAMBIUM_TASK_ID": task_id, "CAMBIUM_GENERATION": "1"}),
+        env=_strip_sensitive_env(
+            _worker_env_for_spec(task_spec, 1), allow=_provider_env_keys(task_spec)
+        ),
         start_new_session=True,
     )
 
@@ -249,20 +256,29 @@ async def run_session(
     stderr_task = asyncio.create_task(_read_stderr())
 
     init_rid = make_request_id(1)
-    await _write_json(proc, {
+    init_message = {
         "type": "init", "request_id": init_rid, "task_id": task_id,
         "proto": PROTO, "generation": 1, "spec": task_spec.get("spec", ""),
-    })
+    }
+    if task_spec.get("fanout_config"):
+        init_message["fanout_config"] = task_spec["fanout_config"]
+        init_message["provider_env_keys"] = sorted(_provider_env_keys(task_spec))
+    await _write_json(proc, init_message)
     log.emit("init", task_id=task_id, request_id=init_rid)
 
     run_payload = {
         "scratch_repo": str(scratch_repo),
         "worktree_path": str(worktree_path),
         "branch": task_spec["branch"],
-        "target_file": task_spec["target_file"],
-        "marker": task_spec["marker"],
-        "write_marker": bool(task_spec.get("write_marker", True)),
     }
+    if task_spec.get("fanout_config"):
+        run_payload["task"] = task_spec["task"]
+    if not task_spec.get("fanout_config"):
+        run_payload.update(
+            target_file=task_spec["target_file"],
+            marker=task_spec["marker"],
+            write_marker=bool(task_spec.get("write_marker", True)),
+        )
 
     # Phase 1: init -> ready (bounded by ready_timeout and the wall budget).
     timeout_kind: str | None = None
@@ -313,8 +329,14 @@ async def run_session(
                     log.emit("protocol", task_id=task_id,
                              note="result_envelope request_id mismatch",
                              expected=run_rid, got=msg.get("request_id"))
-                log.emit("result", task_id=task_id, request_id=msg.get("request_id"),
-                         status=msg.get("status"))
+                result_payload: dict[str, Any] = {"status": msg.get("status")}
+                provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
+                if provider_metadata is not None:
+                    result_payload["provider_metadata"] = provider_metadata
+                log.emit(
+                    "result", task_id=task_id, request_id=msg.get("request_id"),
+                    **result_payload,
+                )
             elif mtype == "exit_message":
                 exit_reason = msg.get("reason")
                 log.emit("exit", task_id=task_id, reason=exit_reason)
@@ -421,11 +443,97 @@ CRITICAL_KINDS = frozenset({
 _API_KEY_RE = re.compile(
     r"(api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
 )
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_PROVIDER_METADATA_USAGE_FIELDS = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+    }
+)
 
 
-def _strip_sensitive_env(env: dict[str, str]) -> dict[str, str]:
+def _strip_sensitive_env(
+    env: dict[str, str], *, allow: frozenset[str] = frozenset()
+) -> dict[str, str]:
     """Drop env keys with API-key-ish names; keep everything else (arch §9)."""
-    return {k: v for k, v in env.items() if not _API_KEY_RE.search(k)}
+    return {k: v for k, v in env.items() if k in allow or not _API_KEY_RE.search(k)}
+
+
+def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
+    """Return only validated provider-key names declared by a task."""
+    values: list[Any] = []
+    explicit = spec.get("provider_env_keys")
+    if isinstance(explicit, (list, tuple)):
+        values.extend(explicit)
+    fanout_config = spec.get("fanout_config")
+    if isinstance(fanout_config, dict):
+        configured = fanout_config.get("provider_env_keys")
+        if isinstance(configured, (list, tuple)):
+            values.extend(configured)
+        providers = fanout_config.get("providers")
+        if isinstance(providers, (list, tuple)):
+            values.extend(
+                provider.get("api_key_env")
+                for provider in providers
+                if isinstance(provider, dict)
+            )
+    return frozenset(
+        value for value in values if isinstance(value, str) and _ENV_NAME_RE.fullmatch(value)
+    )
+
+
+def _worker_env_for_spec(spec: dict[str, Any], generation: int) -> dict[str, str]:
+    """Build a scrubbed worker env, retaining only declared provider keys."""
+    env = _strip_sensitive_env(dict(os.environ))
+    env["PYTHONUNBUFFERED"] = "1"
+    env["CAMBIUM_TASK_ID"] = spec["task_id"]
+    env["CAMBIUM_GENERATION"] = str(generation)
+
+    configured_path = os.environ.get("CAMBIUM_PROVIDERS")
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        env["CAMBIUM_PROVIDERS"] = str(path.resolve())
+
+    for name in _provider_env_keys(spec):
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+    return env
+
+
+def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
+    """Keep only scalar provider provenance safe for event serialization."""
+    if not isinstance(value, dict):
+        return None
+    provider = value.get("provider")
+    model = value.get("model")
+    latency = value.get("latency_s")
+    if not isinstance(provider, str) or not isinstance(model, str):
+        return None
+    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+        return None
+    usage = value.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    usage_counts = {
+        key: count
+        for key, count in usage.items()
+        if key in _PROVIDER_METADATA_USAGE_FIELDS
+        and isinstance(count, (int, float))
+        and not isinstance(count, bool)
+    }
+    return {
+        "provider": provider,
+        "model": model,
+        "usage": usage_counts,
+        "latency_s": max(0.0, float(latency)),
+    }
 
 
 class NonFastForwardError(RuntimeError):
@@ -970,17 +1078,13 @@ class _Runtime:
         return [sys.executable, "-u", str(worker)]
 
     def _worker_env(self, spec: dict[str, Any], generation: int) -> dict[str, str]:
-        env = _strip_sensitive_env(dict(os.environ))
-        env["PYTHONUNBUFFERED"] = "1"
-        env["CAMBIUM_TASK_ID"] = spec["task_id"]
-        env["CAMBIUM_GENERATION"] = str(generation)
-        return env
+        return _worker_env_for_spec(spec, generation)
 
     def _run_payload(
         self, spec: dict[str, Any], run_rid: str, wall_budget: float
     ) -> dict[str, Any]:
         repo = Path(spec["repo"])
-        return {
+        payload = {
             "task_id": spec["task_id"],
             "task": spec.get("task", ""),
             "repo": str(repo),
@@ -989,13 +1093,17 @@ class _Runtime:
             "branch": spec["branch"],
             "gate": spec.get("gate", ""),
             "base_commit": spec["base_commit"],
-            "target_file": spec.get("target_file"),
-            "marker": spec.get("marker"),
-            "write_marker": bool(spec.get("write_marker", True)),
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
             "max_wall_s": wall_budget,
         }
+        if not spec.get("fanout_config"):
+            payload.update(
+                target_file=spec.get("target_file"),
+                marker=spec.get("marker"),
+                write_marker=bool(spec.get("write_marker", True)),
+            )
+        return payload
 
     # -- per-task supervision ------------------------------------------------
 
@@ -1137,7 +1245,7 @@ class _Runtime:
                 stderr=asyncio.subprocess.PIPE,
                 limit=WORKER_STDIN_LIMIT,
                 cwd=str(worktree),
-                env=_strip_sensitive_env(env),
+                env=_strip_sensitive_env(env, allow=_provider_env_keys(spec)),
                 start_new_session=True,
                 pass_fds=(),
                 close_fds=True,
@@ -1201,6 +1309,9 @@ class _Runtime:
             "budget": {"max_wall_s": wall_budget, "max_restarts": DEFAULT_MAX_RESTARTS},
             "permissions": {"shell": True, "network": False},
         }
+        if spec.get("fanout_config"):
+            init_msg["fanout_config"] = spec["fanout_config"]
+            init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
         await self.emit("init", task_id=task_id, request_id=init_rid, generation=generation)
         await _write_json(proc, init_msg)
 
@@ -1294,9 +1405,13 @@ class _Runtime:
                             "protocol", task_id=task_id, note="result request_id mismatch",
                             expected=run_rid, got=msg.get("request_id"),
                         )
+                    result_payload: dict[str, Any] = {"status": msg.get("status")}
+                    provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
+                    if provider_metadata is not None:
+                        result_payload["provider_metadata"] = provider_metadata
                     await self.emit(
                         "result", task_id=task_id, request_id=msg.get("request_id"),
-                        status=msg.get("status"), generation=generation,
+                        generation=generation, **result_payload,
                     )
                 elif mtype in ("exit", "exit_message"):
                     exit_reason = msg.get("reason")

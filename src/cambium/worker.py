@@ -36,11 +36,20 @@ Task spec (the ``run_task`` body) is compatible with
     worktree_path   where the throwaway worktree is created (must stay under
                     the scratch repo's parent — path safety)
     branch          name of the throwaway branch
-    target_file     file inside the worktree to edit (must not escape it)
-    marker          line appended to the target file
+    target_file     file inside the worktree to edit (deterministic fallback;
+                    must not escape it)
+    marker          line appended to the target file (deterministic fallback)
     write_marker    bool; false forces the task to fail
     work_delay_s    optional float; pause before the edit (test hook so
                     cancellation is observable)
+
+When ``init.fanout_config`` is present, the worker ignores ``target_file`` and
+``marker``. It loads the provider file named by the worker's absolute
+``CAMBIUM_PROVIDERS`` environment variable, makes one ``Diffundo.call`` using
+the configured ``tier`` and ``model``, and accepts only this completion
+contract (one line, no reasoning):
+
+    append marker line to file <target_file>: <marker>
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -54,6 +63,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -61,7 +71,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cambium.diffundo import CallResult, Diffundo, ProviderTier
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
+from cambium.provider_config import load_providers
 
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
@@ -70,6 +82,30 @@ IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
+PROVIDER_COMPLETION_PREFIX = "append marker line to file "
+_COMPLETION_CONTRACT = re.compile(
+    rf"\A{re.escape(PROVIDER_COMPLETION_PREFIX)}([^:\n]+): ([^\n]+)\Z"
+)
+_USAGE_COUNT_FIELDS = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+    }
+)
+_DIFFUNDO_OPTIONS = frozenset(
+    {
+        "call_budget_s",
+        "pause_timeout_s",
+        "breaker_window_size",
+        "breaker_failure_threshold",
+        "open_backoff_base",
+        "retry_base_delay_s",
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +144,132 @@ def cap_diff(diff: str) -> tuple[str, bool]:
     return truncated + "\n... [diff truncated]", True
 
 
+def _provider_fanout_config(run: dict[str, Any]) -> dict[str, Any] | None:
+    config = run.get("fanout_config")
+    if not isinstance(config, dict) or not config:
+        return None
+    return config
+
+
+def _provider_path() -> Path:
+    configured = os.environ.get("CAMBIUM_PROVIDERS")
+    if not configured:
+        raise RuntimeError("provider configuration is not set in CAMBIUM_PROVIDERS")
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
+
+
+def _fanout_section(config: dict[str, Any]) -> dict[str, Any]:
+    for key in ("diffundo", "router"):
+        section = config.get(key)
+        if isinstance(section, dict):
+            return section
+    return config
+
+
+def _fanout_value(config: dict[str, Any], section: dict[str, Any], key: str) -> Any:
+    value = config.get(key)
+    if value is not None:
+        return value
+    return section.get(key)
+
+
+def _provider_router(config: dict[str, Any]) -> tuple[Diffundo, ProviderTier, str]:
+    providers = load_providers(_provider_path())
+    section = _fanout_section(config)
+    tier_value = _fanout_value(config, section, "tier")
+    model = _fanout_value(config, section, "model")
+    if not isinstance(tier_value, str) or not tier_value:
+        raise ValueError("fanout_config requires a provider tier")
+    if not isinstance(model, str) or not model:
+        raise ValueError("fanout_config requires a provider model")
+    try:
+        tier = ProviderTier(tier_value)
+    except ValueError as exc:
+        raise ValueError(f"unsupported provider tier {tier_value!r}") from exc
+
+    options: dict[str, Any] = {}
+    for key in _DIFFUNDO_OPTIONS:
+        value = _fanout_value(config, section, key)
+        if value is not None:
+            options[key] = value
+    return Diffundo(providers, **options), tier, model
+
+
+def _provider_prompt(run: dict[str, Any]) -> dict[str, Any]:
+    task = run.get("task")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("provider task requires a non-empty task description")
+    return {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are Cambium's deterministic coding worker.\n"
+                    "Return exactly one append-marker decision.\n"
+                    "Change only the requested file."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"task={task.strip()}\nReturn one decision now.",
+            },
+        ]
+    }
+
+
+def _parse_provider_completion(content: str) -> tuple[str, str]:
+    match = _COMPLETION_CONTRACT.fullmatch(content.strip())
+    if match is None:
+        raise ValueError("completion does not match the append-marker contract")
+    target_file, marker = match.groups()
+    target_path = Path(target_file)
+    if target_path.is_absolute() or ".." in target_path.parts:
+        raise ValueError("completion target_file escapes the worktree")
+    if not marker.strip():
+        raise ValueError("completion marker is empty")
+    return target_file, marker
+
+
+def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        key: value
+        for key, value in usage.items()
+        if key in _USAGE_COUNT_FIELDS
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    }
+
+
+def _provider_metadata(result: CallResult, requested_model: str) -> dict[str, Any]:
+    return {
+        "provider": result.provider,
+        # The requested model is host-authored. Never copy the provider's
+        # response model into the result envelope or durable event payload.
+        "model": requested_model,
+        "usage": _usage_counts(result.usage),
+        "latency_s": max(0.0, float(result.latency_s)),
+    }
+
+
+def _provider_edit(run: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    router, tier, model = _provider_router(config)
+    try:
+        result = asyncio.run(router.call(tier, _provider_prompt(run), model=model))
+    except Exception as exc:
+        # Provider errors may contain response text or request details. Only the
+        # exception class is safe to carry into the result envelope.
+        raise RuntimeError(f"provider completion failed: {exc.__class__.__name__}") from None
+    if result.model != model:
+        raise ValueError("provider response model mismatch")
+    target_file, marker = _parse_provider_completion(result.content)
+    return target_file, marker, _provider_metadata(result, model)
+
+
 def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
     """Execute one task: throwaway worktree, one-file edit, commit.
 
@@ -138,9 +300,22 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
         scratch = Path(run["scratch_repo"]).resolve()
         worktree = Path(run["worktree_path"]).resolve()
         branch = run["branch"]
-        target_file = run["target_file"]
-        marker = run["marker"]
         write_marker = bool(run.get("write_marker", True))
+        provider_metadata: dict[str, Any] | None = None
+
+        fanout_config = _provider_fanout_config(run)
+        if fanout_config is None:
+            target_file = run["target_file"]
+            marker = run["marker"]
+        else:
+            try:
+                target_file, marker, provider_metadata = _provider_edit(run, fanout_config)
+            except ValueError:
+                outcome["failure_reason"] = "provider completion violated the edit contract"
+                return outcome
+            except RuntimeError as exc:
+                outcome["failure_reason"] = str(exc)
+                return outcome
 
         session_root = scratch.parent
         if not worktree.is_relative_to(session_root):
@@ -209,6 +384,7 @@ def do_work(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
             diff=diff,
             diff_truncated=diff_truncated,
             summary=f"appended marker to {target_file}"[:MAX_SUMMARY_CHARS],
+            provider_metadata=provider_metadata,
         )
         return outcome
     except Exception as exc:  # let-it-crash: report as a failure, not a hang
@@ -302,6 +478,9 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),
     }
+    provider_metadata = outcome.get("provider_metadata")
+    if isinstance(provider_metadata, dict):
+        envelope["provider_metadata"] = provider_metadata
     await send(writer, envelope)
 
 
@@ -372,6 +551,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
     init_rid = first["request_id"]
     task_id = first.get("task_id", "unknown")
     generation = first.get("generation", 1)
+    init_fanout_config = first.get("fanout_config")
     await send(writer, {
         "type": "ready",
         "request_id": init_rid,
@@ -453,8 +633,13 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             if "request_id" not in msg:
                 return await _fatal(writer, msg, "run_task without a request_id")
             stop = threading.Event()
+            task_run = dict(msg)
+            if init_fanout_config is not None:
+                # Provider configuration belongs to init. It is kept in the
+                # worker's local task context and never sent back over IPC.
+                task_run["fanout_config"] = init_fanout_config
             current = asyncio.create_task(
-                _run_task(writer, msg, task_id, generation, stop))
+                _run_task(writer, task_run, task_id, generation, stop))
         elif mtype == "check_health":
             await _send_ok(writer, msg, task_id, generation)
         elif mtype == "steer":
