@@ -17,10 +17,10 @@ docs/architecture.md):
   waits (backpressure) up to ``critical_timeout_s``. A non-critical event
   against a full queue is dropped; ``dropped`` counts both evictions and
   incoming drops, and each drop is logged.
-- **Dropped events create ``seq`` gaps.** ``seq`` is reserved at enqueue, so a
-  dropped event's ``seq`` never reaches the table. This supersedes the old
-  "gaps cannot occur by construction" claim *under overflow only*; replay and
-  ``events_after`` already tolerate missing events (phantom-read caveat §6.5).
+- **Dropped incoming events do not receive a ``seq``.** Sequence reservation
+  happens only after queue admission, so a dropped tail cannot be reused after
+  restart. Critical admission can still evict an older non-critical queue item;
+  that item already has a sequence and the eviction is counted.
 - **Hard deadline for critical appends (M4).** A critical append waits at most
   ``critical_timeout_s`` for its fsync ack; on expiry it raises
   ``StoreTimeout`` and the store stays alive (the event is still queued and is
@@ -33,9 +33,10 @@ docs/architecture.md):
   §3 finding 4).
 - **Final close/fsync errors propagate.** ``close()`` re-raises a failure in
   the writer's final flush instead of swallowing it.
-- **Phantom read.** A non-critical append returns a reserved ``seq`` whose row
-  may not be durable yet: ``events_after(seq)`` may not observe it, and a crash
-  inside ``fsync_interval_s`` can lose it. Callers must tolerate both.
+- **Phantom read.** An accepted non-critical append returns a reserved ``seq``
+  whose row may not be durable yet: ``events_after(seq)`` may not observe it,
+  and a crash inside ``fsync_interval_s`` can lose it. Callers must tolerate
+  both. A dropped non-critical append returns ``None``.
 - **Writer death is fatal.** Any error in the writer thread (sqlite/fsync/disk)
   marks the store dead: pending appends raise ``StoreError``, pending events are
   lost, and the supervisor must treat store death as fatal.
@@ -55,6 +56,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -92,9 +94,14 @@ _WRITER_BUSY_TIMEOUT_MS = 5000
 # loop (and the critical-append deadline) in control of total wait time.
 _CHECKPOINT_BUSY_TIMEOUT_MS = 20
 _CHECKPOINT_RETRY_SLEEP_S = 0.02
+_CLOSE_JOIN_TIMEOUT_S = 1.0
 
 _SENTINEL = object()
 _TIMER = object()
+
+
+class _AdmissionCancelled(Exception):
+    """A close started while an append was waiting for queue admission."""
 
 
 class StoreError(Exception):
@@ -127,6 +134,9 @@ class _BoundedEventQueue:
     queue is still full the enqueuer waits (backpressure) up to ``timeout`` and
     then ``queue.Full`` is raised. A non-critical item against a full queue is
     dropped (the incoming one). ``put`` returns the number of dropped items.
+
+    ``on_admit`` runs only after there is space. This lets the caller reserve a
+    sequence only for an item that is actually accepted by the queue.
     """
 
     __slots__ = ("_items", "_maxsize", "_cond")
@@ -136,32 +146,51 @@ class _BoundedEventQueue:
         self._maxsize = maxsize
         self._cond = threading.Condition()
 
-    def put(self, item: tuple, *, critical: bool, timeout: float) -> int:
+    def put(
+        self,
+        item: Any,
+        *,
+        critical: bool,
+        timeout: float,
+        evict_noncritical: bool = True,
+        on_admit: Callable[[], Any] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> int:
         deadline = time.monotonic() + timeout
         with self._cond:
+            if cancel is not None and cancel.is_set():
+                raise _AdmissionCancelled
             if not critical:
                 if len(self._items) >= self._maxsize:
                     return 1
-                self._items.append(item)
+                if cancel is not None and cancel.is_set():
+                    raise _AdmissionCancelled
+                self._items.append(on_admit() if on_admit is not None else item)
                 self._cond.notify()
                 return 0
             dropped = 0
             while len(self._items) >= self._maxsize:
-                if self._evict_oldest_noncritical():
+                if cancel is not None and cancel.is_set():
+                    raise _AdmissionCancelled
+                if evict_noncritical and self._evict_oldest_noncritical():
                     dropped += 1
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise queue.Full
                 self._cond.wait(remaining)
-            self._items.append(item)
+            if cancel is not None and cancel.is_set():
+                raise _AdmissionCancelled
+            self._items.append(on_admit() if on_admit is not None else item)
             self._cond.notify()
             return dropped
 
-    def get(self, timeout: float) -> Any:
+    def get(self, timeout: float, *, stop_event: threading.Event | None = None) -> Any:
         deadline = time.monotonic() + timeout
         with self._cond:
             while not self._items:
+                if stop_event is not None and stop_event.is_set():
+                    raise queue.Empty
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise queue.Empty
@@ -175,6 +204,17 @@ class _BoundedEventQueue:
                 raise queue.Empty
             self._cond.notify_all()
             return self._items.popleft()
+
+    def wake(self) -> None:
+        with self._cond:
+            self._cond.notify_all()
+
+    def drain(self) -> list[Any]:
+        with self._cond:
+            items = list(self._items)
+            self._items.clear()
+            self._cond.notify_all()
+            return items
 
     def _evict_oldest_noncritical(self) -> bool:
         for i, item in enumerate(self._items):
@@ -210,7 +250,11 @@ class EventStore:
         self._checkpoint_busy_retry_s = checkpoint_busy_retry_s
         self._queue: _BoundedEventQueue = _BoundedEventQueue(max_queue_size)
         self._lock = threading.Lock()
+        self._admission_cond = threading.Condition(self._lock)
+        self._active_admissions = 0
         self._closed = False
+        self._close_requested = threading.Event()
+        self._stop_requested = threading.Event()
         self._dead: BaseException | None = None
         self._close_error: BaseException | None = None
         self._dropped = 0
@@ -229,10 +273,11 @@ class EventStore:
 
     @property
     def dropped(self) -> int:
-        """Number of non-critical events dropped by the bounded-queue policy."""
-        return self._dropped
+        """Number of non-critical events lost to overflow or forced shutdown."""
+        with self._lock:
+            return self._dropped
 
-    def append(self, event: dict[str, Any]) -> int:
+    def append(self, event: dict[str, Any]) -> int | None:
         kind = event.get("kind")
         if not isinstance(kind, str) or not kind:
             raise ValueError("event requires a non-empty string 'kind'")
@@ -248,32 +293,62 @@ class EventStore:
         pending = _Pending()
         critical = kind in CRITICAL_KINDS
         deadline = time.monotonic() + self._critical_timeout_s
+        seq_holder: list[int] = []
+
         with self._lock:
             if self._dead is not None:
                 raise StoreError("event store is dead") from self._dead
             if self._closed:
                 raise RuntimeError("EventStore is closed")
-            seq = self._next_seq
-            self._next_seq += 1
-            try:
-                remaining = max(deadline - time.monotonic(), 0.0)
-                dropped = self._queue.put(
-                    (seq, kind, row, pending), critical=critical, timeout=remaining
-                )
-            except queue.Full:
-                raise StoreTimeout(
-                    f"critical event {kind!r} not enqueued within "
-                    f"{self._critical_timeout_s}s (writer stalled)"
-                ) from None
-            if dropped:
-                self._dropped += dropped
-                logger.warning(
-                    "event store overflow: dropped %d non-critical event(s), "
-                    "latest seq %d kind=%r",
-                    dropped,
-                    seq,
-                    kind,
-                )
+            self._active_admissions += 1
+
+        def admit() -> tuple[int, str, tuple, _Pending]:
+            with self._lock:
+                seq = self._next_seq
+                self._next_seq += 1
+            seq_holder.append(seq)
+            return (seq, kind, row, pending)
+
+        try:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            dropped = self._queue.put(
+                None,
+                critical=critical,
+                timeout=remaining,
+                on_admit=admit,
+                cancel=self._close_requested,
+            )
+        except _AdmissionCancelled:
+            raise RuntimeError("EventStore is closed") from None
+        except queue.Full:
+            raise StoreTimeout(
+                f"critical event {kind!r} not enqueued within "
+                f"{self._critical_timeout_s}s (writer stalled)"
+            ) from None
+        finally:
+            with self._lock:
+                self._active_admissions -= 1
+                if self._active_admissions == 0:
+                    self._admission_cond.notify_all()
+
+        if not seq_holder:
+            self._record_dropped(1)
+            logger.warning(
+                "event store overflow: dropped incoming non-critical event kind=%r",
+                kind,
+            )
+            return None
+
+        seq = seq_holder[0]
+        if dropped:
+            self._record_dropped(dropped)
+            logger.warning(
+                "event store overflow: dropped %d non-critical event(s), "
+                "latest seq %d kind=%r",
+                dropped,
+                seq,
+                kind,
+            )
         if critical:
             if not pending.event.wait(max(deadline - time.monotonic(), 0.0)):
                 raise StoreTimeout(
@@ -293,22 +368,104 @@ class EventStore:
             conn.close()
         return [self._row_to_event(row) for row in rows]
 
+    def _record_dropped(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            self._dropped += count
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
-                return
-            self._closed = True
-            dead = self._dead
-        if dead is not None:
-            self._thread.join()
+                failure = self._close_error or self._dead
+                already_closed = True
+            else:
+                self._closed = True
+                self._close_requested.set()
+                failure = self._close_error or self._dead
+                already_closed = False
+        self._queue.wake()
+
+        if already_closed:
+            if failure is not None:
+                self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+                self._raise_close_failure(failure)
             return
-        try:
-            self._queue.put(_SENTINEL, critical=True, timeout=self._critical_timeout_s)
-        except queue.Full:
-            logger.error("event store close: writer stalled, sentinel not enqueued")
-        self._thread.join()
-        if self._close_error is not None:
-            raise self._close_error
+
+        if failure is not None:
+            self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+            self._raise_close_failure(failure)
+
+        admission_deadline = time.monotonic() + _CLOSE_JOIN_TIMEOUT_S
+        with self._lock:
+            while self._active_admissions:
+                remaining = admission_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._admission_cond.wait(remaining)
+            admissions_active = self._active_admissions != 0
+
+        if admissions_active:
+            failure = StoreTimeout(
+                "event store close: append admission did not stop within the close deadline"
+            )
+        else:
+            try:
+                # A close sentinel is not an event. It must wait for space and
+                # never evict an accepted event from the bounded queue.
+                self._queue.put(
+                    _SENTINEL,
+                    critical=True,
+                    timeout=self._critical_timeout_s,
+                    evict_noncritical=False,
+                )
+            except queue.Full:
+                failure = StoreTimeout(
+                    "event store close: writer stalled; sentinel was not admitted"
+                )
+
+        if failure is not None:
+            failure = self._set_close_failure(failure)
+            self._request_stop(failure)
+            self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+            self._raise_close_failure(self._close_failure())
+
+        self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+        if self._thread.is_alive():
+            failure = self._set_close_failure(
+                StoreTimeout("event store close: writer did not stop within the close deadline")
+            )
+            self._request_stop(failure)
+            self._thread.join(_CLOSE_JOIN_TIMEOUT_S)
+
+        failure = self._close_failure()
+        if failure is not None:
+            self._raise_close_failure(failure)
+
+    def _close_failure(self) -> BaseException | None:
+        with self._lock:
+            return self._close_error or self._dead
+
+    def _set_close_failure(self, exc: BaseException) -> BaseException:
+        with self._lock:
+            if self._close_error is None and self._dead is None:
+                self._close_error = exc
+                self._dead = exc
+            return self._close_error or self._dead or exc
+
+    def _request_stop(self, exc: BaseException) -> None:
+        self._stop_requested.set()
+        self._queue.wake()
+        self._fail_pending(exc)
+
+    def _raise_close_failure(self, exc: BaseException | None) -> None:
+        if exc is None:
+            return
+        with self._lock:
+            final_close_error = self._close_error is exc
+        if isinstance(exc, StoreError) or final_close_error:
+            raise exc
+        raise StoreError("event store writer died") from exc
 
     def _writer_loop(self) -> None:
         conn = None
@@ -348,11 +505,15 @@ class EventStore:
         cur_pending = None
         dead_exc = None
         try:
-            while True:
+            while not self._stop_requested.is_set():
                 remaining = next_fsync - time.monotonic()
                 try:
-                    item = self._queue.get(timeout=max(remaining, 0.0))
+                    item = self._queue.get(
+                        timeout=max(remaining, 0.0), stop_event=self._stop_requested
+                    )
                 except queue.Empty:
+                    if self._stop_requested.is_set():
+                        break
                     item = _TIMER
                 if item is _SENTINEL:
                     break
@@ -364,30 +525,48 @@ class EventStore:
                     continue
                 seq, kind, row, pending = item
                 cur_pending = pending
+                if self._stop_requested.is_set():
+                    cur_pending.exc = self._termination_error()
+                    cur_pending.event.set()
+                    cur_pending = None
+                    break
                 conn.execute(_INSERT, (seq, kind, *row))
                 dirty = True
                 if kind in CRITICAL_KINDS:
+                    if self._stop_requested.is_set():
+                        cur_pending.exc = self._termination_error()
+                        cur_pending.event.set()
+                        cur_pending = None
+                        break
                     self._fsync_now()
                     dirty = False
                     next_fsync = time.monotonic() + self._fsync_interval_s
+                if self._stop_requested.is_set():
+                    cur_pending.exc = self._termination_error()
+                    cur_pending.event.set()
+                    cur_pending = None
+                    break
                 pending.event.set()
                 cur_pending = None
         except Exception as exc:
             dead_exc = exc
             with self._lock:
-                self._dead = exc
+                if self._dead is None:
+                    self._dead = exc
             self._fail_pending(exc)
             if cur_pending is not None:
-                cur_pending.exc = exc
+                cur_pending.exc = self._termination_error()
                 cur_pending.event.set()
         finally:
-            if dead_exc is None:
+            if dead_exc is None and not self._stop_requested.is_set():
                 try:
                     self._fsync_now()
                 except Exception as exc:
-                    self._close_error = exc
                     with self._lock:
-                        self._dead = exc
+                        if self._close_error is None:
+                            self._close_error = exc
+                        if self._dead is None:
+                            self._dead = exc
             if wal_fd is not None:
                 os.close(wal_fd)
             if db_fd is not None:
@@ -395,7 +574,12 @@ class EventStore:
             if conn is not None:
                 conn.close()
 
+    def _termination_error(self) -> BaseException:
+        with self._lock:
+            return self._close_error or self._dead or StoreError("event store writer stopped")
+
     def _fail_pending(self, exc: BaseException) -> None:
+        dropped = 0
         while True:
             try:
                 item = self._queue.get_nowait()
@@ -404,8 +588,16 @@ class EventStore:
             if item is _SENTINEL or item is _TIMER:
                 continue
             seq, kind, row, pending = item
+            if kind not in CRITICAL_KINDS:
+                dropped += 1
             pending.exc = exc
             pending.event.set()
+        if dropped:
+            self._record_dropped(dropped)
+            logger.warning(
+                "event store shutdown: dropped %d queued non-critical event(s)",
+                dropped,
+            )
 
     def _fsync_now(self) -> None:
         """Checkpoint the WAL and fsync both fds; never ack a busy checkpoint.
