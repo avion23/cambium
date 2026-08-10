@@ -70,7 +70,7 @@ is not a branch ledger or merge log.
 
 ## 6. External-provider smoke
 
-- After steps 1 and 4 are verified and credentials exist, run one disposable
+- After steps 1, 4, and 5 are verified and credentials exist, run one disposable
   provider configuration through the custom worker loop, tool/checkpoint
   events, deterministic gate, and ref-only merge under the selected
   containment boundary.
