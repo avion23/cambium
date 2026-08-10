@@ -33,28 +33,28 @@ v0.1 reviews, and `implementation-plan.md`.
 | 6 | Trim generation/monotonic/ts from worker envelope | **PARTIAL** | Supervisor stamps authoritative `ts`/`monotonic_ms`, store reserves `seq`; generation remains fencing data and request ID remains correlation (`supervisor.py` emit; `store.py` append; `worker.py`; architecture §§5.1, 7.3). |
 | 7 | Use `graphlib.TopologicalSorter` | **REJECT** | Hand Kahn provides deterministic order/message control and is covered by 29 tests; correction retained: Python 3.14.7 `CycleError.args[1]` does expose a path (`tasktree.py`; `test_tasktree.py`; DS-M6/I2.2). |
 | 8 | Sandbox is theater; containers at deployment | **ALREADY-IMPLEMENTED (historical disposition; current boundary: PARTIAL)** | D7 removed Septum. An optional `ApprovalGate` primitive exists, but no production approval callback or per-worker OS sandbox exists; worktrees/allowlists are harness controls and containers/microVMs are host-owned D8e (`architecture` §§0,2,4,7.2,18.4; implementation-plan decision 5; feedback-2 D8e). |
-| 9 | cgroups + `wait_for_resources` | **ADOPT-LITE** | `resources.py:CompileGate` and `system_health.py:can_run_heavy` are agent-side gates; `systemd-run` is a deployment note (`v2-1-review` §4 M3; architecture §7.2). |
+| 9 | cgroups + `wait_for_resources` | **ADOPT-LITE** | `resources.py:CompileGate` and `system_health.py:can_run_heavy` are agent-side gates; `systemd-run` is a deployment note (`v2-1-review` §4 M4; architecture §7.2). |
 | 10 | Global PID pacing | **ADOPT-LITE** | D8f token buckets/pause already exist in the snapshot Diffundo; PID reset-window pacing is a v2.1 enhancement (`diffundo.py`; architecture §§7.4, 9.2; D8f). Addendum later supersedes PID with GCRA F6-04. |
 | 11 | ≤200-token root Core Directive | **ADOPT** | Static prefix segment in Architectus context, before dynamic content (architectus-design §3.1/§3.2; D8c); wiring was a separate task. |
 | 12 | Three gate failures → reset/retry; `evaluate_goal` | **ADOPT-LITE** | Existing reset/clean before respawn and bounded `gate_max_retries`; codify reset once then abort and treat `evaluate_goal` as the existing gate (supervisor `_recover_worktree_locked`; architecture §§7.1, 7.5, 7.9; architectus-design §6). |
 | 13 | Serialized JSON TaskInput fixtures | **ALREADY-IMPLEMENTED** | Frozen train/eval/canary JSONL and timestamps exist without supervisor; mock-git/AST wrapper is DRAFT M8 (`datasets/*`, `meta.json`, `dataset.py`, bench §8). |
 | 14 | DSPy prompts/few-shots + DLQ mining | **ADOPT** | M8 SIMBA refinement may mine corrected DLQ trajectories. The old snapshot said DLQ was merged; current note says DLQ is absent, so this remains plan-level (`dlq.py` then; `v2-1-review` §4 M8; architectus-design §4.2). |
-| 15 | Only lock is Unio merge lock | **ALREADY-IMPLEMENTED** | Unio lock spans verify/publish; store `threading.Lock` is not merge guard (`architecture §7.8`; event-schema §3.11; worktree-concurrency; feedback-4 claim 11). |
+| 15 | Only lock is Unio merge lock | **PARTIAL** | The narrow Unio publication lock spans verify/publish, but store `threading.Lock` and other synchronization also exist; “only lock” is false. Preserve the merge-publication lock as the intended boundary (`architecture §7.8`; event-schema §3.11; worktree-concurrency; feedback-4 claim 11). |
 | 16 | Batch tool executions | **ALREADY-IN-DESIGN** | Architectus §4.4 proposes speculative `read_file` batching with ≥30% M6 bar; sequential heartbeat loop remains v2. |
 | 17 | Semantic code search `get_signature` | **ALREADY-IMPLEMENTED (snapshot partial wiring)** | `ast_tools.py` has `extract_signature`/references and schemas/dispatch merged, but schema exposure was the remaining task at the original assessment (`ast_tools.py`; `tools.py` 74ff5aa; `schemas.py`; architecture §11). |
 | 18 | Drop upward `unified_diff` | **REJECT** | Keep 64 KiB diff + `diff_truncated`; `include_diff:false` is optional for higher tiers and default-on for evaluator (`feedback-4` claims 7/21; architecture §3.4; architectus-design §3.7; tasktree envelope keys). |
 | 19 | Pre-warmed pool, 3 READY/refill | **ADOPT** | Cold-start measurement ~2.22 s/worker and ~7.0 s/10 versus warm 5.6 ms/39 ms; M7 makes reusable pool the production fan-out gate (`worker-coldstart`; `v2-1-review` §§3D, 4 M7; architecture §14). |
 
 **Counts:** REJECT 4 (2,4,7,18) · ADOPT 4 (1,11,14,19) · ADOPT-LITE 3 (9,10,12) ·
-ALREADY-IMPLEMENTED 4 (8,13,15,17) · ALREADY-PLANNED 1 (3) · ALREADY-IN-DESIGN 1 (16) ·
-PARTIAL 2 (5,6). The original record also listed claim 17 as remaining wiring; the addendum below
+ALREADY-IMPLEMENTED 3 (8,13,17) · ALREADY-PLANNED 1 (3) · ALREADY-IN-DESIGN 1 (16) ·
+PARTIAL 3 (5,6,15). The original record also listed claim 17 as remaining wiring; the addendum below
 records completion.
 
 These are snapshot dispositions. Claim 8 is not a current implementation claim: Septum was
 removed, an optional `ApprovalGate` primitive exists, but no production approval callback or
 per-worker OS sandbox exists. Source and tests, not the status tracker, control current findings.
-Claims 13, 15, and 17 retain implementation labels only for their cited fixture, lock, and tool
-surfaces; none is a claim of full runtime integration.
+Claims 13 and 17 retain implementation labels only for their cited fixture and tool surfaces;
+claim 15 is partial because the merge-publication lock is not the only synchronization lock.
 
 ## 2. Plan consequences
 

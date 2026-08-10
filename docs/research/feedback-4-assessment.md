@@ -32,8 +32,8 @@ Paths are repository-relative. Checks are listed in §3. The source tree at the 
 | 8 | Blackboard for cross-cutting changes | **ADOPT-LITE** | Bounded parent-mediated query substrate in conversation store; not free-for-all scratchpad (architecture §6.6/I2.4; `architectus-design.md`). |
 | 9 | Flat `requires:[…]` task list | **ALREADY-IMPLEMENTED** | `tasktree.build_tree` validates flat `depends_on` plans, one root, no multi-parent/cycle, then Kahn-orders them (`tasktree.py`; D2). |
 | 10 | Data → function → data; supervisor side effects | **ALREADY-IMPLEMENTED** | Pure module contract, writer thread, worker subprocesses, deterministic LLM-free layer (base `Module.decide`; architecture §§2, 4; `agents.md` §7). |
-| 11 | Only lock is final merge | **ALREADY-IMPLEMENTED** | Unio lock spans verify/publish; store lock protects writer scalars, not merge (`architecture §7.8`; event draft §3.11; `worktree-concurrency.md`; D6). |
-| 12 | Mailboxes/queues (CSP) | **ALREADY-IMPLEMENTED** | Single-writer store/logging queues and worker pipes. Store queue is intentionally unbounded v2.1 (`store.py:20–22,106`; review §1.3 P0 gap 10; architecture §§5.1, 6.2). |
+| 11 | Only lock is final merge | **PARTIAL** | The narrow Unio publication lock spans verify/publish, but the snapshots also have store writer/sequence locks and other synchronization; “only lock” is false. Preserve the merge-publication lock as the intended boundary (`architecture §7.8`; event draft §3.11; `worktree-concurrency.md`; D6). |
+| 12 | Mailboxes/queues (CSP) | **ALREADY-IMPLEMENTED** | Single-writer store/logging queues and worker pipes. Store queue is intentionally unbounded v2.1 (`store.py:20–22,106`; `v2-1-review` §2 P0 liveness/resources, item 10; architecture §§5.1, 6.2). |
 | 13 | `check_system_health` before heavy ops | **ADOPT** | Stdlib `/proc`/`os.sysconf` health gate for resource gap; `system_health.py` existed on `wt-luna-health@d4db2ff`, unmerged in snapshot (`v2-1-review` §2 P0 liveness/resources, item 9). |
 | 14 | Token bucket limiter | **ALREADY-IMPLEMENTED** | D8f per-provider buckets, pause/recovery, and cascade are folded into architecture and branch Diffundo (`architecture` §§7.4, 9.1–9.2; D8f; `v2-1-review` §3E). |
 | 15 | Local cache for DSPy evals | **ADOPT (scoped)** | Eval-only full-prompt/model cache is safe with frozen datasets; never production. `eval_cache.py` `wt-luna-evalcache@d8f9408` was unmerged in snapshot (`design-deltas` D1; architecture §8.1/M9; `meta.json`). Current note: eval cache is absent. |
@@ -45,13 +45,14 @@ Paths are repository-relative. Checks are listed in §3. The source tree at the 
 | 21 | `include_diff` flag | **ADOPT-LITE** | Higher tiers may omit diff; evaluator stays default-on and schema enforcement remains (architecture §3.4; D8b). |
 
 **Counts:** 21 rows — REJECT 6 (1–6) · ADOPT 3 (13,15,17) · ADOPT-LITE 6 (7,8,18–21) ·
-ALREADY-IMPLEMENTED 6 (9,10,11,12,14,16). Claim 7's correction is retained: Python 3.14.7
+ALREADY-IMPLEMENTED 5 (9,10,12,14,16). PARTIAL 1 (11). Claim 7's correction is retained: Python 3.14.7
 `graphlib` exposes `CycleError.args[1]`;
 Kahn remains for deterministic ordering/message control.
 
-These implementation labels are limited to the cited task-tree, module, lock, queue, limiter,
-and fixture surfaces. They do not certify full runtime integration or the absent sandbox/approval
-boundary; the current source and status pointer above govern those findings.
+These implementation labels are limited to the cited task-tree, module, queue, limiter, and
+fixture surfaces. The merge-publication lock is only a PARTIAL disposition because other locks
+exist. No label certifies full runtime integration or the absent sandbox/approval boundary; the
+current source and status pointer above govern those findings.
 
 ## 2. Plan consequences
 

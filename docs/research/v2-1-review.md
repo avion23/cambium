@@ -27,7 +27,7 @@ no per-worker sandbox or production shell approval, and no dynamic hierarchy.
    connections (`store.py:93–158,172–272`; `conformance-report.md` §§1 (Check 1), 2 (Store)). `recovery_gap` was folded out
    in favor of no-gap-by-construction plus phantom-read semantics (architecture §§6.3, 6.5).
 2. **MergeSequencer:** throwaway staging worktree, reachable staging ref, quarantine refusal,
-   ancestry/expected-old `update-ref` publish (`merge.py:158–177,281–482`; `conformance-report.md` §3).
+   ancestry/expected-old `update-ref` publish (`merge.py:158–177,281–482`; `conformance-report.md` §1 Check 3; §2 Merge and runtime boundary).
 3. **Nuntius/Opifex seed:** 1 MiB cap/resync, malformed-object skip/torn-tail handling,
    request correlation, heartbeat/cancel/health, result/exit ordering, 64 KiB diff and deadlines
    (`ipc.py:28–129`; `worker.py:66–93,219–317,356–494`; merged `38e1d43`).
