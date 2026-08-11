@@ -203,15 +203,17 @@ def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
     assert all(r.status == "succeeded" for r in result.results)
     events = read_events(session_dir)
     spawned = _kinds(events, "spawned")
-    assert [e["task_id"] for e in spawned] == ["t-a", "t-b"]
-    # t-a's worker phase ends with result + exit (the semaphore is released
-    # after the generation loop, before merge/prune); t-b's spawn is
-    # sequenced strictly after both, so the two workers never overlapped.
-    a_worker_end = max(
+    assert {e["task_id"] for e in spawned} == {"t-a", "t-b"}
+    # Which task wins the single admission slot first is scheduler-dependent;
+    # the invariant is that the second spawn happens only after the first
+    # task's worker phase ended (result + exit both precede the semaphore
+    # release, which happens before merge/prune).
+    first, second = spawned[0], spawned[1]
+    first_worker_end = max(
         e["seq"] for e in events
-        if e["task_id"] == "t-a" and e["kind"] in ("result", "exit")
+        if e["task_id"] == first["task_id"] and e["kind"] in ("result", "exit")
     )
-    assert spawned[1]["seq"] > a_worker_end
+    assert second["seq"] > first_worker_end
 
 
 
