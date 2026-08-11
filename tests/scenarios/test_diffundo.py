@@ -71,7 +71,7 @@ class FakeServer:
         self._httpd.fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
-            kwargs={"poll_interval": 0.05},
+            kwargs={"poll_interval": 0.001},
             daemon=True,
         )
         self._thread.start()
@@ -272,7 +272,8 @@ def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
             _config("p_fast2", fast2, "K_FAST2", model="m2"),
             _config("p_strong", strong, "K_STRONG", tier=ProviderTier.STRONG, model="m-s"),
             _config("p_bal", balanced, "K_BAL", tier=ProviderTier.BALANCED, model="m-b"),
-        )
+        ),
+        pause_timeout_s=0.01,  # the pin-out exhaustion pause is not this test's signal
     )
     try:
         result = asyncio.run(router.call(ProviderTier.BALANCED, PROMPT))
@@ -795,6 +796,7 @@ def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> Non
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.slow  # 0.2s bounded-pause wait
 def test_all_providers_exhausted_pauses_then_raises(tmp_path, monkeypatch) -> None:
     down = FakeServer([(500, _error_payload("down"), 0.0)])
     ok = FakeServer([(200, _ok_payload("ok"), 0.0)])
@@ -823,6 +825,7 @@ def test_all_providers_exhausted_pauses_then_raises(tmp_path, monkeypatch) -> No
         ok.close()
 
 
+@pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.25
 def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) -> None:
     # D8f recovery monitor: after the provider's cooldown elapses mid-pause, the
     # monitor wakes dispatch, the call probes, and the provider heals.
@@ -849,6 +852,7 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
         server.close()
 
 
+@pytest.mark.slow  # 0.2s blocking-pause wait; asserts elapsed >= 0.15
 def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> None:
     # D8f: a tier outage must BLOCK on the pause event, not spin the candidate
     # loop. The reviewer measured ~26k pause iterations in 0.6s before the fix;
@@ -894,6 +898,7 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.slow  # 0.8s scripted provider delays; timing assertion
 def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
     # call_budget_s is a hard deadline over the WHOLE cascade, not just
     # candidate waiting. Two 1.0s-timeout providers with a retry would naively

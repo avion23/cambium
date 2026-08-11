@@ -66,7 +66,7 @@ class FakeServer:
         self._httpd.fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
-            kwargs={"poll_interval": 0.05},
+            kwargs={"poll_interval": 0.001},
             daemon=True,
         )
         self._thread.start()

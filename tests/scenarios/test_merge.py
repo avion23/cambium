@@ -41,6 +41,8 @@ from cambium.merge import (
 from cambium.store import EventStore
 from cambium.supervisor import _Runtime, read_events, run_plan
 
+pytestmark = pytest.mark.slow  # real git merges and worktrees: tier-2
+
 SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 
 
