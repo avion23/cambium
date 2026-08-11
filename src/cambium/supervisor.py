@@ -3122,7 +3122,15 @@ async def run_plan(
                 await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
             finally:
                 if debt_store.dirty:
-                    await asyncio.to_thread(debt_store.save)
+                    try:
+                        await asyncio.to_thread(debt_store.save)
+                    except Exception as exc:  # noqa: BLE001
+                        # A ledger save failure (disk full, permissions) must
+                        # never discard the session result: report and continue.
+                        await runtime.emit(
+                            "log", task_id=None,
+                            message=f"routing-state save failed: {exc}",
+                        )
         result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
         session_id = str(session_dir.resolve())
         await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)

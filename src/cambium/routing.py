@@ -50,7 +50,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -177,7 +177,10 @@ class DebtStore:
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
-        self._path = Path(path) if path is not None else DEFAULT_ROUTING_STATE_PATH
+        if path is None:
+            env_path = os.environ.get("CAMBIUM_ROUTING_STATE_PATH")
+            path = env_path if env_path else DEFAULT_ROUTING_STATE_PATH
+        self._path = Path(path).expanduser()
         self._debts: dict[str, ProviderDebt] = {}
         self._dirty = False
 
@@ -190,8 +193,20 @@ class DebtStore:
         """True when live usage events have been folded since load/save."""
         return self._dirty
 
+    #: Age half-life for the persisted ledger (hours): a provider's recorded
+    #: debt halves every 24h of wall time since ``last_seen`` so historical
+    #: burn cannot saturate utilization forever (placeholder until real quota
+    #: windows are measured; see module docstring).
+    _DECAY_HALF_LIFE_HOURS = 24.0
+
     def load(self) -> None:
-        """Replace memory with the persisted ledger; tolerate a bad file."""
+        """Replace memory with the persisted ledger; tolerate a bad file.
+
+        Applies exponential time-decay to recorded debt so cross-session
+        accumulation cannot permanently skew max-min selection: each counter
+        is scaled by ``0.5 ** (age_hours / 24)`` where age is measured from
+        the entry's ``last_seen`` timestamp.
+        """
         try:
             text = self._path.read_text(encoding="utf-8")
         except OSError:
@@ -208,9 +223,25 @@ class DebtStore:
             and raw.get("version") == _ROUTING_STATE_VERSION
             and isinstance(raw.get("providers"), Mapping)
         ):
+            now = time.time()
             for name, entry in raw["providers"].items():
                 if isinstance(name, str) and isinstance(entry, Mapping):
-                    debts[name] = _debt_from_mapping(name, entry)
+                    debt = _debt_from_mapping(name, entry)
+                    age_hours = max(0.0, (now - debt.last_seen) / 3600.0)
+                    factor = 0.5 ** (age_hours / self._DECAY_HALF_LIFE_HOURS)
+                    # Only decay meaningfully-aged entries: fresh data (same
+                    # session) must round-trip untouched, and a <1% decay is
+                    # below any selection-relevant resolution anyway.
+                    if factor <= 0.99:
+                        debt = replace(
+                            debt,
+                            tokens=round(debt.tokens * factor),
+                            requests=round(debt.requests * factor),
+                            failed_requests=round(debt.failed_requests * factor),
+                            retry_after_count=round(debt.retry_after_count * factor),
+                            cost=debt.cost * factor,
+                        )
+                    debts[name] = debt
         self._debts = debts
 
     def record(self, event: Mapping[str, Any]) -> None:

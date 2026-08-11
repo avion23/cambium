@@ -38,7 +38,6 @@ from typing import Any
 
 import pytest
 
-from cambium import routing as routing_module
 from cambium.diffundo import (
     AllProvidersFailed,
     Diffundo,
@@ -546,7 +545,7 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
             ),
             encoding="utf-8",
         )
-        monkeypatch.setattr(routing_module, "DEFAULT_ROUTING_STATE_PATH", state_path)
+        monkeypatch.setenv("CAMBIUM_ROUTING_STATE_PATH", str(state_path))
         _set_provider_env(monkeypatch, config_path)
 
         session_dir = tmp_path / "session"
@@ -706,8 +705,8 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
                 ("provider-b", server_b, PROVIDER_KEY_B, "m1"),
             ],
         )
-        monkeypatch.setattr(
-            routing_module, "DEFAULT_ROUTING_STATE_PATH", tmp_path / "routing-state.json"
+        monkeypatch.setenv(
+            "CAMBIUM_ROUTING_STATE_PATH", str(tmp_path / "routing-state.json")
         )
         _set_provider_env(monkeypatch, config_path)
 
@@ -773,3 +772,84 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
     finally:
         server_a.close()
         server_b.close()
+
+
+# --------------------------------------------------------------------------- #
+# 7. review findings P1/P3: env-isolated default path; aged debt decays
+# --------------------------------------------------------------------------- #
+
+
+def test_debt_store_default_path_honors_env(monkeypatch, tmp_path) -> None:
+    target = tmp_path / "routing-state.json"
+    monkeypatch.setenv("CAMBIUM_ROUTING_STATE_PATH", str(target))
+    assert DebtStore().path == target.resolve()
+
+
+def test_debt_store_decays_aged_entries_on_load(tmp_path) -> None:
+    import time
+
+    path = tmp_path / "routing-state.json"
+    store = DebtStore(path)
+    store.record({"provider": "p1", "usage": {"total_tokens": 400}})
+    store.save()
+    # age the entry 48h (two 24h half-lives) and reload: 400 -> 100
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["providers"]["p1"]["last_seen"] = time.time() - 48 * 3600
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = DebtStore(path)
+    loaded.load()
+    assert loaded.as_mapping()["p1"].tokens == 100
+
+
+# --------------------------------------------------------------------------- #
+# 8. review finding P2: a ledger save failure must not discard the result
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.slow
+def test_ledger_save_failure_does_not_block_session_result(tmp_path, monkeypatch) -> None:
+    """If the routing-state save raises (disk full, permissions), the session
+    result must still be written and the failure reported as a log event —
+    never propagated past the supervisor's result boundary."""
+    from cambium import supervisor as supervisor_module
+
+    server = FakeServer([(200, _finish_payload("done", model="m1", total_tokens=26), 0.0)])
+    try:
+        config_path = _provider_config_file(
+            tmp_path / "providers.json",
+            [("provider-a", server, PROVIDER_KEY_A, "m1")],
+        )
+        monkeypatch.setenv("CAMBIUM_ROUTING_STATE_PATH", str(tmp_path / "routing-state.json"))
+        _set_provider_env(monkeypatch, config_path)
+
+        def _explode(self) -> None:
+            raise OSError("disk full (simulated)")
+
+        monkeypatch.setattr(supervisor_module.DebtStore, "save", _explode)
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        plan = {
+            "tasks": [
+                _provider_task(
+                    session_dir, repo, base, "t-save-fail",
+                    worktree="wt-sf", branch="wt-sf",
+                )
+            ]
+        }
+        result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
+        events = read_events(session_dir)
+
+        assert result.exit_code == 0
+        assert result.results[0].status == "succeeded"
+        # canonical result artifact is present despite the save failure
+        assert (session_dir / ".cambium" / "result.json").exists()
+        logged = [
+            e["payload"]["message"]
+            for e in events
+            if e["kind"] == "log" and "routing-state save failed" in e["payload"].get("message", "")
+        ]
+        assert logged and "disk full (simulated)" in logged[0]
+    finally:
+        server.close()

@@ -94,9 +94,12 @@ USER_AGENT = f"cambium/{__version__}"
 # Light content scan for model refusals returned as a 200 completion (issue 4).
 # Documented heuristic: exact refusal phrases in the completion text are treated
 # as a REFUSAL fall-through so a refusing model never wins the cascade.
+# Bare "sorry" is deliberately NOT a refusal: legitimate coding responses
+# ("sorry for the confusion, the fix is...") would otherwise be discarded.
+# Refusal requires an explicit refusal verb; "sorry" alone is not one.
 _CONTENT_REFUSAL_RE = re.compile(
     r"\b(?:i can'?t|cannot|can'?t)\s+(?:assist|help|comply|complete|answer)\b"
-    r"|\b(?:refus(?:e|es|ed|ing|al)|sorry)\b",
+    r"|\b(?:refus(?:e|es|ed|ing|al))\b",
     re.IGNORECASE,
 )
 

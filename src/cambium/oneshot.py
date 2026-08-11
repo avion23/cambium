@@ -29,7 +29,13 @@ from .auth import (
 from .ipc import MAX_LINE_BYTES
 from .provider_config import ProviderSelectionError, load_providers, select_provider
 from .session import session_root
-from .supervisor import DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS, DEFAULT_WALL_BUDGET_S, EventSink, PlanResult
+from .supervisor import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MAX_TURNS,
+    DEFAULT_WALL_BUDGET_S,
+    EventSink,
+    PlanResult,
+)
 
 __all__ = [
     "EventSink",
