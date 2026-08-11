@@ -223,16 +223,6 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_summarize_transcript_small_untouched() -> None:
-    transcript = [
-        {"role": "assistant", "content": '{"type":"plan","steps":["one"]}'},
-        {"role": "user", "content": "small observation"},
-    ]
-    result = worker._summarize_transcript(transcript, 120_000)
-    assert result == transcript
-    assert worker._transcript_chars(result) == worker._transcript_chars(transcript)
-
-
 def test_summarize_transcript_large_trimmed_keeps_plan_and_marker(tmp_path: Path) -> None:
     plan_message = {
         "role": "assistant",

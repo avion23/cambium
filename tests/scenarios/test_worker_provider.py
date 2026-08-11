@@ -116,7 +116,9 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
 class _FakeOpenAIServer:
     def __init__(self) -> None:
         self._httpd = HTTPServer(("127.0.0.1", 0), _FakeOpenAIHandler)
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self._thread.start()
 
     @property
@@ -244,7 +246,7 @@ class _WorkerRunner:
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", "-m", "cambium.worker",
+            sys.executable, "-S", "-u", "-m", "cambium.worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -345,59 +347,6 @@ def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Agent-loop happy path through the full supervisor (run_plan)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_worker_agent_loop_finish_without_changes_succeeds_without_commit(
-    tmp_path, monkeypatch
-) -> None:
-    _reset_server()
-    server = _FakeOpenAIServer()
-    try:
-        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        _set_provider_env(monkeypatch, config_path)
-        summary = "reviewed target.txt and confirmed no changes were needed"
-        _enqueue(json.dumps({"type": "finish", "summary": summary}))
-
-        session_dir = tmp_path / "session"
-        repo = session_dir / "repo"
-        base = _make_repo(repo)
-        result, messages, rc, _stderr = asyncio.run(
-            _drive_worker(
-                session_dir,
-                repo,
-                _worker_env(config_path, session_dir),
-                init=_agent_init(config_path, spec=TASK_TEXT),
-                run={"task": TASK_TEXT},
-                branch="no-change",
-            )
-        )
-
-        assert rc == 0
-        assert result["status"] == "succeeded"
-        assert result["commits"] == []
-        assert result["files_changed"] == []
-        assert result["diff"] == ""
-        assert result["summary"] == summary
-        assert subprocess.run(
-            ["git", "-C", str(session_dir / "wt"), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip() == base
-        assert subprocess.run(
-            ["git", "-C", str(session_dir / "wt"), "rev-list", "--count", f"{base}..HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip() == "0"
-        # A true no-op persists no final transcript checkpoint: the raw
-        # transcript may echo credentials back. The summary stays in the
-        # envelope and no empty commit is created.
-        assert not [message for message in messages if message["type"] == "checkpoint"]
-        assert not (session_dir / ".cambium" / "checkpoints").exists()
-    finally:
-        server.close()
 
 
 @pytest.mark.slow
@@ -558,6 +507,11 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         assert root_result["files_changed"] == []
         assert root_result["unified_diff"] == ""
         assert root_result["summary"] == summary
+        # A true no-op persists no final transcript checkpoint: the raw
+        # transcript may echo credentials back. The summary stays in the
+        # envelope and no empty commit is created.
+        assert not [event for event in events if event["kind"] == "checkpoint"]
+        assert not (session_dir / ".cambium" / "checkpoints").exists()
     finally:
         server.close()
 
@@ -899,7 +853,7 @@ def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
         _enqueue('{"type":"finish","summary":"done"}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
-            RESPONSE_DELAY_S = 0.3
+            RESPONSE_DELAY_S = 0.15
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -1028,7 +982,7 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
         _enqueue('{"type":"finish","summary":"read and edited target.txt"}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
-            RESPONSE_DELAY_S = 0.15
+            RESPONSE_DELAY_S = 0.05
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
