@@ -54,7 +54,12 @@ agent loop instead: it loads the provider file named by the worker's absolute
 Tool calls execute inside the worktree (with shell/git permissions from
 ``init.permissions``), emit ``tool_event`` messages, and persist
 ``checkpoint`` state under ``$CAMBIUM_SESSION_ID/.cambium/checkpoints/``.
-The worker owns exactly one fenced commit of the resulting changes.
+Every router call also emits one redacted ``usage_event`` (implementation
+plan step 3): provider/model/turn, token fields, estimated cost, latency,
+Retry-After, request-rate status, account-quota owner, stable prompt-prefix
+bytes, provider-reported cache-hit, and failure reason; fields the provider
+did not report are omitted, never an error. The worker owns exactly one
+fenced commit of the resulting changes.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -82,7 +87,14 @@ from pathlib import Path
 from typing import Any
 
 from cambium.auth import scrub_environment
-from cambium.diffundo import Diffundo, ProviderTier
+from cambium.diffundo import (
+    AllProvidersFailed,
+    CallResult,
+    Diffundo,
+    ProviderError,
+    ProviderTier,
+    prompt_prefix_bytes,
+)
 from cambium.fencing import validate_worker_generation
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
 from cambium.provider_config import load_providers
@@ -640,6 +652,96 @@ async def _emit_tool_event(
     })
 
 
+def _success_usage_event(result: CallResult, turn: int) -> dict[str, Any]:
+    """One redacted durable usage event for a completed router call.
+
+    Fields the provider did not report are omitted; a missing field never
+    breaks the event or the session (implementation plan step 3).
+    """
+    event: dict[str, Any] = {
+        "turn": turn,
+        "provider": result.provider,
+        "model": result.model,
+        "estimated_cost_usd": max(0.0, float(result.estimated_cost_usd)),
+        "latency_s": max(0.0, float(result.latency_s)),
+    }
+    usage = _usage_counts(result.usage)
+    if usage:
+        event["usage"] = usage
+    if result.retry_after_s is not None:
+        event["retry_after_s"] = max(0.0, float(result.retry_after_s))
+    if result.request_rate_status is not None:
+        event["request_rate_status"] = result.request_rate_status
+    if result.account_quota_owner is not None:
+        event["account_quota_owner"] = result.account_quota_owner
+    if result.prompt_prefix_bytes is not None:
+        event["prompt_prefix_bytes"] = result.prompt_prefix_bytes
+    if result.provider_cache_hit is not None:
+        event["provider_cache_hit"] = result.provider_cache_hit
+    return event
+
+
+def _failure_usage_event(
+    exc: BaseException,
+    *,
+    turn: int,
+    model: str | None,
+    router: Diffundo,
+    prompt: dict[str, Any],
+) -> dict[str, Any]:
+    """One redacted durable usage event for a failed router call.
+
+    Carries the terminal failure's provider evidence and the redacted failure
+    reason; fields that are unavailable are omitted, never an error.
+    """
+    event: dict[str, Any] = {"turn": turn}
+    if isinstance(model, str) and model:
+        event["model"] = model
+    failure_reason = exc.__class__.__name__
+    provider: str | None = None
+    retry_after_s: float | None = None
+    request_rate_status: str | None = None
+    account_quota_owner: str | None = None
+    if isinstance(exc, AllProvidersFailed) and isinstance(exc.last_error, ProviderError):
+        error = exc.last_error
+        provider = error.provider
+        retry_after_s = error.retry_after_s
+        request_rate_status = error.request_rate_status
+        account_quota_owner = error.account_quota_owner
+        failure_reason = f"{error.outcome.value}: {error.message}"
+    if provider is not None:
+        event["provider"] = provider
+        if request_rate_status is None:
+            try:
+                request_rate_status = router.status(provider).value
+            except Exception:
+                request_rate_status = None
+    if retry_after_s is not None:
+        event["retry_after_s"] = max(0.0, float(retry_after_s))
+    if request_rate_status is not None:
+        event["request_rate_status"] = request_rate_status
+    if account_quota_owner is not None:
+        event["account_quota_owner"] = account_quota_owner
+    prefix_bytes = prompt_prefix_bytes(prompt)
+    if prefix_bytes is not None:
+        event["prompt_prefix_bytes"] = prefix_bytes
+    event["failure_reason"] = _cap_utf8(failure_reason, 512)
+    return event
+
+
+async def _emit_usage_event(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    event: dict[str, Any],
+) -> None:
+    await send(writer, {
+        "type": "usage_event",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        **event,
+    })
+
+
 def _write_checkpoint_file(
     config: AgentConfig,
     turn: int,
@@ -980,6 +1082,16 @@ async def _run_agent_loop(
             except Exception as exc:
                 # Provider errors may contain response text or request details.
                 # Only the exception class is safe to carry into the envelope.
+                # The usage event carries the redacted failure evidence; the
+                # envelope failure reason stays class-name only.
+                if writer is not None:
+                    await _emit_usage_event(
+                        writer,
+                        config,
+                        _failure_usage_event(
+                            exc, turn=turn, model=model, router=router, prompt=prompt
+                        ),
+                    )
                 return _loop_result(
                     outcome, "failed", f"provider call failed: {exc.__class__.__name__}",
                     turn - 1, cumulative_usage, transcript,
@@ -990,10 +1102,14 @@ async def _run_agent_loop(
                     turn, cumulative_usage, transcript,
                 )
             if result.model != model:
+                # An untrusted response model never enters durable artifacts;
+                # no usage event is emitted for it.
                 return _loop_result(
                     outcome, "failed", "provider response model mismatch",
                     turn - 1, cumulative_usage, transcript,
                 )
+            if writer is not None:
+                await _emit_usage_event(writer, config, _success_usage_event(result, turn))
             total = _usage_total(result.usage)
             if total is None:
                 return _loop_result(

@@ -247,6 +247,9 @@ def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> No
         assert result.tier is ProviderTier.FAST
         assert len(bad.calls) == 1  # 500 -> fall through
         assert len(good.calls) == 1
+        assert result.request_rate_status == "available"
+        assert result.retry_after_s is None
+        assert result.account_quota_owner is None
     finally:
         bad.close()
         good.close()
@@ -370,6 +373,9 @@ def test_retry_after_delta_seconds_controls_same_provider_retry(monkeypatch) -> 
         assert result.content == "recovered"
         assert sleeps == [7.0]
         assert len(server.calls) == 2
+        # the honored Retry-After rides the winning result (plan step 3)
+        assert result.retry_after_s == 7.0
+        assert result.request_rate_status == "available"
     finally:
         server.close()
 
@@ -771,6 +777,8 @@ def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> Non
         assert result.provider == "p_first"
         assert len(first.calls) == 1 and len(second.calls) == 0
         assert router.status("p_first") is ProviderStatus.RATE_LIMITED
+        # the winning call consumed the last token: the event records it
+        assert result.request_rate_status == "rate_limited"
 
         # first provider's bucket is empty -> skipped, cascade reaches p_second
         result2 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
@@ -1044,3 +1052,130 @@ def test_loopback_http_request_bypasses_proxy_and_proxy_never_sees_key(
     finally:
         server.close()
         proxy.close()
+
+
+# --------------------------------------------------------------------------- #
+# 10. usage/quota evidence (implementation plan step 3)
+# --------------------------------------------------------------------------- #
+
+
+def test_429_retry_after_and_quota_owner_surface_on_winning_result(monkeypatch) -> None:
+    # A 429 with Retry-After + a reported account-quota owner retries on the
+    # same provider; the winning result carries both as usage evidence.
+    limited = FakeServer(
+        [
+            (
+                429,
+                {
+                    "error": {
+                        "message": "rate limit exceeded",
+                        "type": "rate_limit_error",
+                        "rate_limit": {"scope": "account", "quota_owner": "org-acme"},
+                    }
+                },
+                0.0,
+                {"Retry-After": "5"},
+            ),
+            (200, _ok_payload("recovered"), 0.0),
+        ]
+    )
+    _set_keys(monkeypatch, "K_QUOTA")
+    router = Diffundo((_config("p_quota", limited, "K_QUOTA", max_retries=1),))
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "recovered"
+        assert result.retry_after_s == 5.0
+        assert result.account_quota_owner == "org-acme"
+        assert sleeps == [5.0]
+        assert len(limited.calls) == 2
+    finally:
+        limited.close()
+
+
+def test_429_quota_owner_reaches_failure_error(monkeypatch) -> None:
+    # The provider-reported quota owner rides the terminal failure too, so a
+    # failed call's durable usage event can name the exhausted quota.
+    server = FakeServer(
+        [
+            (
+                429,
+                {
+                    "error": {
+                        "message": "quota",
+                        "type": "rate_limit_error",
+                        "quota_owner": "org-xyz",
+                    }
+                },
+                0.0,
+                {"Retry-After": "1"},
+            )
+        ]
+    )
+    _set_keys(monkeypatch, "K_QUOTA_FAIL")
+    router = Diffundo((_config("p_quota_fail", server, "K_QUOTA_FAIL"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = exc.value.last_error
+        assert error is not None
+        assert error.outcome is ProviderOutcome.QUOTA
+        assert error.retry_after_s == 1.0
+        assert error.account_quota_owner == "org-xyz"
+        # post-failure request-rate status: the 429 sent the provider to COOLDOWN
+        assert error.request_rate_status == "cooldown"
+    finally:
+        server.close()
+
+
+def test_usage_metric_fields_follow_provider_reports(tmp_path, monkeypatch) -> None:
+    # prompt-prefix stability + provider-reported cache-hit metrics: recorded
+    # per call, never evidence of a local response cache (D1).
+    server = FakeServer(
+        [
+            (
+                200,
+                _ok_payload(
+                    "plain",
+                    usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                ),
+                0.0,
+            ),
+            (
+                200,
+                _ok_payload(
+                    "cached",
+                    usage={
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "total_tokens": 4,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                    },
+                ),
+                0.0,
+            ),
+            (200, _ok_payload("no usage"), 0.0),
+        ]
+    )
+    _set_keys(monkeypatch, "K_METRIC")
+    router = Diffundo((_config("p_metric", server, "K_METRIC"),))
+    try:
+        r1 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
+        r2 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
+        r3 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert r1.provider_cache_hit is False  # usage present, no cache fields
+        assert r2.provider_cache_hit is True  # provider reports cached tokens
+        assert r3.provider_cache_hit is None  # no usage -> unknown, never an error
+        expected_prefix = len(STATIC_HEAD["messages"][0]["content"].encode("utf-8"))
+        # stable prefix across turns of the same fixed prompt fixture
+        assert r1.prompt_prefix_bytes == r2.prompt_prefix_bytes == expected_prefix
+        assert r3.prompt_prefix_bytes is None  # no leading system message
+        assert r3.estimated_cost_usd == 0.0  # no usage -> zero cost
+        assert r3.request_rate_status == "available"
+    finally:
+        server.close()
