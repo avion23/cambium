@@ -31,12 +31,18 @@ from .provider_config import ProviderSelectionError, load_providers, select_prov
 from .session import session_root
 from .supervisor import (
     DEFAULT_MAX_TOKENS,
-    DEFAULT_MAX_TURNS,
     DEFAULT_WALL_BUDGET_S,
     EventSink,
     PlanResult,
     _reject_reused_session,
 )
+
+# User-facing agent-loop budget. The supervisor's own DEFAULT_MAX_TURNS (20)
+# stays the fallback for plans that omit the field; build_plan always writes an
+# explicit max_turns, so this is the effective default for CLI/REPL/TUI runs.
+# 50 accommodates real multi-step work (read/diagnose/fix/verify plus a full
+# test suite) while wall/token budgets and --max-turns still bound the loop.
+DEFAULT_MAX_TURNS = 50
 
 __all__ = [
     "EventSink",

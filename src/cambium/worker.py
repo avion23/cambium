@@ -152,7 +152,7 @@ IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
-DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
 DEFAULT_MAX_WALL_S = 3600.0
 CHECKPOINT_SCHEMA = 1
@@ -333,9 +333,37 @@ def _fanout_value(config: dict[str, Any], section: dict[str, Any], key: str) -> 
     return section.get(key)
 
 
+def _model_identity(
+    providers: list[Any],
+    tier: ProviderTier,
+    model: str,
+    *,
+    assigned_provider: str | None,
+) -> str:
+    """Resolve the truthful model identity for the agent system prompt.
+
+    ``assigned_provider`` (supervisor admission balancing) is authoritative;
+    without one, the provider name is included only when exactly one configured
+    provider serves the resolved tier+model, so the identity never invents a
+    provider. The model name always comes from the resolved fanout config.
+    """
+    provider = assigned_provider
+    if provider is None:
+        serving = [
+            candidate.name
+            for candidate in providers
+            if candidate.enabled and candidate.tier is tier and candidate.model == model
+        ]
+        if len(serving) == 1:
+            provider = serving[0]
+    if provider:
+        return f"{provider}/{model}"
+    return model
+
+
 def _provider_router(
     config: dict[str, Any], *, assigned_provider: str | None = None
-) -> tuple[Diffundo, ProviderTier, str]:
+) -> tuple[Diffundo, ProviderTier, str, str]:
     providers = load_providers(_provider_path())
     section = _fanout_section(config)
     tier_value = _fanout_value(config, section, "tier")
@@ -373,7 +401,9 @@ def _provider_router(
                 "falling back to the seeded primary pick",
                 assigned_provider,
             )
-    return Diffundo(providers, **options), tier, model
+    return Diffundo(providers, **options), tier, model, _model_identity(
+        providers, tier, model, assigned_provider=assigned_provider
+    )
 
 
 def _positive_int(value: Any, name: str, default: int) -> int:
@@ -870,11 +900,22 @@ def _summarize_transcript(
 
 
 def _build_agent_prompt(
-    task: str, tools: list[dict[str, Any]], transcript: list[dict[str, Any]]
+    task: str,
+    tools: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+    model_identity: str = "",
 ) -> dict[str, Any]:
     system_lines = [
         "You are Cambium's autonomous coding agent.",
         "You act inside a disposable git worktree and must complete the task.",
+    ]
+    if model_identity:
+        system_lines.append(
+            f"You are running as the configured model {model_identity}. When "
+            "asked what model or provider you are, answer truthfully from this "
+            "identity and never guess."
+        )
+    system_lines.extend([
         "Return exactly one JSON object per turn; your reply must be one action:",
         '  plan:      {"type": "plan", "steps": ["...", "..."]}',
         '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
@@ -899,7 +940,7 @@ def _build_agent_prompt(
         "Available tools:",
         json.dumps(tools, sort_keys=True),
         f"Task: {task}",
-    ]
+    ])
     messages = [{"role": "system", "content": "\n".join(system_lines)}]
     messages.extend(transcript)
     if not messages or messages[-1].get("role") != "user":
@@ -1333,6 +1374,7 @@ async def _run_agent_loop(
     router: Diffundo,
     tier: ProviderTier,
     model: str,
+    model_identity: str = "",
     worktree: Path,
     writer: asyncio.StreamWriter | None,
     stop: threading.Event,
@@ -1377,7 +1419,7 @@ async def _run_agent_loop(
                 )
             _require_generation(worktree, config.generation)
             transcript = _summarize_transcript(transcript, config.max_transcript_chars)
-            prompt = _build_agent_prompt(config.task, tools, transcript)
+            prompt = _build_agent_prompt(config.task, tools, transcript, model_identity)
             try:
                 result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
             except Exception as exc:
@@ -1509,7 +1551,7 @@ async def _do_provider_work(
             "failure_reason": f"worker worktree is missing: {worktree}",
         })
     try:
-        router, tier, model = _provider_router(
+        router, tier, model, model_identity = _provider_router(
             config.fanout_config, assigned_provider=config.assigned_provider
         )
     except Exception as exc:
@@ -1523,6 +1565,7 @@ async def _do_provider_work(
         router=router,
         tier=tier,
         model=model,
+        model_identity=model_identity,
         worktree=worktree,
         writer=writer,
         stop=stop,
