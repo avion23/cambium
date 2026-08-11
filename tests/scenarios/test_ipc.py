@@ -390,8 +390,15 @@ def test_worker_cancel_acks_ok_then_aborts(tmp_path) -> None:
             assert hb["type"] == "heartbeat"
 
             await w.send({"type": "cancel", "request_id": "cancel-1", "reason": "test"})
-            ok = await w.recv()
-            assert ok["type"] == "ok"
+            # The heartbeat loop (1s cadence) may emit one more heartbeat
+            # between the first recv and the worker processing cancel; drain
+            # heartbeats until the ack lands (load-sensitive).
+            ok = None
+            for _ in range(4):
+                ok = await w.recv()
+                if ok["type"] == "ok":
+                    break
+            assert ok is not None and ok["type"] == "ok"
             assert ok["request_id"] == "cancel-1"  # ack echoes the cancel rid
             assert ok["generation"] == 3
 
