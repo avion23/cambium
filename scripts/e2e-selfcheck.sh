@@ -102,10 +102,13 @@ CHANGED="$(git -C "$CLONE" diff-tree --no-commit-id --name-only -r main)" || fai
 NUMSTAT="$(git -C "$CLONE" diff-tree --no-commit-id --numstat -r main)" || fail "cannot numstat clone main"
 [ "$NUMSTAT" = "$(printf '1\t0\t%s' "$FIXTURE")" ] || fail "new commit numstat [$NUMSTAT], expected exactly one added line"
 
-LINES="$(wc -l < "$CLONE/$FIXTURE")" || fail "cannot read fixture line count"
+# Publication is ref-only: the clone's checked-out working tree is never
+# refreshed, so read the committed blob, not the stale working-tree file.
+FIXTURE_BLOB="$(git -C "$CLONE" show "refs/heads/main:$FIXTURE")" || fail "cannot read committed fixture from clone main"
+LINES="$(printf '%s\n' "$FIXTURE_BLOB" | wc -l)"
 [ "$LINES" -eq 2 ] || fail "fixture has $LINES lines, expected 2"
-grep -qx "cambium-e2e fixture baseline" "$CLONE/$FIXTURE" || fail "fixture baseline line missing"
-grep -qx "cambium-e2e selfcheck marker" "$CLONE/$FIXTURE" || fail "fixture marker line missing"
+printf '%s\n' "$FIXTURE_BLOB" | grep -qx "cambium-e2e fixture baseline" || fail "fixture baseline line missing"
+printf '%s\n' "$FIXTURE_BLOB" | grep -qx "cambium-e2e selfcheck marker" || fail "fixture marker line missing"
 
 # --- worker worktree pruned and branch deleted ------------------------------
 if git -C "$CLONE" worktree list | grep -q "wt-e2e-self-001"; then
