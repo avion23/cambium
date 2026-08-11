@@ -99,6 +99,7 @@ implemented as a bounded session-scoped warm pool:
   other exits kill as before. Restart generations always spawn fresh;
   pooled workers are killed at session end (run_plan finally / shutdown).
 
+<<<<<<< HEAD
 ### Provider auth/protocol tagging (implemented, W1 config slice)
 
 `ProviderConfig` carries tagged `auth` (`api_key` | `codex_chatgpt`) and
@@ -108,3 +109,15 @@ the tags load unchanged. `codex_chatgpt` entries are pinned to the
 protocol `codex_responses`, reject `base_url`/`api_key_env` in the file, and
 the transport later derives the endpoint from the profile, not from config.
 The codex OAuth transport/entitlement flow is the follow-on (plan v2 W1).
+=======
+### OAuth dynamic secret redaction (ADOPT, implemented)
+
+`Redactor.register_secret(value)` registers an exact value at any time
+(thread-safe, idempotent), so a session redactor that snapshots provider
+values at session start can still redact OAuth tokens rotated mid-session.
+`sanitize_oauth_document(doc)` returns a copy with token fields replaced by
+`<redacted>` and `account_id` reduced to the first 8 hex of SHA-256; the OAuth
+field names (`access_token`, `refresh_token`, `id_token`,
+`authorization_code`, `code_verifier`, `device_auth_id`, `user_code`) are
+structured secret names in JSON-looking text. Covered by fast scenario tests.
+>>>>>>> wt-redact

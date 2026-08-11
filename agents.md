@@ -131,6 +131,15 @@ stdout and to a file under /tmp; the source repo is never written.
 - Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
   diagnostics use stderr/logging. The supervisor bounds each worker's decoded
   stdout queue and routes emitted records through `EventStore`.
+- Dynamic secret registration: `Redactor.register_secret(value)` adds an
+  exact value to the replacement set at any time (thread-safe, idempotent),
+  so OAuth tokens rotated mid-session are redacted by later calls without
+  rebuilding the session redactor. `sanitize_oauth_document` returns a copy
+  of an OAuth document with token fields replaced by `<redacted>` and
+  `account_id` reduced to a SHA-256 fingerprint (first 8 hex chars); OAuth
+  field names (`access_token`, `refresh_token`, `id_token`,
+  `authorization_code`, `code_verifier`, `device_auth_id`, `user_code`) are
+  structured secret names redacted in JSON-looking text.
 - Warm worker pool (eval-3 ADOPT): the supervisor keeps a bounded
   session-scoped pool (`CAMBIUM_WARM_POOL_SIZE`, default 1; 0 disables) of
   idle reuse-ready workers and rebinds them to new worktrees via a full

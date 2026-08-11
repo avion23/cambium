@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import threading
 
 import pytest
 
@@ -11,6 +13,7 @@ from cambium.redact import (
     Redactor,
     build_session_redactor,
     build_worker_env,
+    sanitize_oauth_document,
 )
 
 R = Redactor()
@@ -403,3 +406,188 @@ def test_build_session_redactor_defaults_to_provider_patterns() -> None:
 
     assert SK not in output
     assert "ordinary=value" in output
+
+def test_register_secret_redacts_values_registered_after_construction() -> None:
+    old = "opaque-old-value"
+    rotated = "opaque-rotated-" + "R" * 24
+    redactor = Redactor(secret_values={old})
+
+    assert rotated in redactor.redact(f"provider failed with {rotated}")
+
+    redactor.register_secret(rotated)
+    redactor.register_secret(rotated)  # idempotent
+
+    output = redactor.redact(f"provider failed with {rotated}")
+    assert rotated not in output
+    assert output == "provider failed with ***"
+    assert redactor.secret_values == frozenset({old, rotated})
+
+
+def test_register_secret_is_thread_safe_and_rejects_bad_input() -> None:
+    redactor = Redactor()
+    barrier = threading.Barrier(2)
+
+    def register(prefix: str) -> None:
+        barrier.wait()
+        for index in range(20):
+            redactor.register_secret(f"{prefix}-{index}-" + "T" * 16)
+
+    threads = [
+        threading.Thread(target=register, args=(name,)) for name in ("t0", "t1")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    text = " ".join(
+        f"t{name}-{index}-" + "T" * 16
+        for name in (0, 1)
+        for index in range(20)
+    )
+    output = redactor.redact(text)
+    assert all(
+        f"t{name}-{index}-" + "T" * 16 not in output
+        for name in (0, 1)
+        for index in range(20)
+    )
+    assert len(redactor.secret_values) == 40
+    with pytest.raises(TypeError):
+        redactor.register_secret(123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        redactor.register_secret("")
+
+
+def _hex_escape(text: str) -> str:
+    return "".join(f"\\x{ord(character):02x}" for character in text)
+
+
+def _unicode_escape(text: str) -> str:
+    return "".join(f"\\u{ord(character):04x}" for character in text)
+
+
+def test_old_and_rotated_opaque_tokens_redacted_in_all_wire_forms() -> None:
+    old = "opaque-old-token-" + "A" * 20
+    rotated = "opaque-rotated-token-" + "B" * 20
+    redactor = Redactor(secret_values={old})
+    redactor.register_secret(rotated)
+
+    plain = f"stderr: {old} then {rotated}"
+    bearer = f"Authorization: Bearer {rotated}"
+    json_text = f'{{"data": "{rotated}", "note": "{old}"}}'
+    exception_text = f"HTTPError 401 invalid_grant for {old}: {rotated}"
+    hex_wire = '"value": "' + _hex_escape(old) + '"'
+    unicode_wire = '{"payload": "' + _unicode_escape(rotated) + '"}'
+
+    assert old not in redactor.redact(plain)
+    assert rotated not in redactor.redact(plain)
+    assert rotated not in redactor.redact(bearer)
+    assert rotated not in redactor.redact(json_text)
+    assert old not in redactor.redact(exception_text)
+    assert old not in redactor.redact_escaped(hex_wire)
+    assert rotated not in redactor.redact_escaped(unicode_wire)
+
+
+def test_sanitize_oauth_document_redacts_tokens_and_fingerprints_account() -> None:
+    rotated = "opaque-rotated-" + "C" * 20
+    redactor = Redactor(secret_values={rotated})
+    doc = {
+        "access_token": "raw-access-token",
+        "refresh_token": rotated,
+        "id_token": "raw-id-token",
+        "authorization_code": "raw-auth-code",
+        "code_verifier": "raw-code-verifier",
+        "device_auth_id": "raw-device-auth",
+        "user_code": "raw-user-code",
+        "account_id": "acc-12345",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "openid profile",
+        "error": f"invalid_grant: {rotated}",
+        "nested": {
+            "access_token": "raw-nested-token",
+            "refresh_token": "raw-nested-refresh",
+        },
+    }
+
+    output = sanitize_oauth_document(doc, redactor=redactor)
+
+    serialized = repr(output)
+    for raw in (
+        "raw-access-token",
+        rotated,
+        "raw-id-token",
+        "raw-auth-code",
+        "raw-code-verifier",
+        "raw-device-auth",
+        "raw-user-code",
+        "raw-nested-token",
+        "raw-nested-refresh",
+    ):
+        assert raw not in serialized
+
+    for name in (
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "authorization_code",
+        "code_verifier",
+        "device_auth_id",
+        "user_code",
+    ):
+        assert output[name] == "<redacted>"
+    assert output["nested"]["access_token"] == "<redacted>"
+    assert output["nested"]["refresh_token"] == "<redacted>"
+    assert output["account_id"] == hashlib.sha256(b"acc-12345").hexdigest()[:8]
+    assert len(output["account_id"]) == 8
+    assert output["token_type"] == "Bearer"
+    assert output["expires_in"] == 3600
+    assert output["scope"] == "openid profile"
+    assert "opaque-rotated" not in output["error"]
+    assert doc["access_token"] == "raw-access-token"  # input untouched
+
+    default = sanitize_oauth_document(doc)
+    assert default["access_token"] == "<redacted>"
+    assert default["account_id"] == output["account_id"]
+    assert "raw-access-token" not in repr(default)
+    with pytest.raises(TypeError):
+        sanitize_oauth_document(["not", "a", "mapping"])  # type: ignore[arg-type]
+
+
+def test_oauth_structured_field_names_redact_values_in_json_text() -> None:
+    text = (
+        '{"access_token": "at1", "refresh_token": "rt1", "id_token": "it1", '
+        '"authorization_code": "ac1", "code_verifier": "cv1", '
+        '"device_auth_id": "da1", "user_code": "uc1"}'
+    )
+
+    output = R.redact(text)
+
+    for value in ("at1", "rt1", "it1", "ac1", "cv1", "da1", "uc1"):
+        assert value not in output
+    assert '"access_token": "***"' in output
+    assert '"code_verifier": "***"' in output
+    assert '"user_code": "***"' in output
+
+    mapping = R.redact_mapping(
+        {
+            "authorization_code": "ac2",
+            "code_verifier": "cv2",
+            "user_code": "uc2",
+            "token_type": "Bearer",
+        }
+    )
+    assert mapping == {
+        "***": "***",
+        "token_type": "Bearer",
+    }
+
+
+def test_oauth_names_do_not_redact_benign_token_and_code_words() -> None:
+    text = (
+        "a token of appreciation; token_count=3; code_verifier_length=43; "
+        "status_code=200; error_code=404; country_code=US; "
+        "verifier=local-check; user code review; the secret garden; Bearer bonds"
+    )
+
+    assert R.redact(text) == text
