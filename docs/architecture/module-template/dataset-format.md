@@ -203,11 +203,8 @@ same-UID module from bypassing the check with os.system, posix_spawn, raw
 sockets, subprocess monkey-patching, or by killing a same-UID tracer. The
 harness does not start such a tracer or provide an in-harness sandbox. Real
 containment is the deployment-layer boundary.**
-The wheel includes code,
-`__main__.py`, this architecture document, datasets, `meta.json`, tests, and
-baselines. The tool is developed and run directly from source; the Hatch wheel
-target and wheel acceptance tests remain for packaging, which is not the
-primary delivery path. A module is removable by deleting its complete package
+The tool is developed and run directly from source; no wheel is built or
+supported. A module is removable by deleting its complete package
 directory; shared harness scenarios remain.
 
 ## Appendix A. Implemented reference details
@@ -284,8 +281,7 @@ file and line context. Tests must exercise malformed JSON, a non-object record,
 missing required keys, invalid field types, duplicate IDs, invalid metadata,
 record/version drift, and a cross-split collision. The module conformance gate
 also checks that every declared dataset, baseline, architecture file, test,
-and manifest is tracked and included in the wheel. Removal
-means deleting the
+and manifest is tracked. Removal means deleting the
 entire module directory, including its freeze metadata; no shared loader may
 silently resurrect it.
 

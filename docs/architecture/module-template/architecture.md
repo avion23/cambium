@@ -209,17 +209,13 @@ such a tracer or provide an in-harness sandbox. Real containment is the deployme
 boundary.**
 Sibling imports and reverse imports from `bench.py`, `scripts/`, and `tools/` are static failures.
 
-### 9.4 Baseline, wheel, and removal
+### 9.4 Baseline and removal
 
 Each baseline JSON must contain `schema_version`, logical `module`,
 `dataset_version`, `split_digests`, `git_sha`, `date`, `python`, `pytest`,
 `metric`, `canaries`, `dataset`, `tests`, and `drift_thresholds`. Its digests
-and version must match `datasets/meta.json` and exact split bytes. The wheel
-includes package code, `__main__.py`, `architecture.md`, datasets, metadata,
-colocated tests, and baseline; the wheel acceptance probe runs
-`cambium module-test <package_name>` outside the checkout. The tool is
-developed and run directly from source; the Hatch wheel target and wheel
-acceptance tests remain for packaging, which is not the primary delivery path.
+and version must match `datasets/meta.json` and exact split bytes. The tool is
+developed and run directly from source; no wheel is built or supported.
 
 ## 10. Optimization plan
 
@@ -240,7 +236,7 @@ sibling owner, or infrastructure.
 |---|---|---|
 | 0.1.0 | YYYY-MM-DD | Initial draft |
 | 0.2.0 | 2026-08-10 | Normative colocated tests, enum/wire boundary, and current runtime boundaries |
-| 0.3.0 | 2026-08-10 | JSON CLI, conformance, isolation, baseline, wheel, removal, and package naming |
+| 0.3.0 | 2026-08-10 | JSON CLI, conformance, isolation, baseline, removal, and package naming |
 
 ## Appendix A. Required evidence and boundary notes
 
@@ -260,13 +256,14 @@ The current shared surfaces that a module may use are:
 | benchmark/conformance | `src/cambium/bench.py` and `src/cambium/module_conformance.py` |
 | CLI | `src/cambium/cli.py:main` |
 | runtime | `src/cambium/ipc.py`, `worker.py`, `supervisor.py`, `tasktree.py` |
-| state/control | `store.py`, `conversations.py`, `approval.py`, `provider_config.py` |
+| state/control | `store.py`, `conversations.py`, `provider_config.py` |
 
 Do not add a module-specific schema registry, dispatch path, cache, or
 resource-budget abstraction when the shared boundary already owns it. The
-checkout has `resources.py` with `CompileGate`; it has no `ResourceBudget`
-class. It has no `eval_cache.py` and no separate DLQ module. These absences are
-current facts, not invitations to document dead capability claims.
+checkout has no compile gate and no `ResourceBudget` class; `tools.py`
+`run_shell`/`git_op` run without approval gates. It has no `eval_cache.py` and
+no separate DLQ module. These absences are current facts, not invitations to
+document dead capability claims.
 
 ### A.1 Interface and wire checklist
 
@@ -308,10 +305,8 @@ check. It validates tracked files, manifest, dataset versions/digests, imports,
 CLI subprocess behavior, and the loaded module set. Offline checks are
 best-effort lint-style checks, not same-UID containment. Sibling imports and
 reverse imports are static failures and must be reported by file, line, and
-symbol. The wheel acceptance probe must work outside the repository; a
-repository-relative fallback is not a packaging solution. The tool is developed
-and run directly from source; the Hatch wheel target and wheel acceptance tests
-remain for packaging, which is not the primary delivery path.
+symbol. The tool is developed and run directly from source; no wheel is built
+or supported.
 
 ### A.4 Target-state labels
 

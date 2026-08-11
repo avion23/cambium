@@ -234,11 +234,10 @@ PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test example
 
 It validates tracked layout, manifest, dataset and baseline schema/digests,
 imports, CLI, offline subprocess behavior, and module-scoped tests. The gate
-rejects provider/network use and sibling/reverse imports. The wheel acceptance
-probe runs outside the checkout. The tool is developed and run directly from
-source; the Hatch wheel target and wheel acceptance tests remain for packaging,
-which is not the primary delivery path. The module is removable by deleting its package,
-including tests, datasets, baselines, CLI, architecture, and freeze metadata.
+rejects provider/network use and sibling/reverse imports. The tool is developed
+and run directly from source; no wheel is built or supported. The module is
+removable by deleting its package, including tests, datasets, baselines, CLI,
+architecture, and freeze metadata.
 
 ### 9.1 Verification commands and recorded state
 
@@ -281,7 +280,7 @@ surfaces.
 | 0.1.0 | 2026-08-09 | Initial spec |
 | 1.0.0 | 2026-08-09 | Aligned scaffold, exact-match metric, combined dataset, and rule engine |
 | 1.1.0 | 2026-08-10 | Domain enum, stable wire boolean, split dataset |
-| 1.2.0 | 2026-08-10 | CLI, module gate, isolation, baseline/digests, wheel, and removal |
+| 1.2.0 | 2026-08-10 | CLI, module gate, isolation, baseline/digests, and removal |
 
 ## Appendix A. Reference implementation evidence
 
@@ -384,14 +383,13 @@ CANNOT prevent a hostile same-UID module from bypassing the check with
 os.system, posix_spawn, raw sockets, subprocess monkey-patching, or by killing
 a same-UID tracer. The harness does not start such a tracer or provide an
 in-harness sandbox. Real containment is the deployment-layer boundary.**
-Wheel verification runs
-`cambium module-test example` outside the checkout. Complete removal includes
+Complete removal includes
 the package code, CLI, architecture, datasets, tests, baseline, and metadata.
 
 ### A.6 Acceptance status boundaries
 
 The deterministic engine, loader, metric, split files, baseline schema, JSON
-CLI, offline checks, import prohibitions, and wheel/removability checks are
+CLI, offline checks, import prohibitions, and removability checks are
 implemented surfaces. A production `Architectus.execute` caller, DSPy class,
 standalone module eval command, sibling stubs, optimized prompt artifacts,
 and end-to-end orchestrator exercise remain future work. The live checker
@@ -465,5 +463,5 @@ old/new rule, bumps the dataset version as required, regenerates exact split
 digests, reruns the colocated suite and conformance gate, and updates the
 baseline only after review. A documentation-only wording change must not alter
 dataset bytes or imply a new score. A package-name change is an interface
-change: update the `module-test` selector, wheel probe, and every neutral CLI
+change: update the `module-test` selector and every neutral CLI
 boundary before merge.
