@@ -12,6 +12,7 @@ _EXIT_EOF = 0
 _EXIT_INTERRUPT = 130
 _EXIT_BROKEN_PIPE = 0
 _EXIT_BACKEND_MISSING = 1
+_EXIT_RUN_FAILED = 1
 
 
 def _run(value):
@@ -30,6 +31,7 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
         err.write(f"cambium tui: {exc}\n")
         return _EXIT_BACKEND_MISSING
 
+    failed = False
     try:
         while True:
             out.write(_PROMPT)
@@ -38,7 +40,7 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
             if line == "":
                 out.write("\n")
                 out.flush()
-                return _EXIT_EOF
+                return _EXIT_RUN_FAILED if failed else _EXIT_EOF
             prompt = line.rstrip("\r\n")
             if not prompt.strip():
                 continue
@@ -46,6 +48,8 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
                 prompt_config = replace(config, prompt=prompt)
                 response = _run(oneshot.run_oneshot(prompt_config))
                 text = render.render_text_result(response)
+                if response.exit_code != 0:
+                    failed = True
             except Exception as exc:
                 err.write(f"cambium: {exc}\n")
                 err.flush()

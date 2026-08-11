@@ -157,8 +157,6 @@ def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
 
 def _stored_provider_environment(env_name: str) -> dict[str, str]:
     """Return one selected credential without changing ``os.environ``."""
-    if os.environ.get(env_name):
-        return {}
     try:
         launch_environment = AuthStore().launch_environment(base={})
     except AuthError as exc:
@@ -173,12 +171,14 @@ def _resolve_provider(
     config: OneShotConfig, repo: Path
 ) -> tuple[OneShotConfig, dict[str, str]]:
     """Resolve one configured provider and prepare a non-global credential handoff."""
-    provider_mode = (
-        config.provider is not None
-        or config.model is not None
-        or config.fanout_config is not None
+    marker_mode = (
+        config.provider is None
+        and config.model is None
+        and config.fanout_config is None
+        and config.target_file is not None
+        and config.marker is not None
     )
-    if not provider_mode:
+    if marker_mode:
         return config, {}
 
     if (
@@ -241,6 +241,17 @@ def _allocate_session_dir(repo: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix="run-", dir=root))
 
 
+def _reject_reused_session(session_dir: Path) -> None:
+    """Reject an explicit session leaf that already contains run artifacts."""
+    artifacts = (
+        session_dir / "plan.json",
+        session_dir / ".cambium" / "events.db",
+        session_dir / ".cambium" / "result.json",
+    )
+    if any(path.exists() for path in artifacts):
+        raise ValueError(f"one-shot session directory has already been used: {session_dir}")
+
+
 def build_plan(
     config: OneShotConfig,
     repo: Path | None = None,
@@ -294,10 +305,18 @@ async def run_oneshot(
     """Run one prompt through exactly one supervisor plan."""
     repo = resolve_repo(config.repo)
     preflight(config, repo)
+    explicit_session_dir = (
+        Path(config.session_root).expanduser().resolve()
+        if config.session_root is not None
+        else None
+    )
+    if explicit_session_dir is not None:
+        preflight(config, repo, explicit_session_dir)
+        _reject_reused_session(explicit_session_dir)
     resolved, provider_environment = _resolve_provider(config, repo)
     session_dir = (
-        Path(resolved.session_root).expanduser().resolve()
-        if resolved.session_root is not None
+        explicit_session_dir
+        if explicit_session_dir is not None
         else _allocate_session_dir(repo)
     )
     preflight(resolved, repo, session_dir)

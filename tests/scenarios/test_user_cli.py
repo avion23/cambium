@@ -39,6 +39,32 @@ def _plan_result() -> PlanResult:
     return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
 
+def _provider_entry(
+    name: str,
+    *,
+    tier: str = "fast",
+    model: str = "demo-model",
+    priority: int = 0,
+    enabled: bool = True,
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "tier": tier,
+        "base_url": "http://127.0.0.1:8080/v1",
+        "api_key_env": derived_env_name(name),
+        "model": model,
+        "priority": priority,
+        "enabled": enabled,
+    }
+
+
+def _write_provider_config(repo: Path, providers: list[dict[str, object]]) -> Path:
+    path = repo / ".cambium" / "providers.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"providers": providers}), encoding="utf-8")
+    return path
+
+
 def test_parser_maps_run_options_to_one_shot_config(monkeypatch, capsys, tmp_path: Path) -> None:
     captured: list[oneshot.OneShotConfig] = []
 
@@ -102,7 +128,9 @@ def test_run_oneshot_delegates_async_at_supervisor_boundary(monkeypatch, tmp_pat
         return _plan_result()
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
-    config = oneshot.OneShotConfig(prompt="make the change", repo=repo)
+    config = oneshot.OneShotConfig(
+        prompt="make the change", repo=repo, target_file="file.txt", marker="// marker"
+    )
 
     result = asyncio.run(oneshot.run_oneshot(config))
 
@@ -122,13 +150,53 @@ def test_default_runs_allocate_distinct_session_leaves(monkeypatch, tmp_path: Pa
         return _plan_result()
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
-    config = oneshot.OneShotConfig(prompt="repeat", repo=repo)
+    config = oneshot.OneShotConfig(
+        prompt="repeat", repo=repo, target_file="file.txt", marker="// repeat"
+    )
 
     asyncio.run(oneshot.run_oneshot(config))
     asyncio.run(oneshot.run_oneshot(config))
 
     assert sessions[0] != sessions[1]
     assert all(path.parent == repo / ".cambium" / "sessions" for path in sessions)
+
+
+def test_explicit_session_rejects_second_request_without_changing_artifacts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    first = oneshot.OneShotConfig(
+        prompt="first request",
+        repo=repo,
+        session_root=session_dir,
+        target_file="file.txt",
+        marker="// first",
+    )
+    assert asyncio.run(oneshot.run_oneshot(first)).exit_code == 0
+    artifact_paths = (
+        session_dir / "plan.json",
+        session_dir / ".cambium" / "events.db",
+        session_dir / ".cambium" / "result.json",
+    )
+    before = {path: path.read_bytes() for path in artifact_paths}
+
+    async def unexpected_run_plan(*args, **kwargs):
+        raise AssertionError("a reused one-shot session must not reach the supervisor")
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
+    second = oneshot.OneShotConfig(
+        prompt="second request",
+        repo=repo,
+        session_root=session_dir,
+        target_file="file.txt",
+        marker="// second",
+    )
+    with pytest.raises(ValueError, match="already been used"):
+        asyncio.run(oneshot.run_oneshot(second))
+
+    assert {path: path.read_bytes() for path in artifact_paths} == before
 
 
 def test_render_accepts_plan_result() -> None:
@@ -166,6 +234,113 @@ def test_repl_and_tui_make_a_new_config_per_prompt(monkeypatch, tmp_path: Path) 
     assert all(config.repo == base.repo and config.provider == base.provider for config in configs)
     assert "plan=tasks:1" in repl_out.getvalue()
     assert "plan=tasks:1" in tui_out.getvalue()
+
+
+def test_repl_and_tui_return_nonzero_for_failed_plan_result(monkeypatch, tmp_path: Path) -> None:
+    failed = PlanResult(
+        (TaskResult(task_id="oneshot", status="failed", exit_code=1, reason="failed"),)
+    )
+
+    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
+        return failed
+
+    monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
+    base = oneshot.OneShotConfig(repo=tmp_path / "repo", provider="demo")
+
+    assert repl.run_repl(
+        base,
+        input_stream=StringIO("failed\n/exit\n"),
+        output_stream=StringIO(),
+        error_stream=StringIO(),
+    ) == 1
+    assert tui.run_tui(
+        base,
+        input_stream=StringIO("failed\n"),
+        output_stream=StringIO(),
+        error_stream=StringIO(),
+    ) == 1
+
+
+def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    config_path = _write_provider_config(
+        repo,
+        [
+            _provider_entry("disabled", priority=0, enabled=False),
+            _provider_entry("selected", tier="balanced", model="selected-model", priority=1),
+            _provider_entry("later", priority=2),
+        ],
+    )
+    env_name = derived_env_name("selected")
+    secret = "implicit-selection-secret"
+    store = AuthStore(tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json")
+    store.set_provider("selected", secret)
+    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    monkeypatch.delenv(env_name, raising=False)
+    environment_before = dict(os.environ)
+    captured: dict[str, object] = {}
+
+    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
+        captured.update(plan=plan, kwargs=kwargs)
+        return _plan_result()
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
+    result = asyncio.run(
+        oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo))
+    )
+
+    assert result.exit_code == 0
+    task = captured["plan"]["tasks"][0]
+    assert task["provider_env_keys"] == [env_name]
+    assert task["fanout_config"] == {"tier": "balanced", "model": "selected-model"}
+    assert task["provider_config_path"] == str(config_path.resolve())
+    assert captured["kwargs"]["provider_environment"] == {env_name: secret}
+    assert secret not in json.dumps(captured["plan"])
+    assert secret not in repr(captured["plan"])
+    assert dict(os.environ) == environment_before
+
+
+def test_implicit_provider_selection_fails_before_launch_without_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    launched = False
+
+    async def unexpected_run_plan(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("provider preflight must happen before launch")
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
+    with pytest.raises(ValueError, match="provider selection failed.*not found"):
+        asyncio.run(oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo)))
+    assert launched is False
+
+
+def test_implicit_provider_selection_fails_before_launch_without_credential(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    _write_provider_config(repo, [_provider_entry("selected")])
+    store = AuthStore(tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json")
+    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    monkeypatch.delenv(derived_env_name("selected"), raising=False)
+    launched = False
+
+    async def unexpected_run_plan(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("credential preflight must happen before launch")
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
+    with pytest.raises(ValueError, match="provider credential is not configured"):
+        asyncio.run(oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo)))
+    assert launched is False
 
 
 def _write_result(path: Path, ended_at: float) -> None:

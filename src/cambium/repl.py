@@ -43,6 +43,8 @@ def run_repl(
             prompt_config = _config_for_prompt(config, prompt)
             result = _run(oneshot.run_oneshot(prompt_config))
             rendered = render.render_text_result(result)
+            if result.exit_code != 0:
+                failed = True
         except Exception as exc:
             failed = True
             error_stream.write(f"repl: {exc}\n")
