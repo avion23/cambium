@@ -33,10 +33,14 @@ backpressure that prevents retry storms.
 Capability/quality-constrained selection (H2): when a task declares
 ``requirements``, :func:`score_providers` filters candidates strictly by
 capability (``quality == "high"`` keeps only ``ProviderTier.STRONG``
-providers; unknown requirement keys raise ``ValueError`` so a task never
-silently downgrades) and then ranks the eligible providers by a weighted
-score of normalized utilization, cache-hit rate, expected latency, and a
-shadow price (utilization squared — tokens grow scarcer as a window fills).
+providers; ``min_context_window`` keeps only providers whose
+``context_window`` capacity is declared and at least that large — a provider
+without a declared capacity never satisfies it, so a task is never bound to a
+provider that cannot fit its context; unknown requirement keys raise
+``ValueError`` so a task never silently downgrades) and then ranks the
+eligible providers by a weighted score of normalized utilization, cache-hit
+rate, expected latency, and a shadow price (utilization squared — tokens grow
+scarcer as a window fills).
 The weights are module constants (:data:`W_UTIL` etc.), documented
 placeholders until measured quality/latency data exists (implementation-plan
 step 3/5). Without ``requirements``, ``select_primary``/``select_lane`` keep
@@ -583,10 +587,12 @@ def score_providers(
     The capability filter is STRICT and never violated: ``quality == "high"``
     restricts candidates to providers whose tier is
     :attr:`ProviderTier.STRONG`; ``"normal"`` or absent applies no tier
-    restriction. ``min_context_window`` is validated (positive int) but has no
-    effect today because :class:`~cambium.diffundo.ProviderConfig` carries no
-    ``context_window`` field — the check is skipped and documented until the
-    config grows the field. Unknown requirement keys raise ``ValueError``, so
+    restriction. ``min_context_window`` restricts candidates to providers
+    whose ``context_window`` capacity is declared (a positive
+    :attr:`~cambium.diffundo.ProviderConfig.context_window`) and at least as
+    large as the requirement — a provider that declares no capacity can never
+    satisfy the boundary, so the task is never bound to a provider that
+    cannot fit its context. Unknown requirement keys raise ``ValueError``, so
     a cheaper/underused provider that fails the task's constraints is never
     substituted (and no eligible provider raises, fail-closed).
 
@@ -611,6 +617,7 @@ def score_providers(
     if not candidates:
         raise ValueError("model_candidates must be a non-empty list of model ids")
     require_strong = requirements.get("quality") == "high"
+    min_context_window = requirements.get("min_context_window")
     scored: list[tuple[float, int, str, str]] = []
     for index, provider in enumerate(providers):
         if not getattr(provider, "enabled", True):
@@ -620,6 +627,14 @@ def score_providers(
             continue
         if require_strong and getattr(provider, "tier", None) is not ProviderTier.STRONG:
             continue
+        if min_context_window is not None:
+            capacity = getattr(provider, "context_window", 0) or 0
+            if (
+                isinstance(capacity, bool)
+                or not isinstance(capacity, (int, float))
+                or capacity < min_context_window
+            ):
+                continue
         if lanes is not None:
             lane = lanes.get(provider.name)
             if lane is not None:

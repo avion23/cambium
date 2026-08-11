@@ -176,6 +176,10 @@ class ProviderConfig:
     token_window_allowance: float = 0.0
     auth: AuthMode = AuthMode.API_KEY
     protocol: Protocol = Protocol.CHAT_COMPLETIONS
+    # Optional provider context-window capacity in tokens (H2 capability
+    # boundary): 0/absent means the provider declares no capacity, so a task
+    # that requires ``min_context_window`` is never assigned to it.
+    context_window: int = 0
 
 
 @dataclass(frozen=True, slots=True)

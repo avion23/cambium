@@ -84,6 +84,7 @@ _PROVIDER_FIELDS = frozenset(
         "token_window_allowance",
         "auth",
         "protocol",
+        "context_window",
     }
 )
 _DEFAULTS: dict[str, object] = {
@@ -99,6 +100,9 @@ _DEFAULTS: dict[str, object] = {
     # Optional admission-balancing window (solution C); 0/absent falls back
     # to routing.DEFAULT_TOKEN_WINDOW_ALLOWANCE.
     "token_window_allowance": 0.0,
+    # Optional context-window capacity in tokens (H2); 0/absent means the
+    # provider declares no capacity, so min_context_window tasks exclude it.
+    "context_window": 0,
 }
 
 
@@ -347,6 +351,12 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     if token_window_allowance < 0:
         raise _error(f"{location}.token_window_allowance", "must not be negative")
 
+    context_window = _require_integer(
+        values["context_window"], f"{location}.context_window"
+    )
+    if context_window < 0:
+        raise _error(f"{location}.context_window", "must not be negative")
+
     return {
         "name": name,
         "tier": tier_value,
@@ -364,6 +374,7 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         "token_window_allowance": token_window_allowance,
         "auth": auth,
         "protocol": protocol,
+        "context_window": context_window,
     }
 
 
@@ -447,6 +458,7 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
         "token_window_allowance": values["token_window_allowance"],
         "auth": values["auth"],
         "protocol": values["protocol"],
+        "context_window": values["context_window"],
     }
     price = values["price"]
     provider_fields = {field.name for field in fields(ProviderConfig)}
