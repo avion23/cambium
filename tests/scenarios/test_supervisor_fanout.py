@@ -183,6 +183,36 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert sum(kind == "worktree_pruned" for kind, _task_id in terminal) == 3
     assert not any(kind == "worktree_cleanup_deferred" for kind, _task_id in terminal)
     assert ("session_ended", None) in terminal
+def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
+    """max_concurrent_tasks=1: the second task spawns only after the first ends."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
+    plan = {
+        "tasks": [
+            _task(session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
+                  target_file="a.txt", marker="// cambium-a"),
+            _task(session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
+                  target_file="b.txt", marker="// cambium-b"),
+        ]
+    }
+
+    result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
+
+    assert result.exit_code == 0
+    assert all(r.status == "succeeded" for r in result.results)
+    events = read_events(session_dir)
+    spawned = _kinds(events, "spawned")
+    assert [e["task_id"] for e in spawned] == ["t-a", "t-b"]
+    terminal_kinds = {"result", "merge_committed", "worktree_pruned"}
+    a_terminal = next(
+        e["seq"] for e in events
+        if e["task_id"] == "t-a" and e["kind"] in terminal_kinds
+    )
+    # t-b's spawn is sequenced strictly after t-a's last terminal event, so
+    # the two tasks never ran concurrently.
+    assert spawned[1]["seq"] > a_terminal
+
 
 
 def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None:
