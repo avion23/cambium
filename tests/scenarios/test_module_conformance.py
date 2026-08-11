@@ -1,4 +1,10 @@
-"""Scenario checks for the isolated module conformance gate."""
+"""Scenario checks for the isolated module conformance gate.
+
+The offline-environment probes must spawn real child interpreters and
+command shims to verify network denial, credential stripping, and isolated
+Python flags, so they are marked ``slow`` and run in the second tier.  The
+pure file/digest and frozen-content checks stay in the first tier.
+"""
 
 from __future__ import annotations
 
@@ -57,6 +63,7 @@ def test_gate_accepts_module_scoped_baseline() -> None:
     assert spec.name == name
 
 
+@pytest.mark.slow
 def test_offline_subprocess_environment_strips_credentials_and_denies_network(
     monkeypatch,
 ) -> None:
@@ -92,6 +99,7 @@ def test_offline_subprocess_environment_strips_credentials_and_denies_network(
     assert "network access is forbidden" in socket_probe.stderr
 
 
+@pytest.mark.slow
 def test_offline_child_denies_absolute_network_client_path() -> None:
     probe = (
         "import subprocess, sys; "
@@ -112,6 +120,7 @@ def test_offline_child_denies_absolute_network_client_path() -> None:
     assert "network client denied during module conformance: /usr/bin/curl" in result.stderr
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("client", ["curl", "wget", "nc", "ssh"])
 def test_offline_child_denies_shell_network_client(client: str) -> None:
     probe = (
@@ -133,6 +142,7 @@ def test_offline_child_denies_shell_network_client(client: str) -> None:
     assert f"/{client}" in result.stderr
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("api", ["run", "Popen"])
 def test_offline_child_resolves_network_client_realpath(tmp_path: Path, api: str) -> None:
     curl = shutil.which("curl")
@@ -160,6 +170,7 @@ def test_offline_child_resolves_network_client_realpath(tmp_path: Path, api: str
     assert denied in result.stderr
 
 
+@pytest.mark.slow
 def test_offline_child_denies_shell_network_client_realpath_with_whitespace_path(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +200,7 @@ def test_offline_child_denies_shell_network_client_realpath_with_whitespace_path
     assert denied in result.stderr
 
 
+@pytest.mark.slow
 def test_offline_guard_does_not_require_strace(monkeypatch) -> None:
     monkeypatch.setenv("PATH", "/nonexistent")
     probe = (
@@ -209,6 +221,7 @@ def test_offline_guard_does_not_require_strace(monkeypatch) -> None:
     assert result.stdout == "42\n"
 
 
+@pytest.mark.slow
 def test_offline_child_inherits_provider_import_blocker() -> None:
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
@@ -224,6 +237,7 @@ def test_offline_child_inherits_provider_import_blocker() -> None:
     assert "provider import blocked by module conformance: cambium.provider_config" in result.stderr
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("flag", ["-E", "-S", "-I"])
 def test_offline_child_rejects_python_flags_that_bypass_provider_blocker(flag: str) -> None:
     probe = (
@@ -245,6 +259,7 @@ def test_offline_child_rejects_python_flags_that_bypass_provider_blocker(flag: s
     assert f"isolated Python flag denied during module conformance: {flag}" in result.stderr
 
 
+@pytest.mark.slow
 def test_offline_child_rejects_python_flag_after_option_argument() -> None:
     probe = (
         "import subprocess, sys; "
@@ -265,6 +280,7 @@ def test_offline_child_rejects_python_flag_after_option_argument() -> None:
     assert "isolated Python flag denied during module conformance: -I" in result.stderr
 
 
+@pytest.mark.slow
 def test_offline_child_rejects_python_flag_after_option_argument_with_executable() -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -356,6 +372,7 @@ def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch)
     assert "without dataset_version bump (1.0.0)" in findings[0].detail
 
 
+@pytest.mark.slow
 def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
     """Deleting one module directory must not break the shared scenarios.
 

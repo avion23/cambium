@@ -1,35 +1,49 @@
-"""Subprocess tests for the should_review module's JSON CLI wire contract.
+"""In-process tests for the should_review module's JSON CLI wire contract.
 
-Every test spawns ``python -m cambium.modules.should_review`` and exchanges
-one JSON document over stdin/stdout.  Coverage mirrors the reference module
-and extends it with empty/max/unicode input and determinism probes.
+Every test feeds one JSON document to the module's ``main()`` entry point
+in-process (no interpreter spawn) and exchanges one JSON document over the
+module's stdin/stdout streams.  The ``python -m`` subprocess boundary itself
+is exercised by the bench harness and the module-conformance scenarios, so
+these tests do not pay the interpreter-spawn cost per case.  Coverage
+mirrors the reference module and extends it with empty/max/unicode input and
+determinism probes.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
-import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[5]
-SRC_DIR = str(REPO_ROOT / "src")
+from cambium.modules.should_review.__main__ import main as _cli_main
+
+
+class _FakeStdin:
+    """Present one CLI payload as ``sys.stdin.buffer`` in the calling process."""
+
+    def __init__(self, payload: str) -> None:
+        self.buffer = io.BytesIO(payload.encode("utf-8"))
 
 
 def _run_cli(payload: str) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
-    return subprocess.run(
-        [sys.executable, "-m", "cambium.modules.should_review"],
-        cwd=REPO_ROOT,
-        input=payload,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    previous_stdin = sys.stdin
+    sys.stdin = _FakeStdin(payload)
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = _cli_main()
+    finally:
+        sys.stdin = previous_stdin
+    return subprocess.CompletedProcess(
+        args=["cambium.modules.should_review.__main__"],
+        returncode=returncode,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
     )
 
 
