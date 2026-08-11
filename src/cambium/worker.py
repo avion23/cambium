@@ -132,7 +132,6 @@ from cambium.diffundo import (
     ProviderTier,
     prompt_prefix_bytes,
 )
-from cambium.provider_config import AuthMode
 from cambium.fencing import validate_worker_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
@@ -142,7 +141,7 @@ from cambium.ipc import (
     write_message,
 )
 from cambium.lint_diag import LintDiag
-from cambium.provider_config import load_providers
+from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import TOOL_SCHEMAS
 from cambium.tools import ToolContext, ToolResult, run_tool
