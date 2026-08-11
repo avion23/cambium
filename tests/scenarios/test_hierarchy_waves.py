@@ -211,9 +211,24 @@ def _seq_of(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("max_width,children,delay", [(2, 3, "0.15000"), (1, 3, None)])
+@pytest.mark.parametrize("max_width,children,delay", [(2, 3, "1.00000"), (1, 3, None)])
 @pytest.mark.slow
 def test_width_bound_caps_concurrent_dispatch(
+    tmp_path: Path, max_width: int, children: int, delay: str | None
+) -> None:
+    # The wave-overlap assertion needs symmetric worker boots: the session
+    # warm pool (default size 1) would let one child pop root's pooled worker
+    # instantly while its sibling cold-boots, so no overlap is ever observed
+    # under load. The pool's own behavior is covered in test_worker_pool.py.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("CAMBIUM_WARM_POOL_SIZE", "0")
+    try:
+        _assert_wave_width(tmp_path, max_width, children, delay)
+    finally:
+        monkeypatch.undo()
+
+
+def _assert_wave_width(
     tmp_path: Path, max_width: int, children: int, delay: str | None
 ) -> None:
     session_dir = tmp_path / "session"
