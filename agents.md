@@ -79,6 +79,13 @@ Provider lanes (H1): one concurrency lane per provider
 (`routing.LaneState`); `run_plan` pre-assigns each wave's un-pinned tasks in
 one batch pass, and 429 pressure decays a lane's in-flight cap.
 
+Capability/quality-constrained selection (H2): a task may declare
+`requirements` (`quality` high/normal, optional `min_context_window`); the
+supervisor then filters providers strictly by capability and picks the lowest
+`routing.score_providers` score (utilization, cache-hit rate, latency, shadow
+price) instead of `select_lane`, and the `task_assigned` event carries the
+requirements. Unknown requirement keys fail closed.
+
 `scripts/usage_evidence.py` aggregates durable per-call usage events
 across session stores (positional session dirs and/or `--repo <path>`,
 which globs `.cambium/sessions/*`) into per-provider routing evidence:

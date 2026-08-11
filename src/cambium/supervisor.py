@@ -82,7 +82,14 @@ from .redact import (
     build_session_redactor,
 )
 from .results import EXIT_CODES, Result, write_result
-from .routing import DebtStore, LaneState, ProviderDebt, select_lane
+from .routing import (
+    DebtStore,
+    LaneState,
+    ProviderDebt,
+    score_providers,
+    select_lane,
+    validate_requirements,
+)
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
     _ENVELOPE_KEYS,
@@ -1505,6 +1512,8 @@ class _Runtime:
                 assigned_payload["model"] = fanout_config["model"]
             if isinstance(spec.get("assigned_provider"), str):
                 assigned_payload["assigned_provider"] = spec["assigned_provider"]
+            if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
+                assigned_payload["requirements"] = spec["requirements"]
             await self.emit("task_assigned", **assigned_payload)
             restarts = 0
             worker_summary: str | None = None
@@ -2528,6 +2537,14 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
                 f"task {task_id} model_candidates must be a non-empty list of model ids"
             )
         spec["model_candidates"] = list(model_candidates)
+    requirements = spec.get("requirements")
+    if requirements is not None:
+        try:
+            requirements = validate_requirements(requirements)
+        except ValueError as exc:
+            raise ValueError(f"task {task_id}: {exc}") from exc
+        if requirements:
+            spec["requirements"] = requirements
     spec.setdefault("base_commit", None)
     spec.setdefault("write_marker", True)
     return spec
@@ -2547,20 +2564,37 @@ def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None
         lanes[provider.name] = LaneState(rpm_allowance=float(rpm or 60))
 
 
+def _assigned_tier(
+    providers: Sequence[Any], provider_name: str, pinned_tier: str | None
+) -> str:
+    """The call tier for an assigned provider: the provider's own tier (or the
+    caller-pinned tier when the provider matched it). The worker routes calls
+    by tier, so the assignment and the call tier must agree."""
+    if isinstance(pinned_tier, str) and pinned_tier:
+        return pinned_tier
+    for provider in providers:
+        if provider.name == provider_name:
+            return provider.tier.value
+    raise ValueError(f"assigned provider {provider_name!r} not found among candidates")
+
+
 def _resolve_model_candidates(
     spec: dict[str, Any], debt: Mapping[str, Any], lanes: dict[str, LaneState]
 ) -> bool:
     """Resolve a task's (provider, model) when it declares ``model_candidates``
     and its fanout_config carries no pinned model.
 
-    The max-min pick comes from the usage-debt ledger (``routing.select_lane``)
-    against the same provider config the worker will load, before the model
-    filter partitions the pool (solution C), and skips providers whose lane is
-    at or above its effective in-flight cap (H1). Mutates ``spec`` in place:
-    writes the chosen model into ``fanout_config`` and records the chosen
-    provider as ``assigned_provider``. Returns True when an assignment was
-    written; pinned tasks (``fanout_config.model`` set) and tasks without a
-    fanout_config are left untouched and return False.
+    The pick comes from the usage-debt ledger against the same provider config
+    the worker will load, before the model filter partitions the pool (solution
+    C), and skips providers whose lane is at or above its effective in-flight
+    cap (H1). When the task declares ``requirements``, the pick is the lowest
+    ``routing.score_providers`` score among providers that satisfy the task's
+    capability constraints (H2, STRICT filter); otherwise it is the max-min
+    ``routing.select_lane`` pick as before. Mutates ``spec`` in place: writes
+    the chosen model into ``fanout_config`` and records the chosen provider as
+    ``assigned_provider``. Returns True when an assignment was written; pinned
+    tasks (``fanout_config.model`` set) and tasks without a fanout_config are
+    left untouched and return False.
     """
     fanout_config = spec.get("fanout_config")
     candidates = spec.get("model_candidates")
@@ -2572,9 +2606,30 @@ def _resolve_model_candidates(
     ):
         return False
     providers = load_providers(_provider_config_path(os.environ, spec))
+    # A caller-pinned tier is a hard constraint: only providers in that tier
+    # may serve the task, so the assignment can never contradict it.
+    pinned_tier = fanout_config.get("tier")
+    if isinstance(pinned_tier, str) and pinned_tier:
+        providers = [p for p in providers if p.tier.value == pinned_tier]
     _ensure_lanes(lanes, providers)
-    provider_name, model = select_lane(providers, candidates, debt, lanes)
-    spec["fanout_config"] = {**fanout_config, "model": model}
+    requirements = spec.get("requirements")
+    if requirements:
+        # H2: capability/quality-constrained scoring — pick the lowest score
+        # among providers that satisfy the task's requirements (STRICT filter,
+        # fail-closed); never fall back to a provider that fails them.
+        provider_name, model, _score = score_providers(
+            providers, candidates, debt, lanes, requirements=requirements
+        )[0]
+    else:
+        provider_name, model = select_lane(providers, candidates, debt, lanes)
+    # The (provider, model, tier) assignment is one atomic unit: the worker
+    # routes calls by tier, so the assigned provider's tier must be the call
+    # tier or the assignment is filtered out before any request is sent.
+    spec["fanout_config"] = {
+        **fanout_config,
+        "model": model,
+        "tier": _assigned_tier(providers, provider_name, pinned_tier),
+    }
     spec["assigned_provider"] = provider_name
     return True
 
