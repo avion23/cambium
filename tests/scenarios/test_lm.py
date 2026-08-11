@@ -975,12 +975,16 @@ assert lm._DSPY is None
 assert "dspy" not in sys.modules
 
 # Concurrent cold loads: 16 threads race on the first full dspy import; the
-# pre-set DSPY_CACHEDIR must survive the load unclobbered.
+# pre-set DSPY_CACHEDIR must survive the load unclobbered. The repeated calls
+# after the first load only exercise the cached singleton path, so keep a
+# bounded sample instead of paying for thousands of identical lookups.
 sentinel = "/tmp/cambium-dspy-cache-sentinel"
+thread_count = 16
+repeats_per_thread = 100
 os.environ["DSPY_CACHEDIR"] = sentinel
 cold_load_count = 0
 cold_load_count_lock = threading.Lock()
-start = threading.Barrier(16)
+start = threading.Barrier(thread_count)
 
 
 real_temporary_directory = lm.tempfile.TemporaryDirectory
@@ -1005,13 +1009,13 @@ lm.tempfile = TempfileProxy()
 
 def load_repeatedly(_: int) -> list[object]:
     start.wait()
-    return [lm._load_dspy() for _ in range(2000)]
+    return [lm._load_dspy() for _ in range(repeats_per_thread)]
 
 
-with ThreadPoolExecutor(max_workers=16) as executor:
-    loads = list(executor.map(load_repeatedly, range(16)))
+with ThreadPoolExecutor(max_workers=thread_count) as executor:
+    loads = list(executor.map(load_repeatedly, range(thread_count)))
 results = [value for load in loads for value in load]
-assert len(results) == 16 * 2000
+assert len(results) == thread_count * repeats_per_thread
 assert len({id(value) for value in results}) == 1
 assert lm._DSPY is results[0]
 assert cold_load_count == 1, cold_load_count

@@ -423,14 +423,13 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
         for key, value in os.environ.items()
         if key not in {"PYTEST_ADDOPTS", "PYTEST_PLUGINS"}
     }
+    # The canary checks the copied checkout with the same interpreter and test
+    # dependencies as the parent suite; uv environment resolution is not part
+    # of the deletion contract and only repeats interpreter startup.
     result = subprocess.run(
         [
-            "uv",
-            "run",
-            "--python",
-            "3.14.7",
-            "--extra",
-            "test",
+            sys.executable,
+            "-m",
             "pytest",
             "-q",
             "tests/scenarios/test_module_conformance.py",
