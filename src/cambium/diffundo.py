@@ -80,7 +80,6 @@ _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
 _VOLATILE_MARKERS = ("request_id", "request-id")
-_REFUSAL_MARKERS = re.compile(r"content.?filter|refus|moderat|safety", re.IGNORECASE)
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/\s?#@]*@",
     re.IGNORECASE,
@@ -162,6 +161,10 @@ class ProviderConfig:
     cooldown_s: float = 60.0
     price_per_1m_in: float = 0.0
     price_per_1m_out: float = 0.0
+    # Optional per-provider admission-balancing window (solution C): token
+    # allowance for one balancing window; 0/absent falls back to the
+    # routing.DEFAULT_TOKEN_WINDOW_ALLOWANCE placeholder.
+    token_window_allowance: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -693,6 +696,7 @@ class Diffundo:
         open_backoff_base: float = 2.0,
         retry_base_delay_s: float = 0.05,
         rotation_seed: int = 0,
+        primary_provider: str | None = None,
     ) -> None:
         self._providers = tuple(providers)
         self._runtimes = tuple(
@@ -709,6 +713,14 @@ class Diffundo:
         # back to a recovered provider.
         self._rotation = rotation_seed
         self._primary_provider: ProviderConfig | None = None
+        if primary_provider is not None:
+            # Supervisor-level admission balancing (solution C) presets the
+            # per-subagent sticky primary from the task's assigned provider;
+            # an absent name falls back to the seeded first pick below.
+            for provider in self._providers:
+                if provider.name == primary_provider:
+                    self._primary_provider = provider
+                    break
         self._call_budget_s = call_budget_s
         self._pause_timeout_s = pause_timeout_s
         self._breaker_window = breaker_window_size
@@ -1206,7 +1218,12 @@ class Diffundo:
             return ProviderError(
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
             )
-        if status == 400 and _REFUSAL_MARKERS.search(message):
+        if status == 400:
+            # Deterministic HTTP 400s are permanent request-level rejections
+            # (verified live: zai 1214 'messages illegal' was retried then
+            # cooled down). A generic 400 used to fall to the retryable ERROR
+            # class; classify it as REFUSAL so it is never retried and never
+            # drives a health transition.
             return ProviderError(
                 provider.name, ProviderOutcome.REFUSAL, f"HTTP 400: {message}", cause
             )

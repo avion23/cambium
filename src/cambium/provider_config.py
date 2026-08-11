@@ -46,6 +46,7 @@ _PROVIDER_FIELDS = frozenset(
         "priority",
         "cooldown_s",
         "price",
+        "token_window_allowance",
     }
 )
 _DEFAULTS: dict[str, object] = {
@@ -58,6 +59,9 @@ _DEFAULTS: dict[str, object] = {
     "priority": 0,
     "cooldown_s": 60.0,
     "price": 0.0,
+    # Optional admission-balancing window (solution C); 0/absent falls back
+    # to routing.DEFAULT_TOKEN_WINDOW_ALLOWANCE.
+    "token_window_allowance": 0.0,
 }
 
 
@@ -241,6 +245,12 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     if price < 0:
         raise _error(f"{location}.price", "must not be negative")
 
+    token_window_allowance = _require_number(
+        values["token_window_allowance"], f"{location}.token_window_allowance"
+    )
+    if token_window_allowance < 0:
+        raise _error(f"{location}.token_window_allowance", "must not be negative")
+
     return {
         "name": name,
         "tier": tier_value,
@@ -255,6 +265,7 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         "priority": priority,
         "cooldown_s": cooldown_s,
         "price": price,
+        "token_window_allowance": token_window_allowance,
     }
 
 
@@ -332,6 +343,7 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
         "model": values["model"],
         "priority": values["priority"],
         "cooldown_s": values["cooldown_s"],
+        "token_window_allowance": values["token_window_allowance"],
     }
     price = values["price"]
     provider_fields = {field.name for field in fields(ProviderConfig)}

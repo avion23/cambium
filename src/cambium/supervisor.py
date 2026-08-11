@@ -69,7 +69,7 @@ from typing import Any
 
 from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
-from cambium.provider_config import DEFAULT_PROVIDER_PATH
+from cambium.provider_config import DEFAULT_PROVIDER_PATH, load_providers
 from cambium.system_health import can_run_heavy
 
 from .auth import MIN_API_KEY_BYTES, scrub_environment
@@ -82,6 +82,7 @@ from .redact import (
     build_session_redactor,
 )
 from .results import EXIT_CODES, Result, write_result
+from .routing import DebtStore, select_primary
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
     _ENVELOPE_KEYS,
@@ -746,6 +747,7 @@ class _Runtime:
         resource_thresholds: dict[str, Any] | None = None,
         provider_environment: Mapping[str, str] | None = None,
         max_concurrent_tasks: int | None = None,
+        debt_store: DebtStore | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -757,6 +759,7 @@ class _Runtime:
         self._provider_environment = (
             None if provider_environment is None else dict(provider_environment)
         )
+        self._debt_store = debt_store
         self._event_append_lock = asyncio.Lock()
         # max_concurrent_tasks=0 disables the cap (no semaphore); None is
         # rewritten to the auto default by run_plan before _Runtime is built.
@@ -1335,6 +1338,18 @@ class _Runtime:
 
     # -- per-task supervision ------------------------------------------------
 
+    def _resolve_assignment(self, spec: dict[str, Any]) -> None:
+        """Admission-time (provider, model) selection for un-pinned tasks.
+
+        Mutates ``spec`` when it declares ``model_candidates`` and its
+        fanout_config has no pinned model (solution C). The ledger snapshot
+        already reflects every usage event folded in this session, so later
+        admissions in the same session see updated debt.
+        """
+        if self._debt_store is None:
+            return
+        _resolve_model_candidates(spec, self._debt_store.as_mapping())
+
     async def supervise_task(self, spec: dict[str, Any]) -> None:
         if spec["task_id"] in self._results:
             return
@@ -1423,10 +1438,6 @@ class _Runtime:
             )
         spec["base_commit"] = resolved_base
 
-        await self.emit(
-            "task_assigned", task_id=task_id, repo=str(repo), branch=spec["branch"],
-            base_commit=spec["base_commit"], task=spec.get("task", ""),
-        )
         thresholds = (
             spec["resource_thresholds"]
             if "resource_thresholds" in spec
@@ -1459,6 +1470,24 @@ class _Runtime:
         if semaphore is not None:
             await semaphore.acquire()
         try:
+            # Admission-time balancing (solution C): resolve (provider, model)
+            # for un-pinned ``model_candidates`` tasks only now that the task
+            # owns an admission slot, so the usage-debt ledger reflects every
+            # usage event already folded by earlier admissions. The decision
+            # is idempotent across restarts (a resolved spec carries a model).
+            self._resolve_assignment(spec)
+            assigned_payload: dict[str, Any] = {
+                "task_id": task_id, "repo": str(repo), "branch": spec["branch"],
+                "base_commit": spec["base_commit"], "task": spec.get("task", ""),
+            }
+            fanout_config = spec.get("fanout_config")
+            if isinstance(fanout_config, dict) and isinstance(
+                fanout_config.get("model"), str
+            ):
+                assigned_payload["model"] = fanout_config["model"]
+            if isinstance(spec.get("assigned_provider"), str):
+                assigned_payload["assigned_provider"] = spec["assigned_provider"]
+            await self.emit("task_assigned", **assigned_payload)
             restarts = 0
             worker_summary: str | None = None
             while True:
@@ -1608,6 +1637,10 @@ class _Runtime:
         if spec.get("fanout_config"):
             init_msg["fanout_config"] = spec["fanout_config"]
             init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
+        if isinstance(spec.get("assigned_provider"), str):
+            # Admission balancing (solution C): the worker presets Diffundo's
+            # sticky primary from this value instead of the seeded first pick.
+            init_msg["assigned_provider"] = spec["assigned_provider"]
         if encode_message(init_msg) is None:
             await _report_outbound_message_too_long()
             return _GenOutcome(
@@ -1996,6 +2029,11 @@ class _Runtime:
                             "usage_event", task_id=task_id, generation=generation,
                             **forwarded,
                         )
+                        # Admission balancing (solution C): fold the redacted
+                        # usage event into the session debt ledger so later
+                        # admissions in this session see updated utilization.
+                        if self._debt_store is not None:
+                            self._debt_store.record(msg)
                 elif mtype in ("tool_event", "pong"):
                     forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
                     if mtype == "tool_event":
@@ -2463,9 +2501,46 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     if not isinstance(provider_env_keys, (list, tuple)):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
     spec["provider_env_keys"] = list(provider_env_keys)
+    model_candidates = spec.get("model_candidates")
+    if model_candidates is not None:
+        if not isinstance(model_candidates, (list, tuple)) or not model_candidates or not all(
+            isinstance(model, str) and bool(model.strip()) for model in model_candidates
+        ):
+            raise ValueError(
+                f"task {task_id} model_candidates must be a non-empty list of model ids"
+            )
+        spec["model_candidates"] = list(model_candidates)
     spec.setdefault("base_commit", None)
     spec.setdefault("write_marker", True)
     return spec
+
+
+def _resolve_model_candidates(
+    spec: dict[str, Any], debt: Mapping[str, Any]
+) -> None:
+    """Resolve a task's (provider, model) at admission when it declares
+    ``model_candidates`` and its fanout_config carries no pinned model.
+
+    The max-min pick comes from the usage-debt ledger (``routing.select_primary``)
+    against the same provider config the worker will load, before the model
+    filter partitions the pool (solution C). Mutates ``spec`` in place: writes
+    the chosen model into ``fanout_config`` and records the chosen provider as
+    ``assigned_provider``. Pinned tasks (``fanout_config.model`` set) and tasks
+    without a fanout_config are left untouched.
+    """
+    fanout_config = spec.get("fanout_config")
+    candidates = spec.get("model_candidates")
+    if (
+        not isinstance(fanout_config, dict)
+        or bool(fanout_config.get("model"))
+        or not isinstance(candidates, list)
+        or not candidates
+    ):
+        return
+    providers = load_providers(_provider_config_path(os.environ, spec))
+    provider_name, model = select_primary(providers, candidates, debt)
+    spec["fanout_config"] = {**fanout_config, "model": model}
+    spec["assigned_provider"] = provider_name
 
 
 def _child_spec(
@@ -2861,6 +2936,11 @@ async def run_plan(
         started_at = time.time()
         redactor = _session_redactor(specs, provider_environment)
         store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
+        # Usage-debt ledger for admission balancing (solution C): load the
+        # persisted state once, feed it live from usage_event rows, and
+        # persist again when the session ends.
+        debt_store = DebtStore()
+        debt_store.load()
         runtime = _Runtime(
             session_dir,
             store,
@@ -2869,6 +2949,7 @@ async def run_plan(
             resource_thresholds=resource_thresholds,
             provider_environment=provider_environment,
             max_concurrent_tasks=max_concurrent_tasks,
+            debt_store=debt_store,
         )
         await runtime.start()
         runtime.set_session_tasks(specs)
@@ -2891,7 +2972,11 @@ async def run_plan(
                 "log", task_id=None, message=f"task group exception: {exc_group}"
             )
         finally:
-            await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
+            try:
+                await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
+            finally:
+                if debt_store.dirty:
+                    await asyncio.to_thread(debt_store.save)
         result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
         session_id = str(session_dir.resolve())
         await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)

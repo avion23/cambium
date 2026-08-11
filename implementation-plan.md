@@ -37,6 +37,10 @@ is not a branch ledger or merge log.
 - Connect accounting at the supervisor/event boundary and define behavior when
   rate-limit, token, cost, or account-quota state is unavailable. Preserve
   environment-only secrets.
+- Admission-time model selection (solution C): tasks may declare
+  `model_candidates`; the supervisor balances (model, provider) from a durable
+  usage-debt ledger (`~/.config/cambium/routing-state.json`) before the model
+  filter partitions the pool, and binds each task to the assigned provider.
 - Test 429 `Retry-After`, same-provider retry, `RATE_LIMITED` buckets, and
   provider fallback against the contract. Do not introduce weighted routing
   until the usage and quota evidence is stable; configured priority remains the

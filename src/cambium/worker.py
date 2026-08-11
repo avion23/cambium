@@ -296,7 +296,9 @@ def _fanout_value(config: dict[str, Any], section: dict[str, Any], key: str) -> 
     return section.get(key)
 
 
-def _provider_router(config: dict[str, Any]) -> tuple[Diffundo, ProviderTier, str]:
+def _provider_router(
+    config: dict[str, Any], *, assigned_provider: str | None = None
+) -> tuple[Diffundo, ProviderTier, str]:
     providers = load_providers(_provider_path())
     section = _fanout_section(config)
     tier_value = _fanout_value(config, section, "tier")
@@ -323,6 +325,17 @@ def _provider_router(config: dict[str, Any]) -> tuple[Diffundo, ProviderTier, st
     task_id = config.get("task_id") if isinstance(config, dict) else None
     if isinstance(task_id, str) and task_id:
         options.setdefault("rotation_seed", zlib.crc32(task_id.encode("utf-8")))
+    if assigned_provider is not None:
+        if any(provider.name == assigned_provider for provider in providers):
+            # Supervisor-level admission balancing (solution C): preset the
+            # per-subagent sticky primary to the task's assigned provider.
+            options["primary_provider"] = assigned_provider
+        else:
+            logger.warning(
+                "assigned_provider %r is not in the loaded providers; "
+                "falling back to the seeded primary pick",
+                assigned_provider,
+            )
     return Diffundo(providers, **options), tier, model
 
 
@@ -360,6 +373,9 @@ class AgentConfig:
     max_wall_s: float
     checkpoint_root: Path | None
     max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
+    # Supervisor-level admission balancing (solution C): the provider this
+    # task was assigned at admission; presets Diffundo's sticky primary.
+    assigned_provider: str | None = None
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -380,6 +396,9 @@ class AgentConfig:
         worktree = init.get("worktree")
         base_commit = init.get("base_commit")
         task = init.get("spec")
+        assigned_provider = init.get("assigned_provider")
+        if assigned_provider is not None and not isinstance(assigned_provider, str):
+            raise ValueError("init assigned_provider must be a string")
         session_id = os.environ.get("CAMBIUM_SESSION_ID")
         checkpoint_root = (
             Path(session_id).resolve() / ".cambium" / "checkpoints" if session_id else None
@@ -391,6 +410,7 @@ class AgentConfig:
             worktree=Path(worktree) if isinstance(worktree, str) else None,
             base_commit=base_commit if isinstance(base_commit, str) else None,
             fanout_config=_provider_fanout_config(init),
+            assigned_provider=assigned_provider,
             max_turns=_positive_int(init.get("max_turns"), "init max_turns", DEFAULT_MAX_TURNS),
             max_tokens=_positive_int(
                 init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS
@@ -444,6 +464,7 @@ def _merge_task_config(
         worktree=worktree,
         base_commit=base_commit if isinstance(base_commit, str) else None,
         fanout_config=fanout_config,
+        assigned_provider=config.assigned_provider,
         max_turns=max_turns,
         max_tokens=max_tokens,
         shell_permission=config.shell_permission,
@@ -466,6 +487,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         ),
         base_commit=run.get("base_commit"),
         fanout_config=_provider_fanout_config(run),
+        assigned_provider=None,
         max_turns=_positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS),
         max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
         shell_permission=False,
@@ -1384,7 +1406,9 @@ async def _do_provider_work(
             "failure_reason": f"worker worktree is missing: {worktree}",
         })
     try:
-        router, tier, model = _provider_router(config.fanout_config)
+        router, tier, model = _provider_router(
+            config.fanout_config, assigned_provider=config.assigned_provider
+        )
     except Exception as exc:
         return _loop_failure_outcome({
             "status": "failed",
