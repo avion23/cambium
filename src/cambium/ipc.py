@@ -45,13 +45,37 @@ def make_request_id(prefix: str = "req") -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+def encode_message(msg: dict[str, Any]) -> bytes | None:
+    """Encode ``msg`` as one newline-terminated JSON line (``MAX_LINE_BYTES``-checked).
+
+    Returns ``None`` when the encoded frame would exceed ``MAX_LINE_BYTES``
+    (the receiver would otherwise raise ``MessageTooLong`` after resyncing);
+    callers pre-check the return before queueing.
+    """
+    content = json.dumps(msg).encode("utf-8")
+    if len(content) > MAX_LINE_BYTES:
+        return None
+    return content + b"\n"
+
+
+def write_frame(writer: asyncio.StreamWriter, frame: bytes) -> None:
+    """Queue one pre-encoded newline-terminated wire frame on ``writer``."""
+    writer.write(frame)
+
+
 def write_message(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
     """Encode ``msg`` as one newline-terminated JSON line and queue it.
 
     The caller is responsible for draining the writer (``await
     writer.drain()``) so the message is actually flushed to the pipe.
+    The frame is encoded exactly once; an oversized message is still queued
+    (legacy framing behavior) — use :func:`encode_message` to pre-check when
+    the frame must not exceed ``MAX_LINE_BYTES``.
     """
-    writer.write((json.dumps(msg) + "\n").encode("utf-8"))
+    frame = encode_message(msg)
+    if frame is None:
+        frame = (json.dumps(msg) + "\n").encode("utf-8")
+    write_frame(writer, frame)
 
 
 async def _discard_to_newline(reader: asyncio.StreamReader) -> None:

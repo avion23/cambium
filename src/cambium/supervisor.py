@@ -73,7 +73,7 @@ from cambium.provider_config import DEFAULT_PROVIDER_PATH
 from cambium.system_health import can_run_heavy
 
 from .auth import MIN_API_KEY_BYTES, scrub_environment
-from .ipc import MAX_LINE_BYTES, write_message
+from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
 from .redact import (
     EVENT_RECORD_STRUCTURAL_FIELDS,
@@ -127,6 +127,18 @@ def _stdin_write_timeout_s() -> float:
     except ValueError:
         return STDIN_WRITE_TIMEOUT_S
     return max(0.0, timeout)
+
+
+def _durable_event_timeout_s() -> float:
+    """Return the bounded wait for a durable terminal emit (env-configurable)."""
+    value = os.environ.get("CAMBIUM_DURABLE_EVENT_TIMEOUT_S")
+    if value is None:
+        return DURABLE_EVENT_TIMEOUT_S
+    try:
+        timeout = float(value)
+    except ValueError:
+        return DURABLE_EVENT_TIMEOUT_S
+    return timeout if timeout > 0 else DURABLE_EVENT_TIMEOUT_S
 
 
 def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
@@ -263,13 +275,6 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     return float(os.environ.get(env, default))
 
 
-def _encode_json_frame(msg: dict[str, Any]) -> bytes | None:
-    content = json.dumps(msg).encode("utf-8")
-    if len(content) > MAX_LINE_BYTES:
-        return None
-    return content + b"\n"
-
-
 async def _write_json(
     proc: asyncio.subprocess.Process,
     msg: dict[str, Any],
@@ -278,12 +283,13 @@ async def _write_json(
 ) -> bool:
     """Write one wire message before ``deadline`` or kill its process group.
 
-    Framing is delegated to :func:`cambium.ipc.write_message`; the oversize
-    pre-check, deadline-bounded drain, and kill-on-failure stay local.
+    Framing is centralized in :mod:`cambium.ipc`; the oversize pre-check,
+    deadline-bounded drain, and kill-on-failure stay local.
     """
     if proc.stdin is None or proc.stdin.is_closing():
         return False
-    if _encode_json_frame(msg) is None:
+    frame = encode_message(msg)
+    if frame is None:
         await _kill_worker(proc)
         return False
     loop = asyncio.get_running_loop()
@@ -295,7 +301,7 @@ async def _write_json(
         await _kill_worker(proc)
         return False
     try:
-        write_message(proc.stdin, msg)
+        write_frame(proc.stdin, frame)
         await asyncio.wait_for(proc.stdin.drain(), remaining)
         return True
     except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
@@ -1360,6 +1366,19 @@ class _Runtime:
                     reason="ParentTerminatedWithoutResult",
                     message="parent ended without a result envelope; proposal dropped",
                 )
+            # A child task that ends failed is otherwise invisible to its
+            # parent: emit one correlated failure event so the parent learns
+            # the child did not succeed. Succeeded/cancelled children stay
+            # quiet here (their envelopes already carry the outcome).
+            parent_task_id = spec.get("parent_task_id")
+            if parent_task_id is not None:
+                child_result = self._results.get(spec["task_id"])
+                if child_result is not None and child_result.status == "failed":
+                    await self.emit(
+                        "child_failed", task_id=spec["task_id"],
+                        parent_task_id=parent_task_id,
+                        reason=child_result.reason or "failed",
+                    )
 
     async def _supervise(self, spec: dict[str, Any]) -> None:
         task_id = spec["task_id"]
@@ -1574,7 +1593,7 @@ class _Runtime:
         if spec.get("fanout_config"):
             init_msg["fanout_config"] = spec["fanout_config"]
             init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
-        if _encode_json_frame(init_msg) is None:
+        if encode_message(init_msg) is None:
             await _report_outbound_message_too_long()
             return _GenOutcome(
                 clean=False, fatal=True, reason=OUTBOUND_MESSAGE_TOO_LONG,
@@ -1680,7 +1699,7 @@ class _Runtime:
                 "reason": timeout_phase or "timeout",
             }
             try:
-                if _encode_json_frame(cancel_msg) is None:
+                if encode_message(cancel_msg) is None:
                     await _report_outbound_message_too_long()
                 else:
                     await _write_json(
@@ -1704,7 +1723,7 @@ class _Runtime:
             await self.emit(
                 "ping", task_id=task_id, generation=generation, request_id=pong_rid
             )
-            if _encode_json_frame(ping_msg) is None:
+            if encode_message(ping_msg) is None:
                 protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
                 await _report_outbound_message_too_long()
                 await _kill_worker(proc)
@@ -1852,7 +1871,7 @@ class _Runtime:
                         "type": "run_task", "request_id": run_rid,
                         "task_id": task_id, **payload,
                     }
-                    if _encode_json_frame(run_msg) is None:
+                    if encode_message(run_msg) is None:
                         protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
                         await _report_outbound_message_too_long()
                         await _kill_worker(proc)
@@ -2119,8 +2138,9 @@ class _Runtime:
                 ),
                 loop,
             )
+            timeout_s = _durable_event_timeout_s()
             try:
-                future.result(timeout=DURABLE_EVENT_TIMEOUT_S)
+                future.result(timeout=timeout_s)
             except TimeoutError as exc:
                 # The emit keeps running on the loop and still appends the
                 # event; only the wait is bounded, so a saturated pool cannot
@@ -2128,7 +2148,7 @@ class _Runtime:
                 # closed rather than silently dropping the terminal event.
                 raise RuntimeError(
                     f"durable terminal event {kind!r} not persisted within "
-                    f"{DURABLE_EVENT_TIMEOUT_S}s"
+                    f"{timeout_s}s"
                 ) from exc
 
         return MergeSequencer(
