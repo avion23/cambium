@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import os
 import subprocess
@@ -19,9 +18,14 @@ from cambium.diffundo import CallResult, ProviderTier
 from cambium.lm import ArchitectusLM, CambiumLM
 from cambium.tasktree import build_tree
 
+try:
+    import dspy
+except ImportError:
+    dspy = None
+
 
 def _require_dspy() -> None:
-    if importlib.util.find_spec("dspy") is None:
+    if dspy is None:
         pytest.skip("dspy extra is not installed")
 
 
@@ -76,6 +80,7 @@ def _call(lm: CambiumLM, prompt: str = "same prompt") -> list[str]:
     return output
 
 
+@pytest.mark.slow
 def test_dspy_import_and_construction_do_not_write_home(tmp_path: Path) -> None:
     _require_dspy()
     source = Path(__file__).resolve().parents[2] / "src"
@@ -113,6 +118,7 @@ assert dspy.cache.enable_memory_cache is True
     assert _tree(real_cache) == real_cache_before
 
 
+@pytest.mark.slow
 def test_identical_calls_are_not_cached() -> None:
     _require_dspy()
     diffundo = FakeDiffundo()
@@ -803,6 +809,7 @@ def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
     assert response_format.reads == 1
 
 
+@pytest.mark.slow
 def test_state_round_trip_loads_in_a_fresh_process(tmp_path: Path) -> None:
     _require_dspy()
     from cambium.diffundo import Diffundo, ProviderConfig, ProviderTier
@@ -1238,6 +1245,7 @@ def test_empty_or_missing_tool_call_arguments_map_to_empty_args(
     assert response.tool_calls[0].args == {}
 
 
+@pytest.mark.slow
 def test_concurrent_dspy_loads_preserve_cache_environment() -> None:
     _require_dspy()
     source = Path(__file__).resolve().parents[2] / "src"
@@ -1308,6 +1316,7 @@ assert os.environ["DSPY_CACHEDIR"] == sentinel
     assert completed.stderr == ""
 
 
+@pytest.mark.slow
 def test_dspy_load_preserves_cache_environment_writer_during_import() -> None:
     _require_dspy()
     source = Path(__file__).resolve().parents[2] / "src"
