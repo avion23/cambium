@@ -108,12 +108,15 @@ def _reopen_event_store(db):
     return EventStore(db, fsync_interval_s=0.1)
 
 
-def _event_append(store: EventStore, index: int, i: int, critical_at: int) -> int | None:
-    # Mostly non-critical (fast admission) with a single critical tail per
-    # thread so the fsync-acknowledged path is exercised under the close race
-    # without multiplying fsync work. The total critical volume stays small
-    # enough for the writer to drain within the store's close deadline.
-    kind = "result" if i == critical_at else "log"
+def _event_append(
+    store: EventStore, index: int, i: int, critical_at: int, critical_stride: int = 8
+) -> int | None:
+    # Mostly non-critical (fast admission) with a critical tail on one in every
+    # ``critical_stride`` threads so the fsync-acknowledged path is exercised
+    # under the close race without multiplying fsync work. The total critical
+    # volume stays small enough for the writer to drain within the store's
+    # close deadline (each critical fsync is a WAL checkpoint, ~ms each).
+    kind = "result" if i == critical_at and index % critical_stride == 0 else "log"
     return store.append({"kind": kind, "payload": {"thread": index, "i": i}})
 
 
