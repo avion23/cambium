@@ -67,7 +67,9 @@ CONCURRENCY_TERMS = frozenset(
     }
 )
 
-FILE_EXTENSIONS = ("py", "rs", "ts", "js", "go", "toml", "json", "yaml", "yml", "md", "sh", "sql", "txt", "cfg")
+FILE_EXTENSIONS = (
+    "py", "rs", "ts", "js", "go", "toml", "json", "yaml", "yml", "md", "sh", "sql", "txt", "cfg",
+)
 
 _REFUSAL_RE = re.compile(
     r"\b(?:i\s+can'?t|i\s+cannot|cannot|can'?t\s+do|unable\s+to|not\s+able\s+to|refus[a-z]*)\b",
@@ -79,7 +81,9 @@ _MARKER_RE = re.compile(
 _TEST_RE = re.compile(r"\b(?:test|tests|spec|specs|assert|pytest|unittest)\b", re.IGNORECASE)
 _NO_TESTS_RE = re.compile(r"\b(?:no\s+tests?|without\s+tests?|untested)\b", re.IGNORECASE)
 _TERSE_RE = re.compile(r"\b(?:lgtm|done|applied|ok\b|looks\s+good|looks\s+fine)\b", re.IGNORECASE)
-_FILE_REF_RE = re.compile(r"[A-Za-z0-9_./-]+\.(?:py|rs|ts|js|go|toml|json|yaml|yml|md|sh|sql|txt|cfg)\b")
+_FILE_REF_RE = re.compile(
+    r"[A-Za-z0-9_./-]+\.(?:py|rs|ts|js|go|toml|json|yaml|yml|md|sh|sql|txt|cfg)\b"
+)
 _REVIEWED_SUPPRESSION_RE = re.compile(r"\balready (?:reviewed|approved)\b", re.IGNORECASE)
 
 

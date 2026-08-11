@@ -20,11 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 from pathlib import Path
-
-import pytest
 
 from cambium.supervisor import read_events, run_plan
 

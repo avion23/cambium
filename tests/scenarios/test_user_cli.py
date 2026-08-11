@@ -632,7 +632,7 @@ def test_provider_run_persists_real_plan_without_credential(
     repo = _repo(tmp_path / "repo")
     provider = "demo"
     env_name = derived_env_name(provider)
-    config_path = _write_provider_file(
+    _write_provider_file(
         tmp_path / "home" / ".config" / "cambium" / "providers.json",
         [_provider_entry(provider)],
     )

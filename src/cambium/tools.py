@@ -668,7 +668,7 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     results = await asyncio.gather(*(_bounded_read(path) for path in paths))
     parts: list[str] = []
     ok = True
-    for path, result in zip(paths, results):
+    for path, result in zip(paths, results, strict=True):
         body = result.output if result.ok else (result.error or "read failed")
         parts.append(f"--- {path} ---\n{body}")
         if not result.ok:
