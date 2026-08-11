@@ -259,7 +259,7 @@ def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
         plan,
         session_dir,
         TRACE_FILE=str(session_dir / "trace.log"),
-        WORKER_DELAY_S="0.25",
+        WORKER_DELAY_S="0.25000",
     )
 
     assert result.exit_code == 0
@@ -300,7 +300,7 @@ def test_width_bound_one_serializes_wave(tmp_path: Path) -> None:
         plan,
         session_dir,
         TRACE_FILE=str(session_dir / "trace.log"),
-        WORKER_DELAY_S="0.15",
+        WORKER_DELAY_S="0.15000",
     )
 
     assert result.exit_code == 0
@@ -603,7 +603,7 @@ def test_flat_plan_ignores_max_width_and_preserves_canary(tmp_path: Path) -> Non
         ]
     }
 
-    os.environ["WORKER_DELAY_S"] = "0.5"
+    os.environ["WORKER_DELAY_S"] = "0.50000"
     try:
         result = asyncio.run(run_plan(session_dir, plan, max_width=1))
     finally:

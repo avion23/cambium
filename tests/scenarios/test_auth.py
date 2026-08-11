@@ -88,6 +88,16 @@ def test_schema_rejects_key_over_16_kib_and_surrogate() -> None:
             auth.parse_document(document)
 
 
+def test_auth_store_rejects_provider_key_below_minimum_bytes(tmp_path: Path) -> None:
+    path = _store_path(tmp_path)
+    too_short = "x" * (auth.MIN_API_KEY_BYTES - 1)
+
+    with pytest.raises(auth.AuthSchemaError, match="too short"):
+        auth.AuthStore(path).set_provider("openai", too_short)
+
+    assert not path.exists()
+
+
 def test_canonical_env_name_and_collision_are_rejected() -> None:
     assert auth.derived_env_name("foo.bar-baz") == "CAMBIUM_PROVIDER_FOO_BAR_BAZ_API_KEY"
     canonical = auth.derived_env_name("foo-bar")
@@ -96,7 +106,8 @@ def test_canonical_env_name_and_collision_are_rejected() -> None:
     assert auth.is_provider_env_name(canonical)
     collision = (
         b'{"version":1,"providers":{'
-        b'"foo--bar":{"api_key":"one"},"foo__bar":{"api_key":"two"}}}'
+        b'"foo--bar":{"api_key":"one-valid-provider-key"},'
+        b'"foo__bar":{"api_key":"two-valid-provider-key"}}}'
     )
 
     with pytest.raises(auth.AuthSchemaError, match="conflicts"):

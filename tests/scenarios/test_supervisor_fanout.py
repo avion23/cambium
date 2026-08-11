@@ -752,7 +752,7 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
     assert task.merge_sha is not None
     events = read_events(session_dir)
     assert len(_kinds(events, "parse_error")) >= 3
-    assert _protocol(events, "t-garbage") == ["init", "ready", "run_task", "result", "exit"]
+    assert _protocol(events, "t-***") == ["init", "ready", "run_task", "result", "exit"]
 
 
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:

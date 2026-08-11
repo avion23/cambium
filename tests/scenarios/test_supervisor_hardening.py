@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import sqlite3
 import subprocess
@@ -232,12 +233,12 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
 def test_session_redactor_removes_declared_secret_from_db_and_observers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The prose-like secret deliberately avoids every default pattern shape.
-    # Only the session registry built from the declared provider_env_keys value
-    # can redact it. Worker stderr, gate stderr, and the result summary all
-    # echo it; none may contain the credential.
+    # The prose-like secret and noncanonical declaration deliberately avoid
+    # every default/name-based pattern shape. Worker stderr, gate stderr, and
+    # the result summary all echo it; none may contain the credential.
+    provider_key = "CAMBIUM_TEST_PROVIDER_KEY"
     secret = "correct horse battery staple"
-    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", secret)
+    monkeypatch.setenv(provider_key, secret)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
@@ -251,18 +252,18 @@ def test_session_redactor_removes_declared_secret_from_db_and_observers(
         "init['task_id'], 'pid': os.getpid(), 'generation': init.get('generation', 1), "
         "'proto': 1})\n"
         "run = read_msg()\n"
-        "print(os.environ['CAMBIUM_PROVIDER_OPENAI_API_KEY'], file=sys.stderr)\n"
+        f"print(os.environ[{provider_key!r}], file=sys.stderr)\n"
         "status, failure_reason, commits, files_changed, diff = do_work(run)\n"
         "send({'type': 'result_envelope', 'request_id': run['request_id'], 'task_id': "
         "run['task_id'], 'generation': init.get('generation', 1), 'status': status, "
         "'commits': commits, 'files_changed': files_changed, 'diff': diff, "
         "'failure_reason': failure_reason, 'summary': 'Used ' + "
-        "os.environ['CAMBIUM_PROVIDER_OPENAI_API_KEY'] + ' successfully'})\n"
+        f"os.environ[{provider_key!r}] + ' successfully'}})\n"
         "send({'type': 'exit_message', 'task_id': run['task_id'], 'reason': 'done'})\n",
         encoding="utf-8",
     )
     gate = (
-        "printf '%s\\n' \"$CAMBIUM_PROVIDER_OPENAI_API_KEY\" >&2; "
+        f"printf '%s\\n' \"${provider_key}\" >&2; "
         "grep -q '// t-secret' hello.txt"
     )
     task = _task(
@@ -272,7 +273,7 @@ def test_session_redactor_removes_declared_secret_from_db_and_observers(
         "t-secret",
         worker=str(worker),
         gate=gate,
-        provider_env_keys=["CAMBIUM_PROVIDER_OPENAI_API_KEY"],
+        provider_env_keys=[provider_key],
         marker="// t-secret",
     )
     observed: list[dict] = []
@@ -294,7 +295,54 @@ def test_session_redactor_removes_declared_secret_from_db_and_observers(
             "SELECT kind, payload, task_id, worker_id, request_id FROM events"
         ).fetchall()
     assert secret not in json.dumps(rows)
-    assert any(event["kind"] == "log" for event in read_events(session_dir))
+    events = read_events(session_dir)
+    assert any(event["kind"] == "log" for event in events)
+    assert events[-1]["kind"] == "session_ended"
+
+
+@pytest.mark.parametrize("source", ["environment", "provider_environment"])
+def test_short_declared_provider_credential_is_rejected_before_worker_or_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    provider_key = "CAMBIUM_TEST_PROVIDER_KEY"
+    too_short = "x" * (supervisor_module.MIN_API_KEY_BYTES - 1)
+    session_dir = tmp_path / source
+    spec = {
+        "task_id": "short-provider",
+        "task": "edit a file",
+        "repo": str(tmp_path / "repo"),
+        "worktree_path": str(session_dir / "wt"),
+        "branch": "short-provider",
+        "provider_env_keys": [provider_key],
+    }
+    if source == "environment":
+        monkeypatch.setenv(provider_key, too_short)
+        provider_environment = None
+    else:
+        monkeypatch.delenv(provider_key, raising=False)
+        provider_environment = {provider_key: too_short}
+    environment_before = os.environ.get(provider_key)
+    provider_environment_before = (
+        None if provider_environment is None else dict(provider_environment)
+    )
+
+    with pytest.raises(ValueError, match="too short"):
+        supervisor_module._worker_environment(
+            spec, 1, provider_environment=provider_environment
+        )
+    with pytest.raises(ValueError, match="too short"):
+        asyncio.run(
+            run_plan(
+                session_dir,
+                {"tasks": [spec]},
+                provider_environment=provider_environment,
+            )
+        )
+
+    assert os.environ.get(provider_key) == environment_before
+    assert provider_environment == provider_environment_before
+    assert not (session_dir / "plan.json").exists()
+    assert not (session_dir / ".cambium" / "events.db").exists()
 
 
 def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(

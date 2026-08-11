@@ -72,10 +72,10 @@ from cambium.process_env import build_subprocess_env
 from cambium.provider_config import DEFAULT_PROVIDER_PATH
 from cambium.system_health import can_run_heavy
 
-from .auth import scrub_environment
+from .auth import MIN_API_KEY_BYTES, scrub_environment
 from .ipc import MAX_LINE_BYTES, write_message
 from .merge import MergeSequencer
-from .redact import Redactor, build_session_redactor, is_secret_name
+from .redact import Redactor, build_session_redactor
 from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
@@ -433,6 +433,40 @@ def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
     )
 
 
+def _provider_environment_value(
+    key: str, provider_environment: Mapping[str, str] | None
+) -> object:
+    """Return the value that the worker environment would forward for *key*."""
+    if provider_environment is not None:
+        override = provider_environment.get(key)
+        if override is not None:
+            return override
+    return os.environ.get(key)
+
+
+def _validate_provider_credential(value: object) -> None:
+    """Reject a credential that is unsafe to use as an unrestricted redaction needle."""
+    if not isinstance(value, str):
+        raise TypeError("provider credential must be a string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("provider credential is not valid UTF-8") from exc
+    if len(encoded) < MIN_API_KEY_BYTES:
+        raise ValueError("provider credential is too short")
+
+
+def _validate_provider_environment(
+    specs: list[dict[str, Any]], provider_environment: Mapping[str, str] | None
+) -> None:
+    """Validate every non-missing value a declared provider key can forward."""
+    for spec in specs:
+        for key in _provider_env_keys(spec):
+            value = _provider_environment_value(key, provider_environment)
+            if value is not None:
+                _validate_provider_credential(value)
+
+
 def _provider_config_path(
     source: Mapping[str, str], spec: Mapping[str, Any] | None = None
 ) -> str:
@@ -459,6 +493,7 @@ def _worker_environment(
     provider_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a strict worker env with authorized provider credentials."""
+    _validate_provider_environment([spec], provider_environment)
     source = dict(os.environ)
     allowed_provider_keys = _provider_env_keys(spec)
     if provider_environment is not None:
@@ -544,22 +579,15 @@ def _session_redactor(
 ) -> Redactor:
     """Build one session redactor from explicitly authorized provider values.
 
-    The registry must cover every provider credential value
-    ``_worker_environment`` can forward from the declared ``provider_env_keys``.
-    Non-credential allowlist values are not registered. Every non-empty
-    credential value is registered for substring redaction regardless of its
-    shape.
+    The registry covers every value ``_worker_environment`` can forward from
+    the declared ``provider_env_keys``. Every non-empty value is registered for
+    substring redaction regardless of its naming or value shape.
     """
+    _validate_provider_environment(specs, provider_environment)
     secret_values: list[str] = []
     for spec in specs:
         for key in _provider_env_keys(spec):
-            if not is_secret_name(key):
-                continue
-            value = (
-                provider_environment.get(key)
-                if provider_environment is not None and key in provider_environment
-                else os.environ.get(key)
-            )
+            value = _provider_environment_value(key, provider_environment)
             if not isinstance(value, str) or not value:
                 continue
             secret_values.append(value)
@@ -2777,6 +2805,7 @@ async def run_plan(
     if max_concurrent_tasks is None:
         max_concurrent_tasks = max(1, os.process_cpu_count() or os.cpu_count() or 1)
 
+    _validate_provider_environment(specs, provider_environment)
     tree, width_limit = _resolve_hierarchy(specs, plan, max_width)
 
     admission = _SessionAdmission(session_dir)

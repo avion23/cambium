@@ -26,6 +26,7 @@ from typing import Any, TextIO
 
 AUTH_VERSION = 1
 MAX_API_KEY_BYTES = 16 * 1024
+MIN_API_KEY_BYTES = 5
 AUTH_FILE_NAME = "auth.json"
 AUTH_DIRECTORY_MODE = 0o700
 AUTH_FILE_MODE = 0o600
@@ -201,6 +202,8 @@ def _validate_api_key(provider: str, value: object) -> str:
         raise AuthSchemaError(f"provider {provider!r} api key is not valid UTF-8") from exc
     if not encoded:
         raise AuthSchemaError(f"provider {provider!r} api key is empty")
+    if len(encoded) < MIN_API_KEY_BYTES:
+        raise AuthSchemaError(f"provider {provider!r} api key is too short")
     if b"\x00" in encoded:
         raise AuthSchemaError(f"provider {provider!r} api key contains NUL")
     if len(encoded) > MAX_API_KEY_BYTES:
@@ -766,6 +769,7 @@ __all__ = [
     "AUTH_VERSION",
     "AUTH_DIRECTORY_MODE",
     "AUTH_FILE_MODE",
+    "MIN_API_KEY_BYTES",
     "MAX_API_KEY_BYTES",
     "PROVIDER_ID_PATTERN",
     "AuthDocument",
