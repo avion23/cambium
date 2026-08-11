@@ -2812,6 +2812,17 @@ def _resolve_model_candidates(
     ):
         return False
     providers = load_providers(_provider_config_path(os.environ, spec))
+    authorized_provider_keys = _provider_env_keys(spec)
+    if authorized_provider_keys:
+        # Auto-mode plans carry only the provider environment names whose
+        # credentials were loaded for this run.  Model ids are not unique
+        # provider identities, so keep the routing, lane, and worker
+        # assignment pool on that same authorized set.
+        providers = [
+            provider
+            for provider in providers
+            if provider.api_key_env in authorized_provider_keys
+        ]
     # A caller-pinned tier is a hard constraint: only providers in that tier
     # may serve the task, so the assignment can never contradict it.
     pinned_tier = fanout_config.get("tier")
