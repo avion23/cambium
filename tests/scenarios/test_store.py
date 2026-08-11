@@ -759,7 +759,7 @@ def test_writer_death_during_blocked_eviction_persistence_burns_sequence(
     tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.5)
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2)
     fsync_started = threading.Event()
     release = threading.Event()
     reservation_started = threading.Event()

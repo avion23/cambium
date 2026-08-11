@@ -895,7 +895,7 @@ def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
     _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
-        w = WorkerSupervisor(env={"CAMBIUM_INIT_TIMEOUT_S": "0.5"})
+        w = WorkerSupervisor(env={"CAMBIUM_INIT_TIMEOUT_S": "0.3"})
         await w.start()
         try:
             # no init is ever sent
@@ -919,7 +919,7 @@ def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
     _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
-        w = WorkerSupervisor(env={"CAMBIUM_IDLE_TIMEOUT_S": "0.5"})
+        w = WorkerSupervisor(env={"CAMBIUM_IDLE_TIMEOUT_S": "0.3"})
         await w.start()
         try:
             await w.send({"type": "init", "request_id": "init-idle-1",
