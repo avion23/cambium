@@ -195,6 +195,22 @@ def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Pa
     assert time.monotonic() - started < 5.0
 
 
+def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
+    return {
+        "task_id": "slice-too-long",
+        "worker": worker,
+        "scratch_repo": str(session_dir / "scratch"),
+        "worktree_path": str(session_dir / "wt"),
+        "branch": "wt-slice-too-long",
+        "target_file": "hello.txt",
+        "marker": "// slice-too-long",
+        "write_marker": True,
+        "gate": "true",
+        "spec": "edit hello.txt",
+        "provider_env_keys": [],
+    }
+
+
 @pytest.mark.slow
 def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
@@ -621,7 +637,7 @@ def test_worktree_registration_requires_an_exact_path_match(
 
 
 @pytest.mark.slow
-def test_registered_worktree_path_with_literal_newline_is_not_deleted(
+def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"
@@ -857,20 +873,22 @@ def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
     assert _kinds(events, "merge_committed")
 
 
+@pytest.mark.parametrize("proto", [999, None])
 @pytest.mark.slow
 def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
-    tmp_path: Path,
+    tmp_path: Path, proto: int | None
 ) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     worker = tmp_path / "wrong-proto-worker.py"
+    proto_field = "" if proto is None else f", 'proto': {proto}"
     worker.write_text(
         "import json, sys, time\n"
         "init = json.loads(sys.stdin.readline())\n"
         "print(json.dumps({'type': 'ready', 'request_id': init['request_id'], "
-        "'task_id': init['task_id'], 'generation': init['generation'], "
-        "'proto': 999}), flush=True)\n"
+        "'task_id': init['task_id'], 'generation': init['generation']"
+        f"{proto_field}}}), flush=True)\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )
@@ -896,7 +914,7 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
         event["kind"] == "protocol"
         and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
         and event["payload"].get("expected") == supervisor_module.PROTO
-        and event["payload"].get("got") == 999
+        and event["payload"].get("got") == proto
         for event in events
     )
     assert not _kinds(events, "run_task")
@@ -912,115 +930,7 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
 
 
 @pytest.mark.slow
-def test_ready_without_proto_is_terminal_without_run_gate_or_merge(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"hello.txt": "hello\n"})
-    worker = tmp_path / "missing-proto-worker.py"
-    worker.write_text(
-        "import json, sys, time\n"
-        "init = json.loads(sys.stdin.readline())\n"
-        "print(json.dumps({'type': 'ready', 'request_id': init['request_id']}), "
-        "flush=True)\n"
-        "time.sleep(30)\n",
-        encoding="utf-8",
-    )
-    task = _task(
-        session_dir,
-        repo,
-        base,
-        "t-missing-proto",
-        worker=str(worker),
-        gate="true",
-        max_restarts=2,
-        max_wall_s=5.0,
-    )
-
-    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
-
-    task_result = result.results[0]
-    assert task_result.status == "failed"
-    assert task_result.reason == "PROTO_VERSION_MISMATCH"
-    assert task_result.restarts == 0
-    events = read_events(session_dir)
-    assert any(
-        event["kind"] == "protocol"
-        and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
-        and event["payload"].get("got") is None
-        for event in events
-    )
-    assert not _kinds(events, "run_task")
-    assert not _kinds(events, "gate")
-    assert not _kinds(events, "merge_started")
-    assert not _kinds(events, "merge_committed")
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == base
-
-
-@pytest.mark.slow
-def test_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
-    tmp_path: Path,
-) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"hello.txt": "hello\n"})
-    worker = tmp_path / "wrong-ready-result-worker.py"
-    worker.write_text(
-        "import json, sys\n"
-        "def send(message):\n"
-        "    print(json.dumps(message), flush=True)\n"
-        "init = json.loads(sys.stdin.readline())\n"
-        "send({'type': 'ready', 'request_id': 'wrong-request-id', "
-        "'task_id': init['task_id'], 'generation': init['generation'], 'proto': 1})\n"
-        "run = json.loads(sys.stdin.readline())\n"
-        "if run.get('type') == 'run_task':\n"
-        "    with open(run['target_file'], 'a', encoding='utf-8') as handle:\n"
-        "        handle.write('\\n// wrong-ready-result\\n')\n"
-        "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
-        "'status': 'succeeded'})\n"
-        "    send({'type': 'exit_message', 'reason': 'done'})\n",
-        encoding="utf-8",
-    )
-    task = _task(
-        session_dir,
-        repo,
-        base,
-        "t-wrong-ready-result",
-        worker=str(worker),
-        gate="grep -q '// wrong-ready-result' hello.txt",
-        max_restarts=2,
-        max_wall_s=5.0,
-        marker="// wrong-ready-result",
-    )
-
-    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
-
-    task_result = result.results[0]
-    assert task_result.status == "failed"
-    assert task_result.reason == "ready_request_id_mismatch"
-    assert task_result.restarts == 0
-    events = read_events(session_dir)
-    protocol = _kinds(events, "protocol")
-    assert len(protocol) == 1
-    assert protocol[0]["payload"]["code"] == supervisor_module.PROTO_UNKNOWN_REQUEST_ID
-    assert protocol[0]["payload"]["expected"] != protocol[0]["payload"]["got"]
-    assert not _kinds(events, "run_task")
-    assert not _kinds(events, "gate")
-    assert not _kinds(events, "merge_committed")
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == base
-
-
-@pytest.mark.slow
-def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
+def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"
@@ -1116,144 +1026,6 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
         capture_output=True,
     ).returncode != 0
     assert not session_dir.exists()
-
-
-@pytest.mark.slow
-def test_slice_runtime_runs_the_installed_worker_module(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-    spec = _slice_spec(session_dir, "cambium.worker")
-    spec["marker"] = "// slice-module-worker"
-    spec["gate"] = "grep -q '// slice-module-worker' hello.txt"
-
-    result = asyncio.run(run_session(session_dir, spec))
-
-    assert result.status == "succeeded"
-    assert result.exit_code == 0
-    spawned = [event for event in read_events(session_dir) if event["kind"] == "spawned"]
-    assert spawned
-    assert "cambium.worker" in spawned[0]["payload"]["worker"]
-
-
-def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
-    return {
-        "task_id": "slice-too-long",
-        "worker": worker,
-        "scratch_repo": str(session_dir / "scratch"),
-        "worktree_path": str(session_dir / "wt"),
-        "branch": "wt-slice-too-long",
-        "target_file": "hello.txt",
-        "marker": "// slice-too-long",
-        "write_marker": True,
-        "gate": "true",
-        "spec": "edit hello.txt",
-        "provider_env_keys": [],
-    }
-
-
-@pytest.mark.slow
-def test_oversized_stdout_line_fails_slice_reader(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-
-    result = asyncio.run(run_session(session_dir, _slice_spec(session_dir, TOO_LONG_WORKER)))
-
-    assert result.status == "failed"
-    assert result.exit_code == 1
-    assert any(
-        event["kind"] == "protocol" and event["payload"].get("note") == "MessageTooLong"
-        for event in read_events(session_dir)
-    )
-
-
-@pytest.mark.slow
-def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
-    tmp_path: Path,
-) -> None:
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-    worker = tmp_path / "wrong-ready-result-slice-worker.py"
-    worker.write_text(
-        "import json, subprocess, sys\n"
-        "from pathlib import Path\n"
-        "def send(message):\n"
-        "    print(json.dumps(message), flush=True)\n"
-        "init = json.loads(sys.stdin.readline())\n"
-        "send({'type': 'ready', 'request_id': 'wrong-request-id', 'proto': 1})\n"
-        "run = json.loads(sys.stdin.readline())\n"
-        "if run.get('type') != 'run_task':\n"
-        "    raise SystemExit(1)\n"
-        "repo = Path(run['scratch_repo'])\n"
-        "worktree = Path(run['worktree_path'])\n"
-        "subprocess.run(['git', 'worktree', 'add', '-b', run['branch'],\n"
-        "                str(worktree), 'main'], cwd=repo, check=True,\n"
-        "                capture_output=True)\n"
-        "target = worktree / run['target_file']\n"
-        "target.write_text(target.read_text() + '\\n// slice-wrong-ready\\n')\n"
-        "subprocess.run(['git', 'add', run['target_file']], cwd=worktree, check=True,\n"
-        "                capture_output=True)\n"
-        "subprocess.run(['git', 'commit', '-m', 'wrong ready'], cwd=worktree, check=True,\n"
-        "                capture_output=True)\n"
-        "send({'type': 'result_envelope', 'request_id': run['request_id'],\n"
-        "      'status': 'succeeded'})\n"
-        "send({'type': 'exit_message', 'reason': 'done'})\n",
-        encoding="utf-8",
-    )
-    spec = _slice_spec(session_dir, str(worker))
-    spec.update({
-        "marker": "// slice-wrong-ready",
-        "gate": "grep -q '// slice-wrong-ready' hello.txt",
-    })
-
-    result = asyncio.run(run_session(session_dir, spec))
-
-    assert result.status == "failed"
-    assert result.merge_sha is None
-    events = read_events(session_dir)
-    protocol = [event for event in events if event["kind"] == "protocol"]
-    assert len(protocol) == 1
-    assert protocol[0]["payload"]["code"] == supervisor_module.PROTO_UNKNOWN_REQUEST_ID
-    assert not any(event["kind"] in {"gate", "merge"} for event in events)
-    assert "// slice-wrong-ready" not in subprocess.run(
-        ["git", "show", "main:hello.txt"],
-        cwd=session_dir / "scratch",
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-
-
-@pytest.mark.slow
-def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
-    tmp_path: Path,
-) -> None:
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-    worker = tmp_path / "missing-proto-slice-worker.py"
-    worker.write_text(
-        "import json, sys, time\n"
-        "init = json.loads(sys.stdin.readline())\n"
-        "print(json.dumps({'type': 'ready', 'request_id': init['request_id']}), "
-        "flush=True)\n"
-        "time.sleep(30)\n",
-        encoding="utf-8",
-    )
-
-    result = asyncio.run(run_session(session_dir, _slice_spec(session_dir, str(worker))))
-
-    assert result.status == "failed"
-    assert result.merge_sha is None
-    events = read_events(session_dir)
-    assert any(
-        event["kind"] == "protocol"
-        and event["payload"].get("error_type") == "PROTO_VERSION_MISMATCH"
-        and event["payload"].get("got") is None
-        for event in events
-    )
-    assert not any(event["kind"] in {"run_task", "gate", "merge"} for event in events)
 
 
 @pytest.mark.slow

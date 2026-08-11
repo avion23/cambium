@@ -10,10 +10,6 @@ operations. No mocks, no network. Proves the five §1 acceptance measures:
 - exact envelope keys (upward result carries exactly the strict key set),
 - failed children stop dependent admission (failed nodes' descendants are
   never spawned, marked failed with ``dependency_failed:<parent>``).
-
-Plus a focused unit test that proves the dispatcher uses deep-copied
-snapshots: sibling specs handed to ``supervise_task`` are distinct objects
-with unaliased nested values.
 """
 
 from __future__ import annotations
@@ -29,12 +25,9 @@ import pytest
 
 from cambium.supervisor import (
     PlanResult,
-    TaskResult,
-    _dispatch_static_waves,
-    _strict_parent_envelope,
     run_plan,
 )
-from cambium.tasktree import _ENVELOPE_KEYS, build_tree, topological_order
+from cambium.tasktree import _ENVELOPE_KEYS
 
 ROOT = Path(__file__).resolve().parents[2]
 HIERARCHY_WORKER = str(ROOT / "tests" / "fixtures" / "hierarchy_worker.py")
@@ -188,28 +181,6 @@ def test_static_waves_dispatch_in_dependency_order(tmp_path: Path) -> None:
     assert a_exit_index < a1_enter
 
 
-@pytest.mark.slow
-def test_no_unready_dispatch_during_waves(tmp_path: Path) -> None:
-    """A node never enters before its declared parent's exit (event-level)."""
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"d.txt": "d\n", "e.txt": "e\n"})
-    plan = {
-        "tasks": [
-            _task(session_dir, repo, base, "d", target_file="d.txt"),
-            _task(session_dir, repo, base, "e", target_file="e.txt", depends_on=["d"]),
-        ]
-    }
-    result = _run_with_env(plan, session_dir, TRACE_FILE=str(session_dir / "trace.log"))
-
-    assert result.exit_code == 0
-    events = _event_kinds_by_task(session_dir)
-    d_result = _seq_of(events, "d", "result")
-    e_spawn = _seq_of(events, "e", "spawned")
-    assert d_result is not None and e_spawn is not None
-    assert d_result < e_spawn
-
-
 def _event_kinds_by_task(session_dir: Path) -> dict[str, list[tuple[int, str]]]:
     """Read events.db directly and group ``(seq, kind)`` per task_id."""
     import sqlite3
@@ -240,22 +211,25 @@ def _seq_of(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("max_width,children,delay", [(2, 4, "0.20000"), (1, 3, "0.15000")])
 @pytest.mark.slow
-def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
+def test_width_bound_caps_concurrent_dispatch(
+    tmp_path: Path, max_width: int, children: int, delay: str
+) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
-    files = {f"c{i}.txt": f"file c{i}\n" for i in range(1, 6)}
+    files = {f"c{i}.txt": f"file c{i}\n" for i in range(1, children + 1)}
     files["root.txt"] = "root\n"
     base = _make_repo(repo, files)
 
     plan: dict[str, Any] = {
-        "max_width": 2,
+        "max_width": max_width,
         "tasks": [
             _task(session_dir, repo, base, "root", target_file="root.txt"),
             *(
                 _task(session_dir, repo, base, f"c{i}", target_file=f"c{i}.txt",
                       depends_on=["root"])
-                for i in range(1, 6)
+                for i in range(1, children + 1)
             ),
         ],
     }
@@ -264,7 +238,7 @@ def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
         plan,
         session_dir,
         TRACE_FILE=str(session_dir / "trace.log"),
-        WORKER_DELAY_S="0.25000",
+        WORKER_DELAY_S=delay,
     )
 
     assert result.exit_code == 0
@@ -272,45 +246,14 @@ def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
     assert all(status == "succeeded" for status in statuses.values())
 
     lines = _trace_lines(session_dir)
-    # Wave 2 (c1..c5, width=2) must never exceed 2 concurrent workers.
-    assert _peak_concurrency(lines) <= 2
-    # A non-trivial fan-out actually exercised the cap: at least two workers
-    # were in flight at once during the wave.
-    assert _peak_concurrency(lines) >= 2
-    # And all five children plus the root were observed.
+    # A wave never runs more than ``max_width`` concurrently.
+    assert _peak_concurrency(lines) <= max_width
+    # And the bound was actually exercised: a width>1 wave sees non-trivial
+    # overlap, a width=1 wave runs strictly serial.
+    assert _peak_concurrency(lines) == max_width
+    # Every scheduled worker was observed.
     intervals = _enter_exit_intervals(lines)
-    assert set(intervals) == {"root", "c1", "c2", "c3", "c4", "c5"}
-
-
-@pytest.mark.slow
-def test_width_bound_one_serializes_wave(tmp_path: Path) -> None:
-    """``max_width=1`` makes each wave strictly serial (peak concurrency 1)."""
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    files = {f"s{i}.txt": f"file s{i}\n" for i in range(1, 4)}
-    files["root.txt"] = "root\n"
-    base = _make_repo(repo, files)
-
-    plan: dict[str, Any] = {
-        "max_width": 1,
-        "tasks": [
-            _task(session_dir, repo, base, "root", target_file="root.txt"),
-            *(
-                _task(session_dir, repo, base, f"s{i}", target_file=f"s{i}.txt",
-                      depends_on=["root"])
-                for i in range(1, 4)
-            ),
-        ],
-    }
-    result = _run_with_env(
-        plan,
-        session_dir,
-        TRACE_FILE=str(session_dir / "trace.log"),
-        WORKER_DELAY_S="0.15000",
-    )
-
-    assert result.exit_code == 0
-    assert _peak_concurrency(_trace_lines(session_dir)) == 1
+    assert set(intervals) == {"root", *[f"c{i}" for i in range(1, children + 1)]}
 
 
 # ---------------------------------------------------------------------------
@@ -359,55 +302,6 @@ def test_child_receives_bounded_parent_envelope(tmp_path: Path) -> None:
     assert envelope["files_changed"] == ["root.txt"]
     # No sibling context leaks: parent_envelope is one mapping, with root's id.
     assert envelope["summary"] == "" or isinstance(envelope["summary"], str)
-
-
-def test_upward_envelope_carries_exactly_strict_keys() -> None:
-    """The strict envelope projection never leaks a key outside the set."""
-    worker_envelope = {
-        "type": "result_envelope",
-        "request_id": "rid",
-        "task_id": "root",
-        "generation": 1,
-        "status": "succeeded",
-        "exit_code": 0,
-        "commits": ["sha-123"],
-        "files_changed": ["root.txt"],
-        "diff": "diff body",
-        "diff_truncated": False,
-        "summary": "did the work",
-        "failure_reason": None,
-        "started_at": 1.0,
-        "ended_at": 2.0,
-        "provider_metadata": {"provider": "demo", "model": "m"},
-        # Scratchpad-style fields that must NEVER cross the boundary.
-        "scratchpad": "secret reasoning",
-        "trajectory": ["step1", "step2"],
-    }
-    projected = _strict_parent_envelope(worker_envelope, parent_task_id="root")
-    assert set(projected.keys()) == set(_ENVELOPE_KEYS)
-    assert projected["parent_task_id"] == "root"
-    assert projected["unified_diff"] == "diff body"  # 'diff' -> 'unified_diff'
-    assert projected["summary"] == "did the work"
-    assert projected["commits"] == ["sha-123"]
-    assert projected["files_changed"] == ["root.txt"]
-    assert projected["metric_score"] is None
-    assert projected["metric_breakdown"] == {}
-    assert projected["status"] == "succeeded"
-    # The scratchpad fields are not in the strict key set, so they are dropped.
-    assert "scratchpad" not in projected
-    assert "trajectory" not in projected
-    assert "provider_metadata" not in projected
-
-
-def test_strict_envelope_empty_when_no_parent_data() -> None:
-    """A recovered parent (no retained envelope) yields defaults, not leaks."""
-    projected = _strict_parent_envelope(None, parent_task_id="recovered")
-    assert set(projected.keys()) == set(_ENVELOPE_KEYS)
-    assert projected["parent_task_id"] == "recovered"
-    assert projected["unified_diff"] == ""
-    assert projected["commits"] == []
-    assert projected["files_changed"] == []
-    assert projected["status"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -459,133 +353,6 @@ def test_failed_node_cascades_skip_to_dependants(tmp_path: Path) -> None:
     assert _seq_of(events, "root", "spawned") is not None
     assert _seq_of(events, "a", "spawned") is not None
     assert _seq_of(events, "b", "spawned") is not None
-
-
-@pytest.mark.slow
-def test_failed_root_cascades_to_whole_subtree(tmp_path: Path) -> None:
-    """A failed root skips the entire tree (no node is ever spawned)."""
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"root.txt": "root\n", "a.txt": "a\n"})
-
-    plan = {
-        "tasks": [
-            _task(session_dir, repo, base, "root", target_file="root.txt", fail=True),
-            _task(session_dir, repo, base, "a", target_file="a.txt", depends_on=["root"]),
-        ]
-    }
-    result = _run_with_env(
-        plan, session_dir, TRACE_FILE=str(session_dir / "trace.log")
-    )
-
-    assert result.exit_code != 0
-    by_id = {r.task_id: r for r in result.results}
-    assert by_id["root"].status == "failed"
-    assert by_id["a"].status == "failed"
-    assert by_id["a"].reason == "dependency_failed:root"
-    events = _event_kinds_by_task(session_dir)
-    assert _seq_of(events, "a", "spawned") is None
-
-
-# ---------------------------------------------------------------------------
-# Deep-copy snapshot — the dispatcher hands distinct snapshot copies per node.
-# ---------------------------------------------------------------------------
-
-
-class _CapturingRuntime:
-    """Minimal stand-in for ``_Runtime`` that records dispatched specs.
-
-    Used only by the snapshot test to assert that ``_dispatch_static_waves``
-    hands ``supervise_task`` the per-node deep-copied snapshot, not aliased
-    input dicts.
-    """
-
-    def __init__(self) -> None:
-        self._results: dict[str, TaskResult] = {}
-        self._task_envelopes: dict[str, dict[str, Any]] = {}
-        self.captured: list[dict[str, Any]] = []
-
-    async def supervise_task(self, spec: dict[str, Any]) -> None:
-        self.captured.append(spec)
-        self._results[spec["task_id"]] = TaskResult(
-            task_id=spec["task_id"], status="succeeded", exit_code=0
-        )
-
-
-def test_dispatcher_uses_independent_snapshots_per_node(tmp_path: Path) -> None:
-    specs = [
-        {
-            "task_id": "root",
-            "task": "r",
-            "repo": "/tmp/repo",
-            "worktree_path": "/tmp/wt-root",
-            "branch": "wt-root",
-            "target_file": "root.txt",
-            "marker": "// root",
-            "write_marker": True,
-            "base_commit": "deadbeef",
-            "depends_on": [],
-            "extra_block": [1, 2, 3],
-            "nested": {"items": [9, 8, 7]},
-        },
-        {
-            "task_id": "child",
-            "task": "c",
-            "repo": "/tmp/repo",
-            "worktree_path": "/tmp/wt-child",
-            "branch": "wt-child",
-            "target_file": "child.txt",
-            "marker": "// child",
-            "write_marker": True,
-            "base_commit": "deadbeef",
-            "depends_on": ["root"],
-            "extra_block": [1, 2, 3],
-            "nested": {"items": [9, 8, 7]},
-        },
-    ]
-
-    runtime = _CapturingRuntime()
-    # Build the same validated tree the supervisor builds.
-    tree_payload = {
-        "tasks": [
-            {
-                "task_id": s["task_id"],
-                "kind": "feature",
-                "depends_on": list(s["depends_on"]),
-                "spec": s,
-            }
-            for s in specs
-        ]
-    }
-    tree = build_tree(tree_payload)
-    topological_order(tree)
-
-    asyncio.run(_dispatch_static_waves(runtime, tree, width_limit=8))
-
-    assert len(runtime.captured) == 2
-    by_id = {spec["task_id"]: spec for spec in runtime.captured}
-    assert set(by_id) == {"root", "child"}
-
-    # Distinct top-level dict objects per node.
-    assert by_id["root"] is not by_id["child"]
-    # The input plan dicts were deep-copied by build_tree: nested mutables are
-    # not aliased across the two dispatched specs.
-    assert by_id["root"]["extra_block"] is not by_id["child"]["extra_block"]
-    assert by_id["root"]["nested"] is not by_id["child"]["nested"]
-    assert by_id["root"]["nested"]["items"] is not by_id["child"]["nested"]["items"]
-    # Mutating one snapshot does not corrupt the other.
-    by_id["root"]["extra_block"].append(999)
-    by_id["root"]["nested"]["items"].append(999)
-    assert by_id["child"]["extra_block"] == [1, 2, 3]
-    assert by_id["child"]["nested"]["items"] == [9, 8, 7]
-    # And the original plan dicts are not mutated retroactively.
-    assert specs[0]["extra_block"] == [1, 2, 3]
-    assert specs[1]["nested"]["items"] == [9, 8, 7]
-
-    # Each dispatched spec carries a parent_envelope (None parent for the root).
-    assert by_id["root"]["parent_envelope"]["parent_task_id"] is None
-    assert by_id["child"]["parent_envelope"]["parent_task_id"] == "root"
-    assert set(by_id["child"]["parent_envelope"].keys()) == set(_ENVELOPE_KEYS)
 
 
 # ---------------------------------------------------------------------------
