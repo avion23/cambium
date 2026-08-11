@@ -151,6 +151,7 @@ HEARTBEAT_INTERVAL_S = 1.0
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
+MAX_CONSECUTIVE_PLANS = 2
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
 DEFAULT_MAX_TURNS = 50
@@ -1441,6 +1442,7 @@ async def _run_agent_loop(
     tools = _exposed_tool_schemas(config)
     lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
+    consecutive_plans = 0
     try:
         for turn in range(1, config.max_turns + 1):
             progress.turn = turn
@@ -1516,11 +1518,20 @@ async def _run_agent_loop(
             except ValueError as exc:
                 transcript.append({"role": "assistant", "content": action_content})
                 transcript.append({"role": "user", "content": f"invalid action: {exc}"})
+                consecutive_plans = 0
                 continue
             if action["type"] == "plan":
+                consecutive_plans += 1
+                if consecutive_plans > MAX_CONSECUTIVE_PLANS:
+                    return _loop_result(
+                        outcome, "failed",
+                        f"agent made no progress: {consecutive_plans} consecutive plan actions without a tool call",
+                        turn, cumulative_usage, transcript,
+                    )
                 transcript.append({"role": "assistant", "content": action_content})
                 progress.tool = "plan"
                 continue
+            consecutive_plans = 0
             if action["type"] == "finish":
                 transcript.append({"role": "assistant", "content": action_content})
                 return {

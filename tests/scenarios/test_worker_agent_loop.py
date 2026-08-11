@@ -338,3 +338,60 @@ def test_run_task_drain_uses_config_heartbeat_interval(tmp_path: Path) -> None:
     # the old code waited HEARTBEAT_INTERVAL_S + 1.0 == 2.0s; the fixed code
     # drains as soon as the heartbeat observes the stop flag (~50ms).
     assert elapsed < 1.5
+
+
+# ---------------------------------------------------------------------------
+# Plan-spin guard: consecutive plan actions without a tool call fail fast
+# ---------------------------------------------------------------------------
+
+
+def test_consecutive_plan_actions_fail_fast_with_no_progress_reason(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["a"]}',
+            '{"type":"plan","steps":["b"]}',
+            '{"type":"plan","steps":["c"]}',
+            '{"type":"plan","steps":["d"]}',
+            '{"type":"plan","steps":["e"]}',
+            '{"type":"finish","summary":"must never be reached"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "failed"
+    assert "plan" in outcome["failure_reason"]
+    assert "no progress" in outcome["failure_reason"]
+    assert outcome["turn"] == 3  # failed on the 3rd consecutive plan
+    assert len(router.prompts) == 3  # no further router calls
+    assert not any(
+        "must never be reached" in message["content"]
+        for message in outcome["transcript"]
+    )
+
+
+def test_plan_then_tool_resets_consecutive_plan_counter(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["read alpha"]}',
+            '{"type":"plan","steps":["read alpha again"]}',
+            '{"type":"tool_call","name":"read_file","arguments":{"path":"alpha.txt"}}',
+            '{"type":"plan","steps":["one more plan before finishing"]}',
+            '{"type":"finish","summary":"read the file"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["summary"] == "read the file"
+    assert outcome["turn"] == 5
+    assert len(router.prompts) == 5
