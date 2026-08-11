@@ -16,12 +16,14 @@ executes one task and then exits:
                                     logged and ignored (v2.1 hook)
     propose_child (outbound)    ->  after the task body, one message per
                                     entry in the run payload's
-                                    ``proposed_children`` list: {request_id,
-                                    parent_task_id, child_task_id, kind,
-                                    spec}; the supervisor validates the
-                                    revision and replies with durable
-                                    ``child_admitted`` / ``child_rejected``
-                                    events (no wire ack)
+                                    ``proposed_children`` list, or during the
+                                    agent loop, one message per successful
+                                    ``delegate`` tool call; both shapes are
+                                    {request_id, parent_task_id,
+                                    child_task_id, kind, spec}. The
+                                    supervisor validates the revision and
+                                    replies with durable ``child_admitted`` /
+                                    ``child_rejected`` events (no wire ack)
     cancel                      ->  ok (ack) then abort the current task with
                                     status "cancelled"
     shutdown                    ->  ok (ack), abort the current task, then
@@ -1317,6 +1319,11 @@ async def _run_agent_loop(
             progress.tool = name
             with ToolContext(worktree, lint=lint_diag) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)
+            if name == "delegate" and tool_result.ok and writer is not None:
+                # Model-triggered child proposal: emit now; the supervisor
+                # validates and admits at this task's terminal envelope
+                # (implementation-plan step 2's dynamic admission).
+                await _emit_delegated_child(writer, config, arguments)
             transcript.append({"role": "assistant", "content": action_content})
             transcript.append({"role": "user", "content": _tool_observation(name, tool_result)})
             if writer is not None:
@@ -1606,6 +1613,27 @@ async def _emit_proposed_children(
             "kind": kind,
             "spec": child_spec,
         })
+
+
+async def _emit_delegated_child(
+    writer: asyncio.StreamWriter, config: AgentConfig, arguments: dict[str, Any]
+) -> None:
+    """Emit the ``propose_child`` wire message for one model ``delegate`` call.
+
+    Mirrors ``_emit_proposed_children``'s message shape exactly (type,
+    fresh ``request_id``, parent_task_id, child_task_id, kind, spec). The
+    supervisor buffers the proposal per parent and validates/admits it at
+    this task's terminal envelope; the tool result is emitted before this
+    message so the model's observation stays bounded and independent.
+    """
+    await send(writer, {
+        "type": "propose_child",
+        "request_id": make_request_id("propose"),
+        "parent_task_id": config.task_id,
+        "child_task_id": arguments["child_task_id"],
+        "kind": arguments["kind"],
+        "spec": arguments["spec"],
+    })
 
 
 async def _run_task(

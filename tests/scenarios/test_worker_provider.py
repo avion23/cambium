@@ -556,6 +556,96 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         server.close()
 
 
+
+def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -> None:
+    """A model ``delegate`` tool call admits and runs a child through the real worker loop.
+
+    The root's provider-backed agent loop calls the ``delegate`` tool with a
+    valid child task spec; the real worker emits the ``propose_child`` wire
+    message from the agent loop (not from a plan-declared proposal), the
+    supervisor buffers it and validates the revision at the root's terminal
+    envelope, durably admits the child (``child_admitted``), and the child
+    runs on the deterministic marker path (``spawned`` for the child id).
+    """
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        project = tmp_path / "project"
+        project.mkdir()
+        config_path = _provider_config(
+            project / ".cambium" / "providers.json", server.base_url
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+        monkeypatch.setenv(
+            "PYTHONPATH",
+            os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
+        )
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        delegate_args = {
+            "child_task_id": "worker-provider-child",
+            "kind": "test",
+            "spec": {
+                "task": "append a child marker to notes.txt",
+                "repo": str(repo),
+                "worktree_path": str(session_dir / "child-wt"),
+                "branch": "worker-provider-child",
+                "target_file": "notes.txt",
+                "marker": "// provider-child",
+                "write_marker": True,
+                "base_commit": base,
+            },
+        }
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-root\\n"}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"delegate","arguments":'
+            + json.dumps(delegate_args)
+            + "}"
+        )
+        _enqueue('{"type":"finish","summary":"edited target.txt and delegated a child"}')
+
+        task = _task(session_dir, repo, base, config_path)
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
+
+        assert result.exit_code == 0
+        assert {r.task_id for r in result.results} == {
+            "worker-provider", "worker-provider-child"
+        }
+        assert all(r.status == "succeeded" for r in result.results)
+
+        admitted = [e for e in events if e["kind"] == "child_admitted"]
+        assert len(admitted) == 1
+        assert admitted[0]["payload"]["parent_task_id"] == "worker-provider"
+        assert admitted[0]["payload"]["child_task_id"] == "worker-provider-child"
+        assert admitted[0]["payload"]["child_kind"] == "test"
+        assert not [e for e in events if e["kind"] == "child_rejected"]
+
+        spawned = [e for e in events if e["kind"] == "spawned"]
+        spawned_ids = {e["task_id"] for e in spawned}
+        assert "worker-provider-child" in spawned_ids
+
+        merged = subprocess.run(
+            ["git", "-C", str(repo), "show", "refs/heads/main:notes.txt"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert merged.endswith("// provider-child\n")
+        # the child's marker is the agent's own: no provider secret leaked
+        assert PROVIDER_SECRET not in json.dumps(events)
+    finally:
+        server.close()
+
+
 def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch) -> None:
     _reset_server()
     server = _FakeOpenAIServer()

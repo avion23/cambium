@@ -677,7 +677,28 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=ok, output=output)
 
 
+async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    """Register one child proposal for supervisor validation.
+
+    The tool never touches the worktree: it only acknowledges the proposal
+    arguments (already validated against the ``delegate`` schema in
+    ``run_tool``). The worker agent loop emits the ``propose_child`` wire
+    message, and the supervisor re-validates the full revision with
+    ``tasktree.build_tree`` at this task's terminal envelope, then admits or
+    rejects the child.
+    """
+    child_task_id = args["child_task_id"]
+    return _Outcome(
+        ok=True,
+        output=(
+            f"child {child_task_id} proposed; "
+            "admission is validated when this task completes"
+        ),
+    )
+
+
 TOOL_DISPATCH: dict[str, ToolImplementation] = {
+    "delegate": _delegate,
     "read_file": _read_file,
     "read_batch": _read_batch,
     "write_file": _write_file,
