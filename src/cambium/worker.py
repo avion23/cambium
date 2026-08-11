@@ -79,6 +79,10 @@ feedback from ``write_file``, is appended to the transcript so the agent sees
 success or failure.
 The worker owns at most one fenced commit of the resulting changes; a
 successful provider loop that leaves no non-``.cambium`` changes owns none.
+A true no-op succeeds only while the worktree HEAD still resolves to the
+base commit and writes no final transcript checkpoint (the raw transcript
+may echo credentials back); an advanced HEAD is reported as a failure so no
+unfenced commit is ever merged.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -1410,8 +1414,10 @@ def _finalize_worktree(
 ) -> dict[str, Any]:
     """Stage the agent's changed files (excluding ``.cambium/``) and make at
     most ONE fenced worker-owned commit with generation + identity trailers.
-    A clean worktree is a successful no-op and receives no empty commit.
-    Returns the result-envelope shape: model summary + cumulative safe provider metadata.
+    A clean worktree succeeds as a no-op only while HEAD still resolves to
+    the base commit; such a true no-op receives no empty commit and writes
+    no final checkpoint. Returns the result-envelope shape: model summary +
+    cumulative safe provider metadata.
 
     The commit message, envelope, state paths, and provider metadata are all
     worker-authored; no model-controlled value reaches any of them.
@@ -1441,7 +1447,7 @@ def _finalize_worktree(
                 outcome["failure_reason"] = f"no main branch in scratch repo: {err}"
                 return outcome
             base_commit = base
-        rc, _out, err = git("rev-parse", "HEAD", cwd=worktree)
+        rc, head_sha, err = git("rev-parse", "HEAD", cwd=worktree)
         if rc != 0:
             outcome["failure_reason"] = f"cannot resolve worktree HEAD: {err}"
             return outcome
@@ -1468,13 +1474,26 @@ def _finalize_worktree(
             changed.append(path)
         if not changed:
             _require_generation(worktree, generation)
-            final_checkpoint = _write_checkpoint_file(
-                config,
-                loop_outcome.get("turn", 0),
-                loop_outcome.get("transcript", []),
-                loop_outcome.get("usage", {}),
-                [],
+            # A provider can commit directly (e.g. via permitted shell): the
+            # worktree then looks clean but HEAD has advanced. Never report
+            # no-op success for an advanced HEAD — the supervisor would merge
+            # the unfenced commit. Compare fully resolved SHAs.
+            rc, resolved_base, err = git(
+                "rev-parse", "--verify", f"{base_commit}^{{commit}}", cwd=worktree
             )
+            if rc != 0:
+                outcome["failure_reason"] = (
+                    f"cannot resolve base_commit {base_commit}: {err}"
+                )
+                return outcome
+            if head_sha != resolved_base:
+                outcome["failure_reason"] = (
+                    f"worktree HEAD {head_sha} advanced beyond base_commit "
+                    f"{resolved_base}; refusing to publish unverified changes"
+                )
+                return outcome
+            # True no-op: no final checkpoint is written — the raw transcript
+            # may echo credentials back. The summary stays in the envelope.
             outcome.update(
                 status="succeeded",
                 failure_reason=None,
@@ -1486,8 +1505,6 @@ def _finalize_worktree(
                     loop_outcome.get("summary") or f"completed {config.task_id}"
                 )[:MAX_SUMMARY_CHARS],
             )
-            if final_checkpoint is not None:
-                outcome["_checkpoint_path"] = str(final_checkpoint)
             return outcome
         for path in changed:
             _require_generation(worktree, generation)

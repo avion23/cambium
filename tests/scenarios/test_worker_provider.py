@@ -390,8 +390,11 @@ def test_worker_agent_loop_finish_without_changes_succeeds_without_commit(
             capture_output=True,
             text=True,
         ).stdout.strip() == "0"
-        final_checkpoints = [message for message in messages if message["type"] == "checkpoint"]
-        assert final_checkpoints[-1]["commits_so_far"] == []
+        # A true no-op persists no final transcript checkpoint: the raw
+        # transcript may echo credentials back. The summary stays in the
+        # envelope and no empty commit is created.
+        assert not [message for message in messages if message["type"] == "checkpoint"]
+        assert not (session_dir / ".cambium" / "checkpoints").exists()
     finally:
         server.close()
 
@@ -555,6 +558,47 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
     finally:
         server.close()
 
+
+
+def test_worker_advanced_head_no_change_fails_and_main_unchanged(
+    tmp_path, monkeypatch
+) -> None:
+    """A provider that commits directly (permitted shell) must never succeed
+    as a no-op: the worktree looks clean but HEAD has advanced beyond the
+    base commit, so the worker fails and the supervisor never merges."""
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _set_provider_env(monkeypatch, config_path)
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":'
+            '["git","commit","--allow-empty","-m","unfenced-provider-commit"]}}'
+        )
+        _enqueue('{"type":"finish","summary":"committed directly"}')
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        task["max_restarts"] = 0
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
+
+        assert result.exit_code != 0
+        assert result.results[0].status == "failed"
+        assert "advanced beyond base_commit" in result.results[0].reason
+        assert result.results[0].merge_sha is None
+        assert subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == base
+        assert not [event for event in events if event["kind"] == "merge_started"]
+        assert not [event for event in events if event["kind"] == "merge_committed"]
+    finally:
+        server.close()
 
 
 def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -> None:
