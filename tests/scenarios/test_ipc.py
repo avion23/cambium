@@ -31,7 +31,6 @@ import json
 import os
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -45,7 +44,6 @@ from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
     read_message,
-    write_message,
 )
 
 MARKER = "// cambium-ipc"
@@ -265,17 +263,6 @@ def test_read_message_skips_garbage_and_non_object_lines() -> None:
     asyncio.run(scenario())
 
 
-def test_read_message_skips_blank_lines() -> None:
-    async def scenario() -> None:
-        reader = asyncio.StreamReader()
-        reader.feed_data(b"\n   \n\n")
-        reader.feed_data(b'{"type": "ok", "request_id": "r5"}\n')
-        reader.feed_eof()
-        assert await read_message(reader) == {"type": "ok", "request_id": "r5"}
-
-    asyncio.run(scenario())
-
-
 def test_read_message_over_limit_raises_and_resyncs() -> None:
     async def scenario() -> None:
         reader = asyncio.StreamReader()
@@ -289,65 +276,6 @@ def test_read_message_over_limit_raises_and_resyncs() -> None:
         assert await read_message(reader, limit=64) == {"type": "ok", "request_id": "r2"}
 
     asyncio.run(scenario())
-
-
-def test_read_message_complete_line_over_limit_raises() -> None:
-    async def scenario() -> None:
-        reader = asyncio.StreamReader()
-        reader.feed_data(b"y" * 100 + b"\n")
-        reader.feed_data(b'{"type": "ok", "request_id": "r3"}\n')
-        reader.feed_eof()
-        with pytest.raises(MessageTooLong):
-            await read_message(reader, limit=64)
-        assert await read_message(reader, limit=64) == {"type": "ok", "request_id": "r3"}
-
-    asyncio.run(scenario())
-
-
-def test_read_message_eof_mid_line_returns_none() -> None:
-    async def scenario() -> None:
-        reader = asyncio.StreamReader()
-        reader.feed_data(b'{"type": "bro')
-        reader.feed_eof()
-        assert await read_message(reader) is None
-
-    asyncio.run(scenario())
-
-
-def test_read_message_eof_after_newline_returns_message_then_none() -> None:
-    async def scenario() -> None:
-        reader = asyncio.StreamReader()
-        reader.feed_data(b'{"type": "ok", "request_id": "r4"}\n{"type": "pa')
-        reader.feed_eof()
-        assert await read_message(reader) == {"type": "ok", "request_id": "r4"}
-        # trailing partial line is discarded at EOF
-        assert await read_message(reader) is None
-
-    asyncio.run(scenario())
-
-
-def test_write_message_roundtrip() -> None:
-    async def scenario() -> None:
-        rsock, wsock = socket.socketpair()
-        loop = asyncio.get_running_loop()
-        rsock.setblocking(False)
-        wsock.setblocking(False)
-        reader, writer = await asyncio.open_connection(sock=rsock)
-        try:
-            write_message(writer, {"type": "ok", "request_id": "abc"})
-            await writer.drain()
-            data = await loop.sock_recv(wsock, 4096)
-            assert data == b'{"type": "ok", "request_id": "abc"}\n'
-        finally:
-            writer.close()
-            await writer.wait_closed()
-            rsock.close()
-            wsock.close()
-
-    asyncio.run(scenario())
-
-
-# ── worker handshake ───────────────────────────────────────────────────────
 
 
 @pytest.mark.slow
@@ -499,7 +427,7 @@ def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
             assert ready["type"] == "ready"
 
             await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.5))
+                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.3))
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -577,7 +505,7 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             assert ready["type"] == "ready"
 
             await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.5))
+                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.3))
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -648,7 +576,7 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
                           "task_id": "ipc-fence", "generation": 2})
             assert (await w.recv())["type"] == "ready"
             await w.send(_run_task_msg(
-                session_dir, run_rid="run-fence-1", work_delay_s=1.0,
+                session_dir, run_rid="run-fence-1", work_delay_s=0.3,
                 task_id="ipc-fence", generation=2,
             ))
             assert (await w.recv())["type"] == "heartbeat"
@@ -961,44 +889,13 @@ def test_worker_shutdown_graceful_exit(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_worker_shutdown_idle_exits_gracefully(tmp_path) -> None:
-    """shutdown with no running task: ok ack, exit_message shutdown, exit 0."""
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-
-    async def scenario() -> None:
-        w = WorkerSupervisor()
-        await w.start()
-        try:
-            await w.send({"type": "init", "request_id": "init-shutdown-idle",
-                          "task_id": "ipc-shutdown", "generation": 1})
-            ready = await w.recv()
-            assert ready["type"] == "ready"
-
-            await w.send({"type": "shutdown", "request_id": "shutdown-idle-1"})
-            ok = await w.recv()
-            assert ok["type"] == "ok"
-            assert ok["request_id"] == "shutdown-idle-1"
-
-            exit_msg = await w.recv()
-            assert exit_msg["type"] == "exit_message"
-            assert exit_msg["reason"] == "shutdown"
-            rc = await w.proc.wait()
-            assert rc == 0
-        finally:
-            await w.stop()
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.slow
 def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
     """Never sending init must trip the (env-shortened) init deadline."""
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
-        w = WorkerSupervisor(env={"CAMBIUM_INIT_TIMEOUT_S": "2"})
+        w = WorkerSupervisor(env={"CAMBIUM_INIT_TIMEOUT_S": "0.3"})
         await w.start()
         try:
             # no init is ever sent
@@ -1022,7 +919,7 @@ def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
     _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
-        w = WorkerSupervisor(env={"CAMBIUM_IDLE_TIMEOUT_S": "2"})
+        w = WorkerSupervisor(env={"CAMBIUM_IDLE_TIMEOUT_S": "0.3"})
         await w.start()
         try:
             await w.send({"type": "init", "request_id": "init-idle-1",

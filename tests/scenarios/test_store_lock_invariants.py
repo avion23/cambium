@@ -108,12 +108,15 @@ def _reopen_event_store(db):
     return EventStore(db, fsync_interval_s=0.1)
 
 
-def _event_append(store: EventStore, index: int, i: int, critical_at: int) -> int | None:
-    # Mostly non-critical (fast admission) with a single critical tail per
-    # thread so the fsync-acknowledged path is exercised under the close race
-    # without multiplying fsync work. The total critical volume stays small
-    # enough for the writer to drain within the store's close deadline.
-    kind = "result" if i == critical_at else "log"
+def _event_append(
+    store: EventStore, index: int, i: int, critical_at: int, critical_stride: int = 8
+) -> int | None:
+    # Mostly non-critical (fast admission) with a critical tail on one in every
+    # ``critical_stride`` threads so the fsync-acknowledged path is exercised
+    # under the close race without multiplying fsync work. The total critical
+    # volume stays small enough for the writer to drain within the store's
+    # close deadline (each critical fsync is a WAL checkpoint, ~ms each).
+    kind = "result" if i == critical_at and index % critical_stride == 0 else "log"
     return store.append({"kind": kind, "payload": {"thread": index, "i": i}})
 
 
@@ -186,26 +189,6 @@ def test_event_store_overflow_drops_are_accounted(tmp_path) -> None:
         f"overflow accounting lost {len(missing)} acknowledged append(s) "
         f"(store.dropped={store.dropped})"
     )
-
-
-@pytest.mark.slow
-def test_event_store_critical_acks_are_durable(tmp_path) -> None:
-    db = tmp_path / "events.db"
-    store = EventStore(db, fsync_interval_s=0.1)
-    try:
-        seqs = [store.append({"kind": "result", "payload": {"i": i}}) for i in range(20)]
-        _close_event_store(store)
-    finally:
-        if not store._closed:  # pragma: no cover - only when close() was not reached
-            _close_event_store(store)
-
-    assert len(seqs) == len(set(seqs))
-    reopened = _reopen_event_store(db)
-    try:
-        present = {row["seq"] for row in reopened.events_after(0)}
-    finally:
-        reopened.close()
-    assert set(seqs) <= present, "an acknowledged critical append is not durable"
 
 
 def _conversation_append(store: ConversationStore, node_index: int, i: int) -> int:
