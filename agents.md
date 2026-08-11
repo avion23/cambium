@@ -145,6 +145,15 @@ stdout and to a file under /tmp; the source repo is never written.
 - `tasktree.build_tree` validates dependency specs; `run_plan` does not
   schedule a DAG. Architectus and the conversation store are not wired into
   `run_plan`.
+- `cambium.oauth` (new module, not yet wired into the CLI) provides Codex
+  ChatGPT-subscription OAuth: a hardened per-provider `OAuthStore`
+  (`~/.local/share/cambium/oauth.json`, 0700 dir/0600 file, fail-closed
+  corruption with explicit `repair()`), a flock'd `TokenManager` refresh
+  transaction with a persistent per-provider lock file, the device flow
+  (`DeviceFlow`), and `import_codex_cli_session` for the codex CLI's
+  existing `~/.codex/auth.json` session. It reuses auth.py's hardening
+  primitives and never stores the id_token or email.
+
 - `doctor` reports runtime, worktree, provider/auth, optional stores, dataset
   integrity, and advisory host health.
 

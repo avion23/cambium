@@ -98,3 +98,15 @@ implemented as a bounded session-scoped warm pool:
   a clean reuse-ready generation returns its live process to the pool, all
   other exits kill as before. Restart generations always spawn fresh;
   pooled workers are killed at session end (run_plan finally / shutdown).
+
+
+### Codex-subscription OAuth module (W2, implemented)
+
+`src/cambium/oauth.py` lands the wave-2 credential layer ahead of the
+provider_config/diffundo/CLI wiring: a hardened per-provider `OAuthStore`
+(fail-closed corruption, explicit `repair()`), a flock'd `TokenManager`
+refresh transaction with a persistent per-provider lock file and
+last-good-on-429/5xx/timeout policy, the `DeviceFlow` against the pinned
+issuer contract, and `import_codex_cli_session` for the existing
+`~/.codex/auth.json` session. The codex CLI's own client id is passed in
+(`--client-id`), never hardcoded; `cambium auth oauth` (W4) consumes it.
