@@ -632,28 +632,15 @@ def test_provider_run_persists_real_plan_without_credential(
     repo = _repo(tmp_path / "repo")
     provider = "demo"
     env_name = derived_env_name(provider)
-    config_path = repo / ".cambium" / "providers.json"
-    config_path.parent.mkdir(parents=True)
-    config_path.write_text(
-        json.dumps(
-            {
-                "providers": [
-                    {
-                        "name": provider,
-                        "tier": "fast",
-                        "base_url": "http://127.0.0.1:8080/v1",
-                        "api_key_env": env_name,
-                        "model": "demo-model",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
+    config_path = _write_provider_file(
+        tmp_path / "home" / ".config" / "cambium" / "providers.json",
+        [_provider_entry(provider)],
     )
     secret = "persistent-plan-secret"
     auth_path = tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json"
     store = AuthStore(auth_path)
     store.set_provider(provider, secret)
+    monkeypatch.setattr(oneshot, "effective_home", lambda: tmp_path / "home")
     monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv(env_name, raising=False)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
@@ -696,11 +683,15 @@ def test_concurrent_session_lock_contention_returns_busy_exit_code(
     from cambium.supervisor import _SessionAdmission
 
     repo = _repo(tmp_path / "repo")
-    _write_provider_config(repo, [_provider_entry("demo")])
+    _write_provider_file(
+        tmp_path / "home" / ".config" / "cambium" / "providers.json",
+        [_provider_entry("demo")],
+    )
     env_name = derived_env_name("demo")
     secret = "contention-secret"
     store = AuthStore(tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json")
     store.set_provider("demo", secret)
+    monkeypatch.setattr(oneshot, "effective_home", lambda: tmp_path / "home")
     monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv(env_name, raising=False)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
