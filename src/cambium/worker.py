@@ -1,8 +1,10 @@
 """Worker runtime (Opifex seed) — ``python -m cambium.worker``.
 
 Speaks the Nuntius JSON-Lines wire protocol over stdio
-(docs/architecture.md §5, docs/research/ipc-protocol-draft.md). One worker
-executes one task and then exits:
+(docs/architecture.md §5, docs/research/ipc-protocol-draft.md). By default
+one worker executes one task and then exits; when the init carries
+``worker_reuse: true`` the worker stays alive after the task and waits for a
+rebind init on stdin (eval-3 ADOPT warm pool):
 
     init                        ->  ready (echoes the init request_id and the
                                     generation fencing token)
@@ -10,6 +12,13 @@ executes one task and then exits:
                                 ->  result_envelope (echoes the run_task
                                     request_id) -> exit_message (connection
                                     level; carries NO request_id)
+                                ->  with ``worker_reuse``: result_envelope
+                                    then reuse_ready (keeps the process alive)
+    init (rebind, reuse only)   ->  clears ALL per-task state (agent loop,
+                                    transcript, tool state, LM clients), chdir
+                                    to the new worktree, then ready; the
+                                    single-init exit behavior is unchanged
+                                    when ``worker_reuse`` is absent
     check_health                ->  ok (echoes the request_id, generation)
     steer                       ->  {"action": "cancel"} aborts the current
                                     task (status cancelled); anything else is
@@ -28,6 +37,9 @@ executes one task and then exits:
                                     status "cancelled"
     shutdown                    ->  ok (ack), abort the current task, then
                                     exit_message (reason "shutdown") + exit 0
+
+A reuse-enabled worker exits cleanly (code 0) when stdin closes while it is
+idle between tasks.
 
 Defensive timeouts (worker self-protection if the supervisor dies):
     - init deadline: no init message within ``INIT_TIMEOUT_S`` (default 30 s,
@@ -1869,6 +1881,11 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
         "proto": first.get("proto", PROTO),
         "monotonic_ms": _monotonic_ms(),
     })
+    # Worker-reuse opt-in (eval-3 ADOPT): when the init asks for it, the
+    # worker stays alive after the task and waits for a rebind init on stdin
+    # instead of exiting. The single-init exit behavior below is unchanged
+    # when this flag is absent.
+    worker_reuse = bool(first.get("worker_reuse"))
 
     current: asyncio.Task[dict[str, Any]] | None = None
     stop = threading.Event()
@@ -1893,8 +1910,28 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 outcome = task.result()
             except Exception as exc:
                 return await _fatal(writer, {}, f"task crashed: {exc}")
-            await _emit_result(writer, outcome)
-            return 0
+            await _emit_result_envelope(writer, outcome)
+            if not worker_reuse:
+                await send(writer, {
+                    "type": "exit_message",
+                    "task_id": outcome["task_id"],
+                    "generation": outcome["generation"],
+                    "reason": _exit_reason(outcome["status"]),
+                    "monotonic_ms": _monotonic_ms(),
+                })
+                return 0
+            # Reuse path: report ready-for-reuse and loop back to read the
+            # next init instead of exiting. All per-task state (agent loop,
+            # transcript, tool state, LM clients) is rebuilt from the new
+            # init's config on rebind.
+            await send(writer, {
+                "type": "reuse_ready",
+                "task_id": outcome["task_id"],
+                "generation": outcome["generation"],
+                "pid": os.getpid(),
+                "monotonic_ms": _monotonic_ms(),
+            })
+            continue
 
         try:
             msg = read_task.result()
@@ -1924,6 +1961,10 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             return await _fatal(writer, {}, f"wire read failed: {exc}")
 
         if msg is None:
+            if worker_reuse and current is None:
+                # stdin closed while idle between tasks (supervisor closed the
+                # pipe or exited): a pooled worker exits cleanly.
+                return 0
             # stdin closed: no further requests can arrive.
             await send(writer, {
                 "type": "exit_message",
@@ -1935,6 +1976,48 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             return 1
 
         mtype = msg.get("type") if isinstance(msg, dict) else None
+        if mtype == "init":
+            # Rebind: only a reuse-enabled worker accepts a second init. The
+            # rebind re-sends the FULL init (worktree, spec, fanout_config,
+            # assigned_provider, budgets, permissions), so every per-task
+            # client is rebuilt from the new config; nothing is carried over.
+            if not worker_reuse:
+                return await _fatal(writer, msg, "init after init (reuse not enabled)")
+            if current is not None:
+                return await _fatal(writer, msg, "init while a task is already running")
+            if "request_id" not in msg:
+                return await _fatal(writer, msg, "init without a request_id")
+            new_generation = msg.get("generation", 1)
+            if (
+                isinstance(new_generation, bool)
+                or not isinstance(new_generation, int)
+                or new_generation <= 0
+            ):
+                return await _fatal(writer, msg, "init generation must be a positive integer")
+            try:
+                new_config = AgentConfig.from_init(msg)
+            except ValueError as exc:
+                return await _fatal(writer, msg, f"invalid init config: {exc}")
+            if new_config.worktree is not None:
+                os.chdir(new_config.worktree)
+            first = msg
+            init_rid = msg["request_id"]
+            task_id = msg.get("task_id", "unknown")
+            generation = new_generation
+            init_fanout_config = msg.get("fanout_config")
+            init_config = new_config
+            worker_reuse = bool(msg.get("worker_reuse"))
+            stop = threading.Event()
+            await send(writer, {
+                "type": "ready",
+                "request_id": init_rid,
+                "task_id": task_id,
+                "pid": os.getpid(),
+                "generation": generation,
+                "proto": msg.get("proto", PROTO),
+                "monotonic_ms": _monotonic_ms(),
+            })
+            continue
         if mtype == "run_task":
             if current is not None:
                 return await _fatal(writer, msg, "run_task while a task is already running")

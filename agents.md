@@ -122,6 +122,15 @@ stdout and to a file under /tmp; the source repo is never written.
 - Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
   diagnostics use stderr/logging. The supervisor bounds each worker's decoded
   stdout queue and routes emitted records through `EventStore`.
+- Warm worker pool (eval-3 ADOPT): the supervisor keeps a bounded
+  session-scoped pool (`CAMBIUM_WARM_POOL_SIZE`, default 1; 0 disables) of
+  idle reuse-ready workers and rebinds them to new worktrees via a full
+  second init instead of spawning a fresh interpreter per task. Only the
+  first generation of a task may pop the pool; restarts always spawn fresh;
+  pooled workers are killed at session end. A pooled worker only serves a
+  task whose env matches (session, provider config, credentials) and rebuilds
+  all per-task state (agent loop, transcripts, tool state, LM clients) from
+  the rebind init.
 - `worker.do_work` selects deterministic marker mode unless `fanout_config` is
   present. Provider mode runs the bounded `Diffundo` loop: one provider call
   per turn, strict `tool_call`/`finish` parsing, schema and permission checks,
