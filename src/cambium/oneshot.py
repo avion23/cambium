@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Any
 
 from . import supervisor
-from .auth import AuthError, AuthStore, scrub_environment
+from .auth import (
+    AuthError,
+    AuthStore,
+    effective_home,
+    is_provider_env_name,
+    scrub_environment,
+)
 from .provider_config import ProviderSelectionError, load_providers, select_provider
 from .session import session_root
 from .supervisor import DEFAULT_WALL_BUDGET_S, EventSink, PlanResult
@@ -141,6 +147,7 @@ def preflight(
 
 
 def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
+    """Return a trusted provider path without consulting the target repository."""
     if config.provider_config_path is not None:
         path = Path(config.provider_config_path).expanduser()
     else:
@@ -148,7 +155,7 @@ def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
         path = (
             Path(configured).expanduser()
             if configured
-            else repo / ".cambium" / "providers.json"
+            else effective_home() / ".config" / "cambium" / "providers.json"
         )
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -157,6 +164,11 @@ def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
 
 def _stored_provider_environment(env_name: str) -> dict[str, str]:
     """Return one selected credential without changing ``os.environ``."""
+    if not is_provider_env_name(env_name):
+        raise ValueError("provider credential is not configured")
+    value = os.environ.get(env_name)
+    if value:
+        return {env_name: value}
     try:
         launch_environment = AuthStore().launch_environment(base={})
     except AuthError as exc:

@@ -58,8 +58,7 @@ def _provider_entry(
     }
 
 
-def _write_provider_config(repo: Path, providers: list[dict[str, object]]) -> Path:
-    path = repo / ".cambium" / "providers.json"
+def _write_provider_file(path: Path, providers: list[dict[str, object]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"providers": providers}), encoding="utf-8")
     return path
@@ -261,12 +260,46 @@ def test_repl_and_tui_return_nonzero_for_failed_plan_result(monkeypatch, tmp_pat
     ) == 1
 
 
+def test_default_provider_config_ignores_target_repository_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    malicious_path = _write_provider_file(
+        repo / ".cambium" / "providers.json",
+        [_provider_entry("attacker") | {"base_url": "https://attacker.example/v1"}],
+    )
+    trusted_home = tmp_path / "trusted-home"
+    trusted_path = trusted_home / ".config" / "cambium" / "providers.json"
+    secret = "target-repository-secret"
+    store = AuthStore(trusted_home / ".local" / "share" / "cambium" / "auth.json")
+    store.set_provider("attacker", secret)
+    monkeypatch.setattr(oneshot, "effective_home", lambda: trusted_home)
+    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    launched = False
+
+    async def unexpected_run_plan(*args, **kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("an untrusted target provider config must not launch")
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
+    with pytest.raises(ValueError, match="provider selection failed.*not found") as raised:
+        asyncio.run(oneshot.run_oneshot(oneshot.OneShotConfig(prompt="attack", repo=repo)))
+
+    assert launched is False
+    assert str(trusted_path.resolve()) in str(raised.value)
+    assert str(malicious_path.resolve()) not in str(raised.value)
+    assert secret not in str(raised.value)
+
+
 def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo = _repo(tmp_path / "repo")
-    config_path = _write_provider_config(
-        repo,
+    trusted_home = tmp_path / "home"
+    config_path = _write_provider_file(
+        trusted_home / ".config" / "cambium" / "providers.json",
         [
             _provider_entry("disabled", priority=0, enabled=False),
             _provider_entry("selected", tier="balanced", model="selected-model", priority=1),
@@ -275,8 +308,9 @@ def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
     )
     env_name = derived_env_name("selected")
     secret = "implicit-selection-secret"
-    store = AuthStore(tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json")
+    store = AuthStore(trusted_home / ".local" / "share" / "cambium" / "auth.json")
     store.set_provider("selected", secret)
+    monkeypatch.setattr(oneshot, "effective_home", lambda: trusted_home)
     monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(env_name, raising=False)
@@ -325,8 +359,13 @@ def test_implicit_provider_selection_fails_before_launch_without_credential(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo = _repo(tmp_path / "repo")
-    _write_provider_config(repo, [_provider_entry("selected")])
-    store = AuthStore(tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json")
+    trusted_home = tmp_path / "home"
+    _write_provider_file(
+        trusted_home / ".config" / "cambium" / "providers.json",
+        [_provider_entry("selected")],
+    )
+    store = AuthStore(trusted_home / ".local" / "share" / "cambium" / "auth.json")
+    monkeypatch.setattr(oneshot, "effective_home", lambda: trusted_home)
     monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(derived_env_name("selected"), raising=False)
@@ -393,23 +432,8 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     repo = _repo(tmp_path / "repo")
     provider = "demo"
     env_name = derived_env_name(provider)
-    config_path = repo / ".cambium" / "providers.json"
-    config_path.parent.mkdir(parents=True)
-    config_path.write_text(
-        json.dumps(
-            {
-                "providers": [
-                    {
-                        "name": provider,
-                        "tier": "fast",
-                        "base_url": "http://127.0.0.1:8080/v1",
-                        "api_key_env": env_name,
-                        "model": "demo-model",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
+    config_path = _write_provider_file(
+        tmp_path / "trusted" / "providers.json", [_provider_entry(provider)]
     )
     secret = "stored-secret-never-in-plan"
     auth_path = tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json"
@@ -426,7 +450,12 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
     asyncio.run(
         oneshot.run_oneshot(
-            oneshot.OneShotConfig(prompt="use provider", repo=repo, provider=provider)
+            oneshot.OneShotConfig(
+                prompt="use provider",
+                repo=repo,
+                provider=provider,
+                provider_config_path=config_path,
+            )
         )
     )
 
@@ -443,6 +472,48 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     assert captured["kwargs"]["provider_environment"] == {env_name: secret}
     assert secret not in repr(captured["plan"])
     assert env_name not in os.environ
+
+
+def test_environment_only_provider_key_is_handed_without_plan_or_artifact_leak(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    env_name = derived_env_name("environment-only")
+    secret = "environment-only-secret"
+    monkeypatch.setenv(env_name, secret)
+    environment_before = dict(os.environ)
+
+    def unexpected_auth_store():
+        raise AssertionError("an environment-only credential must not require AuthStore")
+
+    monkeypatch.setattr(oneshot, "AuthStore", unexpected_auth_store)
+    captured: dict[str, object] = {}
+
+    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
+        captured.update(session_dir=Path(session_dir), plan=plan, kwargs=kwargs)
+        oneshot.supervisor._write_plan(Path(session_dir), plan)
+        return _plan_result()
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
+    result = asyncio.run(
+        oneshot.run_oneshot(
+            oneshot.OneShotConfig(
+                prompt="use environment",
+                repo=repo,
+                provider_env_keys=(env_name,),
+                fanout_config={"tier": "fast", "model": "environment-model"},
+            )
+        )
+    )
+
+    assert result.exit_code == 0
+    assert captured["kwargs"]["provider_environment"] == {env_name: secret}
+    plan_text = json.dumps(captured["plan"])
+    artifact_text = Path(captured["session_dir"] / "plan.json").read_text(encoding="utf-8")
+    assert secret not in plan_text
+    assert secret not in repr(captured["plan"])
+    assert secret not in artifact_text
+    assert dict(os.environ) == environment_before
 
 
 def test_plan_file_is_private_and_contains_no_credential(tmp_path: Path) -> None:
