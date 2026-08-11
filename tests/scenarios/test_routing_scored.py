@@ -75,11 +75,15 @@ def _config_file(
 
 
 def _spec(
-    task_id: str, config_path: Path, *, requirements: dict[str, Any] | None = None
+    task_id: str,
+    config_path: Path,
+    *,
+    requirements: dict[str, Any] | None = None,
+    tier: str = "fast",
 ) -> dict[str, Any]:
     spec = {
         "task_id": task_id,
-        "fanout_config": {"tier": "fast"},
+        "fanout_config": {"tier": tier},
         "model_candidates": ["m1", "m2"],
         "provider_config_path": str(config_path),
     }
@@ -139,8 +143,11 @@ def test_score_providers_strict_filter_applies_in_batch_preassignment(
             ("strong", "m1", "strong", 60),
         ],
     )
+    # quality=high requires the STRONG tier; the pinned fanout tier must
+    # match, or the assignment would be filtered out by the worker's tier
+    # routing (the (provider, model, tier) assignment is atomic).
     specs = [
-        _spec(f"t-{i}", config_path, requirements={"quality": "high"})
+        _spec(f"t-{i}", config_path, requirements={"quality": "high"}, tier="strong")
         for i in range(2)
     ]
     lanes: dict[str, LaneState] = {}
@@ -151,7 +158,8 @@ def test_score_providers_strict_filter_applies_in_batch_preassignment(
     # both tasks bind to the strong provider even though weak is idle
     assert [spec["assigned_provider"] for spec in specs] == ["strong", "strong"]
     assert lanes["strong"].in_flight == 2
-    assert lanes["weak"].in_flight == 0  # weak never admitted
+    # weak was never even considered (tier filter), so no lane exists for it
+    assert "weak" not in lanes or lanes["weak"].in_flight == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -452,3 +460,53 @@ def test_task_assigned_event_carries_requirements(tmp_path, monkeypatch) -> None
         assert server.calls[0]["model"] == "m1"
     finally:
         server.close()
+
+
+# --------------------------------------------------------------------------- #
+# 6. assignment writes the provider's tier; a pinned tier constrains candidates
+# --------------------------------------------------------------------------- #
+
+
+def test_assignment_writes_tier_and_pinned_tier_constrains(tmp_path, monkeypatch) -> None:
+    """The (provider, model, tier) assignment is atomic: the worker routes
+    calls by tier, so the resolved fanout tier must match the assigned
+    provider's tier, and a caller-pinned tier must act as a hard filter."""
+    config_path = _config_file(
+        tmp_path / "providers.json",
+        [
+            ("weak", "m1", "fast", 60),
+            ("strong", "m2", "strong", 60),
+        ],
+    )
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
+    debt: dict[str, ProviderDebt] = {}
+    lanes = {"weak": LaneState(), "strong": LaneState()}
+
+    # no pinned tier: the assignment writes the chosen provider's own tier
+    spec = {
+        "task_id": "t1",
+        "fanout_config": {},
+        "model_candidates": ["m1", "m2"],
+        "provider_config_path": str(config_path),
+    }
+    from cambium.supervisor import _resolve_model_candidates
+
+    assert _resolve_model_candidates(spec, debt, lanes)
+    assert spec["assigned_provider"] in ("weak", "strong")
+    assert spec["fanout_config"]["tier"] == (
+        "fast" if spec["assigned_provider"] == "weak" else "strong"
+    )
+    assert spec["fanout_config"]["model"] in ("m1", "m2")
+
+    # pinned tier "fast": only the fast provider may serve, even though
+    # "strong" is idle and would otherwise win on utilization.
+    pinned = {
+        "task_id": "t2",
+        "fanout_config": {"tier": "fast"},
+        "model_candidates": ["m1", "m2"],
+        "provider_config_path": str(config_path),
+    }
+    debt = {"strong": ProviderDebt(tokens=0)}
+    assert _resolve_model_candidates(pinned, debt, {"weak": LaneState(), "strong": LaneState()})
+    assert pinned["assigned_provider"] == "weak"
+    assert pinned["fanout_config"]["tier"] == "fast"

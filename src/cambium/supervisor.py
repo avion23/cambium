@@ -2564,6 +2564,20 @@ def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None
         lanes[provider.name] = LaneState(rpm_allowance=float(rpm or 60))
 
 
+def _assigned_tier(
+    providers: Sequence[Any], provider_name: str, pinned_tier: str | None
+) -> str:
+    """The call tier for an assigned provider: the provider's own tier (or the
+    caller-pinned tier when the provider matched it). The worker routes calls
+    by tier, so the assignment and the call tier must agree."""
+    if isinstance(pinned_tier, str) and pinned_tier:
+        return pinned_tier
+    for provider in providers:
+        if provider.name == provider_name:
+            return provider.tier.value
+    raise ValueError(f"assigned provider {provider_name!r} not found among candidates")
+
+
 def _resolve_model_candidates(
     spec: dict[str, Any], debt: Mapping[str, Any], lanes: dict[str, LaneState]
 ) -> bool:
@@ -2592,6 +2606,11 @@ def _resolve_model_candidates(
     ):
         return False
     providers = load_providers(_provider_config_path(os.environ, spec))
+    # A caller-pinned tier is a hard constraint: only providers in that tier
+    # may serve the task, so the assignment can never contradict it.
+    pinned_tier = fanout_config.get("tier")
+    if isinstance(pinned_tier, str) and pinned_tier:
+        providers = [p for p in providers if p.tier.value == pinned_tier]
     _ensure_lanes(lanes, providers)
     requirements = spec.get("requirements")
     if requirements:
@@ -2603,7 +2622,14 @@ def _resolve_model_candidates(
         )[0]
     else:
         provider_name, model = select_lane(providers, candidates, debt, lanes)
-    spec["fanout_config"] = {**fanout_config, "model": model}
+    # The (provider, model, tier) assignment is one atomic unit: the worker
+    # routes calls by tier, so the assigned provider's tier must be the call
+    # tier or the assignment is filtered out before any request is sent.
+    spec["fanout_config"] = {
+        **fanout_config,
+        "model": model,
+        "tier": _assigned_tier(providers, provider_name, pinned_tier),
+    }
     spec["assigned_provider"] = provider_name
     return True
 
