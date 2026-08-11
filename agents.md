@@ -75,6 +75,10 @@ at admission from the usage-debt ledger (`DebtStore`,
 `~/.config/cambium/routing-state.json`) and presets the worker's Diffundo
 primary to the assigned provider.
 
+Provider lanes (H1): one concurrency lane per provider
+(`routing.LaneState`); `run_plan` pre-assigns each wave's un-pinned tasks in
+one batch pass, and 429 pressure decays a lane's in-flight cap.
+
 `scripts/usage_evidence.py` aggregates durable per-call usage events
 across session stores (positional session dirs and/or `--repo <path>`,
 which globs `.cambium/sessions/*`) into per-provider routing evidence:

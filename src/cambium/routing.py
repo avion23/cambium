@@ -19,6 +19,16 @@ The window allowance defaults to :data:`DEFAULT_TOKEN_WINDOW_ALLOWANCE`
 (20M tokens, a placeholder until real quota contracts are measured,
 implementation-plan step 3); a provider config may override it per provider
 with the optional ``token_window_allowance`` field.
+
+Provider lanes (H1) add concurrency-aware admission on top of the ledger:
+each provider owns one :class:`LaneState` (in-flight tasks plus an
+``rpm``-derived concurrency allowance) and :func:`select_lane` picks the
+provider with the lowest normalized utilization among lanes with spare
+capacity, so a wave of concurrent admissions spreads across providers instead
+of all picking the same max-min winner. 429 pressure shrinks a lane's
+effective in-flight cap (placeholder adaptive rule, see
+``LaneState.effective_in_flight_cap``), which is the admission-side
+backpressure that prevents retry storms.
 """
 
 from __future__ import annotations
@@ -55,6 +65,11 @@ class ProviderDebt:
     failed_requests: int = 0
     cost: float = 0.0
     retry_after_count: int = 0
+    # Provider-reported cache hits and call latency, folded for later routing
+    # evidence (H2 uses them; H1 only records them).
+    cache_hit_count: int = 0
+    latency_total_s: float = 0.0
+    latency_count: int = 0
     last_seen: float | None = None
 
     def record(self, event: Mapping[str, Any]) -> None:
@@ -85,6 +100,16 @@ class ProviderDebt:
             isinstance(failure_reason, str) and "429" in failure_reason
         ):
             self.retry_after_count += 1
+        if event.get("provider_cache_hit") is True:
+            self.cache_hit_count += 1
+        latency = event.get("latency_s")
+        if (
+            isinstance(latency, (int, float))
+            and not isinstance(latency, bool)
+            and latency >= 0
+        ):
+            self.latency_total_s += float(latency)
+            self.latency_count += 1
         self.last_seen = time.time()
 
 
@@ -96,6 +121,8 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
         ("requests", int),
         ("failed_requests", int),
         ("retry_after_count", int),
+        ("cache_hit_count", int),
+        ("latency_count", int),
     ):
         value = entry.get(field)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
@@ -103,6 +130,13 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
     cost = entry.get("cost")
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
         debt.cost = float(cost)
+    latency_total_s = entry.get("latency_total_s")
+    if (
+        isinstance(latency_total_s, (int, float))
+        and not isinstance(latency_total_s, bool)
+        and latency_total_s >= 0
+    ):
+        debt.latency_total_s = float(latency_total_s)
     last_seen = entry.get("last_seen")
     if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
         debt.last_seen = float(last_seen)
@@ -182,6 +216,9 @@ class DebtStore:
                     "failed_requests": debt.failed_requests,
                     "cost": debt.cost,
                     "retry_after_count": debt.retry_after_count,
+                    "cache_hit_count": debt.cache_hit_count,
+                    "latency_total_s": debt.latency_total_s,
+                    "latency_count": debt.latency_count,
                     "last_seen": debt.last_seen,
                 }
                 for name, debt in sorted(self._debts.items())
@@ -263,10 +300,90 @@ def select_primary(
     return winner.name, winner.model
 
 
+@dataclass
+class LaneState:
+    """One concurrency lane per provider subscription (H1).
+
+    ``in_flight`` counts tasks admitted onto the lane (batch pre-assignment or
+    admission-time assignment); ``rpm_allowance`` is the provider's configured
+    requests-per-minute, the concurrency budget the lane may keep in flight.
+    """
+
+    in_flight: int = 0
+    rpm_allowance: float = 60.0
+
+    def effective_in_flight_cap(self, retry_after_count: int) -> int:
+        """In-flight cap under 429 pressure: ``max(1, floor(rpm * decay))``.
+
+        Placeholder adaptive rule: each 429-style usage event shrinks the
+        budget by ``1/50`` of the allowance, floor 50%, until live 429 events
+        stop and the debt stops accumulating. The cap never drops below 1 so
+        a pressured provider keeps serving at least one task instead of being
+        fully starved (the 429 is the provider's own backpressure signal).
+        """
+        decay = max(0.5, 1.0 - retry_after_count / 50.0)
+        return max(1, int(self.rpm_allowance * decay))
+
+
+def select_lane(
+    providers: Sequence[Any],
+    candidates: Sequence[str],
+    debt: Mapping[str, ProviderDebt] | None,
+    lanes: Mapping[str, LaneState],
+) -> tuple[str, str]:
+    """Max-min admission pick over per-provider lanes (H1).
+
+    Like :func:`select_primary`, but a provider whose lane is at or above its
+    effective in-flight cap (``rpm_allowance`` decayed by that provider's
+    ``retry_after_count`` in ``debt``) is skipped entirely, so concurrent
+    admissions in one wave spread across providers and a 429-pressured
+    provider admits fewer tasks instead of colliding and retrying. Remaining
+    providers rank by (normalized utilization, lane in_flight, requests,
+    config index): max-min utilization semantics with idle lanes winning
+    ties. Raises ``ValueError`` when no enabled provider with a spare lane
+    serves a candidate model.
+    """
+    candidates = tuple(candidates)
+    if not candidates:
+        raise ValueError("model_candidates must be a non-empty list of model ids")
+    serving: list[tuple[int, Any]] = []
+    for index, provider in enumerate(providers):
+        if not getattr(provider, "enabled", True):
+            continue
+        model = getattr(provider, "model", "")
+        if not (isinstance(model, str) and model in candidates):
+            continue
+        lane = lanes.get(provider.name)
+        if lane is not None:
+            current = debt.get(provider.name) if debt is not None else None
+            retry_after_count = current.retry_after_count if current is not None else 0
+            if lane.in_flight >= lane.effective_in_flight_cap(retry_after_count):
+                continue
+        serving.append((index, provider))
+    if not serving:
+        raise ValueError(
+            f"model_candidates {list(candidates)!r} match no enabled configured "
+            "provider with a spare lane"
+        )
+
+    def rank(item: tuple[int, Any]) -> tuple[float, int, int, int]:
+        index, provider = item
+        lane = lanes.get(provider.name)
+        current = debt.get(provider.name) if debt is not None else None
+        requests = current.requests if current is not None else 0
+        in_flight = lane.in_flight if lane is not None else 0
+        return (_normalized_utilization(provider, debt), in_flight, requests, index)
+
+    _, winner = min(serving, key=rank)
+    return winner.name, winner.model
+
+
 __all__ = [
     "DEFAULT_ROUTING_STATE_PATH",
     "DEFAULT_TOKEN_WINDOW_ALLOWANCE",
     "DebtStore",
+    "LaneState",
     "ProviderDebt",
+    "select_lane",
     "select_primary",
 ]

@@ -62,8 +62,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +82,7 @@ from .redact import (
     build_session_redactor,
 )
 from .results import EXIT_CODES, Result, write_result
-from .routing import DebtStore, select_primary
+from .routing import DebtStore, LaneState, ProviderDebt, select_lane
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
     _ENVELOPE_KEYS,
@@ -778,6 +778,10 @@ class _Runtime:
         self._pending_children: dict[str, list[dict[str, Any]]] = {}
         self._child_envelopes: dict[str, list[dict[str, Any]]] = {}
         self._task_group: asyncio.TaskGroup | None = None
+        # Per-provider concurrency lanes (H1): in-flight admission counts and
+        # rpm-derived caps; incremented at admission, released in
+        # ``supervise_task``'s finally on every exit path.
+        self._lanes: dict[str, LaneState] = {}
 
     @property
     def last_envelope(self) -> dict[str, Any] | None:
@@ -1342,16 +1346,26 @@ class _Runtime:
         """Admission-time (provider, model) selection for un-pinned tasks.
 
         Mutates ``spec`` when it declares ``model_candidates`` and its
-        fanout_config has no pinned model (solution C). The ledger snapshot
-        already reflects every usage event folded in this session, so later
-        admissions in the same session see updated debt.
+        fanout_config has no pinned model (solution C), and books the chosen
+        provider's lane +1 in_flight (H1). Tasks pre-assigned by
+        ``_preassign_lanes`` already carry ``fanout_config.model`` and
+        ``assigned_provider``, so this is a no-op for them — their lane slot
+        was reserved in the batch pass. Tasks that arrive without
+        pre-assignment (dynamic children proposed mid-session) resolve against
+        the live ledger and current lanes and book their slot here.
         """
         if self._debt_store is None:
             return
-        _resolve_model_candidates(spec, self._debt_store.as_mapping())
+        if _resolve_model_candidates(
+            spec, self._debt_store.as_mapping(), self._lanes
+        ):
+            self._lanes[spec["assigned_provider"]].in_flight += 1
 
     async def supervise_task(self, spec: dict[str, Any]) -> None:
         if spec["task_id"] in self._results:
+            # Reconcile may have marked the task finished before its lane was
+            # reserved; release the reservation if one was made.
+            _release_lane(self._lanes, spec)
             return
         try:
             await self._supervise(spec)
@@ -1366,6 +1380,10 @@ class _Runtime:
                 reason=f"supervisor error: {exc.__class__.__name__}",
             )
         finally:
+            # Lane release (H1): every task that holds a lane reservation
+            # (batch pre-assignment or admission-time assignment) frees it on
+            # every exit path — success, failure, exception, cancellation.
+            _release_lane(self._lanes, spec)
             if spec["task_id"] in self._results:
                 await self._prune_worktree(spec)
             # Proposals buffered but never processed (the parent ended without
@@ -2515,18 +2533,34 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     return spec
 
 
-def _resolve_model_candidates(
-    spec: dict[str, Any], debt: Mapping[str, Any]
-) -> None:
-    """Resolve a task's (provider, model) at admission when it declares
-    ``model_candidates`` and its fanout_config carries no pinned model.
+def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None:
+    """Create a LaneState for every configured provider not yet tracked.
 
-    The max-min pick comes from the usage-debt ledger (``routing.select_primary``)
+    ``rpm_allowance`` comes from the provider's optional ``rpm`` field
+    (default 60.0); first config wins when multiple specs configure the same
+    provider name.
+    """
+    for provider in providers:
+        if provider.name in lanes:
+            continue
+        rpm = getattr(provider, "rpm", 60)
+        lanes[provider.name] = LaneState(rpm_allowance=float(rpm or 60))
+
+
+def _resolve_model_candidates(
+    spec: dict[str, Any], debt: Mapping[str, Any], lanes: dict[str, LaneState]
+) -> bool:
+    """Resolve a task's (provider, model) when it declares ``model_candidates``
+    and its fanout_config carries no pinned model.
+
+    The max-min pick comes from the usage-debt ledger (``routing.select_lane``)
     against the same provider config the worker will load, before the model
-    filter partitions the pool (solution C). Mutates ``spec`` in place: writes
-    the chosen model into ``fanout_config`` and records the chosen provider as
-    ``assigned_provider``. Pinned tasks (``fanout_config.model`` set) and tasks
-    without a fanout_config are left untouched.
+    filter partitions the pool (solution C), and skips providers whose lane is
+    at or above its effective in-flight cap (H1). Mutates ``spec`` in place:
+    writes the chosen model into ``fanout_config`` and records the chosen
+    provider as ``assigned_provider``. Returns True when an assignment was
+    written; pinned tasks (``fanout_config.model`` set) and tasks without a
+    fanout_config are left untouched and return False.
     """
     fanout_config = spec.get("fanout_config")
     candidates = spec.get("model_candidates")
@@ -2536,11 +2570,58 @@ def _resolve_model_candidates(
         or not isinstance(candidates, list)
         or not candidates
     ):
-        return
+        return False
     providers = load_providers(_provider_config_path(os.environ, spec))
-    provider_name, model = select_primary(providers, candidates, debt)
+    _ensure_lanes(lanes, providers)
+    provider_name, model = select_lane(providers, candidates, debt, lanes)
     spec["fanout_config"] = {**fanout_config, "model": model}
     spec["assigned_provider"] = provider_name
+    return True
+
+
+def _preassign_lanes(
+    specs: Sequence[dict[str, Any]],
+    debt: Mapping[str, ProviderDebt] | None,
+    lanes: dict[str, LaneState],
+) -> None:
+    """Batch-aware (provider, model) pre-assignment for a plan wave (H1).
+
+    Resolves every un-pinned ``model_candidates`` task in ONE pass, in plan
+    order, against a batch debt view seeded from the ledger snapshot plus the
+    lanes, so concurrent admissions in the same wave spread across providers
+    instead of all picking the same max-min winner (the known C limitation).
+    Each pre-assigned task folds +1 request (0 tokens) into the batch view and
+    reserves +1 in_flight on its chosen lane; ``supervise_task`` releases the
+    reservation when the task completes. Tasks left untouched here (pinned,
+    no fanout_config, or already finished before the pass) resolve at
+    admission against the live ledger instead.
+    """
+    batch_debt = {name: replace(entry) for name, entry in (debt or {}).items()}
+    for spec in specs:
+        if not _resolve_model_candidates(spec, batch_debt, lanes):
+            continue
+        provider_name = spec["assigned_provider"]
+        lanes[provider_name].in_flight += 1
+        entry = batch_debt.get(provider_name)
+        if entry is None:
+            entry = batch_debt[provider_name] = ProviderDebt()
+        entry.requests += 1
+
+
+def _release_lane(lanes: dict[str, LaneState], spec: Mapping[str, Any]) -> None:
+    """Release a task's lane reservation (H1).
+
+    Every supervised task that holds one (batch pre-assignment or
+    admission-time assignment) frees it exactly once on every exit path —
+    success, failure, exception, and cancellation. Tasks without an
+    ``assigned_provider`` never held a reservation.
+    """
+    assigned = spec.get("assigned_provider")
+    if not isinstance(assigned, str):
+        return
+    lane = lanes.get(assigned)
+    if lane is not None and lane.in_flight > 0:
+        lane.in_flight -= 1
 
 
 def _child_spec(
@@ -2959,6 +3040,16 @@ async def run_plan(
             if tree is not None:
                 await _dispatch_static_waves(runtime, tree, width_limit)
             else:
+                # Batch-aware lane pre-assignment (H1): resolve every
+                # un-pinned ``model_candidates`` task in one pass against the
+                # persisted debt snapshot plus the lanes, so concurrent
+                # admissions in this wave spread across providers. Tree-path
+                # waves resolve at admission against the live ledger instead.
+                _preassign_lanes(
+                    [spec for spec in specs if spec["task_id"] not in runtime._results],
+                    debt_store.as_mapping(),
+                    runtime._lanes,
+                )
                 async with asyncio.TaskGroup() as tg:
                     # Dynamic child admission spawns into the active group;
                     # the flat fan-out path owns this group for the session.

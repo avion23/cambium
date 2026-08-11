@@ -41,6 +41,10 @@ is not a branch ledger or merge log.
   `model_candidates`; the supervisor balances (model, provider) from a durable
   usage-debt ledger (`~/.config/cambium/routing-state.json`) before the model
   filter partitions the pool, and binds each task to the assigned provider.
+- Provider lanes (H1): one concurrency lane per provider; `run_plan`
+  pre-assigns each wave's un-pinned tasks in one pass, and 429 pressure
+  decays a lane's in-flight cap (`routing.select_lane`). The existing `rpm`
+  provider field is the lane allowance.
 - Test 429 `Retry-After`, same-provider retry, `RATE_LIMITED` buckets, and
   provider fallback against the contract. Do not introduce weighted routing
   until the usage and quota evidence is stable; configured priority remains the
