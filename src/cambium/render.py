@@ -30,7 +30,6 @@ _SUPERVISOR_RESULT_FIELDS = frozenset(
         "task_id",
         "reason",
         "merge_sha",
-        "gate_exit_code",
         "restarts",
         "worker_exit_code",
         "worker_status",
