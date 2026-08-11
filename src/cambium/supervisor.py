@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -56,6 +57,14 @@ from .modules.base import _is_secret_shaped
 from .redact import Redactor, build_session_redactor
 from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
+from .tasktree import (
+    _ENVELOPE_KEYS,
+    MAX_WIDTH,
+    TaskTree,
+    build_tree,
+    ready_tasks,
+    topological_order,
+)
 
 PROTO = 1
 WORKER_STDIN_LIMIT = MAX_LINE_BYTES
@@ -625,6 +634,7 @@ class _Runtime:
         self._event_append_lock = asyncio.Lock()
         self._handles: dict[str, WorkerHandle] = {}
         self._results: dict[str, TaskResult] = {}
+        self._task_envelopes: dict[str, dict[str, Any]] = {}
         self._worktree_lock = asyncio.Lock()
         self._merge_lock = asyncio.Lock()
         self._rid = 0
@@ -1051,6 +1061,9 @@ class _Runtime:
                 marker=spec.get("marker"),
                 write_marker=bool(spec.get("write_marker", True)),
             )
+        parent_envelope = spec.get("parent_envelope")
+        if parent_envelope is not None:
+            payload["parent_envelope"] = parent_envelope
         return payload
 
     # -- per-task supervision ------------------------------------------------
@@ -1156,6 +1169,7 @@ class _Runtime:
             )
             if outcome.envelope is not None and outcome.correlated:
                 self._last_envelope = self._redact_envelope(outcome.envelope)
+                self._task_envelopes[task_id] = self._last_envelope
             if outcome.clean:
                 envelope_status = (
                     outcome.envelope.get("status")
@@ -2156,6 +2170,194 @@ def _build_session_result(
     )
 
 
+# =====================================================================
+# Static ready-node waves (implementation-plan §1).
+#
+# When a plan supplies dependency specs (``depends_on``), the harness owns one
+# explicit validated ``TaskTree`` and dispatches static ready-node waves: only
+# nodes whose dependencies finished are admitted per wave, the wave's
+# concurrency is bounded by the width limit, and a failed node cascades so its
+# descendants are never spawned. A flat plan (no ``depends_on``) keeps the
+# unbounded one-TaskGroup fan-out path. See ``docs/architecture/architecture.md``
+# §3 (production hierarchy and admission).
+# =====================================================================
+
+
+def _has_dependencies(spec: dict[str, Any]) -> bool:
+    deps = spec.get("depends_on")
+    return isinstance(deps, list) and len(deps) > 0
+
+
+def _resolve_width(
+    max_width: int | None, plan: dict[str, Any] | list[dict[str, Any]]
+) -> int:
+    """Resolve the per-wave dispatch width: parameter, then plan field, then default."""
+    if isinstance(max_width, int) and not isinstance(max_width, bool) and max_width > 0:
+        return max_width
+    if isinstance(plan, dict):
+        field = plan.get("max_width")
+        if (
+            isinstance(field, int)
+            and not isinstance(field, bool)
+            and field > 0
+        ):
+            return field
+    return MAX_WIDTH
+
+
+def _resolve_hierarchy(
+    specs: list[dict[str, Any]],
+    plan: dict[str, Any] | list[dict[str, Any]],
+    max_width: int | None,
+) -> tuple[TaskTree | None, int | None]:
+    """Return ``(tree, width_limit)`` for the plan, or ``(None, None)`` for flat.
+
+    A plan where any task carries ``depends_on`` is built into one validated
+    rooted ``TaskTree`` (single root, no multi-parent, no cycle, depth/width
+    bounds) before the session is admitted, so a malformed hierarchy raises
+    ``TaskTreeError`` with no worker side effect. A flat plan returns the
+    unbounded fast path.
+    """
+    if not any(_has_dependencies(spec) for spec in specs):
+        return None, None
+    tree_payload = {
+        "tasks": [
+            {
+                "task_id": spec["task_id"],
+                "kind": spec.get("kind", "feature"),
+                "depends_on": list(spec.get("depends_on") or []),
+                "spec": spec,
+            }
+            for spec in specs
+        ]
+    }
+    tree = build_tree(tree_payload)
+    topological_order(tree)  # dispatch-time cycle re-check (architecture §18.1 DS-M6)
+    return tree, _resolve_width(max_width, plan)
+
+
+def _strict_parent_envelope(
+    envelope: dict[str, Any] | None, parent_task_id: str | None
+) -> dict[str, Any]:
+    """Project a retained worker envelope into the strict upward key set.
+
+    The strict key set is ``tasktree._ENVELOPE_KEYS`` (architecture §3.7 I2.7,
+    mirrored by ``tasktree.upward_result``). The worker envelope carries
+    ``diff`` where the strict set carries ``unified_diff``; missing fields
+    default to empty containers or ``None`` so a child can never receive a key
+    outside the set or an unbounded transcript.
+    """
+    src = envelope or {}
+    values = {
+        "parent_task_id": parent_task_id,
+        "unified_diff": src.get("unified_diff", src.get("diff", "")),
+        "diff_truncated": src.get("diff_truncated", False),
+        "summary": src.get("summary", ""),
+        "metric_score": src.get("metric_score", None),
+        "metric_breakdown": src.get("metric_breakdown", {}),
+        "commits": list(src.get("commits", ())),
+        "files_changed": list(src.get("files_changed", ())),
+        "status": src.get("status", ""),
+    }
+    return {key: copy.deepcopy(values[key]) for key in _ENVELOPE_KEYS}
+
+
+async def _run_wave_bounded(
+    runtime: _Runtime, specs: list[dict[str, Any]], width_limit: int
+) -> None:
+    """Dispatch one wave's specs under a wave-local width bound.
+
+    The bound is per-wave, not a global semaphore held across the whole plan:
+    queued ready nodes wait on a wave-local ``asyncio.Semaphore`` until a slot
+    frees, and the semaphore is released when the wave completes.
+    """
+    if width_limit is None or width_limit >= len(specs):
+        async with asyncio.TaskGroup() as tg:
+            for spec in specs:
+                tg.create_task(runtime.supervise_task(spec))
+        return
+    semaphore = asyncio.Semaphore(width_limit)
+
+    async def bounded(spec: dict[str, Any]) -> None:
+        async with semaphore:
+            await runtime.supervise_task(spec)
+
+    async with asyncio.TaskGroup() as tg:
+        for spec in specs:
+            tg.create_task(bounded(spec))
+
+
+async def _dispatch_static_waves(
+    runtime: _Runtime, tree: TaskTree, width_limit: int | None
+) -> None:
+    """Dispatch a validated tree in static ready-node waves with width control.
+
+    Each iteration computes the ready set (``ready_tasks`` over the succeeded
+    set), attaches a fresh bounded ``parent_envelope`` (strict key set only)
+    to each ready node's snapshotted spec, runs the wave under the width bound,
+    then promotes finished nodes to ``succeeded`` or cascades failure to
+    descendants that must never be spawned. Specs are deep-copied by
+    ``build_tree``; the dispatcher hands ``supervise_task`` a shallow copy of
+    the snapshot so per-task base-commit resolution never aliases the tree or
+    a sibling.
+    """
+    children: dict[str, list[str]] = {node.task_id: [] for node in tree.nodes}
+    for parent, child in tree.edges:
+        children[parent].append(child)
+
+    succeeded = {
+        tid for tid, result in runtime._results.items() if result.status == "succeeded"
+    }
+    terminal = set(runtime._results.keys())
+
+    def cascade_skip(failed_tid: str) -> None:
+        """Mark every transitive descendant of ``failed_tid`` failed, unspawned."""
+        stack = list(children.get(failed_tid, []))
+        while stack:
+            descendant = stack.pop()
+            if descendant in terminal:
+                continue
+            terminal.add(descendant)
+            runtime._results[descendant] = TaskResult(
+                task_id=descendant,
+                status="failed",
+                exit_code=1,
+                reason=f"dependency_failed:{failed_tid}",
+            )
+            stack.extend(children.get(descendant, []))
+
+    for tid in list(terminal):
+        if tid not in succeeded:
+            cascade_skip(tid)
+
+    while len(terminal) < len(tree.nodes):
+        ready_nodes = [
+            node
+            for node in ready_tasks(tree, succeeded)
+            if node.task_id not in terminal
+        ]
+        if not ready_nodes:
+            break
+        wave_specs: list[dict[str, Any]] = []
+        for node in ready_nodes:
+            spec = dict(node.spec)
+            parent_id = node.parent_task_id
+            envelope = runtime._task_envelopes.get(parent_id) if parent_id else None
+            spec["parent_envelope"] = _strict_parent_envelope(envelope, parent_id)
+            wave_specs.append(spec)
+
+        await _run_wave_bounded(runtime, wave_specs, width_limit)
+
+        for node in ready_nodes:
+            tid = node.task_id
+            terminal.add(tid)
+            result = runtime._results.get(tid)
+            if result is not None and result.status == "succeeded":
+                succeeded.add(tid)
+            else:
+                cascade_skip(tid)
+
+
 async def run_plan(
     session_dir: str | Path,
     plan: dict[str, Any] | list[dict[str, Any]],
@@ -2163,6 +2365,7 @@ async def run_plan(
     *,
     resource_thresholds: dict[str, Any] | None = None,
     provider_environment: Mapping[str, str] | None = None,
+    max_width: int | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -2178,6 +2381,20 @@ async def run_plan(
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
     canonical root result is written atomically to
     ``<session_dir>/.cambium/result.json`` before this coroutine returns.
+
+    Dispatch shape:
+
+    - A flat task list (no task carries ``depends_on``) fans out under one
+      ``asyncio.TaskGroup`` with no concurrency cap — the historical canary
+      behavior. ``max_width`` is ignored on this path.
+    - A plan where any task carries ``depends_on`` is validated as one rooted
+      ``TaskTree`` (single root, no multi-parent, no cycle, depth/width bounds)
+      and dispatched in static ready-node waves: only nodes whose dependencies
+      have finished are admitted per wave, and each wave's concurrency is
+      bounded by ``max_width`` (explicit parameter, then the plan's
+      ``max_width`` field, then ``tasktree.MAX_WIDTH``). A node that fails
+      cascades: its descendants are never spawned and are recorded as failed
+      with reason ``dependency_failed:<parent>``.
     """
     session_dir = Path(session_dir)
     tasks = _plan_tasks(plan)
@@ -2185,6 +2402,8 @@ async def run_plan(
     specs = [_validate_plan_task(session_dir, t) for t in tasks]
     if not specs:
         raise ValueError("plan contains no tasks")
+
+    tree, width_limit = _resolve_hierarchy(specs, plan, max_width)
 
     admission = _SessionAdmission(session_dir)
     admission.acquire()
@@ -2205,9 +2424,12 @@ async def run_plan(
         cancelled = False
         try:
             await runtime.reconcile(specs)
-            async with asyncio.TaskGroup() as tg:
-                for spec in specs:
-                    tg.create_task(runtime.supervise_task(spec))
+            if tree is not None:
+                await _dispatch_static_waves(runtime, tree, width_limit)
+            else:
+                async with asyncio.TaskGroup() as tg:
+                    for spec in specs:
+                        tg.create_task(runtime.supervise_task(spec))
         except asyncio.CancelledError:
             cancelled = True
         except BaseExceptionGroup as exc_group:
