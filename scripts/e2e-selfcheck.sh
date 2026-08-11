@@ -145,11 +145,11 @@ print("\n".join(kinds))
 PY
 )"
 REQUIRED_CHAIN="task_assigned spawned init ready run_task result exit merge_started merge_committed worktree_pruned session_ended"
-printf '%s' "$EVENT_KINDS" | "$PY" - "$REQUIRED_CHAIN" <<'PY' || fail "event kind chain missing required kinds in order"
+"$PY" - "$EVENT_KINDS" "$REQUIRED_CHAIN" <<'PY' || fail "event kind chain missing required kinds in order"
 import sys
 
-chain = sys.stdin.read().split()
-required = sys.argv[1].split()
+chain = sys.argv[1].split()
+required = sys.argv[2].split()
 i = 0
 for kind in chain:
     if i < len(required) and kind == required[i]:
