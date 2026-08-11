@@ -283,6 +283,46 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     return float(os.environ.get(env, default))
 
 
+def _warm_pool_size() -> int:
+    """Session warm-pool bound from ``CAMBIUM_WARM_POOL_SIZE`` (0 disables)."""
+    value = os.environ.get("CAMBIUM_WARM_POOL_SIZE")
+    if value is None:
+        return DEFAULT_WARM_POOL_SIZE
+    try:
+        size = int(value)
+    except ValueError:
+        return DEFAULT_WARM_POOL_SIZE
+    return max(0, size)
+
+
+def _pool_env_key(env: dict[str, str]) -> frozenset[tuple[str, str]]:
+    """Env identity for pool matching, ignoring rebindable per-task values.
+
+    ``_worker_environment`` stamps values a rebind cannot change (the child's
+    env is fixed at spawn): a pooled worker may only serve a task whose
+    remaining env matches exactly. Three stamped values are excluded because
+    they are per-task/per-worktree by construction and rebinding re-sends the
+    full init:
+
+    - ``CAMBIUM_TASK_ID`` / ``CAMBIUM_GENERATION``: per-task identity, rebuilt
+      from the rebind init.
+    - ``HOME``: the supervisor injects ``<worktree>/.cambium/home`` so the
+      value differs for every worktree. A pooled worker's stale HOME is
+      benign (worker git ops use repo-local config and ``GIT_CONFIG_NOSYSTEM``
+      is set), so HOME must not block rebinding.
+
+    ``CAMBIUM_SESSION_ID``, ``CAMBIUM_PROVIDERS``, and the allowlisted
+    provider credentials remain in the key: a worker whose env cannot serve
+    the new task (different session, provider config, or credentials) is
+    never popped.
+    """
+    return frozenset(
+        (name, value)
+        for name, value in env.items()
+        if name not in ("CAMBIUM_TASK_ID", "CAMBIUM_GENERATION", "HOME")
+    )
+
+
 async def _write_json(
     proc: asyncio.subprocess.Process,
     msg: dict[str, Any],
@@ -410,6 +450,11 @@ DEFAULT_MAX_TURNS = 20
 DEFAULT_MAX_TOKENS = 200_000
 RESTART_BASE_DELAY_S = 1.0
 RESTART_MAX_DELAY_S = 30.0
+# Session-scoped warm worker pool (eval-3 ADOPT): idle workers that reported
+# reuse-ready are rebindable to later tasks in the same session, avoiding the
+# spawn-to-ready cold start (interpreter boot + heavy imports) per task.
+# 0 disables the pool entirely (single-init worker behavior, unchanged).
+DEFAULT_WARM_POOL_SIZE = 1
 EOF_GRACE_S = 5.0
 WORKER_EXIT_WAIT_S = 10.0
 TERM_GRACE_S = 5.0
@@ -723,6 +768,20 @@ class WorkerHandle:
     last_heartbeat: float | None = None
 
 
+@dataclass(slots=True)
+class _PooledWorker:
+    """One idle reuse-ready worker in the session warm pool (eval-3 ADOPT).
+
+    The pool is session-scoped on the ``_Runtime``; entries are matched by
+    the exact spawn command and the task env modulo the per-task overrides,
+    so a pooled process only serves tasks it can actually rebind to.
+    """
+
+    proc: asyncio.subprocess.Process
+    cmd: tuple[str, ...]
+    env_key: frozenset[tuple[str, str]]
+
+
 @dataclass(frozen=True, slots=True)
 class _GenOutcome:
     """Outcome of one generation's drive loop."""
@@ -735,6 +794,9 @@ class _GenOutcome:
     exit_reason: str | None = None
     envelope: dict[str, Any] | None = None
     correlated: bool = False
+    # Eval-3 ADOPT: true when the worker reported reuse-ready after its
+    # terminal envelope and the live process was returned to the session pool.
+    reuse_ready: bool = False
 
 
 class _Runtime:
@@ -789,6 +851,11 @@ class _Runtime:
         # rpm-derived caps; incremented at admission, released in
         # ``supervise_task``'s finally on every exit path.
         self._lanes: dict[str, LaneState] = {}
+        # Eval-3 ADOPT warm pool: idle reuse-ready worker processes. The pool
+        # is bounded by ``_warm_pool_size`` (0 disables) and never survives
+        # this runtime (shutdown kills every pooled process).
+        self._warm_pool_size = _warm_pool_size()
+        self._pool: list[_PooledWorker] = []
 
     @property
     def last_envelope(self) -> dict[str, Any] | None:
@@ -895,33 +962,37 @@ class _Runtime:
     async def shutdown(self, session_status: str = "ended") -> None:
         """Steps 2-8 of the custos shutdown sequence (design §4)."""
         alive = [
-            h for h in self._handles.values()
+            h.proc for h in self._handles.values()
             if h.proc is not None and h.proc.returncode is None
         ]
-        for h in alive:
+        # Eval-3 ADOPT pool hygiene: idle pooled workers are killed with the
+        # session; a pooled process that already died is dropped silently.
+        alive += [entry.proc for entry in self._pool if entry.proc.returncode is None]
+        self._pool.clear()
+        for proc in alive:
             try:
-                os.killpg(h.proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         if alive:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*(h.proc.wait() for h in alive), return_exceptions=True),
+                    asyncio.gather(*(proc.wait() for proc in alive), return_exceptions=True),
                     TERM_GRACE_S,
                 )
             except TimeoutError:
-                for h in alive:
-                    if h.proc.returncode is not None:
+                for proc in alive:
+                    if proc.returncode is not None:
                         continue
                     try:
-                        os.killpg(h.proc.pid, signal.SIGKILL)
+                        os.killpg(proc.pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError, OSError):
                         pass
                     try:
-                        h.proc.kill()
+                        proc.kill()
                     except ProcessLookupError:
                         pass
-                await asyncio.gather(*(h.proc.wait() for h in alive), return_exceptions=True)
+                await asyncio.gather(*(proc.wait() for proc in alive), return_exceptions=True)
         try:
             await self.emit(
                 "session_ended", task_id=None, session_status=session_status,
@@ -1517,6 +1588,10 @@ class _Runtime:
             await self.emit("task_assigned", **assigned_payload)
             restarts = 0
             worker_summary: str | None = None
+            # Eval-3 ADOPT: only the first generation may pop the warm pool.
+            # Restart generations always spawn a fresh process (a restarted
+            # worker must never reuse a pooled process).
+            first_generation = True
             while True:
                 handle = WorkerHandle(task_id=task_id, generation=generation)
                 self._handles[task_id] = handle
@@ -1526,7 +1601,9 @@ class _Runtime:
                     heartbeat_interval=heartbeat_interval,
                     heartbeat_timeout=heartbeat_timeout,
                     wall_budget=wall_budget,
+                    allow_pool=first_generation,
                 )
+                first_generation = False
                 sanitized_envelope: dict[str, Any] | None = None
                 if outcome.envelope is not None and outcome.correlated:
                     sanitized_envelope = self._redact_envelope(outcome.envelope)
@@ -1626,10 +1703,66 @@ class _Runtime:
                 semaphore.release()
 
 
+    # -- warm worker pool (eval-3 ADOPT) ------------------------------------
+
+    def _pool_pop(self, cmd: list[str], env: dict[str, str]) -> asyncio.subprocess.Process | None:
+        """Return a matching live pooled process, or ``None`` to spawn fresh.
+
+        Matching requires the exact spawn command and the task env modulo the
+        per-task overrides (``_pool_env_key``): a pooled worker's env is fixed
+        at spawn, so a rebind is only valid when the new task's env is
+        identical on every key the worker can observe. Entries whose process
+        died while idle are dropped silently. Synchronous (no awaits) so
+        concurrent supervise tasks never pop the same process.
+        """
+        if not self._pool:
+            return None
+        want_cmd = tuple(cmd)
+        want_env = _pool_env_key(env)
+        for index in range(len(self._pool) - 1, -1, -1):
+            entry = self._pool[index]
+            if entry.cmd != want_cmd or entry.env_key != want_env:
+                continue
+            if entry.proc.returncode is not None:
+                self._pool.pop(index)
+                continue
+            self._pool.pop(index)
+            return entry.proc
+        return None
+
+    async def _pool_return(
+        self, proc: asyncio.subprocess.Process, cmd: list[str], env: dict[str, str]
+    ) -> None:
+        """Return a live reuse-ready process to the warm pool, or kill it.
+
+        The process is pooled only when the pool is enabled, not full, and
+        the process is still alive; otherwise it is killed and reaped as a
+        fresh spawn would be. Dead idle entries are dropped silently.
+        """
+        if self._warm_pool_size <= 0 or proc.returncode is not None:
+            await self._kill_pooled(proc)
+            return
+        self._pool = [entry for entry in self._pool if entry.proc.returncode is None]
+        if len(self._pool) >= self._warm_pool_size:
+            await self._kill_pooled(proc)
+            return
+        self._pool.append(
+            _PooledWorker(proc=proc, cmd=tuple(cmd), env_key=_pool_env_key(env))
+        )
+
+    @staticmethod
+    async def _kill_pooled(proc: asyncio.subprocess.Process) -> None:
+        """Kill one pooled process and reap it (no zombies left behind)."""
+        await _kill_worker(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+
     async def _drive_generation(
         self, spec: dict[str, Any], handle: WorkerHandle, *,
         ready_timeout: float, heartbeat_interval: float, heartbeat_timeout: float,
-        wall_budget: float,
+        wall_budget: float, allow_pool: bool = True,
     ) -> _GenOutcome:
         task_id = spec["task_id"]
         worktree = Path(spec["worktree_path"])
@@ -1661,6 +1794,11 @@ class _Runtime:
             "permissions": {"shell": True, "network": False},
             "provider_env_keys": list(spec.get("provider_env_keys", ())),
         }
+        if self._warm_pool_size > 0:
+            # Eval-3 ADOPT opt-in: the worker stays alive after its task and
+            # accepts a rebind init instead of exiting. 0 disables the pool
+            # and keeps the single-init worker behavior unchanged.
+            init_msg["worker_reuse"] = True
         if spec.get("fanout_config"):
             init_msg["fanout_config"] = spec["fanout_config"]
             init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
@@ -1674,20 +1812,33 @@ class _Runtime:
                 clean=False, fatal=True, reason=OUTBOUND_MESSAGE_TOO_LONG,
             )
 
-        await self.emit("spawned", task_id=task_id, generation=generation, worker=" ".join(cmd))
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=WORKER_STDIN_LIMIT,
-                cwd=str(worktree),
-                env=env,
-                start_new_session=True,
-                pass_fds=(),
-                close_fds=True,
+        # Eval-3 ADOPT warm pool: the first generation of a task may pop a
+        # matching idle worker instead of spawning. Restart generations pass
+        # allow_pool=False and always spawn fresh: a restarted task must
+        # never reuse a pooled process (it may have run the same task).
+        pooled = self._pool_pop(cmd, env) if allow_pool else None
+        if pooled is not None:
+            await self.emit(
+                "worker_reused", task_id=task_id, generation=generation, pid=pooled.pid
             )
+        if pooled is None:
+            await self.emit("spawned", task_id=task_id, generation=generation, worker=" ".join(cmd))
+        try:
+            if pooled is not None:
+                proc = pooled
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=WORKER_STDIN_LIMIT,
+                    cwd=str(worktree),
+                    env=env,
+                    start_new_session=True,
+                    pass_fds=(),
+                    close_fds=True,
+                )
         except (FileNotFoundError, OSError, PermissionError) as exc:
             return _GenOutcome(clean=False, fatal=True, reason=f"spawn failed: {exc}")
         handle.proc = proc
@@ -1766,6 +1917,11 @@ class _Runtime:
         protocol_reason: str | None = None
         protocol_failure: str | None = None
         timeout_phase: str | None = "stdin" if not init_written else None
+        # Eval-3 ADOPT: set when the worker reported reuse-ready; the process
+        # is kept alive and returned to the session pool instead of being
+        # waited on and reaped as a terminal worker.
+        reuse_ready = False
+        keep_alive = False
 
         async def _cancel_and_kill() -> None:
             cancel_msg = {
@@ -2018,6 +2174,26 @@ class _Runtime:
                         # against the session tree (build_tree over the
                         # accumulated tasks list).
                         self._pending_children.setdefault(task_id, []).append(msg)
+                elif mtype == "reuse_ready":
+                    # Eval-3 ADOPT: the worker delivered its terminal result
+                    # and waits for a rebind init; keep the live process for
+                    # the session pool instead of letting it exit.
+                    if envelope is None or not correlated:
+                        protocol_reason = "reuse_ready_without_result"
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            error_type=protocol_reason,
+                            note="reuse_ready before a correlated terminal result",
+                        )
+                        await _kill_worker(proc)
+                        break
+                    reuse_ready = True
+                    keep_alive = True
+                    await self.emit(
+                        "reuse_ready", task_id=task_id, generation=generation,
+                        pid=msg.get("pid"),
+                    )
+                    break
                 elif mtype in ("exit", "exit_message"):
                     exit_reason = msg.get("reason")
                     handle.exit_reason = exit_reason
@@ -2108,17 +2284,18 @@ class _Runtime:
                 pass
             raise
         finally:
-            try:
-                await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
-            except BaseException:
-                try:
-                    await _kill_worker(proc)
-                except BaseException:
-                    pass
+            if not keep_alive:
                 try:
                     await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
                 except BaseException:
-                    pass
+                    try:
+                        await _kill_worker(proc)
+                    except BaseException:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
+                    except BaseException:
+                        pass
             for rt in (stdout_task, stderr_task):
                 if not rt.done():
                     rt.cancel()
@@ -2127,14 +2304,25 @@ class _Runtime:
             except BaseException:
                 pass
 
-        exit_code = proc.returncode
-        handle.exit_code = exit_code
-        handle.state = "EXITED"
         terminal_verdict = (
             envelope is not None
             and correlated
             and envelope.get("status") in ("succeeded", "failed", "cancelled")
         )
+        if reuse_ready and not message_too_long:
+            # The worker stays alive and owns no task state; the handle no
+            # longer owns the process (the pool does). The generation verdict
+            # is clean exactly when the terminal envelope is correlated.
+            await self._pool_return(proc, cmd, env)
+            handle.proc = None
+            return _GenOutcome(
+                clean=terminal_verdict, fatal=False, reason=None,
+                exit_code=None, exit_reason=None, envelope=envelope,
+                correlated=correlated, reuse_ready=True,
+            )
+        exit_code = proc.returncode
+        handle.exit_code = exit_code
+        handle.state = "EXITED"
         clean = (
             exit_reason is not None
             and terminal_verdict

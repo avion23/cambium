@@ -79,3 +79,22 @@ After steps 1–4 are reproducible, measure worker reuse, provider routing,
 context compression, and the example module's DSPy seam with fixed datasets,
 baselines, and failure criteria. Adopt, defer, or reject each experiment from
 its evidence; do not change the runtime contract silently.
+
+### Worker reuse (ADOPT, implemented)
+
+`docs/research/worker-coldstart.md` measured spawn-to-ready at ~130–158 ms
+for the marker worker and ~2.2 s with dspy imports; `scripts/measure_worker_coldstart.py`
+projects a 96–99.8 % per-task saving from a persistent-worker pool. ADOPT is
+implemented as a bounded session-scoped warm pool:
+
+- worker.py: an init may opt in with `worker_reuse: true`; after the task the
+  worker emits `reuse_ready` and waits for a full rebind init on stdin
+  instead of exiting (clears all per-task state, chdir to the new worktree,
+  rebuilds clients from the new init's config; exits cleanly on EOF).
+  Without the flag the single-init exit behavior is unchanged.
+- supervisor.py: `_Runtime` holds the pool (`CAMBIUM_WARM_POOL_SIZE`, default
+  1, 0 disables). The first generation of a task pops a matching idle worker
+  (same command, env modulo per-task overrides) and emits `worker_reused`;
+  a clean reuse-ready generation returns its live process to the pool, all
+  other exits kill as before. Restart generations always spawn fresh;
+  pooled workers are killed at session end (run_plan finally / shutdown).
