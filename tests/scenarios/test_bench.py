@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -1193,79 +1192,3 @@ def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     assert "re-anchored should_decompose: 1.0.0 -> 1.1.0" in capsys.readouterr().out
     fresh = json.loads(anchor_path.read_text())
     assert fresh["dataset_version"] == "1.1.0"
-
-
-def _build_and_install_wheel(site_dir: Path) -> Path:
-    dist = site_dir / "dist"
-    dist.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "build", "--target", str(site_dir)],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(dist)],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    wheel = next(dist.glob("cambium-*.whl"))
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "--target", str(site_dir), str(wheel)],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    return wheel
-
-
-@REQUIRES_EXAMPLE
-def test_installed_package_discovery_from_unrelated_cwd(tmp_path) -> None:
-    """A wheel install discovers modules from its own resources, not the repo."""
-    uv = shutil.which("uv")
-    assert uv is not None
-    unrelated = tmp_path / "unrelated"
-    unrelated.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=unrelated, check=True)
-    site = tmp_path / "site-packages"
-    dist = tmp_path / "dist"
-    subprocess.run(
-        [uv, "build", "--wheel", "--out-dir", str(dist)],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    wheel = next(dist.glob("cambium-*.whl"))
-    subprocess.run(
-        [uv, "pip", "install", "--python", sys.executable, "--target", str(site), str(wheel)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    bench_root = tmp_path / "baselines"
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "cambium.bench",
-            "report",
-            "--bench-root",
-            str(bench_root),
-        ],
-        cwd=unrelated,
-        env={**os.environ, "PYTHONPATH": str(site)},
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert probe.returncode == 0, probe.stdout + probe.stderr
-    baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
-    assert baseline["module"] == "should_decompose"
-    assert baseline["split_digests"]

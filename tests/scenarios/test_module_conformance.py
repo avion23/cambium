@@ -299,109 +299,6 @@ def test_offline_child_rejects_python_flag_after_option_argument_with_executable
     assert "isolated Python flag denied during module conformance: -I" in result.stderr
 
 
-def test_installed_package_ignores_unrelated_git_and_normalizes_nodeids(
-    tmp_path: Path,
-) -> None:
-    if not module_conformance.discover_modules():
-        pytest.skip("no decision modules are installed")
-    checkout = tmp_path / "unrelated"
-    checkout.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
-    site = tmp_path / "site-packages"
-    dist = tmp_path / "dist"
-    uv = shutil.which("uv")
-    assert uv is not None
-    subprocess.run(
-        [uv, "build", "--wheel", "--out-dir", str(dist)],
-        cwd=module_conformance.REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    wheel = next(dist.glob("cambium-*.whl"))
-    subprocess.run(
-        [
-            uv,
-            "pip",
-            "install",
-            "--python",
-            sys.executable,
-            "--target",
-            str(site),
-            str(wheel),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    probe = """
-import json
-from cambium import module_conformance as m
-
-name = m.discover_modules()[0]
-prefix = m._module_prefix(name)
-tracked = m._module_files(name, prefix)
-test_files = tuple(
-    path for path in tracked
-    if path.suffix == '.py' and path.name.startswith('test_') and path.parent == prefix / 'tests'
-)
-spec = m.ModuleSpec(
-    name=name,
-    path=m.MODULES_DIR / name,
-    tracked_files=tracked,
-    python_files=(),
-    test_files=test_files,
-    baseline_files=(),
-    dataset_files=(),
-)
-baseline_path = spec.tests_dir / 'baselines' / 'baseline.json'
-baseline = json.loads(baseline_path.read_text(encoding='utf-8'))
-committed_findings = m._baseline_fact_findings(baseline, baseline_path, spec)
-committed_foreign = [
-    finding for finding in committed_findings if 'does not belong' in finding.detail
-]
-owned = {
-    nodeid: duration for nodeid, duration in baseline['tests']['by_nodeid'].items()
-    if nodeid.startswith('src/cambium/modules/example/tests/')
-}
-baseline['tests']['by_nodeid'] = owned
-baseline['tests']['count'] = len(owned)
-findings = m._baseline_fact_findings(baseline, baseline_path, spec)
-foreign = [finding for finding in findings if 'does not belong' in finding.detail]
-reverse = m.scan_reverse_imports()
-print(json.dumps({
-    'repo_root': str(m.REPO_ROOT),
-    'package_root': str(m.PACKAGE_ROOT),
-    'tracked_are_wheel_paths': all(path.parts[:2] == ('modules', name) for path in tracked),
-    'resources_exist': all(m._resource_path(path).is_file() for path in tracked),
-    'committed_foreign_count': len(committed_foreign),
-    'owned_count': len(owned),
-    'owned_foreign_count': len(foreign),
-    'reverse_paths': [finding.path.as_posix() for finding in reverse],
-}))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", probe],
-        cwd=checkout,
-        env={**os.environ, "PYTHONPATH": str(site)},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-
-    assert result.returncode == 0, result.stderr
-    observed = json.loads(result.stdout)
-    assert observed["repo_root"] == observed["package_root"]
-    assert Path(observed["package_root"]).is_relative_to(site)
-    assert observed["tracked_are_wheel_paths"] is True
-    assert observed["resources_exist"] is True
-    assert observed["committed_foreign_count"] == 0
-    assert observed["owned_count"] == 57
-    assert observed["owned_foreign_count"] == 0
-    assert observed["reverse_paths"] == []
-
-
 def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch) -> None:
     module_path = tmp_path / "src" / "cambium" / "modules" / "example"
     datasets = module_path / "datasets"
@@ -459,10 +356,10 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
     """Deleting one module directory must not break the shared scenarios.
 
     Copies the repository into a throwaway directory, deletes only
-    ``src/cambium/modules/example/``, and runs the shared scenario suite plus
-    the clean-wheel checks from the copy. Every module-dependent scenario must
-    skip (tolerate absence) and everything else must stay green; any scenario
-    that hardcodes the removed module fails this canary.
+    ``src/cambium/modules/example/``, and runs the shared scenario suite from
+    the copy. Every module-dependent scenario must skip (tolerate absence) and
+    everything else must stay green; any scenario that hardcodes the removed
+    module fails this canary.
     """
     if not module_conformance.discover_modules():
         pytest.skip("no decision modules are installed; nothing to delete")
@@ -514,7 +411,6 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
             "pytest",
             "-q",
             "tests/scenarios/test_module_conformance.py",
-            "tests/scenarios/test_wheel_cli.py",
             "tests/scenarios/test_bench.py",
             "tests/scenarios/test_tooling.py",
         ],

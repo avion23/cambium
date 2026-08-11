@@ -194,9 +194,9 @@ failure exits non-zero and canary pass rate gates promotion.
 Run:
 
 ```console
-uv run --extra test cambium module-test <package_name>
+PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test <package_name>
 # reference:
-uv run --extra test cambium module-test example
+PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test example
 ```
 
 The live `module_conformance` gate validates tracked layout, datasets,

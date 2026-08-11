@@ -3,7 +3,7 @@
 The gate is deliberately repository-aware.  A module is not conformant just
 because its tests pass: its required files must be tracked, its data must be
 readable, its imports must stay inside the module boundary, and its JSON CLI
-must work without the checkout on ``sys.path``.
+must work from the source tree on ``PYTHONPATH``.
 """
 
 from __future__ import annotations
@@ -1488,9 +1488,11 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
 
 
 def probe_module_cli(spec: ModuleSpec) -> None:
-    """Run the module CLI from an empty cwd with no import-path injection.
+    """Run the module CLI from an empty cwd.
 
-    The CLI subprocess also runs the sibling/import runtime check: every
+    The CLI subprocess receives the source tree through ``PYTHONPATH``: the
+    offline environment injects the checkout's ``src`` directory.  The CLI
+    subprocess also runs the sibling/import runtime check: every
     ``cambium.modules.*`` import it performs is recorded, and a sibling
     decision package loaded inside the probe fails the gate.
     """

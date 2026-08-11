@@ -192,7 +192,7 @@ metadata does not silently get ignored.
 The live command is:
 
 ```console
-uv run --extra test cambium module-test <package_name>
+PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test <package_name>
 ```
 
 It checks tracked module layout, manifest, schema/digests, imports, JSON CLI,
