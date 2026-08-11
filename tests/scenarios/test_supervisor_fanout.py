@@ -622,7 +622,7 @@ def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) ->
 @pytest.mark.slow
 def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "noready")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.15")
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -768,7 +768,7 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
 @pytest.mark.slow
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage_only")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.15")
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"

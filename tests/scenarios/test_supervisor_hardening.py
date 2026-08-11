@@ -637,7 +637,7 @@ def test_worktree_registration_requires_an_exact_path_match(
 
 
 @pytest.mark.slow
-def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
+def test_registered_worktree_path_with_literal_newline_is_not_deleted(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"
@@ -781,7 +781,7 @@ def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     tmp_path: Path, monkeypatch, worker: str
 ) -> None:
     monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
-    monkeypatch.setattr(supervisor_module, "PONG_DEADLINE_S", 0.2)
+    monkeypatch.setattr(supervisor_module, "PONG_DEADLINE_S", 0.1)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
@@ -930,7 +930,7 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
 
 
 @pytest.mark.slow
-def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
+def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"

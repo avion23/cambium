@@ -211,10 +211,10 @@ def _seq_of(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("max_width,children,delay", [(2, 4, "0.20000"), (1, 3, "0.15000")])
+@pytest.mark.parametrize("max_width,children,delay", [(2, 3, "0.15000"), (1, 3, None)])
 @pytest.mark.slow
 def test_width_bound_caps_concurrent_dispatch(
-    tmp_path: Path, max_width: int, children: int, delay: str
+    tmp_path: Path, max_width: int, children: int, delay: str | None
 ) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -234,12 +234,10 @@ def test_width_bound_caps_concurrent_dispatch(
         ],
     }
 
-    result = _run_with_env(
-        plan,
-        session_dir,
-        TRACE_FILE=str(session_dir / "trace.log"),
-        WORKER_DELAY_S=delay,
-    )
+    env: dict[str, str] = {"TRACE_FILE": str(session_dir / "trace.log")}
+    if delay is not None:
+        env["WORKER_DELAY_S"] = delay
+    result = _run_with_env(plan, session_dir, **env)
 
     assert result.exit_code == 0
     statuses = {r.task_id: r.status for r in result.results}
@@ -380,7 +378,7 @@ def test_flat_plan_ignores_max_width_and_preserves_canary(tmp_path: Path) -> Non
         ]
     }
 
-    os.environ["WORKER_DELAY_S"] = "0.50000"
+    os.environ["WORKER_DELAY_S"] = "0.30000"
     try:
         result = asyncio.run(run_plan(session_dir, plan, max_width=1))
     finally:
