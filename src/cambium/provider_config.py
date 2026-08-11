@@ -84,6 +84,7 @@ _PROVIDER_FIELDS = frozenset(
         "token_window_allowance",
         "auth",
         "protocol",
+        "reasoning_effort",
     }
 )
 _DEFAULTS: dict[str, object] = {
@@ -347,6 +348,14 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     if token_window_allowance < 0:
         raise _error(f"{location}.token_window_allowance", "must not be negative")
 
+    # Optional Responses-API reasoning effort (codex_responses providers); an
+    # absent value keeps the request body free of the reasoning field.
+    reasoning_effort = raw.get("reasoning_effort")
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str) or not reasoning_effort.strip():
+            raise _error(f"{location}.reasoning_effort", "must be a non-empty string")
+        reasoning_effort = reasoning_effort.strip()
+
     return {
         "name": name,
         "tier": tier_value,
@@ -364,6 +373,7 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         "token_window_allowance": token_window_allowance,
         "auth": auth,
         "protocol": protocol,
+        "reasoning_effort": reasoning_effort,
     }
 
 
@@ -447,6 +457,7 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
         "token_window_allowance": values["token_window_allowance"],
         "auth": values["auth"],
         "protocol": values["protocol"],
+        "reasoning_effort": values["reasoning_effort"],
     }
     price = values["price"]
     provider_fields = {field.name for field in fields(ProviderConfig)}

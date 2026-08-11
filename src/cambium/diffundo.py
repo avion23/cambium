@@ -49,8 +49,12 @@ deadline is not just a candidate-waiting bound.
 
 Stdlib only. HTTP calls use urllib against an OpenAI-compatible
 ``/chat/completions`` endpoint; the API key is read from the environment (name
-from ``ProviderConfig.api_key_env``) at call time. All blocking I/O runs off
-the event loop via ``asyncio.to_thread``.
+from ``ProviderConfig.api_key_env``) at call time. A provider tagged protocol
+``codex_responses`` (codex_chatgpt auth) instead targets the pinned
+``CODEX_CHATGPT_PROFILE`` endpoint with the OpenAI Responses-API shape over
+SSE; its bearer token and optional ChatGPT account id come only from an
+injected ``CredentialSource`` (a codex provider without one fails closed).
+All blocking I/O runs off the event loop via ``asyncio.to_thread``.
 """
 
 from __future__ import annotations
@@ -74,7 +78,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import __version__
-from .provider_config import AuthMode, Protocol, is_loopback_host
+from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
 
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
@@ -137,13 +141,20 @@ class ProviderStatus(Enum):
 
 
 class ProviderOutcome(Enum):
-    """Outcome classes that decide fall-through and health transitions (§1.2)."""
+    """Outcome classes that decide fall-through and health transitions (§1.2).
+
+    ``CONFIG_ERROR`` is the non-retryable configuration class: an unsupported
+    model/parameter or a machine-readable model/parameter 400 quarantines the
+    provider exactly like ``AUTH_ERROR`` (disable, never retry), it just names
+    the cause (codex responses adapter).
+    """
 
     TIMEOUT = "timeout"
     ERROR = "error"
     QUOTA = "quota"
     REFUSAL = "refusal"
     AUTH_ERROR = "auth_error"
+    CONFIG_ERROR = "config_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +166,8 @@ class ProviderConfig:
     ``CHAT_COMPLETIONS`` pair is unchanged; a ``CODEX_CHATGPT`` provider is
     pinned to ``CODEX_CHATGPT_PROFILE`` and carries empty ``base_url``/
     ``api_key_env`` (the transport derives the endpoint from the profile).
+    ``reasoning_effort`` is a normal (non-secret) config field emitted as the
+    Responses-API ``reasoning: {effort}`` body field on the codex path.
     """
 
     name: str
@@ -176,6 +189,25 @@ class ProviderConfig:
     token_window_allowance: float = 0.0
     auth: AuthMode = AuthMode.API_KEY
     protocol: Protocol = Protocol.CHAT_COMPLETIONS
+    # Optional Responses-API reasoning effort (codex_responses providers):
+    # absent -> the request body carries no reasoning field; the pinned codex
+    # provider entry sets "max".
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialSource:
+    """Injected bearer credential for a ``codex_chatgpt`` provider.
+
+    The adapter never reads a token itself: the caller injects the access
+    token (and the optional ChatGPT account id) at construction. ``account_id``
+    is sent as the ``ChatGPT-Account-Id`` header only when set. A
+    ``codex_chatgpt`` provider without an injected source fails closed with
+    ``ProviderOutcome.AUTH_ERROR``.
+    """
+
+    access_token: str
+    account_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +509,53 @@ class _RawResponse:
         )
 
 
+class _CodexRawResponse(_RawResponse):
+    """Parsed codex responses stream: the completed event plus the
+    delta-assembled output text (``response.output_text.delta`` events)."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, payload: dict[str, Any], latency_s: float, text: str) -> None:
+        super().__init__(payload, latency_s)
+        self.text = text
+
+    def to_result(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        retry_after_s: float | None = None,
+        account_quota_owner: str | None = None,
+    ) -> CallResult:
+        if _CONTENT_REFUSAL_RE.search(self.text):
+            # A completed stream whose assembled text is a model refusal:
+            # fall through to the next provider, never a health transition
+            # (mirrors the chat path's 200-completion heuristic).
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.REFUSAL,
+                f"completion content carries refusal markers: {self.text[:80]!r}",
+            )
+        usage = _codex_usage(self.payload)
+        response = self.payload.get("response")
+        model = provider.model
+        if isinstance(response, dict) and isinstance(response.get("model"), str):
+            model = response["model"]
+        return CallResult(
+            provider=provider.name,
+            model=model,
+            tier=provider.tier,
+            content=self.text,
+            latency_s=self.latency_s,
+            usage=usage,
+            estimated_cost_usd=_estimate_cost(provider, usage),
+            retry_after_s=retry_after_s,
+            account_quota_owner=account_quota_owner,
+            prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+            provider_cache_hit=_provider_cache_hit(usage),
+        )
+
+
 def _provider_cache_hit(usage: dict[str, Any] | None) -> bool | None:
     """Provider-reported cache-hit for one completion, or None when unknown.
 
@@ -679,6 +758,243 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 # --------------------------------------------------------------------------- #
+# Codex-ChatGPT responses adapter (protocol CODEX_RESPONSES)
+# --------------------------------------------------------------------------- #
+
+# In-stream error-event classification (probed live against
+# https://chatgpt.com/backend-api/codex/responses): service outages are
+# retryable (existing cooldown machinery); model/parameter problems are
+# permanent config errors (disable the provider, never retry); content
+# refusals fall through like any other refusal.
+_RETRYABLE_CODEX_ERROR_MARKERS = (
+    "service_unavailable",
+    "server_is_overloaded",
+    "overloaded",
+    "unavailable",
+    "rate_limit",
+    "429",
+)
+_CONFIG_CODEX_ERROR_MARKERS = (
+    "model_not_found",
+    "not found",
+    "unsupported",
+    "invalid",
+    "parameter",
+)
+_REFUSAL_CODEX_ERROR_MARKERS = ("content_policy", "refus")
+
+
+def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
+    """One chat message -> one Responses-API input item (input_text parts).
+
+    The system role maps to ``developer``; string content becomes an
+    ``input_text`` part; list content (already OpenAI-shaped parts) passes
+    through unchanged.
+    """
+    role = message.get("role", "user")
+    if role == "system":
+        role = "developer"
+    content = message.get("content")
+    if isinstance(content, str):
+        parts = [{"type": "input_text", "text": content}]
+    elif isinstance(content, list):
+        parts = list(content)
+    else:
+        parts = []
+    return {"role": role, "content": parts}
+
+
+def _codex_tools(tools: Any) -> list[dict[str, Any]]:
+    """Flatten chat tool entries to the Responses-API function-tool shape.
+
+    Chat ``{"type": "function", "function": {name, description, parameters}}``
+    becomes ``{"type": "function", name, description, parameters}``; non-function
+    tool types are dropped (the responses endpoint accepts function tools only).
+    """
+    if not isinstance(tools, list):
+        return []
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, Mapping) or tool.get("type") != "function":
+            continue
+        function = tool.get("function")
+        if not isinstance(function, Mapping):
+            continue
+        item: dict[str, Any] = {"type": "function"}
+        for key in ("name", "description", "parameters"):
+            value = function.get(key)
+            if value is not None:
+                item[key] = value
+        converted.append(item)
+    return converted
+
+
+def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dict[str, Any]:
+    """Convert a chat-completions prompt to the codex Responses-API request body.
+
+    The endpoint requires the Responses shape — ``input`` as a list of
+    ``{role, content: [{type: "input_text", text}]}`` items, ``store: false``,
+    ``stream: true`` — and rejects chat extras (``max_output_tokens``, bare
+    string input). Only the documented fields are emitted: prompt extras
+    (``max_tokens`` etc.) never leak into the body.
+    """
+    body: dict[str, Any] = {
+        "model": provider.model,
+        "input": [],
+        "store": False,
+        "stream": True,
+    }
+    messages = prompt.get("messages")
+    if isinstance(messages, list):
+        body["input"] = [
+            _codex_input_item(message) for message in messages if isinstance(message, Mapping)
+        ]
+    tools = _codex_tools(prompt.get("tools"))
+    if tools:
+        body["tools"] = tools
+    tool_choice = prompt.get("tool_choice")
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
+    if provider.reasoning_effort:
+        body["reasoning"] = {"effort": provider.reasoning_effort}
+    return body
+
+
+def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize Responses-API usage to the chat-shape usage used downstream.
+
+    The ``response.completed`` payload reports ``input_tokens``/``output_tokens``
+    with ``input_tokens_details``/``output_tokens_details``; the cost estimate
+    and cache-hit extraction read the chat shape (``prompt_tokens``/
+    ``completion_tokens``, ``prompt_tokens_details.cached_tokens``), so the
+    normalized dict carries both.
+    """
+    response = completed.get("response")
+    usage = response.get("usage") if isinstance(response, dict) else completed.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    normalized: dict[str, Any] = {
+        "prompt_tokens": usage.get("input_tokens") or 0,
+        "completion_tokens": usage.get("output_tokens") or 0,
+    }
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict):
+        normalized["prompt_tokens_details"] = {
+            "cached_tokens": input_details.get("cached_tokens") or 0
+        }
+        normalized["input_tokens_details"] = dict(input_details)
+    output_details = usage.get("output_tokens_details")
+    if isinstance(output_details, dict):
+        normalized["output_tokens_details"] = dict(output_details)
+    if usage.get("total_tokens") is not None:
+        normalized["total_tokens"] = usage["total_tokens"]
+    return normalized
+
+
+def _codex_stream_error(
+    provider: ProviderConfig, error: Mapping[str, Any], access_token: str
+) -> ProviderError:
+    """Classify one in-stream codex error object into a ProviderError."""
+    text = json.dumps(error)
+    lowered = text.lower()
+    if any(marker in lowered for marker in _RETRYABLE_CODEX_ERROR_MARKERS):
+        outcome = ProviderOutcome.ERROR
+    elif any(marker in lowered for marker in _CONFIG_CODEX_ERROR_MARKERS):
+        outcome = ProviderOutcome.CONFIG_ERROR
+    elif any(marker in lowered for marker in _REFUSAL_CODEX_ERROR_MARKERS):
+        outcome = ProviderOutcome.REFUSAL
+    else:
+        outcome = ProviderOutcome.ERROR
+    return ProviderError(
+        provider.name,
+        outcome,
+        f"codex stream error: {_redact_error_text(text[:300], access_token)}",
+    )
+
+
+def _parse_codex_sse(
+    provider: ProviderConfig, stream: str, access_token: str
+) -> tuple[dict[str, Any], str, ProviderError | None]:
+    """Parse a codex SSE stream into (completed event, assembled text, error).
+
+    Text is assembled from ``response.output_text.delta`` events; the final
+    ``response.completed`` event carries the full response incl. usage. An
+    in-stream ``error`` or ``response.failed`` event short-circuits with a
+    classified ``ProviderError``; a stream that ends without completion is
+    malformed.
+    """
+    text_parts: list[str] = []
+    completed: dict[str, Any] | None = None
+    stream_error: ProviderError | None = None
+    for line in stream.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                text_parts.append(delta)
+        elif event_type == "response.completed":
+            completed = event
+        elif event_type == "error":
+            error = event.get("error")
+            if isinstance(error, dict):
+                stream_error = stream_error or _codex_stream_error(
+                    provider, error, access_token
+                )
+        elif event_type == "response.failed":
+            response = event.get("response")
+            if isinstance(response, dict):
+                error = response.get("error")
+                if isinstance(error, dict):
+                    stream_error = stream_error or _codex_stream_error(
+                        provider, error, access_token
+                    )
+    text = "".join(text_parts)
+    if stream_error is not None:
+        return {}, text, stream_error
+    if completed is None:
+        return {}, text, ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            "malformed codex stream: no response.completed event",
+        )
+    return completed, text, None
+
+
+def _codex_config_400(message: str) -> bool:
+    """True when a codex HTTP 400 body is machine-readable and names a
+    model/parameter problem ("model", "not found", "unsupported", "invalid").
+
+    A JSON error object naming one of those is a permanent config error
+    (quarantine the provider); any other 400 keeps the generic content-refusal
+    fall-through.
+    """
+    try:
+        payload = json.loads(message)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    lowered = json.dumps(error).lower()
+    return any(
+        marker in lowered for marker in ("model", "not found", "unsupported", "invalid")
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Diffundo router
 # --------------------------------------------------------------------------- #
 
@@ -708,6 +1024,8 @@ class Diffundo:
         retry_base_delay_s: float = 0.05,
         rotation_seed: int = 0,
         primary_provider: str | None = None,
+        credential_source: CredentialSource | None = None,
+        codex_profile: Mapping[str, object] | None = None,
     ) -> None:
         self._providers = tuple(providers)
         self._runtimes = tuple(
@@ -738,6 +1056,14 @@ class Diffundo:
         self._breaker_threshold = breaker_failure_threshold
         self._open_backoff_base = open_backoff_base
         self._retry_base_delay_s = retry_base_delay_s
+        # Codex-ChatGPT responses adapter: the bearer credential is injected
+        # (never read from the environment or config) and the endpoint profile
+        # is pinned by default — the constructor override is a test/DI seam
+        # only, providers.json can never set it.
+        self._credential_source = credential_source
+        self._codex_profile = (
+            dict(CODEX_CHATGPT_PROFILE) if codex_profile is None else dict(codex_profile)
+        )
 
     # -- public API --------------------------------------------------------- #
 
@@ -1022,7 +1348,10 @@ class Diffundo:
                             last_quota_owner = exc.account_quota_owner
                         if exc.outcome is ProviderOutcome.REFUSAL:
                             break
-                        if exc.outcome is ProviderOutcome.AUTH_ERROR:
+                        if exc.outcome in (
+                            ProviderOutcome.AUTH_ERROR,
+                            ProviderOutcome.CONFIG_ERROR,
+                        ):
                             self._record_disable(provider)
                             break
                         if attempt_no >= provider.max_retries:
@@ -1044,7 +1373,11 @@ class Diffundo:
                         result, request_rate_status=request_rate_status
                     )
                 assert last_exc is not None
-                if last_exc.outcome in (ProviderOutcome.REFUSAL, ProviderOutcome.AUTH_ERROR):
+                if last_exc.outcome in (
+                    ProviderOutcome.REFUSAL,
+                    ProviderOutcome.AUTH_ERROR,
+                    ProviderOutcome.CONFIG_ERROR,
+                ):
                     request_rate_status = self.status(provider.name).value
                     raise ProviderError(
                         provider.name,
@@ -1093,6 +1426,8 @@ class Diffundo:
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
+        if provider.protocol is Protocol.CODEX_RESPONSES:
+            return self._codex_post_sync(provider, prompt, timeout_s)
         # Defensive transport guard: a ProviderConfig constructed without going
         # through the config loader must still never send the Authorization
         # header over plaintext http to a non-loopback host (security audit).
@@ -1187,6 +1522,120 @@ class Diffundo:
             )
         return _RawResponse(payload, time.monotonic() - start)
 
+    def _codex_post_sync(
+        self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
+    ) -> _RawResponse:
+        """Codex-ChatGPT ``/backend-api/codex/responses`` transport (SSE).
+
+        The endpoint is pinned to ``CODEX_CHATGPT_PROFILE`` (constructor-
+        injectable for tests only; providers.json can never set it). The bearer
+        token and optional account id come from the injected
+        ``CredentialSource`` only — without one a codex provider fails closed
+        with ``AUTH_ERROR``. The same fail-closed transport guards apply as on
+        the chat path: no redirects, no plaintext http off loopback, no proxy
+        on loopback.
+        """
+        profile = self._codex_profile
+        origin = str(profile.get("api_origin") or "").rstrip("/")
+        path = str(profile.get("api_path") or "")
+        parsed = urlparse(origin)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("https", "http"):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "codex responses endpoint origin must be an absolute http(s) URL",
+            )
+        if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "http transport is allowed only for loopback hosts; "
+                "remote providers require https",
+            )
+        credential = self._credential_source
+        if credential is None:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "provider requires auth 'codex_chatgpt' but no credential "
+                "source is injected",
+            )
+        if not credential.access_token:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "injected credential source carries an empty access token",
+            )
+        access_token = credential.access_token
+        url = f"{origin}{path}"
+        body = _codex_request_body(provider, prompt)
+        data = json.dumps(body).encode("utf-8")
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": USER_AGENT,
+        }
+        if credential.account_id:
+            headers["ChatGPT-Account-Id"] = credential.account_id
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        # Fail-closed transport, same rationale as the chat path.
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if scheme == "http":
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(*handlers)
+        start = time.monotonic()
+        http_error: ProviderError | None = None
+        http_cause: _SanitizedHTTPError | None = None
+        try:
+            with opener.open(request, timeout=timeout_s) as response:
+                stream = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                error_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                error_body = ""
+            safe_body = _redact_error_text(error_body, access_token)[:500]
+            http_cause = _SanitizedHTTPError(
+                status, _redact_error_text(str(exc.reason), access_token)
+            )
+            http_error = self._classify_http(
+                provider,
+                status,
+                safe_body,
+                cause=http_cause,
+                retry_after_s=_parse_retry_after(exc.headers) if status == 429 else None,
+                account_quota_owner=_account_quota_owner(error_body, access_token),
+            )
+        except urllib.error.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, TimeoutError):
+                outcome = ProviderOutcome.TIMEOUT
+            else:
+                outcome = ProviderOutcome.ERROR
+            raise ProviderError(
+                provider.name, outcome, f"transport error: {reason}", exc
+            ) from exc
+        except TimeoutError as exc:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                f"timeout after {timeout_s}s",
+                exc,
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise ProviderError(
+                provider.name, ProviderOutcome.ERROR, f"request failed: {exc}", exc
+            ) from exc
+        if http_error is not None:
+            assert http_cause is not None
+            raise http_error from http_cause
+        payload, text, stream_error = _parse_codex_sse(provider, stream, access_token)
+        if stream_error is not None:
+            raise stream_error
+        return _CodexRawResponse(payload, time.monotonic() - start, text)
+
     def _classify_http(
         self,
         provider: ProviderConfig,
@@ -1230,6 +1679,21 @@ class Diffundo:
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
             )
         if status == 400:
+            # Codex split (review requirement): a machine-readable 400 naming a
+            # model/parameter problem is a permanent CONFIG error that
+            # quarantines the provider, NOT a content refusal. The generic
+            # all-400 -> REFUSAL rule below is unchanged for chat_completions
+            # providers.
+            if (
+                provider.protocol is Protocol.CODEX_RESPONSES
+                and _codex_config_400(message)
+            ):
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.CONFIG_ERROR,
+                    f"HTTP 400: {message}",
+                    cause,
+                )
             # Deterministic HTTP 400s are permanent request-level rejections
             # (verified live: zai 1214 'messages illegal' was retried then
             # cooled down). A generic 400 used to fall to the retryable ERROR
