@@ -129,6 +129,7 @@ def _branch_exists(repo: Path, branch: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -183,6 +184,7 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert sum(kind == "worktree_pruned" for kind, _task_id in terminal) == 3
     assert not any(kind == "worktree_cleanup_deferred" for kind, _task_id in terminal)
     assert ("session_ended", None) in terminal
+@pytest.mark.slow
 def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
     """max_concurrent_tasks=1: the second task spawns only after the first ends."""
     session_dir = tmp_path / "session"
@@ -217,6 +219,7 @@ def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
 
 
 
+@pytest.mark.slow
 def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -270,6 +273,7 @@ def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> None:
     worker = tmp_path / "branch-lock-worker.py"
     worker.write_text(textwrap.dedent("""
@@ -354,6 +358,7 @@ def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> N
     assert "worktree_pruned" not in {kind for kind, _task_id in terminal}
 
 
+@pytest.mark.slow
 def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) -> None:
     worker = tmp_path / "dirty-worker.py"
     worker.write_text(textwrap.dedent("""
@@ -445,6 +450,7 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
     worker = tmp_path / "wrong-ready-worker.py"
     worker.write_text(textwrap.dedent("""
@@ -528,6 +534,7 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
     assert _show(repo, "main", "a.txt") == "file a\n"
 
 
+@pytest.mark.slow
 def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -565,6 +572,7 @@ def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
     assert committed[0]["payload"]["new"] == main_tip
 
 
+@pytest.mark.slow
 def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -613,6 +621,7 @@ def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "noready")
     monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
@@ -655,6 +664,7 @@ def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t3_crash_mid_edit_recovered_worktree(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
@@ -692,6 +702,7 @@ def test_t3_crash_mid_edit_recovered_worktree(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t4_same_file_race_one_wins_loser_merge_failed(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "overwrite")
     session_dir = tmp_path / "session"
@@ -731,6 +742,7 @@ def test_t4_same_file_race_one_wins_loser_merge_failed(tmp_path, monkeypatch) ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage")
     session_dir = tmp_path / "session"
@@ -755,6 +767,7 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
     assert _protocol(events, "t-garbage") == ["init", "ready", "run_task", "result", "exit"]
 
 
+@pytest.mark.slow
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage_only")
     monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
@@ -788,6 +801,7 @@ def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -863,6 +877,7 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_t7_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "authorized-secret")
     monkeypatch.setenv("CAMBIUM_PROVIDER_ANTHROPIC_API_KEY", "undeclared-secret")
@@ -896,6 +911,7 @@ def test_t7_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monke
     assert spawned_env["CAMBIUM_GENERATION"] == "1"
 
 
+@pytest.mark.slow
 def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -944,6 +960,7 @@ def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) ->
     assert "secret kill-window content" not in payloads
 
 
+@pytest.mark.slow
 def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(
     tmp_path, monkeypatch
 ) -> None:
@@ -1001,6 +1018,7 @@ def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(
     assert reconciled[0]["payload"]["new"] == staged
 
 
+@pytest.mark.slow
 def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -1045,6 +1063,7 @@ def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
     assert not _kinds(events, "spawned")
 
 
+@pytest.mark.slow
 def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     tmp_path, monkeypatch,
 ) -> None:
@@ -1123,6 +1142,7 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     ).stdout.strip() == commits_after_recovery
 
 
+@pytest.mark.slow
 def test_next_startup_ignores_durably_pruned_quarantine_and_spawns_worker(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -1182,6 +1202,7 @@ def test_next_startup_ignores_durably_pruned_quarantine_and_spawns_worker(tmp_pa
     assert _kinds(events, "spawned")
 
 
+@pytest.mark.slow
 def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypatch) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -1226,6 +1247,7 @@ def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypat
     assert len(refs) == 1
 
 
+@pytest.mark.slow
 def test_t8_supervisor_git_sync_post_checkout_hook_sees_no_provider_key(
     tmp_path, monkeypatch
 ) -> None:
@@ -1263,6 +1285,7 @@ def test_t8_supervisor_git_sync_post_checkout_hook_sees_no_provider_key(
         assert "hook-secret" not in json.dumps(record)
 
 
+@pytest.mark.slow
 def test_resource_gate_fail_closed_preflight_creates_no_worktree(tmp_path) -> None:
     """An impossible memory threshold refuses admission before worktree creation."""
     session_dir = tmp_path / "session"
@@ -1307,6 +1330,7 @@ def test_resource_gate_fail_closed_preflight_creates_no_worktree(tmp_path) -> No
     assert any("mem_available_frac" in reason for reason in denied[0]["payload"]["reasons"])
 
 
+@pytest.mark.slow
 def test_resource_preflight_is_opt_in_and_skipped_without_thresholds(tmp_path, monkeypatch) -> None:
     """Without configured thresholds the health pre-flight is skipped entirely.
 

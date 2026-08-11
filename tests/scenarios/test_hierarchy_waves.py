@@ -25,6 +25,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from cambium.supervisor import (
     PlanResult,
     TaskResult,
@@ -146,6 +148,7 @@ def _peak_concurrency(lines: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_static_waves_dispatch_in_dependency_order(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -185,6 +188,7 @@ def test_static_waves_dispatch_in_dependency_order(tmp_path: Path) -> None:
     assert a_exit_index < a1_enter
 
 
+@pytest.mark.slow
 def test_no_unready_dispatch_during_waves(tmp_path: Path) -> None:
     """A node never enters before its declared parent's exit (event-level)."""
     session_dir = tmp_path / "session"
@@ -236,6 +240,7 @@ def _seq_of(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -277,6 +282,7 @@ def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
     assert set(intervals) == {"root", "c1", "c2", "c3", "c4", "c5"}
 
 
+@pytest.mark.slow
 def test_width_bound_one_serializes_wave(tmp_path: Path) -> None:
     """``max_width=1`` makes each wave strictly serial (peak concurrency 1)."""
     session_dir = tmp_path / "session"
@@ -312,6 +318,7 @@ def test_width_bound_one_serializes_wave(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_child_receives_bounded_parent_envelope(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -408,6 +415,7 @@ def test_strict_envelope_empty_when_no_parent_data() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_failed_node_cascades_skip_to_dependants(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -453,6 +461,7 @@ def test_failed_node_cascades_skip_to_dependants(tmp_path: Path) -> None:
     assert _seq_of(events, "b", "spawned") is not None
 
 
+@pytest.mark.slow
 def test_failed_root_cascades_to_whole_subtree(tmp_path: Path) -> None:
     """A failed root skips the entire tree (no node is ever spawned)."""
     session_dir = tmp_path / "session"
@@ -584,6 +593,7 @@ def test_dispatcher_uses_independent_snapshots_per_node(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_flat_plan_ignores_max_width_and_preserves_canary(tmp_path: Path) -> None:
     """A flat plan (no ``depends_on``) never applies the wave width bound.
 

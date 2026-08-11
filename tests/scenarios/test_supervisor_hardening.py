@@ -164,6 +164,7 @@ def test_oversized_init_fails_before_spawn_without_restart_budget(tmp_path: Path
     assert protocol[0]["payload"]["error_type"] == "OUTBOUND_MESSAGE_TOO_LONG"
 
 
+@pytest.mark.slow
 def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
@@ -194,6 +195,7 @@ def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Pa
     assert time.monotonic() - started < 5.0
 
 
+@pytest.mark.slow
 def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -230,6 +232,7 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
     asyncio.run(canary())
 
 
+@pytest.mark.slow
 def test_session_redactor_removes_declared_secret_from_db_and_observers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -345,6 +348,7 @@ def test_short_declared_provider_credential_is_rejected_before_worker_or_events(
     assert not (session_dir / ".cambium" / "events.db").exists()
 
 
+@pytest.mark.slow
 def test_registered_protocol_values_preserve_event_kinds_and_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -402,6 +406,7 @@ def test_registered_protocol_values_preserve_event_kinds_and_status(
     assert assigned["payload"]["task"] == "*** *** ***"
 
 
+@pytest.mark.slow
 def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -444,6 +449,7 @@ def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
     assert merge_report.read_text(encoding="utf-8").strip() == "absent absent"
 
 
+@pytest.mark.slow
 def test_stdin_write_deadline_kills_non_reader_group(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CAMBIUM_WRITE_TIMEOUT_S", "0.1")
     session_dir = tmp_path / "session"
@@ -476,6 +482,7 @@ def test_stdin_write_deadline_kills_non_reader_group(tmp_path: Path, monkeypatch
     )
 
 
+@pytest.mark.slow
 def test_generation_seven_advances_and_never_rolls_back_on_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -519,6 +526,7 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(
     assert not worktree.exists()
 
 
+@pytest.mark.slow
 def test_generation_survives_crash_after_worktree_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -576,6 +584,7 @@ def test_generation_survives_crash_after_worktree_clean(
     assert not worktree.exists()
 
 
+@pytest.mark.slow
 def test_worktree_registration_requires_an_exact_path_match(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -611,6 +620,7 @@ def test_worktree_registration_requires_an_exact_path_match(
     assert (registered_extra / "hello.txt").read_text(encoding="utf-8") == "hello\n"
 
 
+@pytest.mark.slow
 def test_registered_worktree_path_with_literal_newline_is_not_deleted(
     tmp_path: Path,
 ) -> None:
@@ -647,6 +657,7 @@ def test_registered_worktree_path_with_literal_newline_is_not_deleted(
     assert (worktree / "hello.txt").read_text(encoding="utf-8") == "hello\n"
 
 
+@pytest.mark.slow
 def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -693,6 +704,7 @@ def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
 
 
 @pytest.mark.parametrize("failed_command", ["reset", "clean"])
+@pytest.mark.slow
 def test_recovery_git_failure_fails_task_without_spawn_or_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_command: str
 ) -> None:
@@ -748,6 +760,7 @@ def test_recovery_git_failure_fails_task_without_spawn_or_publish(
 
 
 @pytest.mark.parametrize("worker", [EOF_QUIET_WORKER, EOF_STALE_PONG_WORKER])
+@pytest.mark.slow
 def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     tmp_path: Path, monkeypatch, worker: str
 ) -> None:
@@ -780,6 +793,7 @@ def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     )
 
 
+@pytest.mark.slow
 def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
     tmp_path: Path,
 ) -> None:
@@ -843,6 +857,7 @@ def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
     assert _kinds(events, "merge_committed")
 
 
+@pytest.mark.slow
 def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
     tmp_path: Path,
 ) -> None:
@@ -896,6 +911,7 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
     ).stdout.strip() == base
 
 
+@pytest.mark.slow
 def test_ready_without_proto_is_terminal_without_run_gate_or_merge(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -945,6 +961,7 @@ def test_ready_without_proto_is_terminal_without_run_gate_or_merge(tmp_path: Pat
     ).stdout.strip() == base
 
 
+@pytest.mark.slow
 def test_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
     tmp_path: Path,
 ) -> None:
@@ -1002,6 +1019,7 @@ def test_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge
     ).stdout.strip() == base
 
 
+@pytest.mark.slow
 def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
     tmp_path: Path,
 ) -> None:
@@ -1100,6 +1118,7 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
     assert not session_dir.exists()
 
 
+@pytest.mark.slow
 def test_slice_runtime_runs_the_installed_worker_module(tmp_path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
@@ -1132,6 +1151,7 @@ def _slice_spec(session_dir: Path, worker: str) -> dict[str, object]:
     }
 
 
+@pytest.mark.slow
 def test_oversized_stdout_line_fails_slice_reader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1149,6 +1169,7 @@ def test_oversized_stdout_line_fails_slice_reader(
     )
 
 
+@pytest.mark.slow
 def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without_merge(
     tmp_path: Path,
 ) -> None:
@@ -1205,6 +1226,7 @@ def test_slice_wrong_ready_request_id_with_correlated_result_is_terminal_without
     ).stdout
 
 
+@pytest.mark.slow
 def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
     tmp_path: Path,
 ) -> None:
@@ -1234,6 +1256,7 @@ def test_slice_ready_without_proto_is_terminal_without_run_gate_or_merge(
     assert not any(event["kind"] in {"run_task", "gate", "merge"} for event in events)
 
 
+@pytest.mark.slow
 def test_oversized_stdout_line_fails_custos_reader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
