@@ -181,7 +181,7 @@ def test_stdout_flood_stays_within_wall_deadline_with_slow_observer(tmp_path: Pa
         encoding="utf-8",
     )
     spec = _slice_spec(session_dir, str(worker))
-    spec["wall_budget_s"] = 0.25
+    spec["wall_budget_s"] = 0.15
 
     async def observer(event: dict) -> None:
         if event["kind"] == "log":
@@ -467,7 +467,7 @@ def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
 
 @pytest.mark.slow
 def test_stdin_write_deadline_kills_non_reader_group(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("CAMBIUM_WRITE_TIMEOUT_S", "0.1")
+    monkeypatch.setenv("CAMBIUM_WRITE_TIMEOUT_S", "0.05")
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
@@ -781,7 +781,7 @@ def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     tmp_path: Path, monkeypatch, worker: str
 ) -> None:
     monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.05)
-    monkeypatch.setattr(supervisor_module, "PONG_DEADLINE_S", 0.1)
+    monkeypatch.setattr(supervisor_module, "PONG_DEADLINE_S", 0.05)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
