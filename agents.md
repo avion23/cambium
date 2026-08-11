@@ -79,6 +79,16 @@ failure reasons, and quota owners (`--json` for machine-readable
 output). Sessions without usage events are skipped; missing event DBs
 warn and exit 0.
 
+## Eval isolation
+
+`scripts/isolated_eval.sh --repo <path> [--eval module-test|bench|pytest|all]
+[--worktree <path>] [--bench-root <path>]` snapshots a repository's committed
+state with `git clone --shared`, makes the copy read-only (ro bind mount when
+permitted, `chmod -R a-w` fallback), and runs the eval from that copy with the
+cambium venv interpreter, so the suite never executes inside a mutable agent
+worktree and working-tree tampering cannot reach the eval. Results go to
+stdout and to a file under /tmp; the source repo is never written.
+
 ## Current entry points and behavior
 
 - `supervisor.run_plan` validates a flat task list, starts one runtime, and
