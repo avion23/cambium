@@ -255,9 +255,8 @@ def test_failed_wire_may_carry_nonzero_exit_code(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("wire", "expected"),
     [
-        ({"status": "succeeded", "gate_exit_code": 0, "merge_status": "ok"}, "done"),
+        ({"status": "succeeded", "merge_status": "ok"}, "done"),
         ({"status": "failed"}, "failed"),
-        ({"status": "succeeded", "gate_exit_code": 1}, "failed"),
         ({"status": "succeeded", "merge_status": "failed"}, "failed"),
         ({"status": "timeout"}, "timeout"),
         ({"status": "cancellation"}, "cancelled"),
@@ -289,15 +288,8 @@ def test_timeout_reasons_map_to_timeout_exit_code(wire: dict[str, object]) -> No
     assert wire_to_child_result(wire)["status"] == "timeout"
 
 
-@pytest.mark.parametrize(
-    "wire",
-    [
-        {"status": "succeeded", "gate_exit_code": 1},
-        {"status": "succeeded", "merge_status": "failed"},
-    ],
-)
-def test_gate_and_merge_failures_keep_failed_exit_code(wire: dict[str, object]) -> None:
-    status = status_from_wire(wire)
+def test_merge_failure_keeps_failed_exit_code() -> None:
+    status = status_from_wire({"status": "succeeded", "merge_status": "failed"})
 
     assert status == "failed"
     assert EXIT_CODES[status] == 1
@@ -317,7 +309,6 @@ def test_success_reason_is_advisory_not_cancellation(tmp_path: Path) -> None:
     result = root_result_from_wire(
         {
             "status": "succeeded",
-            "gate_exit_code": 0,
             "merge_status": "ok",
             "reason": "success",
         },

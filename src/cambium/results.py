@@ -190,7 +190,7 @@ def _has_marker(value: Any, markers: Sequence[str]) -> bool:
 
 
 def _signal_failed(value: Any) -> bool:
-    """Return whether a gate/merge verdict explicitly failed."""
+    """Return whether a merge verdict explicitly failed."""
     if isinstance(value, Mapping):
         value = _first_wire_value(value, ("status", "verdict", "ok", "passed", "exit_code"))
         if value is _MISSING:
@@ -239,9 +239,6 @@ def _status_mapping(value: Mapping[str, Any] | str) -> Mapping[str, Any]:
 def status_from_wire(
     wire_or_status: Mapping[str, Any] | str,
     *,
-    gate_exit_code: int | None = None,
-    gate_ok: bool | None = None,
-    gate_status: Any = None,
     merge_ok: bool | None = None,
     merge_status: Any = None,
     evaluator_rejected: bool | None = None,
@@ -249,11 +246,10 @@ def status_from_wire(
 ) -> str:
     """Convert worker/supervisor outcome signals to a canonical status.
 
-    A successful worker is ``done`` only when no gate or merge failure is
-    present.  Supervisor failure classes are deliberately fail-closed and
-    collapse to ``failed``.  Explicit evaluator rejection has priority over
-    the worker and gate outcome because it is the terminal orchestration
-    verdict.
+    A successful worker is ``done`` only when no merge failure is present.
+    Supervisor failure classes are deliberately fail-closed and collapse to
+    ``failed``.  Explicit evaluator rejection has priority over the worker and
+    merge outcome because it is the terminal orchestration verdict.
     """
     wire = _status_mapping(wire_or_status)
 
@@ -355,23 +351,6 @@ def status_from_wire(
         )) is True
     )
     if hard_failure:
-        return "failed"
-
-    gate_value = gate_status
-    if gate_value is None:
-        gate_value = _first_wire_value(
-            wire,
-            ("gate_status", "gate_verdict", "gate_result", "gate_ok", "gate_passed", "gate"),
-        )
-    gate_failed = gate_ok is False or _signal_failed(gate_value)
-    gate_code = gate_exit_code
-    if gate_code is None:
-        gate_code = _first_wire_value(wire, ("gate_exit_code", "gate_rc", "gate_code"))
-    if gate_code is not _MISSING and gate_code is not None:
-        if isinstance(gate_code, bool) or not isinstance(gate_code, int):
-            raise TypeError("gate exit code must be an integer")
-        gate_failed = gate_failed or gate_code != 0
-    if gate_failed:
         return "failed"
 
     merge_value = merge_status

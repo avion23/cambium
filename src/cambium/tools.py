@@ -28,7 +28,6 @@ from threading import Lock, Thread, current_thread
 from typing import Any
 
 from . import ast_tools
-from .approval import ApprovalGate
 from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
@@ -49,7 +48,6 @@ class ToolContext:
     """Dependencies needed by one tool invocation."""
 
     cwd: Path | str
-    approval: ApprovalGate | None = None
     lint: LintDiag | None = None
     init: Mapping[str, Any] | None = None
     emit: ToolEventSink | None = None

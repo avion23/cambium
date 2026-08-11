@@ -86,7 +86,6 @@ def test_vertical_slice_happy_path(tmp_path) -> None:
 
     assert result.status == "succeeded"
     assert result.exit_code == 0
-    assert result.gate_exit_code == 0
     assert result.merge_sha is not None
     assert _show_main(scratch, "hello.txt") == (
         "hello from the vertical slice\n"

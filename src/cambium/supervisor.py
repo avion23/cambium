@@ -128,7 +128,6 @@ class SliceResult:
     exit_code: int  # supervisor exit code: 0 only when everything succeeded
     worker_exit_code: int | None = None
     worker_status: str | None = None  # from the result_envelope (advisory)
-    gate_exit_code: int | None = None
     merge_sha: str | None = None
     timed_out: bool = False
     timeout_phase: str | None = None  # "ready" | "wall" | "heartbeat" | "pong" | "stdin"
@@ -268,7 +267,6 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
         exit_code=result.exit_code,
         worker_exit_code=None,
         worker_status=None,
-        gate_exit_code=result.gate_exit_code,
         merge_sha=result.merge_sha,
         timed_out=timeout_phase is not None,
         timeout_phase=timeout_phase,
@@ -480,7 +478,6 @@ class TaskResult:
     exit_code: int  # 0 succeeded; 1 failed
     reason: str | None = None
     merge_sha: str | None = None
-    gate_exit_code: int | None = None
     restarts: int = 0
 
 
@@ -1132,7 +1129,7 @@ class _Runtime:
                     )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason=integrity, gate_exit_code=None, restarts=restarts,
+                        reason=integrity, restarts=restarts,
                     )
                     return
                 if outcome.envelope and outcome.envelope.get("status") == "succeeded":
@@ -1140,18 +1137,17 @@ class _Runtime:
                     if merged is not None:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
-                            reason=None, merge_sha=merged, gate_exit_code=0,
-                            restarts=restarts,
+                            reason=None, merge_sha=merged, restarts=restarts,
                         )
                     else:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
-                            reason="merge_failed", gate_exit_code=0, restarts=restarts,
+                            reason="merge_failed", restarts=restarts,
                         )
                 else:
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason="worker_verdict_failed", gate_exit_code=0, restarts=restarts,
+                        reason="worker_verdict_failed", restarts=restarts,
                     )
                 return
             if outcome.fatal:

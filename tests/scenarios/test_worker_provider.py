@@ -403,7 +403,6 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
 
         assert result.exit_code == 0
         assert result.results[0].status == "succeeded"
-        assert result.results[0].gate_exit_code == 0
         assert merged.endswith("// provider-alpha\n")
 
         with REQUEST_LOCK:
