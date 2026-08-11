@@ -15,6 +15,12 @@ Redaction is session-scoped: one ``cambium.redact.Redactor`` built from every
 worker-forwardable declared secret value redacts the complete event record
 before the store, the non-critical queue, and event observers.
 
+Workers additionally emit one redacted ``usage_event`` per provider call
+(implementation plan step 3); the supervisor validates the field allowlist
+(``_invalid_usage_event_fields``) and persists the record through the same
+EventStore path, so provider usage/quota evidence is durable without ever
+exposing credentials.
+
 ``run_plan`` drives a multi-task plan and returns a ``PlanResult``;
 ``run_session`` is a thin one-task adapter that keeps the historical
 ``SliceResult`` return shape. ``cambium.store`` and ``cambium.merge`` are
@@ -103,6 +109,22 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
 
 _TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
 _TOOL_EVENT_DURATION_FIELDS = ("duration_ms",)
+_USAGE_EVENT_FORWARD_FIELDS = frozenset(
+    {
+        "turn",
+        "provider",
+        "model",
+        "usage",
+        "estimated_cost_usd",
+        "latency_s",
+        "retry_after_s",
+        "request_rate_status",
+        "account_quota_owner",
+        "prompt_prefix_bytes",
+        "provider_cache_hit",
+        "failure_reason",
+    }
+)
 
 
 def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
@@ -122,6 +144,46 @@ def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
             type(value) in (int, float) and value >= 0 and math.isfinite(value)
         ):
             invalid.append(field)
+    return invalid
+
+
+def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
+    """Return worker usage_event fields whose values must not enter durable events.
+
+    Field names only; values are never echoed back. Unknown fields fail the
+    whole event so a schema drift cannot smuggle data into the log.
+    """
+    unknown = sorted(set(msg) - ({"type", "task_id", "generation"} | _USAGE_EVENT_FORWARD_FIELDS))
+    if unknown:
+        return unknown
+    invalid: list[str] = []
+    for field in ("turn", "prompt_prefix_bytes"):
+        if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
+            invalid.append(field)
+    for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):
+        value = msg.get(field)
+        if field in msg and not (
+            type(value) in (int, float) and value >= 0 and math.isfinite(value)
+        ):
+            invalid.append(field)
+    if "provider_cache_hit" in msg and type(msg["provider_cache_hit"]) is not bool:
+        invalid.append("provider_cache_hit")
+    for field in (
+        "provider", "model", "request_rate_status", "account_quota_owner", "failure_reason"
+    ):
+        if field in msg and not (type(msg[field]) is str and msg[field]):
+            invalid.append(field)
+    usage = msg.get("usage")
+    if "usage" in msg and (
+        not isinstance(usage, dict)
+        or any(
+            key not in _PROVIDER_METADATA_USAGE_FIELDS
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            for key, value in usage.items()
+        )
+    ):
+        invalid.append("usage")
     return invalid
 
 
@@ -1603,6 +1665,24 @@ class _Runtime:
                         state_ref=msg.get("state_ref"), generation=generation,
                         commits_so_far=msg.get("commits_so_far"),
                     )
+                elif mtype == "usage_event":
+                    invalid_fields = _invalid_usage_event_fields(msg)
+                    if invalid_fields:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="usage_event rejected: invalid field(s)",
+                            fields=invalid_fields,
+                        )
+                    else:
+                        forwarded = {
+                            field: msg[field]
+                            for field in _USAGE_EVENT_FORWARD_FIELDS
+                            if field in msg
+                        }
+                        await self.emit(
+                            "usage_event", task_id=task_id, generation=generation,
+                            **forwarded,
+                        )
                 elif mtype in ("tool_event", "pong"):
                     forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
                     if mtype == "tool_event":

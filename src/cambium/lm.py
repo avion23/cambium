@@ -898,16 +898,25 @@ class _CambiumLMMixin:
             )
         if not parts:
             parts.append({"type": "text", "text": ""})
+        # cache_hit records what the provider reported; the adapter itself
+        # never caches (cache=False everywhere, D1) and a provider that does
+        # not report cache state yields False (plan step 3).
         return dspy.LMResponse(
             model=result.model,
             outputs=[{"parts": parts}],
             usage=result.usage,
             cost=result.estimated_cost_usd,
-            cache_hit=False,
+            cache_hit=(
+                bool(result.provider_cache_hit)
+                if result.provider_cache_hit is not None
+                else False
+            ),
             metadata={
                 "provider": result.provider,
                 "tier": result.tier.value,
                 "latency_s": result.latency_s,
+                "prompt_prefix_bytes": result.prompt_prefix_bytes,
+                "provider_cache_hit": result.provider_cache_hit,
             },
         )
 

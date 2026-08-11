@@ -17,6 +17,19 @@ only:
   unavailable, ``call`` pauses the dispatch on an ``asyncio.Event`` and a
   per-tier recovery monitor wakes it when any provider's bucket/cooldown/breaker
   recovers.
+- **D11 — durable usage events (implementation plan step 3).** Every router
+  call surfaces per-call usage evidence on the ``CallResult`` (success) or the
+  terminal ``ProviderError`` (failure): provider, model, token fields,
+  estimated cost, latency, the honored ``Retry-After``, the provider's
+  request-rate status after the call, the provider-reported account-quota
+  owner, the stable prompt-prefix byte length, the provider-reported
+  cache-hit flag, and the failure reason. The worker persists these as
+  redacted ``usage_event`` records through the EventStore. When a provider
+  does not report a value the field is omitted from the event — a missing
+  field never breaks the event or the session. These are metrics, not
+  evidence of a local response cache (D1): the router always requests
+  ``cache=False`` and ``provider_cache_hit`` records only what the provider
+  reports.
 
 Provider health transitions implemented here are: UNKNOWN -> HEALTHY on first
 success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN (probe) ->
@@ -53,7 +66,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from enum import Enum
@@ -167,6 +180,11 @@ class CallResult:
     usage: dict[str, Any] | None = None
     estimated_cost_usd: float = 0.0
     tool_calls: tuple[dict[str, Any], ...] | None = None
+    retry_after_s: float | None = None
+    request_rate_status: str | None = None
+    account_quota_owner: str | None = None
+    prompt_prefix_bytes: int | None = None
+    provider_cache_hit: bool | None = None
 
 
 class DiffundoError(Exception):
@@ -200,6 +218,8 @@ class ProviderError(DiffundoError):
         *,
         budget_exhausted: bool = False,
         retry_after_s: float | None = None,
+        request_rate_status: str | None = None,
+        account_quota_owner: str | None = None,
     ) -> None:
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
@@ -208,6 +228,8 @@ class ProviderError(DiffundoError):
         self.cause = cause
         self.budget_exhausted = budget_exhausted
         self.retry_after_s = retry_after_s
+        self.request_rate_status = request_rate_status
+        self.account_quota_owner = account_quota_owner
 
 
 class CostBudgetExceeded(DiffundoError):
@@ -267,6 +289,25 @@ def validate_prompt_structure(prompt: dict[str, Any]) -> None:
                     f"line {idx}: volatile {marker!r} token in the static prefix; "
                     "request ids belong below the first 3 lines (D8c)"
                 )
+
+
+def prompt_prefix_bytes(prompt: dict[str, Any]) -> int | None:
+    """Stable byte prefix length of the leading system message (plan step 3).
+
+    The byte length of the leading ``role: system`` message content, the
+    fixed prefix that provider exact-prefix caches address. Returns ``None``
+    when the prompt has no leading system message; a missing prefix is omitted
+    from usage events, never an error. The metric is evidence for routing
+    decisions, not evidence that a local response cache exists (D1).
+    """
+    messages = prompt.get("messages")
+    if isinstance(messages, list) and messages:
+        first = messages[0]
+        if isinstance(first, dict) and first.get("role") == "system":
+            content = first.get("content")
+            if isinstance(content, str):
+                return len(content.encode("utf-8"))
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -349,7 +390,14 @@ class _RawResponse:
         self.payload = payload
         self.latency_s = latency_s
 
-    def to_result(self, provider: ProviderConfig) -> CallResult:
+    def to_result(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        retry_after_s: float | None = None,
+        account_quota_owner: str | None = None,
+    ) -> CallResult:
         try:
             choices = self.payload["choices"]
             message = choices[0]["message"]
@@ -408,7 +456,73 @@ class _RawResponse:
             usage=usage,
             estimated_cost_usd=_estimate_cost(provider, usage),
             tool_calls=tool_calls,
+            retry_after_s=retry_after_s,
+            account_quota_owner=account_quota_owner,
+            prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+            provider_cache_hit=_provider_cache_hit(usage),
         )
+
+
+def _provider_cache_hit(usage: dict[str, Any] | None) -> bool | None:
+    """Provider-reported cache-hit for one completion, or None when unknown.
+
+    True when the usage payload reports cached input tokens (OpenAI
+    ``prompt_tokens_details.cached_tokens``, Anthropic
+    ``cache_read_input_tokens``, or a top-level ``cached_tokens``); False when
+    usage is present without any cache field; None when usage is absent. This
+    records what the provider reports, the router always requests
+    ``cache=False`` and never serves from a local response cache (D1).
+    """
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens")
+        if isinstance(cached, (int, float)) and not isinstance(cached, bool) and cached > 0:
+            return True
+    for key in ("cache_read_input_tokens", "cached_tokens"):
+        cached = usage.get(key)
+        if isinstance(cached, (int, float)) and not isinstance(cached, bool) and cached > 0:
+            return True
+    return False
+
+
+_ACCOUNT_QUOTA_OWNER_KEYS = ("quota_owner", "account_quota_owner", "account_quota")
+
+
+def _account_quota_owner(body: str, api_key: str) -> str | None:
+    """Provider-reported account-quota owner from an error body, else None.
+
+    Parses an OpenAI-compatible error payload for allowlisted quota-owner
+    fields at the top level, under ``error``, or under ``error.rate_limit``
+    (``quota_owner`` / ``account_quota_owner`` / ``account_quota``, plus
+    ``rate_limit.scope``). The extracted value is redacted like any other
+    provider text. Returns ``None`` when the provider does not report one; a
+    missing owner never breaks the call or the usage event (plan step 3).
+    """
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[dict[str, Any]] = [payload]
+    error = payload.get("error")
+    if isinstance(error, dict):
+        candidates.append(error)
+        rate_limit = error.get("rate_limit")
+        if isinstance(rate_limit, dict):
+            candidates.append(rate_limit)
+    for candidate in candidates:
+        keys = _ACCOUNT_QUOTA_OWNER_KEYS
+        if candidate is not error and candidate is not payload:
+            keys = (*keys, "scope")
+        for key in keys:
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                owner = _redact_error_text(value.strip(), api_key)
+                return owner if owner != _REDACTED else None
+    return None
 
 
 def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> float:
@@ -808,6 +922,8 @@ class Diffundo:
                 runtime.probe_in_flight = True
             try:
                 last_exc: ProviderError | None = None
+                last_retry_after: float | None = None
+                last_quota_owner: str | None = None
                 for attempt_no in range(provider.max_retries + 1):
                     remaining = self._remaining(deadline)
                     if remaining is not None and remaining <= 0:
@@ -822,9 +938,18 @@ class Diffundo:
                         timeout_s = min(timeout_s, remaining)
                     try:
                         raw = await self._post(provider, prompt, timeout_s=timeout_s)
-                        result = raw.to_result(provider)
+                        result = raw.to_result(
+                            provider,
+                            prompt,
+                            retry_after_s=last_retry_after,
+                            account_quota_owner=last_quota_owner,
+                        )
                     except ProviderError as exc:
                         last_exc = exc
+                        if exc.retry_after_s is not None:
+                            last_retry_after = exc.retry_after_s
+                        if exc.account_quota_owner is not None:
+                            last_quota_owner = exc.account_quota_owner
                         if exc.outcome is ProviderOutcome.REFUSAL:
                             break
                         if exc.outcome is ProviderOutcome.AUTH_ERROR:
@@ -844,10 +969,13 @@ class Diffundo:
                             break
                         await asyncio.sleep(delay)
                         continue
-                    self._record_success(provider)
-                    return result
+                    request_rate_status = self._record_success(provider)
+                    return replace(
+                        result, request_rate_status=request_rate_status
+                    )
                 assert last_exc is not None
                 if last_exc.outcome in (ProviderOutcome.REFUSAL, ProviderOutcome.AUTH_ERROR):
+                    request_rate_status = self.status(provider.name).value
                     raise ProviderError(
                         provider.name,
                         last_exc.outcome,
@@ -855,8 +983,10 @@ class Diffundo:
                         last_exc.cause,
                         budget_exhausted=last_exc.budget_exhausted,
                         retry_after_s=last_exc.retry_after_s,
+                        request_rate_status=request_rate_status,
+                        account_quota_owner=last_exc.account_quota_owner,
                     ) from last_exc
-                self._record_failure(provider)
+                request_rate_status = self._record_failure(provider)
                 raise ProviderError(
                     provider.name,
                     last_exc.outcome,
@@ -864,6 +994,8 @@ class Diffundo:
                     last_exc.cause,
                     budget_exhausted=last_exc.budget_exhausted,
                     retry_after_s=last_exc.retry_after_s,
+                    request_rate_status=request_rate_status,
+                    account_quota_owner=last_exc.account_quota_owner,
                 ) from last_exc
             finally:
                 runtime.probe_in_flight = False
@@ -954,6 +1086,7 @@ class Diffundo:
                 safe_body,
                 cause=http_cause,
                 retry_after_s=_parse_retry_after(exc.headers) if status == 429 else None,
+                account_quota_owner=_account_quota_owner(error_body, api_key),
             )
         except urllib.error.URLError as exc:
             reason = exc.reason
@@ -992,6 +1125,7 @@ class Diffundo:
         *,
         cause: BaseException | None = None,
         retry_after_s: float | None = None,
+        account_quota_owner: str | None = None,
     ) -> ProviderError:
         if status in (301, 302, 303, 307, 308):
             # Reached only via _NoRedirectHandler: a completion endpoint that
@@ -1010,6 +1144,7 @@ class Diffundo:
                 f"HTTP 429: {message}",
                 cause,
                 retry_after_s=retry_after_s,
+                account_quota_owner=account_quota_owner,
             )
         # Cloudflare's browser-signature block is a provider/network error, not
         # evidence that the configured API credential is invalid.
@@ -1034,13 +1169,16 @@ class Diffundo:
 
     # -- health bookkeeping -------------------------------------------------- #
 
-    def _record_success(self, provider: ProviderConfig) -> None:
+    def _record_success(self, provider: ProviderConfig) -> str:
+        """Record one success; returns the provider's request-rate status."""
         runtime = self._runtime(provider.name)
         runtime.outcomes.append(True)
         if runtime.health in (HealthState.UNKNOWN, HealthState.COOLDOWN, HealthState.HALF_OPEN):
             runtime.health = HealthState.HEALTHY
+        return self.status(provider.name).value
 
-    def _record_failure(self, provider: ProviderConfig) -> None:
+    def _record_failure(self, provider: ProviderConfig) -> str:
+        """Record one failure; returns the provider's request-rate status."""
         runtime = self._runtime(provider.name)
         runtime.outcomes.append(False)
         now = time.monotonic()
@@ -1066,6 +1204,7 @@ class Diffundo:
         ):
             runtime.health = HealthState.OPEN
             runtime.open_until = now + provider.cooldown_s * self._open_backoff_base
+        return self.status(provider.name).value
 
     def _record_disable(self, provider: ProviderConfig) -> None:
         self._runtime(provider.name).health = HealthState.DISABLED
