@@ -670,12 +670,16 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class Diffundo:
-    """Stateless tiered provider router (no local cache — D1).
+    """Tiered provider router with a per-subagent primary association (D1).
 
     Per-instance state is limited to per-provider cooldown timers, circuit
-    breaker health, token buckets, and per-tier pause events (architecture
-    §8.1/§9, D8f). No attribute is a mutable mapping; there is no response
-    store anywhere.
+    breaker health, token buckets, per-tier pause events (architecture
+    §8.1/§9, D8f), and the task's primary provider association: one worker
+    process runs one task, so the router binds to one provider and keeps
+    sending the task's growing context to it, preserving per-provider
+    prompt-prefix caching. The association moves only when that provider
+    fails and a fallback serves. No attribute is a mutable mapping; there is
+    no response store anywhere.
     """
 
     def __init__(
@@ -695,13 +699,16 @@ class Diffundo:
             _ProviderRuntime(provider, breaker_window_size) for provider in self._providers
         )
         self._pauses = tuple(_PauseTracker() for _ in ProviderTier)
-        # Per-instance round-robin cursor for equal-priority candidates. Each
-        # worker process owns one Diffundo instance, so concurrent subagents
-        # interleave their requests across providers instead of all starting
-        # at the same provider (total token throughput); a caller may seed the
-        # cursor (e.g. from the task id) to desynchronize instances that start
-        # together.
+        # Per-subagent primary association: the provider this task is bound
+        # to. The first pick comes from the lowest-priority eligible run,
+        # rotated by ``rotation_seed`` (the worker seeds it from the task id)
+        # so concurrent subagents spread across providers at task granularity.
+        # The binding leads every subsequent candidate list while eligible and
+        # moves to whichever provider actually serves, so a task's context
+        # stays on one provider (prompt-prefix caching) and never bounces
+        # back to a recovered provider.
         self._rotation = rotation_seed
+        self._primary_provider: ProviderConfig | None = None
         self._call_budget_s = call_budget_s
         self._pause_timeout_s = pause_timeout_s
         self._breaker_window = breaker_window_size
@@ -748,6 +755,9 @@ class Diffundo:
                     raise CostBudgetExceeded(
                         result.provider, result.estimated_cost_usd, budget_usd
                     )
+                # The provider that served owns the task's context from here
+                # on (prompt-prefix caching locality).
+                self._primary_provider = provider
                 return result
             raise AllProvidersFailed(tried, last_error)
 
@@ -807,9 +817,18 @@ class Diffundo:
                 continue
             out.append(provider)
         out.sort(key=lambda provider: provider.priority)
-        # Round-robin within equal-priority runs: priority ordering across
-        # tiers/groups is preserved; providers with the same priority rotate
-        # their start position so repeated calls interleave across them.
+        if self._primary_provider is not None:
+            # Bound provider leads while eligible; otherwise plain priority
+            # order applies and the serving fallback becomes the new binding.
+            if self._primary_provider in out:
+                out = [
+                    self._primary_provider,
+                    *(p for p in out if p is not self._primary_provider),
+                ]
+            return out
+        # First pick: rotate the lowest equal-priority run by the seeded
+        # offset so concurrent subagents start at different providers;
+        # priority ordering across groups is preserved.
         if len(out) > 1:
             rotated: list[ProviderConfig] = []
             run_start = 0
@@ -827,7 +846,6 @@ class Diffundo:
                 rotated.extend(run)
                 run_start = run_end
             out = rotated
-        self._rotation += 1
         return out
 
     async def _await_candidates(
