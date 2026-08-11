@@ -102,5 +102,9 @@ def test_minimal_plan_missing_target_file_fails_cleanly(tmp_path) -> None:
 
     assert outcome["exit_msg"]["type"] == "exit_message"
     assert outcome["exit_msg"]["reason"] == "failed"
-    assert outcome["returncode"] == 1  # clean failed verdict, not a process crash
+    # A delivered terminal verdict is a clean protocol completion: the process
+    # exits 0 and the task outcome lives in the envelope status. The
+    # supervisor treats the correlated failed envelope as a verdict, never a
+    # crash, so no restart masks the diagnosis.
+    assert outcome["returncode"] == 0  # verdict delivered, not a process crash
     assert outcome["stderr"] == [], f"worker stderr must be clean: {outcome['stderr']!r}"

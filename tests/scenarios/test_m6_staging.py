@@ -324,7 +324,6 @@ def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) ->
         task_result = result.results[0]
         assert task_result.task_id == "m6-staging"
         assert task_result.status == "succeeded"
-        assert task_result.gate_exit_code == 0
         assert task_result.merge_sha
 
         main_sha = _git(repo, "rev-parse", "refs/heads/main").stdout.strip()

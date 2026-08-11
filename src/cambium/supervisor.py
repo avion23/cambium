@@ -129,7 +129,6 @@ class SliceResult:
     exit_code: int  # supervisor exit code: 0 only when everything succeeded
     worker_exit_code: int | None = None
     worker_status: str | None = None  # from the result_envelope (advisory)
-    gate_exit_code: int | None = None
     merge_sha: str | None = None
     timed_out: bool = False
     timeout_phase: str | None = None  # "ready" | "wall" | "heartbeat" | "pong" | "stdin"
@@ -269,7 +268,6 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
         exit_code=result.exit_code,
         worker_exit_code=None,
         worker_status=None,
-        gate_exit_code=result.gate_exit_code,
         merge_sha=result.merge_sha,
         timed_out=timeout_phase is not None,
         timeout_phase=timeout_phase,
@@ -481,7 +479,6 @@ class TaskResult:
     exit_code: int  # 0 succeeded; 1 failed
     reason: str | None = None
     merge_sha: str | None = None
-    gate_exit_code: int | None = None
     restarts: int = 0
 
 
@@ -565,7 +562,7 @@ class WorkerHandle:
 class _GenOutcome:
     """Outcome of one generation's drive loop."""
 
-    clean: bool  # worker delivered a verdict (result + exit + rc 0)
+    clean: bool  # worker delivered a terminal verdict (correlated envelope + exit message)
     fatal: bool = False  # restarting cannot help (spawn or terminal protocol error)
     reason: str | None = None
     timeout_phase: str | None = None
@@ -1125,6 +1122,22 @@ class _Runtime:
             if outcome.envelope is not None and outcome.correlated:
                 self._last_envelope = self._redact_envelope(outcome.envelope)
             if outcome.clean:
+                envelope_status = (
+                    outcome.envelope.get("status")
+                    if outcome.envelope is not None else None
+                )
+                if envelope_status != "succeeded":
+                    failure_reason = (
+                        outcome.envelope.get("failure_reason")
+                        if outcome.envelope is not None else None
+                    )
+                    if not isinstance(failure_reason, str) or not failure_reason:
+                        failure_reason = "worker_verdict_failed"
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason=failure_reason, restarts=restarts,
+                    )
+                    return
                 integrity = await self._worker_success_integrity(spec, worktree)
                 if integrity is not None:
                     await self.emit(
@@ -1133,26 +1146,19 @@ class _Runtime:
                     )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason=integrity, gate_exit_code=None, restarts=restarts,
+                        reason=integrity, restarts=restarts,
                     )
                     return
-                if outcome.envelope and outcome.envelope.get("status") == "succeeded":
-                    merged = await self._merge_task(spec, handle)
-                    if merged is not None:
-                        self._results[task_id] = TaskResult(
-                            task_id=task_id, status="succeeded", exit_code=0,
-                            reason=None, merge_sha=merged, gate_exit_code=0,
-                            restarts=restarts,
-                        )
-                    else:
-                        self._results[task_id] = TaskResult(
-                            task_id=task_id, status="failed", exit_code=1,
-                            reason="merge_failed", gate_exit_code=0, restarts=restarts,
-                        )
+                merged = await self._merge_task(spec, handle)
+                if merged is not None:
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="succeeded", exit_code=0,
+                        reason=None, merge_sha=merged, restarts=restarts,
+                    )
                 else:
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason="worker_verdict_failed", gate_exit_code=0, restarts=restarts,
+                        reason="merge_failed", restarts=restarts,
                     )
                 return
             if outcome.fatal:
@@ -1621,11 +1627,15 @@ class _Runtime:
         exit_code = proc.returncode
         handle.exit_code = exit_code
         handle.state = "EXITED"
-        clean = (
-            exit_code == 0
-            and exit_reason is not None
-            and envelope is not None
+        terminal_verdict = (
+            envelope is not None
             and correlated
+            and envelope.get("status") in ("succeeded", "failed", "cancelled")
+        )
+        clean = (
+            exit_reason is not None
+            and terminal_verdict
+            and (exit_code == 0 or envelope.get("status") != "succeeded")
         )
         if message_too_long:
             clean = False

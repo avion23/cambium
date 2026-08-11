@@ -403,7 +403,6 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
 
         assert result.exit_code == 0
         assert result.results[0].status == "succeeded"
-        assert result.results[0].gate_exit_code == 0
         assert merged.endswith("// provider-alpha\n")
 
         with REQUEST_LOCK:
@@ -583,7 +582,7 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
 
         assert result["status"] == "failed"
         assert "max turns exceeded" in result["failure_reason"]
-        assert rc == 1
+        assert rc == 0  # verdict delivered; the failure lives in the envelope
         with REQUEST_LOCK:
             assert len(REQUESTS) == 3
     finally:
@@ -618,7 +617,7 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
 
         assert result["status"] == "failed"
         assert "token budget exceeded" in result["failure_reason"]
-        assert rc == 1
+        assert rc == 0  # verdict delivered; the failure lives in the envelope
         # the second action (edit_file) was never executed
         assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
         with REQUEST_LOCK:
@@ -646,7 +645,7 @@ def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
 
         assert result["status"] == "failed"
         assert "missing usable token counts" in result["failure_reason"]
-        assert rc == 1
+        assert rc == 0  # verdict delivered; the failure lives in the envelope
         with REQUEST_LOCK:
             assert len(REQUESTS) == 1
     finally:
@@ -675,7 +674,7 @@ def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
 
         assert result["status"] == "failed"
         assert "wall budget exceeded" in result["failure_reason"]
-        assert rc == 1
+        assert rc == 0  # verdict delivered; the failure lives in the envelope
         with REQUEST_LOCK:
             assert len(REQUESTS) == 1
     finally:

@@ -58,8 +58,9 @@ The worker owns exactly one fenced commit of the resulting changes.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
-process exit code is 0 when the task status is "succeeded" or when the exit
-is a graceful supervisor- or worker-initiated close (shutdown, idle).
+process exit code is 0 when the worker delivered a terminal result envelope
+(the task outcome lives in the envelope ``status``) or when the exit is a
+graceful supervisor- or worker-initiated close (shutdown, idle).
 """
 
 from __future__ import annotations
@@ -1460,7 +1461,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             except Exception as exc:
                 return await _fatal(writer, {}, f"task crashed: {exc}")
             await _emit_result(writer, outcome)
-            return EXIT_CODES.get(outcome["status"], 1)
+            return 0
 
         try:
             msg = read_task.result()

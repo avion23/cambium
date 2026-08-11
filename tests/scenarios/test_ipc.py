@@ -471,7 +471,7 @@ def test_worker_cancel_acks_ok_then_aborts(tmp_path) -> None:
             assert exit_msg["reason"] == "cancelled"
 
             rc = await w.proc.wait()
-            assert rc == 4
+            assert rc == 0  # cancelled verdict delivered; outcome lives in the envelope
         finally:
             await w.stop()
 
@@ -547,7 +547,7 @@ def test_worker_steer_action_cancel_aborts(tmp_path) -> None:
             exit_msg = await w.recv()
             assert exit_msg["reason"] == "cancelled"
             rc = await w.proc.wait()
-            assert rc == 4
+            assert rc == 0  # cancelled verdict delivered; outcome lives in the envelope
         finally:
             await w.stop()
 
@@ -648,7 +648,7 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
             assert result["status"] == "failed"
             assert "generation mismatch" in result["failure_reason"]
             assert "// cambium-ipc" not in (worktree / "hello.txt").read_text()
-            assert await w.proc.wait() == 1
+            assert await w.proc.wait() == 0  # failed verdict delivered cleanly
         finally:
             await w.stop()
 
@@ -694,7 +694,7 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
             result, _ = await w.recv_result()
             assert result["status"] == "failed"
             assert "generation mismatch" in result["failure_reason"]
-            assert await w.proc.wait() == 1
+            assert await w.proc.wait() == 0  # failed verdict delivered cleanly
         finally:
             hook_release.touch()
             await w.stop()
@@ -753,7 +753,7 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
             result, _ = await w.recv_result()
             assert result["status"] == "failed"
             assert "generation mismatch" in result["failure_reason"]
-            assert await w.proc.wait() == 1
+            assert await w.proc.wait() == 0  # failed verdict delivered cleanly
         finally:
             hook_release.touch()
             await w.stop()
