@@ -216,6 +216,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ["cmd"],
         ),
     },
+    {
+        "name": "read_batch",
+        "description": (
+            "Read multiple UTF-8 text files inside the worker worktree in one call. "
+            "Prefer this over several read_file calls when related files are needed."
+        ),
+        "parameters": _parameters(
+            {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "File paths to read, in order.",
+                },
+            },
+            ["paths"],
+        ),
+    },
 ]
 
 

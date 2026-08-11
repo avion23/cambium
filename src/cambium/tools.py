@@ -655,8 +655,31 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(True, output)
 
 
+async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    paths = args["paths"]
+    if not paths:
+        raise _ToolFailure("read_batch requires at least one path")
+    semaphore = asyncio.Semaphore(BATCH_READ_MAX_CONCURRENCY)
+
+    async def _bounded_read(path: str) -> ToolResult:
+        async with semaphore:
+            return await _run_read_result({"path": path}, ctx)
+
+    results = await asyncio.gather(*(_bounded_read(path) for path in paths))
+    parts: list[str] = []
+    ok = True
+    for path, result in zip(paths, results):
+        body = result.output if result.ok else (result.error or "read failed")
+        parts.append(f"--- {path} ---\n{body}")
+        if not result.ok:
+            ok = False
+    output = _truncate_text("\n\n".join(parts), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER)
+    return _Outcome(ok=ok, output=output)
+
+
 TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "read_file": _read_file,
+    "read_batch": _read_batch,
     "write_file": _write_file,
     "edit_file": _edit_file,
     "grep_code": _grep_code,
