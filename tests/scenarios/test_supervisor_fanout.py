@@ -772,7 +772,12 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
 @pytest.mark.slow
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage_only")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.1")
+    # 1.0s (not 0.1s): under parallel/loaded runs the ready-timeout must not
+    # fire before the stdout reader has parsed at least one garbage line —
+    # the test asserts parse_error events landed. The worker emits one line
+    # per 10ms, so ~100 parse errors accrue within the window, still far
+    # below the 500-event kill cap.
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "1.0")
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
