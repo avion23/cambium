@@ -249,6 +249,7 @@ def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> Non
     )
 
 
+@pytest.mark.slow
 def test_durable_usage_events_redacted_and_missing_fields_omitted(
     tmp_path, monkeypatch
 ) -> None:

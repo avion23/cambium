@@ -80,6 +80,7 @@ def test_append_read_back_fields_and_monotonic_seq(tmp_path) -> None:
         store.close()
 
 
+@pytest.mark.slow
 def test_crash_durability_critical_events_survive(tmp_path) -> None:
     path = tmp_path / "crash" / "events.db"
     n = 50
@@ -126,7 +127,7 @@ def test_non_critical_append_does_not_block_on_fsync(tmp_path, monkeypatch) -> N
 
     def slow_fsync(self) -> None:
         calls["n"] += 1
-        time.sleep(0.5)
+        time.sleep(0.1)
 
     monkeypatch.setattr(EventStore, "_fsync_now", slow_fsync)
     try:
@@ -134,12 +135,12 @@ def test_non_critical_append_does_not_block_on_fsync(tmp_path, monkeypatch) -> N
         seq = store.append({"kind": "log", "payload": {"line": "x"}})
         elapsed = time.monotonic() - start
         assert seq == 1
-        assert elapsed < 0.2  # returned without waiting on the writer's fsync
+        assert elapsed < 0.05  # returned without waiting on the writer's fsync
 
         start = time.monotonic()
         store.append({"kind": "result", "payload": {"ok": True}})
         blocked = time.monotonic() - start
-        assert blocked >= 0.4  # the slow fsync is in effect; critical append waits
+        assert blocked >= 0.08  # the slow fsync is in effect; critical append waits
         assert calls["n"] >= 1
     finally:
         store.close()
@@ -197,15 +198,16 @@ def test_corrupt_db_init_raises_not_hangs(tmp_path) -> None:
     assert time.monotonic() - start < 5.0
 
 
+@pytest.mark.slow
 def test_writer_dead_on_locked_db_critical_append_raises(
     tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "events.db"
     # The writer's SQLite busy timeout is what bounds the wait on the locked
-    # DB; 5s (production default) is an implementation detail, not the signal.
-    # The signal is: the append waits the busy timeout, then raises, and the
-    # store is dead afterwards.
-    monkeypatch.setattr(store_module, "_WRITER_BUSY_TIMEOUT_MS", 1000)
+    # DB; the value is an implementation detail, not the signal. The signal
+    # is: the append waits the busy timeout, then raises, and the store is
+    # dead afterwards.
+    monkeypatch.setattr(store_module, "_WRITER_BUSY_TIMEOUT_MS", 200)
     store = _open(path)
     blocker = sqlite3.connect(path, isolation_level=None)
     try:
@@ -217,7 +219,7 @@ def test_writer_dead_on_locked_db_critical_append_raises(
         # Lower bound proves the append waited the busy timeout rather than
         # failing instantly; the upper bound allows the hard append deadline
         # (10s) to fire under load without flaking the bound.
-        assert 0.8 <= elapsed < 30.0  # bounded by busy_timeout, not a hang
+        assert 0.15 <= elapsed < 30.0  # bounded by busy_timeout, not a hang
     finally:
         blocker.close()
     # store is dead: subsequent appends fail immediately, and close() surfaces
@@ -230,6 +232,7 @@ def test_writer_dead_on_locked_db_critical_append_raises(
         store.close()
 
 
+@pytest.mark.slow
 def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
     tmp_path, monkeypatch
 ) -> None:
@@ -237,7 +240,7 @@ def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
     # Shorten the writer busy timeout (see the dead-writer test above) so the
     # locked-DB writer failure is observed quickly; the drop accounting and
     # sequence burn do not depend on the timeout value.
-    monkeypatch.setattr(store_module, "_WRITER_BUSY_TIMEOUT_MS", 1000)
+    monkeypatch.setattr(store_module, "_WRITER_BUSY_TIMEOUT_MS", 200)
     store = EventStore(path, fsync_interval_s=60.0)
     blocker = sqlite3.connect(path, isolation_level=None)
     try:
@@ -295,7 +298,7 @@ def test_stalled_writer_flood_drops_non_critical_preserves_critical(
             target=lambda: store.append({"kind": "result", "payload": {"c": 0}})
         )
         starter.start()
-        assert stalled.wait(5.0)  # writer is now blocked in C0's fsync
+        assert stalled.wait(0.6)  # writer is now blocked in C0's fsync
 
         start = time.monotonic()
         for i in range(40):
@@ -326,6 +329,7 @@ def test_stalled_writer_flood_drops_non_critical_preserves_critical(
     assert [e["kind"] for e in events] == ["result"] + ["log"] * 7 + ["result"]
 
 
+@pytest.mark.slow
 def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatch) -> None:
     store = EventStore(
         tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.5
@@ -361,6 +365,7 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
     assert len([e for e in events if e["kind"] == "result"]) == 2
 
 
+@pytest.mark.slow
 def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
     path = tmp_path / "events.db"
     store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=1.0)
@@ -409,7 +414,7 @@ def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) ->
 
     def fail_final_fsync(self) -> None:
         fsync_started.set()
-        release.wait(5.0)
+        release.wait(1.0)
         raise OSError(28, "No space left on device")
 
     def close_store(name: str, done: threading.Event | None = None) -> None:
@@ -428,7 +433,7 @@ def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) ->
         first.start()
         assert fsync_started.wait(1.0)
         second.start()
-        assert not second_done.wait(0.1)
+        assert not second_done.wait(0.05)
 
         release.set()
         first.join(2.0)
@@ -448,6 +453,7 @@ def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) ->
             store._thread.join(2.0)
 
 
+@pytest.mark.slow
 def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
     store = EventStore(
@@ -499,6 +505,7 @@ def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monke
             store._thread.join(5.0)
 
 
+@pytest.mark.slow
 def test_close_release_during_stop_join_does_not_report_writer_not_stopped(
     tmp_path, monkeypatch
 ) -> None:
@@ -731,7 +738,7 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(5.0)
+        release.wait(1.0)
         real_fsync(self)
 
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
@@ -752,7 +759,7 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
 
     try:
         starter.start()
-        assert stalled.wait(5.0)
+        assert stalled.wait(0.6)
         accepted = [
             store.append({"kind": "log", "payload": {"i": 1}}),
             store.append({"kind": "log", "payload": {"i": 2}}),
@@ -765,7 +772,7 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
         closer.start()
         assert not closer_done.wait(0.05)  # sentinel is waiting, not evicting
         release.set()
-        assert closer_done.wait(5.0)
+        assert closer_done.wait(1.0)
         closer.join(1.0)
         starter.join(1.0)
         assert not starter.is_alive()
@@ -792,7 +799,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(5.0)
+        release.wait(1.0)
         real_fsync(self)
 
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
@@ -803,7 +810,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
     )
     try:
         starter.start()
-        assert stalled.wait(5.0)
+        assert stalled.wait(0.6)
         accepted = store.append({"kind": "log", "payload": {"i": 1}})
         dropped = store.append({"kind": "log", "payload": {"i": 2}})
         assert accepted == 2
@@ -826,6 +833,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
     assert [event["seq"] for event in reopened.events_after(2)] == [3]
 
 
+@pytest.mark.slow
 def test_failed_eviction_reservation_restores_event_and_sequence(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
     store = EventStore(
@@ -878,6 +886,7 @@ def test_failed_eviction_reservation_restores_event_and_sequence(tmp_path, monke
     assert [event["seq"] for event in reopened.events_after(0)] == [1, 2, 3]
 
 
+@pytest.mark.slow
 def test_writer_death_during_blocked_eviction_persistence_burns_sequence(
     tmp_path, monkeypatch
 ) -> None:
@@ -955,6 +964,7 @@ def test_writer_death_during_blocked_eviction_persistence_burns_sequence(
     assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
 
 
+@pytest.mark.slow
 def test_close_retries_pending_sequence_persistence_after_reservation_lock(
     tmp_path, monkeypatch
 ) -> None:
@@ -1053,6 +1063,7 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
     assert [event["seq"] for event in reopened.events_after(0)] == [1, 3]
 
 
+@pytest.mark.slow
 def test_eviction_reservation_respects_critical_deadline_and_close_bound(
     tmp_path, monkeypatch
 ) -> None:
@@ -1144,6 +1155,7 @@ def test_eviction_reservation_respects_critical_deadline_and_close_bound(
             store._thread.join(5.0)
 
 
+@pytest.mark.slow
 def test_close_full_critical_queue_is_bounded(tmp_path, monkeypatch) -> None:
     store = EventStore(
         tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
@@ -1340,7 +1352,7 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(5.0)
+        release.wait(1.0)
         real_fsync(self)
 
     def append_result(value: int, started: threading.Event) -> None:
@@ -1487,6 +1499,7 @@ def test_redactor_runs_before_storage_on_long_strings_with_shaped_key(tmp_path) 
     assert opaque_key not in request_id
 
 
+@pytest.mark.slow
 def test_session_artifacts_are_private_under_permissive_umask(tmp_path) -> None:
     """umask 0022 must not widen .cambium (0700) or events.db/-wal/-shm (0600)."""
     session = tmp_path / "session"
@@ -1513,6 +1526,7 @@ def test_session_artifacts_are_private_under_permissive_umask(tmp_path) -> None:
     assert proc.returncode == 0, proc.stderr
 
 
+@pytest.mark.slow
 def test_reopen_repairs_preseeded_permissive_artifacts(tmp_path) -> None:
     """A crash leaves -wal/-shm behind; a permissive preseed must be repaired on reopen."""
     session = tmp_path / "session"

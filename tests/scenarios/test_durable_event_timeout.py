@@ -51,6 +51,7 @@ def _worker_commit(repo: Path, branch: str, wt: Path, files: dict[str, str], fro
     return _rev(wt, "HEAD")
 
 
+@pytest.mark.slow
 def test_durable_event_timeout_fails_merge_closed_but_event_lands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -69,7 +70,7 @@ def test_durable_event_timeout_fails_merge_closed_but_event_lands(
     real_append = EventStore.append
 
     def slow_append(instance: EventStore, event: dict) -> int | None:
-        time.sleep(0.5)  # comfortably exceed the 0.2s durable-emit wait
+        time.sleep(0.3)  # comfortably exceed the 0.2s durable-emit wait
         return real_append(instance, event)
 
     monkeypatch.setattr(EventStore, "append", slow_append)
@@ -84,7 +85,7 @@ def test_durable_event_timeout_fails_merge_closed_but_event_lands(
         finally:
             # Keep the loop alive so the in-flight emit (still waiting on the
             # slow append) completes and appends the event before shutdown.
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.6)
 
     try:
         with pytest.raises(StagingCleanupError) as excinfo:
@@ -92,7 +93,7 @@ def test_durable_event_timeout_fails_merge_closed_but_event_lands(
         cause = excinfo.value.__cause__
         assert isinstance(cause, RuntimeError)
         assert "not persisted within 0.2s" in str(cause)
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 3.0
         landed: list[dict] = []
         while time.monotonic() < deadline:
             landed = [
