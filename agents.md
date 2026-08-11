@@ -65,6 +65,8 @@ list/latest/show` reads completed session results); prefer it over the internal
 supervisor module.
 Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
 child imports resolve without an install.
+Root `conftest.py` exports `src` on `PYTHONPATH` so scenario subprocesses
+import `cambium` without a manual export.
 
 ## Current entry points and behavior
 
