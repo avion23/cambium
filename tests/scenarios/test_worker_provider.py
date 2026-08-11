@@ -1070,7 +1070,10 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
         _enqueue('{"type":"finish","summary":"read and edited target.txt"}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
-            RESPONSE_DELAY_S = 0.05
+            # 0.5s tool window vs the 0.05s heartbeat cadence: under load the
+            # heartbeat loop must still tick at least once inside read_file/
+            # edit_file for the tool-carrying heartbeat assertions to hold.
+            RESPONSE_DELAY_S = 0.5
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
