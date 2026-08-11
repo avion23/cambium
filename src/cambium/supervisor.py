@@ -611,6 +611,7 @@ class _Runtime:
         redactor: Redactor | None = None,
         resource_thresholds: dict[str, Any] | None = None,
         provider_environment: Mapping[str, str] | None = None,
+        max_concurrent_tasks: int | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -623,6 +624,9 @@ class _Runtime:
             None if provider_environment is None else dict(provider_environment)
         )
         self._event_append_lock = asyncio.Lock()
+        self._admission_semaphore = (
+            None if max_concurrent_tasks is None else asyncio.Semaphore(max_concurrent_tasks)
+        )
         self._handles: dict[str, WorkerHandle] = {}
         self._results: dict[str, TaskResult] = {}
         self._worktree_lock = asyncio.Lock()
@@ -1058,21 +1062,28 @@ class _Runtime:
     async def supervise_task(self, spec: dict[str, Any]) -> None:
         if spec["task_id"] in self._results:
             return
+        semaphore = self._admission_semaphore
+        if semaphore is not None:
+            await semaphore.acquire()
         try:
-            await self._supervise(spec)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self.emit(
-                "worker_failed", task_id=spec["task_id"], reason=f"supervisor error: {exc!r}"
-            )
-            self._results[spec["task_id"]] = TaskResult(
-                task_id=spec["task_id"], status="failed", exit_code=1,
-                reason=f"supervisor error: {exc.__class__.__name__}",
-            )
+            try:
+                await self._supervise(spec)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.emit(
+                    "worker_failed", task_id=spec["task_id"], reason=f"supervisor error: {exc!r}"
+                )
+                self._results[spec["task_id"]] = TaskResult(
+                    task_id=spec["task_id"], status="failed", exit_code=1,
+                    reason=f"supervisor error: {exc.__class__.__name__}",
+                )
+            finally:
+                if spec["task_id"] in self._results:
+                    await self._prune_worktree(spec)
         finally:
-            if spec["task_id"] in self._results:
-                await self._prune_worktree(spec)
+            if semaphore is not None:
+                semaphore.release()
 
     async def _supervise(self, spec: dict[str, Any]) -> None:
         task_id = spec["task_id"]
@@ -2163,6 +2174,7 @@ async def run_plan(
     *,
     resource_thresholds: dict[str, Any] | None = None,
     provider_environment: Mapping[str, str] | None = None,
+    max_concurrent_tasks: int | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -2178,6 +2190,10 @@ async def run_plan(
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
     canonical root result is written atomically to
     ``<session_dir>/.cambium/result.json`` before this coroutine returns.
+
+    ``max_concurrent_tasks`` bounds how many tasks are supervised at once
+    (a session-wide parallel-worker cap, I2.3). Defaults to one per CPU;
+    pass ``None`` for unlimited concurrency.
     """
     session_dir = Path(session_dir)
     tasks = _plan_tasks(plan)
@@ -2185,6 +2201,12 @@ async def run_plan(
     specs = [_validate_plan_task(session_dir, t) for t in tasks]
     if not specs:
         raise ValueError("plan contains no tasks")
+    if max_concurrent_tasks is not None and (
+        not isinstance(max_concurrent_tasks, int) or max_concurrent_tasks < 1
+    ):
+        raise ValueError("max_concurrent_tasks must be a positive int or None")
+    if max_concurrent_tasks is None:
+        max_concurrent_tasks = max(1, os.cpu_count() or 1)
 
     admission = _SessionAdmission(session_dir)
     admission.acquire()
@@ -2200,6 +2222,7 @@ async def run_plan(
             redactor=redactor,
             resource_thresholds=resource_thresholds,
             provider_environment=provider_environment,
+            max_concurrent_tasks=max_concurrent_tasks,
         )
         await runtime.start()
         cancelled = False
