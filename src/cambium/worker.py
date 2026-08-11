@@ -92,9 +92,8 @@ success or failure.
 The worker owns at most one fenced commit of the resulting changes; a
 successful provider loop that leaves no non-``.cambium`` changes owns none.
 A true no-op succeeds only while the worktree HEAD still resolves to the
-base commit and writes no final transcript checkpoint (the raw transcript
-may echo credentials back); an advanced HEAD is reported as a failure so no
-unfenced commit is ever merged.
+base commit and writes no final transcript checkpoint; an advanced HEAD is
+reported as a failure so no unfenced commit is ever merged.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -141,6 +140,7 @@ from cambium.ipc import (
 )
 from cambium.lint_diag import LintDiag
 from cambium.provider_config import load_providers
+from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import TOOL_SCHEMAS
 from cambium.tools import ToolContext, ToolResult, run_tool
 
@@ -283,6 +283,30 @@ def _provider_fanout_config(run: dict[str, Any]) -> dict[str, Any] | None:
     return config
 
 
+def _provider_env_keys(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(key for key in value if isinstance(key, str))
+
+
+def _checkpoint_redactor(
+    provider_env_keys: tuple[str, ...], credentials: Any = None
+) -> Redactor:
+    """Build the worker's immutable redactor from its authorized credentials."""
+    secret_values = [
+        value
+        for key in provider_env_keys
+        if isinstance(value := os.environ.get(key), str) and value
+    ]
+    if isinstance(credentials, dict):
+        secret_values.extend(
+            value
+            for key, value in credentials.items()
+            if key in provider_env_keys and isinstance(value, str) and value
+        )
+    return build_session_redactor(secret_values)
+
+
 def _provider_path() -> Path:
     configured = os.environ.get("CAMBIUM_PROVIDERS")
     if not configured:
@@ -388,6 +412,8 @@ class AgentConfig:
     # Supervisor-level admission balancing (solution C): the provider this
     # task was assigned at admission; presets Diffundo's sticky primary.
     assigned_provider: str | None = None
+    provider_env_keys: tuple[str, ...] = ()
+    redactor: Redactor | None = None
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -411,6 +437,7 @@ class AgentConfig:
         assigned_provider = init.get("assigned_provider")
         if assigned_provider is not None and not isinstance(assigned_provider, str):
             raise ValueError("init assigned_provider must be a string")
+        provider_env_keys = _provider_env_keys(init.get("provider_env_keys"))
         session_id = os.environ.get("CAMBIUM_SESSION_ID")
         checkpoint_root = (
             Path(session_id).resolve() / ".cambium" / "checkpoints" if session_id else None
@@ -441,6 +468,8 @@ class AgentConfig:
                 "init max_transcript_chars",
                 MAX_TRANSCRIPT_CHARS,
             ),
+            provider_env_keys=provider_env_keys,
+            redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
         )
 
 
@@ -485,11 +514,14 @@ def _merge_task_config(
         max_wall_s=max_wall_s,
         checkpoint_root=config.checkpoint_root,
         max_transcript_chars=config.max_transcript_chars,
+        provider_env_keys=config.provider_env_keys,
+        redactor=config.redactor,
     )
 
 
 def _config_from_run(run: dict[str, Any]) -> AgentConfig:
     """Fallback config when do_work is invoked directly (no init message)."""
+    provider_env_keys = _provider_env_keys(run.get("provider_env_keys"))
     return AgentConfig(
         task_id=str(run.get("task_id", "unknown")),
         generation=_positive_int(run.get("generation"), "run_task generation", 1),
@@ -509,6 +541,8 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
             run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
         ),
         checkpoint_root=None,
+        provider_env_keys=provider_env_keys,
+        redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
     )
 
 
@@ -978,6 +1012,8 @@ def _write_checkpoint_file(
         "usage": usage,
         "commits_so_far": commits_so_far,
     }
+    redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
+    payload = redactor.redact_mapping(payload)
     _atomic_json_write(path, json.dumps(payload, sort_keys=True, indent=2))
     return path
 
@@ -1550,8 +1586,8 @@ def _finalize_worktree(
             return outcome
         if not changed:
             _require_generation(worktree, generation)
-            # True no-op: no final checkpoint is written — the raw transcript
-            # may echo credentials back. The summary stays in the envelope.
+            # True no-op: no final checkpoint is written. The summary stays in
+            # the envelope.
             outcome.update(
                 status="succeeded",
                 failure_reason=None,
