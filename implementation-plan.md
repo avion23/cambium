@@ -45,6 +45,13 @@ is not a branch ledger or merge log.
   pre-assigns each wave's un-pinned tasks in one pass, and 429 pressure
   decays a lane's in-flight cap (`routing.select_lane`). The existing `rpm`
   provider field is the lane allowance.
+- Capability/quality-constrained selection (H2): tasks may declare
+  `requirements` (quality high/normal, optional `min_context_window`); the
+  supervisor filters providers strictly by capability (fail-closed on unknown
+  keys) and picks the lowest `routing.score_providers` score — utilization,
+  cache-hit rate, latency, and a shadow price — instead of `select_lane`, with
+  placeholder module-constant weights until measured quality/latency data
+  exists (step 5).
 - Test 429 `Retry-After`, same-provider retry, `RATE_LIMITED` buckets, and
   provider fallback against the contract. Do not introduce weighted routing
   until the usage and quota evidence is stable; configured priority remains the

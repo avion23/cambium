@@ -82,7 +82,14 @@ from .redact import (
     build_session_redactor,
 )
 from .results import EXIT_CODES, Result, write_result
-from .routing import DebtStore, LaneState, ProviderDebt, select_lane
+from .routing import (
+    DebtStore,
+    LaneState,
+    ProviderDebt,
+    score_providers,
+    select_lane,
+    validate_requirements,
+)
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
     _ENVELOPE_KEYS,
@@ -1505,6 +1512,8 @@ class _Runtime:
                 assigned_payload["model"] = fanout_config["model"]
             if isinstance(spec.get("assigned_provider"), str):
                 assigned_payload["assigned_provider"] = spec["assigned_provider"]
+            if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
+                assigned_payload["requirements"] = spec["requirements"]
             await self.emit("task_assigned", **assigned_payload)
             restarts = 0
             worker_summary: str | None = None
@@ -2528,6 +2537,14 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
                 f"task {task_id} model_candidates must be a non-empty list of model ids"
             )
         spec["model_candidates"] = list(model_candidates)
+    requirements = spec.get("requirements")
+    if requirements is not None:
+        try:
+            requirements = validate_requirements(requirements)
+        except ValueError as exc:
+            raise ValueError(f"task {task_id}: {exc}") from exc
+        if requirements:
+            spec["requirements"] = requirements
     spec.setdefault("base_commit", None)
     spec.setdefault("write_marker", True)
     return spec
@@ -2553,14 +2570,17 @@ def _resolve_model_candidates(
     """Resolve a task's (provider, model) when it declares ``model_candidates``
     and its fanout_config carries no pinned model.
 
-    The max-min pick comes from the usage-debt ledger (``routing.select_lane``)
-    against the same provider config the worker will load, before the model
-    filter partitions the pool (solution C), and skips providers whose lane is
-    at or above its effective in-flight cap (H1). Mutates ``spec`` in place:
-    writes the chosen model into ``fanout_config`` and records the chosen
-    provider as ``assigned_provider``. Returns True when an assignment was
-    written; pinned tasks (``fanout_config.model`` set) and tasks without a
-    fanout_config are left untouched and return False.
+    The pick comes from the usage-debt ledger against the same provider config
+    the worker will load, before the model filter partitions the pool (solution
+    C), and skips providers whose lane is at or above its effective in-flight
+    cap (H1). When the task declares ``requirements``, the pick is the lowest
+    ``routing.score_providers`` score among providers that satisfy the task's
+    capability constraints (H2, STRICT filter); otherwise it is the max-min
+    ``routing.select_lane`` pick as before. Mutates ``spec`` in place: writes
+    the chosen model into ``fanout_config`` and records the chosen provider as
+    ``assigned_provider``. Returns True when an assignment was written; pinned
+    tasks (``fanout_config.model`` set) and tasks without a fanout_config are
+    left untouched and return False.
     """
     fanout_config = spec.get("fanout_config")
     candidates = spec.get("model_candidates")
@@ -2573,7 +2593,16 @@ def _resolve_model_candidates(
         return False
     providers = load_providers(_provider_config_path(os.environ, spec))
     _ensure_lanes(lanes, providers)
-    provider_name, model = select_lane(providers, candidates, debt, lanes)
+    requirements = spec.get("requirements")
+    if requirements:
+        # H2: capability/quality-constrained scoring — pick the lowest score
+        # among providers that satisfy the task's requirements (STRICT filter,
+        # fail-closed); never fall back to a provider that fails them.
+        provider_name, model, _score = score_providers(
+            providers, candidates, debt, lanes, requirements=requirements
+        )[0]
+    else:
+        provider_name, model = select_lane(providers, candidates, debt, lanes)
     spec["fanout_config"] = {**fanout_config, "model": model}
     spec["assigned_provider"] = provider_name
     return True
