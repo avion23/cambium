@@ -81,6 +81,10 @@ non-critical (loss window ≤ `fsync_interval_s`, default 1 s).
 | 19 | `drop` | NC | dropped kind/count/reason/queue depth; non-critical overflow marker. |
 | 20 | `recovery_gap` | C | missing seq range, last durable seq, source (`replay|snapshot`); changes replay semantics. |
 | 21 | `eof_seen` | NC | stream, generation, grace deadline, process poll result; layer-4 advisory. |
+| 22 | `child_admitted` | C | `parent_task_id`, `child_task_id`, `child_kind`, `branch`, `request_id`; validated dynamic tree revision, durably recorded before spawn (plan step 2). |
+| 23 | `child_rejected` | C | `parent_task_id`, `child_task_id`, `child_kind`, `reason` (`DuplicateTaskError`, `DepthBoundError`, `NoActiveTaskGroup`, `ParentTerminatedWithoutResult`, ...), bounded `message`, `request_id`; spawn nothing. |
+| 24 | `child_result` | NC | exact strict envelope key set (I2.7: `parent_task_id`, `unified_diff`, `diff_truncated`, `summary`, `metric_score`, `metric_breakdown`, `commits`, `files_changed`, `status`); child's upward result, visible only to its parent. |
+| 25 | `usage_event` | NC | per provider call: `turn`, `provider`, `model`, allowlisted `usage` token fields, `estimated_cost_usd`, `latency_s`, `retry_after_s`, `request_rate_status`, `account_quota_owner`, `prompt_prefix_bytes`, `provider_cache_hit`, `failure_reason`; unproduced fields omitted (plan step 3). Redacted; never credentials. | |
 
 `worker_started.liveness` encodes `{process_alive, ipc_ready, checkpoint_seen,
 exit_message, eof_seen, watchdog_armed:{interval_s,timeout_s}}`; EOF starts escalation,
