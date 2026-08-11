@@ -67,7 +67,10 @@ def test_doctor_exits_zero_without_example_module(tmp_path, monkeypatch) -> None
     shutil.copytree(
         REPO_ROOT / "src" / "cambium",
         package,
-        ignore=shutil.ignore_patterns("example", "__pycache__"),
+        # Drop the whole decision-module tree: with a second module in the
+        # checkout, excluding only ``example`` no longer yields the
+        # no-datasets state this scenario asserts.
+        ignore=shutil.ignore_patterns("modules", "__pycache__"),
     )
     environment = {
         name: value
