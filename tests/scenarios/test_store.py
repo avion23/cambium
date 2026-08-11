@@ -368,7 +368,7 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
 @pytest.mark.slow
 def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=0.6)
+    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=0.3)
     reader = sqlite3.connect(path)
     try:
         reader.execute("BEGIN")
@@ -377,7 +377,7 @@ def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
         with pytest.raises(StoreError):  # StoreTimeout is a StoreError
             store.append({"kind": "result", "payload": {"ok": True}})
         elapsed = time.monotonic() - start
-        assert 0.5 <= elapsed < 10.0  # no ack, no hang
+        assert 0.25 <= elapsed < 10.0  # no ack, no hang
     finally:
         reader.rollback()
         reader.close()

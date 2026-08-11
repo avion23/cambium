@@ -263,7 +263,7 @@ def test_durable_usage_events_redacted_and_missing_fields_omitted(
         )
         # turn 2: 429 with Retry-After + reported quota owner, then a same-provider
         # retry succeeds (max_retries=1)
-        _enqueue_error(_rate_limit_error(), status=429, headers={"Retry-After": "1"})
+        _enqueue_error(_rate_limit_error(), status=429, headers={"Retry-After": "0"})
         _enqueue(
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"target.txt","old_string":"fixture\\n",'
@@ -280,7 +280,12 @@ def test_durable_usage_events_redacted_and_missing_fields_omitted(
         base = _make_repo(repo)
         task = _task(session_dir, repo, base, config_path)
         task["max_restarts"] = 0
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
 
         # the failing turn means the task fails, but the events are durable
@@ -316,7 +321,7 @@ def test_durable_usage_events_redacted_and_missing_fields_omitted(
         assert "failure_reason" not in first
 
         retried = usage_events[1]["payload"]
-        assert retried["retry_after_s"] == 1.0
+        assert retried["retry_after_s"] == 0.0
         assert retried["account_quota_owner"] == "org-acme"
         assert retried["usage"]["cached_tokens"] == 3
         assert retried["provider_cache_hit"] is True  # provider-reported cache hit

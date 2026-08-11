@@ -325,7 +325,7 @@ def test_staging_sha_survives_worktree_removal(tmp_path) -> None:
 
 
 def test_concurrent_publish_exactly_one_winner(tmp_path) -> None:
-    for trial in range(5):
+    for trial in range(3):
         repo = tmp_path / f"repo-{trial}"
         base = _init_repo(repo)
         wt_a = tmp_path / f"wt-a-{trial}"

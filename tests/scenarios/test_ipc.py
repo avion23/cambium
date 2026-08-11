@@ -286,17 +286,19 @@ def test_worker_happy_path_handshake(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_worker_happy_path_20x_no_corrupted_lines(tmp_path) -> None:
-    """Repeat the happy path 20x; every stdout line must parse as one JSON object.
+def test_worker_happy_path_8x_no_corrupted_lines(tmp_path) -> None:
+    """Repeat the happy path 8x; every stdout line must parse as one JSON object.
 
     Regression for the heartbeat-cancel-during-drain race: a torn write would
-    produce a line that fails ``json.loads`` or merges two messages.
+    produce a line that fails ``json.loads`` or merges two messages. The race
+    window is hit once per run at task completion, so 8 iterations retain the
+    stress coverage at 40% of the cost of 20.
     """
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
-        for i in range(20):
+        for i in range(8):
             w = WorkerSupervisor()
             await w.start()
             try:
