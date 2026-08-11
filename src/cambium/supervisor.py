@@ -51,7 +51,7 @@ from cambium.provider_config import DEFAULT_PROVIDER_PATH
 from cambium.system_health import can_run_heavy
 
 from .auth import scrub_environment
-from .ipc import MAX_LINE_BYTES
+from .ipc import MAX_LINE_BYTES, write_message
 from .merge import MergeSequencer
 from .modules.base import _is_secret_shaped
 from .redact import Redactor, build_session_redactor
@@ -73,7 +73,7 @@ WORKER_STDOUT_QUEUE_MAXSIZE = max(1, MAX_LINE_BYTES // (256 * 1024))
 OUTBOUND_MESSAGE_TOO_LONG = "outbound_message_too_long"
 STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
-PROCESS_REAP_TIMEOUT_S = 5.0
+DURABLE_EVENT_TIMEOUT_S = 5.0
 
 EventSink = Callable[[dict[str, Any]], None]
 
@@ -174,11 +174,14 @@ async def _write_json(
     *,
     deadline: float | None = None,
 ) -> bool:
-    """Write one wire message before ``deadline`` or kill its process group."""
+    """Write one wire message before ``deadline`` or kill its process group.
+
+    Framing is delegated to :func:`cambium.ipc.write_message`; the oversize
+    pre-check, deadline-bounded drain, and kill-on-failure stay local.
+    """
     if proc.stdin is None or proc.stdin.is_closing():
         return False
-    frame = _encode_json_frame(msg)
-    if frame is None:
+    if _encode_json_frame(msg) is None:
         await _kill_worker(proc)
         return False
     loop = asyncio.get_running_loop()
@@ -190,7 +193,7 @@ async def _write_json(
         await _kill_worker(proc)
         return False
     try:
-        proc.stdin.write(frame)
+        write_message(proc.stdin, msg)
         await asyncio.wait_for(proc.stdin.drain(), remaining)
         return True
     except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
@@ -203,24 +206,6 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
-        pass
-
-
-async def _kill_process_group_and_reap(proc: asyncio.subprocess.Process) -> None:
-    """Kill a subprocess group, including descendants, and reap its leader."""
-    await _kill_worker(proc)
-    try:
-        await asyncio.wait_for(proc.wait(), PROCESS_REAP_TIMEOUT_S)
-        return
-    except (ProcessLookupError, TimeoutError):
-        pass
-    try:
-        proc.kill()
-    except (ProcessLookupError, OSError):
-        pass
-    try:
-        await asyncio.wait_for(proc.wait(), PROCESS_REAP_TIMEOUT_S)
-    except (ProcessLookupError, TimeoutError):
         pass
 
 
@@ -1764,7 +1749,17 @@ class _Runtime:
                 ),
                 loop,
             )
-            future.result()
+            try:
+                future.result(timeout=DURABLE_EVENT_TIMEOUT_S)
+            except TimeoutError as exc:
+                # The emit keeps running on the loop and still appends the
+                # event; only the wait is bounded, so a saturated pool cannot
+                # circularly deadlock every merge thread. Fail the merge
+                # closed rather than silently dropping the terminal event.
+                raise RuntimeError(
+                    f"durable terminal event {kind!r} not persisted within "
+                    f"{DURABLE_EVENT_TIMEOUT_S}s"
+                ) from exc
 
         return MergeSequencer(
             task_id=task_id, session_dir=self._session_dir, durable_event=persist_terminal
