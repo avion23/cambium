@@ -1545,7 +1545,13 @@ def _finalize_worktree(
             return outcome
         _require_generation(worktree, generation)
         status_proc = subprocess.run(
-            ["git", "status", "--porcelain"],
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
             cwd=worktree,
             capture_output=True,
             text=True,
@@ -1557,11 +1563,15 @@ def _finalize_worktree(
             )
             return outcome
         changed: list[str] = []
+        ignored: list[str] = []
         for line in status_proc.stdout.splitlines():
             path = line[3:].strip() if len(line) > 3 else line.strip()
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
             if not path or path == ".cambium" or path.startswith(".cambium/"):
+                continue
+            if line[:2] == "!!":
+                ignored.append(path)
                 continue
             changed.append(path)
         # A provider can commit directly (e.g. via permitted shell): HEAD then
@@ -1582,6 +1592,12 @@ def _finalize_worktree(
             outcome["failure_reason"] = (
                 f"worktree HEAD {head_sha} advanced beyond base_commit "
                 f"{resolved_base}; refusing to publish unverified changes"
+            )
+            return outcome
+        if ignored:
+            outcome["failure_reason"] = (
+                f"worktree contains ignored changes {ignored!r}; refusing to publish "
+                "unverified changes"
             )
             return outcome
         if not changed:

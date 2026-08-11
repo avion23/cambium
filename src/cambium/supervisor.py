@@ -2375,7 +2375,12 @@ class _Runtime:
         if symbolic != f"refs/heads/{spec['branch']}":
             return "worker_wrong_branch"
         status = await self._git(
-            worktree, "status", "--porcelain=v1", "--untracked-files=all", check=False
+            worktree,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            check=False,
         )
         if status.returncode != 0:
             return "worker_status_failed"
