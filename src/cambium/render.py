@@ -1,6 +1,6 @@
-"""Pure renderers for Cambium results and event lines.
+"""Pure renderers for Cambium results, events, and usage stats lines.
 
-The three public functions are side-effect free and deterministic.  They
+The four public functions are side-effect free and deterministic.  They
 accept the canonical ``cambium.results.Result``, the supervisor result
 dataclasses (``TaskResult``, ``SliceResult``, ``PlanResult``), or a
 JSON-like mapping holding one of those records.  Untyped mappings are
@@ -19,6 +19,7 @@ separators, no NaN, and UTF-8 without ASCII escaping.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -177,6 +178,64 @@ def render_text_result(result: Any) -> str:
     return " ".join(parts)
 
 
+_STATS_COUNT_FIELDS = (
+    ("calls", "calls"),
+    ("total_tokens", "tokens"),
+    ("input_tokens", "in"),
+    ("output_tokens", "out"),
+    ("cached_tokens", "cached"),
+)
+
+
+def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
+    """Render one usage-stats record as one deterministic line.
+
+    Accepts a ``cambium.stats.UsageStats`` dataclass or a JSON-like mapping
+    with the same fields. Untyped mapping values are validated; fields whose
+    values have the wrong type are skipped rather than raising. ``worktree``
+    is appended only when the argument (or the record) provides a non-empty
+    string.
+    """
+    if stats is None:
+        return ""
+    if is_dataclass(stats) and not isinstance(stats, type):
+        record = asdict(stats)
+    elif isinstance(stats, Mapping):
+        record = dict(stats)
+    else:
+        raise TypeError(
+            "render_usage_stats_line requires a cambium.stats.UsageStats "
+            "dataclass or a JSON-like mapping"
+        )
+
+    def count(key: str) -> int | None:
+        value = record.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return int(value)
+
+    parts: list[str] = ["stats:"]
+    for key, label in _STATS_COUNT_FIELDS:
+        value = count(key)
+        if value is not None:
+            parts.append(f"{label}={value}")
+    turns = record.get("turns")
+    if isinstance(turns, int) and not isinstance(turns, bool):
+        last_turn = count("last_turn_tokens")
+        if last_turn is not None:
+            parts.append(f"last_turn=+{last_turn}")
+    model = record.get("model")
+    if isinstance(model, str) and model:
+        parts.append(f"model={model}")
+    if not (isinstance(worktree, str) and worktree):
+        worktree = record.get("worktree")
+    if isinstance(worktree, str) and worktree:
+        parts.append(f"worktree={worktree}")
+    return " ".join(parts)
+
+
 def render_event_line(event: Mapping[str, Any]) -> str:
     """Render one redacted event record as one deterministic line.
 
@@ -205,4 +264,9 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     return f"{prefix}  {_dumps(payload)}"
 
 
-__all__ = ["render_event_line", "render_json_result", "render_text_result"]
+__all__ = [
+    "render_event_line",
+    "render_json_result",
+    "render_text_result",
+    "render_usage_stats_line",
+]
