@@ -49,8 +49,9 @@ failed name search is not proof of absence.
 ## Run
 
 Cambium is a Python-native multi-agent coding-agent harness run directly from
-source. No wheel or install is required. Use `uv` for environments and
-commands; use the system interpreter for direct runs.
+source. No wheel is built and no install is required or supported. Use `uv`
+only for environment setup; direct runs and the commands below use the system
+interpreter.
 
 ```sh
 cd /home/ubuntu/cambium
@@ -59,7 +60,9 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
-`module-test`, and `version`; prefer it over the internal supervisor module.
+`module-test`, `version`, `run`, `repl`, `tui`, and `session` (`session
+list/latest/show` reads completed session results); prefer it over the internal
+supervisor module.
 Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
 child imports resolve without an install.
 
@@ -69,8 +72,11 @@ child imports resolve without an install.
   fans tasks out under an `asyncio.TaskGroup`. It creates `store.EventStore`,
   writes `.cambium/result.json`, and publishes a clean worker whose envelope
   reports `succeeded` by an expected-old update of `refs/heads/main`. There is
-  no pre-merge gate: the worker verdict alone decides merge eligibility.
-  Publication is ref-only; it does not refresh a checkout.
+  no task-command pre-merge gate: a succeeded envelope proceeds to merge only
+  after the repository-integrity checks pass (worker success integrity,
+  fencing, expected-old ref publication, session admission, worktree
+  confinement, protocol/request correlation, and quarantine). Publication is
+  ref-only; it does not refresh a checkout.
 - Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
   diagnostics use stderr/logging. The supervisor bounds each worker's decoded
   stdout queue and routes emitted records through `EventStore`.
@@ -79,8 +85,8 @@ child imports resolve without an install.
   per turn, strict `tool_call`/`finish` parsing, schema and permission checks,
   tool events, checkpoints, and one fenced commit.
 - Worker-exposed `run_shell` and inspection-only `git_op` run without an
-  `ApprovalGate`; mutating Git operations are not worker-exposed. `approval.py`
-  and `resources.py` remain standalone reusable primitives with their own tests.
+  `ApprovalGate` or `CompileGate`; mutating Git operations are not
+  worker-exposed. `approval.py` and `resources.py` are deleted.
 - `tasktree.build_tree` validates dependency specs; `run_plan` does not
   schedule a DAG. Architectus and the conversation store are not wired into
   `run_plan`.
@@ -89,10 +95,12 @@ child imports resolve without an install.
 
 ## Boundary invariants
 
-- IPC framing is bounded and request/generation-correlated. Malformed advisory
-  lines are logged or skipped; fatal framing, missing correlated results,
-  non-zero exits, and deadline failures fail or restart the task according to
-  the boundary policy.
+- IPC framing is bounded and correlated by `request_id` (generation is not
+  enforced for message correlation). Malformed lines that fail JSON parsing are
+  counted and skipped up to a bound; a valid JSON line that is not an object
+  currently fails supervision (open defect). Fatal framing, missing correlated
+  results, non-zero exits, and deadline failures fail or restart the task
+  according to the boundary policy.
 - A merge conflict, non-fast-forward, stale expected-old ref, or quarantine
   violation never publishes `main`.
 - Provider keys are allowlisted environment values. Never put credentials or
@@ -101,10 +109,11 @@ child imports resolve without an install.
 
 ## Checks and handoff
 
-Tests are example data-in/data-out pairs: deterministic module input produces
-the expected module output. Run the narrowest real check, then the affected
-package check when a boundary changes. Useful system commands from the
-repository root:
+Module tests are example data-in/data-out pairs: deterministic module input
+produces the expected module output. The scenario suite also covers process,
+git, persistence, and concurrency behavior. Run the narrowest real check, then
+the affected package check when a boundary changes. Useful system commands from
+the repository root:
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo

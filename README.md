@@ -1,20 +1,23 @@
 # Cambium
 
-Cambium is a Python-native coding-agent harness, run directly from source. The
-`cambium` CLI starts a supervisor, workers edit isolated Git worktrees over
-NDJSON stdio, and a clean worker whose envelope reports `succeeded` publishes to
-`refs/heads/main`. Production pre-merge gates were removed by product decision:
-this is a local development tool, so the worker verdict alone decides merge
-eligibility and tools execute without an approval gate.
+Cambium is a Python-native coding-agent harness, run directly from source. No
+wheel is built and no install is required or supported. The `cambium` CLI starts
+a supervisor, workers edit isolated Git worktrees over NDJSON stdio, and a
+clean worker whose envelope reports `succeeded` publishes to `refs/heads/main`.
+There is no task-command pre-merge gate, no `CompileGate`, and no approval
+gate: this is a local development tool, so a succeeded envelope proceeds to
+merge after the repository-integrity checks pass and tools execute without an
+approval gate.
 
 ## Current shape
 
 - `cambium.supervisor.run_plan` accepts a flat supplied task list and supervises
   it concurrently. There is no worker-count semaphore: an 11-task canary
   observed 11 concurrent supervisions. `resource_thresholds` only checks host
-  health. There is no pre-merge gate and no `CompileGate` concurrency bound:
-  a clean worker whose envelope reports `succeeded` is merged. Events persist
-  in `.cambium/events.db`; publication does not refresh a checkout.
+  health. There is no pre-merge gate and no `CompileGate`: a clean worker whose
+  envelope reports `succeeded` is merged after the repository-integrity checks
+  pass. Events persist in `.cambium/events.db`; publication does not refresh a
+  checkout.
 - `worker.do_work` has deterministic marker mode and a bounded custom provider
   and tool loop. Provider calls go through `Diffundo`; strict actions dispatch
   validated tools, emit checkpoints, and end in one worker commit.
@@ -38,10 +41,9 @@ are in [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 ## Quickstart
 
 Cambium is a local development tool run directly from source. Requires Python
-3.14 and the project dependencies installed for pytest. Development runs
-directly from source and no wheel install is required (pyproject.toml still
-defines a wheel target, exercised by `tests/scenarios/test_wheel_cli.py`):
-point `PYTHONPATH` at `src` and run the module.
+3.14 and the project dependencies installed for pytest. No wheel is built and
+no install is required or supported: point `PYTHONPATH` at `src` and run the
+module.
 
 ```sh
 PYTHONPATH=src python3.14 -m pytest -q
@@ -51,6 +53,7 @@ Run the deterministic demo:
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
+PYTHONPATH=src python3.14 -m cambium.cli session show --session-dir demo demo-001
 PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 

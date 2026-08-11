@@ -8,10 +8,11 @@ live gap table.
 
 ## 1. Current runtime
 
-`pyproject.toml` installs one `cambium` script at `cambium.cli:main`. The CLI
-routes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`, `module-test`, and
-`version`. `cambium.__init__` exports only `__version__`; there is no public
-session API.
+Cambium runs directly from source; no wheel is built and no install is
+required or supported. The CLI routes `auth`, `supervisor`, `doctor`, `bench`,
+`tasktree`, `module-test`, `version`, `run`, `repl`, `tui`, and `session`
+(`session list/latest/show` reads completed session results).
+`cambium.__init__` exports only `__version__`; there is no public session API.
 
 ### Plan and publication
 
@@ -19,14 +20,16 @@ session API.
 validates supplied task records, rejects duplicate IDs and unsafe worktree
 paths, then supervises the supplied tasks concurrently in one
 `asyncio.TaskGroup`. A task worker runs in a Git worktree and process group. A
-clean worker whose envelope reports `succeeded` publishes; there is no pre-merge
-gate. Successful publication uses an expected-old atomic
-update of `refs/heads/main`. It is ref-only and never refreshes the caller's
-checkout or index.
+clean worker whose envelope reports `succeeded` publishes; there is no
+task-command pre-merge gate. A succeeded envelope proceeds to merge only after
+the repository-integrity checks pass (worker success integrity, fencing,
+expected-old ref publication, session admission, worktree confinement,
+protocol/request correlation, and quarantine). Successful publication uses an
+expected-old atomic update of `refs/heads/main`. It is ref-only and never
+refreshes the caller's checkout or index.
 
 There is no worker-count semaphore: an 11-task canary observed 11 concurrent
-supervisions. `resource_thresholds` remains the only host-health pre-flight;
-`CompileGate` was removed by product decision.
+supervisions. `resource_thresholds` remains the only host-health pre-flight.
 
 The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
 records through it, and writes `.cambium/result.json` after shutdown. The
@@ -79,9 +82,8 @@ that path; `orchestrator.py` is a skeleton. Persistent worker reuse is absent.
 
 `doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
 auth coverage, optional event and conversation databases, module datasets, and
-advisory host health. `resources.CompileGate` is a standalone reusable
-primitive; `run_plan` no longer runs gate commands. There is no `ResourceBudget`
-class. `module_conformance` provides an
+advisory host health. `resources.py` is deleted; there is no `CompileGate` and
+no `ResourceBudget` class. `module_conformance` provides an
 isolated module-test gate. `modules/example` has deterministic decision logic,
 train/eval/canary data, split metrics, and a JSON CLI with `decide` and
 `evaluate` operations. There is no `eval_cache.py`.
@@ -98,20 +100,22 @@ Do not use those names as current architecture components.
    it cannot publish `main` directly.
 4. The merge sequencer owns staging, expected-old checks, quarantine, and
    cleanup. A conflict, non-fast-forward, or cleanup violation does not
-   advance `main` (gate failure is no longer a condition).
+   advance `main`.
 5. The event store owns durable rows and its writer thread. Observer copies
    cannot mutate persisted records.
 
-IPC is bounded and correlated by request ID and worker generation. Fatal
-   framing, oversized lines, missing correlated results, non-zero exits, and
-   deadline failures follow the boundary-specific supervisor policy; advisory
-   malformed lines are logged or skipped. Tool schemas reject malformed calls.
+IPC is bounded and correlated by request ID (generation is not enforced for
+   message correlation). Fatal framing, oversized lines, missing correlated
+   results, non-zero exits, and deadline failures follow the boundary-specific
+   supervisor policy; malformed lines that fail JSON parsing are counted and
+   skipped up to a bound, and a valid JSON line that is not an object currently
+   fails supervision (open defect). Tool schemas reject malformed calls.
 
 Provider credentials are allowlisted environment values. They must not enter
 task specs, prompts persisted as events, logs, or result
 artifacts. Worktree and process-group isolation is not an OS sandbox.
-`approval.py:ApprovalGate` is a standalone reusable primitive; `tools.py`
-`run_shell`/`git_op` execute without it by product decision.
+`approval.py` and `resources.py` are deleted; `tools.py`
+`run_shell`/`git_op` execute without `ApprovalGate` or `CompileGate`.
 
 Live-use blockers were removed by product decision; this is a local development
 tool run directly from source.
@@ -164,7 +168,7 @@ ephemeral; doctor currently reports no runnable configured provider.
 | --- | --- | --- |
 | Plan | `run_plan` rejects malformed tasks, duplicate IDs, and unsafe paths before worker setup. | No worker side effect before structural validation. |
 | Task tree | `build_tree` rejects missing dependencies, multiple roots/parents, cycles, and bounds. | A future scheduler dispatches only a validated graph with snapshotted specs. |
-| IPC | Framing limits, request IDs, generations, heartbeat deadlines, and correlated result checks are enforced in `_Runtime._drive_generation`. | Stale or missing worker messages cannot complete a task. |
+| IPC | Framing limits, request IDs, heartbeat deadlines, and request-correlated result checks are enforced in `_Runtime._drive_generation`. | Stale or missing worker messages cannot complete a task. |
 | Worker | Provider/tool failures, missing results, non-zero exits, and wall/token limits fail the generation; recoverable failures may restart it. | A worker verdict is accepted only for its active generation. |
 | Merge | Conflict, non-fast-forward, unsafe quarantine, or cleanup failure stops publication. | `main` advances only through the expected-old ref contract. |
 | Store | Critical event admission waits for the writer; writer death raises; non-critical overflow follows the bounded queue policy. | Durable failure is visible; no silent success after store failure. |
@@ -177,13 +181,13 @@ hierarchy remain targets; approval and containment were removed by decision.
 
 | Concern | Current source | State |
 | --- | --- | --- |
-| CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Installed CLI; version-only package export |
+| CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Direct-source CLI; version-only package export |
 | Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan`; one-task adapter retained |
 | Worker/IPC | `src/cambium/worker.py`, `ipc.py` | Marker mode, custom provider loop, bounded NDJSON |
 | Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
 | Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; no run-plan hierarchy wiring |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
-| Controls | `tools.py`, `schemas.py`, `approval.py`, `resources.py`, `redact.py` | Primitives; approval/containment removed from the tool path by decision |
+| Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` | CLI diagnostics and example evaluation exist |
 
 Any target moves to current only after a caller and focused failure test
