@@ -48,12 +48,20 @@ agent loop instead: it loads the provider file named by the worker's absolute
 ``CAMBIUM_PROVIDERS`` environment variable and iterates bounded
 ``Diffundo.call`` turns, each accepting exactly one JSON action:
 
+    {"type": "plan", "steps": [<non-empty strings>]}
     {"type": "tool_call", "name": <schema name>, "arguments": {...}}
     {"type": "finish", "summary": <non-empty summary>}
+
+The agent is instructed to emit a short ``plan`` action before any
+``tool_call``; the plan is kept in the transcript. The transcript is
+summarized (truncation plus a synthetic dropped-message marker, no LLM call)
+when it exceeds a character budget, so it stays bounded across turns.
 
 Tool calls execute inside the worktree (with shell/git permissions from
 ``init.permissions``), emit ``tool_event`` messages, and persist
 ``checkpoint`` state under ``$CAMBIUM_SESSION_ID/.cambium/checkpoints/``.
+Every tool result, including lint feedback from ``write_file``, is appended to
+the transcript so the agent sees success or failure.
 The worker owns exactly one fenced commit of the resulting changes.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
@@ -85,6 +93,7 @@ from cambium.auth import scrub_environment
 from cambium.diffundo import Diffundo, ProviderTier
 from cambium.fencing import validate_worker_generation
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
+from cambium.lint_diag import LintDiag
 from cambium.provider_config import load_providers
 from cambium.schemas import TOOL_SCHEMAS
 from cambium.tools import ToolContext, ToolResult, run_tool
@@ -103,6 +112,8 @@ CHECKPOINT_SCHEMA = 1
 MAX_ACTION_CONTENT_BYTES = 16 * 1024
 MAX_OBSERVATION_BYTES = 64 * 1024
 MAX_CMD_BYTES = 512
+MAX_TRANSCRIPT_CHARS = 120_000
+TRANSCRIPT_KEEP_TURNS = 6
 INSPECTION_GIT_OPS = frozenset({"status", "diff", "log"})
 _USAGE_COUNT_FIELDS = frozenset(
     {
@@ -306,6 +317,7 @@ class AgentConfig:
     heartbeat_interval_s: float
     max_wall_s: float
     checkpoint_root: Path | None
+    max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -350,6 +362,11 @@ class AgentConfig:
                 max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S
             ),
             checkpoint_root=checkpoint_root,
+            max_transcript_chars=_positive_int(
+                init.get("max_transcript_chars"),
+                "init max_transcript_chars",
+                MAX_TRANSCRIPT_CHARS,
+            ),
         )
 
 
@@ -392,6 +409,7 @@ def _merge_task_config(
         heartbeat_interval_s=config.heartbeat_interval_s,
         max_wall_s=max_wall_s,
         checkpoint_root=config.checkpoint_root,
+        max_transcript_chars=config.max_transcript_chars,
     )
 
 
@@ -515,10 +533,18 @@ def _permission_denied(name: str, args: dict[str, Any], config: AgentConfig) -> 
     return None
 
 
+def _action_keys(parsed: dict[str, Any], required: frozenset[str]) -> bool:
+    """Exactly ``required`` keys plus at most an optional ``thought`` field."""
+    allowed = required | {"thought"}
+    return required <= parsed.keys() and parsed.keys() <= allowed
+
+
 def _parse_agent_action(content: str) -> dict[str, Any]:
     """Strictly parse one agent action; raises ``ValueError`` on any deviation.
 
-    Accepted shapes:
+    Accepted shapes (each may optionally carry a ``thought`` field for
+    reasoning; the action fields themselves must be exact):
+        {"type": "plan", "steps": [<non-empty strings>]}
         {"type": "tool_call", "name": <schema name>, "arguments": {...}}
         {"type": "finish", "summary": <non-empty str>}
     """
@@ -532,9 +558,19 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("agent action must be exactly one JSON object")
     action_type = parsed.get("type")
+    if action_type == "plan":
+        if not _action_keys(parsed, frozenset({"type", "steps"})):
+            raise ValueError("plan must carry exactly type/steps (plus optional thought)")
+        steps = parsed.get("steps")
+        if not isinstance(steps, list) or not steps or not all(
+            isinstance(step, str) and step.strip() for step in steps
+        ):
+            raise ValueError("plan steps must be a non-empty array of non-empty strings")
+        return {"type": "plan", "steps": list(steps)}
     if action_type == "tool_call":
-        if set(parsed) != {"type", "name", "arguments"}:
-            raise ValueError("tool_call must carry exactly type/name/arguments")
+        if not _action_keys(parsed, frozenset({"type", "name", "arguments"})):
+            raise ValueError(
+                "tool_call must carry exactly type/name/arguments (plus optional thought)")
         name = parsed.get("name")
         arguments = parsed.get("arguments")
         if not isinstance(name, str) or not name:
@@ -545,8 +581,8 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError(f"unknown tool: {name!r}")
         return {"type": "tool_call", "name": name, "arguments": arguments}
     if action_type == "finish":
-        if set(parsed) != {"type", "summary"}:
-            raise ValueError("finish must carry exactly type/summary")
+        if not _action_keys(parsed, frozenset({"type", "summary"})):
+            raise ValueError("finish must carry exactly type/summary (plus optional thought)")
         summary = parsed.get("summary")
         if not isinstance(summary, str) or not summary.strip():
             raise ValueError("finish summary must be a non-empty string")
@@ -588,16 +624,121 @@ def _cumulative_total(cumulative: dict[str, int]) -> int:
     )
 
 
+def _transcript_chars(transcript: list[dict[str, Any]]) -> int:
+    total = 0
+    for message in transcript:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+    return total
+
+
+def _plan_message(transcript: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the transcript entry carrying a valid ``plan`` action, or ``None``."""
+    for message in transcript:
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            continue
+        if isinstance(parsed, dict) and parsed.get("type") == "plan":
+            return message
+    return None
+
+
+def _fit_transcript_to_budget(
+    messages: list[dict[str, Any]], budget: int
+) -> list[dict[str, Any]]:
+    """Trim retained user observations so ``messages`` fits ``budget`` chars.
+
+    The plan (if any) and the synthetic marker keep their full content; only
+    the retained tail observations are proportionally truncated (plain cuts,
+    no extra marker) to reach an exact fit.
+    """
+    truncatable = [
+        message for message in messages[2:] if message.get("role") == "user"
+    ]
+    if not truncatable:
+        return messages
+    fixed = _transcript_chars(messages) - _transcript_chars(truncatable)
+    target = max(0, budget - fixed)
+    current = _transcript_chars(truncatable)
+    if current <= target:
+        return messages
+    scale = target / current
+    for message in truncatable:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        message["content"] = _cap_utf8(content, int(len(content) * scale))
+    return messages
+
+
+def _summarize_transcript(
+    transcript: list[dict[str, Any]],
+    budget: int,
+    keep_turns: int = TRANSCRIPT_KEEP_TURNS,
+) -> list[dict[str, Any]]:
+    """Bound the transcript to ``budget`` characters without calling the LLM.
+
+    Returns the transcript unchanged when it fits within the budget. When it
+    does not, keeps the plan message (if any), drops everything older than the
+    most recent ``keep_turns`` turns, inserts one synthetic "prior context
+    summary" marker, and proportionally truncates the retained observations so
+    the result stays within the budget.
+    """
+    if _transcript_chars(transcript) <= budget:
+        return list(transcript)
+    tail = transcript[-(keep_turns * 2):] if keep_turns > 0 else []
+    plan = _plan_message(transcript)
+    tail = [dict(message) for message in tail if message is not plan]
+    dropped = len(transcript) - len(tail) - (1 if plan is not None else 0)
+    marker = {
+        "role": "user",
+        "content": (
+            f"[prior context: {dropped} earlier message(s) dropped to bound the "
+            "transcript; only the plan and the most recent turns are retained]"
+        ),
+    }
+    kept: list[dict[str, Any]] = []
+    if plan is not None:
+        kept.append(dict(plan))
+    kept.append(marker)
+    kept.extend(tail)
+    return _fit_transcript_to_budget(kept, budget)
+
+
 def _build_agent_prompt(
     task: str, tools: list[dict[str, Any]], transcript: list[dict[str, Any]]
 ) -> dict[str, Any]:
     system_lines = [
         "You are Cambium's autonomous coding agent.",
         "You act inside a disposable git worktree and must complete the task.",
-        "Return exactly one JSON object per turn: a tool_call or a finish.",
-        'tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
-        'finish: {"type": "finish", "summary": <non-empty summary>}',
-        "No prose, no code fences, no reasoning.",
+        "Return exactly one JSON object per turn; your reply must be one action:",
+        '  plan:      {"type": "plan", "steps": ["...", "..."]}',
+        '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
+        '  finish:    {"type": "finish", "summary": <non-empty summary>}',
+        'An optional "thought" field may be added to the same object to record your '
+        "reasoning; the action fields above must remain exact.",
+        "Your FIRST action must be a short plan: list the concrete steps before any "
+        "tool_call.",
+        "Approach:",
+        "- Prefer the batch read tool (read_batch) to read related files in one call.",
+        "- Read the relevant files before editing; verify each change before moving on.",
+        "- If a tool call fails, diagnose the error and retry with a corrected call.",
+        "- When the task changes code, run the relevant tests via run_shell; only emit "
+        "finish after the change is verified and the tests pass. If tests fail, iterate.",
+        "- Emit finish only when the task is complete and verified.",
+        "Examples:",
+        '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", '
+        '"run tests"]}',
+        '  {"type": "tool_call", "name": "read_batch", '
+        '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
+        '  {"type": "finish", "summary": "implemented and verified the change"}',
         "Available tools:",
         json.dumps(tools, sort_keys=True),
         f"Task: {task}",
@@ -959,6 +1100,7 @@ async def _run_agent_loop(
     cumulative_usage: dict[str, int] = {}
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
+    lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
     try:
         for turn in range(1, config.max_turns + 1):
@@ -974,6 +1116,7 @@ async def _run_agent_loop(
                     cumulative_usage, transcript,
                 )
             _require_generation(worktree, config.generation)
+            transcript = _summarize_transcript(transcript, config.max_transcript_chars)
             prompt = _build_agent_prompt(config.task, tools, transcript)
             try:
                 result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
@@ -1013,6 +1156,10 @@ async def _run_agent_loop(
                 transcript.append({"role": "assistant", "content": action_content})
                 transcript.append({"role": "user", "content": f"invalid action: {exc}"})
                 continue
+            if action["type"] == "plan":
+                transcript.append({"role": "assistant", "content": action_content})
+                progress.tool = "plan"
+                continue
             if action["type"] == "finish":
                 transcript.append({"role": "assistant", "content": action_content})
                 return {
@@ -1037,7 +1184,7 @@ async def _run_agent_loop(
                     outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
                 )
             progress.tool = name
-            with ToolContext(worktree) as ctx:
+            with ToolContext(worktree, lint=lint_diag) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)
             transcript.append({"role": "assistant", "content": action_content})
             transcript.append({"role": "user", "content": _tool_observation(name, tool_result)})
@@ -1262,7 +1409,13 @@ async def _heartbeat_loop(
             # Observed the stop flag right after this send: exit at the safe
             # point (between iterations) instead of starting another send.
             break
-        await asyncio.sleep(interval_s)
+        # Sleep in short slices so stop is observed promptly even when the
+        # configured interval is large; the send cadence stays ~interval_s.
+        remaining = interval_s
+        while remaining > 0 and not stop.is_set():
+            step = min(0.05, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
 
 
 async def _run_task(
@@ -1294,7 +1447,7 @@ async def _run_task(
         # point (after the in-flight send completes, before the next one).
         # A hard cancel is only a fallback if the loop fails to drain promptly.
         try:
-            await asyncio.wait_for(hb, timeout=HEARTBEAT_INTERVAL_S + 1.0)
+            await asyncio.wait_for(hb, timeout=config.heartbeat_interval_s + 1.0)
         except (TimeoutError, asyncio.CancelledError):
             hb.cancel()
             try:

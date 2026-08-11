@@ -57,9 +57,15 @@ Non-critical store records can be dropped under the store overflow policy.
    one commit.
 2. With `fanout_config`, the worker loads the configured providers and runs a
    custom bounded loop. Each turn calls `Diffundo`, requires exactly one strict
-   `tool_call` or `finish` action, validates permissions and tool arguments,
-   dispatches the tool, emits a `tool_event` and checkpoint, and then creates
-   one fenced result commit.
+   JSON action (`plan`, `tool_call`, or `finish`), validates permissions and
+   tool arguments, dispatches the tool, emits a `tool_event` and checkpoint,
+   and then creates one fenced result commit. The agent is instructed to emit a
+   short `plan` action before any `tool_call`, and the plan is retained in the
+   transcript. The transcript is summarized without an LLM call (dropping old
+   turns plus a synthetic dropped-message marker, keeping the plan) whenever it
+   exceeds a character budget, so it stays bounded within `max_turns`. A
+   `read_batch` tool reads related files in one bounded call, and lint feedback
+   from `write_file` reaches the agent as a tool observation.
 
 The loop bounds turns, tokens, wall time, transcript size, and summaries. It
 returns cumulative provider usage and latency as redacted metadata. `lm.py`
