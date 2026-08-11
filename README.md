@@ -27,6 +27,12 @@ The entry point (`src/cambium/cli.py`) dispatches these commands:
 A multi-word command line that is not a known command is a prompt:
 `cambium make the change` runs `cambium run "make the change"`.
 
+Provider-backed `run`, `repl`, and `tui` prompts may complete successfully
+with a conversational/read-only answer and no file change: no commit is made
+and nothing is merged or published (no empty commit or merge occurs), and the
+rendered output carries the summary. A prompt that changes files commits once
+and merges as before.
+
 See [`docs/architecture/user-cli.md`](docs/architecture/user-cli.md) for the
 exact run, bare-prompt, repl, tui, and session workflows, provider selection
 from the trusted user config (`~/.config/cambium/providers.json`), and how

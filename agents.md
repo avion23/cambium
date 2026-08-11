@@ -71,21 +71,28 @@ import `cambium` without a manual export.
 ## Current entry points and behavior
 
 - `supervisor.run_plan` validates a flat task list, starts one runtime, and
-  fans tasks out under an `asyncio.TaskGroup`. It creates `store.EventStore`,
-  writes `.cambium/result.json`, and publishes a clean worker whose envelope
-  reports `succeeded` by an expected-old update of `refs/heads/main`. There is
-  no task-command pre-merge gate: a succeeded envelope proceeds to merge only
-  after the repository-integrity checks pass (worker success integrity,
-  fencing, expected-old ref publication, session admission, worktree
-  confinement, protocol/request correlation, and quarantine). Publication is
-  ref-only; it does not refresh a checkout.
+  fans tasks out under an `asyncio.TaskGroup`. It creates `store.EventStore`
+  and writes `.cambium/result.json`. A clean worker whose envelope reports
+  `succeeded` with a commit publishes that commit by an expected-old update of
+  `refs/heads/main`. A provider-backed task that changed no files completes
+  successfully with a conversational/read-only answer: no commit is made and
+  nothing is merged or published — no empty commit or merge occurs. There is
+  no task-command pre-merge gate: a succeeded envelope with a commit proceeds
+  to merge only after the repository-integrity checks pass (worker success
+  integrity, fencing, expected-old ref publication, session admission,
+  worktree confinement, protocol/request correlation, and quarantine).
+  Publication is ref-only; it does not refresh a checkout.
 - Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
   diagnostics use stderr/logging. The supervisor bounds each worker's decoded
   stdout queue and routes emitted records through `EventStore`.
 - `worker.do_work` selects deterministic marker mode unless `fanout_config` is
   present. Provider mode runs the bounded `Diffundo` loop: one provider call
   per turn, strict `tool_call`/`finish` parsing, schema and permission checks,
-  tool events, checkpoints, and one fenced commit.
+  tool events, checkpoints, and one fenced commit when the agent changed
+  files. A provider task that changed no files completes successfully with a
+  conversational/read-only answer and no commit; its summary is carried in the
+  result and the rendered output. The deterministic marker worker always
+  writes its marker and commits.
 - Worker-exposed `run_shell` and inspection-only `git_op` run without an
   `ApprovalGate` or `CompileGate`; mutating Git operations are not
   worker-exposed. `approval.py` and `resources.py` are deleted.
@@ -105,6 +112,10 @@ import `cambium` without a manual export.
   according to the boundary policy.
 - A merge conflict, non-fast-forward, stale expected-old ref, or quarantine
   violation never publishes `main`.
+- A provider-backed task may complete successfully with a conversational/
+  read-only answer and no file/commit; no empty commit or merge occurs. An
+  edit task still commits once and merges normally; the marker worker always
+  writes its marker and commits.
 - Provider keys are allowlisted environment values. Never put credentials or
   sensitive content in task specs, event payloads, or durable artifacts.
 - Keep blocking disk and subprocess I/O at existing thread/process boundaries.

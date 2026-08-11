@@ -63,7 +63,9 @@ root result is `.cambium/result.json`.
 
 The result is rendered by `cambium.render` from the supervisor `PlanResult`:
 text output is one line such as `plan=tasks:1 plan_status={succeeded}`, JSON
-output is the filtered `{"results": [...]}` record. Exit codes: `0` success,
+output is the filtered `{"results": [...]}` record; both carry the worker
+`summary` when present, including a successful conversational/read-only run
+with no commits. Exit codes: `0` success,
 `2` for config/preflight errors (`cambium run: <message>`), `75` when the
 session admission lock is already held by another live supervisor
 (`cambium run: session is already running: ...`, a temporary failure callers
@@ -74,7 +76,11 @@ auto-selects the first enabled provider from the trusted user config (see
 §7). The marker task (`target_file` plus `marker`) is an internal
 `OneShotConfig` path only; the CLI does not expose those fields, so a plain
 run never becomes a marker task. Provider runs use the bounded Diffundo
-worker loop.
+worker loop. A provider run may complete successfully with a
+conversational/read-only answer and no file/commit: when the agent changed no
+files, no empty commit or merge occurs and nothing is published, and the
+rendered output still carries the summary. A run that changed files commits
+once and merges normally.
 
 ## 3. Bare multi-word prompt
 
@@ -103,7 +109,8 @@ stops the loop; every other line is a prompt. Each prompt runs through
 changes the shared config. Each result is printed as one rendered text line.
 The exit code is `1` if any result failed (a nonzero result exit code or a
 per-prompt exception), otherwise `0`; per-prompt failures print
-`repl: <error>` to stderr and continue.
+`repl: <error>` to stderr and continue. A prompt answered conversationally
+with no file/commit is a successful result (exit `0`), not a failure.
 
 ## 5. `cambium tui`
 
@@ -112,7 +119,8 @@ written and flushed before each read. Blank lines are skipped; per-prompt
 errors print `cambium: <error>` to stderr and continue. Exit codes: `0` on
 EOF when every prompt succeeded, `1` on EOF if any result failed, `0` on
 `BrokenPipeError`, `130` on `KeyboardInterrupt`, `1` if the backend modules
-cannot be imported.
+cannot be imported. A prompt answered conversationally with no file/commit
+counts as a successful prompt (exit `0`), not a failure.
 
 ## 6. `cambium session list/latest/show`
 
