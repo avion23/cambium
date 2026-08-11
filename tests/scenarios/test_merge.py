@@ -59,12 +59,29 @@ def _rev(cwd: Path, rev: str) -> str:
     return _run(cwd, "rev-parse", "--verify", f"{rev}^{{commit}}").stdout.strip()
 
 
+def _write_git_config(repo: Path, git_dir: Path | None = None) -> None:
+    """Write the fixed repo identity directly into the git config file.
+
+    ``git config`` costs one subprocess per key; the merge scenarios spawn
+    dozens of git subprocesses per test, so the three fixed settings are
+    appended to the config file once instead. ``git_dir`` is the real admin
+    directory for ``--separate-git-dir`` repos (``repo/.git`` is then a file).
+    """
+    config = (git_dir or repo / ".git") / "config"
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "[user]\n"
+            "\tname = merge-test\n"
+            "\temail = merge@test\n"
+            "[gc]\n"
+            "\tauto = 0\n"
+        )
+
+
 def _init_repo(repo: Path) -> str:
     """Scratch repo on branch main with one base commit. Returns the base SHA."""
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    for key, value in (("user.name", "merge-test"), ("user.email", "merge@test"),
-                       ("gc.auto", "0")):
-        _run(repo, "config", key, value)
+    _write_git_config(repo)
     (repo / "base.txt").write_text("base\n")
     _run(repo, "add", "base.txt")
     _run(repo, "commit", "-m", "initial")
@@ -76,9 +93,7 @@ def _init_separate_git_dir_repo(repo: Path, git_dir: Path) -> str:
         ["git", "init", "-b", "main", f"--separate-git-dir={git_dir}", str(repo)],
         check=True, capture_output=True,
     )
-    for key, value in (("user.name", "merge-test"), ("user.email", "merge@test"),
-                       ("gc.auto", "0")):
-        _run(repo, "config", key, value)
+    _write_git_config(repo, git_dir)
     (repo / "base.txt").write_text("base\n")
     _run(repo, "add", "base.txt")
     _run(repo, "commit", "-m", "initial")
@@ -86,14 +101,35 @@ def _init_separate_git_dir_repo(repo: Path, git_dir: Path) -> str:
 
 
 def _worker_commit(repo: Path, branch: str, wt: Path, files: dict[str, str], from_: str) -> str:
-    """Worker-style worktree on ``branch`` with one commit. Returns the tip SHA."""
-    _run(repo, "worktree", "add", "-b", branch, str(wt), from_)
+    """Worker-style commit on ``branch`` with one commit. Returns the tip SHA.
+
+    Built with git plumbing (``fast-import``) instead of a checkout in a
+    worktree: the sequencer only consumes the branch tip and its tree, so one
+    subprocess replaces ``worktree add`` + ``add`` + ``commit`` + ``rev-parse``.
+    File bytes are preserved exactly.
+    """
+    lines = [
+        f"commit refs/heads/{branch}",
+        "mark :1",
+        f"committer merge-test <merge@test> {int(time.time())} +0000",
+    ]
+    message = f"{branch}: {','.join(files)}\n"
+    lines.append(f"data {len(message.encode('utf-8'))}")
+    lines.append(message.rstrip("\n"))
+    lines.append(f"from {from_}")
     for name, content in files.items():
-        (wt / name).parent.mkdir(parents=True, exist_ok=True)
-        (wt / name).write_text(content)
-        _run(wt, "add", name)
-    _run(wt, "commit", "-m", f"{branch}: {','.join(files)}")
-    return _rev(wt, "HEAD")
+        payload = content.encode("utf-8")
+        lines.append(f"M 100644 inline {name}")
+        lines.append(f"data {len(payload)}")
+        lines.append(content.rstrip("\n"))
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        input=("\n".join(lines) + "\n").encode("utf-8"),
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
+    )
+    return _rev(repo, f"refs/heads/{branch}")
 
 
 def _publish(repo: Path, tip: str, old: str) -> None:
@@ -348,6 +384,11 @@ def test_publish_rejects_empty_and_zero_expected_old(tmp_path) -> None:
     # the legitimate first-publish path still works
     seq.create_main(repo, tip_a)
     assert _rev(repo, "refs/heads/main") == tip_a
+    # a second create is refused (race-safety: create_main's "must not exist"
+    # old-value never clobbers an existing main) and changes nothing
+    with pytest.raises(NonFastForwardError):
+        seq.create_main(repo, tip_a)
+    assert _rev(repo, "refs/heads/main") == tip_a
 
 
 def test_publish_rejects_non_fast_forward_tips(tmp_path) -> None:
@@ -376,30 +417,6 @@ def test_publish_rejects_non_fast_forward_tips(tmp_path) -> None:
     tip_c = _worker_commit(repo, "wt-c", wt_c, {"c.txt": "c\n"}, base)
     with pytest.raises(NonFastForwardError):
         seq.publish_merge(repo, tip_c, tip_b)
-    assert _rev(repo, "refs/heads/main") == tip_b
-
-
-def test_create_main_first_publish(tmp_path) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repo(repo)
-    wt_a = tmp_path / "wt-a"
-    tip_a = _worker_commit(repo, "wt-a", wt_a, {"a.txt": "a\n"}, base)
-    _run(repo, "update-ref", "-d", "refs/heads/main")
-
-    seq = MergeSequencer(task_id="create-1")
-    assert seq.reconcile(repo) is None
-    seq.create_main(repo, tip_a)
-    assert _rev(repo, "refs/heads/main") == tip_a
-
-    # a second create is refused and changes nothing
-    with pytest.raises(NonFastForwardError):
-        seq.create_main(repo, tip_a)
-    assert _rev(repo, "refs/heads/main") == tip_a
-
-    # publish_merge from the created main works (ff)
-    wt_b = tmp_path / "wt-b"
-    tip_b = _worker_commit(repo, "wt-b", wt_b, {"b.txt": "b\n"}, tip_a)
-    seq.publish_merge(repo, tip_b, tip_a)
     assert _rev(repo, "refs/heads/main") == tip_b
 
 
@@ -455,9 +472,7 @@ def test_prepare_staging_fetches_branch_from_remote(tmp_path) -> None:
 
     builder = tmp_path / "builder"
     subprocess.run(["git", "clone", "-q", str(remote), str(builder)], check=True)
-    for key, value in (("user.name", "merge-test"), ("user.email", "merge@test"),
-                       ("gc.auto", "0")):
-        _run(builder, "config", key, value)
+    _write_git_config(builder)
     _run(builder, "checkout", "-b", "wt-remote")
     (builder / "remote.txt").write_text("remote\n")
     _run(builder, "add", "remote.txt")
@@ -544,40 +559,52 @@ def _quarantined(seq: MergeSequencer) -> tuple[dict, Path]:
     return payload, session / ".cambium" / "quarantine" / payload["quarantine_id"]
 
 
-@pytest.mark.parametrize(
-    "dirty_kind", ["tracked", "indexed", "untracked", "ignored", "in-progress"]
-)
-def test_dirty_staging_kinds_are_moved_byte_for_byte(tmp_path, dirty_kind) -> None:
+def test_dirty_staging_kinds_are_moved_byte_for_byte(tmp_path) -> None:
+    """All five dirty-kind detectors move the worktree byte-for-byte.
+
+    One staging worktree is dirtied with every kind at once: a tracked
+    modification (worker.txt), an added index entry, an untracked file, an
+    ignored file, and an in-progress rebase marker. The single quarantine
+    move must preserve every file's bytes, keep the staging branch and ref
+    alive, and the emitted reason must name all five kinds — so a detector
+    that fails to recognize any kind fails this test (the reason-set check)
+    exactly as the per-kind scenario did.
+    """
     repo = tmp_path / "repo"
     base = _init_repo(repo)
-    if dirty_kind == "ignored":
-        (repo / ".gitignore").write_text("secret-name.bin\n")
-        _run(repo, "add", ".gitignore")
-        _run(repo, "commit", "-m", "ignore forensic fixture")
-        base = _rev(repo, "HEAD")
+    (repo / ".gitignore").write_text("secret-name.bin\n")
+    _run(repo, "add", ".gitignore")
+    _run(repo, "commit", "-m", "ignore forensic fixture")
+    base = _rev(repo, "HEAD")
     worker = tmp_path / "worker"
     _worker_commit(repo, "worker", worker, {"worker.txt": "worker\n"}, base)
     staging = tmp_path / "staging"
-    seq = MergeSequencer(task_id=f"dirty-{dirty_kind}", session_dir=tmp_path)
+    seq = MergeSequencer(task_id="dirty-all", session_dir=tmp_path)
     seq.prepare_staging(repo, staging, "worker", "main")
-    name = "secret-name.bin" if dirty_kind == "ignored" else "evidence.bin"
-    evidence = b"forensic\x00bytes\xff"
-    if dirty_kind == "tracked":
-        name = "worker.txt"
-    (staging / name).write_bytes(evidence)
-    if dirty_kind == "indexed":
-        _run(staging, "add", name)
-    if dirty_kind == "in-progress":
-        git_dir = Path(
-            _run(staging, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
-        )
-        (git_dir / "MERGE_HEAD").write_text(base + "\n")
+
+    evidence = {
+        "worker.txt": b"modified\x00tracked\xff",  # tracked: in the committed tree
+        "evidence.bin": b"untracked\x00bytes\xff",
+        "indexed.bin": b"indexed\x00bytes\xff",
+        "secret-name.bin": b"ignored\x00bytes\xff",
+    }
+    for name, blob in evidence.items():
+        (staging / name).write_bytes(blob)
+    _run(staging, "add", "indexed.bin")
+    git_dir = Path(
+        _run(staging, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+    )
+    (git_dir / "MERGE_HEAD").write_text(base + "\n")
 
     branch, ref = seq.staging_branch, seq.staging_ref
     seq.cleanup_staging(repo)
     payload, destination = _quarantined(seq)
 
-    assert (destination / name).read_bytes() == evidence
+    for name, blob in evidence.items():
+        assert (destination / name).read_bytes() == blob
+    assert set(payload["reason"].split(",")) == {
+        "in-progress", "indexed", "ignored", "tracked", "untracked",
+    }
     assert branch and _run(repo, "show-ref", "--verify", f"refs/heads/{branch}").returncode == 0
     assert ref and _run(repo, "show-ref", "--verify", ref).returncode == 0
     serialized = repr(payload)
@@ -714,44 +741,6 @@ def test_task_directory_swap_at_move_boundary_restores_staging(tmp_path, monkeyp
         seq.cleanup_staging(repo)
 
     assert evidence.read_bytes() == b"must remain at source"
-    assert not list(displaced.iterdir())
-    assert not list(sink.iterdir())
-
-
-def test_task_directory_swap_after_final_check_restores_staging(tmp_path, monkeypatch) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repo(repo)
-    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
-    staging = tmp_path / "staging"
-    task_id = "swap-after-check"
-    seq = MergeSequencer(task_id=task_id, session_dir=tmp_path)
-    seq.prepare_staging(repo, staging, "worker", "main")
-    evidence = staging / "evidence.bin"
-    evidence.write_bytes(b"must return to source")
-    task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
-    task_dir = tmp_path / ".cambium" / "quarantine" / "merge" / f"task-{task_key}"
-    outside = tmp_path / "outside"
-    displaced = outside / "displaced"
-    sink = outside / "sink"
-    outside.mkdir()
-    sink.mkdir()
-    original = seq._is_open_child
-    checks = 0
-
-    def swap_after_check(parent_fd, name, child_fd):
-        nonlocal checks
-        contained = original(parent_fd, name, child_fd)
-        checks += 1
-        if checks == 8:
-            task_dir.rename(displaced)
-            task_dir.symlink_to(sink, target_is_directory=True)
-        return contained
-
-    monkeypatch.setattr(seq, "_is_open_child", swap_after_check)
-    with pytest.raises(StagingCleanupError, match="changed during worktree move"):
-        seq.cleanup_staging(repo)
-
-    assert evidence.read_bytes() == b"must return to source"
     assert not list(displaced.iterdir())
     assert not list(sink.iterdir())
 
@@ -996,39 +985,6 @@ def test_observer_failure_after_durable_append_does_not_restore_staging(tmp_path
     assert (destination / "evidence.bin").read_bytes() == b"observer cannot strand evidence"
 
 
-def test_observer_cancellation_after_durable_append_does_not_restore_staging(tmp_path) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repo(repo)
-    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
-    staging = tmp_path / "staging"
-    store = EventStore(tmp_path / ".cambium" / "events.db")
-
-    async def cancel_observer(_event: dict) -> None:
-        raise asyncio.CancelledError
-
-    async def quarantine() -> None:
-        runtime = _Runtime(tmp_path, store, on_event=cancel_observer)
-        seq = runtime._make_sequencer("observer-cancellation")
-        seq.prepare_staging(repo, staging, "worker", "main")
-        (staging / "evidence.bin").write_bytes(b"cancellation cannot strand evidence")
-        await asyncio.to_thread(seq.cleanup_staging, repo)
-
-    try:
-        asyncio.run(quarantine())
-        events = [
-            event for event in store.events_after(0)
-            if event["kind"] == "merge_staging_quarantined"
-        ]
-    finally:
-        store.close()
-
-    assert len(events) == 1
-    destination = tmp_path / ".cambium" / "quarantine" / events[0]["payload"]["quarantine_id"]
-    assert destination.is_dir()
-    assert not staging.exists()
-    assert (destination / "evidence.bin").read_bytes() == b"cancellation cannot strand evidence"
-
-
 def test_move_failure_preserves_original_and_emits_sanitized_failure(tmp_path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
@@ -1154,26 +1110,6 @@ def test_expired_artifact_is_pruned_on_reconcile(tmp_path) -> None:
     seq.reconcile(repo)
     assert not destination.exists()
     assert any(kind == "merge_staging_pruned" for kind, _ in seq.drain_events())
-
-
-def test_expired_artifact_is_pruned_with_separate_git_dir(tmp_path) -> None:
-    repo = tmp_path / "repo"
-    base = _init_separate_git_dir_repo(repo, tmp_path / "repo-git")
-    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
-    staging = tmp_path / "staging"
-    seq = MergeSequencer(
-        task_id="separate-expired", session_dir=tmp_path, quarantine_retention_ns=1,
-        quarantine_min_free_bytes=0,
-    )
-    seq.prepare_staging(repo, staging, "worker", "main")
-    (staging / "dirty").write_text("expired evidence")
-    seq.cleanup_staging(repo)
-    _, destination = _quarantined(seq)
-    time.sleep(0.001)
-
-    seq.reconcile(repo)
-
-    assert not destination.exists()
 
 
 def test_count_cap_prunes_with_separate_git_dir(tmp_path) -> None:

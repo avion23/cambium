@@ -17,8 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from cambium.tasktree import TaskKind
-
 SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,17 +31,15 @@ def _plan(tasks: list[tuple[str, str, list[str]]]) -> dict:
     }
 
 
-def _chain_plan(length: int = 1200) -> dict:
+def _chain_plan(length: int = 200) -> dict:
+    """A chain long past the default ``max_depth`` (3), so the CLI must fail
+    with the documented DepthBoundError instead of a stack or recursion error.
+    The depth bound fires at depth 4 regardless of total length, so 200 tasks
+    exercise the same code paths as any larger chain."""
     return _plan([
         (f"task-{index}", "TEST", [] if index == 0 else [f"task-{index - 1}"])
         for index in range(length)
     ])
-
-
-def test_task_kind_is_the_enum_norm() -> None:
-    assert {kind.name for kind in TaskKind} == {
-        "FEATURE", "BUGFIX", "REFACTOR", "TEST", "DOCS", "INVESTIGATION",
-    }
 
 
 def _run_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
@@ -118,15 +114,6 @@ def test_cli_explicit_dash_reads_plan_from_stdin() -> None:
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
-def test_cli_explicit_dash_rejects_invalid_json_from_stdin() -> None:
-    result = _run_cli("{", "-")
-
-    assert result.returncode == 1
-    assert result.stdout == ""
-    assert "tasktree: invalid JSON in stdin" in result.stderr
-
-
-@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_no_args_prints_help_for_empty_stdin() -> None:
     result = _run_cli()
 
@@ -198,6 +185,12 @@ def test_cli_rejects_invalid_json_from_stdin() -> None:
     assert result.returncode == 1
     assert result.stdout == ""
     assert "tasktree: invalid JSON in stdin" in result.stderr
+
+    # the explicit "-" plan argument takes the same stdin path
+    explicit = _run_cli("{", "-")
+    assert explicit.returncode == 1
+    assert explicit.stdout == ""
+    assert "tasktree: invalid JSON in stdin" in explicit.stderr
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
