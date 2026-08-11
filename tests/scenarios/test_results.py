@@ -16,7 +16,6 @@ from cambium.results import (
     EXIT_CODES,
     Result,
     result_to_dict,
-    root_result_from_child,
     root_result_from_wire,
     status_from_wire,
     wire_to_child_result,
