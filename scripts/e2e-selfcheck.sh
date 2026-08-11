@@ -144,16 +144,25 @@ finally:
 print("\n".join(kinds))
 PY
 )"
-REQUIRED_CHAIN="task_assigned spawned init ready run_task result exit merge_started merge_committed worktree_pruned session_ended"
-"$PY" - "$EVENT_KINDS" "$REQUIRED_CHAIN" <<'PY' || fail "event kind chain missing required kinds in order"
+REQUIRED_CHAIN="task_assigned spawned init ready run_task result merge_started merge_committed worktree_pruned session_ended"
+REQUIRED_ALTERNATES="exit reuse_ready"
+"$PY" - "$EVENT_KINDS" "$REQUIRED_CHAIN" "$REQUIRED_ALTERNATES" <<'PY' || fail "event kind chain missing required kinds in order"
 import sys
 
 chain = sys.argv[1].split()
 required = sys.argv[2].split()
+alternates = sys.argv[3].split()
 i = 0
 for kind in chain:
-    if i < len(required) and kind == required[i]:
+    if i >= len(required):
+        break
+    if kind == required[i]:
         i += 1
+        continue
+    # A pooled worker emits reuse_ready where an exited worker emits exit;
+    # accept either terminal event between result and merge_started.
+    if required[i] == "result" and kind in alternates:
+        continue
 if i != len(required):
     raise SystemExit(f"missing after match: {required[i:]}")
 PY
