@@ -420,7 +420,11 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
     result = asyncio.run(run_plan(session_dir, plan))
 
     (task,) = result.results
-    assert task.status == "succeeded"
+    # the worker left an ignored file behind (leftover.txt): the integrity
+    # check must not accept that as a clean success — the task fails, and the
+    # dirty retained tree defers cleanup as before.
+    assert task.status == "failed"
+    assert task.reason == "worker_tree_dirty"
     assert worktree.exists()
     assert (worktree / "leftover.txt").read_text() == "dirty content\n"
     assert _worktree_paths(repo) == [repo.resolve(), worktree.resolve()]
