@@ -4,12 +4,14 @@ Review Claim 5 (docs/research/v2-1-review.md §E) proposed weighted
 round-robin/LRU rotation among eligible providers; root REJECTED that change.
 The adopted normative contract is priority ascending: within a tier the lower
 ``ProviderConfig.priority`` is tried first (architecture.md §9.1/§9.2 step 2,
-cascade-design.md §1.1), equal-priority providers round-robin their start position per call
-(diffundo.py:_candidates, per-instance rotation cursor seeded by the caller —
-the worker seeds it from the task id so concurrent subagents interleave),
+cascade-design.md §1.1), equal-priority providers pick a sticky primary per instance
+(diffundo.py:_candidates, fixed offset seeded by the caller — the worker
+seeds it from the task id, and each worker runs one task, so concurrent
+subagents spread across providers at task granularity while a task's context
+stays on one provider, preserving per-provider prompt-prefix caching),
 priority ordering across runs is preserved, and selection stays stateless
 otherwise — provider outcomes change eligibility (health / token bucket),
-never the rotation.
+never the primary.
 
 No mocks, no network: each scenario drives real ``Diffundo.call`` against fake
 OpenAI-compatible ``http.server`` backends in background threads, reusing the
@@ -209,7 +211,7 @@ def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatc
 # --------------------------------------------------------------------------- #
 
 
-def test_equal_priority_providers_round_robin_within_run(monkeypatch) -> None:
+def test_equal_priority_providers_stick_to_primary_per_instance(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
@@ -220,19 +222,22 @@ def test_equal_priority_providers_round_robin_within_run(monkeypatch) -> None:
         )
     )
     try:
-        # equal-priority providers rotate their start position per call, so
-        # requests interleave across them (per-subagent token throughput).
+        # One instance = one task: every call lands on the same provider so
+        # the task's growing context stays on one provider (prompt-prefix
+        # caching preserved). No per-call rotation.
         served = [asyncio.run(router.call(ProviderTier.FAST, PROMPT)).provider
                   for _ in range(6)]
-        assert served == ["p_first", "p_second"] * 3
-        assert len(first.calls) == 3
-        assert len(second.calls) == 3
+        assert served == ["p_first"] * 6
+        assert len(first.calls) == 6
+        assert len(second.calls) == 0
     finally:
         first.close()
         second.close()
 
 
-def test_round_robin_seed_shifts_start_and_priority_groups_keep_order(monkeypatch) -> None:
+def test_rotation_seed_spreads_primaries_across_instances_and_keeps_priority_order(
+    monkeypatch,
+) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     low = FakeServer([(200, _ok_payload("low"), 0.0)])
@@ -253,16 +258,49 @@ def test_round_robin_seed_shifts_start_and_priority_groups_keep_order(monkeypatc
         ),
     )
     try:
-        # seed 1 starts the equal-priority run at the second provider.
+        # seed 1 picks the second provider as this instance's sticky primary.
         assert asyncio.run(seeded.call(ProviderTier.FAST, PROMPT)).provider == "p_second"
-        assert asyncio.run(seeded.call(ProviderTier.FAST, PROMPT)).provider == "p_first"
-        # priority order across runs is preserved: p_low never precedes p_first.
+        assert asyncio.run(seeded.call(ProviderTier.FAST, PROMPT)).provider == "p_second"
+        # the unseeded instance sticks to the first provider: concurrent
+        # subagents spread across providers at task granularity.
         assert asyncio.run(unseeded.call(ProviderTier.FAST, PROMPT)).provider == "p_first"
+        assert asyncio.run(unseeded.call(ProviderTier.FAST, PROMPT)).provider == "p_first"
+        # priority order across runs is preserved: p_low never precedes.
         assert len(low.calls) == 0
     finally:
         first.close()
         second.close()
         low.close()
+
+
+def test_fallback_moves_association_and_never_bounces_back(monkeypatch) -> None:
+    """A task's context follows the provider that served; a recovered former
+    primary does not reclaim the task (prompt-prefix caching preserved)."""
+    first = FakeServer([(500, {"error": "boom"}, 0.0), (200, _ok_payload("first"), 0.0)])
+    second = FakeServer([(200, _ok_payload("second"), 0.0)])
+    _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
+    router = Diffundo(
+        (
+            _config("p_first", first, "K_FIRST", priority=0, cooldown_s=0.05, max_retries=0),
+            _config("p_second", second, "K_SECOND", priority=0),
+        )
+    )
+    try:
+        # call 1: p_first fails (500 -> cooldown), p_second serves and becomes
+        # the task's associated provider.
+        r1 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert r1.provider == "p_second"
+        # call 2: p_first's cooldown expired and it is eligible again, but the
+        # association leads, so the task stays on p_second — no bounce-back
+        # that would cold-start the context at p_first.
+        time.sleep(0.06)
+        r2 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert r2.provider == "p_second"
+        assert len(first.calls) == 1
+        assert len(second.calls) == 2
+    finally:
+        first.close()
+        second.close()
 
 
 # --------------------------------------------------------------------------- #
