@@ -28,14 +28,21 @@ protocol/request correlation, and quarantine). Successful publication uses an
 expected-old atomic update of `refs/heads/main`. It is ref-only and never
 refreshes the caller's checkout or index.
 
-There is no worker-count semaphore: an 11-task canary observed 11 concurrent
-supervisions. `resource_thresholds` remains the only host-health pre-flight.
+There is no global worker-count semaphore. A flat plan (no `depends_on`)
+fans out under one `asyncio.TaskGroup` with no concurrency cap — an 11-task
+canary observed 11 concurrent supervisions. A plan that supplies
+`depends_on` is built into one validated rooted `TaskTree` and dispatched in
+static ready-node waves: only nodes whose dependencies finished are admitted
+per wave, and each wave's concurrency is bounded by `max_width` (parameter,
+then the plan field, then `tasktree.MAX_WIDTH`). A failed node cascades so
+its descendants are never spawned. `resource_thresholds` remains the only
+host-health pre-flight.
 
 The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
 records through it, and writes `.cambium/result.json` after shutdown. The
-one-task `run_session` adapter remains for compatibility. It is not a DAG
-scheduler. `EventStore` is the current event boundary; there is no current
-`events.py` or dead-letter queue module.
+one-task `run_session` adapter remains for compatibility. `EventStore` is
+the current event boundary; there is no current `events.py` or dead-letter
+queue module.
 
 The supervisor gives each worker a bounded decoded-stdout `asyncio.Queue` and
 routes worker and runtime records through `EventStore`'s bounded writer queue.
@@ -74,7 +81,9 @@ longer a live blocker.
 `tasktree.build_tree` validates one rooted dependency tree, cycle and
 depth/width bounds, and deep-copies each input `spec` into frozen node records.
 `topological_order` and `ready_tasks` are pure inspection/scheduling inputs.
-`run_plan` currently bypasses them and fans out the supplied flat list.
+`run_plan` integrates them on the hierarchy path: a plan whose tasks carry
+`depends_on` is built into a `TaskTree` and dispatched in static ready-node
+waves; a flat plan keeps the unbounded one-`TaskGroup` fan-out.
 
 `architectus.ArchitectusCore` is tested with injected LLMs but has no caller in
 `run_plan`. Dynamic decomposition and the conversation store are not wired into
@@ -182,10 +191,10 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Concern | Current source | State |
 | --- | --- | --- |
 | CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Direct-source CLI; version-only package export |
-| Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan`; one-task adapter retained |
+| Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan` for plans without `depends_on`; static ready-node waves with width-bounded admission for plans with `depends_on`; one-task adapter retained |
 | Worker/IPC | `src/cambium/worker.py`, `ipc.py` | Marker mode, custom provider loop, bounded NDJSON |
 | Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
-| Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; no run-plan hierarchy wiring |
+| Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic admission remains follow-on |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
 | Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` | CLI diagnostics and example evaluation exist |
