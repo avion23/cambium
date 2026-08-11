@@ -105,6 +105,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -314,6 +315,12 @@ def _provider_router(config: dict[str, Any]) -> tuple[Diffundo, ProviderTier, st
         value = _fanout_value(config, section, key)
         if value is not None:
             options[key] = value
+    # Seed the per-subagent round-robin cursor from the task id: separate
+    # worker processes (separate Diffundo instances) then start their rotation
+    # at different providers and interleave requests across providers.
+    task_id = config.get("task_id") if isinstance(config, dict) else None
+    if isinstance(task_id, str) and task_id:
+        options.setdefault("rotation_seed", zlib.crc32(task_id.encode("utf-8")))
     return Diffundo(providers, **options), tier, model
 
 
@@ -778,11 +785,17 @@ def _build_agent_prompt(
     ]
     messages = [{"role": "system", "content": "\n".join(system_lines)}]
     messages.extend(transcript)
-    if not any(message.get("role") != "system" for message in messages):
-        # Some providers (e.g. ZAI/GLM) reject a messages array that contains
-        # only a system message; a neutral user opener keeps turn one valid
-        # without changing the static system prefix (plan step 3 caching).
-        messages.append({"role": "user", "content": "Begin."})
+    if not messages or messages[-1].get("role") != "user":
+        # Some providers (e.g. ZAI/GLM) reject payloads whose last message is
+        # not a user message: a fresh transcript has no non-system message
+        # (1214 on turn one), and a plan action leaves the transcript ending
+        # with an assistant message (1214 on the next turn). A neutral user
+        # message keeps every payload valid without changing the static
+        # system prefix (plan step 3 caching).
+        messages.append({
+            "role": "user",
+            "content": "Begin." if len(messages) == 1 else "Continue.",
+        })
     return {"messages": messages}
 
 

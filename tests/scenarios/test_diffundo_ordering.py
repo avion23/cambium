@@ -4,10 +4,12 @@ Review Claim 5 (docs/research/v2-1-review.md §E) proposed weighted
 round-robin/LRU rotation among eligible providers; root REJECTED that change.
 The adopted normative contract is priority ascending: within a tier the lower
 ``ProviderConfig.priority`` is tried first (architecture.md §9.1/§9.2 step 2,
-cascade-design.md §1.1), equal-priority providers stay in config order
-(``sorted`` stability in diffundo.py:_candidates), and the selection order is
-stateless — provider outcomes change eligibility (health / token bucket), never
-the order, and ``Diffundo`` holds no ordering cursor (D1).
+cascade-design.md §1.1), equal-priority providers round-robin their start position per call
+(diffundo.py:_candidates, per-instance rotation cursor seeded by the caller —
+the worker seeds it from the task id so concurrent subagents interleave),
+priority ordering across runs is preserved, and selection stays stateless
+otherwise — provider outcomes change eligibility (health / token bucket),
+never the rotation.
 
 No mocks, no network: each scenario drives real ``Diffundo.call`` against fake
 OpenAI-compatible ``http.server`` backends in background threads, reusing the
@@ -202,11 +204,12 @@ def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatc
 
 
 # --------------------------------------------------------------------------- #
-# 2. equal priorities -> config order preserved, no rotation
+# 2. equal priorities -> round-robin within the priority run, priority order
+#    across runs preserved
 # --------------------------------------------------------------------------- #
 
 
-def test_equal_priority_providers_remain_in_config_order(monkeypatch) -> None:
+def test_equal_priority_providers_round_robin_within_run(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
@@ -217,16 +220,49 @@ def test_equal_priority_providers_remain_in_config_order(monkeypatch) -> None:
         )
     )
     try:
-        # stable sort keeps config order; the cascade returns the first success,
-        # so the first configured provider serves every call while healthy.
-        for _ in range(10):
-            result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-            assert result.provider == "p_first"
-        assert len(first.calls) == 10
-        assert len(second.calls) == 0
+        # equal-priority providers rotate their start position per call, so
+        # requests interleave across them (per-subagent token throughput).
+        served = [asyncio.run(router.call(ProviderTier.FAST, PROMPT)).provider
+                  for _ in range(6)]
+        assert served == ["p_first", "p_second"] * 3
+        assert len(first.calls) == 3
+        assert len(second.calls) == 3
     finally:
         first.close()
         second.close()
+
+
+def test_round_robin_seed_shifts_start_and_priority_groups_keep_order(monkeypatch) -> None:
+    first = FakeServer([(200, _ok_payload("first"), 0.0)])
+    second = FakeServer([(200, _ok_payload("second"), 0.0)])
+    low = FakeServer([(200, _ok_payload("low"), 0.0)])
+    _set_keys(monkeypatch, "K_FIRST", "K_SECOND", "K_LOW")
+    seeded = Diffundo(
+        (
+            _config("p_first", first, "K_FIRST", priority=0),
+            _config("p_second", second, "K_SECOND", priority=0),
+            _config("p_low", low, "K_LOW", priority=5),
+        ),
+        rotation_seed=1,
+    )
+    unseeded = Diffundo(
+        (
+            _config("p_first", first, "K_FIRST", priority=0),
+            _config("p_second", second, "K_SECOND", priority=0),
+            _config("p_low", low, "K_LOW", priority=5),
+        ),
+    )
+    try:
+        # seed 1 starts the equal-priority run at the second provider.
+        assert asyncio.run(seeded.call(ProviderTier.FAST, PROMPT)).provider == "p_second"
+        assert asyncio.run(seeded.call(ProviderTier.FAST, PROMPT)).provider == "p_first"
+        # priority order across runs is preserved: p_low never precedes p_first.
+        assert asyncio.run(unseeded.call(ProviderTier.FAST, PROMPT)).provider == "p_first"
+        assert len(low.calls) == 0
+    finally:
+        first.close()
+        second.close()
+        low.close()
 
 
 # --------------------------------------------------------------------------- #
