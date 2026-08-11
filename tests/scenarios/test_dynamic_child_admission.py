@@ -293,3 +293,39 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
     parent_events = [e for e in events if e["task_id"] == "t-root"]
     parent_serialized = json.dumps([e["payload"] for e in parent_events])
     assert "// child-marker" not in parent_serialized
+
+
+# ---------------------------------------------------------------------------
+# DC3: a failing child is reported to its parent (child_failed correlation).
+# ---------------------------------------------------------------------------
+
+
+def test_dc3_failed_child_emits_child_failed_for_parent(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
+    # write_marker=false forces the child's worker to report failed, so the
+    # child ends with a recorded "failed" result.
+    child = _task(
+        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
+        target_file="b.txt", marker="// child-marker", write_marker=False,
+    )
+    root = _task(
+        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
+        target_file="a.txt", marker="// parent-marker",
+        proposed_children=[_child_proposal(child)],
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [root]}))
+
+    assert {r.task_id for r in result.results} == {"t-root", "c1"}
+    statuses = {r.task_id: r.status for r in result.results}
+    assert statuses["t-root"] == "succeeded"
+    assert statuses["c1"] == "failed"
+
+    events = read_events(session_dir)
+    failed = _kinds(events, "child_failed")
+    assert len(failed) == 1
+    assert failed[0]["task_id"] == "c1"
+    assert failed[0]["payload"]["parent_task_id"] == "t-root"
+    assert failed[0]["payload"]["reason"] == "marker not written (write_marker=false)"
