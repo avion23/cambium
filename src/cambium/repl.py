@@ -95,10 +95,13 @@ def run_repl(
                 error_stream.write(f"repl: {exc}\n")
                 error_stream.flush()
                 continue
-            output_stream.write(rendered)
-            if not rendered.endswith("\n"):
-                output_stream.write("\n")
-            output_stream.flush()
+            try:
+                output_stream.write(rendered)
+                if not rendered.endswith("\n"):
+                    output_stream.write("\n")
+                output_stream.flush()
+            except Exception:
+                return 1 if failed else 0
     finally:
         if history_path is not None:
             _save_history(history_path)

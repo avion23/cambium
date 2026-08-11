@@ -65,7 +65,11 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
         out.flush()
         return _EXIT_INTERRUPT
     except BrokenPipeError:
-        return _EXIT_BROKEN_PIPE
+        return _EXIT_RUN_FAILED if failed else _EXIT_BROKEN_PIPE
+    except Exception as exc:
+        err.write(f"cambium: {exc}\n")
+        err.flush()
+        return _EXIT_RUN_FAILED if failed else _EXIT_BROKEN_PIPE
 
 
 __all__ = ["run_tui"]
