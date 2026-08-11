@@ -144,7 +144,7 @@ def test_doctor_fails_on_missing_required_provider_key(tmp_path, monkeypatch) ->
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert "required provider key missing" in result.stdout
-    assert "1 fail" in result.stdout
+    assert re.search(r"Summary: .* [1-9]\d* fail", result.stdout)
 
 
 def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:

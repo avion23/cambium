@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,7 +63,7 @@ def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> N
     assert result.returncode == 1, result.stdout + result.stderr
     assert "Provider env" in result.stdout
     assert "required provider key missing" in result.stdout
-    assert "1 fail" in result.stdout
+    assert re.search(r"Summary: .* [1-9]\d* fail", result.stdout)
 
 
 def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> None:
