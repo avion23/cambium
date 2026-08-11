@@ -347,6 +347,55 @@ def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def test_worker_agent_loop_finish_without_changes_succeeds_without_commit(
+    tmp_path, monkeypatch
+) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _set_provider_env(monkeypatch, config_path)
+        summary = "reviewed target.txt and confirmed no changes were needed"
+        _enqueue(json.dumps({"type": "finish", "summary": summary}))
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        result, messages, rc, _stderr = asyncio.run(
+            _drive_worker(
+                session_dir,
+                repo,
+                _worker_env(config_path, session_dir),
+                init=_agent_init(config_path, spec=TASK_TEXT),
+                run={"task": TASK_TEXT},
+                branch="no-change",
+            )
+        )
+
+        assert rc == 0
+        assert result["status"] == "succeeded"
+        assert result["commits"] == []
+        assert result["files_changed"] == []
+        assert result["diff"] == ""
+        assert result["summary"] == summary
+        assert subprocess.run(
+            ["git", "-C", str(session_dir / "wt"), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == base
+        assert subprocess.run(
+            ["git", "-C", str(session_dir / "wt"), "rev-list", "--count", f"{base}..HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == "0"
+        final_checkpoints = [message for message in messages if message["type"] == "checkpoint"]
+        assert final_checkpoints[-1]["commits_so_far"] == []
+    finally:
+        server.close()
+
+
 def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
     tmp_path, monkeypatch
 ) -> None:
@@ -459,6 +508,50 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         assert "You are Cambium's autonomous coding agent." not in event_text
         # read_file output must never reach the durable event log
         assert "output-sentinel-7x9q" not in event_text
+    finally:
+        server.close()
+
+
+def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
+    tmp_path, monkeypatch
+) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _set_provider_env(monkeypatch, config_path)
+        summary = "reviewed the repository and confirmed it already satisfies the request"
+        _enqueue(json.dumps({"type": "finish", "summary": summary}))
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
+        root_result = json.loads(
+            (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
+        )
+
+        assert result.exit_code == 0
+        assert result.results[0].status == "succeeded"
+        assert result.results[0].merge_sha is None
+        assert result.results[0].summary == summary
+        assert subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == base
+        assert not [event for event in events if event["kind"] == "merge_started"]
+        assert not [event for event in events if event["kind"] == "merge_committed"]
+        assert events[-1]["kind"] == "session_ended"
+        assert root_result["status"] == "done"
+        assert root_result["exit_code"] == 0
+        assert root_result["commits"] == []
+        assert root_result["files_changed"] == []
+        assert root_result["unified_diff"] == ""
+        assert root_result["summary"] == summary
     finally:
         server.close()
 

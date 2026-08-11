@@ -21,38 +21,41 @@ class _FlushStream(io.StringIO):
         self.flushes += 1
 
 
-def _failed_result() -> PlanResult:
+def _no_change_result() -> PlanResult:
     return PlanResult(
         (
             TaskResult(
                 task_id="oneshot",
-                status="failed",
-                exit_code=1,
-                reason="no files changed by the agent",
+                status="succeeded",
+                exit_code=0,
                 summary="I reviewed the repository but changed nothing.",
             ),
         )
     )
 
 
-def test_tui_no_change_exposes_summary_and_reason_with_failure_rc(monkeypatch, tmp_path):
+def test_no_change_completion_returns_success_across_user_interfaces(monkeypatch, tmp_path):
     async def run(_config: oneshot.OneShotConfig) -> PlanResult:
-        return _failed_result()
+        return _no_change_result()
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
-    out = _FlushStream()
-    code = tui.run_tui(
+    tui_out = _FlushStream()
+    assert tui.run_tui(
         oneshot.OneShotConfig(repo=tmp_path),
         input_stream=io.StringIO("hi\n"),
-        output_stream=out,
+        output_stream=tui_out,
         error_stream=io.StringIO(),
-    )
+    ) == 0
+    assert "plan_status={succeeded}" in tui_out.getvalue()
+    assert "I reviewed the repository but changed nothing." in tui_out.getvalue()
 
-    assert code == 1
-    text = out.getvalue()
-    assert "plan_status={failed}" in text
-    assert "no files changed by the agent" in text
-    assert "I reviewed the repository but changed nothing." in text
+    assert repl.run_repl(
+        oneshot.OneShotConfig(repo=tmp_path),
+        input_stream=io.StringIO("hi\n/exit\n"),
+        output_stream=io.StringIO(),
+        error_stream=io.StringIO(),
+    ) == 0
+    assert cli.main(["run", "hi", "--repo", str(tmp_path)]) == 0
 
 
 def test_tui_backend_exception_then_eof_returns_failure(monkeypatch, tmp_path):
@@ -97,13 +100,13 @@ def test_repl_backend_exception_flushes_and_returns_failure(monkeypatch, tmp_pat
 
 
 def test_nested_plan_result_renders_reason_summary_and_safe_json():
-    result = _failed_result()
+    result = _no_change_result()
 
     text = render_text_result(result)
-    assert "plan_failures={oneshot:'no files changed by the agent'}" in text
     assert "plan_summaries={oneshot:'I reviewed the repository but changed nothing.'}" in text
     rendered = json.loads(render_json_result(result))
-    assert rendered["results"][0]["reason"] == "no files changed by the agent"
+    assert rendered["results"][0]["status"] == "succeeded"
+    assert rendered["results"][0]["reason"] is None
     assert rendered["results"][0]["summary"].startswith("I reviewed")
 
 

@@ -4,10 +4,10 @@ Speaks the Nuntius JSON-Lines wire protocol (docs/architecture.md §5) with N
 worker subprocesses under one ``asyncio.TaskGroup``: spawn ``python -m
 cambium.worker`` (or a task's ``worker`` script) inside a git worktree,
 correlate ``init`` -> ``ready`` -> ``run_task`` -> ``result_envelope`` ->
-``exit_message`` by request_id, and publish the worker branch onto
-``refs/heads/main`` atomically through ``cambium.merge.MergeSequencer`` when
-the worker's envelope reports ``succeeded``. There is no pre-merge gate: the
-worker verdict alone decides merge eligibility.
+``exit_message`` by request_id, and publish a changed worker branch onto
+``refs/heads/main`` atomically through ``cambium.merge.MergeSequencer``. A
+successful clean worker already at the resolved base is a no-op; otherwise a
+successful worker must merge. There is no pre-merge gate.
 
 Every event is persisted to ``<session_dir>/.cambium/events.db`` through the
 canonical ``cambium.store.EventStore`` (readable via ``read_events``).
@@ -380,8 +380,9 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
 # git worktree; liveness is the four-layer model (process exit, exit
 # message, heartbeat watchdog, EOF-as-advisory); restarts use full-jitter
 # backoff with a per-task cap; worktrees are hard-reset before every
-# respawn; a clean worker whose envelope reports "succeeded" is merged
-# atomically onto refs/heads/main (no pre-merge gate).
+# respawn; a clean worker whose branch differs from its resolved base and whose
+# envelope reports "succeeded" is merged atomically onto refs/heads/main (no
+# pre-merge gate).
 #
 # cambium.store and cambium.merge are runtime dependency contracts.
 # =====================================================================
@@ -1472,6 +1473,13 @@ class _Runtime:
                         )
                         return
                     integrity = await self._worker_success_integrity(spec, worktree)
+                    head: str | None = None
+                    if integrity is None:
+                        head = await self._git_stdout(
+                            worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
+                        )
+                        if head is None:
+                            integrity = "worker_head_failed"
                     if integrity is not None:
                         await self.emit(
                             "worker_failed", task_id=task_id, generation=generation,
@@ -1480,6 +1488,13 @@ class _Runtime:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
                             reason=integrity, restarts=restarts, summary=worker_summary,
+                        )
+                        return
+                    if head == spec["base_commit"]:
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id, status="succeeded", exit_code=0,
+                            reason=None, merge_sha=None, restarts=restarts,
+                            summary=worker_summary,
                         )
                         return
                     merged = await self._merge_task(spec, handle)
@@ -2483,8 +2498,8 @@ def _task_canonical_status(result: TaskResult) -> str:
     """Map one supervisor TaskResult verdict to a canonical root status.
 
     The supervisor verdict is authoritative: a worker ``succeeded`` maps to
-    ``done`` only after the merge passed (the caller records the merged
-    TaskResult); any failed TaskResult is ``failed`` unless its reason
+    ``done`` after either the merge passed or the worker branch was already at
+    the resolved base; any failed TaskResult is ``failed`` unless its reason
     identifies a drive-phase timeout.
     """
     if result.status == "succeeded":
@@ -2771,9 +2786,11 @@ async def run_plan(
     """Run every task in the plan concurrently under one supervisor session.
 
     Workers are spawned as ``python -m cambium.worker`` (or the task's
-    ``worker`` script); a clean worker whose envelope reports ``succeeded`` is
-    merged onto ``refs/heads/main``. There is no pre-merge gate: the worker
-    verdict alone decides merge eligibility. Publication is ref-only:
+    ``worker`` script); a clean worker whose branch differs from its resolved
+    base and whose envelope reports ``succeeded`` is merged onto
+    ``refs/heads/main``. A clean branch already at its resolved base succeeds
+    without a merge. There is no pre-merge gate: branch state decides whether
+    the merge path is required after the worker verdict. Publication is ref-only:
     ``refs/heads/main`` advances via atomic ``update-ref`` and no checkout is
     refreshed.
     Returns a PlanResult; the exact accepted plan is persisted atomically as

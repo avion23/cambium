@@ -75,7 +75,8 @@ bytes, provider-reported cache-hit, and failure reason; fields the provider
 did not report are omitted, never an error. Every tool result, including lint
 feedback from ``write_file``, is appended to the transcript so the agent sees
 success or failure.
-The worker owns exactly one fenced commit of the resulting changes.
+The worker owns at most one fenced commit of the resulting changes; a
+successful provider loop that leaves no non-``.cambium`` changes owns none.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -1400,9 +1401,10 @@ def _finalize_worktree(
     stop: threading.Event,
     loop_outcome: dict[str, Any],
 ) -> dict[str, Any]:
-    """Stage the agent's changed files (excluding ``.cambium/``) and make ONE
-    fenced worker-owned commit with generation + identity trailers. Returns the
-    result-envelope shape: model summary + cumulative safe provider metadata.
+    """Stage the agent's changed files (excluding ``.cambium/``) and make at
+    most ONE fenced worker-owned commit with generation + identity trailers.
+    A clean worktree is a successful no-op and receives no empty commit.
+    Returns the result-envelope shape: model summary + cumulative safe provider metadata.
 
     The commit message, envelope, state paths, and provider metadata are all
     worker-authored; no model-controlled value reaches any of them.
@@ -1458,7 +1460,27 @@ def _finalize_worktree(
                 continue
             changed.append(path)
         if not changed:
-            outcome["failure_reason"] = "no files changed by the agent"
+            _require_generation(worktree, generation)
+            final_checkpoint = _write_checkpoint_file(
+                config,
+                loop_outcome.get("turn", 0),
+                loop_outcome.get("transcript", []),
+                loop_outcome.get("usage", {}),
+                [],
+            )
+            outcome.update(
+                status="succeeded",
+                failure_reason=None,
+                commits=[],
+                files_changed=[],
+                diff="",
+                diff_truncated=False,
+                summary=(
+                    loop_outcome.get("summary") or f"completed {config.task_id}"
+                )[:MAX_SUMMARY_CHARS],
+            )
+            if final_checkpoint is not None:
+                outcome["_checkpoint_path"] = str(final_checkpoint)
             return outcome
         for path in changed:
             _require_generation(worktree, generation)

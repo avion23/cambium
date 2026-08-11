@@ -780,6 +780,69 @@ def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     )
 
 
+def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    worker = tmp_path / "empty-envelope-worker.py"
+    worker.write_text(
+        "import json, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "def send(message):\n"
+        "    print(json.dumps(message), flush=True)\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        "send({'type': 'ready', 'request_id': init['request_id'], 'task_id': init['task_id'],\n"
+        "      'generation': init['generation'], 'proto': 1})\n"
+        "run = json.loads(sys.stdin.readline())\n"
+        "worktree = Path(run['worktree_path'])\n"
+        "target = worktree / run['target_file']\n"
+        "target.write_text(target.read_text() + run['marker'] + '\\n', encoding='utf-8')\n"
+        "subprocess.run(['git', 'add', run['target_file']], cwd=worktree, check=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'advanced head'], cwd=worktree, check=True,\n"
+        "               capture_output=True)\n"
+        "send({'type': 'result_envelope', 'request_id': run['request_id'],\n"
+        "      'task_id': run['task_id'], 'generation': init['generation'],\n"
+        "      'status': 'succeeded', 'commits': [], 'files_changed': [], 'diff': '',\n"
+        "      'summary': 'dishonest empty envelope'})\n"
+        "send({'type': 'exit_message', 'task_id': run['task_id'],\n"
+        "      'generation': init['generation'], 'reason': 'done'})\n",
+        encoding="utf-8",
+    )
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-empty-envelope",
+        worker=str(worker),
+        gate="true",
+        marker="// advanced-head",
+        max_restarts=0,
+        max_wall_s=10.0,
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+    events = read_events(session_dir)
+
+    assert result.results[0].status == "succeeded"
+    assert result.results[0].merge_sha is not None
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() != base
+    assert "// advanced-head" in subprocess.run(
+        ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert _kinds(events, "merge_started")
+    assert _kinds(events, "merge_committed")
+
+
 def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
     tmp_path: Path,
 ) -> None:
