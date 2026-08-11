@@ -341,7 +341,15 @@ def test_implicit_provider_selection_fails_before_launch_without_config(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo = _repo(tmp_path / "repo")
+    trusted_home = tmp_path / "trusted-home"
+    trusted_path = trusted_home / ".config" / "cambium" / "providers.json"
+    monkeypatch.setattr(oneshot, "effective_home", lambda: trusted_home)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+
+    def unexpected_auth_store():
+        raise AssertionError("provider selection must fail before reading credentials")
+
+    monkeypatch.setattr(oneshot, "AuthStore", unexpected_auth_store)
     launched = False
 
     async def unexpected_run_plan(*args, **kwargs):
@@ -350,9 +358,10 @@ def test_implicit_provider_selection_fails_before_launch_without_config(
         raise AssertionError("provider preflight must happen before launch")
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
-    with pytest.raises(ValueError, match="provider selection failed.*not found"):
+    with pytest.raises(ValueError, match="provider selection failed.*not found") as raised:
         asyncio.run(oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo)))
     assert launched is False
+    assert str(trusted_path.resolve()) in str(raised.value)
 
 
 def test_implicit_provider_selection_fails_before_launch_without_credential(
@@ -439,7 +448,9 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     auth_path = tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json"
     store = AuthStore(auth_path)
     store.set_provider(provider, secret)
+    monkeypatch.setattr(oneshot, "effective_home", lambda: tmp_path / "home")
     monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     captured: dict[str, object] = {}
 
@@ -481,6 +492,7 @@ def test_environment_only_provider_key_is_handed_without_plan_or_artifact_leak(
     env_name = derived_env_name("environment-only")
     secret = "environment-only-secret"
     monkeypatch.setenv(env_name, secret)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     environment_before = dict(os.environ)
 
     def unexpected_auth_store():
