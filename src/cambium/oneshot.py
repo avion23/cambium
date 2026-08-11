@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -271,6 +272,12 @@ def _reject_reused_session(session_dir: Path) -> None:
         raise ValueError(f"one-shot session directory has already been used: {session_dir}")
 
 
+def _default_branch(session_dir: Path) -> str:
+    """Return a stable, private branch name for one concrete session leaf."""
+    suffix = sha256(str(session_dir).encode("utf-8")).hexdigest()[:16]
+    return f"cambium-oneshot-{suffix}"
+
+
 def build_plan(
     config: OneShotConfig,
     repo: Path | None = None,
@@ -293,7 +300,7 @@ def build_plan(
         if config.worktree_path is not None
         else target_session / "wt"
     )
-    branch = config.branch or f"cambium-{task_id}"
+    branch = config.branch if config.branch is not None else _default_branch(target_session)
     spec: dict[str, Any] = {
         "task_id": task_id,
         "task": config.prompt,
