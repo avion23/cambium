@@ -81,37 +81,27 @@ def test_cli_applies_optional_context_default() -> None:
     assert output["decompose"] is False
 
 
-def test_cli_rejects_duplicate_task_fields() -> None:
-    result = _run_cli('{"task": 42, "task": "Rename one function."}')
+@pytest.mark.parametrize(
+    ("payload", "field"),
+    [
+        ('{"task": 42, "task": "Rename one function."}', "task"),
+        (
+            '{"task": "Rename one function.", "context": "first", "context": "second"}',
+            "context",
+        ),
+        (
+            '{"task": "Rename one function.", "context": {"note": "first", "note": "second"}}',
+            "note",
+        ),
+    ],
+)
+def test_cli_rejects_duplicate_task_fields(payload: str, field: str) -> None:
+    result = _run_cli(payload)
 
     assert result.returncode != 0
     response = _one_json_object(result.stdout)
     assert response["error"]["type"] == "JSONDecodeError"
-    assert "duplicate JSON object field: 'task'" in response["error"]["message"]
-    assert response["error"]["message"] in result.stderr
-
-
-def test_cli_rejects_duplicate_context_fields() -> None:
-    result = _run_cli(
-        '{"task": "Rename one function.", "context": "first", "context": "second"}'
-    )
-
-    assert result.returncode != 0
-    response = _one_json_object(result.stdout)
-    assert response["error"]["type"] == "JSONDecodeError"
-    assert "duplicate JSON object field: 'context'" in response["error"]["message"]
-    assert response["error"]["message"] in result.stderr
-
-
-def test_cli_rejects_duplicate_fields_inside_nested_object() -> None:
-    result = _run_cli(
-        '{"task": "Rename one function.", "context": {"note": "first", "note": "second"}}'
-    )
-
-    assert result.returncode != 0
-    response = _one_json_object(result.stdout)
-    assert response["error"]["type"] == "JSONDecodeError"
-    assert "duplicate JSON object field: 'note'" in response["error"]["message"]
+    assert f"duplicate JSON object field: '{field}'" in response["error"]["message"]
     assert response["error"]["message"] in result.stderr
 
 

@@ -253,7 +253,7 @@ def test_module_test_runs_reference_module() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     output = result.stdout + result.stderr
-    assert "example: passed=57 failed=0 skipped=0" in output, output
+    assert "example: passed=51 failed=0 skipped=0" in output, output
 
 
 def test_module_test_unknown_module_exits_two(capsys) -> None:

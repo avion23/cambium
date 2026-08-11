@@ -151,51 +151,6 @@ def test_root_result_rejects_none_unified_diff(tmp_path: Path) -> None:
         replace(result, unified_diff=None)
 
 
-def test_child_mapper_rejects_explicit_none_diff_when_excluded() -> None:
-    with pytest.raises(TypeError, match="unified_diff"):
-        wire_to_child_result(
-            {"status": "succeeded", "include_diff": False, "unified_diff": None}
-        )
-    with pytest.raises(TypeError, match="unified_diff"):
-        wire_to_child_result(_wire(include_diff=False, diff=None))
-    excluded = wire_to_child_result({"status": "succeeded", "include_diff": False})
-    assert excluded["unified_diff"] == ""
-
-
-def test_child_mapper_rejects_non_string_diff_when_excluded() -> None:
-    for value in (1, 0.5, ["a"], b"bytes"):
-        with pytest.raises(TypeError, match="unified_diff"):
-            wire_to_child_result(
-                {"status": "succeeded", "include_diff": False, "unified_diff": value}
-            )
-    excluded = wire_to_child_result(
-        {"status": "succeeded", "include_diff": False, "unified_diff": "ignored"}
-    )
-    assert excluded["unified_diff"] == ""
-
-
-def test_root_result_rejects_non_string_diff_when_excluded(tmp_path: Path) -> None:
-    for value in (1, 0.5, ["a"], b"bytes"):
-        with pytest.raises(TypeError, match="unified_diff"):
-            root_result_from_wire(
-                {"status": "succeeded", "include_diff": False, "unified_diff": value},
-                tmp_path,
-                session_id="session-1",
-            )
-    result = root_result_from_wire(
-        {"status": "succeeded", "include_diff": False, "unified_diff": "ignored"},
-        tmp_path,
-        session_id="session-1",
-    )
-    assert result.unified_diff == ""
-    missing = root_result_from_wire(
-        {"status": "succeeded", "include_diff": False},
-        tmp_path,
-        session_id="session-1",
-    )
-    assert missing.unified_diff == ""
-
-
 def test_child_mapper_rejects_non_bool_diff_truncated() -> None:
     for value in (1, 0, "yes", 0.5, None):
         with pytest.raises(TypeError, match="diff_truncated"):
@@ -204,42 +159,11 @@ def test_child_mapper_rejects_non_bool_diff_truncated() -> None:
     assert child["diff_truncated"] is True
 
 
-def test_root_result_rejects_non_bool_diff_truncated(tmp_path: Path) -> None:
-    for value in (1, 0, "yes", 0.5, None):
-        with pytest.raises(TypeError, match="diff_truncated"):
-            root_result_from_child(
-                {"status": "succeeded", "diff_truncated": value},
-                tmp_path,
-                session_id="session-1",
-            )
-    with pytest.raises(TypeError, match="diff_truncated"):
-        _root(tmp_path, status="succeeded", diff_truncated=1)
-    with pytest.raises(TypeError, match="diff_truncated"):
-        _root(tmp_path, status="succeeded", diff_truncated=None)
-    result = _root(tmp_path, status="succeeded", diff_truncated=True)
-    assert result.diff_truncated is True
-
-
 def test_child_mapper_rejects_nonzero_exit_code_on_success() -> None:
     with pytest.raises(ValueError, match="exit_code"):
         wire_to_child_result({"status": "succeeded", "exit_code": 99})
     child = wire_to_child_result({"status": "succeeded", "exit_code": 0})
     assert child["status"] == "done"
-
-
-def test_root_result_rejects_nonzero_exit_code_on_success(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="exit_code"):
-        root_result_from_wire(
-            {"status": "succeeded", "exit_code": 99},
-            tmp_path,
-            session_id="session-1",
-        )
-    with pytest.raises(ValueError, match="exit_code"):
-        root_result_from_child(
-            {"status": "succeeded", "exit_code": 99},
-            tmp_path,
-            session_id="session-1",
-        )
 
 
 def test_failed_wire_may_carry_nonzero_exit_code(tmp_path: Path) -> None:

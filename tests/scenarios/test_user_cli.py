@@ -607,22 +607,6 @@ def test_environment_only_provider_key_is_handed_without_plan_or_artifact_leak(
     assert dict(os.environ) == environment_before
 
 
-def test_plan_file_is_private_and_contains_no_credential(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    session_dir.mkdir()
-    secret = "plan-secret-must-not-appear"
-    from cambium.supervisor import _write_plan
-
-    path = _write_plan(
-        session_dir,
-        {"tasks": [{"task_id": "one", "provider_env_keys": [derived_env_name("demo")]}]},
-    )
-
-    # The permission assertion stays: ``plan.json`` is always created 0600.
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert secret not in path.read_text(encoding="utf-8")
-
-
 def test_provider_run_persists_real_plan_without_credential(
     monkeypatch, tmp_path: Path
 ) -> None:

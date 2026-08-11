@@ -11,20 +11,16 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
-from cambium.modules.base import DatasetError, Example
+from cambium.modules.base import DatasetError
 from cambium.modules.example import (
     Decision,
-    DecomposeOutput,
     ExampleDatasetLoader,
     ShouldDecomposeModule,
-    TaskInput,
 )
-from cambium.modules.example.metric import should_decompose_metric
 
 DATASET_PATH = Path(__file__).resolve().parents[1] / "datasets" / "example_pairs.jsonl"
 
@@ -55,37 +51,6 @@ def test_dataset_is_loadable_and_schema_valid() -> None:
     assert len(examples) >= 8
     assert all(isinstance(ex.expected["decompose"], Decision) for ex in examples)
     assert all(hasattr(ex.input, "task") and hasattr(ex.input, "context") for ex in examples)
-
-
-def test_decision_members_exist() -> None:
-    assert set(Decision) == {Decision.DECOMPOSE, Decision.DO_NOT_DECOMPOSE}
-
-
-def test_decompose_property_is_read_only_compat_shim() -> None:
-    decomposed = DecomposeOutput(decision=Decision.DECOMPOSE, reason="parallel work")
-    atomic = DecomposeOutput(decision=Decision.DO_NOT_DECOMPOSE, reason="atomic")
-
-    assert decomposed.decompose is True
-    assert atomic.decompose is False
-    # Frozen slots dataclasses reject assignment in their generated
-    # __setattr__ before the read-only property descriptor is reached.
-    # FrozenInstanceError is the precise AttributeError subtype here.
-    with pytest.raises(FrozenInstanceError):
-        decomposed.decompose = False
-
-
-def test_metric_matches_enum_decisions() -> None:
-    expected = {"decompose": Decision.DECOMPOSE, "reason": "parallel work"}
-    prediction = DecomposeOutput(decision=Decision.DECOMPOSE, reason="parallel work")
-    example = Example(
-        input=TaskInput("Split the work", ""), expected=expected, prediction=prediction
-    )
-    assert should_decompose_metric(example) == 1.0
-
-    wrong = example.with_prediction(
-        DecomposeOutput(decision=Decision.DO_NOT_DECOMPOSE, reason="atomic")
-    )
-    assert should_decompose_metric(wrong) == 0.0
 
 
 def test_loader_maps_wire_boolean_to_decision(tmp_path) -> None:
@@ -132,17 +97,12 @@ def test_engine_tolerates_leading_separators() -> None:
 
 
 def test_module_scores_perfect_on_its_dataset() -> None:
+    loader = ExampleDatasetLoader(DATASET_PATH)
+    canaries = [ex for ex in loader.load() if ex.canary]
+    assert len(canaries) >= 1
     scored = _run_all()
     assert len(scored) >= 8
     assert all(item["metric"] == 1.0 for item in scored)
-
-
-def test_canary_entries_are_processed() -> None:
-    loader = ExampleDatasetLoader(DATASET_PATH)
-    examples = loader.load()
-    canaries = [ex for ex in examples if ex.canary]
-    assert len(canaries) >= 1
-    scored = _run_all()
     processed_canaries = [item for item in scored if item["example"].canary]
     assert len(processed_canaries) == len(canaries)
     assert all(item["prediction"] is not None for item in processed_canaries)

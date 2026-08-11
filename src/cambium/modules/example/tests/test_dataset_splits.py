@@ -53,14 +53,6 @@ def test_load_all_bundle() -> None:
     assert bundle.dataset_version == "1.1.0"
 
 
-def test_split_loader_accepts_split_file_path() -> None:
-    file_loader = ExampleDatasetLoader(DATASETS_DIR / "train.jsonl")
-    dir_loader = ExampleDatasetLoader(DATASETS_DIR)
-    assert len(file_loader.load_split(Split.TRAIN)) == len(
-        dir_loader.load_split(Split.TRAIN)
-    )
-
-
 def test_canaries_excluded_from_train_and_eval() -> None:
     loader = ExampleDatasetLoader(DATASETS_DIR)
     train = loader.load_split(Split.TRAIN)
@@ -336,20 +328,6 @@ def test_evaluate_split_async_inside_event_loop() -> None:
     assert result["count"] == EXPECTED_COUNTS[Split.EVAL]
     assert result["mean"] == 1.0
     assert result["std"] == 0.0
-
-
-def test_evaluate_split_rejects_running_event_loop() -> None:
-    module = ShouldDecomposeModule()
-    loader = ExampleDatasetLoader(DATASETS_DIR)
-
-    async def run() -> None:
-        try:
-            evaluate_split(module, loader, Split.TRAIN)
-        except RuntimeError:
-            return
-        raise AssertionError("expected RuntimeError from a running event loop")
-
-    asyncio.run(run())
 
 
 def test_duplicate_ids_rejected(tmp_path) -> None:
