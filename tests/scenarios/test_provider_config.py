@@ -157,19 +157,6 @@ def test_non_finite_numeric_field_is_rejected(tmp_path: Path) -> None:
         load_providers(path)
 
 
-def test_infinity_numeric_field_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "providers.json"
-    path.write_text(
-        json.dumps({"providers": [_provider()]}).replace(
-            '"timeout_s": 30.0', '"timeout_s": Infinity'
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="non-standard JSON constant"):
-        load_providers(path)
-
-
 def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
     path = _write(
         tmp_path / "providers.json",

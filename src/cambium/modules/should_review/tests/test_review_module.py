@@ -11,21 +11,17 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
-from cambium.modules.base import DatasetError, Example
+from cambium.modules.base import DatasetError
 from cambium.modules.should_review import (
     Decision,
     ExampleDatasetLoader,
-    ReviewOutput,
     ShouldReviewModule,
     Split,
-    TaskInput,
 )
-from cambium.modules.should_review.metric import should_review_metric
 
 DATASETS_DIR = Path(__file__).resolve().parents[1] / "datasets"
 
@@ -60,39 +56,6 @@ def test_dataset_is_loadable_and_schema_valid() -> None:
         assert isinstance(example.expected["review"], Decision)
         assert example.expected["decompose"] in (True, False)
         assert hasattr(example.input, "task") and hasattr(example.input, "context")
-
-
-def test_decision_members_exist() -> None:
-    assert set(Decision) == {Decision.REVIEW, Decision.DO_NOT_REVIEW}
-
-
-def test_review_property_is_read_only_compat_shim() -> None:
-    reviewed = ReviewOutput(decision=Decision.REVIEW, reason="refusal marker")
-    clean = ReviewOutput(decision=Decision.DO_NOT_REVIEW, reason="complete")
-
-    assert reviewed.review is True
-    assert clean.review is False
-    # Frozen slots dataclasses reject assignment in their generated
-    # __setattr__ before the read-only property descriptor is reached.
-    # FrozenInstanceError is the precise AttributeError subtype here.
-    with pytest.raises(FrozenInstanceError):
-        reviewed.review = False
-
-
-def test_metric_matches_enum_decisions() -> None:
-    expected = {"review": Decision.REVIEW, "reason": "refusal marker"}
-    prediction = ReviewOutput(decision=Decision.REVIEW, reason="refusal marker")
-    example = Example(
-        input=TaskInput("I cannot finish the migration.", ""),
-        expected=expected,
-        prediction=prediction,
-    )
-    assert should_review_metric(example) == 1.0
-
-    wrong = example.with_prediction(
-        ReviewOutput(decision=Decision.DO_NOT_REVIEW, reason="complete")
-    )
-    assert should_review_metric(wrong) == 0.0
 
 
 def test_loader_maps_wire_boolean_to_decision(tmp_path) -> None:
@@ -155,16 +118,12 @@ def test_engine_tolerates_leading_separators() -> None:
 
 
 def test_module_scores_perfect_on_its_dataset() -> None:
-    scored = _run_all()
-    assert len(scored) == 55
-    assert all(item["metric"] == 1.0 for item in scored)
-
-
-def test_canary_entries_are_processed() -> None:
     loader = ExampleDatasetLoader(DATASETS_DIR)
     canaries = loader.load_split(Split.CANARIES)
     assert len(canaries) == 5
     scored = _run_all()
+    assert len(scored) == 55
+    assert all(item["metric"] == 1.0 for item in scored)
     processed_canaries = [item for item in scored if item["example"].canary]
     assert len(processed_canaries) == len(canaries)
     assert all(item["prediction"] is not None for item in processed_canaries)

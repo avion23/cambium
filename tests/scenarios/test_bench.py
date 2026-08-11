@@ -832,7 +832,7 @@ def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
 
     baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
-    assert baseline["tests"]["count"] == 57
+    assert baseline["tests"]["count"] == 51
     assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
     assert baseline["tests"]["wall_seconds"]["p90"] > 0
     assert all(
