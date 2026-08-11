@@ -28,6 +28,8 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
 from cambium.conversations import ConversationStore, ConversationStoreError
 from cambium.store import EventStore, StoreError, StoreTimeout
 
@@ -115,6 +117,7 @@ def _event_append(store: EventStore, index: int, i: int, critical_at: int) -> in
     return store.append({"kind": kind, "payload": {"thread": index, "i": i}})
 
 
+@pytest.mark.slow
 def test_event_store_close_race_preserves_seq_uniqueness_and_durability(tmp_path) -> None:
     db = tmp_path / "events.db"
     store = EventStore(db, fsync_interval_s=0.1)
@@ -150,6 +153,7 @@ def test_event_store_close_race_preserves_seq_uniqueness_and_durability(tmp_path
     )
 
 
+@pytest.mark.slow
 def test_event_store_overflow_drops_are_accounted(tmp_path) -> None:
     db = tmp_path / "events.db"
     store = EventStore(db, fsync_interval_s=0.05, max_queue_size=8, critical_timeout_s=5.0)
@@ -184,6 +188,7 @@ def test_event_store_overflow_drops_are_accounted(tmp_path) -> None:
     )
 
 
+@pytest.mark.slow
 def test_event_store_critical_acks_are_durable(tmp_path) -> None:
     db = tmp_path / "events.db"
     store = EventStore(db, fsync_interval_s=0.1)
@@ -207,6 +212,7 @@ def _conversation_append(store: ConversationStore, node_index: int, i: int) -> i
     return store.append(f"node-{node_index}", "user", f"message {i}")
 
 
+@pytest.mark.slow
 def test_conversation_store_close_race_preserves_rowid_uniqueness(tmp_path) -> None:
     db = tmp_path / "conversations.db"
     store = ConversationStore(db, fsync_interval_s=0.05)
