@@ -25,6 +25,22 @@ exposing credentials.
 ``run_session`` is a thin one-task adapter that keeps the historical
 ``SliceResult`` return shape. ``cambium.store`` and ``cambium.merge`` are
 hard runtime dependency contracts: import failure fails at load.
+
+Dynamic child admission (implementation-plan step 2): a worker may propose a
+child task with the ``propose_child`` wire message ({request_id,
+parent_task_id, child_task_id, kind, spec}), correlated by request_id like
+the other wire messages. The supervisor validates each revision against the
+session task tree — ``tasktree.build_tree`` over the accumulated tasks list,
+root = the single plan root. A duplicate, cyclic, multi-parent, over-depth,
+or over-width revision is durably rejected with a ``child_rejected`` event
+(reason + spawn nothing); a valid revision is durably recorded as
+``child_admitted`` through the existing EventStore path (redacted) and then
+spawned as a new session task through the same ``supervise_task`` machinery,
+with context limited to its own spec plus the parent's strict-key envelope
+(the ``tasktree.upward_result`` key set). The child's upward envelope uses
+that same strict key set and reaches only its parent. Top-level flat fan-out
+is unchanged; plan tasks without an explicit ``kind`` default to the session
+kind for tree validation only.
 """
 
 from __future__ import annotations
@@ -66,7 +82,9 @@ from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
     _ENVELOPE_KEYS,
     MAX_WIDTH,
+    TaskKind,
     TaskTree,
+    TaskTreeError,
     build_tree,
     ready_tasks,
     topological_order,
@@ -82,6 +100,12 @@ PONG_DEADLINE_S = 10.0
 DURABLE_EVENT_TIMEOUT_S = 5.0
 
 EventSink = Callable[[dict[str, Any]], None]
+
+# Session-tree kind for plan tasks that do not declare one. ``build_tree``
+# requires a kind per node; flat run_plan specs are code-editing tasks, so
+# FEATURE is the schema default. The proposal's own ``kind`` is always used
+# for admitted children.
+_DEFAULT_SESSION_KIND = TaskKind.FEATURE.value
 
 
 def make_request_id(seq: int) -> str:
@@ -99,6 +123,18 @@ def _stdin_write_timeout_s() -> float:
     except ValueError:
         return STDIN_WRITE_TIMEOUT_S
     return max(0.0, timeout)
+
+
+def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
+    """Return propose_child fields whose values cannot be admitted."""
+    invalid: list[str] = []
+    for field in ("request_id", "parent_task_id", "child_task_id", "kind"):
+        value = msg.get(field)
+        if not isinstance(value, str) or not value:
+            invalid.append(field)
+    if not isinstance(msg.get("spec"), dict):
+        invalid.append("spec")
+    return invalid
 
 
 def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
@@ -680,8 +716,10 @@ class _Runtime:
             None if provider_environment is None else dict(provider_environment)
         )
         self._event_append_lock = asyncio.Lock()
+        # max_concurrent_tasks=0 disables the cap (no semaphore); None is
+        # rewritten to the auto default by run_plan before _Runtime is built.
         self._admission_semaphore = (
-            None if max_concurrent_tasks is None else asyncio.Semaphore(max_concurrent_tasks)
+            None if not max_concurrent_tasks else asyncio.Semaphore(max_concurrent_tasks)
         )
         self._handles: dict[str, WorkerHandle] = {}
         self._results: dict[str, TaskResult] = {}
@@ -690,6 +728,11 @@ class _Runtime:
         self._merge_lock = asyncio.Lock()
         self._rid = 0
         self._last_envelope: dict[str, Any] | None = None
+        # Dynamic child admission state (implementation-plan step 2).
+        self._session_tasks: list[dict[str, Any]] = []
+        self._pending_children: dict[str, list[dict[str, Any]]] = {}
+        self._child_envelopes: dict[str, list[dict[str, Any]]] = {}
+        self._task_group: asyncio.TaskGroup | None = None
 
     @property
     def last_envelope(self) -> dict[str, Any] | None:
@@ -1112,38 +1155,172 @@ class _Runtime:
                 marker=spec.get("marker"),
                 write_marker=bool(spec.get("write_marker", True)),
             )
-        parent_envelope = spec.get("parent_envelope")
-        if parent_envelope is not None:
-            payload["parent_envelope"] = parent_envelope
+        # Dynamic child admission: the child's context is its own spec plus
+        # the parent's envelope; a child may itself declare proposals.
+        if spec.get("parent_envelope") is not None:
+            payload["parent_envelope"] = spec["parent_envelope"]
+        if spec.get("proposed_children") is not None:
+            payload["proposed_children"] = spec["proposed_children"]
         return payload
+
+    # -- dynamic child admission (implementation-plan step 2) ----------------
+
+    def set_session_tasks(self, specs: list[dict[str, Any]]) -> None:
+        """Seed the accumulated session task list used for revision validation.
+
+        Plan tasks are the session roots (``depends_on`` empty). The list
+        grows with every admitted child, so ``tasktree.build_tree`` over it
+        reproduces the session tree (root = the single plan root). A flat
+        multi-root plan has no single session tree: proposals are then
+        rejected with the build_tree root-count reason.
+        """
+        self._session_tasks = [
+            {
+                "task_id": spec["task_id"],
+                "kind": spec.get("kind") or _DEFAULT_SESSION_KIND,
+                "depends_on": list(spec.get("depends_on") or []),
+                "spec": spec,
+            }
+            for spec in specs
+        ]
+
+    def _strict_envelope(self, spec: dict[str, Any], msg: dict[str, Any]) -> dict[str, Any]:
+        """The strict upward envelope for a worker result (I2.7 key set).
+
+        Exactly the nine ``tasktree.upward_result`` keys — parent_task_id,
+        unified_diff, diff_truncated, summary, metric_score,
+        metric_breakdown, commits, files_changed, status. There is no
+        transcript/scratchpad field to send, so a parent can never receive
+        one. Used both for the parent envelope admitted into a child's
+        context and for a dynamic child's own upward result.
+        """
+        values = {
+            "parent_task_id": spec.get("parent_task_id"),
+            "unified_diff": msg.get("diff", ""),
+            "diff_truncated": bool(msg.get("diff_truncated", False)),
+            "summary": msg.get("summary", ""),
+            "metric_score": None,
+            "metric_breakdown": {},
+            "commits": msg.get("commits", []),
+            "files_changed": msg.get("files_changed", []),
+            "status": msg.get("status"),
+        }
+        return {key: values[key] for key in _ENVELOPE_KEYS}
+
+    async def _admit_child(
+        self,
+        parent_spec: dict[str, Any],
+        proposal: dict[str, Any],
+        parent_envelope: dict[str, Any],
+    ) -> None:
+        """Validate one child revision, record it durably, then spawn it.
+
+        The revision is validated with ``tasktree.build_tree`` over the
+        accumulated session tasks plus the proposed child. A duplicate,
+        cyclic, multi-parent, over-depth, or over-width revision (or an
+        invalid child spec) is durably rejected with ``child_rejected`` and
+        spawns nothing. A valid revision is appended to the session tree,
+        durably recorded as ``child_admitted`` through the existing
+        EventStore path (redacted), and spawned as a new session task with
+        context limited to its own spec plus the parent's envelope — never
+        sibling context or a parent transcript.
+        """
+        request_id = proposal.get("request_id")
+        parent_task_id = parent_spec["task_id"]
+        child_task_id = proposal["child_task_id"]
+        kind = proposal["kind"]
+        candidate = {
+            "task_id": child_task_id,
+            "kind": kind,
+            "depends_on": [parent_task_id],
+            "spec": proposal.get("spec", {}),
+        }
+        try:
+            build_tree({"tasks": [*self._session_tasks, candidate]})
+        except TaskTreeError as exc:
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
+            )
+            return
+        try:
+            child_spec = _child_spec(
+                self._session_dir, parent_spec, proposal, parent_envelope
+            )
+        except ValueError as exc:
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
+            )
+            return
+        # Append synchronously before any await so a concurrent proposal
+        # validation observes this child (duplicate detection stays exact).
+        self._session_tasks.append({
+            "task_id": child_task_id,
+            "kind": kind,
+            "depends_on": [parent_task_id],
+            "spec": child_spec,
+        })
+        try:
+            if self._task_group is None:
+                raise RuntimeError("no active task group")
+            self._task_group.create_task(self.supervise_task(child_spec))
+        except RuntimeError as exc:
+            # Group already closed/cancelled: roll the tree back so the child
+            # is not left durably admitted but never spawned, and record the
+            # rejection instead.
+            self._session_tasks[:] = [
+                task for task in self._session_tasks
+                if task.get("spec") is not child_spec
+            ]
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
+            )
+            return
+        await self.emit(
+            "child_admitted", task_id=parent_task_id, request_id=request_id,
+            parent_task_id=parent_task_id, child_task_id=child_task_id,
+            child_kind=kind, branch=child_spec.get("branch"),
+        )
 
     # -- per-task supervision ------------------------------------------------
 
     async def supervise_task(self, spec: dict[str, Any]) -> None:
         if spec["task_id"] in self._results:
             return
-        semaphore = self._admission_semaphore
-        if semaphore is not None:
-            await semaphore.acquire()
         try:
-            try:
-                await self._supervise(spec)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                await self.emit(
-                    "worker_failed", task_id=spec["task_id"], reason=f"supervisor error: {exc!r}"
-                )
-                self._results[spec["task_id"]] = TaskResult(
-                    task_id=spec["task_id"], status="failed", exit_code=1,
-                    reason=f"supervisor error: {exc.__class__.__name__}",
-                )
-            finally:
-                if spec["task_id"] in self._results:
-                    await self._prune_worktree(spec)
+            await self._supervise(spec)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.emit(
+                "worker_failed", task_id=spec["task_id"], reason=f"supervisor error: {exc!r}"
+            )
+            self._results[spec["task_id"]] = TaskResult(
+                task_id=spec["task_id"], status="failed", exit_code=1,
+                reason=f"supervisor error: {exc.__class__.__name__}",
+            )
         finally:
-            if semaphore is not None:
-                semaphore.release()
+            if spec["task_id"] in self._results:
+                await self._prune_worktree(spec)
+            # Proposals buffered but never processed (the parent ended without
+            # a result envelope) are dropped with a durable rejection so they
+            # neither leak nor vanish silently.
+            pending = self._pending_children.pop(spec["task_id"], [])
+            for proposal in pending:
+                await self.emit(
+                    "child_rejected", task_id=spec["task_id"],
+                    request_id=proposal.get("request_id"),
+                    parent_task_id=spec["task_id"],
+                    child_task_id=proposal["child_task_id"],
+                    child_kind=proposal.get("kind"),
+                    reason="ParentTerminatedWithoutResult",
+                    message="parent ended without a result envelope; proposal dropped",
+                )
 
     async def _supervise(self, spec: dict[str, Any]) -> None:
         task_id = spec["task_id"]
@@ -1214,92 +1391,105 @@ class _Runtime:
                 return
         generation = await self._ensure_worktree(spec)
 
-        restarts = 0
-        while True:
-            handle = WorkerHandle(task_id=task_id, generation=generation)
-            self._handles[task_id] = handle
-            outcome = await self._drive_generation(
-                spec, handle,
-                ready_timeout=ready_timeout,
-                heartbeat_interval=heartbeat_interval,
-                heartbeat_timeout=heartbeat_timeout,
-                wall_budget=wall_budget,
-            )
-            if outcome.envelope is not None and outcome.correlated:
-                self._last_envelope = self._redact_envelope(outcome.envelope)
-                self._task_envelopes[task_id] = self._last_envelope
-            if outcome.clean:
-                envelope_status = (
-                    outcome.envelope.get("status")
-                    if outcome.envelope is not None else None
+        # The admission semaphore bounds concurrent worker processes only. It
+        # is held across the generation loop and released before merge, prune,
+        # and observer notification, so a barrier observer waiting on a peer
+        # task's merge can never deadlock against tasks still queued for an
+        # admission slot.
+        semaphore = self._admission_semaphore
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            restarts = 0
+            while True:
+                handle = WorkerHandle(task_id=task_id, generation=generation)
+                self._handles[task_id] = handle
+                outcome = await self._drive_generation(
+                    spec, handle,
+                    ready_timeout=ready_timeout,
+                    heartbeat_interval=heartbeat_interval,
+                    heartbeat_timeout=heartbeat_timeout,
+                    wall_budget=wall_budget,
                 )
-                if envelope_status != "succeeded":
-                    failure_reason = (
-                        outcome.envelope.get("failure_reason")
+                if outcome.envelope is not None and outcome.correlated:
+                    self._last_envelope = self._redact_envelope(outcome.envelope)
+                    self._task_envelopes[task_id] = self._last_envelope
+                if outcome.clean:
+                    envelope_status = (
+                        outcome.envelope.get("status")
                         if outcome.envelope is not None else None
                     )
-                    if not isinstance(failure_reason, str) or not failure_reason:
-                        failure_reason = "worker_verdict_failed"
+                    if envelope_status != "succeeded":
+                        failure_reason = (
+                            outcome.envelope.get("failure_reason")
+                            if outcome.envelope is not None else None
+                        )
+                        if not isinstance(failure_reason, str) or not failure_reason:
+                            failure_reason = "worker_verdict_failed"
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id, status="failed", exit_code=1,
+                            reason=failure_reason, restarts=restarts,
+                        )
+                        return
+                    integrity = await self._worker_success_integrity(spec, worktree)
+                    if integrity is not None:
+                        await self.emit(
+                            "worker_failed", task_id=task_id, generation=generation,
+                            reason=integrity,
+                        )
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id, status="failed", exit_code=1,
+                            reason=integrity, restarts=restarts,
+                        )
+                        return
+                    merged = await self._merge_task(spec, handle)
+                    if merged is not None:
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id, status="succeeded", exit_code=0,
+                            reason=None, merge_sha=merged, restarts=restarts,
+                        )
+                    else:
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id, status="failed", exit_code=1,
+                            reason="merge_failed", restarts=restarts,
+                        )
+                    return
+                if outcome.fatal:
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason=failure_reason, restarts=restarts,
+                        reason=outcome.reason, restarts=restarts,
                     )
                     return
-                integrity = await self._worker_success_integrity(spec, worktree)
-                if integrity is not None:
+                reason = outcome.reason or "crash"
+                if outcome.timeout_phase:
+                    await self.emit(
+                        "timeout", task_id=task_id, generation=generation, phase=outcome.timeout_phase
+                    )
+                if restarts >= max_restarts:
                     await self.emit(
                         "worker_failed", task_id=task_id, generation=generation,
-                        reason=integrity,
+                        restarts=restarts, max_restarts=max_restarts, reason=reason,
                     )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason=integrity, restarts=restarts,
+                        reason=f"max_restarts ({max_restarts}): {reason}", restarts=restarts,
                     )
                     return
-                merged = await self._merge_task(spec, handle)
-                if merged is not None:
-                    self._results[task_id] = TaskResult(
-                        task_id=task_id, status="succeeded", exit_code=0,
-                        reason=None, merge_sha=merged, restarts=restarts,
-                    )
-                else:
-                    self._results[task_id] = TaskResult(
-                        task_id=task_id, status="failed", exit_code=1,
-                        reason="merge_failed", restarts=restarts,
-                    )
-                return
-            if outcome.fatal:
-                self._results[task_id] = TaskResult(
-                    task_id=task_id, status="failed", exit_code=1,
-                    reason=outcome.reason, restarts=restarts,
+                restarts += 1
+                delay = random.uniform(
+                    0.0, min(RESTART_MAX_DELAY_S, RESTART_BASE_DELAY_S * 2**restarts)
                 )
-                return
-            reason = outcome.reason or "crash"
-            if outcome.timeout_phase:
                 await self.emit(
-                    "timeout", task_id=task_id, generation=generation, phase=outcome.timeout_phase
+                    "restart_scheduled", task_id=task_id, generation=generation,
+                    restart_count=restarts, max_restarts=max_restarts,
+                    delay_s=round(delay, 3), reason=reason,
                 )
-            if restarts >= max_restarts:
-                await self.emit(
-                    "worker_failed", task_id=task_id, generation=generation,
-                    restarts=restarts, max_restarts=max_restarts, reason=reason,
-                )
-                self._results[task_id] = TaskResult(
-                    task_id=task_id, status="failed", exit_code=1,
-                    reason=f"max_restarts ({max_restarts}): {reason}", restarts=restarts,
-                )
-                return
-            restarts += 1
-            delay = random.uniform(
-                0.0, min(RESTART_MAX_DELAY_S, RESTART_BASE_DELAY_S * 2**restarts)
-            )
-            await self.emit(
-                "restart_scheduled", task_id=task_id, generation=generation,
-                restart_count=restarts, max_restarts=max_restarts,
-                delay_s=round(delay, 3), reason=reason,
-            )
-            await asyncio.sleep(delay)
-            generation = await self._recover_worktree(spec, generation + 1)
+                await asyncio.sleep(delay)
+                generation = await self._recover_worktree(spec, generation + 1)
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
 
     async def _drive_generation(
         self, spec: dict[str, Any], handle: WorkerHandle, *,
@@ -1311,6 +1501,10 @@ class _Runtime:
         generation = handle.generation
         cmd = self._worker_command(spec)
         env = self._worker_env(spec, generation)
+        # A new generation is a fresh worker process: proposals buffered by a
+        # previous, dead generation are stale and must not be admitted when a
+        # later generation delivers its result.
+        self._pending_children.pop(task_id, None)
 
         async def _report_outbound_message_too_long() -> None:
             await self.emit(
@@ -1645,6 +1839,46 @@ class _Runtime:
                         "result", task_id=task_id, request_id=msg.get("request_id"),
                         generation=generation, **result_payload,
                     )
+                    # Dynamic child admission: proposals are processed only
+                    # now, when the parent's terminal envelope exists (the
+                    # child's context is its own spec plus that envelope).
+                    pending = self._pending_children.pop(task_id, [])
+                    if pending:
+                        parent_envelope = self._redact_envelope(
+                            self._strict_envelope(spec, msg)
+                        )
+                        for proposal in pending:
+                            await self._admit_child(spec, proposal, parent_envelope)
+                    if spec.get("parent_task_id") is not None:
+                        child_result = self._strict_envelope(spec, msg)
+                        await self.emit(
+                            "child_result", task_id=task_id, generation=generation,
+                            **child_result,
+                        )
+                        self._child_envelopes.setdefault(
+                            spec["parent_task_id"], []
+                        ).append(child_result)
+                elif mtype == "propose_child":
+                    invalid_fields = _invalid_propose_child_fields(msg)
+                    if invalid_fields:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="propose_child rejected: invalid field(s)",
+                            fields=invalid_fields,
+                        )
+                    elif msg.get("parent_task_id") != task_id:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="propose_child parent_task_id mismatch",
+                            parent_task_id=msg.get("parent_task_id"),
+                            child_task_id=msg.get("child_task_id"),
+                        )
+                    else:
+                        # Buffered until the parent's terminal envelope
+                        # arrives; admission then validates the revision
+                        # against the session tree (build_tree over the
+                        # accumulated tasks list).
+                        self._pending_children.setdefault(task_id, []).append(msg)
                 elif mtype in ("exit", "exit_message"):
                     exit_reason = msg.get("reason")
                     handle.exit_reason = exit_reason
@@ -2154,6 +2388,39 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     return spec
 
 
+def _child_spec(
+    session_dir: Path,
+    parent_spec: dict[str, Any],
+    proposal: dict[str, Any],
+    parent_envelope: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the spawnable child spec: its own spec plus the parent envelope.
+
+    The child context is limited to its own proposed spec fields, its tree
+    identity (``task_id``/``kind``/``parent_task_id``), and the parent's
+    redacted strict-key envelope. ``_validate_plan_task`` applies the same
+    path-safety and required-field checks as a plan task; the child's
+    ``parent_envelope`` is carried only into its own run payload and is never
+    broadcast to siblings. Raises ``ValueError`` when the proposal spec is
+    not a valid task spec.
+    """
+    raw = proposal.get("spec")
+    if not isinstance(raw, dict):
+        raise ValueError("child proposal spec must be an object")
+    child_spec = dict(raw)
+    child_spec["task_id"] = proposal["child_task_id"]
+    child_spec["kind"] = proposal["kind"]
+    child_spec["parent_task_id"] = parent_spec["task_id"]
+    # Children inherit, never exceed, the parent's environment access: a
+    # worker must not widen provider_env_keys beyond what its parent (or the
+    # plan) already had.
+    parent_keys = set(parent_spec.get("provider_env_keys") or ())
+    child_keys = set(child_spec.get("provider_env_keys") or ())
+    child_spec["provider_env_keys"] = sorted(child_keys & parent_keys)
+    child_spec["parent_envelope"] = parent_envelope
+    return _validate_plan_task(session_dir, child_spec)
+
+
 def _reject_duplicate_task_ids(tasks: list[dict[str, Any]]) -> None:
     """Reject duplicate IDs before validation can create session side effects."""
     seen: set[str] = set()
@@ -2359,6 +2626,7 @@ async def _run_wave_bounded(
     """
     if width_limit is None or width_limit >= len(specs):
         async with asyncio.TaskGroup() as tg:
+            runtime._task_group = tg
             for spec in specs:
                 tg.create_task(runtime.supervise_task(spec))
         return
@@ -2369,6 +2637,7 @@ async def _run_wave_bounded(
             await runtime.supervise_task(spec)
 
     async with asyncio.TaskGroup() as tg:
+        runtime._task_group = tg
         for spec in specs:
             tg.create_task(bounded(spec))
 
@@ -2481,9 +2750,11 @@ async def run_plan(
       ``max_width`` field, then ``tasktree.MAX_WIDTH``). A node that fails
       cascades: its descendants are never spawned and are recorded as failed
       with reason ``dependency_failed:<parent>``.
-    - ``max_concurrent_tasks`` bounds how many tasks are supervised at once
+    - ``max_concurrent_tasks`` bounds how many worker processes run at once
       (a session-wide parallel-worker cap, I2.3) on either path. Defaults to
-      one per CPU; pass ``None`` for unlimited concurrency.
+      one per CPU; pass ``0`` for unlimited concurrency. The cap covers the
+      worker phase only (spawn through worker exit), never merge, prune, or
+      observer notification.
     """
     session_dir = Path(session_dir)
     tasks = _plan_tasks(plan)
@@ -2492,11 +2763,11 @@ async def run_plan(
     if not specs:
         raise ValueError("plan contains no tasks")
     if max_concurrent_tasks is not None and (
-        not isinstance(max_concurrent_tasks, int) or max_concurrent_tasks < 1
+        type(max_concurrent_tasks) is not int or max_concurrent_tasks < 0
     ):
-        raise ValueError("max_concurrent_tasks must be a positive int or None")
+        raise ValueError("max_concurrent_tasks must be a non-negative int or None")
     if max_concurrent_tasks is None:
-        max_concurrent_tasks = max(1, os.cpu_count() or 1)
+        max_concurrent_tasks = max(1, os.process_cpu_count() or os.cpu_count() or 1)
 
     tree, width_limit = _resolve_hierarchy(specs, plan, max_width)
 
@@ -2517,6 +2788,7 @@ async def run_plan(
             max_concurrent_tasks=max_concurrent_tasks,
         )
         await runtime.start()
+        runtime.set_session_tasks(specs)
         cancelled = False
         try:
             await runtime.reconcile(specs)
@@ -2524,6 +2796,9 @@ async def run_plan(
                 await _dispatch_static_waves(runtime, tree, width_limit)
             else:
                 async with asyncio.TaskGroup() as tg:
+                    # Dynamic child admission spawns into the active group;
+                    # the flat fan-out path owns this group for the session.
+                    runtime._task_group = tg
                     for spec in specs:
                         tg.create_task(runtime.supervise_task(spec))
         except asyncio.CancelledError:

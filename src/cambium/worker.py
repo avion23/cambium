@@ -14,6 +14,14 @@ executes one task and then exits:
     steer                       ->  {"action": "cancel"} aborts the current
                                     task (status cancelled); anything else is
                                     logged and ignored (v2.1 hook)
+    propose_child (outbound)    ->  after the task body, one message per
+                                    entry in the run payload's
+                                    ``proposed_children`` list: {request_id,
+                                    parent_task_id, child_task_id, kind,
+                                    spec}; the supervisor validates the
+                                    revision and replies with durable
+                                    ``child_admitted`` / ``child_rejected``
+                                    events (no wire ack)
     cancel                      ->  ok (ack) then abort the current task with
                                     status "cancelled"
     shutdown                    ->  ok (ack), abort the current task, then
@@ -96,7 +104,13 @@ from cambium.diffundo import (
     prompt_prefix_bytes,
 )
 from cambium.fencing import validate_worker_generation
-from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
+from cambium.ipc import (
+    MAX_LINE_BYTES,
+    MessageTooLong,
+    make_request_id,
+    read_message,
+    write_message,
+)
 from cambium.provider_config import load_providers
 from cambium.schemas import TOOL_SCHEMAS
 from cambium.tools import ToolContext, ToolResult, run_tool
@@ -1381,6 +1395,44 @@ async def _heartbeat_loop(
         await asyncio.sleep(interval_s)
 
 
+async def _emit_proposed_children(
+    writer: asyncio.StreamWriter, run: dict[str, Any], task_id: str
+) -> None:
+    """Emit one ``propose_child`` wire message per declared child proposal.
+
+    The proposal set is read from the run payload's ``proposed_children``
+    (declared by the caller in the plan spec; deterministic, no model
+    autonomy): each entry is ``{"child_task_id", "kind", "spec"}``. Every
+    message carries a fresh ``request_id`` so the supervisor can correlate the
+    resulting ``child_admitted`` / ``child_rejected`` events. Emitted after
+    the task body finishes and before the result envelope, so the supervisor
+    can admit children as soon as the parent's terminal envelope is known.
+    """
+    proposals = run.get("proposed_children")
+    if not isinstance(proposals, list):
+        return
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        child_task_id = proposal.get("child_task_id")
+        kind = proposal.get("kind")
+        child_spec = proposal.get("spec")
+        if not isinstance(child_task_id, str) or not child_task_id:
+            continue
+        if not isinstance(kind, str) or not kind:
+            continue
+        if not isinstance(child_spec, dict):
+            continue
+        await send(writer, {
+            "type": "propose_child",
+            "request_id": make_request_id("propose"),
+            "parent_task_id": task_id,
+            "child_task_id": child_task_id,
+            "kind": kind,
+            "spec": child_spec,
+        })
+
+
 async def _run_task(
     writer: asyncio.StreamWriter,
     run: dict[str, Any],
@@ -1422,6 +1474,7 @@ async def _run_task(
     outcome["generation"] = generation
     outcome["started_at"] = started_at
     outcome["ended_at"] = time.time()
+    await _emit_proposed_children(writer, run, task_id)
     return outcome
 
 

@@ -204,14 +204,14 @@ def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
     events = read_events(session_dir)
     spawned = _kinds(events, "spawned")
     assert [e["task_id"] for e in spawned] == ["t-a", "t-b"]
-    terminal_kinds = {"result", "merge_committed", "worktree_pruned"}
-    a_terminal = next(
+    # t-a's worker phase ends with result + exit (the semaphore is released
+    # after the generation loop, before merge/prune); t-b's spawn is
+    # sequenced strictly after both, so the two workers never overlapped.
+    a_worker_end = max(
         e["seq"] for e in events
-        if e["task_id"] == "t-a" and e["kind"] in terminal_kinds
+        if e["task_id"] == "t-a" and e["kind"] in ("result", "exit")
     )
-    # t-b's spawn is sequenced strictly after t-a's last terminal event, so
-    # the two tasks never ran concurrently.
-    assert spawned[1]["seq"] > a_terminal
+    assert spawned[1]["seq"] > a_worker_end
 
 
 
