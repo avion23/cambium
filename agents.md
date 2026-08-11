@@ -171,9 +171,18 @@ stdout and to a file under /tmp; the source repo is never written.
   (`DeviceFlow`), and `import_codex_cli_session` for the codex CLI's
   existing `~/.codex/auth.json` session. It reuses auth.py's hardening
   primitives and never stores the id_token or email.
+- OAuth wiring: `run_plan` preflights codex_chatgpt tasks against the LOCAL
+  oauth store (present + unexpired-or-refreshable; no network probe), and each
+  worker spawn injects `CAMBIUM_OAUTH_ACCESS_<PROVIDER>`/`CAMBIUM_OAUTH_ACCOUNT_<PROVIDER>`
+  from the supervisor's `TokenManager` — never the refresh token — registering
+  the access token with the session redactor. `cambium auth oauth` manages the
+  session (device flow, `--status`, `--logout`, `--import-codex-cli`);
+  `cambium doctor --oauth-live` is an opt-in live refresh/reachability probe
+  that consumes quota and never makes a model call.
 
 - `doctor` reports runtime, worktree, provider/auth, optional stores, dataset
-  integrity, and advisory host health.
+  integrity, advisory host health, and (opt-in `--oauth-live`) Codex OAuth
+  refreshability and issuer reachability.
 
 ## Boundary invariants
 

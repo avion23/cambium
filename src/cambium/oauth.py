@@ -505,6 +505,30 @@ class OAuthStore:
         provider = _validate_provider_id(provider)
         return self.read().by_provider(provider)
 
+    def read_document(self, provider: str) -> OAuthDoc | None:
+        """Return one provider's :class:`OAuthDoc`, or ``None`` when absent.
+
+        Fail-closed like :meth:`read_provider`: a present-but-corrupt or
+        insecure store raises instead of appearing empty. The supervisor and
+        CLI use this for local-only reads (status, preflight); it never
+        touches the network.
+        """
+        record = self.read_provider(provider)
+        return None if record is None else record.doc
+
+    def validate(self, provider: str) -> OAuthDoc:
+        """Require one provider's :class:`OAuthDoc`; raise when absent or unreadable.
+
+        The supervisor's fail-closed oauth preflight uses this to distinguish
+        a missing session (``OAuthMissingError``) from a corrupt store
+        (``OAuthSchemaError``/``OAuthStoreError``) with one local read.
+        """
+        provider = _validate_provider_id(provider)
+        record = self.read().by_provider(provider)
+        if record is None:
+            raise OAuthMissingError(f"provider {provider!r} has no oauth credentials")
+        return record.doc
+
     def providers(self) -> tuple[str, ...]:
         return tuple(record.doc.provider for record in self.read().records)
 
@@ -1158,6 +1182,17 @@ class TokenManager:
     @property
     def store(self) -> OAuthStore:
         return self._store
+
+    def disabled(self, provider: str | None = None) -> bool:
+        """Return whether the provider's stored session is disabled.
+
+        A disabled record means the refresh token was rejected and re-login is
+        required. A missing session counts as disabled (fail closed); the
+        check is one local store read and never touches the network.
+        """
+        target = self._provider if provider is None else _validate_provider_id(provider)
+        record = self._store.read_provider(target)
+        return record is None or record.disabled
 
     def _lock_path(self) -> Path:
         return (

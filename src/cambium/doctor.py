@@ -26,6 +26,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +36,21 @@ from urllib.parse import quote
 
 from . import auth
 from .auth import AuthError, AuthStore
+from .oauth import (
+    DEFAULT_ISSUER,
+    InvalidGrantError,
+    OAuthError,
+    OAuthMissingError,
+    OAuthStore,
+    RefreshUnavailableError,
+    refresh_access_token,
+)
 from .provider_config import (
     DEFAULT_SAMPLE,
+    AuthMode,
     env_report,
     load_provider_specs,
+    load_providers,
     validate_provider_specs,
 )
 from .system_health import format_health, health
@@ -558,7 +571,99 @@ def check_secrets() -> tuple[Status, str]:
     return Status.PASS, f"{models} present but not git-tracked"
 
 
-def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
+def _issuer_reachable(issuer: str, timeout_s: float) -> tuple[bool, str]:
+    """Any HTTP response proves endpoint reachability; failures are detailed."""
+    try:
+        with urllib.request.urlopen(issuer, timeout=timeout_s) as response:
+            response.read(256)
+            return True, f"issuer HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        return True, f"issuer HTTP {exc.code}"
+    except Exception as exc:  # TimeoutError, URLError, OSError
+        return False, f"issuer unreachable: {exc}"
+
+
+def check_oauth_live(
+    cwd: Path,
+    *,
+    provider_config: Path | None = None,
+    oauth_store: OAuthStore | None = None,
+    client_id: str | None = None,
+    issuer: str | None = None,
+    timeout_s: float = 10.0,
+) -> tuple[Status, str]:
+    """OPT-IN live oauth probe for codex_chatgpt providers.
+
+    Runs only with ``cambium doctor --oauth-live``. It probes issuer
+    reachability and performs one real refresh-token exchange per configured
+    codex provider (consuming quota); it never makes a model call. ``issuer``,
+    ``oauth_store``, ``provider_config``, and ``client_id`` are injectable so
+    tests can probe a loopback fake issuer without the network or a store at
+    the real path.
+    """
+    if provider_config is None:
+        provider_config = _provider_config_path(cwd)[0]
+    try:
+        providers = load_providers(provider_config)
+    except (OSError, ValueError) as exc:
+        return Status.SKIP, f"oauth live check skipped: provider config failed: {exc}"
+    codex = [provider for provider in providers if provider.auth is AuthMode.CODEX_CHATGPT]
+    if not codex:
+        return Status.PASS, "no codex_chatgpt providers configured; nothing to probe live"
+
+    store = OAuthStore() if oauth_store is None else oauth_store
+    effective_issuer = DEFAULT_ISSUER if issuer is None else issuer
+    effective_client_id = (
+        client_id if client_id is not None else os.environ.get("CAMBIUM_CODEX_CLIENT_ID", "")
+    )
+    reachable, reachability = _issuer_reachable(effective_issuer, timeout_s)
+
+    details: list[str] = []
+    failed = not reachable
+    for provider in codex:
+        name = provider.name
+        try:
+            doc = store.validate(name)
+        except OAuthMissingError:
+            details.append(f"{name}=no-session")
+            continue
+        except OAuthError:
+            details.append(f"{name}=invalid-store")
+            failed = True
+            continue
+        if not effective_client_id:
+            details.append(f"{name}=refresh-skipped(no client id)")
+            continue
+        try:
+            refresh_access_token(
+                effective_issuer, effective_client_id, doc.refresh_token, timeout_s
+            )
+            details.append(f"{name}=refreshable")
+        except InvalidGrantError:
+            details.append(f"{name}=refresh-rejected")
+            failed = True
+        except RefreshUnavailableError:
+            details.append(f"{name}=refresh-unavailable")
+        except OAuthError:
+            details.append(f"{name}=refresh-failed")
+            failed = True
+
+    detail = f"{reachability}; " + "; ".join(details) if details else reachability
+    if failed:
+        return Status.FAIL, detail
+    if any(
+        "no-session" in item or "refresh-skipped" in item or "refresh-unavailable" in item
+        for item in details
+    ):
+        return Status.WARN, detail
+    if not reachable:
+        return Status.FAIL, detail
+    return Status.PASS, detail
+
+
+def run_checks(
+    session_dir: Path | None, cwd: Path, *, oauth_live: bool = False
+) -> list[Check]:
     checks = [
         (1, "Python version", check_python()),
         (2, "uv", check_uv()),
@@ -575,6 +680,8 @@ def run_checks(session_dir: Path | None, cwd: Path) -> list[Check]:
         (13, "Conversation store", check_conversation_store(session_dir)),
         (14, "System health", check_system_health(cwd)),
     ]
+    if oauth_live:
+        checks.append((15, "OAuth live", check_oauth_live(cwd)))
     return [
         Check(number=number, name=name, status=status, detail=detail)
         for number, name, (status, detail) in checks
@@ -615,8 +722,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="session dir whose Cambium artifacts are checked (optional)",
     )
+    parser.add_argument(
+        "--oauth-live",
+        action="store_true",
+        help="opt-in live oauth probe for codex_chatgpt providers (consumes "
+        "quota; never makes a model call)",
+    )
     args = parser.parse_args(argv)
-    checks = run_checks(args.session_dir, Path.cwd())
+    checks = run_checks(args.session_dir, Path.cwd(), oauth_live=args.oauth_live)
     print(format_report(checks))
     return exit_code(checks)
 

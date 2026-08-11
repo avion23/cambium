@@ -130,3 +130,18 @@ issuer contract, and `import_codex_cli_session` for the existing
 `~/.codex/auth.json` session. The codex CLI's own client id is passed in
 (`--client-id`), never hardcoded; `cambium auth oauth` (W4) consumes it.
 
+### Supervisor/CLI OAuth wiring (implemented, W3/W4)
+
+`run_plan` preflights every task that references a `codex_chatgpt` provider:
+the local `OAuthStore` document must be present and unexpired-or-refreshable
+(fail-closed, no network probe; the transport stays authoritative). At spawn
+`_worker_environment` ensures a fresh access token once and injects
+`CAMBIUM_OAUTH_ACCESS_<PROVIDER>` + `CAMBIUM_OAUTH_ACCOUNT_<PROVIDER>` — never
+the refresh token — registering the token with the session `Redactor` via
+`register_secret`. `cambium auth oauth <provider> [--client-id ID]` runs the
+device flow (verification URL + user code printed only to the controlling
+TTY), plus `--status` (local expiry + account fingerprint, no refresh, no
+secrets), `--logout` (locked local removal, no remote revoke claim), and
+`--import-codex-cli` (imports `~/.codex/auth.json` as provider `codex`).
+`cambium doctor --oauth-live` is an opt-in live probe of issuer reachability
+and refreshability that consumes quota and never makes a model call.
