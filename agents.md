@@ -60,8 +60,9 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
-`module-test`, `version`, and `inspect` (`inspect --session-dir DIR` reads
-`.cambium/result.json`); prefer it over the internal supervisor module.
+`module-test`, `version`, `run`, `repl`, `tui`, and `session` (`session
+list/latest/show` reads completed session results); prefer it over the internal
+supervisor module.
 Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
 child imports resolve without an install.
 

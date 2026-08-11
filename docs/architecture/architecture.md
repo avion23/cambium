@@ -10,9 +10,9 @@ live gap table.
 
 Cambium runs directly from source; no wheel is built and no install is
 required or supported. The CLI routes `auth`, `supervisor`, `doctor`, `bench`,
-`tasktree`, `module-test`, `version`, and `inspect` (`inspect --session-dir DIR`
-reads `.cambium/result.json`). `cambium.__init__` exports only `__version__`;
-there is no public session API.
+`tasktree`, `module-test`, `version`, `run`, `repl`, `tui`, and `session`
+(`session list/latest/show` reads completed session results).
+`cambium.__init__` exports only `__version__`; there is no public session API.
 
 ### Plan and publication
 

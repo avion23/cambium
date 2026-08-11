@@ -53,7 +53,7 @@ Run the deterministic demo:
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
-PYTHONPATH=src python3.14 -m cambium.cli inspect --session-dir demo
+PYTHONPATH=src python3.14 -m cambium.cli session show --session-dir demo demo-001
 PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
