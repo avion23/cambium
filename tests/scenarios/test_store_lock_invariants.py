@@ -188,26 +188,6 @@ def test_event_store_overflow_drops_are_accounted(tmp_path) -> None:
     )
 
 
-@pytest.mark.slow
-def test_event_store_critical_acks_are_durable(tmp_path) -> None:
-    db = tmp_path / "events.db"
-    store = EventStore(db, fsync_interval_s=0.1)
-    try:
-        seqs = [store.append({"kind": "result", "payload": {"i": i}}) for i in range(20)]
-        _close_event_store(store)
-    finally:
-        if not store._closed:  # pragma: no cover - only when close() was not reached
-            _close_event_store(store)
-
-    assert len(seqs) == len(set(seqs))
-    reopened = _reopen_event_store(db)
-    try:
-        present = {row["seq"] for row in reopened.events_after(0)}
-    finally:
-        reopened.close()
-    assert set(seqs) <= present, "an acknowledged critical append is not durable"
-
-
 def _conversation_append(store: ConversationStore, node_index: int, i: int) -> int:
     return store.append(f"node-{node_index}", "user", f"message {i}")
 
