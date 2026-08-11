@@ -350,12 +350,14 @@ def test_write_message_roundtrip() -> None:
 # ── worker handshake ───────────────────────────────────────────────────────
 
 
+@pytest.mark.slow
 def test_worker_happy_path_handshake(tmp_path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
     asyncio.run(_happy_handshake(session_dir))
 
 
+@pytest.mark.slow
 def test_worker_happy_path_20x_no_corrupted_lines(tmp_path) -> None:
     """Repeat the happy path 20x; every stdout line must parse as one JSON object.
 
@@ -403,6 +405,7 @@ def test_worker_happy_path_20x_no_corrupted_lines(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_invalid_input_fatal_error(tmp_path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
@@ -435,6 +438,7 @@ def test_worker_invalid_input_fatal_error(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_cancel_acks_ok_then_aborts(tmp_path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
@@ -478,6 +482,7 @@ def test_worker_cancel_acks_ok_then_aborts(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
     """Free text containing "cancel" must NOT abort the task (structured parse)."""
     session_dir = tmp_path / "session"
@@ -517,6 +522,7 @@ def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_steer_action_cancel_aborts(tmp_path) -> None:
     """An exact ``{"action": "cancel"}`` steer aborts the current task."""
     session_dir = tmp_path / "session"
@@ -554,6 +560,7 @@ def test_worker_steer_action_cancel_aborts(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
     """check_health must reply ok (rid echoed) while a task runs, then continue."""
     session_dir = tmp_path / "session"
@@ -596,6 +603,7 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
@@ -626,6 +634,7 @@ def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_path) -> None:
     session_dir = tmp_path / "session"
     _make_scratch(session_dir / "scratch")
@@ -655,6 +664,7 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
     tmp_path: Path,
 ) -> None:
@@ -716,6 +726,7 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
     ).stdout
 
 
+@pytest.mark.slow
 def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     tmp_path: Path,
 ) -> None:
@@ -806,6 +817,7 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     assert MARKER not in (worktree / "hello.txt").read_text(encoding="utf-8")
 
 
+@pytest.mark.slow
 def test_stale_worker_never_mutates_newer_generations_staged_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -905,6 +917,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     assert generation_2_file.read_text(encoding="utf-8") == "generation 2 in progress\n"
 
 
+@pytest.mark.slow
 def test_worker_shutdown_graceful_exit(tmp_path) -> None:
     """shutdown acks ok, aborts the current task, and exits gracefully (code 0)."""
     session_dir = tmp_path / "session"
@@ -947,6 +960,7 @@ def test_worker_shutdown_graceful_exit(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_shutdown_idle_exits_gracefully(tmp_path) -> None:
     """shutdown with no running task: ok ack, exit_message shutdown, exit 0."""
     session_dir = tmp_path / "session"
@@ -977,6 +991,7 @@ def test_worker_shutdown_idle_exits_gracefully(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
     """Never sending init must trip the (env-shortened) init deadline."""
     session_dir = tmp_path / "session"
@@ -1000,6 +1015,7 @@ def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
     """Silence after ready (past the env-shortened idle deadline) exits 0."""
     session_dir = tmp_path / "session"
@@ -1025,6 +1041,7 @@ def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.slow
 def test_worker_diff_cap_bytes_and_truncation_flag(tmp_path) -> None:
     """A diff larger than 64 KiB must be byte-capped with diff_truncated true."""
     session_dir = tmp_path / "session"

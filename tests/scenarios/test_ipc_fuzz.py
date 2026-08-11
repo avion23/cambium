@@ -11,8 +11,10 @@ import pytest
 
 from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
 
-FUZZ_CASES = 500
-MAX_RANDOM_BYTES = 64 * 1024
+# 128 cases keep every byte-pattern mode (case % 8) sampled 16x; the line-length
+# framing boundary itself is covered by test_read_message_one_mib_plus_one_byte_resyncs.
+FUZZ_CASES = 128
+MAX_RANDOM_BYTES = 8 * 1024
 FUZZ_SEED = 0xC0FFEE
 # Byte-at-a-time reads make this scenario machine-load sensitive; keep only a
 # generous async timeout so it still catches a true hang without wall-time flake.
