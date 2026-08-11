@@ -41,6 +41,22 @@ with context limited to its own spec plus the parent's strict-key envelope
 that same strict key set and reaches only its parent. Top-level flat fan-out
 is unchanged; plan tasks without an explicit ``kind`` default to the session
 kind for tree validation only.
+
+Decision port and conversation persistence (implementation-plan step 2,
+items 23-24): ``run_plan`` accepts an optional ``architectus`` decision core
+(an ``ArchitectusCore`` or a small adapter port exposing ``aggregate``/``step``)
+and an optional ``conversations`` flag that opens ``ConversationStore`` at
+``<session_dir>/.cambium/conversations.db`` with the same session lifecycle
+as the event store. When the port is configured it is the ONLY provider-side
+channel whose response can become a child proposal: each admitted parent's
+terminal envelope is fed to ``core.aggregate``/``core.step`` and the resulting
+typed proposals are routed through the existing ``_admit_child`` validation —
+a provider response never mutates the live session tree directly. Every
+admitted/rejected revision is also appended to the conversation store (one
+row per revision, ``node_id`` = child task id, parent task in ``meta``); a
+store open failure raises and a store append failure is never silent. With
+neither backend configured, ``run_plan`` is byte-for-byte the historical
+behavior.
 """
 
 from __future__ import annotations
@@ -76,7 +92,9 @@ from cambium.provider_config import (
 )
 from cambium.system_health import can_run_heavy
 
+from .architectus import ActionKind, ArchitectusCore
 from .auth import MIN_API_KEY_BYTES, scrub_environment
+from .conversations import ConversationStore
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
 from .oauth import (
@@ -170,6 +188,11 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     if not isinstance(msg.get("spec"), dict):
         invalid.append("spec")
     return invalid
+
+
+def _wire_str(value: Any) -> str | None:
+    """Coerce an unvalidated wire value for a JSON-safe event payload."""
+    return value if isinstance(value, str) else None
 
 
 def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
@@ -911,6 +934,54 @@ class SessionAlreadyRunningError(RuntimeError):
     """Another supervisor already owns the requested session."""
 
 
+class ArchitectusAdmissionPort:
+    """Adapt an ``ArchitectusCore`` decision model to the ``propose_child`` wire shape.
+
+    ``aggregate`` records an admitted parent's terminal envelope in the core;
+    ``step`` runs one decision wave and maps the core's accepted ``spawn``
+    actions into ``propose_child``-shaped proposals ({request_id,
+    parent_task_id, child_task_id, kind, spec}) whose ``kind`` and ``spec``
+    are recovered from the core's frozen tree node. The supervisor routes
+    every returned proposal through the existing ``_admit_child`` revision
+    validation, so a provider response never mutates the live session tree
+    directly.
+    """
+
+    def __init__(self, core: ArchitectusCore) -> None:
+        if not isinstance(core, ArchitectusCore):
+            raise TypeError("architectus core must be a cambium.architectus.ArchitectusCore")
+        self._core = core
+        self._nodes = {node.task_id: node for node in core.tree.nodes}
+        self._seq = 0
+
+    def aggregate(self, task_id: str, envelope: dict[str, Any]) -> None:
+        """Accept one admitted parent's strict-key envelope into the core."""
+        self._core.aggregate(task_id, envelope)
+
+    async def step(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Run one decision wave; return the typed proposals for the runtime."""
+        actions = await self._core.step(events)
+        proposals: list[dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict) or action.get("action") != ActionKind.SPAWN.value:
+                continue
+            task_id = action.get("task_id")
+            if not isinstance(task_id, str) or task_id not in self._nodes:
+                raise ValueError(
+                    f"decision port spawn action references unknown task_id {task_id!r}"
+                )
+            node = self._nodes[task_id]
+            self._seq += 1
+            proposals.append({
+                "request_id": make_request_id(self._seq),
+                "parent_task_id": node.parent_task_id,
+                "child_task_id": task_id,
+                "kind": node.kind.value,
+                "spec": copy.deepcopy(node.spec),
+            })
+        return proposals
+
+
 class _SessionAdmission:
     """Process-wide and cross-process ownership of one session directory."""
 
@@ -1008,6 +1079,8 @@ class _Runtime:
         max_concurrent_tasks: int | None = None,
         debt_store: DebtStore | None = None,
         oauth_store: OAuthStore | None = None,
+        architectus: Any = None,
+        conversations: Any = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1048,6 +1121,30 @@ class _Runtime:
         # this runtime (shutdown kills every pooled process).
         self._warm_pool_size = _warm_pool_size()
         self._pool: list[_PooledWorker] = []
+        # Decision port and revision conversation persistence (step 2 items
+        # 23-24): both optional; None keeps the historical byte-for-byte path.
+        self._admission_port = self._make_admission_port(architectus)
+        self._admission_port_lock = asyncio.Lock()
+        self._conversations = conversations
+
+    @staticmethod
+    def _make_admission_port(architectus: Any) -> Any:
+        """Normalize the optional decision port to an ``aggregate``/``step`` seam.
+
+        An ``ArchitectusCore`` is adapted to the ``propose_child`` wire shape;
+        any object already exposing ``aggregate``/``step`` is used directly as
+        a caller-provided port. ``None`` disables provider-side admission.
+        """
+        if architectus is None:
+            return None
+        if isinstance(architectus, ArchitectusCore):
+            return ArchitectusAdmissionPort(architectus)
+        if hasattr(architectus, "aggregate") and hasattr(architectus, "step"):
+            return architectus
+        raise TypeError(
+            "architectus must be an ArchitectusCore or a port with "
+            "aggregate()/step()"
+        )
 
     @property
     def last_envelope(self) -> dict[str, Any] | None:
@@ -1193,6 +1290,8 @@ class _Runtime:
         except BaseException:
             pass
         await asyncio.to_thread(self._store.close)
+        if self._conversations is not None:
+            await asyncio.to_thread(self._conversations.close)
 
     def plan_result(self) -> PlanResult:
         return PlanResult(results=tuple(self._results.values()))
@@ -1570,6 +1669,11 @@ class _Runtime:
                 parent_task_id=parent_task_id, child_task_id=child_task_id,
                 child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
             )
+            await self._record_revision_conversation(
+                outcome="rejected", parent_task_id=parent_task_id,
+                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                reason=exc.__class__.__name__, proposal=proposal,
+            )
             return
         try:
             child_spec = _child_spec(
@@ -1580,6 +1684,11 @@ class _Runtime:
                 "child_rejected", task_id=parent_task_id, request_id=request_id,
                 parent_task_id=parent_task_id, child_task_id=child_task_id,
                 child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected", parent_task_id=parent_task_id,
+                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                reason=exc.__class__.__name__, proposal=proposal,
             )
             return
         # Append synchronously before any await so a concurrent proposal
@@ -1607,11 +1716,180 @@ class _Runtime:
                 parent_task_id=parent_task_id, child_task_id=child_task_id,
                 child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
             )
+            await self._record_revision_conversation(
+                outcome="rejected", parent_task_id=parent_task_id,
+                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                reason="NoActiveTaskGroup", proposal=proposal,
+            )
             return
         await self.emit(
             "child_admitted", task_id=parent_task_id, request_id=request_id,
             parent_task_id=parent_task_id, child_task_id=child_task_id,
             child_kind=kind, branch=child_spec.get("branch"),
+        )
+        await self._record_revision_conversation(
+            outcome="admitted", parent_task_id=parent_task_id,
+            child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+            proposal=proposal,
+        )
+
+    async def _record_revision_conversation(
+        self,
+        *,
+        outcome: str,
+        parent_task_id: str,
+        child_task_id: str,
+        child_kind: str | None,
+        request_id: str | None,
+        reason: str | None = None,
+        proposal: dict[str, Any],
+    ) -> None:
+        """Durably append one conversation row per admitted/rejected revision.
+
+        One ``kind="system"`` row per revision, keyed by ``node_id`` = child
+        task id; the parent task is recorded in ``meta`` (the schema's
+        ``parent_id`` column is a row id, not a task id). The proposal is
+        redacted through the session redactor before it enters the store. A
+        store failure raises — the boundary never silently succeeds.
+        """
+        if self._conversations is None:
+            return
+        record: dict[str, Any] = {
+            "outcome": outcome,
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "child_kind": child_kind,
+            "request_id": request_id,
+        }
+        if reason is not None:
+            record["reason"] = reason
+        record["proposal"] = self._redact_proposal(proposal)
+        await asyncio.to_thread(
+            self._conversations.append,
+            child_task_id,
+            "system",
+            json.dumps(record, sort_keys=True, default=str),
+            kind="system",
+            meta={"parent_task_id": parent_task_id},
+        )
+
+    def _redact_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        """Redact a propose_child wire record without flattening its structure."""
+        if self._redactor is None:
+            return dict(proposal)
+        redacted = self._redactor.redact_protocol_record(
+            proposal,
+            structural_fields=("request_id", "parent_task_id", "child_task_id", "kind"),
+        )
+        return dict(redacted)
+
+    async def _admit_port_proposals(
+        self, parent_spec: dict[str, Any], parent_envelope: dict[str, Any]
+    ) -> None:
+        """Feed one admitted parent's envelope to the decision port and admit its proposals.
+
+        The port is the only provider-side channel whose response can become a
+        child proposal: its aggregate/step output is routed through the
+        existing ``_admit_child`` revision validation — never the live tree
+        directly. A malformed or mismatched proposal is durably rejected with
+        ``child_rejected`` and spawns nothing. A finished task outside the
+        port's decision domain (unknown to its tree) yields no wave: the port
+        has nothing to propose for it.
+        """
+        parent_task_id = parent_spec["task_id"]
+        malformed: str | None = None
+        proposals: list[dict[str, Any]] = []
+        async with self._admission_port_lock:
+            try:
+                self._admission_port.aggregate(parent_task_id, parent_envelope)
+            except ValueError:
+                return
+            try:
+                proposals = await self._admission_port.step([
+                    {
+                        "kind": "child_result",
+                        "task_id": parent_task_id,
+                        "payload": dict(parent_envelope),
+                    }
+                ])
+            except (TypeError, ValueError) as exc:
+                malformed = repr(exc)
+        if malformed is not None:
+            await self.emit(
+                "child_rejected", task_id=parent_task_id,
+                parent_task_id=parent_task_id, child_task_id=None, child_kind=None,
+                reason="MalformedProposal", message=f"decision port error: {malformed}"[:512],
+            )
+            return
+        for proposal in proposals:
+            await self._admit_port_proposal(parent_spec, parent_envelope, proposal)
+
+    async def _admit_port_proposal(
+        self,
+        parent_spec: dict[str, Any],
+        parent_envelope: dict[str, Any],
+        proposal: Any,
+    ) -> None:
+        """Route one decision-port proposal through the revision boundary."""
+        parent_task_id = parent_spec["task_id"]
+        if not isinstance(proposal, dict):
+            await self.emit(
+                "child_rejected", task_id=parent_task_id,
+                parent_task_id=parent_task_id, child_task_id=None, child_kind=None,
+                reason="MalformedProposal",
+                message="decision port returned a non-object proposal",
+            )
+            return
+        invalid_fields = _invalid_propose_child_fields(proposal)
+        if invalid_fields:
+            await self.emit(
+                "child_rejected", task_id=parent_task_id,
+                request_id=_wire_str(proposal.get("request_id")),
+                parent_task_id=parent_task_id,
+                child_task_id=_wire_str(proposal.get("child_task_id")),
+                child_kind=_wire_str(proposal.get("kind")),
+                reason="MalformedProposal",
+                message=f"decision port proposal rejected: invalid field(s) {invalid_fields}",
+            )
+            await self._record_port_rejection(
+                parent_task_id, proposal, "MalformedProposal",
+                f"invalid field(s) {invalid_fields}",
+            )
+            return
+        if proposal.get("parent_task_id") != parent_task_id:
+            await self.emit(
+                "child_rejected", task_id=parent_task_id,
+                request_id=_wire_str(proposal.get("request_id")),
+                parent_task_id=parent_task_id,
+                child_task_id=proposal["child_task_id"],
+                child_kind=proposal["kind"],
+                reason="ParentTaskIdMismatch",
+                message="decision port proposal parent_task_id does not match the finished task",
+            )
+            await self._record_port_rejection(
+                parent_task_id, proposal, "ParentTaskIdMismatch",
+                "parent_task_id does not match the finished task",
+            )
+            return
+        await self._admit_child(parent_spec, proposal, parent_envelope)
+
+    async def _record_port_rejection(
+        self,
+        parent_task_id: str,
+        proposal: dict[str, Any],
+        reason: str,
+        message: str,
+    ) -> None:
+        """Persist a conversation row when a rejected port proposal has identity."""
+        child_task_id = proposal.get("child_task_id")
+        if not isinstance(child_task_id, str) or not child_task_id:
+            return
+        await self._record_revision_conversation(
+            outcome="rejected", parent_task_id=parent_task_id,
+            child_task_id=child_task_id,
+            child_kind=_wire_str(proposal.get("kind")),
+            request_id=_wire_str(proposal.get("request_id")),
+            reason=f"{reason}: {message}"[:512], proposal=proposal,
         )
 
     # -- per-task supervision ------------------------------------------------
@@ -2334,12 +2612,14 @@ class _Runtime:
                     # now, when the parent's terminal envelope exists (the
                     # child's context is its own spec plus that envelope).
                     pending = self._pending_children.pop(task_id, [])
-                    if pending:
+                    if pending or self._admission_port is not None:
                         parent_envelope = self._redact_envelope(
                             self._strict_envelope(spec, msg)
                         )
                         for proposal in pending:
                             await self._admit_child(spec, proposal, parent_envelope)
+                        if self._admission_port is not None:
+                            await self._admit_port_proposals(spec, parent_envelope)
                     if spec.get("parent_task_id") is not None:
                         child_result = self._strict_envelope(spec, msg)
                         await self.emit(
@@ -3434,6 +3714,8 @@ async def run_plan(
     routing_state_path: str | Path | None = None,
     reject_reused_session: bool = False,
     oauth_store: OAuthStore | None = None,
+    architectus: Any = None,
+    conversations: bool | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3459,6 +3741,15 @@ async def run_plan(
     while the caller resolved its provider is rejected instead of overwritten.
     The supervisor's own reconciliation path (re-running a session) keeps the
     default ``False``.
+
+    ``architectus`` is an optional decision port (an ``ArchitectusCore`` or an
+    ``aggregate``/``step`` adapter); when set, each admitted parent's envelope
+    feeds the port and the resulting typed proposals are routed through the
+    existing ``_admit_child`` revision validation. ``conversations=True`` opens
+    ``ConversationStore`` at ``<session_dir>/.cambium/conversations.db`` for the
+    session (closed on shutdown) and appends one row per admitted/rejected
+    revision. Both default off: the historical behavior is byte-for-byte
+    unchanged.
 
     Dispatch shape:
 
@@ -3507,14 +3798,20 @@ async def run_plan(
         store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
         # Usage-debt ledger for admission balancing (solution C): load the
         # persisted state once, feed it live from usage_event rows, and
-        # persist again when the session ends.
-        # Usage-debt ledger for admission balancing (solution C): load the
-        # persisted state once, feed it live from usage_event rows, and
         # persist again when the session ends. The path is injected so the
         # caller owns where routing evidence lives (oneshot defaults it to a
         # repo-scoped file; tests pass scratch paths).
         debt_store = DebtStore(routing_state_path)
         debt_store.load()
+        conversations_store = None
+        try:
+            if conversations:
+                conversations_store = ConversationStore(
+                    session_dir / ".cambium" / "conversations.db"
+                )
+        except BaseException:
+            await asyncio.to_thread(store.close)
+            raise
         runtime = _Runtime(
             session_dir,
             store,
@@ -3525,6 +3822,8 @@ async def run_plan(
             max_concurrent_tasks=max_concurrent_tasks,
             debt_store=debt_store,
             oauth_store=oauth_store,
+            architectus=architectus,
+            conversations=conversations_store,
         )
         await runtime.start()
         runtime.set_session_tasks(specs)

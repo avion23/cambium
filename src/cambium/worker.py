@@ -126,11 +126,13 @@ from cambium.auth import scrub_environment
 from cambium.diffundo import (
     AllProvidersFailed,
     CallResult,
+    CredentialSource,
     Diffundo,
     ProviderError,
     ProviderTier,
     prompt_prefix_bytes,
 )
+from cambium.provider_config import AuthMode
 from cambium.fencing import validate_worker_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
@@ -361,6 +363,15 @@ def _model_identity(
     return model
 
 
+def _oauth_env_suffix(provider: str) -> str:
+    """Normalize a provider id into its ``CAMBIUM_OAUTH_*`` env suffix.
+
+    Mirrors ``supervisor._oauth_env_suffix`` so the supervisor's injected
+    env vars and the worker's lookup agree byte-for-byte.
+    """
+    return re.sub(r"[._-]+", "_", provider.upper())
+
+
 def _provider_router(
     config: dict[str, Any], *, assigned_provider: str | None = None
 ) -> tuple[Diffundo, ProviderTier, str, str]:
@@ -401,6 +412,33 @@ def _provider_router(
                 "falling back to the seeded primary pick",
                 assigned_provider,
             )
+    codex_providers = [
+        provider for provider in providers
+        if getattr(provider, "auth", None) is AuthMode.CODEX_CHATGPT
+    ]
+    if codex_providers:
+        # The supervisor injected CAMBIUM_OAUTH_ACCESS_/ACCOUNT_<SUFFIX> into
+        # the worker env at spawn (access token ONLY — the refresh token never
+        # leaves the supervisor). Diffundo carries one CredentialSource, so
+        # more than one codex provider is unsupported until a per-provider
+        # mapping exists: fail closed rather than silently share a credential.
+        if len(codex_providers) > 1:
+            raise ValueError(
+                "multiple codex_chatgpt providers require per-provider "
+                "credential sources (unsupported)"
+            )
+        codex = codex_providers[0]
+        suffix = _oauth_env_suffix(codex.name)
+        access = os.environ.get(f"CAMBIUM_OAUTH_ACCESS_{suffix}")
+        account = os.environ.get(f"CAMBIUM_OAUTH_ACCOUNT_{suffix}")
+        if not access:
+            raise ValueError(
+                f"codex provider {codex.name!r}: CAMBIUM_OAUTH_ACCESS_{suffix} "
+                "is not set in the worker environment"
+            )
+        options["credential_source"] = CredentialSource(
+            access_token=access, account_id=account or None
+        )
     return Diffundo(providers, **options), tier, model, _model_identity(
         providers, tier, model, assigned_provider=assigned_provider
     )

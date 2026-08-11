@@ -582,3 +582,94 @@ def test_doctor_oauth_live_skips_without_codex_providers(tmp_path: Path) -> None
     status, detail = doctor.check_oauth_live(tmp_path, provider_config=config)
     assert status is doctor.Status.PASS
     assert "nothing to probe live" in detail
+
+
+# --------------------------------------------------------------------------- #
+# P0 bridge (glm-5.2 review): the worker must consume the injected
+# CAMBIUM_OAUTH_ACCESS_/ACCOUNT_<SUFFIX> env vars and fail closed without them.
+# --------------------------------------------------------------------------- #
+
+
+def _codex_providers_file(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "codex",
+                        "tier": "strong",
+                        "auth": "codex_chatgpt",
+                        "protocol": "codex_responses",
+                        "model": "gpt-5.6-luna",
+                        "priority": 0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_provider_router_wires_credential_from_env(tmp_path: Path) -> None:
+    """The worker's _provider_router builds Diffundo with the injected
+    CredentialSource (access token + account id) — the P0 bridge."""
+    from cambium import worker
+    from cambium.diffundo import CredentialSource
+
+    config_path = _codex_providers_file(tmp_path / "providers.json")
+    previous = {
+        "CAMBIUM_PROVIDERS": os.environ.get("CAMBIUM_PROVIDERS"),
+        "CAMBIUM_OAUTH_ACCESS_CODEX": os.environ.get("CAMBIUM_OAUTH_ACCESS_CODEX"),
+        "CAMBIUM_OAUTH_ACCOUNT_CODEX": os.environ.get("CAMBIUM_OAUTH_ACCOUNT_CODEX"),
+    }
+    try:
+        os.environ["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
+        os.environ["CAMBIUM_OAUTH_ACCESS_CODEX"] = ACCESS
+        os.environ["CAMBIUM_OAUTH_ACCOUNT_CODEX"] = ACCOUNT
+        router, tier, model, identity = worker._provider_router(
+            {"diffundo": {"tier": "strong", "model": "gpt-5.6-luna"}}
+        )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert tier.value == "strong"
+    assert model == "gpt-5.6-luna"
+    source = router._credential_source
+    assert isinstance(source, CredentialSource)
+    assert source.access_token == ACCESS
+    assert source.account_id == ACCOUNT
+
+
+def test_provider_router_fails_closed_without_oauth_env(tmp_path: Path) -> None:
+    """A codex provider without the injected access-token env var fails at
+    router construction — never a request-time guess."""
+    from cambium import worker
+
+    config_path = _codex_providers_file(tmp_path / "providers.json")
+    previous = {
+        "CAMBIUM_PROVIDERS": os.environ.get("CAMBIUM_PROVIDERS"),
+        "CAMBIUM_OAUTH_ACCESS_CODEX": os.environ.get("CAMBIUM_OAUTH_ACCESS_CODEX"),
+    }
+    try:
+        os.environ["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
+        os.environ.pop("CAMBIUM_OAUTH_ACCESS_CODEX", None)
+        try:
+            worker._provider_router(
+                {"diffundo": {"tier": "strong", "model": "gpt-5.6-luna"}}
+            )
+        except ValueError as exc:
+            assert "CAMBIUM_OAUTH_ACCESS_CODEX" in str(exc)
+        else:
+            raise AssertionError("missing oauth env must fail closed")
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

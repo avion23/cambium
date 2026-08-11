@@ -802,7 +802,17 @@ def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(content, str):
         parts = [{"type": "input_text", "text": content}]
     elif isinstance(content, list):
-        parts = list(content)
+        # Normalize chat-shaped parts: the responses endpoint requires
+        # ``input_text`` (chat's ``text`` is rejected). Non-dict parts are
+        # dropped so a malformed item can never poison the request.
+        parts = []
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") == "text":
+                parts.append({"type": "input_text", "text": part.get("text", "")})
+            else:
+                parts.append(dict(part))
     else:
         parts = []
     return {"role": role, "content": parts}
@@ -977,10 +987,14 @@ def _parse_codex_sse(
 
 def _codex_config_400(message: str) -> bool:
     """True when a codex HTTP 400 body is machine-readable and names a
-    model/parameter problem ("model", "not found", "unsupported", "invalid").
+    model/parameter problem.
 
-    A JSON error object naming one of those is a permanent config error
-    (quarantine the provider); any other 400 keeps the generic content-refusal
+    The live endpoint returns both ``{"error": {...}}`` and ``{"detail": "..."}``
+    envelopes, so the whole payload is scanned. Only narrow markers count:
+    model-not-found/unsupported-model, and explicit parameter rejections. Bare
+    "invalid" is deliberately NOT a marker — generic request-shape errors
+    (``{"detail": "Stream must be set to true"}``) are request-level, not
+    provider config problems, and keep the generic content-refusal
     fall-through.
     """
     try:
@@ -989,12 +1003,18 @@ def _codex_config_400(message: str) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-    lowered = json.dumps(error).lower()
+    lowered = json.dumps(payload).lower()
     return any(
-        marker in lowered for marker in ("model", "not found", "unsupported", "invalid")
+        marker in lowered
+        for marker in (
+            "model_not_found",
+            "model not found",
+            "model does not exist",
+            "unsupported model",
+            "unknown model",
+            "unsupported parameter",
+            "invalid parameter",
+        )
     )
 
 
