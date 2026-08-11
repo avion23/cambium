@@ -10,7 +10,14 @@ import pytest
 diffundo = pytest.importorskip("cambium.diffundo")
 
 from cambium.auth import derived_env_name  # noqa: E402
-from cambium.provider_config import env_report, load_providers  # noqa: E402
+from cambium.provider_config import (  # noqa: E402
+    CODEX_CHATGPT_PROFILE,
+    AuthMode,
+    Protocol,
+    env_report,
+    load_providers,
+    select_provider,
+)
 
 
 def _provider(name: str = "openai", **overrides: object) -> dict[str, object]:
@@ -198,3 +205,151 @@ def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
             price_per_1m_out=0.25,
         )
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Tagged auth/protocol modes (codex-oauth plan W1)
+# --------------------------------------------------------------------------- #
+
+
+def _codex_provider(name: str = "codex", **overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "name": name,
+        "tier": "strong",
+        "auth": "codex_chatgpt",
+        "protocol": "codex_responses",
+        "timeout_s": 30.0,
+        "max_retries": 2,
+        "rpm": 60,
+        "enabled": True,
+        "model": "example-model",
+        "priority": 0,
+        "cooldown_s": 60.0,
+        "price": 0.0,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_legacy_provider_defaults_to_api_key_and_chat_completions(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider()])
+
+    providers = load_providers(path)
+
+    assert providers[0].auth is AuthMode.API_KEY
+    assert providers[0].protocol is Protocol.CHAT_COMPLETIONS
+
+
+def test_auth_protocol_round_trip_from_providers_json(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_codex_provider()])
+
+    providers = load_providers(path)
+
+    assert len(providers) == 1
+    assert providers[0].auth is AuthMode.CODEX_CHATGPT
+    assert providers[0].protocol is Protocol.CODEX_RESPONSES
+    # The profile pins the endpoint and the OAuth flow: a codex provider never
+    # carries a base_url or an api_key_env through the loader.
+    assert providers[0].base_url == ""
+    assert providers[0].api_key_env == ""
+
+
+def test_codex_chatgpt_without_codex_responses_protocol_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_codex_provider(protocol="chat_completions")],
+    )
+
+    with pytest.raises(ValueError, match="requires protocol 'codex_responses'"):
+        load_providers(path)
+
+
+def test_codex_chatgpt_base_url_in_file_is_rejected(tmp_path: Path) -> None:
+    # Token-exfiltration guard: a modified provider file must never redirect
+    # the bearer token away from the pinned profile endpoint.
+    path = _write(
+        tmp_path / "providers.json",
+        [_codex_provider(base_url="https://attacker.example.test/v1")],
+    )
+
+    with pytest.raises(ValueError, match="must not be set with auth 'codex_chatgpt'"):
+        load_providers(path)
+
+
+def test_codex_chatgpt_api_key_env_in_file_is_rejected(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_codex_provider(api_key_env="CAMBIUM_PROVIDER_CODEX_API_KEY")],
+    )
+
+    with pytest.raises(ValueError, match="must not be set with auth 'codex_chatgpt'"):
+        load_providers(path)
+
+
+def test_api_key_provider_without_api_key_env_is_rejected(tmp_path: Path) -> None:
+    value = _provider()
+    del value["api_key_env"]
+    path = _write(tmp_path / "providers.json", [value])
+
+    with pytest.raises(ValueError, match=r"missing required field\(s\).*api_key_env"):
+        load_providers(path)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"auth": "bearer"}, "invalid auth mode"),
+        ({"auth": 1}, "must be an auth mode name"),
+        ({"auth": None}, "must be an auth mode name"),
+        ({"protocol": "responses"}, "invalid protocol"),
+        ({"protocol": 2}, "must be a protocol name"),
+        ({"protocol": None}, "must be a protocol name"),
+    ],
+)
+def test_malformed_auth_protocol_values_fail_closed(
+    tmp_path: Path, overrides: dict[str, object], match: str
+) -> None:
+    # An explicit malformed tag is an error, never a silent default.
+    path = _write(tmp_path / "providers.json", [_provider(**overrides)])
+
+    with pytest.raises(ValueError, match=match):
+        load_providers(path)
+
+
+def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [
+            _provider("openai"),
+            _codex_provider("codex"),
+        ],
+    )
+
+    providers = load_providers(path)
+
+    assert [provider.name for provider in providers] == ["openai", "codex"]
+    assert select_provider(providers, name="openai").auth is AuthMode.API_KEY
+    assert select_provider(providers, name="codex").auth is AuthMode.CODEX_CHATGPT
+    assert select_provider(providers, name="codex").protocol is Protocol.CODEX_RESPONSES
+
+
+def test_multiple_codex_providers_do_not_collide_on_env_name(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_codex_provider("codex-a"), _codex_provider("codex-b")],
+    )
+
+    providers = load_providers(path)
+
+    assert [provider.name for provider in providers] == ["codex-a", "codex-b"]
+
+
+def test_codex_chatgpt_profile_is_pinned_exact() -> None:
+    assert CODEX_CHATGPT_PROFILE == {
+        "issuer": "https://auth.openai.com",
+        "api_origin": "https://chatgpt.com",
+        "api_path": "/backend-api/codex/responses",
+        "scopes": ["openid", "profile", "email", "offline_access"],
+    }

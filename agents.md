@@ -68,6 +68,15 @@ child imports resolve without an install.
 Root `conftest.py` exports `src` on `PYTHONPATH` so scenario subprocesses
 import `cambium` without a manual export.
 
+### Provider auth modes
+
+Provider entries carry a tagged `auth`/`protocol` mode in `providers.json`
+(`src/cambium/provider_config.py`). The legacy `api_key` + `chat_completions`
+pair is unchanged and still requires `base_url`/`api_key_env`; `codex_chatgpt`
+is pinned to the `CODEX_CHATGPT_PROFILE` module constants, requires protocol
+`codex_responses`, and rejects `base_url`/`api_key_env` in the file so a
+modified provider file can never redirect the bearer token.
+
 ### Usage evidence
 
 `supervisor.run_plan` resolves un-pinned provider tasks (`model_candidates`)
