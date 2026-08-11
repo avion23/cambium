@@ -235,9 +235,9 @@ PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test example
 It validates tracked layout, manifest, dataset and baseline schema/digests,
 imports, CLI, offline subprocess behavior, and module-scoped tests. The gate
 rejects provider/network use and sibling/reverse imports. The tool is developed
-and run directly from source; no wheel is built. The module is removable by
-deleting its package, including tests, datasets, baselines, CLI, architecture,
-and freeze metadata.
+and run directly from source; no wheel is built or supported. The module is
+removable by deleting its package, including tests, datasets, baselines, CLI,
+architecture, and freeze metadata.
 
 ### 9.1 Verification commands and recorded state
 

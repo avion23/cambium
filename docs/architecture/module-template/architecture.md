@@ -218,7 +218,7 @@ and version must match `datasets/meta.json` and exact split bytes. The module
 package in the source layout includes package code, `__main__.py`,
 `architecture.md`, datasets, metadata, colocated tests, and baseline; the
 source-layout probe runs `cambium module-test <package_name>`. The tool is
-developed and run directly from source; no wheel is built.
+developed and run directly from source; no wheel is built or supported.
 
 ## 10. Optimization plan
 
@@ -264,9 +264,10 @@ The current shared surfaces that a module may use are:
 
 Do not add a module-specific schema registry, dispatch path, cache, or
 resource-budget abstraction when the shared boundary already owns it. The
-checkout has no `ResourceBudget` class, no `eval_cache.py`, and no separate DLQ
-module. These absences are current facts, not invitations to document dead
-capability claims.
+checkout has no compile gate and no `ResourceBudget` class; `tools.py`
+`run_shell`/`git_op` run without approval gates. It has no `eval_cache.py` and
+no separate DLQ module. These absences are current facts, not invitations to
+document dead capability claims.
 
 ### A.1 Interface and wire checklist
 
@@ -309,7 +310,7 @@ CLI subprocess behavior, and the loaded module set. Offline checks are
 best-effort lint-style checks, not same-UID containment. Sibling imports and
 reverse imports are static failures and must be reported by file, line, and
 symbol. The tool is developed and run directly from source; no wheel is built
-and packaging is not a delivery path.
+or supported and packaging is not a delivery path.
 
 ### A.4 Target-state labels
 

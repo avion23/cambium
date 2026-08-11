@@ -206,8 +206,8 @@ containment is the deployment-layer boundary.**
 The module package in the source layout includes code,
 `__main__.py`, this architecture document, datasets, `meta.json`, tests, and
 baselines. The tool is developed and run directly from source; no wheel is
-built. A module is removable by deleting its complete package directory; shared
-harness scenarios remain.
+built or supported. A module is removable by deleting its complete package
+directory; shared harness scenarios remain.
 
 ## Appendix A. Implemented reference details
 
@@ -283,8 +283,8 @@ file and line context. Tests must exercise malformed JSON, a non-object record,
 missing required keys, invalid field types, duplicate IDs, invalid metadata,
 record/version drift, and a cross-split collision. The module conformance gate
 also checks that every declared dataset, baseline, architecture file, test,
-and manifest is tracked in the source module package; no wheel is built. Removal
-means deleting the
+and manifest is tracked in the source module package; no wheel is built or
+supported. Removal means deleting the
 entire module directory, including its freeze metadata; no shared loader may
 silently resurrect it.
 
