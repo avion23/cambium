@@ -14,6 +14,7 @@ never reads the environment or a key value.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Sequence
@@ -128,6 +129,8 @@ def _require_string(value: object, location: str) -> str:
 def _require_number(value: object, location: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _error(location, "must be a number")
+    if not math.isfinite(value):
+        raise _error(location, "must be a finite number")
     return float(value)
 
 
@@ -358,7 +361,11 @@ def _read_config(source: str | Path | None) -> object:
 
     try:
         text = path.read_text(encoding="utf-8")
-        return json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_non_standard_constant,
+        )
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid provider config JSON in {path}: {exc}") from exc
 
@@ -370,6 +377,16 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
             raise ValueError("provider config contains duplicate JSON fields")
         values[key] = value
     return values
+
+
+def _reject_non_standard_constant(value: object) -> object:
+    """Reject the non-standard JSON constants NaN/Infinity/-Infinity.
+
+    ``json.loads`` accepts them by default; provider config is machine-written
+    numeric metadata, so the non-standard constants are always wrong and must
+    not reach the numeric field validators.
+    """
+    raise ValueError(f"provider config root: non-standard JSON constant {value!r}")
 
 
 def load_provider_specs(source: str | Path | None = None) -> tuple[ProviderEnvSpec, ...]:
