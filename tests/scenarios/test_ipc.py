@@ -427,7 +427,7 @@ def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
             assert ready["type"] == "ready"
 
             await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.5))
+                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.3))
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -505,7 +505,7 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             assert ready["type"] == "ready"
 
             await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.5))
+                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.3))
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
