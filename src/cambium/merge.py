@@ -76,7 +76,9 @@ class NonFastForwardError(RuntimeError):
     otherwise silently *create* ``main``), ``main`` absent (first publish goes
     through :meth:`create_main`), ``new_tip`` not a descendant of
     ``expected_old``, or the atomic ``update-ref`` refusing because ``main``
-    moved between the caller's read of ``expected_old`` and the publish. The
+    moved between the caller's read of ``expected_old`` and the publish
+    (including the concurrent-race lock-file contention on ``main.lock``,
+    which git reports as ``cannot lock ref`` / ``File exists``). The
     orchestrator treats the last as "main advanced; re-merge against the new
     main."
     """
@@ -902,7 +904,8 @@ class MergeSequencer:
             GitError: the repo path is unusable or a git call fails.
             NonFastForwardError: ``expected_old`` is empty/zero, ``main`` is
                 absent, ``new_tip`` is not a descendant of ``expected_old``, or
-                ``refs/heads/main`` moved away from ``expected_old``.
+                ``refs/heads/main`` moved away from ``expected_old`` (including
+                the concurrent-race ``main.lock`` lock-file contention).
         """
         repo = Path(repo)
         self._check_quarantine()
@@ -944,10 +947,12 @@ class MergeSequencer:
         match = re.search(r"is at ([0-9a-f]{40}) but expected", detail)
         if match:
             current = match.group(1)
+        lock_contention = "cannot lock ref" in detail and "File exists" in detail
         if (
             current is not None
             or "reference already exists" in detail
             or "unable to resolve reference" in detail
+            or lock_contention
         ):
             raise NonFastForwardError(
                 new_tip=new_tip, expected_old=expected_old, current=current, detail=detail[:512]
