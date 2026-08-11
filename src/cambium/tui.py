@@ -29,6 +29,7 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
         from cambium import oneshot, render
     except ImportError as exc:
         err.write(f"cambium tui: {exc}\n")
+        err.flush()
         return _EXIT_BACKEND_MISSING
 
     failed = False
@@ -51,6 +52,7 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
                 if response.exit_code != 0:
                     failed = True
             except Exception as exc:
+                failed = True
                 err.write(f"cambium: {exc}\n")
                 err.flush()
                 continue

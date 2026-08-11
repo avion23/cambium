@@ -19,9 +19,11 @@ it inspects.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 def session_root(repo: Path) -> Path:
@@ -67,6 +69,7 @@ def show_session(path: Path) -> SessionView:
     events_path = session_path / ".cambium" / "events.db"
     if not events_path.is_file():
         raise FileNotFoundError(f"session event log is missing: {events_path}")
+    _validate_event_log(events_path)
     with open(result_path, encoding="utf-8") as stream:
         record = json.load(stream)
     if not isinstance(record, dict):
@@ -124,6 +127,16 @@ def _sort_key(record: dict[str, Any], path: Path) -> tuple[float, float, str]:
         _timestamp(record.get("started_at")),
         path.name,
     )
+
+
+def _validate_event_log(db: Path) -> None:
+    """Open one existing event log read-only without materializing its rows."""
+    uri = f"file:{quote(str(Path(db).resolve()), safe='/:')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        connection.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    finally:
+        connection.close()
 
 
 __all__ = ["SessionView", "latest_session", "list_sessions", "session_root", "show_session"]

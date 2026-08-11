@@ -595,6 +595,7 @@ class TaskResult:
     reason: str | None = None
     merge_sha: str | None = None
     restarts: int = 0
+    summary: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -608,6 +609,12 @@ class PlanResult:
         if not self.results:
             return 1
         return 0 if all(r.status == "succeeded" for r in self.results) else 1
+
+
+def _envelope_text(envelope: Mapping[str, Any] | None, key: str) -> str | None:
+    """Return one non-empty, already-redacted worker envelope string."""
+    value = envelope.get(key) if envelope is not None else None
+    return value if isinstance(value, str) and value else None
 
 
 class DuplicateTaskIDError(ValueError):
@@ -1401,6 +1408,7 @@ class _Runtime:
             await semaphore.acquire()
         try:
             restarts = 0
+            worker_summary: str | None = None
             while True:
                 handle = WorkerHandle(task_id=task_id, generation=generation)
                 self._handles[task_id] = handle
@@ -1411,24 +1419,24 @@ class _Runtime:
                     heartbeat_timeout=heartbeat_timeout,
                     wall_budget=wall_budget,
                 )
+                sanitized_envelope: dict[str, Any] | None = None
                 if outcome.envelope is not None and outcome.correlated:
-                    self._last_envelope = self._redact_envelope(outcome.envelope)
-                    self._task_envelopes[task_id] = self._last_envelope
+                    sanitized_envelope = self._redact_envelope(outcome.envelope)
+                    self._last_envelope = sanitized_envelope
+                    self._task_envelopes[task_id] = sanitized_envelope
+                    worker_summary = _envelope_text(sanitized_envelope, "summary")
                 if outcome.clean:
                     envelope_status = (
                         outcome.envelope.get("status")
                         if outcome.envelope is not None else None
                     )
                     if envelope_status != "succeeded":
-                        failure_reason = (
-                            outcome.envelope.get("failure_reason")
-                            if outcome.envelope is not None else None
-                        )
-                        if not isinstance(failure_reason, str) or not failure_reason:
+                        failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
+                        if failure_reason is None:
                             failure_reason = "worker_verdict_failed"
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
-                            reason=failure_reason, restarts=restarts,
+                            reason=failure_reason, restarts=restarts, summary=worker_summary,
                         )
                         return
                     integrity = await self._worker_success_integrity(spec, worktree)
@@ -1439,7 +1447,7 @@ class _Runtime:
                         )
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
-                            reason=integrity, restarts=restarts,
+                            reason=integrity, restarts=restarts, summary=worker_summary,
                         )
                         return
                     merged = await self._merge_task(spec, handle)
@@ -1447,23 +1455,27 @@ class _Runtime:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=merged, restarts=restarts,
+                            summary=worker_summary,
                         )
                     else:
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
-                            reason="merge_failed", restarts=restarts,
+                            reason="merge_failed", restarts=restarts, summary=worker_summary,
                         )
                     return
                 if outcome.fatal:
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason=outcome.reason, restarts=restarts,
+                        reason=outcome.reason, restarts=restarts, summary=worker_summary,
                     )
                     return
                 reason = outcome.reason or "crash"
                 if outcome.timeout_phase:
                     await self.emit(
-                        "timeout", task_id=task_id, generation=generation, phase=outcome.timeout_phase
+                        "timeout",
+                        task_id=task_id,
+                        generation=generation,
+                        phase=outcome.timeout_phase,
                     )
                 if restarts >= max_restarts:
                     await self.emit(
@@ -1472,7 +1484,8 @@ class _Runtime:
                     )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
-                        reason=f"max_restarts ({max_restarts}): {reason}", restarts=restarts,
+                        reason=f"max_restarts ({max_restarts}): {reason}",
+                        restarts=restarts, summary=worker_summary,
                     )
                     return
                 restarts += 1

@@ -114,7 +114,11 @@ def render_json_result(result: Any) -> str:
 
 
 def render_text_result(result: Any) -> str:
-    """Render one result record as one concise human-readable line."""
+    """Render one result record as one concise human-readable line.
+
+    Nested plan entries surface their non-succeeded ``reason`` values and any
+    non-empty worker ``summary`` values without widening the safe field set.
+    """
     record = _result_record(result)
     parts: list[str] = []
     status = record.get("status")
@@ -151,6 +155,25 @@ def render_text_result(result: Any) -> str:
         )
         if statuses:
             parts.append(f"plan_status={{{statuses}}}")
+        failures = [
+            f"{entry.get('task_id') or index}:{entry['reason']!r}"
+            for index, entry in enumerate(results)
+            if isinstance(entry, Mapping)
+            and entry.get("status") != "succeeded"
+            and isinstance(entry.get("reason"), str)
+            and entry["reason"]
+        ]
+        if failures:
+            parts.append(f"plan_failures={{{', '.join(failures)}}}")
+        summaries = [
+            f"{entry.get('task_id') or index}:{entry['summary']!r}"
+            for index, entry in enumerate(results)
+            if isinstance(entry, Mapping)
+            and isinstance(entry.get("summary"), str)
+            and entry["summary"]
+        ]
+        if summaries:
+            parts.append(f"plan_summaries={{{', '.join(summaries)}}}")
     return " ".join(parts)
 
 

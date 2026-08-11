@@ -572,10 +572,11 @@ def _run_session(args: argparse.Namespace) -> int:
         path = candidate if candidate.is_absolute() else root / candidate
         try:
             view = session.show_session(path)
+            rendered = render.render_json_result(view.result)
         except (OSError, ValueError, sqlite3.Error) as exc:
             print(f"cambium session: {exc}", file=sys.stderr)
             return 1
-        print(render.render_json_result(view.result))
+        print(rendered)
         return 0
     raise AssertionError(f"unhandled session command: {args.session_command!r}")
 
