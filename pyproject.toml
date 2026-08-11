@@ -25,11 +25,14 @@ test = [
 # AST dependencies here as well so `--extra dev` exercises the same backend.
 # ruff>=0.12, not ruff>=0.9: ruff<0.12 rejects `target-version = "py314"`
 # (verified 0.9.10/0.11.0: "unknown variant `py314`"); 0.12.0 accepts it.
+# pytest-xdist powers `pytest -n auto` for the parallel tiers (verified: the
+# whole suite is xdist-safe; slow tier 92s -> ~35s on 4 cores).
 dev = [
     "ruff>=0.12",
     "tree-sitter>=0.26",
     "tree-sitter-python>=0.25",
     "dspy>=3.3.0,<3.4",
+    "pytest-xdist>=3.6",
 ]
 
 [tool.pytest.ini_options]
