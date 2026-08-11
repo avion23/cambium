@@ -75,8 +75,7 @@ from cambium.system_health import can_run_heavy
 from .auth import scrub_environment
 from .ipc import MAX_LINE_BYTES, write_message
 from .merge import MergeSequencer
-from .modules.base import _is_secret_shaped
-from .redact import Redactor, build_session_redactor
+from .redact import Redactor, build_session_redactor, is_secret_name
 from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
@@ -543,20 +542,19 @@ def _session_redactor(
     specs: list[dict[str, Any]],
     provider_environment: Mapping[str, str] | None = None,
 ) -> Redactor:
-    """Build one session redactor from every worker-forwardable declared value.
+    """Build one session redactor from explicitly authorized provider values.
 
-    The registry must cover every value ``_worker_environment`` can forward to
-    a worker from the declared ``provider_env_keys``. The declaration is the
-    authority boundary; the variable name does not determine whether its value
-    is sensitive. Compact machine-token values (``_is_secret_shaped``) are
-    registered for substring redaction wherever they appear; prose-like
-    declared values are registered as whole strings only, so a benign
-    diagnostic that merely contains the value is not corrupted.
+    The registry must cover every provider credential value
+    ``_worker_environment`` can forward from the declared ``provider_env_keys``.
+    Non-credential allowlist values are not registered. Every non-empty
+    credential value is registered for substring redaction regardless of its
+    shape.
     """
     secret_values: list[str] = []
-    whole_values: list[str] = []
     for spec in specs:
         for key in _provider_env_keys(spec):
+            if not is_secret_name(key):
+                continue
             value = (
                 provider_environment.get(key)
                 if provider_environment is not None and key in provider_environment
@@ -564,11 +562,8 @@ def _session_redactor(
             )
             if not isinstance(value, str) or not value:
                 continue
-            if _is_secret_shaped(value):
-                secret_values.append(value)
-            else:
-                whole_values.append(value)
-    return build_session_redactor(secret_values, whole_values=whole_values)
+            secret_values.append(value)
+    return build_session_redactor(secret_values)
 
 
 def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:

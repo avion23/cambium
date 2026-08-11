@@ -30,6 +30,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
+from urllib.parse import quote
 
 from . import auth
 from .auth import AuthError, AuthStore
@@ -47,6 +48,11 @@ EVENTS_DB_REL = ".cambium/events.db"
 CONVERSATIONS_DB_REL = ".cambium/sessions/conversations.db"
 MODULES_ROOT = Path(__file__).resolve().parent / "modules"
 OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
+
+
+def _sqlite_read_only_uri(db: Path) -> str:
+    """Return a read-only SQLite URI with the filesystem path encoded safely."""
+    return f"file:{quote(str(Path(db).resolve()), safe='/:')}?mode=ro"
 
 
 class Status(enum.StrEnum):
@@ -157,7 +163,7 @@ def check_worktrees(cwd: Path) -> tuple[Status, str]:
 
 def _event_store(db: Path) -> tuple[int | None, list[str]]:
     """Return (row count, integrity problems). Count is None when integrity failed."""
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    conn = sqlite3.connect(_sqlite_read_only_uri(db), uri=True)
     try:
         integrity = [row[0] for row in conn.execute("PRAGMA integrity_check")]
         problems = [line for line in integrity if line != "ok"]
@@ -403,7 +409,7 @@ def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status
 
 
 def _sqlite_integrity(db: Path) -> list[str]:
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    conn = sqlite3.connect(_sqlite_read_only_uri(db), uri=True)
     try:
         return [row[0] for row in conn.execute("PRAGMA integrity_check") if row[0] != "ok"]
     finally:

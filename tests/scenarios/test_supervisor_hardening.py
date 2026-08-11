@@ -232,12 +232,11 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
 def test_session_redactor_removes_declared_secret_from_db_and_observers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The secret deliberately avoids every default pattern shape (no sk-/AIza/
-    # Bearer prefix), so only the session registry built from the declared
-    # provider_env_keys values can redact it. Worker stderr and gate stderr
-    # both echo it; neither the durable SQLite rows nor the observer records
-    # may contain it.
-    secret = "opaque-session-secret-42abcdef"
+    # The prose-like secret deliberately avoids every default pattern shape.
+    # Only the session registry built from the declared provider_env_keys value
+    # can redact it. Worker stderr, gate stderr, and the result summary all
+    # echo it; none may contain the credential.
+    secret = "correct horse battery staple"
     monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", secret)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -257,11 +256,15 @@ def test_session_redactor_removes_declared_secret_from_db_and_observers(
         "send({'type': 'result_envelope', 'request_id': run['request_id'], 'task_id': "
         "run['task_id'], 'generation': init.get('generation', 1), 'status': status, "
         "'commits': commits, 'files_changed': files_changed, 'diff': diff, "
-        "'failure_reason': failure_reason})\n"
+        "'failure_reason': failure_reason, 'summary': 'Used ' + "
+        "os.environ['CAMBIUM_PROVIDER_OPENAI_API_KEY'] + ' successfully'})\n"
         "send({'type': 'exit_message', 'task_id': run['task_id'], 'reason': 'done'})\n",
         encoding="utf-8",
     )
-    gate = f"echo {secret} >&2; grep -q '// t-secret' hello.txt"
+    gate = (
+        "printf '%s\\n' \"$CAMBIUM_PROVIDER_OPENAI_API_KEY\" >&2; "
+        "grep -q '// t-secret' hello.txt"
+    )
     task = _task(
         session_dir,
         repo,
@@ -280,6 +283,11 @@ def test_session_redactor_removes_declared_secret_from_db_and_observers(
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}, on_event=observer))
 
     assert result.results[0].status == "succeeded"
+    assert result.results[0].summary == "Used *** successfully"
+    result_record = json.loads(
+        (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
+    )
+    assert result_record["summary"] == "Used *** successfully"
     assert secret not in json.dumps(observed)
     with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
         rows = connection.execute(

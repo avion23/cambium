@@ -11,9 +11,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+
+from cambium import doctor
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = str(REPO_ROOT / "src")
@@ -77,3 +80,22 @@ def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> N
     assert "Provider env" in result.stdout
     assert "missing provider key is WARN" in result.stdout
     assert "0 fail" in result.stdout
+
+
+def test_doctor_opens_session_databases_with_special_character_paths(tmp_path) -> None:
+    session_dir = tmp_path / "session?query#fragment"
+    events_db = session_dir / doctor.EVENTS_DB_REL
+    conversations_db = session_dir / doctor.CONVERSATIONS_DB_REL
+    events_db.parent.mkdir(parents=True)
+    conversations_db.parent.mkdir(parents=True)
+
+    with sqlite3.connect(events_db) as connection:
+        connection.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")
+    with sqlite3.connect(conversations_db):
+        pass
+
+    event_status, event_detail = doctor.check_event_store(session_dir)
+    conversation_status, conversation_detail = doctor.check_conversation_store(session_dir)
+
+    assert event_status is doctor.Status.PASS, event_detail
+    assert conversation_status is doctor.Status.PASS, conversation_detail
