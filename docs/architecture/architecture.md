@@ -28,15 +28,23 @@ protocol/request correlation, and quarantine). Successful publication uses an
 expected-old atomic update of `refs/heads/main`. It is ref-only and never
 refreshes the caller's checkout or index.
 
-There is no global worker-count semaphore. A flat plan (no `depends_on`)
-fans out under one `asyncio.TaskGroup` with no concurrency cap — an 11-task
-canary observed 11 concurrent supervisions. A plan that supplies
-`depends_on` is built into one validated rooted `TaskTree` and dispatched in
-static ready-node waves: only nodes whose dependencies finished are admitted
-per wave, and each wave's concurrency is bounded by `max_width` (parameter,
-then the plan field, then `tasktree.MAX_WIDTH`). A failed node cascades so
-its descendants are never spawned. `resource_thresholds` remains the only
-host-health pre-flight.
+A session-wide parallel-worker cap defaults to one worker per CPU:
+`run_plan` rewrites `max_concurrent_tasks=None` to the CPU count before
+building `_Runtime`, which creates an `asyncio.Semaphore` when the cap is
+nonzero (`0` disables the cap, meaning unlimited). The semaphore is acquired
+for the worker phase (spawn through worker exit) on both the flat and the
+hierarchy paths, and is released before merge, prune, and observer
+notification. A flat plan (no `depends_on`) fans out under one
+`asyncio.TaskGroup`; the flat canary
+(`test_flat_plan_ignores_max_width_and_preserves_canary`, four tasks) shows
+`max_width` is ignored on that path while the default CPU-count cap still
+bounds concurrent workers. A plan that supplies `depends_on` is built into
+one validated rooted `TaskTree` and dispatched in static ready-node waves:
+only nodes whose dependencies finished are admitted per wave, and each
+wave's concurrency is bounded by `max_width` (parameter, then the plan
+field, then `tasktree.MAX_WIDTH`). A failed node cascades so its descendants
+are never spawned. `resource_thresholds` remains the only host-health
+pre-flight.
 
 The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
 records through it, and writes `.cambium/result.json` after shutdown. The
@@ -92,7 +100,8 @@ depth/width bounds, and deep-copies each input `spec` into frozen node records.
 `topological_order` and `ready_tasks` are pure inspection/scheduling inputs.
 `run_plan` integrates them on the hierarchy path: a plan whose tasks carry
 `depends_on` is built into a `TaskTree` and dispatched in static ready-node
-waves; a flat plan keeps the unbounded one-`TaskGroup` fan-out.
+waves; a flat plan keeps the one-`TaskGroup` fan-out under the default
+CPU-count cap.
 
 `architectus.ArchitectusCore` is tested with injected LLMs but has no caller in
 `run_plan`. Dynamic decomposition and the conversation store are not wired into
@@ -100,7 +109,11 @@ that path; `orchestrator.py` is a skeleton. Persistent worker reuse is absent.
 
 `doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
 auth coverage, optional event and conversation databases, module datasets, and
-advisory host health. `resources.py` is deleted; there is no `CompileGate` and
+advisory host health. Its provider-environment check reads the file named by
+`CAMBIUM_PROVIDERS` or `<cwd>/.cambium/providers.json` (falling back to the
+shipped default sample), not the trusted user config
+`~/.config/cambium/providers.json` that `run` selects providers from.
+`resources.py` is deleted; there is no `CompileGate` and
 no `ResourceBudget` class. `module_conformance` provides an
 isolated module-test gate. `modules/example` has deterministic decision logic,
 train/eval/canary data, split metrics, and a JSON CLI with `decide` and

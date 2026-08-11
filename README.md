@@ -12,15 +12,17 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 The entry point (`src/cambium/cli.py`) dispatches these commands:
 
 - `run PROMPT` — run one prompt against a repository (`--repo`,
-  `--session-dir`, `--provider`, `--model`, `--json`).
+  `--session-dir`, `--provider`, `--model`, `--auto`, `--max-wall-s`,
+  `--max-tokens`, `--max-turns`, `--json`).
 - `repl` — interactive line loop; each input line is one prompt.
 - `tui` — line-oriented front end with a `cambium> ` prompt.
 - `session list | latest | show SESSION` — read completed sessions from their
   `.cambium/result.json` and `.cambium/events.db` artifacts.
 - `supervisor --session-dir DIR` — run one supervisor session from a plan, a
   task spec, or the built-in deterministic demo.
-- `auth set|remove|list PROVIDER` — manage stored provider credentials; read
-  the key from stdin with `--stdin`.
+- `auth set|remove PROVIDER` — manage stored provider credentials; `set` reads
+  the key from stdin with `--stdin`. Only `set` and `remove` take a
+  `PROVIDER` positional; `auth list` takes none.
 - `doctor`, `bench`, `tasktree`, `module-test`, `version` — diagnostics and
   tooling.
 

@@ -33,6 +33,7 @@ that may be a credential never appears in diagnostics.
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli run --repo PATH \
     [--session-dir DIR] [--provider PROVIDER] [--model MODEL] \
+    [--auto] [--max-wall-s SECONDS] [--max-tokens N] [--max-turns N] \
     [--json] PROMPT
 ```
 
@@ -51,15 +52,32 @@ Options:
   default runs never share a directory).
 - `--provider` / `--model` — select one configured provider (see §7).
   Provider ids are validated against `[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?`.
+- `--auto` — route the run through the usage-debt selector (solution C): the
+  supervisor picks `(provider, model, tier)` from all enabled configured
+  providers with stored credentials instead of pinning `--provider`/`--model`.
+- `--max-wall-s SECONDS` — per-task wall-clock budget in seconds (default
+  `300`, matching `cambium run --help` at this commit).
+- `--max-tokens N` — total token budget across the run (default `200000`).
+- `--max-turns N` — maximum agent-loop turns (default `20` at this commit;
+  `cambium run --help` reports the same).
 - `--json` — print the rendered result as JSON instead of the text line.
 
 Pipeline (`oneshot.run_oneshot`): preflight the repo and prompt, resolve the
 provider (§7), allocate or accept the session dir, build one task
-(`task_id` `oneshot`, worktree `<session>/wt`, branch `cambium-oneshot`), and
+(`task_id` `oneshot`, worktree `<session>/wt`, branch
+`cambium-oneshot-<sha256(session_dir)[:16]>` — the first 16 hex digits of the
+SHA-256 of the resolved session-directory path), and
 call `supervisor.run_plan(session_dir, plan, provider_environment=...)`. The
 accepted plan is written atomically as `<session>/plan.json` (mode `0600`)
 before any worker starts; the event log is `.cambium/events.db`; the canonical
 root result is `.cambium/result.json`.
+
+Each prompt runs in a fresh, isolated worktree copy of the repository: the
+supervisor creates `<session>/wt` with `git worktree add -b
+cambium-oneshot-<sha256(session_dir)[:16]>` at the repo's `refs/heads/main`
+base commit. `git diff` inside that worktree therefore shows only the agent's
+changes, never the user's checkout state (uncommitted edits, a different
+branch, or a moved HEAD).
 
 The result is rendered by `cambium.render` from the supervisor `PlanResult`:
 text output is one line such as `plan=tasks:1 plan_status={succeeded}`, JSON
@@ -106,7 +124,10 @@ reinterpreted as prompts.
 stops the loop; every other line is a prompt. Each prompt runs through
 `oneshot.run_oneshot` with a fresh immutable config
 (`dataclasses.replace(config, prompt=...)`), so a failed or mutated run never
-changes the shared config. Each result is printed as one rendered text line.
+changes the shared config. Each prompt also gets its own fresh session leaf
+and therefore its own isolated worktree copy of the repo (§2), so a prompt
+never works against another prompt's or the user's checkout. Each result is
+printed as one rendered text line.
 The exit code is `1` if any result failed (a nonzero result exit code or a
 per-prompt exception), otherwise `0`; per-prompt failures print
 `repl: <error>` to stderr and continue. A prompt answered conversationally
