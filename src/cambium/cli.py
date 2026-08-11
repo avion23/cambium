@@ -66,6 +66,11 @@ _COMMAND_NAMES = frozenset(
 )
 
 
+# sysexits.h EX_TEMPFAIL: the session admission lock is held by another live
+# supervisor. The condition is transient; callers may retry the same run.
+_EXIT_SESSION_BUSY = 75
+
+
 def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-dir", required=True, metavar="DIR")
     plan = parser.add_mutually_exclusive_group()
@@ -214,8 +219,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     session = commands.add_parser(
         "session",
-        help="list, inspect, or show sessions",
-        description="List, inspect, or show Cambium sessions.",
+        help="list, latest, or show sessions",
+        description="List, latest, or show Cambium sessions.",
     )
     session_commands = session.add_subparsers(
         dest="session_command",
@@ -469,6 +474,8 @@ def _run_oneshot(args: argparse.Namespace) -> int:
     render = _import_or_fail("cambium.render", "run")
     if render is None:
         return 1
+    from .supervisor import SessionAlreadyRunningError
+
     config = oneshot.OneShotConfig(
         prompt=_prompt_text(args.prompt),
         repo=args.repo,
@@ -481,6 +488,12 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         result = asyncio.run(value) if inspect.isawaitable(value) else value
     except KeyboardInterrupt:
         return 130
+    except SessionAlreadyRunningError as exc:
+        # The session admission lock is held by another live supervisor.
+        # Report one sanitized diagnostic (no traceback) and return the
+        # documented temporary-failure exit code so callers can retry.
+        print(f"cambium run: {exc}", file=sys.stderr)
+        return _EXIT_SESSION_BUSY
     except (AuthError, OSError, ValueError) as exc:
         print(f"cambium run: {exc}", file=sys.stderr)
         return 2
@@ -535,11 +548,20 @@ def _run_session(args: argparse.Namespace) -> int:
         else session.session_root(Path.cwd())
     )
     if args.session_command == "list":
-        for path in session.list_sessions(root):
+        try:
+            paths = session.list_sessions(root)
+        except OSError as exc:
+            print(f"cambium session: {exc}", file=sys.stderr)
+            return 1
+        for path in paths:
             print(path)
         return 0
     if args.session_command == "latest":
-        path = session.latest_session(root)
+        try:
+            path = session.latest_session(root)
+        except OSError as exc:
+            print(f"cambium session: {exc}", file=sys.stderr)
+            return 1
         if path is None:
             print(f"cambium session: no completed sessions under {root}", file=sys.stderr)
             return 1

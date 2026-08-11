@@ -70,15 +70,24 @@ def _dumps(value: Any) -> str:
 
 
 def _filter_safe(record: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep only canonical result fields, recursing into ``PlanResult.results``."""
+    """Keep only canonical result fields, recursing into ``PlanResult.results``.
+
+    ``results`` must be a sequence of mappings; a non-sequence value is dropped
+    wholesale and every non-mapping entry of a sequence is rejected, so a
+    mapping-, scalar-, or nested-list-valued ``results`` field cannot carry
+    arbitrary data through the renderer.
+    """
     filtered: dict[str, Any] = {}
     for key, item in record.items():
         if key not in _SAFE_KEYS:
             continue
-        if key == "results" and isinstance(item, (list, tuple)):
+        if key == "results":
+            if not isinstance(item, (list, tuple)):
+                continue
             item = [
-                _filter_safe(entry) if isinstance(entry, Mapping) else entry
+                _filter_safe(entry)
                 for entry in item
+                if isinstance(entry, Mapping)
             ]
         filtered[key] = item
     return filtered

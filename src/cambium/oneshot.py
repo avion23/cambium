@@ -25,6 +25,7 @@ from .auth import (
     is_provider_env_name,
     scrub_environment,
 )
+from .ipc import MAX_LINE_BYTES
 from .provider_config import ProviderSelectionError, load_providers, select_provider
 from .session import session_root
 from .supervisor import DEFAULT_WALL_BUDGET_S, EventSink, PlanResult
@@ -117,6 +118,12 @@ def preflight(
     """Reject a prompt or repository that cannot reach the supervisor."""
     if not isinstance(config.prompt, str) or not config.prompt.strip():
         raise ValueError("one-shot prompt must be a non-empty string")
+    encoded_len = len(config.prompt.encode("utf-8"))
+    if encoded_len > MAX_LINE_BYTES:
+        raise ValueError(
+            f"one-shot prompt exceeds the supervisor frame limit "
+            f"({encoded_len} > {MAX_LINE_BYTES} bytes)"
+        )
     if config.task_id is not None and (
         not isinstance(config.task_id, str) or not config.task_id.strip()
     ):

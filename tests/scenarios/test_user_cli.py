@@ -14,8 +14,10 @@ import pytest
 
 from cambium import cli, oneshot, repl, session, tui
 from cambium.auth import AuthStore, derived_env_name
+from cambium.ipc import MAX_LINE_BYTES
 from cambium.render import render_json_result, render_text_result
 from cambium.results import Result, write_result
+from cambium.store import EventStore
 from cambium.supervisor import PlanResult, TaskResult
 
 
@@ -203,6 +205,39 @@ def test_render_accepts_plan_result() -> None:
 
     assert "plan=tasks:1" in render_text_result(result)
     assert json.loads(render_json_result(result))["results"][0]["status"] == "succeeded"
+
+
+def test_render_drops_mapping_valued_results_wholesale() -> None:
+    # A mapping-valued ``results`` field is not a sequence of mappings; the
+    # renderer must drop it entirely rather than pass the nested mapping
+    # through with arbitrary keys.
+    payload = {"results": {"task_id": "oneshot", "secret_field": "leak"}}
+
+    rendered = json.loads(render_json_result(payload))
+
+    assert "results" not in rendered
+    assert "leak" not in json.dumps(rendered)
+
+
+def test_render_rejects_non_mapping_entries_in_results() -> None:
+    payload = {
+        "results": [
+            {"task_id": "ok", "status": "succeeded"},
+            "scalar-leak",
+            42,
+            ["nested", "leak"],
+            {"task_id": "ok2"},
+        ]
+    }
+
+    rendered = json.loads(render_json_result(payload))
+    results = rendered["results"]
+
+    assert [entry.get("task_id") for entry in results] == ["ok", "ok2"]
+    assert all(isinstance(entry, dict) for entry in results)
+    serialized = json.dumps(rendered)
+    assert "scalar-leak" not in serialized
+    assert "nested" not in serialized
 
 
 def test_repl_and_tui_make_a_new_config_per_prompt(monkeypatch, tmp_path: Path) -> None:
@@ -413,12 +448,24 @@ def _write_result(path: Path, ended_at: float) -> None:
     write_result(result, path, session_id=str(path.resolve()))
 
 
+def _write_events_db(path: Path) -> None:
+    """Create a minimal but valid session event log under ``path/.cambium``."""
+    state = path / ".cambium"
+    store = EventStore(state / "events.db", fsync_interval_s=0.01)
+    try:
+        store.append({"kind": "result", "payload": {"note": path.name}})
+    finally:
+        store.close()
+
+
 def test_session_readers_and_cli_expose_paths_and_result_data(
     capsys, tmp_path: Path
 ) -> None:
     root = tmp_path / "sessions"
     _write_result(root / "old", 1.0)
+    _write_events_db(root / "old")
     _write_result(root / "new", 2.0)
+    _write_events_db(root / "new")
 
     assert session.list_sessions(root) == [(root / "old").resolve(), (root / "new").resolve()]
     assert session.latest_session(root) == (root / "new").resolve()
@@ -433,6 +480,38 @@ def test_session_readers_and_cli_expose_paths_and_result_data(
     ]
     assert cli.main(["session", "show", "--session-dir", str(root), "new"]) == 0
     assert json.loads(capsys.readouterr().out)["summary"] == "new"
+
+
+def test_session_show_rejects_incomplete_session_without_event_db(
+    capsys, tmp_path: Path
+) -> None:
+    root = tmp_path / "sessions"
+    _write_result(root / "incomplete", 1.0)
+    # No events.db is created for this session on purpose.
+
+    assert (
+        cli.main(["session", "show", "--session-dir", str(root), "incomplete"]) == 1
+    )
+    captured = capsys.readouterr()
+    assert "cambium session:" in captured.err
+    assert "missing" in captured.err
+    assert "Traceback" not in captured.err
+
+    with pytest.raises(FileNotFoundError, match="events.db"):
+        session.show_session(root / "incomplete")
+
+
+def test_session_show_does_not_materialize_event_log(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    _write_result(root / "events", 1.0)
+    _write_events_db(root / "events")
+
+    view = session.show_session(root / "events")
+
+    # The view exposes only the result artifact; the durable event log is
+    # streamed by cambium.supervisor.read_events, not preloaded here.
+    assert view.events == ()
+    assert view.result["summary"] == "events"
 
 
 def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
@@ -539,5 +618,177 @@ def test_plan_file_is_private_and_contains_no_credential(tmp_path: Path) -> None
         {"tasks": [{"task_id": "one", "provider_env_keys": [derived_env_name("demo")]}]},
     )
 
+    # The permission assertion stays: ``plan.json`` is always created 0600.
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert secret not in path.read_text(encoding="utf-8")
+
+
+def test_provider_run_persists_real_plan_without_credential(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A real provider run persists ``plan.json`` and the handed-off credential
+    must not appear in that persisted file (the prior ``test_plan_file_*``
+    assertion was vacuous because the secret never reached the plan)."""
+    repo = _repo(tmp_path / "repo")
+    provider = "demo"
+    env_name = derived_env_name(provider)
+    config_path = repo / ".cambium" / "providers.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": provider,
+                        "tier": "fast",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "api_key_env": env_name,
+                        "model": "demo-model",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    secret = "persistent-plan-secret"
+    auth_path = tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json"
+    store = AuthStore(auth_path)
+    store.set_provider(provider, secret)
+    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
+    monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+
+    captured_session_dir: list[Path] = []
+    from cambium.supervisor import _write_plan
+
+    async def persisting_run_plan(session_dir, plan, on_event=None, **kwargs):
+        captured_session_dir.append(Path(session_dir))
+        # Persist the accepted plan exactly as the real supervisor boundary
+        # would, so the on-disk artifact is the genuine plan.json.
+        _write_plan(Path(session_dir), plan)
+        return _plan_result()
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", persisting_run_plan)
+
+    result = asyncio.run(
+        oneshot.run_oneshot(
+            oneshot.OneShotConfig(prompt="use provider", repo=repo, provider=provider)
+        )
+    )
+    assert result.exit_code == 0
+
+    persisted_plan = captured_session_dir[0] / "plan.json"
+    assert persisted_plan.is_file()
+    assert stat.S_IMODE(persisted_plan.stat().st_mode) == 0o600
+    plan_text = persisted_plan.read_text(encoding="utf-8")
+    # The handed-off credential must not appear in the persisted plan.json.
+    assert secret not in plan_text
+    parsed = json.loads(plan_text)
+    assert parsed["tasks"][0]["provider_env_keys"] == [env_name]
+
+
+def test_concurrent_session_lock_contention_returns_busy_exit_code(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    """M2: a session already under admission must surface one sanitized
+    diagnostic at the CLI boundary and the documented temporary-failure
+    exit code instead of a RuntimeError traceback."""
+    from cambium.supervisor import _SessionAdmission
+
+    repo = _repo(tmp_path / "repo")
+    _write_provider_config(repo, [_provider_entry("demo")])
+    env_name = derived_env_name("demo")
+    secret = "contention-secret"
+    store = AuthStore(tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json")
+    store.set_provider("demo", secret)
+    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
+    monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    # Hold the admission lock to mimic another live supervisor on this session.
+    blocking = _SessionAdmission(session_dir)
+    blocking.acquire()
+    try:
+        exit_code = cli.main(
+            [
+                "run",
+                "--repo",
+                str(repo),
+                "--session-dir",
+                str(session_dir),
+                "--provider",
+                "demo",
+                "--model",
+                "demo-model",
+                "fix the bug",
+            ]
+        )
+    finally:
+        blocking.release()
+
+    assert exit_code == 75
+    captured = capsys.readouterr()
+    assert "cambium run:" in captured.err
+    assert "already running" in captured.err
+    assert "Traceback" not in captured.err
+    # No session artifacts are written when admission refused the run.
+    assert not (session_dir / "plan.json").exists()
+    assert not (session_dir / ".cambium" / "result.json").exists()
+
+
+def test_session_list_and_latest_emit_sanitized_error_for_unreadable_root(
+    capsys, tmp_path: Path
+) -> None:
+    """M3: ``session list``/``latest`` against an unreadable root surface the
+    same sanitized ``cambium session: ...`` diagnostic as ``show``."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory read permissions")
+    root = tmp_path / "sessions"
+    root.mkdir(mode=0o700)
+    _write_result(root / "old", 1.0)
+    _write_events_db(root / "old")
+    root.chmod(0o000)
+    try:
+        assert cli.main(["session", "list", "--session-dir", str(root)]) == 1
+        first = capsys.readouterr()
+        assert "cambium session:" in first.err
+        assert "Traceback" not in first.err
+
+        assert cli.main(["session", "latest", "--session-dir", str(root)]) == 1
+        second = capsys.readouterr()
+        assert "cambium session:" in second.err
+        assert "Traceback" not in second.err
+    finally:
+        root.chmod(0o700)
+
+
+def test_oversized_prompt_is_rejected_before_session_allocation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """L1: a prompt over the supervisor's IPC frame limit is rejected before a
+    session directory is allocated or plan.json is persisted."""
+    repo = _repo(tmp_path / "repo")
+    sessions_root = repo / ".cambium" / "sessions"
+
+    async def unexpected_run_plan(*args, **kwargs):
+        raise AssertionError("oversized prompt must not reach the supervisor")
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
+
+    oversized = "x" * (MAX_LINE_BYTES + 1)
+    with pytest.raises(ValueError, match="frame limit"):
+        asyncio.run(
+            oneshot.run_oneshot(
+                oneshot.OneShotConfig(
+                    prompt=oversized,
+                    repo=repo,
+                    target_file="file.txt",
+                    marker="// marker",
+                )
+            )
+        )
+
+    assert not sessions_root.exists() or not list(sessions_root.iterdir())

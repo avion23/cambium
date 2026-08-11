@@ -64,8 +64,10 @@ root result is `.cambium/result.json`.
 The result is rendered by `cambium.render` from the supervisor `PlanResult`:
 text output is one line such as `plan=tasks:1 plan_status={succeeded}`, JSON
 output is the filtered `{"results": [...]}` record. Exit codes: `0` success,
-`2` for config/preflight errors (`cambium run: <message>`), `130` on
-`KeyboardInterrupt`, otherwise the result exit code.
+`2` for config/preflight errors (`cambium run: <message>`), `75` when the
+session admission lock is already held by another live supervisor
+(`cambium run: session is already running: ...`, a temporary failure callers
+may retry), `130` on `KeyboardInterrupt`, otherwise the result exit code.
 
 Without `--provider`/`--model`, the run still resolves a provider: it
 auto-selects the first enabled provider from the trusted user config (see
@@ -127,11 +129,12 @@ that default `run` leaves are created under.
   prints `cambium session: no completed sessions under <root>` to stderr and
   exits `1`.
 - `show SESSION` reads one session's `.cambium/result.json` (must be a JSON
-  object) and its `.cambium/events.db` (opened read-only with `sqlite3
-  mode=ro`, events in `seq` order) into a `SessionView`, then prints the JSON
-  result. `SESSION` may be an absolute path or a name resolved under the
-  root. Missing or malformed artifacts print `cambium session: <error>` to
-  stderr and exit `1`.
+  object) and requires its `.cambium/events.db` artifact to exist (the event
+  log is not materialized into the view; readers that need it stream it
+  through `cambium.supervisor.read_events`). The view's JSON result is printed.
+  `SESSION` may be an absolute path or a name resolved under the root. Missing
+  or malformed artifacts print `cambium session: <error>` to stderr and exit
+  `1`.
 
 `session.py` never creates or opens artifacts for writing.
 

@@ -19,15 +19,9 @@ it inspects.
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-_SELECT_EVENTS = (
-    "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
-    "generation, request_id FROM events WHERE seq > 0 ORDER BY seq"
-)
 
 
 def session_root(repo: Path) -> Path:
@@ -61,23 +55,33 @@ def latest_session(root: Path) -> Path | None:
 
 
 def show_session(path: Path) -> SessionView:
-    """Read one session's current result and event artifacts into a view."""
+    """Read one session's current result and event artifacts into a view.
+
+    The session event log (``.cambium/events.db``) is required: a session
+    without one is incomplete and is rejected as a missing artifact. Events
+    are not materialized into the view; readers that need the durable log
+    stream it through ``cambium.supervisor.read_events``.
+    """
     session_path = Path(path)
     result_path = session_path / ".cambium" / "result.json"
+    events_path = session_path / ".cambium" / "events.db"
+    if not events_path.is_file():
+        raise FileNotFoundError(f"session event log is missing: {events_path}")
     with open(result_path, encoding="utf-8") as stream:
         record = json.load(stream)
     if not isinstance(record, dict):
         raise ValueError(f"session result is not a JSON object: {result_path}")
-    events = _read_events(session_path / ".cambium" / "events.db")
-    return SessionView(path=session_path.resolve(), result=record, events=events)
+    return SessionView(path=session_path.resolve(), result=record, events=())
 
 
 @dataclass(frozen=True, slots=True)
 class SessionView:
     """Renderer-friendly snapshot of one completed session.
 
-    ``result`` is the parsed ``.cambium/result.json`` record; ``events`` are
-    the durable event records in sequence order.
+    ``result`` is the parsed ``.cambium/result.json`` record. ``events`` is
+    kept for API stability; :func:`show_session` no longer materializes the
+    durable log into it — readers that need events stream them through
+    ``cambium.supervisor.read_events``.
     """
 
     path: Path
@@ -120,33 +124,6 @@ def _sort_key(record: dict[str, Any], path: Path) -> tuple[float, float, str]:
         _timestamp(record.get("started_at")),
         path.name,
     )
-
-
-def _read_events(db: Path) -> tuple[dict[str, Any], ...]:
-    if not db.is_file():
-        return ()
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    try:
-        rows = conn.execute(_SELECT_EVENTS).fetchall()
-    finally:
-        conn.close()
-    return tuple(_event_record(row) for row in rows)
-
-
-def _event_record(row: tuple) -> dict[str, Any]:
-    """Map one events row to the canonical record shape of store.EventStore."""
-    (seq, kind, payload, ts, monotonic_ms, task_id, worker_id, generation, request_id) = row
-    return {
-        "seq": seq,
-        "kind": kind,
-        "payload": json.loads(payload),
-        "ts": ts,
-        "monotonic_ms": monotonic_ms,
-        "task_id": task_id,
-        "worker_id": worker_id,
-        "generation": generation,
-        "request_id": request_id,
-    }
 
 
 __all__ = ["SessionView", "latest_session", "list_sessions", "session_root", "show_session"]
