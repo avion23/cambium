@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "measure_worker_coldstart.py"
 FIXTURE_REL = "tests/fixtures/e2e/cambium-e2e-marker.txt"
@@ -38,6 +40,7 @@ def _make_source_repo(repo: Path) -> None:
     )
 
 
+@pytest.mark.slow
 def test_measure_worker_coldstart_runs_and_emits_parseable_summary(tmp_path) -> None:
     source = tmp_path / "source"
     _make_source_repo(source)

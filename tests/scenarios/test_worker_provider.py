@@ -347,6 +347,7 @@ def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_worker_agent_loop_finish_without_changes_succeeds_without_commit(
     tmp_path, monkeypatch
 ) -> None:
@@ -399,6 +400,7 @@ def test_worker_agent_loop_finish_without_changes_succeeds_without_commit(
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
     tmp_path, monkeypatch
 ) -> None:
@@ -515,6 +517,7 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         server.close()
 
 
+@pytest.mark.slow
 def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
     tmp_path, monkeypatch
 ) -> None:
@@ -560,6 +563,7 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
 
 
 
+@pytest.mark.slow
 def test_worker_advanced_head_no_change_fails_and_main_unchanged(
     tmp_path, monkeypatch
 ) -> None:
@@ -601,6 +605,7 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -> None:
     """A model ``delegate`` tool call admits and runs a child through the real worker loop.
 
@@ -690,6 +695,7 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -719,6 +725,7 @@ def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch)
         server.close()
 
 
+@pytest.mark.slow
 def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -753,6 +760,7 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_git_worktree_hook_does_not_receive_provider_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -787,6 +795,7 @@ def test_worker_git_worktree_hook_does_not_receive_provider_key(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -816,6 +825,7 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -853,6 +863,7 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -879,6 +890,7 @@ def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -913,6 +925,7 @@ def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -955,6 +968,7 @@ def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
         server.close()
 
 
+@pytest.mark.slow
 def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
@@ -997,6 +1011,7 @@ def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()

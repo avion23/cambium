@@ -23,6 +23,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -156,6 +158,7 @@ def _write_child_dump_worker(dump_worker: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dc1_rejected_revisions_spawn_nothing(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -223,6 +226,7 @@ def test_dc1_rejected_revisions_spawn_nothing(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -300,6 +304,7 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dc3_failed_child_emits_child_failed_for_parent(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"

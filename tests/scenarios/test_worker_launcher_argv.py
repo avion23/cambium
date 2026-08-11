@@ -29,6 +29,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -133,6 +135,7 @@ def _spawned(events: list[dict]) -> list[dict]:
     return [e for e in events if e["kind"] == "spawned"]
 
 
+@pytest.mark.slow
 def test_script_worker_spawns_exact_argv_and_confined_env(tmp_path, monkeypatch) -> None:
     script = _write_dump_worker(tmp_path)
     argv_dump = tmp_path / "argv.json"
