@@ -120,8 +120,6 @@ RUNTIME_BASELINE_DIR = Path.cwd() / ".cambium" / "baselines"
 
 SPLITS = ("train", "eval", "canaries")
 
-_OPTIONS_ADDED = False
-
 
 def _baseline_path(
     package_name: str,
@@ -742,11 +740,9 @@ def _fmt(stats: Any) -> str:
 
 
 def pytest_addoption(parser: Any) -> None:
-    global _OPTIONS_ADDED
-    if _OPTIONS_ADDED:
-        return  # the entry point and -p may both register this module
-    _OPTIONS_ADDED = True
     group = parser.getgroup("cambium-bench")
+    if any(getattr(option, "dest", None) == "bench" for option in group.options):
+        return  # the entry point and -p may both register this module
     group.addoption(
         "--bench",
         choices=("report", "gate", "re-anchor"),

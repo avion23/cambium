@@ -1,14 +1,22 @@
 """Scenario tests for the cambium bench harness itself.
 
-The harness is exercised end-to-end: each test launches a real pytest
-subprocess (the same interpreter the suite runs under) with
-``-p cambium.bench --bench=...`` and asserts on the produced baseline JSON
-and the process exit code.
+The harness is exercised end-to-end in-process: the bench pytest plugin is
+loaded through ``pytest.main(["-p", "cambium.bench", "--bench=..."])`` and the
+standalone CLI through ``cambium.bench.main([...])`` instead of launching a
+nested interpreter per invocation (interpreter startup plus real module
+scoring dominated the old subprocess-based suite). Only the genuinely
+process-level behaviors still spawn subprocesses: the standalone timing
+subprocesses that must stay live (``@pytest.mark.slow`` tier-2), the
+dataset-check script, and the git-status guarantee.
 
 The bench plugin writes baselines to ``--bench-root``; the tests redirect it
 to a per-test temporary directory so the committed repo baselines are never
 touched. Wall-time drift is disabled (``--bench-wall-ratio=100``) so the
-assertions isolate the metric/exit-code behavior.
+assertions isolate the metric/exit-code behavior. Deterministic fixture
+modules replace the reference module wherever the assertions do not depend on
+its exact values; tests that do depend on the real module score it in-process
+(the module's own ``__main__`` runs unchanged, just without per-split
+interpreter startup).
 """
 
 from __future__ import annotations
@@ -18,6 +26,8 @@ import os
 import subprocess
 import sys
 import textwrap
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -29,6 +39,10 @@ REQUIRES_EXAMPLE = pytest.mark.skipif(
     not EXAMPLE_MODULE_DIR.is_dir(),
     reason="reference module cambium.modules.example is absent",
 )
+
+# Tier-2: requires real wall timings or real process behavior; excluded from
+# the default fast run (tier-1 = -m "not slow") but run explicitly with -m slow.
+SLOW = pytest.mark.slow
 
 SCHEMA_KEYS = {
     "schema_version",
@@ -62,14 +76,100 @@ WALL_RATIO = "--bench-wall-ratio=100"
 
 # Deterministic module-test timings for CLI-path tests whose assertions do not
 # involve wall time (drift reports, re-anchor, dataset_version fail-closed).
-# The standalone CLI re-measures the module's full test suite (57 tests) in a
-# nested pytest subprocess per invocation (~3.5s); substituting a fixed timing
-# set keeps those tests exercising the report/gate/drift-report code paths
-# without repeating identical subprocess work.
+# The standalone CLI normally re-measures the module's full test suite (57
+# tests) in a nested pytest subprocess per invocation (~3.5s); substituting a
+# fixed timing set keeps those tests exercising the report/gate/drift-report
+# code paths without repeating identical subprocess work.
 FAKE_TIMINGS = {
     "src/cambium/modules/example/tests/"
     "test_example_module.py::test_dataset_is_loadable_and_schema_valid": 0.01,
 }
+
+
+class _BenchResult:
+    """Stand-in for ``subprocess.CompletedProcess`` on in-process runs."""
+
+    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def run_plugin_bench(bench_root: Path, mode: str, *extra: str) -> _BenchResult:
+    """Run the bench pytest plugin in-process (no nested interpreter).
+
+    The module under test is selected by monkeypatching
+    ``cambium.bench.MODULES_DIR`` in the calling test before this runs; the
+    plugin executes in the same process, so the patch drives its session-finish
+    work. Output is captured to the returned object.
+    """
+    if not EXAMPLE_MODULE_DIR.is_dir():
+        pytest.skip("reference module cambium.modules.example is absent")
+    stdout, stderr = StringIO(), StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        returncode = pytest.main(
+            [
+                "-q",
+                "-p",
+                "cambium.bench",
+                f"--bench={mode}",
+                f"--bench-root={bench_root}",
+                WALL_RATIO,
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:capture",
+                "--no-header",
+                "-p",
+                "no:warnings",
+                *extra,
+                *FAST_TESTS,
+            ]
+        )
+    return _BenchResult(returncode, stdout.getvalue(), stderr.getvalue())
+
+
+def _inprocess_module_cli(cli_module, payload, **kwargs):
+    """Run a module's real JSON CLI in-process instead of in a subprocess.
+
+    Used only by tests whose assertions target the report/gate content, not
+    the subprocess transport (which the fixture and credential tests exercise
+    directly). The module's actual ``__main__`` runs unchanged in a worker
+    thread — its ``asyncio.run`` cannot nest inside the harness's own event
+    loop — so only the per-split interpreter startup is avoided.
+    """
+    import importlib
+    import io
+    import json as _json
+    import threading
+
+    from cambium.modules.base import ModuleCLIError
+
+    module = importlib.import_module(f"{cli_module}.__main__")
+    stdout, stderr = io.StringIO(), io.StringIO()
+    holder: dict[str, int] = {}
+
+    class _Stdin:
+        buffer = io.BytesIO((_json.dumps(payload, ensure_ascii=False) + "\n").encode())
+
+    def _run() -> None:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            holder["rc"] = module.main()
+
+    stdin_old = sys.stdin
+    sys.stdin = _Stdin()
+    try:
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+    finally:
+        sys.stdin = stdin_old
+    if holder["rc"] != 0:
+        raise ModuleCLIError(
+            f"module {cli_module!r}: CLI exited {holder['rc']}: "
+            f"{stderr.getvalue().strip()[:300]}"
+        )
+    return _json.loads(stdout.getvalue())
 
 
 def _write_fixture_module(
@@ -87,8 +187,15 @@ def _write_fixture_module(
     (source_root / "cambium" / "__init__.py").write_text("")
     (modules_dir / "__init__.py").write_text("")
     (package_dir / "__init__.py").write_text("")
-    if manifest is not None:
-        (package_dir / "module.json").write_text(json.dumps(manifest))
+    if manifest is None:
+        manifest = {
+            "contract_version": 1,
+            "module_name": "fixture_module",
+            "cli_module": "cambium.modules.fixture",
+            "protocol": "json-v1",
+            "dataset_schema_version": 1,
+        }
+    (package_dir / "module.json").write_text(json.dumps(manifest))
     (package_dir / "__main__.py").write_text(
         textwrap.dedent(
             """
@@ -188,43 +295,13 @@ def _write_env_probe_module(tmp_path: Path) -> Path:
     return modules_dir
 
 
-def run_bench(
-    bench_root: Path,
-    mode: str,
-    *extra: str,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run ``pytest -p cambium.bench --bench=<mode>`` as a subprocess."""
-    if not EXAMPLE_MODULE_DIR.is_dir():
-        pytest.skip("reference module cambium.modules.example is absent")
-    full_env = dict(os.environ)
-    if env:
-        full_env.update(env)
-    return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "cambium.bench",
-            f"--bench={mode}",
-            f"--bench-root={bench_root}",
-            WALL_RATIO,
-            *extra,
-            *FAST_TESTS,
-        ],
-        cwd=REPO_ROOT,
-        env=full_env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
+@REQUIRES_EXAMPLE
+def test_report_writes_valid_baseline(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
 
-
-def test_report_writes_valid_baseline(tmp_path) -> None:
+    monkeypatch.setattr(bench, "run_module_cli", _inprocess_module_cli)
     bench_root = tmp_path / "baselines"
-    result = run_bench(bench_root, "report")
+    result = run_plugin_bench(bench_root, "report")
     assert result.returncode == 0, result.stdout + result.stderr
 
     baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
@@ -282,6 +359,7 @@ def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypat
 def test_real_combined_dataset_reports_only_flagged_canaries(monkeypatch) -> None:
     import cambium.bench as bench
 
+    monkeypatch.setattr(bench, "run_module_cli", _inprocess_module_cli)
     load_jsonl = bench.load_jsonl
 
     def force_combined(path: Path) -> list[dict]:
@@ -682,6 +760,7 @@ def test_module_contract_violation_fails_closed_with_module_diagnostic(
     assert not bench_root.exists()
 
 
+@SLOW
 @REQUIRES_EXAMPLE
 def test_scripts_use_the_neutral_module_boundary() -> None:
     check = subprocess.run(
@@ -713,40 +792,35 @@ def test_scripts_use_the_neutral_module_boundary() -> None:
     assert "'decompose': False" in generated.stdout
 
 
-def test_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
+def test_gate_fails_closed_without_pre_existing_anchor(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    gate = run_bench(bench_root, "gate")
+    gate = run_plugin_bench(bench_root, "gate")
 
     assert gate.returncode == 1, gate.stdout + gate.stderr
     assert "missing pre-existing anchor" in gate.stdout
-    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+    assert not (bench_root / "fixture_module" / "baseline.json").exists()
 
 
-@REQUIRES_EXAMPLE
-def test_standalone_cli_gate_fails_closed_without_pre_existing_anchor(tmp_path) -> None:
+def test_standalone_cli_gate_fails_closed_without_pre_existing_anchor(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
     bench_root.mkdir()
 
-    gate = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "cambium.bench",
-            "gate",
-            "--bench-root",
-            str(bench_root),
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-
-    assert gate.returncode == 1, gate.stdout + gate.stderr
-    assert "missing pre-existing anchor" in gate.stdout
-    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+    assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
+    assert "missing pre-existing anchor" in capsys.readouterr().out
+    assert not (bench_root / "fixture_module" / "baseline.json").exists()
 
 
+@SLOW
 @REQUIRES_EXAMPLE
 def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
     """The standalone CLI report must populate real wall timings, not empty ones."""
@@ -765,7 +839,6 @@ def test_standalone_cli_report_records_module_test_timings(tmp_path) -> None:
     )
 
 
-@REQUIRES_EXAMPLE
 def test_standalone_cli_gate_detects_wall_time_regression(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -776,23 +849,26 @@ def test_standalone_cli_gate_detects_wall_time_regression(
     """
     import cambium.bench as bench
 
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
     nodeid = (
-        "src/cambium/modules/example/tests/"
-        "test_example_cli.py::test_cli_evaluate_operation_returns_scores"
+        "src/cambium/modules/fixture/tests/"
+        "test_fixture.py::test_always_passes"
     )
 
     monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: {nodeid: 0.01})
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
-    anchor = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
+    anchor = json.loads((bench_root / "fixture_module" / "baseline.json").read_text())
     assert anchor["tests"]["count"] == 1
     assert anchor["tests"]["wall_seconds"]["p90"] > 0
 
     monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: {nodeid: 100.0})
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
-    assert "DRIFT should_decompose: tests.wall_seconds.p90" in capsys.readouterr().out
+    assert "DRIFT fixture_module: tests.wall_seconds.p90" in capsys.readouterr().out
 
 
+@SLOW
 @REQUIRES_EXAMPLE
 def test_standalone_cli_immediate_gate_does_not_false_fail_under_load(tmp_path) -> None:
     """An immediate report->gate on unchanged code must not fail under load.
@@ -812,6 +888,7 @@ def test_standalone_cli_immediate_gate_does_not_false_fail_under_load(tmp_path) 
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 0
 
 
+@SLOW
 def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -850,29 +927,34 @@ def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
     assert "timing run exited" in capsys.readouterr().err
 
 
-def test_gate_passes_without_drift(tmp_path) -> None:
+def test_gate_passes_without_drift(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    report = run_bench(bench_root, "report")
+    report = run_plugin_bench(bench_root, "report")
     assert report.returncode == 0, report.stdout + report.stderr
-    gate = run_bench(bench_root, "gate")
+    gate = run_plugin_bench(bench_root, "gate")
     assert gate.returncode == 0, gate.stdout + gate.stderr
     assert "DRIFT" not in gate.stdout
 
 
-def test_gate_fails_on_metric_drift(tmp_path) -> None:
+def test_gate_fails_on_metric_drift(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    (tmp_path / "drift_inject.py").write_text(
-        "import cambium.bench as _bench\n"
-        "\n"
-        "def _fake(module, scored):\n"
-        "    return {'mean': 0.9, 'std': 0.0, 'count': len(scored)}\n"
-        "\n"
-        "_bench.score_examples = _fake\n"
-    )
-    report = run_bench(bench_root, "report")
+    report = run_plugin_bench(bench_root, "report")
     assert report.returncode == 0, report.stdout + report.stderr
 
-    gate = run_bench(bench_root, "gate", "-p", "drift_inject", env={"PYTHONPATH": str(tmp_path)})
+    monkeypatch.setattr(
+        bench,
+        "score_examples",
+        lambda _module, scored: {"mean": 0.9, "std": 0.0, "count": len(scored)},
+    )
+    gate = run_plugin_bench(bench_root, "gate")
     assert gate.returncode == 1, gate.stdout + gate.stderr
     assert "DRIFT metric.train.mean" in gate.stdout
     assert "1.0 -> 0.9" in gate.stdout
@@ -883,106 +965,97 @@ def test_gate_fails_on_metric_drift(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gate_fails_and_preserves_anchor_on_dataset_version_change(tmp_path) -> None:
+def test_gate_fails_and_preserves_anchor_on_dataset_version_change(
+    tmp_path, monkeypatch
+) -> None:
     """A dataset_version change must fail the gate and preserve the old anchor:
     the gate never re-anchors (agents.md:42). Recording the new baseline
     requires the explicit ``--bench=re-anchor`` operation."""
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    report = run_bench(bench_root, "report")
+    report = run_plugin_bench(bench_root, "report")
     assert report.returncode == 0, report.stdout + report.stderr
-    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_path = bench_root / "fixture_module" / "baseline.json"
     anchor = json.loads(anchor_path.read_text())
-    assert anchor["dataset_version"] == "1.1.0"
-    anchor["dataset_version"] = "1.0.0"  # simulate a pre-bump anchor
+    assert anchor["dataset_version"] == "fixture-1"
+    anchor["dataset_version"] = "0.0.0"  # simulate a pre-bump anchor
     anchor_path.write_text(json.dumps(anchor))
 
-    gate = run_bench(bench_root, "gate")
+    gate = run_plugin_bench(bench_root, "gate")
     assert gate.returncode == 1, gate.stdout + gate.stderr
     assert "DRIFT dataset_version" in gate.stdout
     assert "RE-ANCHOR" not in gate.stdout
     fresh = json.loads(anchor_path.read_text())
-    assert fresh["dataset_version"] == "1.0.0"  # old anchor preserved
+    assert fresh["dataset_version"] == "0.0.0"  # old anchor preserved
 
-    reanchor = run_bench(bench_root, "re-anchor")
+    reanchor = run_plugin_bench(bench_root, "re-anchor")
     assert reanchor.returncode == 0, reanchor.stdout + reanchor.stderr
-    assert "RE-ANCHOR should_decompose: 1.0.0 -> 1.1.0" in reanchor.stdout
+    assert "RE-ANCHOR fixture_module: 0.0.0 -> fixture-1" in reanchor.stdout
     fresh = json.loads(anchor_path.read_text())
-    assert fresh["dataset_version"] == "1.1.0"
+    assert fresh["dataset_version"] == "fixture-1"
 
 
-def test_reanchor_mode_requires_pre_existing_anchor(tmp_path) -> None:
+def test_reanchor_mode_requires_pre_existing_anchor(tmp_path, monkeypatch) -> None:
     """Explicit re-anchor is a review operation: it needs an anchor to replace."""
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    result = run_bench(bench_root, "re-anchor")
+    result = run_plugin_bench(bench_root, "re-anchor")
     assert result.returncode == 1, result.stdout + result.stderr
     assert "missing pre-existing anchor" in result.stdout
-    assert not (bench_root / "should_decompose" / "baseline.json").exists()
+    assert not (bench_root / "fixture_module" / "baseline.json").exists()
 
 
-def test_gate_honors_cli_metric_delta_override(tmp_path) -> None:
+def test_gate_honors_cli_metric_delta_override(tmp_path, monkeypatch) -> None:
     """--bench-metric-delta must override the anchor thresholds on a gate run."""
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    report = run_bench(bench_root, "report")
+    report = run_plugin_bench(bench_root, "report")
     assert report.returncode == 0, report.stdout + report.stderr
 
-    (tmp_path / "drift_2pct.py").write_text(
-        "import cambium.bench as _bench\n"
-        "\n"
-        "def _fake(module, scored):\n"
-        "    return {'mean': 0.98, 'std': 0.0, 'count': len(scored)}\n"
-        "\n"
-        "_bench.score_examples = _fake\n"
+    monkeypatch.setattr(
+        bench,
+        "score_examples",
+        lambda _module, scored: {"mean": 0.98, "std": 0.0, "count": len(scored)},
     )
-    fail = run_bench(
-        bench_root,
-        "gate",
-        "-p",
-        "drift_2pct",
-        "--bench-metric-delta",
-        "0.01",
-        env={"PYTHONPATH": str(tmp_path)},
-    )
+    fail = run_plugin_bench(bench_root, "gate", "--bench-metric-delta=0.01")
     assert fail.returncode == 1, fail.stdout + fail.stderr
     assert "DRIFT metric.train.mean" in fail.stdout  # drop 0.02 > 0.01
 
-    (tmp_path / "drift_half_pct.py").write_text(
-        "import cambium.bench as _bench\n"
-        "\n"
-        "def _fake(module, scored):\n"
-        "    return {'mean': 0.995, 'std': 0.0, 'count': len(scored)}\n"
-        "\n"
-        "_bench.score_examples = _fake\n"
+    monkeypatch.setattr(
+        bench,
+        "score_examples",
+        lambda _module, scored: {"mean": 0.995, "std": 0.0, "count": len(scored)},
     )
-    ok = run_bench(
-        bench_root,
-        "gate",
-        "-p",
-        "drift_half_pct",
-        "--bench-metric-delta",
-        "0.01",
-        env={"PYTHONPATH": str(tmp_path)},
-    )
+    ok = run_plugin_bench(bench_root, "gate", "--bench-metric-delta=0.01")
     assert ok.returncode == 0, ok.stdout + ok.stderr
     assert "DRIFT" not in ok.stdout  # drop 0.005 <= 0.01
 
 
-def test_missing_modules_dir_fails_closed_for_report_and_gate(tmp_path) -> None:
+def test_missing_modules_dir_fails_closed_for_report_and_gate(
+    tmp_path, monkeypatch
+) -> None:
     """A wheel without modules must not let report/gate succeed silently."""
-    bench_root = tmp_path / "baselines"
-    missing = tmp_path / "no-such-modules"
-    (tmp_path / "bench_missing_modules.py").write_text(
-        "import cambium.bench as _bench\n"
-        "from pathlib import Path\n"
-        f"_bench.MODULES_DIR = Path({str(missing)!r})\n"
-    )
-    env = {"PYTHONPATH": str(tmp_path)}
+    import cambium.bench as bench
 
-    report = run_bench(bench_root, "report", "-p", "bench_missing_modules", env=env)
+    missing = tmp_path / "no-such-modules"
+    monkeypatch.setattr(bench, "MODULES_DIR", missing)
+    bench_root = tmp_path / "baselines"
+
+    report = run_plugin_bench(bench_root, "report")
     assert report.returncode == 1, report.stdout + report.stderr
     assert "no modules discovered" in report.stdout + report.stderr
     assert not (bench_root / "should_decompose" / "baseline.json").exists()
 
-    gate = run_bench(bench_root, "gate", "-p", "bench_missing_modules", env=env)
+    gate = run_plugin_bench(bench_root, "gate")
     assert gate.returncode == 1, gate.stdout + gate.stderr
     assert "no modules discovered" in gate.stdout + gate.stderr
 
@@ -1014,9 +1087,13 @@ def test_standalone_cli_empty_modules_dir_fails_closed(tmp_path, monkeypatch, ca
 
 
 @REQUIRES_EXAMPLE
-def test_cli_report_protects_committed_baseline(tmp_path) -> None:
+def test_cli_report_protects_committed_baseline(tmp_path, monkeypatch) -> None:
     """CLI report without --bench-root writes to .cambium/, never the
     committed baseline, and leaves the tree clean."""
+    import cambium.bench as bench
+
+    monkeypatch.setattr(bench, "run_module_cli", _inprocess_module_cli)
+    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
     committed = (
         REPO_ROOT
         / "src"
@@ -1036,14 +1113,7 @@ def test_cli_report_protects_committed_baseline(tmp_path) -> None:
         timeout=60,
     ).stdout
 
-    result = subprocess.run(
-        [sys.executable, "-m", "cambium.bench", "report"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert bench.main(["report"]) == 0
 
     assert committed.read_bytes() == before  # committed baseline untouched
     runtime = (
@@ -1062,41 +1132,30 @@ def test_cli_report_protects_committed_baseline(tmp_path) -> None:
     assert status_after == status_before, status_after  # only gitignored writes
 
 
-@REQUIRES_EXAMPLE
-def test_cli_full_drift_report_writes_artifact(tmp_path) -> None:
+def test_cli_full_drift_report_writes_artifact(tmp_path, monkeypatch) -> None:
     """``report --full --drift-report`` writes a drift artifact to the root."""
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "cambium.bench",
-            "report",
-            "--full",
-            "--drift-report",
-            "--bench-root",
-            str(bench_root),
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert (bench_root / "should_decompose" / "baseline.json").is_file()
+    assert bench.main(
+        ["report", "--full", "--drift-report", "--bench-root", str(bench_root)]
+    ) == 0
+    assert (bench_root / "fixture_module" / "baseline.json").is_file()
     artifact = json.loads((bench_root / "drift-report.json").read_text())
     assert artifact["full"] is True
     assert artifact["mode"] == "report"
-    assert "should_decompose" in artifact["modules"]
-    assert artifact["modules"]["should_decompose"]["dataset_version"] == "1.1.0"
+    assert "fixture_module" in artifact["modules"]
+    assert artifact["modules"]["fixture_module"]["dataset_version"] == "fixture-1"
 
 
-@REQUIRES_EXAMPLE
 def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> None:
     """``gate --drift-report`` still fails on drift and records it."""
     import cambium.bench as bench
 
-    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
     monkeypatch.setattr(
@@ -1107,11 +1166,10 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
     artifact = json.loads((bench_root / "drift-report.json").read_text())
     assert os.stat(bench_root / "drift-report.json").st_mode & 0o077 == 0
-    regressions = artifact["modules"]["should_decompose"]["regressions"]
+    regressions = artifact["modules"]["fixture_module"]["regressions"]
     assert any(field == "metric.train.mean" for field, _detail in regressions)
 
 
-@REQUIRES_EXAMPLE
 def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1120,10 +1178,11 @@ def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     artifact write fails the run instead of clobbering the anchor."""
     import cambium.bench as bench
 
-    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
-    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_path = bench_root / "fixture_module" / "baseline.json"
     anchor_before = anchor_path.read_bytes()
     artifact = bench_root / "drift-report.json"
     artifact.symlink_to(anchor_path)
@@ -1136,7 +1195,6 @@ def test_cli_gate_drift_report_refuses_symlinked_artifact_and_preserves_anchor(
     assert artifact.is_symlink()  # artifact never materialized over the link
 
 
-@REQUIRES_EXAMPLE
 def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1145,10 +1203,11 @@ def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
     preserving the anchor, and the run fails."""
     import cambium.bench as bench
 
-    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
-    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_path = bench_root / "fixture_module" / "baseline.json"
     anchor_before = anchor_path.read_bytes()
     anchor_ino = anchor_path.stat().st_ino
     artifact = bench_root / "drift-report.json"
@@ -1165,7 +1224,6 @@ def test_cli_gate_drift_report_refuses_hardlinked_artifact_and_preserves_anchor(
     assert anchor_path.stat().st_nlink == 2  # hard link never unlinked
 
 
-@REQUIRES_EXAMPLE
 def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1173,22 +1231,23 @@ def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     change fails the gate and preserves the anchor; ``re-anchor`` records it."""
     import cambium.bench as bench
 
-    monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: dict(FAKE_TIMINGS))
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
-    anchor_path = bench_root / "should_decompose" / "baseline.json"
+    anchor_path = bench_root / "fixture_module" / "baseline.json"
     anchor = json.loads(anchor_path.read_text())
-    assert anchor["dataset_version"] == "1.1.0"
-    anchor["dataset_version"] = "1.0.0"  # simulate a pre-bump anchor
+    assert anchor["dataset_version"] == "fixture-1"
+    anchor["dataset_version"] = "0.0.0"  # simulate a pre-bump anchor
     anchor_path.write_text(json.dumps(anchor))
 
     assert bench.main(["gate", "--bench-root", str(bench_root)]) == 1
     out = capsys.readouterr().out
-    assert "DRIFT should_decompose: dataset_version" in out
+    assert "DRIFT fixture_module: dataset_version" in out
     fresh = json.loads(anchor_path.read_text())
-    assert fresh["dataset_version"] == "1.0.0"  # old anchor preserved
+    assert fresh["dataset_version"] == "0.0.0"  # old anchor preserved
 
     assert bench.main(["re-anchor", "--bench-root", str(bench_root)]) == 0
-    assert "re-anchored should_decompose: 1.0.0 -> 1.1.0" in capsys.readouterr().out
+    assert "re-anchored fixture_module: 0.0.0 -> fixture-1" in capsys.readouterr().out
     fresh = json.loads(anchor_path.read_text())
-    assert fresh["dataset_version"] == "1.1.0"
+    assert fresh["dataset_version"] == "fixture-1"
