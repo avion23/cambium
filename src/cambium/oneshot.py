@@ -1,28 +1,27 @@
-"""One-shot execution boundary: a direct prompt run through the supervisor.
+"""The one-prompt boundary for the user-facing Cambium CLI.
 
-Turns one user prompt plus a target repository into a supervised one-task
-plan.  ``run_oneshot`` resolves the repository and session root, runs
-:func:`preflight`, builds the plan with :func:`build_plan`, and delegates
-execution to the existing ``cambium.supervisor.run_plan``.  Session state,
-worker supervision, gating, and ref-only publication therefore follow the
-supervisor contract unchanged; this module supplies only the mapping and the
-edge checks around it.
+This module maps one prompt to the existing supervisor plan contract.  It does
+not run a provider itself and it does not change the parent process
+environment.  Provider credentials loaded from :class:`AuthStore` are passed
+to the supervisor as an in-memory, per-run mapping; the supervisor forwards
+only the selected environment name to the worker process.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from cambium.supervisor import (
-    DEFAULT_WALL_BUDGET_S,
-    EventSink,
-    PlanResult,
-    run_plan,
-)
+from . import supervisor
+from .auth import AuthError, AuthStore, scrub_environment
+from .provider_config import ProviderSelectionError, load_providers, select_provider
+from .session import session_root
+from .supervisor import DEFAULT_WALL_BUDGET_S, EventSink, PlanResult
 
 __all__ = [
     "EventSink",
@@ -37,21 +36,28 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class OneShotConfig:
-    """One direct prompt run against a repository.
+    """Configuration for one direct prompt run.
 
-    ``prompt``, ``repo``, and ``task_id`` are required.  ``session_root``
-    defaults to :func:`default_session_root`; ``worktree_path`` defaults to
-    ``session_root/wt`` and ``branch`` to ``wt-<task_id>``.  The remaining
-    fields map directly onto the supervisor task spec.
+    ``prompt`` and ``repo`` have usable defaults so callers that build a
+    context for the REPL or TUI do not need to invent an internal task id.
+    ``session_root`` is the concrete session directory for an explicit run;
+    when it is ``None``, :func:`run_oneshot` allocates a fresh leaf under the
+    repository's default session root.
+
+    ``provider_env_keys`` and ``fanout_config`` are internal, non-secret plan
+    fields.  Normal callers set ``provider`` and optionally ``model``; the
+    runner resolves those fields against the existing provider configuration.
     """
 
-    prompt: str
-    repo: str | Path
-    task_id: str
+    prompt: str = ""
+    repo: str | Path = "."
     session_root: str | Path | None = None
+    provider: str | None = None
+    model: str | None = None
+    provider_config_path: str | Path | None = None
+    task_id: str | None = None
     worktree_path: str | Path | None = None
     branch: str | None = None
-    gate: str = "true"
     worker: str = "cambium.worker"
     provider_env_keys: tuple[str, ...] = ()
     fanout_config: Mapping[str, Any] | None = None
@@ -61,15 +67,28 @@ class OneShotConfig:
     target_file: str | None = None
     marker: str | None = None
 
+    @property
+    def task(self) -> str:
+        """Return the prompt under the supervisor's task terminology."""
+        return self.prompt
+
+    @property
+    def session_dir(self) -> str | Path | None:
+        """Return the explicit concrete session leaf, when supplied."""
+        return self.session_root
+
 
 def resolve_repo(repo: str | Path) -> Path:
-    """Resolve a repository argument to an absolute filesystem path."""
+    """Resolve a non-empty repository argument to an absolute path."""
+    if not isinstance(repo, (str, Path)) or (isinstance(repo, str) and not repo.strip()):
+        raise ValueError("one-shot repository must be a non-empty path")
     return Path(repo).expanduser().resolve()
 
 
-def default_session_root() -> Path:
-    """Return the default session root for one-shot runs."""
-    return Path.cwd() / "sessions"
+def default_session_root(repo: str | Path | None = None) -> Path:
+    """Return the repository-local root that contains user sessions."""
+    target = resolve_repo("." if repo is None else repo)
+    return session_root(target)
 
 
 def _git_stdout(repo: Path, *args: str) -> str | None:
@@ -77,66 +96,180 @@ def _git_stdout(repo: Path, *args: str) -> str | None:
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
+        env=scrub_environment(),
     )
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
 
 
-def preflight(config: OneShotConfig, repo: Path, session_root: Path) -> None:
-    """Raise ``ValueError`` when the one-shot run cannot start.
-
-    Checks the request (non-empty prompt and task id) and the repository
-    (exists, is a git repository, and has ``refs/heads/main`` to publish
-    onto).  The worktree must stay under the session root, matching the
-    supervisor's plan validation.  Remaining plan validation is delegated to
-    ``run_plan``.
-    """
+def preflight(
+    config: OneShotConfig,
+    repo: Path | None = None,
+    session_dir: Path | None = None,
+) -> None:
+    """Reject a prompt or repository that cannot reach the supervisor."""
     if not isinstance(config.prompt, str) or not config.prompt.strip():
         raise ValueError("one-shot prompt must be a non-empty string")
-    if not isinstance(config.task_id, str) or not config.task_id.strip():
+    if config.task_id is not None and (
+        not isinstance(config.task_id, str) or not config.task_id.strip()
+    ):
         raise ValueError("one-shot task_id must be a non-empty string")
-    if not repo.exists():
-        raise ValueError(f"one-shot repository does not exist: {repo}")
-    if not repo.is_dir():
-        raise ValueError(f"one-shot repository is not a directory: {repo}")
-    if not (repo / ".git").exists():
-        raise ValueError(f"one-shot repository is not a git repository: {repo}")
-    if _git_stdout(repo, "rev-parse", "--verify", "refs/heads/main") is None:
-        raise ValueError(f"one-shot repository has no refs/heads/main: {repo}")
+
+    target_repo = resolve_repo(config.repo) if repo is None else Path(repo).resolve()
+    if not target_repo.exists():
+        raise ValueError(f"one-shot repository does not exist: {target_repo}")
+    if not target_repo.is_dir():
+        raise ValueError(f"one-shot repository is not a directory: {target_repo}")
+    if not (target_repo / ".git").exists():
+        raise ValueError(f"one-shot repository is not a git repository: {target_repo}")
+    if _git_stdout(target_repo, "rev-parse", "--verify", "refs/heads/main") is None:
+        raise ValueError(f"one-shot repository has no refs/heads/main: {target_repo}")
+
+    if session_dir is None:
+        return
+    session_path = Path(session_dir).expanduser().resolve()
     worktree = (
         Path(config.worktree_path).expanduser().resolve()
         if config.worktree_path is not None
-        else Path(session_root).resolve() / "wt"
+        else session_path / "wt"
     )
-    if not worktree.is_relative_to(Path(session_root).resolve()):
+    if not worktree.is_relative_to(session_path):
         raise ValueError(
-            f"one-shot worktree_path must stay under the session root: {worktree}"
+            f"one-shot worktree_path must stay under the session directory: {worktree}"
         )
 
 
-def build_plan(
-    config: OneShotConfig, repo: Path, session_root: Path
-) -> dict[str, Any]:
-    """Map one one-shot config to the supervisor's one-task plan.
+def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
+    if config.provider_config_path is not None:
+        path = Path(config.provider_config_path).expanduser()
+    else:
+        configured = os.environ.get("CAMBIUM_PROVIDERS")
+        path = (
+            Path(configured).expanduser()
+            if configured
+            else repo / ".cambium" / "providers.json"
+        )
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
 
-    Pure mapping: no filesystem access.  ``worktree_path`` defaults to
-    ``session_root/wt`` and ``branch`` to ``wt-<task_id>``; the supervisor
-    resolves and validates the resulting paths inside ``run_plan``.
-    """
-    worktree = (
-        Path(config.worktree_path)
-        if config.worktree_path is not None
-        else Path(session_root) / "wt"
+
+def _stored_provider_environment(env_name: str) -> dict[str, str]:
+    """Return one selected credential without changing ``os.environ``."""
+    if os.environ.get(env_name):
+        return {}
+    try:
+        launch_environment = AuthStore().launch_environment(base={})
+    except AuthError as exc:
+        raise ValueError("provider credential is unavailable") from exc
+    value = launch_environment.get(env_name)
+    if not value:
+        raise ValueError("provider credential is not configured")
+    return {env_name: value}
+
+
+def _resolve_provider(
+    config: OneShotConfig, repo: Path
+) -> tuple[OneShotConfig, dict[str, str]]:
+    """Resolve one configured provider and prepare a non-global credential handoff."""
+    provider_mode = (
+        config.provider is not None
+        or config.model is not None
+        or config.fanout_config is not None
     )
-    branch = config.branch if config.branch is not None else f"wt-{config.task_id}"
+    if not provider_mode:
+        return config, {}
+
+    if (
+        config.fanout_config is not None
+        and config.provider is None
+        and not config.provider_env_keys
+    ):
+        raise ValueError("provider mode requires a selected provider")
+
+    if config.provider is None and config.provider_env_keys:
+        environment: dict[str, str] = {}
+        for env_name in config.provider_env_keys:
+            environment.update(_stored_provider_environment(env_name))
+        return config, environment
+
+    config_path = _provider_config_path(config, repo)
+    try:
+        providers = load_providers(config_path)
+        if config.provider is None and config.model is not None:
+            matching = [
+                candidate
+                for candidate in providers
+                if candidate.enabled and candidate.model == config.model
+            ]
+            selected = select_provider(matching)
+        else:
+            selected = select_provider(providers, name=config.provider)
+    except (OSError, ProviderSelectionError, ValueError) as exc:
+        raise ValueError(f"provider selection failed: {exc}") from exc
+
+    effective_model = config.model if config.model is not None else selected.model
+    if not isinstance(effective_model, str) or not effective_model:
+        raise ValueError(f"provider {selected.name!r} has no configured model")
+    if selected.model != effective_model:
+        raise ValueError(
+            f"model {effective_model!r} is not configured for provider {selected.name!r}"
+        )
+
+    fanout_config = dict(config.fanout_config or {})
+    fanout_config["tier"] = selected.tier.value
+    fanout_config["model"] = effective_model
+    resolved = replace(
+        config,
+        provider=selected.name,
+        model=effective_model,
+        provider_config_path=config_path,
+        provider_env_keys=(selected.api_key_env,),
+        fanout_config=fanout_config,
+    )
+    return resolved, _stored_provider_environment(selected.api_key_env)
+
+
+def _allocate_session_dir(repo: Path) -> Path:
+    root = default_session_root(repo)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return Path(tempfile.mkdtemp(prefix="run-", dir=root))
+
+
+def build_plan(
+    config: OneShotConfig,
+    repo: Path | None = None,
+    session_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Map one resolved config to the supervisor's one-task plan."""
+    target_repo = resolve_repo(config.repo) if repo is None else Path(repo).resolve()
+    target_session = (
+        Path(session_dir).expanduser().resolve()
+        if session_dir is not None
+        else (
+            Path(config.session_root).expanduser().resolve()
+            if config.session_root is not None
+            else default_session_root(target_repo)
+        )
+    )
+    task_id = config.task_id or "oneshot"
+    worktree = (
+        Path(config.worktree_path).expanduser().resolve()
+        if config.worktree_path is not None
+        else target_session / "wt"
+    )
+    branch = config.branch or f"cambium-{task_id}"
     spec: dict[str, Any] = {
-        "task_id": config.task_id,
+        "task_id": task_id,
         "task": config.prompt,
-        "repo": str(repo),
+        "repo": str(target_repo),
         "worktree_path": str(worktree),
         "branch": branch,
-        "gate": config.gate,
         "worker": config.worker,
         "provider_env_keys": list(config.provider_env_keys),
         "max_wall_s": config.max_wall_s,
@@ -144,6 +277,8 @@ def build_plan(
     }
     if config.fanout_config is not None:
         spec["fanout_config"] = dict(config.fanout_config)
+    if config.provider_config_path is not None and config.fanout_config is not None:
+        spec["provider_config_path"] = str(Path(config.provider_config_path).resolve())
     if config.base_commit is not None:
         spec["base_commit"] = config.base_commit
     if config.target_file is not None:
@@ -156,13 +291,22 @@ def build_plan(
 async def run_oneshot(
     config: OneShotConfig, on_event: EventSink | None = None
 ) -> PlanResult:
-    """Resolve, preflight, and execute one direct prompt against a repository."""
+    """Run one prompt through exactly one supervisor plan."""
     repo = resolve_repo(config.repo)
-    session_root = (
-        Path(config.session_root).expanduser().resolve()
-        if config.session_root is not None
-        else default_session_root()
+    preflight(config, repo)
+    resolved, provider_environment = _resolve_provider(config, repo)
+    session_dir = (
+        Path(resolved.session_root).expanduser().resolve()
+        if resolved.session_root is not None
+        else _allocate_session_dir(repo)
     )
-    preflight(config, repo, session_root)
-    plan = build_plan(config, repo, session_root)
-    return await run_plan(session_root, plan, on_event=on_event)
+    preflight(resolved, repo, session_dir)
+    plan = build_plan(resolved, repo, session_dir)
+    if provider_environment:
+        return await supervisor.run_plan(
+            session_dir,
+            plan,
+            on_event=on_event,
+            provider_environment=provider_environment,
+        )
+    return await supervisor.run_plan(session_dir, plan, on_event=on_event)

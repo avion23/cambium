@@ -342,8 +342,17 @@ def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
     )
 
 
-def _provider_config_path(source: Mapping[str, str]) -> str:
+def _provider_config_path(
+    source: Mapping[str, str], spec: Mapping[str, Any] | None = None
+) -> str:
     """Resolve the absolute provider-config path a provider-mode worker loads."""
+    if spec is not None:
+        configured = spec.get("provider_config_path")
+        if isinstance(configured, str) and configured:
+            path = Path(configured).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            return str(path.resolve())
     configured = source.get("CAMBIUM_PROVIDERS")
     if configured:
         path = Path(configured).expanduser()
@@ -355,10 +364,17 @@ def _provider_config_path(source: Mapping[str, str]) -> str:
 
 
 def _worker_environment(
-    spec: dict[str, Any], generation: int, *, session_dir: Path | None = None
+    spec: dict[str, Any], generation: int, *, session_dir: Path | None = None,
+    provider_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a strict worker env with authorized provider credentials."""
     source = dict(os.environ)
+    allowed_provider_keys = _provider_env_keys(spec)
+    if provider_environment is not None:
+        for name in allowed_provider_keys:
+            value = provider_environment.get(name)
+            if value is not None:
+                source[name] = value
     overrides = {
         "CAMBIUM_TASK_ID": spec["task_id"],
         "CAMBIUM_GENERATION": str(generation),
@@ -370,12 +386,12 @@ def _worker_environment(
     )
     env = _strip_sensitive_env(
         source,
-        allowed_keys=_provider_env_keys(spec),
+        allowed_keys=allowed_provider_keys,
         worktree=worktree,
         overrides=overrides,
     )
     if spec.get("fanout_config"):
-        env["CAMBIUM_PROVIDERS"] = _provider_config_path(source)
+        env["CAMBIUM_PROVIDERS"] = _provider_config_path(source, spec)
     return env
 
 
@@ -431,7 +447,10 @@ def _strip_sensitive_env(
     )
 
 
-def _session_redactor(specs: list[dict[str, Any]]) -> Redactor:
+def _session_redactor(
+    specs: list[dict[str, Any]],
+    provider_environment: Mapping[str, str] | None = None,
+) -> Redactor:
     """Build one session redactor from every worker-forwardable declared value.
 
     The registry must cover every value ``_worker_environment`` can forward to
@@ -446,7 +465,11 @@ def _session_redactor(specs: list[dict[str, Any]]) -> Redactor:
     whole_values: list[str] = []
     for spec in specs:
         for key in _provider_env_keys(spec):
-            value = os.environ.get(key)
+            value = (
+                provider_environment.get(key)
+                if provider_environment is not None and key in provider_environment
+                else os.environ.get(key)
+            )
             if not isinstance(value, str) or not value:
                 continue
             if _is_secret_shaped(value):
@@ -587,6 +610,7 @@ class _Runtime:
         *,
         redactor: Redactor | None = None,
         resource_thresholds: dict[str, Any] | None = None,
+        provider_environment: Mapping[str, str] | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -594,6 +618,9 @@ class _Runtime:
         self._redactor = redactor
         self._resource_thresholds = (
             None if resource_thresholds is None else dict(resource_thresholds)
+        )
+        self._provider_environment = (
+            None if provider_environment is None else dict(provider_environment)
         )
         self._event_append_lock = asyncio.Lock()
         self._handles: dict[str, WorkerHandle] = {}
@@ -991,7 +1018,15 @@ class _Runtime:
 
     def _worker_env(self, spec: dict[str, Any], generation: int) -> dict[str, str]:
         session_dir = self._session_dir if self is not None else None
-        return _worker_environment(spec, generation, session_dir=session_dir)
+        provider_environment = (
+            self._provider_environment if self is not None else None
+        )
+        return _worker_environment(
+            spec,
+            generation,
+            session_dir=session_dir,
+            provider_environment=provider_environment,
+        )
 
     def _run_payload(
         self, spec: dict[str, Any], run_rid: str, wall_budget: float, generation: int
@@ -1954,6 +1989,7 @@ def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, target)
+        os.chmod(target, 0o600)
         directory_fd = os.open(Path(session_dir), os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -2126,6 +2162,7 @@ async def run_plan(
     on_event: EventSink | None = None,
     *,
     resource_thresholds: dict[str, Any] | None = None,
+    provider_environment: Mapping[str, str] | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -2154,7 +2191,7 @@ async def run_plan(
     try:
         await asyncio.to_thread(_write_plan, session_dir, {"tasks": specs})
         started_at = time.time()
-        redactor = _session_redactor(specs)
+        redactor = _session_redactor(specs, provider_environment)
         store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
         runtime = _Runtime(
             session_dir,
@@ -2162,6 +2199,7 @@ async def run_plan(
             on_event=on_event,
             redactor=redactor,
             resource_thresholds=resource_thresholds,
+            provider_environment=provider_environment,
         )
         await runtime.start()
         cancelled = False

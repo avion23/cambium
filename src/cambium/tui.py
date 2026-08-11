@@ -1,17 +1,11 @@
-"""Line-oriented terminal front end for Cambium one-shot sessions.
-
-``run_tui`` reads prompt lines from ``input_stream``, sends each one together
-with ``config`` to ``cambium.oneshot.run``, and prints the returned response
-via ``cambium.render.text``.  Both backends are imported lazily so importing
-this module allocates no terminal and no provider session.  EOF exits 0,
-Ctrl-C exits 130, a closed output pipe exits 0, and a missing backend exits 1.
-Backend failures are written to ``error_stream`` and the loop continues.
-"""
+"""Line-oriented terminal front end for Cambium one-shot sessions."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
+from dataclasses import replace
 
 _PROMPT = "cambium> "
 _EXIT_EOF = 0
@@ -20,8 +14,12 @@ _EXIT_BROKEN_PIPE = 0
 _EXIT_BACKEND_MISSING = 1
 
 
+def _run(value):
+    return asyncio.run(value) if inspect.isawaitable(value) else value
+
+
 def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None) -> int:
-    """Run the line-oriented one-shot terminal loop and return an exit code."""
+    """Run the line-oriented terminal loop and return an exit code."""
     source = sys.stdin if input_stream is None else input_stream
     out = sys.stdout if output_stream is None else output_stream
     err = sys.stderr if error_stream is None else error_stream
@@ -45,10 +43,9 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
             if not prompt.strip():
                 continue
             try:
-                response = oneshot.run(config, prompt)
-                if asyncio.iscoroutine(response):
-                    response = asyncio.run(response)
-                text = render.text(response)
+                prompt_config = replace(config, prompt=prompt)
+                response = _run(oneshot.run_oneshot(prompt_config))
+                text = render.render_text_result(response)
             except Exception as exc:
                 err.write(f"cambium: {exc}\n")
                 err.flush()
@@ -63,3 +60,6 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
         return _EXIT_INTERRUPT
     except BrokenPipeError:
         return _EXIT_BROKEN_PIPE
+
+
+__all__ = ["run_tui"]

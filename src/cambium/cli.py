@@ -8,12 +8,14 @@ place while providing one installed ``cambium`` command.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import importlib
+import inspect
 import os
+import sqlite3
 import subprocess
 import sys
-from importlib.util import find_spec
 from pathlib import Path
 
 from . import __version__
@@ -29,8 +31,13 @@ from .auth import (
 class _SafeArgumentParser(argparse.ArgumentParser):
     """Do not echo arbitrary rejected tokens, which may be credentials."""
 
+    def parse_known_args(self, args=None, namespace=None):
+        if args is not None and "--" in args and self.prog.endswith(" run"):
+            self.error("invalid command arguments")
+        return super().parse_known_args(args, namespace)
+
     def error(self, message: str) -> None:
-        if "unrecognized arguments" in message:
+        if "unrecognized arguments" in message or "invalid choice" in message:
             message = "invalid command arguments"
         super().error(message)
 
@@ -78,6 +85,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--repo",
         metavar="PATH",
+        default=".",
         help="repository to work in (default: current directory)",
     )
     parser.add_argument("--session-dir", metavar="DIR", help="session directory")
@@ -412,18 +420,46 @@ def _import_or_fail(module_name: str, command: str):
         raise
 
 
-def _oneshot_installed() -> bool:
-    return find_spec("cambium.oneshot") is not None
-
-
 def _looks_like_prompt(first: str) -> bool:
     return bool(first) and not first.startswith("-") and first not in _COMMAND_NAMES
 
 
+def _bare_prompt_allowed(command_line: list[str]) -> bool:
+    """Allow natural-language bare prompts without hiding command typos.
+
+    A single shell token without whitespace is treated as a command and is
+    parsed by the root parser.  A quoted sentence, or multiple bare words,
+    uses the prompt path.  Known commands and leading options are always
+    preserved by :func:`main`.
+    """
+    if not command_line or not _looks_like_prompt(command_line[0]):
+        return False
+    if any(char.isspace() for char in command_line[0]):
+        return True
+    return sum(not token.startswith("-") for token in command_line[:2]) > 1
+
+
+def _prompt_text(value: str | list[str]) -> str:
+    if isinstance(value, str):
+        return value
+    return " ".join(value)
+
+
 def _run_bare_prompt(command_line: list[str]) -> int:
-    parser = _SafeArgumentParser(prog="cambium")
+    parser = _SafeArgumentParser(prog="cambium run")
     _add_run_arguments(parser)
-    return _run_oneshot(parser.parse_args(command_line))
+    prompt_words: list[str] = []
+    remainder: list[str] = []
+    index = 0
+    while index < len(command_line):
+        token = command_line[index]
+        if token.startswith("--"):
+            remainder.extend(command_line[index:])
+            break
+        prompt_words.append(token)
+        index += 1
+    normalized = [" ".join(prompt_words), *remainder]
+    return _run_oneshot(parser.parse_args(normalized))
 
 
 def _run_oneshot(args: argparse.Namespace) -> int:
@@ -434,54 +470,91 @@ def _run_oneshot(args: argparse.Namespace) -> int:
     if render is None:
         return 1
     config = oneshot.OneShotConfig(
-        prompt=args.prompt,
+        prompt=_prompt_text(args.prompt),
         repo=args.repo,
-        session_dir=args.session_dir,
+        session_root=args.session_dir,
         provider=args.provider,
         model=args.model,
     )
-    result = oneshot.run_oneshot(config)
+    try:
+        value = oneshot.run_oneshot(config)
+        result = asyncio.run(value) if inspect.isawaitable(value) else value
+    except KeyboardInterrupt:
+        return 130
+    except (AuthError, OSError, ValueError) as exc:
+        print(f"cambium run: {exc}", file=sys.stderr)
+        return 2
     if args.json:
         print(render.render_json_result(result))
     else:
         print(render.render_text_result(result))
-    return getattr(result, "exit_code", 0)
+    exit_code = getattr(result, "exit_code", 1)
+    return exit_code if type(exit_code) is int else 1
 
 
 def _run_repl(args: argparse.Namespace) -> int:
     repl = _import_or_fail("cambium.repl", "repl")
     if repl is None:
         return 1
-    return repl.run_repl(
+    from . import oneshot
+
+    config = oneshot.OneShotConfig(
         repo=args.repo,
-        session_dir=args.session_dir,
+        session_root=args.session_dir,
         provider=args.provider,
         model=args.model,
     )
+    return repl.run_repl(config)
 
 
 def _run_tui(args: argparse.Namespace) -> int:
     tui = _import_or_fail("cambium.tui", "tui")
     if tui is None:
         return 1
-    return tui.run_tui(
+    from . import oneshot
+
+    config = oneshot.OneShotConfig(
         repo=args.repo,
-        session_dir=args.session_dir,
+        session_root=args.session_dir,
         provider=args.provider,
         model=args.model,
     )
+    return tui.run_tui(config)
 
 
 def _run_session(args: argparse.Namespace) -> int:
     session = _import_or_fail("cambium.session", "session")
     if session is None:
         return 1
+    render = _import_or_fail("cambium.render", "session")
+    if render is None:
+        return 1
+    root = (
+        Path(args.session_dir).expanduser().resolve()
+        if args.session_dir is not None
+        else session.session_root(Path.cwd())
+    )
     if args.session_command == "list":
-        return session.list_sessions(session_dir=args.session_dir)
+        for path in session.list_sessions(root):
+            print(path)
+        return 0
     if args.session_command == "latest":
-        return session.latest_session(session_dir=args.session_dir)
+        path = session.latest_session(root)
+        if path is None:
+            print(f"cambium session: no completed sessions under {root}", file=sys.stderr)
+            return 1
+        print(path)
+        return 0
     if args.session_command == "show":
-        return session.show_session(args.session_id, session_dir=args.session_dir)
+        candidate = Path(args.session_id).expanduser()
+        path = candidate if candidate.is_absolute() else root / candidate
+        try:
+            view = session.show_session(path)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            print(f"cambium session: {exc}", file=sys.stderr)
+            return 1
+        print(render.render_json_result(view.result))
+        return 0
     raise AssertionError(f"unhandled session command: {args.session_command!r}")
 
 
@@ -493,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return tasktree.main(command_line[1:])
 
-    if command_line and _looks_like_prompt(command_line[0]) and _oneshot_installed():
+    if _bare_prompt_allowed(command_line):
         return _run_bare_prompt(command_line)
 
     args = _build_parser().parse_args(command_line)
