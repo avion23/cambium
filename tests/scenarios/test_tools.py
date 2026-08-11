@@ -11,6 +11,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from cambium import tools
 from cambium.tools import (
     MAX_OUTPUT_BYTES,
@@ -58,6 +60,7 @@ def _batch_context(tmp_path: Path, events: list[dict] | None = None) -> ToolCont
     )
 
 
+@pytest.mark.slow  # 3x100ms scripted reads; asserts elapsed < 0.2 (load-sensitive)
 def test_read_batch_runs_three_100ms_reads_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -206,6 +209,7 @@ def test_read_batch_missing_middle_file_is_per_call_failure(tmp_path: Path) -> N
     assert [event["ok"] for event in events] == [True, False, True]
 
 
+@pytest.mark.slow  # 8x50ms scripted reads; concurrency measured via timing
 def test_read_batch_concurrency_is_bounded(tmp_path: Path, monkeypatch) -> None:
     for index in range(8):
         (tmp_path / f"f{index}.txt").write_text("x", encoding="utf-8")
@@ -309,6 +313,7 @@ def test_edit_file_requires_exactly_one_occurrence(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == "two\n"
 
 
+@pytest.mark.slow  # python interpreter spawn (fake rg); asserts subprocess argv
 def test_grep_code_uses_list_form_rg(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "sample.py").write_text("needle\n", encoding="utf-8")
     fake_rg = tmp_path / "rg"
@@ -476,6 +481,7 @@ def test_get_signature_rejects_oversized_source(tmp_path: Path) -> None:
     assert "MAX_READ_BYTES" in (result.error or "")
 
 
+@pytest.mark.slow  # 100ms scripted parse; proves the dispatcher yields via timing
 def test_get_signature_read_and_parse_do_not_block_dispatcher(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -507,6 +513,7 @@ def test_get_signature_read_and_parse_do_not_block_dispatcher(
     assert result.ok
 
 
+@pytest.mark.slow  # 2s blocked-read wait behind a 1s tool timeout; timing assertion
 def test_get_signature_timeout_does_not_wait_for_blocked_read(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -596,6 +603,7 @@ def test_get_signature_rejects_fifo_replaced_after_validation(
     assert "not a regular file" in (result.error or "")
 
 
+@pytest.mark.slow  # real git subprocess via the git_op tool
 def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
 
@@ -609,6 +617,7 @@ def test_git_op_runs_allowlisted_status(tmp_path: Path) -> None:
     assert result.error is None
 
 
+@pytest.mark.slow  # python interpreter spawn; asserts subprocess execution
 def test_run_shell_is_list_form(tmp_path: Path) -> None:
     command = [sys.executable, "-c", "print('shell-ok')"]
     result = _run("run_shell", {"cmd": command}, ToolContext(tmp_path))
@@ -616,6 +625,7 @@ def test_run_shell_is_list_form(tmp_path: Path) -> None:
     assert result.output == "shell-ok\n"
 
 
+@pytest.mark.slow  # python interpreter spawn; asserts subprocess execution
 def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     command = [sys.executable, "-c", "print('x' * 100000)"]
     result = _run("run_shell", {"cmd": command}, ToolContext(tmp_path))
@@ -625,6 +635,7 @@ def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     assert len(result.output.encode()) <= MAX_OUTPUT_BYTES
 
 
+@pytest.mark.slow  # python interpreter spawn; asserts subprocess execution
 def test_tool_subprocesses_do_not_inherit_provider_credentials(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -641,6 +652,7 @@ def test_tool_subprocesses_do_not_inherit_provider_credentials(
     assert result.output == "False\n"
 
 
+@pytest.mark.slow  # python linter subprocess; asserts subprocess env boundary
 def test_tool_lint_result_does_not_contain_provider_key(tmp_path: Path, monkeypatch) -> None:
     """A linter that echoes its environment proves the tool result carries no
     provider credential (regression: the linter subprocess inherited os.environ)."""

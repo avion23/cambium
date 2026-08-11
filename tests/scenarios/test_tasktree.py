@@ -74,6 +74,7 @@ def _run_unified_cli(payload: str = "", *args: str) -> subprocess.CompletedProce
     )
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_prints_topological_order_json_lines() -> None:
     plan = _plan([
         ("r", "FEATURE", []),
@@ -86,6 +87,7 @@ def test_cli_prints_topological_order_json_lines() -> None:
     assert result.stderr == ""
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_reads_plan_from_json_file(tmp_path: Path) -> None:
     plan = _plan([
         ("r", "FEATURE", []),
@@ -101,6 +103,7 @@ def test_cli_reads_plan_from_json_file(tmp_path: Path) -> None:
     assert result.stderr == ""
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_explicit_dash_reads_plan_from_stdin() -> None:
     plan = _plan([
         ("r", "FEATURE", []),
@@ -114,6 +117,7 @@ def test_cli_explicit_dash_reads_plan_from_stdin() -> None:
     assert result.stderr == ""
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_explicit_dash_rejects_invalid_json_from_stdin() -> None:
     result = _run_cli("{", "-")
 
@@ -122,6 +126,7 @@ def test_cli_explicit_dash_rejects_invalid_json_from_stdin() -> None:
     assert "tasktree: invalid JSON in stdin" in result.stderr
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_no_args_prints_help_for_empty_stdin() -> None:
     result = _run_cli()
 
@@ -131,6 +136,7 @@ def test_cli_no_args_prints_help_for_empty_stdin() -> None:
     assert result.stderr == ""
 
 
+@pytest.mark.slow  # real python -m subprocess on a pty; process-boundary assertions
 def test_cli_no_args_prints_help_without_waiting_on_tty() -> None:
     master_fd, slave_fd = pty.openpty()
     try:
@@ -167,6 +173,7 @@ def test_cli_no_args_prints_help_without_waiting_on_tty() -> None:
     assert stderr == ""
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_entry_points_share_help_and_extra_argument_errors() -> None:
     module_help = _run_cli("", "--help")
     unified_help = _run_unified_cli("", "--help")
@@ -184,6 +191,7 @@ def test_cli_entry_points_share_help_and_extra_argument_errors() -> None:
     assert "TOP_SECRET_123" not in unified_extra.stderr
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_rejects_invalid_json_from_stdin() -> None:
     result = _run_cli("{")
 
@@ -192,6 +200,7 @@ def test_cli_rejects_invalid_json_from_stdin() -> None:
     assert "tasktree: invalid JSON in stdin" in result.stderr
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_bad_plan_argument_exits_two_with_stderr(tmp_path: Path) -> None:
     missing = tmp_path / "missing-plan.json"
 
@@ -204,6 +213,7 @@ def test_cli_bad_plan_argument_exits_two_with_stderr(tmp_path: Path) -> None:
     assert str(missing) in result.stderr
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_cyclic_plan_exits_one_with_stderr() -> None:
     plan = _plan([
         ("r", "FEATURE", []),
@@ -217,6 +227,7 @@ def test_cli_cyclic_plan_exits_one_with_stderr() -> None:
     assert result.stdout == ""
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 @pytest.mark.parametrize(
     "runner",
     [_run_cli, _run_unified_cli],

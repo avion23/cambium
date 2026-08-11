@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from cambium.supervisor import read_events
 from cambium.tasktree import build_tree, topological_order
 
@@ -87,6 +89,7 @@ def _protocol(events: list[dict], task_id: str) -> list[str]:
     ]
 
 
+@pytest.mark.slow  # supervisor subprocess + 3 worker subprocesses + real merges
 def test_tasktree_plan_runs_supervisor_subprocess_to_three_merges(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -185,6 +188,7 @@ def test_tasktree_plan_runs_supervisor_subprocess_to_three_merges(tmp_path) -> N
     assert events[-1]["kind"] == "session_ended"
 
 
+@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_tasktree_cli_rejects_cycle_before_supervisor(tmp_path) -> None:
     cyclic_plan = {
         "tasks": [

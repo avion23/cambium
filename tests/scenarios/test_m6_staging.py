@@ -119,7 +119,11 @@ class _FakeOpenAIServer:
 
     def __init__(self) -> None:
         self._httpd = HTTPServer(("127.0.0.1", 0), _FakeOpenAIHandler)
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            kwargs={"poll_interval": 0.005},
+            daemon=True,
+        )
         self._thread.start()
 
     @property
@@ -240,6 +244,7 @@ def _isolate_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("no_proxy", _LOOPBACK_NO_PROXY)
 
 
+@pytest.mark.slow  # real git + worker subprocess + sequencer publish
 def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) -> None:
     """Run two uncached provider calls, then publish the second decision once."""
     _reset_fake_server()

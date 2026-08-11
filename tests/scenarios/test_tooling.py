@@ -16,6 +16,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.slow  # every scenario drives python -m cambium.doctor
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = str(REPO_ROOT / "src")
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]

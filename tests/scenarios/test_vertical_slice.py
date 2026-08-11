@@ -18,9 +18,13 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import cambium.supervisor as supervisor_module
 from cambium.results import ROOT_RESULT_KEYS
 from cambium.supervisor import read_events, run_session
+
+pytestmark = pytest.mark.slow  # real worker subprocess spawn + real git merge
 
 WORKER = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
 MARKER = "// cambium-slice"
