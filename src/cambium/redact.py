@@ -940,6 +940,7 @@ class _StructuredContext(Enum):
 
 class _FieldRole(Enum):
     NORMAL = "normal"
+    STRUCTURAL = "structural"
     COOKIE_VALUE = "cookie_value"
     COOKIE_ATTRIBUTE = "cookie_attribute"
 
@@ -949,6 +950,35 @@ class _TuplePlaceholder:
 
     def __init__(self) -> None:
         self.value: tuple[Any, ...] | None = None
+
+
+_STRUCTURAL_FIELD_NAMES = frozenset(
+    {
+        "child",
+        "child_id",
+        "child_kind",
+        "child_task_id",
+        "event_id",
+        "generation",
+        "kind",
+        "parent",
+        "parent_id",
+        "parent_task_id",
+        "proto",
+        "request_id",
+        "schema_version",
+        "session_status",
+        "status",
+        "task_id",
+        "timeout_phase",
+        "type",
+        "worker_id",
+    }
+)
+
+
+def _is_structural_field(name: str) -> bool:
+    return _normalise_name(name) in _STRUCTURAL_FIELD_NAMES
 
 
 _MISSING = object()
@@ -1022,20 +1052,29 @@ def _child_context(key: object, value: object, context: _StructuredContext) -> _
 
 
 def _child_role(key: object, value: object, context: _StructuredContext) -> _FieldRole:
-    if context is not _StructuredContext.COOKIES or not isinstance(key, str):
-        return _FieldRole.NORMAL
-    if _cookie_name_is_attribute(key):
-        return _FieldRole.COOKIE_ATTRIBUTE
-    if _cookie_context_value_key(key, value):
-        return _FieldRole.COOKIE_VALUE
+    if context is _StructuredContext.COOKIES and isinstance(key, str):
+        if _cookie_name_is_attribute(key):
+            return _FieldRole.COOKIE_ATTRIBUTE
+        if _cookie_context_value_key(key, value):
+            return _FieldRole.COOKIE_VALUE
+    if (
+        context is _StructuredContext.NORMAL
+        and isinstance(key, str)
+        and _is_structural_field(key)
+    ):
+        return _FieldRole.STRUCTURAL
     return _FieldRole.NORMAL
 
 
-def _redact_mapping_key(key: object, redactor: Redactor) -> object:
+def _redact_mapping_key(
+    key: object, redactor: Redactor, context: _StructuredContext
+) -> object:
     if not isinstance(key, str):
         return key
     if is_secret_name(key):
         return redactor.replacement
+    if context is _StructuredContext.NORMAL and _is_structural_field(key):
+        return redactor._redact_structural(key)
     return redactor.redact(key)
 
 
@@ -1055,6 +1094,8 @@ def _clone_structured(
     if isinstance(node, str):
         if context is _StructuredContext.COOKIES and role is not _FieldRole.COOKIE_ATTRIBUTE:
             result_string = redactor.replacement
+        elif role is _FieldRole.STRUCTURAL:
+            result_string = redactor._redact_structural(node)
         else:
             result_string = redactor.redact(node)
         _memoise(state, node, context, role, result_string)
@@ -1065,7 +1106,7 @@ def _clone_structured(
         _memoise(state, node, context, role, result)
         for key, value in node.items():
             key_name = key if isinstance(key, str) else None
-            result_key = _redact_mapping_key(key, redactor)
+            result_key = _redact_mapping_key(key, redactor, context)
             cookie_value = context is _StructuredContext.COOKIES and _cookie_context_value_key(
                 key, value
             )
@@ -1170,7 +1211,9 @@ class Redactor:
     values that is applied additively as unbounded substrings before the
     configured pattern behavior; ``whole_values`` is an immutable set of exact
     values that is replaced only when a whole string equals one of them, so a
-    prose-like credential never corrupts a larger benign diagnostic.
+    prose-like credential never corrupts a larger benign diagnostic. Structured
+    protocol fields use the configured patterns without the registered exact
+    value pass so schema identifiers cannot be corrupted.
     ``replacement`` is inserted literally, even when it contains backslashes
     or digits.
     """
@@ -1225,6 +1268,12 @@ class Redactor:
         for pattern in self._patterns:
             text = _replacement_sub(pattern, text, self.replacement)
         return text
+
+    def _redact_structural(self, text: str) -> str:
+        """Apply configured patterns without matching registered exact values."""
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        return self._redact_patterns(text)
 
     def redact(self, text: str) -> str:
         """Redact secrets and email addresses from *text*.
@@ -1302,10 +1351,11 @@ def build_session_redactor(
     A session builds a single instance here and hands it to its EventStore so
     persisted event records redact the same exact values.
 
-    ``secret_values`` are registered for substring redaction (compact machine
-    tokens, wherever they appear); ``whole_values`` are replaced only when a
-    whole string equals one of them, so prose-like declared values never
-    corrupt a larger benign diagnostic.
+    ``secret_values`` are registered for substring redaction in free-text
+    values; structured protocol fields keep their exact values and use only
+    configured patterns. ``whole_values`` are replaced only when a whole
+    string equals one of them, so prose-like declared values never corrupt a
+    larger benign diagnostic.
     """
 
     return Redactor(secret_values=secret_values, whole_values=whole_values)

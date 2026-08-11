@@ -944,7 +944,16 @@ def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) ->
     assert "secret kill-window content" not in payloads
 
 
-def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(tmp_path) -> None:
+def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(
+    tmp_path, monkeypatch
+) -> None:
+    credentials = {
+        "CAMBIUM_TEST_MERGE": "merge",
+        "CAMBIUM_TEST_RESULT": "result",
+        "CAMBIUM_TEST_SUCCEEDED": "succeeded",
+    }
+    for name, value in credentials.items():
+        monkeypatch.setenv(name, value)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
@@ -972,6 +981,7 @@ def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(tmp_pat
                 session_dir, repo, base, task_id, worktree="wt-clean-gap", branch="wt-clean-gap",
                 target_file="a.txt", marker="// must-not-rerun",
                 gate="grep -q '// must-not-rerun' a.txt",
+                provider_env_keys=list(credentials),
             )
         ]
     }

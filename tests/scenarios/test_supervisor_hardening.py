@@ -345,6 +345,42 @@ def test_short_declared_provider_credential_is_rejected_before_worker_or_events(
     assert not (session_dir / ".cambium" / "events.db").exists()
 
 
+def test_registered_protocol_values_preserve_event_kinds_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials = {
+        "CAMBIUM_TEST_MERGE": "merge",
+        "CAMBIUM_TEST_RESULT": "result",
+        "CAMBIUM_TEST_SUCCEEDED": "succeeded",
+    }
+    for name, value in credentials.items():
+        monkeypatch.setenv(name, value)
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"hello.txt": "hello\n"})
+    task = _task(
+        session_dir,
+        repo,
+        base,
+        "t-structured",
+        worker=FAKE_WORKER,
+        gate="grep -q '// t-structured' hello.txt",
+        provider_env_keys=list(credentials),
+        task="merge result succeeded",
+        marker="// t-structured",
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+    events = read_events(session_dir)
+
+    assert result.results[0].status == "succeeded"
+    assert _kinds(events, "result")[0]["payload"]["status"] == "succeeded"
+    assert _kinds(events, "merge_committed")
+    assert events[-1]["kind"] == "session_ended"
+    assigned = _kinds(events, "task_assigned")[0]
+    assert assigned["payload"]["task"] == "*** *** ***"
+
+
 def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -134,6 +134,58 @@ def test_registered_values_are_redacted_in_nested_tool_payloads() -> None:
     }
 
 
+def test_registered_values_skip_protocol_structure_but_redact_free_text() -> None:
+    redactor = Redactor(secret_values={"merge", "result", "succeeded"})
+    payload = {
+        "kind": "merge",
+        "type": "result",
+        "status": "succeeded",
+        "task_id": "task-merge",
+        "worker_id": "worker-result",
+        "request_id": "request-succeeded",
+        "parent_task_id": "parent-merge",
+        "child_task_id": "child-result",
+        "generation": "generation-merge",
+        "schema_version": "schema-result",
+        "session_status": "succeeded",
+        "timeout_phase": "merge",
+        "parent": ["merge", "result"],
+        "summary": "merge result succeeded",
+        "reason": "result merge succeeded",
+        "nested": {"output": "merge result succeeded"},
+        "api_key": "merge",
+        "password": "result",
+    }
+
+    output = redactor.redact_mapping(payload)
+
+    for field in (
+        "kind",
+        "type",
+        "status",
+        "task_id",
+        "worker_id",
+        "request_id",
+        "parent_task_id",
+        "child_task_id",
+        "generation",
+        "schema_version",
+        "session_status",
+        "timeout_phase",
+        "parent",
+    ):
+        assert output[field] == payload[field]
+    assert output["summary"] == "*** *** ***"
+    assert output["reason"] == "*** *** ***"
+    assert output["nested"] == {"output": "*** *** ***"}
+    assert "api_key" not in output
+    assert "password" not in output
+    assert output["***"] == "***"
+
+    contextual = redactor.redact_mapping({"status": "api_key=merge"})
+    assert contextual["status"] == "api_key=***"
+
+
 def test_one_character_secret_does_not_corrupt_unicode_escape_syntax() -> None:
     """A short registered value must not corrupt ``\\uXXXX`` escape syntax.
 
