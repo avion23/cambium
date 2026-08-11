@@ -123,6 +123,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="SECONDS",
         help="per-task wall-clock budget in seconds (default 300)",
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        metavar="N",
+        help="total token budget across the run (default 200000)",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -497,6 +503,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         model=args.model,
         auto=getattr(args, "auto", False),
         max_wall_s=getattr(args, "max_wall_s", None) or oneshot.DEFAULT_WALL_BUDGET_S,
+        max_tokens=getattr(args, "max_tokens", None) or oneshot.DEFAULT_MAX_TOKENS,
     )
     try:
         value = oneshot.run_oneshot(config)
