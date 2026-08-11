@@ -1156,7 +1156,7 @@ class TokenManager:
         provider: str,
         store: OAuthStore | None = None,
         *,
-        client_id: str,
+        client_id: str | None = None,
         issuer: str = DEFAULT_ISSUER,
         refresh_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
         lock_timeout_s: float = DEFAULT_LOCK_TIMEOUT_S,
@@ -1164,6 +1164,13 @@ class TokenManager:
     ) -> None:
         self._provider = _validate_provider_id(provider)
         self._store = OAuthStore() if store is None else store
+        # The codex_chatgpt profile pins the official shared Codex/ChatGPT
+        # public client; an explicit client_id (env/flag) overrides it.
+        if client_id is None:
+            from cambium.provider_config import CODEX_CHATGPT_PROFILE
+
+            profile_client = CODEX_CHATGPT_PROFILE.get("client_id")
+            client_id = profile_client if isinstance(profile_client, str) and profile_client else ""
         self._client_id = client_id
         self._issuer = validate_issuer(issuer)
         self._refresh_timeout_s = refresh_timeout_s

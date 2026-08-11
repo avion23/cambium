@@ -599,17 +599,26 @@ def _codex_oauth_provider_names(
     config.
     """
     referenced = _fanout_provider_names(spec)
-    if not referenced:
-        return frozenset()
     try:
         providers = load_providers(_provider_config_path(source, spec))
     except (OSError, ValueError):
         return frozenset()
-    return frozenset(
+    codex = frozenset(
         provider.name
         for provider in providers
-        if provider.auth is AuthMode.CODEX_CHATGPT and provider.name in referenced
+        if provider.auth is AuthMode.CODEX_CHATGPT
     )
+    if referenced:
+        return codex & referenced
+    # No explicit provider restriction: the worker loads every configured
+    # provider and cascades over the model-matching ones, so any codex
+    # provider may serve this task (e.g. a pinned oneshot run whose
+    # fanout_config carries no providers list). Marker-mode tasks never
+    # build a router and stay empty.
+    fanout_config = spec.get("fanout_config")
+    if isinstance(fanout_config, dict) and fanout_config:
+        return codex
+    return frozenset()
 
 
 def _oauth_document_is_usable(doc: Any, *, now: float | None = None) -> bool:

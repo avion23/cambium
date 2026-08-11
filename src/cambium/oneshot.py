@@ -214,6 +214,31 @@ def _stored_provider_environment(
     return {env_name: value}
 
 
+def _is_codex_oauth_provider(provider: Any) -> bool:
+    """True when a provider authenticates via the Codex ChatGPT OAuth profile.
+
+    Such providers carry an empty ``api_key_env`` (the config slice pins the
+    profile and forbids env keys) and their credential lives in the OAuth
+    store, never in the worker env — so the oneshot resolver must not try to
+    look up an API key for them.
+    """
+    from cambium.provider_config import AuthMode
+
+    return getattr(provider, "auth", None) is AuthMode.CODEX_CHATGPT
+
+
+def _oauth_doc_present(provider_name: str) -> bool:
+    """Local-only check that the OAuth store holds a document for the provider."""
+    from cambium.oauth import OAuthStore
+
+    try:
+        store = OAuthStore()
+        document = store.read_document(provider_name)
+    except Exception:
+        return False
+    return document is not None
+
+
 def _resolve_provider(
     config: OneShotConfig,
     repo: Path,
@@ -247,6 +272,12 @@ def _resolve_provider(
         for candidate in providers:
             if not candidate.enabled:
                 continue
+            if _is_codex_oauth_provider(candidate):
+                # OAuth-authenticated: eligible when the local store holds a
+                # document; the credential is never an env key.
+                if _oauth_doc_present(candidate.name):
+                    stored.append(candidate)
+                continue
             try:
                 environment.update(_stored_provider_environment(candidate.api_key_env, auth_store))
             except ValueError:
@@ -265,7 +296,9 @@ def _resolve_provider(
             # The fanout model/tier are left to the supervisor's routing
             # resolution (solution C) so the ledger balances the pick.
             fanout_config={},
-            provider_env_keys=tuple(candidate.api_key_env for candidate in stored),
+            provider_env_keys=tuple(
+                candidate.api_key_env for candidate in stored if candidate.api_key_env
+            ),
             model_candidates=tuple(
                 sorted({candidate.model for candidate in stored})
             ),
@@ -316,9 +349,12 @@ def _resolve_provider(
         provider=selected.name,
         model=effective_model,
         provider_config_path=config_path,
-        provider_env_keys=(selected.api_key_env,),
+        provider_env_keys=() if _is_codex_oauth_provider(selected) else (selected.api_key_env,),
         fanout_config=fanout_config,
     )
+    if _is_codex_oauth_provider(selected):
+        # Credential comes from the OAuth store at spawn; preflight validates.
+        return resolved, {}
     return resolved, _stored_provider_environment(selected.api_key_env, auth_store)
 
 

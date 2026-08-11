@@ -393,4 +393,7 @@ def test_codex_chatgpt_profile_is_pinned_exact() -> None:
         "api_origin": "https://chatgpt.com",
         "api_path": "/backend-api/codex/responses",
         "scopes": ["openid", "profile", "email", "offline_access"],
+        # official shared Codex/ChatGPT public client (verified live: the
+        # user's ChatGPT session JWT carries this id and refresh succeeds)
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
     }

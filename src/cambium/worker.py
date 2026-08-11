@@ -2081,8 +2081,14 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
     stop = threading.Event()
 
     while True:
+        # The idle deadline only applies BETWEEN tasks: while a task runs the
+        # supervisor sends no steering messages, and a slow model (e.g. max-
+        # reasoning luna) can legitimately run far past the idle timeout. A
+        # timeout mid-task would abort the run and exit "idle" with no result
+        # envelope. With a task in flight the read simply waits.
+        read_timeout = None if current is not None else idle_timeout
         read_task = asyncio.create_task(
-            asyncio.wait_for(read_message(reader), timeout=idle_timeout))
+            asyncio.wait_for(read_message(reader), timeout=read_timeout))
         pending = {read_task}
         if current is not None:
             pending.add(current)

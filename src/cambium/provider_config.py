@@ -61,6 +61,12 @@ CODEX_CHATGPT_PROFILE: dict[str, object] = {
     "api_origin": "https://chatgpt.com",
     "api_path": "/backend-api/codex/responses",
     "scopes": ["openid", "profile", "email", "offline_access"],
+    # The official shared Codex/ChatGPT public OAuth client: the codex CLI
+    # embeds this id and existing ChatGPT sessions are minted by it (verified:
+    # the session's JWT carries this client_id, and a refresh with it succeeds
+    # while the codex-native uuid id returns invalid_client). Refresh tokens
+    # are bound to their issuing client, so this id is REQUIRED to refresh.
+    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
 }
 
 DEFAULT_PROVIDER_PATH = Path(".cambium/providers.json")

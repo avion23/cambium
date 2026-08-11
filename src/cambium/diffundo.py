@@ -800,17 +800,21 @@ def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
         role = "developer"
     content = message.get("content")
     if isinstance(content, str):
-        parts = [{"type": "input_text", "text": content}]
+        part_type = "output_text" if role == "assistant" else "input_text"
+        parts = [{"type": part_type, "text": content}]
     elif isinstance(content, list):
         # Normalize chat-shaped parts: the responses endpoint requires
-        # ``input_text`` (chat's ``text`` is rejected). Non-dict parts are
-        # dropped so a malformed item can never poison the request.
+        # ``input_text`` on user/developer turns and ``output_text`` on
+        # assistant turns (live-verified: the backend rejects input_text on
+        # assistant items). Non-dict parts are dropped so a malformed item
+        # can never poison the request.
+        part_type = "output_text" if role == "assistant" else "input_text"
         parts = []
         for part in content:
             if not isinstance(part, Mapping):
                 continue
-            if part.get("type") == "text":
-                parts.append({"type": "input_text", "text": part.get("text", "")})
+            if part.get("type") in ("text", "output_text", "input_text"):
+                parts.append({"type": part_type, "text": part.get("text", "")})
             else:
                 parts.append(dict(part))
     else:
