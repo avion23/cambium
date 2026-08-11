@@ -22,6 +22,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
 
 from .results import CHILD_RESULT_KEYS, ROOT_RESULT_KEYS, Result, result_to_dict
@@ -178,13 +179,22 @@ def render_text_result(result: Any) -> str:
     return " ".join(parts)
 
 
-_STATS_COUNT_FIELDS = (
-    ("calls", "calls"),
-    ("total_tokens", "tokens"),
-    ("input_tokens", "in"),
-    ("output_tokens", "out"),
-    ("cached_tokens", "cached"),
-)
+def _human_count(n: int) -> str:
+    """Format a count for humans: ``3217`` -> ``3.2k``, ``347`` -> ``347``."""
+    if n < 1000:
+        return str(n)
+    value = f"{n / 1000:.1f}"
+    if value.endswith(".0"):
+        value = value[:-2]
+    return f"{value}k"
+
+
+def _short_worktree(worktree: str) -> str:
+    """Shorten a worktree path to its last two segments (``…/run-x/wt``)."""
+    parts = [p for p in Path(worktree.replace("\\", "/")).parts if p != "/"]
+    if len(parts) <= 1:
+        return worktree
+    return "…/" + "/".join(parts[-2:])
 
 
 def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
@@ -192,9 +202,11 @@ def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
 
     Accepts a ``cambium.stats.UsageStats`` dataclass or a JSON-like mapping
     with the same fields. Untyped mapping values are validated; fields whose
-    values have the wrong type are skipped rather than raising. ``worktree``
-    is appended only when the argument (or the record) provides a non-empty
-    string.
+    values have the wrong type are skipped rather than raising. Counts render
+    human-readable (``3.2k``, ``347``) except ``calls``; ``tokens``/``in``/
+    ``out``/``cached`` form one group, and ``worktree`` is shortened to its
+    last two path segments. ``worktree`` is appended only when the argument
+    (or the record) provides a non-empty string.
     """
     if stats is None:
         return ""
@@ -216,24 +228,42 @@ def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
             return None
         return int(value)
 
-    parts: list[str] = ["stats:"]
-    for key, label in _STATS_COUNT_FIELDS:
+    groups: list[str] = []
+    calls = count("calls")
+    if calls is not None:
+        groups.append(f"calls={calls}")
+    tokens_group: list[str] = []
+    total = count("total_tokens")
+    if total is not None:
+        tokens_group.append(f"tokens={_human_count(total)}")
+    inner: list[str] = []
+    for key, label in (
+        ("input_tokens", "in"),
+        ("output_tokens", "out"),
+        ("cached_tokens", "cached"),
+    ):
         value = count(key)
         if value is not None:
-            parts.append(f"{label}={value}")
+            inner.append(f"{label}={_human_count(value)}")
+    if inner:
+        tokens_group.append(f"({' '.join(inner)})")
+    if tokens_group:
+        groups.append(" ".join(tokens_group))
     turns = record.get("turns")
     if isinstance(turns, int) and not isinstance(turns, bool):
         last_turn = count("last_turn_tokens")
         if last_turn is not None:
-            parts.append(f"last_turn=+{last_turn}")
+            groups.append(f"last_turn=+{_human_count(last_turn)}")
     model = record.get("model")
     if isinstance(model, str) and model:
-        parts.append(f"model={model}")
+        groups.append(f"model={model}")
     if not (isinstance(worktree, str) and worktree):
         worktree = record.get("worktree")
     if isinstance(worktree, str) and worktree:
-        parts.append(f"worktree={worktree}")
-    return " ".join(parts)
+        groups.append(f"worktree={_short_worktree(worktree)}")
+    if not groups:
+        return "stats:"
+    return "stats: " + " · ".join(groups)
 
 
 def render_event_line(event: Mapping[str, Any]) -> str:

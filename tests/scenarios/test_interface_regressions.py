@@ -217,9 +217,12 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
     assert code == 0
     assert err.getvalue() == ""
     assert "plan_status={succeeded}" in value
-    assert "stats: calls=2 tokens=200 in=130 out=70 cached=0 last_turn=+50" in value
+    assert "· tokens=200 (in=130 out=70 cached=0) ·" in value
+    assert "stats: calls=2 ·" in value
+    assert "last_turn=+50" in value
     assert "model=opencode-go/deepseek-v4-flash" in value
-    assert f"worktree={session_dir / 'wt'}" in value
+    assert f"worktree=…/{session_dir.name}/wt" in value
+    assert str(session_dir) not in value
 
 
 def test_tui_without_usage_events_prints_no_stats_line(monkeypatch, tmp_path):

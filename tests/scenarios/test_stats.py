@@ -6,7 +6,9 @@ import json
 import sqlite3
 from dataclasses import asdict
 
-from cambium.render import render_usage_stats_line
+import pytest
+
+from cambium.render import _human_count, render_usage_stats_line
 from cambium.stats import UsageStats, session_usage_stats, usage_stats_from_events
 
 _EVENTS_SCHEMA = """CREATE TABLE events (
@@ -333,18 +335,18 @@ def test_session_usage_stats_skips_undecodable_payloads(tmp_path) -> None:
 
 
 def test_render_usage_stats_line_from_dataclass() -> None:
-    stats = UsageStats(2, 3, 100, 50, 0, 150, 150, "p/m", "p")
+    stats = UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "p/m", "p")
     assert render_usage_stats_line(stats, worktree="/wt") == (
-        "stats: calls=2 tokens=150 in=100 out=50 cached=0 last_turn=+150 "
-        "model=p/m worktree=/wt"
+        "stats: calls=2 · tokens=3.2k (in=2.9k out=347 cached=0) · last_turn=+1.6k "
+        "· model=p/m · worktree=/wt"
     )
 
 
 def test_render_usage_stats_line_from_mapping() -> None:
-    stats = asdict(UsageStats(2, 3, 100, 50, 0, 150, 150, "p/m", "p"))
+    stats = asdict(UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "p/m", "p"))
     assert render_usage_stats_line(stats, worktree="/wt") == (
-        "stats: calls=2 tokens=150 in=100 out=50 cached=0 last_turn=+150 "
-        "model=p/m worktree=/wt"
+        "stats: calls=2 · tokens=3.2k (in=2.9k out=347 cached=0) · last_turn=+1.6k "
+        "· model=p/m · worktree=/wt"
     )
 
 
@@ -352,16 +354,16 @@ def test_render_usage_stats_line_mapping_worktree_value() -> None:
     stats = {
         "calls": 1,
         "turns": 1,
-        "input_tokens": 1,
-        "output_tokens": 2,
+        "input_tokens": 1000,
+        "output_tokens": 2000,
         "cached_tokens": 0,
-        "total_tokens": 3,
-        "last_turn_tokens": 3,
+        "total_tokens": 3000,
+        "last_turn_tokens": 3000,
         "model": "m",
         "provider": "p",
         "worktree": "/map/wt",
     }
-    assert render_usage_stats_line(stats).endswith("worktree=/map/wt")
+    assert render_usage_stats_line(stats).endswith("worktree=…/map/wt")
 
 
 def test_render_usage_stats_line_none_is_empty() -> None:
@@ -369,16 +371,18 @@ def test_render_usage_stats_line_none_is_empty() -> None:
 
 
 def test_render_usage_stats_line_omits_missing_model_and_worktree() -> None:
-    stats = UsageStats(1, 1, 10, 5, 0, 15, 15, None, None)
+    stats = UsageStats(1, 1, 1000, 500, 0, 1500, 1500, None, None)
     assert (
         render_usage_stats_line(stats)
-        == "stats: calls=1 tokens=15 in=10 out=5 cached=0 last_turn=+15"
+        == "stats: calls=1 · tokens=1.5k (in=1k out=500 cached=0) · last_turn=+1.5k"
     )
 
 
 def test_render_usage_stats_line_omits_last_turn_without_turns() -> None:
-    stats = UsageStats(1, None, 10, 5, 0, 15, 0, None, None)
-    assert render_usage_stats_line(stats) == "stats: calls=1 tokens=15 in=10 out=5 cached=0"
+    stats = UsageStats(1, None, 1000, 500, 0, 1500, 0, None, None)
+    assert (
+        render_usage_stats_line(stats) == "stats: calls=1 · tokens=1.5k (in=1k out=500 cached=0)"
+    )
 
 
 def test_render_usage_stats_line_skips_invalid_mapping_value_types() -> None:
@@ -386,11 +390,68 @@ def test_render_usage_stats_line_skips_invalid_mapping_value_types() -> None:
         "calls": True,
         "turns": 1,
         "input_tokens": "x",
-        "output_tokens": 20,
+        "output_tokens": 20000,
         "cached_tokens": 0,
-        "total_tokens": 10,
-        "last_turn_tokens": 5,
+        "total_tokens": 10000,
+        "last_turn_tokens": 5000,
         "model": 42,
         "provider": None,
     }
-    assert render_usage_stats_line(stats) == "stats: tokens=10 out=20 cached=0 last_turn=+5"
+    assert render_usage_stats_line(stats) == "stats: tokens=10k (out=20k cached=0) · last_turn=+5k"
+
+
+def test_render_usage_stats_line_human_counts() -> None:
+    for raw, expected in (
+        (3217, "3.2k"),
+        (347, "347"),
+        (1000, "1k"),
+        (12345, "12.3k"),
+        (0, "0"),
+    ):
+        assert _human_count(raw) == expected
+    stats = UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "m", "p")
+    assert render_usage_stats_line(stats, worktree="/wt") == (
+        "stats: calls=2 · tokens=3.2k (in=2.9k out=347 cached=0) · last_turn=+1.6k "
+        "· model=m · worktree=/wt"
+    )
+
+
+def test_render_usage_stats_line_plain_counts_below_thousand() -> None:
+    stats = UsageStats(2, 2, 130, 70, 0, 200, 50, "m", "p")
+    assert render_usage_stats_line(stats) == (
+        "stats: calls=2 · tokens=200 (in=130 out=70 cached=0) · last_turn=+50 · model=m"
+    )
+
+
+def test_render_usage_stats_line_grouping_and_separators() -> None:
+    stats = UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "m", "p")
+    line = render_usage_stats_line(stats, worktree="/wt")
+    assert " · " in line
+    assert "tokens=3.2k (in=2.9k out=347 cached=0)" in line
+    assert line.count(" · ") == 4
+    assert line.startswith("stats: calls=2")
+
+
+def test_render_usage_stats_line_shortens_worktree() -> None:
+    stats = UsageStats(1, 1, 1000, 500, 0, 1500, 1500, "m", "p")
+    assert render_usage_stats_line(stats, worktree="/tmp/x/.cambium/sessions/run-abc123/wt") == (
+        "stats: calls=1 · tokens=1.5k (in=1k out=500 cached=0) · last_turn=+1.5k · model=m "
+        "· worktree=…/run-abc123/wt"
+    )
+    assert render_usage_stats_line(stats, worktree="wt").endswith("worktree=wt")
+    assert not render_usage_stats_line(stats, worktree=None).endswith("worktree=")
+
+
+def test_render_usage_stats_line_mapping_matches_dataclass_line() -> None:
+    dataclass_line = render_usage_stats_line(
+        UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "p/m", "p"), worktree="/wt"
+    )
+    mapping_line = render_usage_stats_line(
+        asdict(UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "p/m", "p")), worktree="/wt"
+    )
+    assert mapping_line == dataclass_line
+
+
+def test_render_usage_stats_line_raises_type_error_for_other_input() -> None:
+    with pytest.raises(TypeError):
+        render_usage_stats_line(42)
