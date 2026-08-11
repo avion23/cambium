@@ -69,12 +69,23 @@ from typing import Any
 
 from cambium.fencing import next_generation, read_generation, write_generation
 from cambium.process_env import build_subprocess_env
-from cambium.provider_config import DEFAULT_PROVIDER_PATH, load_providers
+from cambium.provider_config import (
+    DEFAULT_PROVIDER_PATH,
+    AuthMode,
+    load_providers,
+)
 from cambium.system_health import can_run_heavy
 
 from .auth import MIN_API_KEY_BYTES, scrub_environment
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
+from .oauth import (
+    DEFAULT_REFRESH_MARGIN_S,
+    OAuthError,
+    OAuthMissingError,
+    OAuthStore,
+    TokenManager,
+)
 from .redact import (
     EVENT_RECORD_STRUCTURAL_FIELDS,
     WORKER_RESULT_STRUCTURAL_FIELDS,
@@ -531,15 +542,116 @@ def _validate_provider_credential(value: object) -> None:
         raise ValueError("provider credential is too short")
 
 
+def _oauth_env_suffix(provider: str) -> str:
+    """Normalize a provider id into its ``CAMBIUM_OAUTH_*`` environment suffix."""
+    return re.sub(r"[._-]+", "_", provider.upper())
+
+
+def _fanout_provider_names(spec: Mapping[str, Any]) -> frozenset[str]:
+    """Provider names a task references through fanout_config or assignment."""
+    names: set[str] = set()
+    fanout_config = spec.get("fanout_config")
+    if isinstance(fanout_config, dict):
+        providers = fanout_config.get("providers")
+        if isinstance(providers, (list, tuple)):
+            names.update(
+                entry["name"]
+                for entry in providers
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+            )
+    assigned = spec.get("assigned_provider")
+    if isinstance(assigned, str):
+        names.add(assigned)
+    return frozenset(names)
+
+
+def _codex_oauth_provider_names(
+    spec: Mapping[str, Any], source: Mapping[str, str]
+) -> frozenset[str]:
+    """The referenced providers whose loaded config tags ``auth=codex_chatgpt``.
+
+    A config that cannot be loaded yields no names: the worker's own config
+    load surfaces file errors at its boundary (transport authoritative), so
+    this preflight only adds the oauth-document gate on top of a loadable
+    config.
+    """
+    referenced = _fanout_provider_names(spec)
+    if not referenced:
+        return frozenset()
+    try:
+        providers = load_providers(_provider_config_path(source, spec))
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(
+        provider.name
+        for provider in providers
+        if provider.auth is AuthMode.CODEX_CHATGPT and provider.name in referenced
+    )
+
+
+def _oauth_document_is_usable(doc: Any, *, now: float | None = None) -> bool:
+    """Local freshness gate: unexpired, or refreshable via a stored refresh token.
+
+    Never touches the network: an unexpired access token passes; an expired
+    one passes only when the stored document still carries a refresh token
+    (the transport refreshes at spawn, never per request).
+    """
+    if doc.expires_at - (time.time() if now is None else now) > DEFAULT_REFRESH_MARGIN_S:
+        return True
+    return bool(doc.refresh_token)
+
+
+def _require_oauth_document(provider: str, oauth_store: OAuthStore | None) -> None:
+    """Fail-closed preflight for one codex_chatgpt provider: LOCAL store read only."""
+    store = OAuthStore() if oauth_store is None else oauth_store
+    try:
+        doc = store.validate(provider)
+    except OAuthMissingError:
+        raise ValueError(
+            f"task references codex_chatgpt provider {provider!r} but no oauth "
+            "session is stored for it; run `cambium auth oauth --import-codex-cli` "
+            "or `cambium auth oauth <provider> --client-id ID`"
+        ) from None
+    except OAuthError as exc:
+        raise ValueError(
+            f"task references codex_chatgpt provider {provider!r} but the oauth "
+            f"store is invalid: {exc}"
+        ) from None
+    if not _oauth_document_is_usable(doc):
+        raise ValueError(
+            f"task references codex_chatgpt provider {provider!r} whose stored "
+            "oauth session is expired and has no usable refresh token"
+        )
+    if TokenManager(store=store, provider=provider, client_id="").disabled(provider):
+        raise ValueError(
+            f"task references codex_chatgpt provider {provider!r} whose oauth "
+            "session is disabled (refresh was rejected); re-login is required"
+        )
+
+
 def _validate_provider_environment(
-    specs: list[dict[str, Any]], provider_environment: Mapping[str, str] | None
+    specs: list[dict[str, Any]],
+    provider_environment: Mapping[str, str] | None,
+    *,
+    oauth_store: OAuthStore | None = None,
 ) -> None:
-    """Validate every non-missing value a declared provider key can forward."""
+    """Validate every non-missing value a declared provider key can forward.
+
+    OAuth preflight (fail closed): a task that references a codex_chatgpt
+    provider must have a present, unexpired-or-refreshable oauth document in
+    the LOCAL store; missing or corrupt credentials raise a clear ValueError.
+    The preflight is local-only (no network probe); the transport (worker
+    refresh at spawn) stays authoritative.
+    """
     for spec in specs:
         for key in _provider_env_keys(spec):
             value = _provider_environment_value(key, provider_environment)
             if value is not None:
                 _validate_provider_credential(value)
+        for provider in sorted(
+            _codex_oauth_provider_names(spec, provider_environment or os.environ)
+        ):
+            _require_oauth_document(provider, oauth_store)
 
 
 def _provider_config_path(
@@ -563,19 +675,77 @@ def _provider_config_path(
     return str(path.resolve())
 
 
+def _oauth_worker_environment(
+    spec: dict[str, Any],
+    source: Mapping[str, str],
+    oauth_store: OAuthStore | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Ensure-fresh at spawn for referenced codex providers.
+
+    Returns ``(env_additions, access_values)``: the former carries ONLY the
+    access token and account id as ``CAMBIUM_OAUTH_ACCESS_<PROVIDER>`` /
+    ``CAMBIUM_OAUTH_ACCOUNT_<PROVIDER>``; the refresh token never leaves the
+    supervisor process. A refresh at spawn is acceptable (never per request).
+    """
+    providers = _codex_oauth_provider_names(spec, source)
+    if not providers:
+        return {}, []
+    store = OAuthStore() if oauth_store is None else oauth_store
+    client_id = source.get("CAMBIUM_CODEX_CLIENT_ID") or ""
+    additions: dict[str, str] = {}
+    access_values: list[str] = []
+    for provider in sorted(providers):
+        manager = TokenManager(store=store, provider=provider, client_id=client_id)
+        try:
+            access_token, account_id = manager.ensure_fresh()
+        except OAuthError as exc:
+            hint = (
+                " (set CAMBIUM_CODEX_CLIENT_ID to the codex client id "
+                "so an expired access token can be refreshed)"
+                if not client_id
+                else ""
+            )
+            raise ValueError(
+                f"task references codex_chatgpt provider {provider!r} but its "
+                f"oauth session could not be ensured fresh: {exc}{hint}"
+            ) from None
+        additions[f"CAMBIUM_OAUTH_ACCESS_{_oauth_env_suffix(provider)}"] = access_token
+        access_values.append(access_token)
+        if account_id:
+            additions[f"CAMBIUM_OAUTH_ACCOUNT_{_oauth_env_suffix(provider)}"] = account_id
+    return additions, access_values
+
+
 def _worker_environment(
     spec: dict[str, Any], generation: int, *, session_dir: Path | None = None,
     provider_environment: Mapping[str, str] | None = None,
+    oauth_store: OAuthStore | None = None,
+    redactor: Redactor | None = None,
 ) -> dict[str, str]:
-    """Build a strict worker env with authorized provider credentials."""
-    _validate_provider_environment([spec], provider_environment)
+    """Build a strict worker env with authorized provider credentials.
+
+    For a task that references a codex_chatgpt provider, the access token and
+    account id are ensured fresh once at spawn from the supervisor's
+    ``TokenManager`` and injected as ``CAMBIUM_OAUTH_ACCESS_<PROVIDER>`` /
+    ``CAMBIUM_OAUTH_ACCOUNT_<PROVIDER>``. Worker processes never receive the
+    refresh token. Injected access tokens are registered with the session
+    redactor via ``register_secret`` so a rotated token stays redacted in
+    every later event record.
+    """
+    _validate_provider_environment([spec], provider_environment, oauth_store=oauth_store)
     source = dict(os.environ)
-    allowed_provider_keys = _provider_env_keys(spec)
+    allowed_provider_keys = set(_provider_env_keys(spec))
     if provider_environment is not None:
         for name in allowed_provider_keys:
             value = provider_environment.get(name)
             if value is not None:
                 source[name] = value
+    oauth_environment, oauth_access_values = _oauth_worker_environment(
+        spec, source, oauth_store
+    )
+    for name, value in oauth_environment.items():
+        source[name] = value
+        allowed_provider_keys.add(name)
     overrides = {
         "CAMBIUM_TASK_ID": spec["task_id"],
         "CAMBIUM_GENERATION": str(generation),
@@ -593,6 +763,9 @@ def _worker_environment(
     )
     if spec.get("fanout_config"):
         env["CAMBIUM_PROVIDERS"] = _provider_config_path(source, spec)
+    if redactor is not None:
+        for value in oauth_access_values:
+            redactor.register_secret(value)
     return env
 
 
@@ -654,14 +827,18 @@ def _strip_sensitive_env(
 def _session_redactor(
     specs: list[dict[str, Any]],
     provider_environment: Mapping[str, str] | None = None,
+    *,
+    oauth_store: OAuthStore | None = None,
 ) -> Redactor:
     """Build one session redactor from explicitly authorized provider values.
 
     The registry covers every value ``_worker_environment`` can forward from
     the declared ``provider_env_keys``. Every non-empty value is registered for
-    substring redaction regardless of its naming or value shape.
+    substring redaction regardless of its naming or value shape. OAuth access
+    tokens are ensured fresh and registered at spawn time (per task) via
+    ``register_secret``, so rotated tokens never reach a durable event.
     """
-    _validate_provider_environment(specs, provider_environment)
+    _validate_provider_environment(specs, provider_environment, oauth_store=oauth_store)
     secret_values: list[str] = []
     for spec in specs:
         for key in _provider_env_keys(spec):
@@ -830,6 +1007,7 @@ class _Runtime:
         provider_environment: Mapping[str, str] | None = None,
         max_concurrent_tasks: int | None = None,
         debt_store: DebtStore | None = None,
+        oauth_store: OAuthStore | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -842,6 +1020,7 @@ class _Runtime:
             None if provider_environment is None else dict(provider_environment)
         )
         self._debt_store = debt_store
+        self._oauth_store = oauth_store
         self._event_append_lock = asyncio.Lock()
         # max_concurrent_tasks=0 disables the cap (no semaphore); None is
         # rewritten to the auto default by run_plan before _Runtime is built.
@@ -1269,11 +1448,15 @@ class _Runtime:
         provider_environment = (
             self._provider_environment if self is not None else None
         )
+        oauth_store = self._oauth_store if self is not None else None
+        redactor = self._redactor if self is not None else None
         return _worker_environment(
             spec,
             generation,
             session_dir=session_dir,
             provider_environment=provider_environment,
+            oauth_store=oauth_store,
+            redactor=redactor,
         )
 
     def _run_payload(
@@ -3250,6 +3433,7 @@ async def run_plan(
     max_concurrent_tasks: int | None = None,
     routing_state_path: str | Path | None = None,
     reject_reused_session: bool = False,
+    oauth_store: OAuthStore | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3307,7 +3491,7 @@ async def run_plan(
     if max_concurrent_tasks is None:
         max_concurrent_tasks = max(1, os.process_cpu_count() or os.cpu_count() or 1)
 
-    _validate_provider_environment(specs, provider_environment)
+    _validate_provider_environment(specs, provider_environment, oauth_store=oauth_store)
     tree, width_limit = _resolve_hierarchy(specs, plan, max_width)
 
     admission = _SessionAdmission(session_dir)
@@ -3317,7 +3501,9 @@ async def run_plan(
             _reject_reused_session(session_dir)
         await asyncio.to_thread(_write_plan, session_dir, {"tasks": specs})
         started_at = time.time()
-        redactor = _session_redactor(specs, provider_environment)
+        redactor = _session_redactor(
+            specs, provider_environment, oauth_store=oauth_store
+        )
         store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
         # Usage-debt ledger for admission balancing (solution C): load the
         # persisted state once, feed it live from usage_event rows, and
@@ -3338,6 +3524,7 @@ async def run_plan(
             provider_environment=provider_environment,
             max_concurrent_tasks=max_concurrent_tasks,
             debt_store=debt_store,
+            oauth_store=oauth_store,
         )
         await runtime.start()
         runtime.set_session_tasks(specs)

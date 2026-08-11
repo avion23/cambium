@@ -142,3 +142,18 @@ errors classify as retryable outage / CONFIG-quarantine (`model_not_found`,
 machine-readable model/parameter 400) / refusal. Bearer credentials are
 injected via `CredentialSource` (absent -> AUTH_ERROR) and `reasoning_effort`
 is a normal provider-config field.
+### Supervisor/CLI OAuth wiring (implemented, W3/W4)
+
+`run_plan` preflights every task that references a `codex_chatgpt` provider:
+the local `OAuthStore` document must be present and unexpired-or-refreshable
+(fail-closed, no network probe; the transport stays authoritative). At spawn
+`_worker_environment` ensures a fresh access token once and injects
+`CAMBIUM_OAUTH_ACCESS_<PROVIDER>` + `CAMBIUM_OAUTH_ACCOUNT_<PROVIDER>` — never
+the refresh token — registering the token with the session `Redactor` via
+`register_secret`. `cambium auth oauth <provider> [--client-id ID]` runs the
+device flow (verification URL + user code printed only to the controlling
+TTY), plus `--status` (local expiry + account fingerprint, no refresh, no
+secrets), `--logout` (locked local removal, no remote revoke claim), and
+`--import-codex-cli` (imports `~/.codex/auth.json` as provider `codex`).
+`cambium doctor --oauth-live` is an opt-in live probe of issuer reachability
+and refreshability that consumes quota and never makes a model call.

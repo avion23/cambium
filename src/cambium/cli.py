@@ -10,12 +10,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import hashlib
 import importlib
 import inspect
 import os
 import sqlite3
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__
@@ -25,6 +28,15 @@ from .auth import (
     AuthStore,
     read_stdin_key,
     validate_provider_id,
+)
+from .oauth import (
+    DEFAULT_ISSUER,
+    DeviceFlow,
+    DeviceFlowCanceled,
+    DeviceFlowExpired,
+    OAuthError,
+    OAuthStore,
+    import_codex_cli_session,
 )
 
 
@@ -202,6 +214,43 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     auth_remove.add_argument("provider", type=_provider_argument, metavar="PROVIDER")
 
+    auth_oauth = auth_commands.add_parser(
+        "oauth",
+        help="manage one provider's Codex ChatGPT OAuth session",
+        description="Device-flow login, local status, locked local logout, and "
+        "codex CLI session import for a codex_chatgpt provider. The device "
+        "code is shown only on the controlling TTY and never logged.",
+    )
+    auth_oauth.add_argument(
+        "provider",
+        nargs="?",
+        type=_provider_argument,
+        metavar="PROVIDER",
+        help="provider id (not needed with --import-codex-cli)",
+    )
+    auth_oauth.add_argument(
+        "--client-id",
+        metavar="ID",
+        help="codex client id for the device flow (or CAMBIUM_CODEX_CLIENT_ID)",
+    )
+    auth_oauth.add_argument(
+        "--status",
+        action="store_true",
+        help="local session status: expiry and account fingerprint only "
+        "(no refresh, no secrets)",
+    )
+    auth_oauth.add_argument(
+        "--logout",
+        action="store_true",
+        help="remove the local oauth session (no remote revocation is claimed)",
+    )
+    auth_oauth.add_argument(
+        "--import-codex-cli",
+        action="store_true",
+        help="import the existing codex CLI session from ~/.codex/auth.json "
+        "as provider 'codex'",
+    )
+
     auth_commands.add_parser("list", help="list configured providers and derived names")
 
     auth_run = auth_commands.add_parser(
@@ -222,6 +271,13 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Run Cambium harness diagnostics.",
     )
     doctor.add_argument("--session-dir", type=Path, metavar="DIR")
+    doctor.add_argument(
+        "--oauth-live",
+        action="store_true",
+        help="opt-in live oauth probe for codex_chatgpt providers: endpoint "
+        "reachability plus a real refresh-token exchange (consumes quota; "
+        "never makes a model call)",
+    )
 
     bench = commands.add_parser(
         "bench",
@@ -336,7 +392,11 @@ def _run_supervisor(args: argparse.Namespace) -> int:
 def _run_doctor(args: argparse.Namespace) -> int:
     from . import doctor
 
-    delegated = [] if args.session_dir is None else ["--session-dir", str(args.session_dir)]
+    delegated = []
+    if args.session_dir is not None:
+        delegated.extend(["--session-dir", str(args.session_dir)])
+    if getattr(args, "oauth_live", False):
+        delegated.append("--oauth-live")
     return doctor.main(delegated)
 
 
@@ -392,6 +452,168 @@ def _run_auth_supervisor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _oauth_fingerprint(account_id: str | None) -> str:
+    """A stable account fingerprint (first 8 hex of SHA-256), never the id."""
+    if not account_id:
+        return "unknown"
+    return hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:8]
+
+
+def _oauth_status_text(store: OAuthStore, provider: str) -> str:
+    """Local-only status: expiry plus an account fingerprint; no secrets."""
+    doc = store.read_document(provider)
+    if doc is None:
+        return f"provider {provider}: no oauth session stored"
+    remaining = doc.expires_at - time.time()
+    state = "expired" if remaining <= 0 else f"{remaining:.0f}s remaining"
+    return (
+        f"provider {provider}: oauth session {state}; "
+        f"account fingerprint {_oauth_fingerprint(doc.account_id)}"
+    )
+
+
+def _run_auth_oauth_status(store: OAuthStore, provider: str) -> int:
+    try:
+        text = _oauth_status_text(store, provider)
+    except OAuthError as exc:
+        print(f"cambium auth: oauth status unavailable: {exc}", file=sys.stderr)
+        return 1
+    if "no oauth session" in text:
+        print(text, file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+def _run_auth_oauth_logout(store: OAuthStore, provider: str) -> int:
+    """Locked local removal only; no remote revocation is claimed."""
+    try:
+        removed = store.remove_provider(provider)
+    except OAuthError as exc:
+        print(f"cambium auth: oauth logout failed: {exc}", file=sys.stderr)
+        return 1
+    if removed:
+        print(
+            f"removed local oauth session for provider {provider} "
+            "(the issuer session is unchanged)"
+        )
+    else:
+        print(f"provider {provider} has no stored oauth session")
+    return 0
+
+
+def _run_auth_oauth_import(
+    store: OAuthStore, path: str | Path | None = None
+) -> int:
+    try:
+        doc = import_codex_cli_session(path)
+        store.save_provider(doc)
+    except OAuthError as exc:
+        print(f"cambium auth: could not import the codex CLI session: {exc}", file=sys.stderr)
+        return 1
+    print(f"imported the codex CLI session for provider {doc.provider}")
+    return 0
+
+
+def _controlling_tty_writer() -> Callable[[str], None]:
+    """Return a writer that prints to the controlling TTY and nowhere else."""
+
+    def write(text: str) -> None:
+        try:
+            with open("/dev/tty", "w", encoding="utf-8") as tty:
+                tty.write(text)
+                tty.flush()
+        except OSError as exc:
+            raise OAuthError(
+                "no controlling TTY is available to display the device code; "
+                "refusing to print it to stdout or logs"
+            ) from exc
+
+    return write
+
+
+def _run_auth_oauth_device(
+    provider: str,
+    client_id: str,
+    *,
+    store: OAuthStore | None = None,
+    issuer: str | None = None,
+    tty: Callable[[str], None] | None = None,
+) -> int:
+    """Run the device flow; the user code reaches only the controlling TTY."""
+    if not client_id:
+        print(
+            "cambium auth: a --client-id is required for the device flow "
+            "(or set CAMBIUM_CODEX_CLIENT_ID)",
+            file=sys.stderr,
+        )
+        return 1
+    writer = _controlling_tty_writer() if tty is None else tty
+    flow = DeviceFlow(
+        provider,
+        client_id=client_id,
+        issuer=DEFAULT_ISSUER if issuer is None else issuer,
+        store=store,
+    )
+    try:
+        flow.run(
+            on_code=lambda url, code: writer(
+                f"Open {url} and enter the code {code}" + "\n"
+            )
+        )
+    except KeyboardInterrupt:
+        print("cambium auth: device flow canceled", file=sys.stderr)
+        return 130
+    except DeviceFlowCanceled:
+        print("cambium auth: device flow canceled", file=sys.stderr)
+        return 130
+    except DeviceFlowExpired:
+        print("cambium auth: device flow expired before approval", file=sys.stderr)
+        return 1
+    except OAuthError as exc:
+        print(f"cambium auth: device flow failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"stored oauth session for provider {provider}")
+    return 0
+
+
+def _run_auth_oauth(args: argparse.Namespace) -> int:
+    mode = sum(
+        bool(getattr(args, flag, False))
+        for flag in ("status", "logout", "import_codex_cli")
+    )
+    if mode > 1:
+        print(
+            "cambium auth: choose exactly one of --status, --logout, "
+            "--import-codex-cli, or the device flow",
+            file=sys.stderr,
+        )
+        return 2
+    if args.import_codex_cli:
+        if args.provider is not None and args.provider != "codex":
+            print(
+                "cambium auth: --import-codex-cli imports the session as provider "
+                "'codex'; no provider argument is accepted",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_auth_oauth_import(OAuthStore())
+    if args.provider is None:
+        print(
+            "cambium auth: oauth requires a provider for the device flow, "
+            "--status, or --logout",
+            file=sys.stderr,
+        )
+        return 2
+    store = OAuthStore()
+    if args.status:
+        return _run_auth_oauth_status(store, args.provider)
+    if args.logout:
+        return _run_auth_oauth_logout(store, args.provider)
+    client_id = args.client_id or os.environ.get("CAMBIUM_CODEX_CLIENT_ID", "")
+    return _run_auth_oauth_device(args.provider, client_id, store=store)
+
+
 def _run_auth(args: argparse.Namespace) -> int:
     if args.auth_command == "set":
         return _run_auth_set(args)
@@ -399,6 +621,8 @@ def _run_auth(args: argparse.Namespace) -> int:
         return _run_auth_remove(args)
     if args.auth_command == "list":
         return _run_auth_list()
+    if args.auth_command == "oauth":
+        return _run_auth_oauth(args)
     if args.auth_command == "run" and args.profile == "supervisor":
         return _run_auth_supervisor(args)
     raise AssertionError(f"unhandled auth command: {args.auth_command!r}")
