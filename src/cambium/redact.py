@@ -486,25 +486,49 @@ def _decode_escape_char(text: str, position: int) -> tuple[str, int]:
     return "\\", position + 1
 
 
-def _escaped_value_spans(text: str, value: str) -> list[tuple[int, int]]:
-    """Return spans of *text* that decode to exactly *value*.
+def _decoded_characters(text: str) -> list[tuple[str, int, int]]:
+    """Return ``(character, start, end)`` for each decoded character of *text*.
 
-    Scanning decodes up to ``len(value)`` characters from every offset, so a
-    credential whose wire form mixes raw characters, short escapes, and
-    ``\\uXXXX``/hex escapes (either hex case) is matched as one span.  A match
-    advances past its own span; decoding is deterministic per offset.
+    A valid escape sequence is exactly one decoded character, so a registered
+    value can never match characters inside a ``\\uXXXX`` escape that belongs
+    to a longer credential.  A backslash that does not begin a valid escape
+    stays a literal backslash and the following character is decoded on its
+    own.
+    """
+    characters: list[tuple[str, int, int]] = []
+    position = 0
+    while position < len(text):
+        start = position
+        character, position = _decode_escape_char(text, position)
+        characters.append((character, start, position))
+    return characters
+
+
+def _escaped_value_spans(text: str, value: str) -> list[tuple[int, int]]:
+    """Return spans of *text* whose decoded form is exactly *value*.
+
+    Matching operates on decoded characters, so a credential whose wire form
+    mixes raw characters, short escapes, and ``\\uXXXX``/hex escapes (either
+    hex case) is matched as one span, while a short registered value never
+    matches a character inside an unrelated escape sequence.  A match advances
+    past its own span; decoding is deterministic per decoded character.
     """
     target = len(value)
+    if target == 0:
+        return []
+    decoded = _decoded_characters(text)
     spans: list[tuple[int, int]] = []
     index = 0
-    while index < len(text):
-        decoded: list[str] = []
+    while index < len(decoded):
+        if len(decoded) - index < target:
+            break
+        characters: list[str] = []
         position = index
-        while len(decoded) < target and position < len(text):
-            character, position = _decode_escape_char(text, position)
-            decoded.append(character)
-        if len(decoded) == target and "".join(decoded) == value:
-            spans.append((index, position))
+        while len(characters) < target:
+            characters.append(decoded[position][0])
+            position += 1
+        if "".join(characters) == value:
+            spans.append((decoded[index][1], decoded[position - 1][2]))
             index = position
         else:
             index += 1
@@ -1194,6 +1218,14 @@ class Redactor:
             return text
         return _replacement_sub(self._exact_value_pattern, text, self.replacement)
 
+    def _redact_patterns(self, text: str) -> str:
+        """Apply the configured pattern and contextual passes to *text*."""
+        if self._patterns == DEFAULT_PATTERNS:
+            return _redact_default(text, self.replacement)
+        for pattern in self._patterns:
+            text = _replacement_sub(pattern, text, self.replacement)
+        return text
+
     def redact(self, text: str) -> str:
         """Redact secrets and email addresses from *text*.
 
@@ -1207,39 +1239,35 @@ class Redactor:
         if text in self._whole_values:
             return self.replacement
         text = self._redact_exact_values(text)
-        if self._patterns == DEFAULT_PATTERNS:
-            return _redact_default(text, self.replacement)
-        for pattern in self._patterns:
-            text = _replacement_sub(pattern, text, self.replacement)
-        return text
+        return self._redact_patterns(text)
 
     def redact_escaped(self, text: str) -> str:
         """Redact *text* after decoding JSON/repr escape sequences in place.
 
-        The plain text pass runs first; a second pass decodes ``\\uXXXX``,
-        ``\\xHH``, octal, and short escapes at every offset so a credential
-        whose wire form was rewritten (any hex case, any mix of escapes) is
-        matched as the decoded value.  Whole-value registrations stay whole:
-        an escaped whole value is replaced only when the entire text decodes
-        to it.
+        Registered values are matched against the decoded wire form first, so
+        a credential whose wire form was rewritten (any hex case, any mix of
+        escapes) is replaced as one span and a short registered value never
+        matches a character inside an unrelated ``\\uXXXX`` escape.  The
+        pattern and contextual passes then run over the remaining text.
+        Whole-value registrations stay whole: a string that decodes to one is
+        replaced outright, never corrupted into a larger span.
         """
 
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         if "\\" not in text:
             return self.redact(text)
-        text = self.redact(text)
-        if "\\" not in text:
-            return text
+        if text in self._whole_values:
+            return self.replacement
+        for value in self._whole_values:
+            if _decodes_to(text, value):
+                return self.replacement
         spans: list[tuple[int, int]] = []
         for value in self._secret_values:
             spans.extend(_escaped_value_spans(text, value))
         if spans:
             text = _replace_spans(text, spans, self.replacement)
-        for value in self._whole_values:
-            if _decodes_to(text, value):
-                return self.replacement
-        return text
+        return self._redact_patterns(text)
 
     def redact_mapping(self, mapping: object) -> object:
         """Return a redacted copy of a mapping or sequence.

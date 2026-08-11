@@ -134,6 +134,34 @@ def test_registered_values_are_redacted_in_nested_tool_payloads() -> None:
     }
 
 
+def test_one_character_secret_does_not_corrupt_unicode_escape_syntax() -> None:
+    """A short registered value must not corrupt ``\\uXXXX`` escape syntax.
+
+    A one-character registered secret (e.g. a numeric session id leaked from
+    the parent environment) previously matched the digits *inside* a
+    ``\\uXXXX`` escape, mangling the escape so a longer escaped credential was
+    no longer decoded and leaked its ``\\u005c`` wire form.
+    """
+    short = "2"
+    sk = 'sk-proj-A"B\\C'
+    redactor = Redactor(secret_values={short, sk})
+
+    output = redactor.redact_escaped('the wire shows "sk-proj-A\\u0022B\\u005cC" here')
+
+    assert output == 'the wire shows "***" here'
+    assert "\\u0022" not in output
+    assert "\\u005c" not in output
+    assert sk not in output
+
+
+def test_one_character_secret_preserves_benign_escape() -> None:
+    """A short registered value never matches inside an unrelated escape."""
+
+    redactor = Redactor(secret_values={"2"})
+
+    assert redactor.redact_escaped('code="\\u0022"') == 'code="\\u0022"'
+
+
 def test_semicolon_can_be_secret_punctuation_without_swallowing_next_field() -> None:
     text = "api_key=part;with;punct next=value; password=p@ss; author=Ada"
 
