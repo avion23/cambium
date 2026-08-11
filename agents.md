@@ -70,6 +70,11 @@ import `cambium` without a manual export.
 
 ### Usage evidence
 
+`supervisor.run_plan` resolves un-pinned provider tasks (`model_candidates`)
+at admission from the usage-debt ledger (`DebtStore`,
+`~/.config/cambium/routing-state.json`) and presets the worker's Diffundo
+primary to the assigned provider.
+
 `scripts/usage_evidence.py` aggregates durable per-call usage events
 across session stores (positional session dirs and/or `--repo <path>`,
 which globs `.cambium/sessions/*`) into per-provider routing evidence:
