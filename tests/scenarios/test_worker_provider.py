@@ -560,6 +560,64 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(
 
 
 @pytest.mark.slow
+def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
+    tmp_path, monkeypatch
+) -> None:
+    """A provider that commits directly (permitted shell) and then edits
+    another file must never reach the fenced-commit path: the worktree is
+    dirty, but HEAD has advanced beyond the base commit, so the worker fails
+    with the invariant reason and the supervisor never merges either commit."""
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _set_provider_env(monkeypatch, config_path)
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// provider-1\\n"}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":'
+            '["git","add","target.txt"]}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":'
+            '["git","commit","-m","unfenced-provider-commit"]}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"notes.txt","old_string":"output-sentinel-7x9q\\n",'
+            '"new_string":"output-sentinel-7x9q\\n// dirty-after-commit\\n"}}'
+        )
+        _enqueue('{"type":"finish","summary":"committed directly then edited"}')
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        task["max_restarts"] = 0
+        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        events = read_events(session_dir)
+
+        assert result.exit_code != 0
+        assert result.results[0].status == "failed"
+        assert "advanced beyond base_commit" in result.results[0].reason
+        assert "refusing to publish unverified changes" in result.results[0].reason
+        assert result.results[0].merge_sha is None
+        assert subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == base
+        assert not [event for event in events if event["kind"] == "merge_started"]
+        assert not [event for event in events if event["kind"] == "merge_committed"]
+    finally:
+        server.close()
+
+
+@pytest.mark.slow
 def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -> None:
     """A model ``delegate`` tool call admits and runs a child through the real worker loop.
 

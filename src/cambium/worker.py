@@ -1516,26 +1516,28 @@ def _finalize_worktree(
             if not path or path == ".cambium" or path.startswith(".cambium/"):
                 continue
             changed.append(path)
+        # A provider can commit directly (e.g. via permitted shell): HEAD then
+        # no longer matches the base commit, whether or not the worktree is
+        # dirty. Never publish such unfenced commits — the fenced-commit path
+        # would stack a fenced commit on top of them and the supervisor would
+        # merge both. Resolve the base once and require worktree HEAD to equal
+        # it on every publish path.
+        rc, resolved_base, err = git(
+            "rev-parse", "--verify", f"{base_commit}^{{commit}}", cwd=worktree
+        )
+        if rc != 0:
+            outcome["failure_reason"] = (
+                f"cannot resolve base_commit {base_commit}: {err}"
+            )
+            return outcome
+        if head_sha != resolved_base:
+            outcome["failure_reason"] = (
+                f"worktree HEAD {head_sha} advanced beyond base_commit "
+                f"{resolved_base}; refusing to publish unverified changes"
+            )
+            return outcome
         if not changed:
             _require_generation(worktree, generation)
-            # A provider can commit directly (e.g. via permitted shell): the
-            # worktree then looks clean but HEAD has advanced. Never report
-            # no-op success for an advanced HEAD — the supervisor would merge
-            # the unfenced commit. Compare fully resolved SHAs.
-            rc, resolved_base, err = git(
-                "rev-parse", "--verify", f"{base_commit}^{{commit}}", cwd=worktree
-            )
-            if rc != 0:
-                outcome["failure_reason"] = (
-                    f"cannot resolve base_commit {base_commit}: {err}"
-                )
-                return outcome
-            if head_sha != resolved_base:
-                outcome["failure_reason"] = (
-                    f"worktree HEAD {head_sha} advanced beyond base_commit "
-                    f"{resolved_base}; refusing to publish unverified changes"
-                )
-                return outcome
             # True no-op: no final checkpoint is written — the raw transcript
             # may echo credentials back. The summary stays in the envelope.
             outcome.update(
@@ -1572,7 +1574,7 @@ def _finalize_worktree(
             outcome["failure_reason"] = f"commit failed: {err}"
             return outcome
         _rc, sha, _err = git("rev-parse", "HEAD", cwd=worktree)
-        _rc, diff, _err = git("diff", f"{base_commit}..HEAD", cwd=worktree)
+        _rc, diff, _err = git("diff", f"{resolved_base}..HEAD", cwd=worktree)
         diff, diff_truncated = cap_diff(diff)
         _require_generation(worktree, generation)
         final_checkpoint = _write_checkpoint_file(
