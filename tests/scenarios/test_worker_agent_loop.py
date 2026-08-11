@@ -133,6 +133,21 @@ async def _drive_loop(
 # Plan-before-act: plan action parses, is stored, and the loop proceeds
 # ---------------------------------------------------------------------------
 
+def test_build_agent_prompt_turn_one_has_non_system_message() -> None:
+    """Turn-one payloads must contain a non-system message (ZAI/GLM 1214)."""
+    prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_file"}], [])
+    messages = prompt["messages"]
+    assert messages[0]["role"] == "system"
+    assert any(message.get("role") != "system" for message in messages)
+    # The static system prefix is unchanged when a transcript already exists.
+    with_transcript = worker._build_agent_prompt(
+        "edit a.txt",
+        [{"name": "read_file"}],
+        [{"role": "assistant", "content": "{\"type\": \"plan\", \"steps\": []}"}],
+    )
+    assert with_transcript["messages"][0]["content"] == messages[0]["content"]
+
+
 
 def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"

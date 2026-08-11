@@ -778,6 +778,11 @@ def _build_agent_prompt(
     ]
     messages = [{"role": "system", "content": "\n".join(system_lines)}]
     messages.extend(transcript)
+    if not any(message.get("role") != "system" for message in messages):
+        # Some providers (e.g. ZAI/GLM) reject a messages array that contains
+        # only a system message; a neutral user opener keeps turn one valid
+        # without changing the static system prefix (plan step 3 caching).
+        messages.append({"role": "user", "content": "Begin."})
     return {"messages": messages}
 
 
