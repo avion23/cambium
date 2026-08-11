@@ -105,6 +105,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -314,6 +315,12 @@ def _provider_router(config: dict[str, Any]) -> tuple[Diffundo, ProviderTier, st
         value = _fanout_value(config, section, key)
         if value is not None:
             options[key] = value
+    # Seed the per-subagent round-robin cursor from the task id: separate
+    # worker processes (separate Diffundo instances) then start their rotation
+    # at different providers and interleave requests across providers.
+    task_id = config.get("task_id") if isinstance(config, dict) else None
+    if isinstance(task_id, str) and task_id:
+        options.setdefault("rotation_seed", zlib.crc32(task_id.encode("utf-8")))
     return Diffundo(providers, **options), tier, model
 
 

@@ -688,12 +688,20 @@ class Diffundo:
         breaker_failure_threshold: float = 0.5,
         open_backoff_base: float = 2.0,
         retry_base_delay_s: float = 0.05,
+        rotation_seed: int = 0,
     ) -> None:
         self._providers = tuple(providers)
         self._runtimes = tuple(
             _ProviderRuntime(provider, breaker_window_size) for provider in self._providers
         )
         self._pauses = tuple(_PauseTracker() for _ in ProviderTier)
+        # Per-instance round-robin cursor for equal-priority candidates. Each
+        # worker process owns one Diffundo instance, so concurrent subagents
+        # interleave their requests across providers instead of all starting
+        # at the same provider (total token throughput); a caller may seed the
+        # cursor (e.g. from the task id) to desynchronize instances that start
+        # together.
+        self._rotation = rotation_seed
         self._call_budget_s = call_budget_s
         self._pause_timeout_s = pause_timeout_s
         self._breaker_window = breaker_window_size
@@ -799,6 +807,27 @@ class Diffundo:
                 continue
             out.append(provider)
         out.sort(key=lambda provider: provider.priority)
+        # Round-robin within equal-priority runs: priority ordering across
+        # tiers/groups is preserved; providers with the same priority rotate
+        # their start position so repeated calls interleave across them.
+        if len(out) > 1:
+            rotated: list[ProviderConfig] = []
+            run_start = 0
+            while run_start < len(out):
+                run_end = run_start + 1
+                while (
+                    run_end < len(out)
+                    and out[run_end].priority == out[run_start].priority
+                ):
+                    run_end += 1
+                run = out[run_start:run_end]
+                if len(run) > 1:
+                    offset = self._rotation % len(run)
+                    run = run[offset:] + run[:offset]
+                rotated.extend(run)
+                run_start = run_end
+            out = rotated
+        self._rotation += 1
         return out
 
     async def _await_candidates(
