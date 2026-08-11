@@ -576,7 +576,7 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
                           "task_id": "ipc-fence", "generation": 2})
             assert (await w.recv())["type"] == "ready"
             await w.send(_run_task_msg(
-                session_dir, run_rid="run-fence-1", work_delay_s=1.0,
+                session_dir, run_rid="run-fence-1", work_delay_s=0.3,
                 task_id="ipc-fence", generation=2,
             ))
             assert (await w.recv())["type"] == "heartbeat"
