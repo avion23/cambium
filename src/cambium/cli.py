@@ -117,6 +117,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "supervisor picks (provider, model, tier) from all enabled configured "
         "providers with stored credentials instead of pinning --provider/--model",
     )
+    parser.add_argument(
+        "--max-wall-s",
+        type=float,
+        metavar="SECONDS",
+        help="per-task wall-clock budget in seconds (default 300)",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -490,6 +496,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         provider=args.provider,
         model=args.model,
         auto=getattr(args, "auto", False),
+        max_wall_s=getattr(args, "max_wall_s", None) or oneshot.DEFAULT_WALL_BUDGET_S,
     )
     try:
         value = oneshot.run_oneshot(config)
