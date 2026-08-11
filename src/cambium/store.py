@@ -46,11 +46,12 @@ reservations use a short-lived, full-synchronous metadata connection before a
 replacement can enter the queue. Readers use their own short-lived connections.
 
 Redaction is optional for backward compatibility: when an event store is
-constructed with a ``cambium.redact.Redactor``, the complete event record is
-passed through its recursive ``redact_mapping`` before it enters the bounded
-queue and again immediately before the INSERT in the writer.  Without one, the
-event is persisted unchanged.  ``build_session_redactor`` is the single place
-a session constructs the shared redactor.
+constructed with a ``cambium.redact.Redactor``, the event envelope uses its
+explicit protocol redaction API before it enters the bounded queue and again
+immediately before the INSERT in the writer; nested payloads use generic
+recursive redaction. Without one, the event is persisted unchanged.
+``build_session_redactor`` is the single place a session constructs the shared
+redactor.
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .redact import Redactor
+from .redact import EVENT_RECORD_STRUCTURAL_FIELDS, Redactor
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +417,9 @@ class EventStore:
         if not isinstance(kind, str) or not kind:
             raise ValueError("event requires a non-empty string 'kind'")
         if self._redactor is not None:
-            event = self._redactor.redact_mapping(event)
+            event = self._redactor.redact_protocol_record(
+                event, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
+            )
             kind = event.get("kind")
         row = (
             json.dumps(event.get("payload", {})),
@@ -532,10 +535,28 @@ class EventStore:
         except (TypeError, ValueError):
             # Undecodable payloads are left untouched; substring redaction of
             # the encoded text would corrupt them further.
-            return (row[0],) + self._redactor.redact_mapping(row[1:])
-        redacted_payload = self._redactor.redact_mapping(payload)
-        return (json.dumps(redacted_payload),) + self._redactor.redact_mapping(
-            row[1:]
+            payload = row[0]
+        else:
+            payload = json.dumps(self._redactor.redact_mapping(payload))
+        metadata = self._redactor.redact_protocol_record(
+            {
+                "ts": row[1],
+                "monotonic_ms": row[2],
+                "task_id": row[3],
+                "worker_id": row[4],
+                "generation": row[5],
+                "request_id": row[6],
+            },
+            structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS,
+        )
+        return (
+            payload,
+            metadata["ts"],
+            metadata["monotonic_ms"],
+            metadata["task_id"],
+            metadata["worker_id"],
+            metadata["generation"],
+            metadata["request_id"],
         )
 
     def _record_dropped(self, count: int) -> None:

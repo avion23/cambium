@@ -1389,7 +1389,7 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
     assert append_errors == []
 
 
-def test_redactor_scrubs_opaque_secret_from_durable_rows(tmp_path) -> None:
+def test_redactor_scrubs_payload_but_preserves_structural_event_ids(tmp_path) -> None:
     opaque_key = "opaque-worker-controlled-secret-1234567890"
     event = {
         "kind": "result",
@@ -1422,8 +1422,8 @@ def test_redactor_scrubs_opaque_secret_from_durable_rows(tmp_path) -> None:
 
     (payload, task_id, request_id) = durable_rows(tmp_path / "redacted.db")[0]
     assert opaque_key not in payload
-    assert opaque_key not in task_id
-    assert opaque_key not in request_id
+    assert task_id == opaque_key
+    assert request_id == opaque_key
     assert "***" in payload
 
     (payload, task_id, request_id) = durable_rows(tmp_path / "plain.db")[0]

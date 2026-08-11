@@ -75,7 +75,12 @@ from cambium.system_health import can_run_heavy
 from .auth import MIN_API_KEY_BYTES, scrub_environment
 from .ipc import MAX_LINE_BYTES, write_message
 from .merge import MergeSequencer
-from .redact import Redactor, build_session_redactor
+from .redact import (
+    EVENT_RECORD_STRUCTURAL_FIELDS,
+    WORKER_RESULT_STRUCTURAL_FIELDS,
+    Redactor,
+    build_session_redactor,
+)
 from .results import EXIT_CODES, Result, write_result
 from .store import CRITICAL_KINDS, EventStore
 from .tasktree import (
@@ -777,7 +782,9 @@ class _Runtime:
     def _redact_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
         if self._redactor is None:
             return dict(envelope)
-        redacted = self._redactor.redact_mapping(envelope)
+        redacted = self._redactor.redact_protocol_record(
+            envelope, structural_fields=WORKER_RESULT_STRUCTURAL_FIELDS
+        )
         return dict(redacted)
 
     # -- event path ---------------------------------------------------------
@@ -803,7 +810,9 @@ class _Runtime:
             "payload": dict(payload),
         }
         if self._redactor is not None:
-            record = self._redactor.redact_mapping(record)
+            record = self._redactor.redact_protocol_record(
+                record, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
+            )
             kind = record["kind"]
         durable_record = self._copy_event(record)
         try:

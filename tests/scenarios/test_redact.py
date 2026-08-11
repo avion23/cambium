@@ -134,55 +134,63 @@ def test_registered_values_are_redacted_in_nested_tool_payloads() -> None:
     }
 
 
-def test_registered_values_skip_protocol_structure_but_redact_free_text() -> None:
+def test_generic_mapping_redacts_structure_and_protocol_allowlist_is_explicit() -> None:
     redactor = Redactor(secret_values={"merge", "result", "succeeded"})
-    payload = {
-        "kind": "merge",
-        "type": "result",
-        "status": "succeeded",
-        "task_id": "task-merge",
-        "worker_id": "worker-result",
-        "request_id": "request-succeeded",
-        "parent_task_id": "parent-merge",
-        "child_task_id": "child-result",
-        "generation": "generation-merge",
-        "schema_version": "schema-result",
-        "session_status": "succeeded",
-        "timeout_phase": "merge",
-        "parent": ["merge", "result"],
-        "summary": "merge result succeeded",
-        "reason": "result merge succeeded",
-        "nested": {"output": "merge result succeeded"},
-        "api_key": "merge",
-        "password": "result",
+    generic = redactor.redact_mapping(
+        {
+            "status": "merge",
+            "kind": "result",
+            "type": "succeeded",
+            "nested": {"status": "merge", "kind": "result", "message": "succeeded"},
+        }
+    )
+    assert generic == {
+        "status": "***",
+        "kind": "***",
+        "type": "***",
+        "nested": {"status": "***", "kind": "***", "message": "***"},
     }
 
-    output = redactor.redact_mapping(payload)
+    protocol = redactor.redact_protocol_record(
+        {
+            "kind": "merge",
+            "type": "result",
+            "status": "succeeded",
+            "task_id": "task-merge",
+            "request_id": "request-result",
+            "summary": "merge result succeeded",
+            "reason": "result merge succeeded",
+            "payload": {
+                "status": "merge",
+                "kind": "result",
+                "message": "succeeded",
+                "api_key": "merge",
+            },
+            "api_key": "merge",
+            "password": "result",
+        },
+        structural_fields={"kind", "type", "status", "task_id", "request_id", "payload"},
+    )
+    assert protocol["kind"] == "merge"
+    assert protocol["type"] == "result"
+    assert protocol["status"] == "succeeded"
+    assert protocol["task_id"] == "task-merge"
+    assert protocol["request_id"] == "request-result"
+    assert protocol["summary"] == "*** *** ***"
+    assert protocol["reason"] == "*** *** ***"
+    assert protocol["payload"] == {
+        "status": "***",
+        "kind": "***",
+        "message": "***",
+        "***": "***",
+    }
+    assert "api_key" not in protocol
+    assert "password" not in protocol
+    assert protocol["***"] == "***"
 
-    for field in (
-        "kind",
-        "type",
-        "status",
-        "task_id",
-        "worker_id",
-        "request_id",
-        "parent_task_id",
-        "child_task_id",
-        "generation",
-        "schema_version",
-        "session_status",
-        "timeout_phase",
-        "parent",
-    ):
-        assert output[field] == payload[field]
-    assert output["summary"] == "*** *** ***"
-    assert output["reason"] == "*** *** ***"
-    assert output["nested"] == {"output": "*** *** ***"}
-    assert "api_key" not in output
-    assert "password" not in output
-    assert output["***"] == "***"
-
-    contextual = redactor.redact_mapping({"status": "api_key=merge"})
+    contextual = redactor.redact_protocol_record(
+        {"status": "api_key=merge"}, structural_fields={"status"}
+    )
     assert contextual["status"] == "api_key=***"
 
 

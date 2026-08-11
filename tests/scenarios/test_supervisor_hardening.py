@@ -369,13 +369,34 @@ def test_registered_protocol_values_preserve_event_kinds_and_status(
         task="merge result succeeded",
         marker="// t-structured",
     )
+    observed: list[dict] = []
+    redactor = supervisor_module._session_redactor([task])
+    runtime = supervisor_module._Runtime(session_dir, object(), redactor=redactor)
+    envelope = runtime._redact_envelope(
+        {
+            "type": "result_envelope",
+            "request_id": "request-result",
+            "task_id": "task-merge",
+            "generation": "generation-succeeded",
+            "status": "succeeded",
+            "summary": "merge result succeeded",
+            "failure_reason": "result: merge succeeded",
+        }
+    )
+    assert envelope["type"] == "result_envelope"
+    assert envelope["status"] == "succeeded"
+    assert envelope["summary"] == "*** *** ***"
+    assert envelope["failure_reason"] == "***: *** ***"
 
-    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+    result = asyncio.run(
+        run_plan(session_dir, {"tasks": [task]}, on_event=observed.append)
+    )
     events = read_events(session_dir)
 
     assert result.results[0].status == "succeeded"
-    assert _kinds(events, "result")[0]["payload"]["status"] == "succeeded"
+    assert _kinds(events, "result")[0]["payload"]["status"] == "***"
     assert _kinds(events, "merge_committed")
+    assert any(event["kind"] == "merge_committed" for event in observed)
     assert events[-1]["kind"] == "session_ended"
     assigned = _kinds(events, "task_assigned")[0]
     assert assigned["payload"]["task"] == "*** *** ***"
