@@ -129,6 +129,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="N",
         help="total token budget across the run (default 200000)",
     )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="maximum agent-loop turns (default 20)",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -504,6 +510,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         auto=getattr(args, "auto", False),
         max_wall_s=getattr(args, "max_wall_s", None) or oneshot.DEFAULT_WALL_BUDGET_S,
         max_tokens=getattr(args, "max_tokens", None) or oneshot.DEFAULT_MAX_TOKENS,
+        max_turns=getattr(args, "max_turns", None) or oneshot.DEFAULT_MAX_TURNS,
     )
     try:
         value = oneshot.run_oneshot(config)

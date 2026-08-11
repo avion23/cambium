@@ -29,7 +29,7 @@ from .auth import (
 from .ipc import MAX_LINE_BYTES
 from .provider_config import ProviderSelectionError, load_providers, select_provider
 from .session import session_root
-from .supervisor import DEFAULT_MAX_TOKENS, DEFAULT_WALL_BUDGET_S, EventSink, PlanResult
+from .supervisor import DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS, DEFAULT_WALL_BUDGET_S, EventSink, PlanResult
 
 __all__ = [
     "EventSink",
@@ -79,6 +79,7 @@ class OneShotConfig:
     base_commit: str | None = None
     max_wall_s: float = DEFAULT_WALL_BUDGET_S
     max_tokens: int = DEFAULT_MAX_TOKENS
+    max_turns: int = DEFAULT_MAX_TURNS
     max_restarts: int = 0
     target_file: str | None = None
     marker: str | None = None
@@ -357,6 +358,7 @@ def build_plan(
         "provider_env_keys": list(config.provider_env_keys),
         "max_wall_s": config.max_wall_s,
         "max_tokens": int(config.max_tokens),
+        "max_turns": int(config.max_turns),
         "max_restarts": config.max_restarts,
     }
     if config.model_candidates:
