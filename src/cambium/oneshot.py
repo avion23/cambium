@@ -35,6 +35,7 @@ from .supervisor import (
     DEFAULT_WALL_BUDGET_S,
     EventSink,
     PlanResult,
+    _reject_reused_session,
 )
 
 __all__ = [
@@ -324,17 +325,6 @@ def _allocate_session_dir(repo: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix="run-", dir=root))
 
 
-def _reject_reused_session(session_dir: Path) -> None:
-    """Reject an explicit session leaf that already contains run artifacts."""
-    artifacts = (
-        session_dir / "plan.json",
-        session_dir / ".cambium" / "events.db",
-        session_dir / ".cambium" / "result.json",
-    )
-    if any(path.exists() for path in artifacts):
-        raise ValueError(f"one-shot session directory has already been used: {session_dir}")
-
-
 def _default_branch(session_dir: Path) -> str:
     """Return a stable, private branch name for one concrete session leaf."""
     suffix = sha256(str(session_dir).encode("utf-8")).hexdigest()[:16]
@@ -406,6 +396,7 @@ async def run_oneshot(
     if explicit_session_dir is not None:
         preflight(config, repo, explicit_session_dir)
         _reject_reused_session(explicit_session_dir)
+
     resolved, provider_environment = _resolve_provider(config, repo)
     session_dir = (
         explicit_session_dir
@@ -429,7 +420,12 @@ async def run_oneshot(
             on_event=on_event,
             provider_environment=provider_environment,
             routing_state_path=routing_state_path,
+            reject_reused_session=True,
         )
     return await supervisor.run_plan(
-        session_dir, plan, on_event=on_event, routing_state_path=routing_state_path
+        session_dir,
+        plan,
+        on_event=on_event,
+        routing_state_path=routing_state_path,
+        reject_reused_session=True,
     )

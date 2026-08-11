@@ -2647,6 +2647,24 @@ class _Runtime:
         return staging_tip
 
 
+def _reject_reused_session(session_dir: str | Path) -> None:
+    """Reject a session leaf that already contains run artifacts.
+
+    The explicit one-shot session contract (``oneshot.run_oneshot``) rejects a
+    reused leaf; the check is re-verified here while the caller holds the
+    session admission lock so a leaf that became used while the caller waited
+    (TOCTOU across provider resolution) is rejected before any write.
+    """
+    path = Path(session_dir).resolve()
+    artifacts = (
+        path / "plan.json",
+        path / ".cambium" / "events.db",
+        path / ".cambium" / "result.json",
+    )
+    if any(artifact.exists() for artifact in artifacts):
+        raise ValueError(f"one-shot session directory has already been used: {path}")
+
+
 def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
     """Atomically persist the accepted plan as ``<session_dir>/plan.json``.
 
@@ -3231,6 +3249,7 @@ async def run_plan(
     max_width: int | None = None,
     max_concurrent_tasks: int | None = None,
     routing_state_path: str | Path | None = None,
+    reject_reused_session: bool = False,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3248,6 +3267,14 @@ async def run_plan(
     ``<session_dir>/.cambium/events.db`` (readable via ``read_events``), and a
     canonical root result is written atomically to
     ``<session_dir>/.cambium/result.json`` before this coroutine returns.
+
+    When ``reject_reused_session`` is set, the session is refused (ValueError
+    with the one-shot reused-session message) while the admission lock is
+    held, before ``plan.json`` is written, if the leaf already contains run
+    artifacts. One-shot explicit sessions pass this so a leaf that became used
+    while the caller resolved its provider is rejected instead of overwritten.
+    The supervisor's own reconciliation path (re-running a session) keeps the
+    default ``False``.
 
     Dispatch shape:
 
@@ -3286,6 +3313,8 @@ async def run_plan(
     admission = _SessionAdmission(session_dir)
     admission.acquire()
     try:
+        if reject_reused_session:
+            _reject_reused_session(session_dir)
         await asyncio.to_thread(_write_plan, session_dir, {"tasks": specs})
         started_at = time.time()
         redactor = _session_redactor(specs, provider_environment)
