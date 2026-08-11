@@ -3,18 +3,7 @@
 Ordered work only. Source and tests decide when a step is complete; this file
 is not a branch ledger or merge log.
 
-## 1. Live-run prerequisites — gates removed by decision
-
-- The pre-merge gate runner, its `CompileGate` concurrency bound, and the
-  escaped free-form redaction canary were removed by product decision: this is
-  a local development tool run directly from source, so there is no production
-  gating. The bench canary test no longer exists.
-- Observation that still stands: `run_plan`'s flat `TaskGroup` starts one
-  lifecycle per task with no worker-count semaphore; an 11-task canary observed
-  11 concurrent supervisions. `resource_thresholds` remains the only pre-run
-  host-health check.
-
-## 2. Smallest production hierarchy slice: static waves
+## 1. Smallest production hierarchy slice: static waves
 
 - Make the harness own one explicit validated `TaskTree`. Integrate
   `build_tree`, `ready_tasks`, and `topological_order` with `run_plan` so static
@@ -26,7 +15,7 @@ is not a branch ledger or merge log.
   dispatch, width enforcement, bounded child context, and exact envelope keys;
   failed children stop dependent admission.
 
-## 3. Validated dynamic child admission
+## 2. Validated dynamic child admission
 
 - After the static slice is reproducible, let a parent propose a child only as a
   typed tree revision. The harness validates and durably records each revision
@@ -37,14 +26,7 @@ is not a branch ledger or merge log.
   over-width revisions spawn nothing; a valid child is admitted only at a ready
   wave and its envelope is visible only to its parent.
 
-## 4. Per-worker OS containment and approval — removed by decision
-
-- OS containment and `approval.py:ApprovalGate` policy/callback wiring in the
-  worker tool context are removed by product decision. Worktree/process-group
-  isolation remains the only worker boundary; `tools.py` `run_shell`/`git_op`
-  execute without approval. The allowlist and argument validation stay.
-
-## 5. Provider usage, prompt stability, and quota contract
+## 3. Provider usage, prompt stability, and quota contract
 
 - Specify redacted durable usage events: provider, model, request/turn,
   token fields, cost, latency, Retry-After, request-rate status, account-quota
@@ -62,11 +44,11 @@ is not a branch ledger or merge log.
 - Acceptance measures: fixed prompts report stable prefix and cache-hit fields;
   rate-limit and accounting failures are visible without exposing credentials.
 
-## 6. External-provider smoke
+## 4. External-provider smoke
 
-- After step 5 is verified and credentials exist, run one disposable provider
+- After step 3 is verified and credentials exist, run one disposable provider
   configuration through the custom worker loop, tool/checkpoint events, and
-  ref-only merge (no pre-merge gate).
+  ref-only merge.
 - Keep the run opt-in and networked only by explicit command. Record request
   count, usage events, commit, merge ref, and the failure case that leaves
   `main` unchanged without recording secrets.
@@ -74,11 +56,11 @@ is not a branch ledger or merge log.
   usage record, one expected ref update, and an unchanged `main` on the
   failure fixture.
 - Local fake-provider fixtures can support regression tests, but they do not
-  substitute for an external-provider run or prove per-worker OS isolation.
+  substitute for an external-provider run.
 
-## 7. Follow-on evaluation
+## 5. Follow-on evaluation
 
-After steps 1–6 are reproducible, measure worker reuse, provider routing,
+After steps 1–4 are reproducible, measure worker reuse, provider routing,
 context compression, and the example module's DSPy seam with fixed datasets,
 baselines, and failure criteria. Adopt, defer, or reject each experiment from
 its evidence; do not change the runtime contract silently.
