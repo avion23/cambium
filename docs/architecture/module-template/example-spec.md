@@ -229,7 +229,7 @@ Architectus integration test yet.
 The module conformance command is:
 
 ```console
-uv run --extra test cambium module-test example
+PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test example
 ```
 
 It validates tracked layout, manifest, dataset and baseline schema/digests,

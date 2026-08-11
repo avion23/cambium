@@ -5,15 +5,8 @@ description = "Multi-agent coding-agent harness"
 readme = "README.md"
 requires-python = ">=3.14"
 # pytest is a runtime dependency: `cambium bench` and `cambium module-test`
-# import pytest (bench.py, module_conformance.py) in a plain wheel install.
+# import pytest at runtime (bench.py, module_conformance.py).
 dependencies = ["pytest>=9"]
-
-[project.scripts]
-cambium = "cambium.cli:main"
-
-[project.entry-points.pytest11]
-"cambium.bench" = "cambium.bench"
-"cambium.module_conformance" = "cambium.module_conformance"
 
 [project.optional-dependencies]
 dspy = ["dspy>=3.3.0,<3.4"]
@@ -38,13 +31,6 @@ dev = [
     "tree-sitter-python>=0.25",
     "dspy>=3.3.0,<3.4",
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/cambium"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "src"]
