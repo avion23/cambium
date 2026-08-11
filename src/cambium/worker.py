@@ -778,11 +778,17 @@ def _build_agent_prompt(
     ]
     messages = [{"role": "system", "content": "\n".join(system_lines)}]
     messages.extend(transcript)
-    if not any(message.get("role") != "system" for message in messages):
-        # Some providers (e.g. ZAI/GLM) reject a messages array that contains
-        # only a system message; a neutral user opener keeps turn one valid
-        # without changing the static system prefix (plan step 3 caching).
-        messages.append({"role": "user", "content": "Begin."})
+    if not messages or messages[-1].get("role") != "user":
+        # Some providers (e.g. ZAI/GLM) reject payloads whose last message is
+        # not a user message: a fresh transcript has no non-system message
+        # (1214 on turn one), and a plan action leaves the transcript ending
+        # with an assistant message (1214 on the next turn). A neutral user
+        # message keeps every payload valid without changing the static
+        # system prefix (plan step 3 caching).
+        messages.append({
+            "role": "user",
+            "content": "Begin." if len(messages) == 1 else "Continue.",
+        })
     return {"messages": messages}
 
 

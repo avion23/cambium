@@ -133,19 +133,23 @@ async def _drive_loop(
 # Plan-before-act: plan action parses, is stored, and the loop proceeds
 # ---------------------------------------------------------------------------
 
-def test_build_agent_prompt_turn_one_has_non_system_message() -> None:
-    """Turn-one payloads must contain a non-system message (ZAI/GLM 1214)."""
+def test_build_agent_prompt_last_message_is_always_user() -> None:
+    """Payloads must not end on a system/assistant message (ZAI/GLM 1214)."""
     prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_file"}], [])
     messages = prompt["messages"]
     assert messages[0]["role"] == "system"
-    assert any(message.get("role") != "system" for message in messages)
-    # The static system prefix is unchanged when a transcript already exists.
-    with_transcript = worker._build_agent_prompt(
-        "edit a.txt",
-        [{"name": "read_file"}],
-        [{"role": "assistant", "content": "{\"type\": \"plan\", \"steps\": []}"}],
-    )
-    assert with_transcript["messages"][0]["content"] == messages[0]["content"]
+    assert messages[-1]["role"] == "user"
+    # A plan action leaves the transcript ending with an assistant message;
+    # the builder appends a neutral user continuation.
+    plan_transcript = [
+        {"role": "user", "content": "Begin."},
+        {"role": "assistant", "content": "{\"type\": \"plan\", \"steps\": []}"},
+    ]
+    prompt2 = worker._build_agent_prompt("edit a.txt", [{"name": "read_file"}], plan_transcript)
+    assert prompt2["messages"][-1]["role"] == "user"
+    assert prompt2["messages"][-1]["content"] == "Continue."
+    # The static system prefix is unchanged across transcripts.
+    assert prompt2["messages"][0]["content"] == messages[0]["content"]
 
 
 
