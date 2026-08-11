@@ -60,7 +60,7 @@ def _batch_context(tmp_path: Path, events: list[dict] | None = None) -> ToolCont
     )
 
 
-@pytest.mark.slow  # 3x100ms scripted reads; asserts elapsed < 0.2 (load-sensitive)
+@pytest.mark.slow  # 3x100ms scripted reads; concurrency proven by overlap, not wall clock
 def test_read_batch_runs_three_100ms_reads_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -68,13 +68,18 @@ def test_read_batch_runs_three_100ms_reads_concurrently(
         (tmp_path / name).write_text(name, encoding="utf-8")
 
     original = tools._read_file_sync
+    state = {"active": 0, "max_active": 0}
 
     def delayed_read(_ctx, path, display_path):
-        time.sleep(0.1)
-        return original(_ctx, path, display_path)
+        state["active"] += 1
+        state["max_active"] = max(state["max_active"], state["active"])
+        try:
+            time.sleep(0.1)
+            return original(_ctx, path, display_path)
+        finally:
+            state["active"] -= 1
 
     monkeypatch.setattr(tools, "_read_file_sync", delayed_read)
-    started = time.perf_counter()
     results = asyncio.run(
         run_read_batch(
             [{"path": "one.txt"}, {"path": "two.txt"}, {"path": "three.txt"}],
@@ -82,7 +87,11 @@ def test_read_batch_runs_three_100ms_reads_concurrently(
         )
     )
 
-    assert time.perf_counter() - started < 0.2
+    # Sequential execution would peak at 1 active read; overlap proves the
+    # batch ran the three 100ms reads concurrently. Wall-clock bounds are
+    # load-sensitive under parallel test runs (pytest-xdist), so the
+    # overlap metric is the load-immune proof.
+    assert state["max_active"] == 3
     assert [result.output for result in results] == ["one.txt", "two.txt", "three.txt"]
 
 
