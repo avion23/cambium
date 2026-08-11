@@ -1,72 +1,58 @@
 # Cambium
 
-Cambium is a Python-native coding-agent harness, run directly from source. No
-wheel is built and no install is required or supported. The `cambium` CLI starts
-a supervisor, workers edit isolated Git worktrees over NDJSON stdio, and a
-clean worker whose envelope reports `succeeded` publishes to `refs/heads/main`.
-There is no task-command pre-merge gate, no `CompileGate`, and no approval
-gate: this is a local development tool, so a succeeded envelope proceeds to
-merge after the repository-integrity checks pass and tools execute without an
-approval gate.
-
-## Current shape
-
-- `cambium.supervisor.run_plan` accepts a flat supplied task list and supervises
-  it concurrently. There is no worker-count semaphore: an 11-task canary
-  observed 11 concurrent supervisions. `resource_thresholds` only checks host
-  health. There is no pre-merge gate and no `CompileGate`: a clean worker whose
-  envelope reports `succeeded` is merged after the repository-integrity checks
-  pass. Events persist in `.cambium/events.db`; publication does not refresh a
-  checkout.
-- `worker.do_work` has deterministic marker mode and a bounded custom provider
-  and tool loop. Provider calls go through `Diffundo`; strict actions dispatch
-  validated tools, emit checkpoints, and end in one worker commit.
-- `Diffundo` has tier, priority, cooldown, configured-RPM request-rate buckets,
-  and retry behavior. Rate-limited providers report `RATE_LIMITED`; HTTP 429
-  `Retry-After` is honored.
-- `tasktree` validates and snapshots dependency specs, but `run_plan` does not
-  schedule that tree. Architectus, dynamic decomposition, and the conversation
-  store are not wired into `run_plan`.
-- Target scheduling starts with a harness-owned validated tree and static
-  ready-node waves. Each child gets a fresh bounded context and returns only a
-  strict envelope; dynamic child admission follows that slice. Prompt-prefix
-  stability and provider cache-hit metrics are acceptance requirements.
-- The package exports only `__version__`; use the CLI or module-level functions.
-  The example module includes deterministic `decide` and `evaluate` operations.
-
-See [`docs/research/v2-1-status.md`](docs/research/v2-1-status.md) for the live
-capability and gap table. Source and tests are the evidence; target contracts
-are in [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
-
-## Quickstart
-
-Cambium is a local development tool run directly from source. Requires Python
-3.14 and the project dependencies installed for pytest. No wheel is built and
-no install is required or supported: point `PYTHONPATH` at `src` and run the
-module.
+Cambium is a Python-native multi-agent coding-agent harness. The `cambium`
+CLI runs directly from source with the system interpreter:
 
 ```sh
-PYTHONPATH=src python3.14 -m pytest -q
-```
-
-Run the deterministic demo:
-
-```sh
-PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
-PYTHONPATH=src python3.14 -m cambium.cli session show --session-dir demo demo-001
 PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
-Plan publication advances `refs/heads/main` only. Read that ref or explicitly
-update a consumer checkout before building or testing it.
+## User CLI
+
+The entry point (`src/cambium/cli.py`) dispatches these commands:
+
+- `run PROMPT` — run one prompt against a repository (`--repo`,
+  `--session-dir`, `--provider`, `--model`, `--json`).
+- `repl` — interactive line loop; each input line is one prompt.
+- `tui` — line-oriented front end with a `cambium> ` prompt.
+- `session list | latest | show SESSION` — read completed sessions from their
+  `.cambium/result.json` and `.cambium/events.db` artifacts.
+- `supervisor --session-dir DIR` — run one supervisor session from a plan, a
+  task spec, or the built-in deterministic demo.
+- `auth set|remove|list PROVIDER` — manage stored provider credentials; read
+  the key from stdin with `--stdin`.
+- `doctor`, `bench`, `tasktree`, `module-test`, `version` — diagnostics and
+  tooling.
+
+A multi-word command line that is not a known command is a prompt:
+`cambium make the change` runs `cambium run "make the change"`.
+
+See [`docs/architecture/user-cli.md`](docs/architecture/user-cli.md) for the
+exact run, bare-prompt, repl, tui, and session workflows, provider selection
+from `.cambium/providers.json`, and how stored credentials are handed to
+workers in memory.
+
+## Quickstart
+
+```sh
+PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
+PYTHONPATH=src python3.14 -m cambium.cli session show --session-dir . demo
+PYTHONPATH=src python3.14 -m cambium.cli --help
+```
+
+The supervisor demo runs a deterministic worker against a seeded repository
+inside `demo/` and publishes its branch onto that repository's
+`refs/heads/main`.
 
 ## Documentation authority
 
 - [`agents.md`](agents.md) — operating contract and current module map.
 - [`docs/architecture/architecture.md`](docs/architecture/architecture.md) —
   canonical current-versus-target contract.
-- [`docs/research/v2-1-status.md`](docs/research/v2-1-status.md) — sole detailed
-  live capability/gap table.
+- [`docs/architecture/user-cli.md`](docs/architecture/user-cli.md) — user CLI
+  workflows and credential handoff.
+- [`docs/research/v2-1-status.md`](docs/research/v2-1-status.md) — capability
+  and gap table.
 - [`implementation-plan.md`](implementation-plan.md) — ordered work only.
-- [`docs/research/README.md`](docs/research/README.md) — research authority and
-  index. Drafts provide context, not runtime proof.
+- [`docs/research/README.md`](docs/research/README.md) — research authority
+  and index.
