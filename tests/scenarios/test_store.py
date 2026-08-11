@@ -332,7 +332,7 @@ def test_stalled_writer_flood_drops_non_critical_preserves_critical(
 @pytest.mark.slow
 def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatch) -> None:
     store = EventStore(
-        tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.5
+        tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.4
     )
     release = threading.Event()
     real_fsync = EventStore._fsync_now
@@ -368,7 +368,7 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
 @pytest.mark.slow
 def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=1.0)
+    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=0.6)
     reader = sqlite3.connect(path)
     try:
         reader.execute("BEGIN")
@@ -456,8 +456,12 @@ def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) ->
 @pytest.mark.slow
 def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
+    # max_queue_size=2: the close sentinel is admitted immediately (one slot
+    # free alongside the stalled non-critical item), so close() spends its
+    # deadline on the writer join rather than on the sentinel admission wait;
+    # the force-stop verdict is what this test pins.
     store = EventStore(
-        path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=60.0
+        path, fsync_interval_s=60.0, max_queue_size=2, critical_timeout_s=60.0
     )
     fsync_started = threading.Event()
     release = threading.Event()
@@ -833,7 +837,7 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
     tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.3)
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2)
     fsync_started = threading.Event()
     fsync_release = threading.Event()
     reservation_started = threading.Event()
@@ -889,7 +893,7 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
 
         closer.start()
         assert persistence_started.wait(1.0)
-        time.sleep(0.45)  # let the blocked eviction reservation reach its deadline
+        time.sleep(0.3)  # let the blocked eviction reservation reach its deadline
         blocker.rollback()
         blocker.close()
         blocker = None
