@@ -47,6 +47,7 @@ DEFAULT_MAX_TURNS = 50
 __all__ = [
     "EventSink",
     "OneShotConfig",
+    "allocate_session_dir",
     "build_plan",
     "default_session_root",
     "preflight",
@@ -321,7 +322,8 @@ def _resolve_provider(
     return resolved, _stored_provider_environment(selected.api_key_env, auth_store)
 
 
-def _allocate_session_dir(repo: Path) -> Path:
+def allocate_session_dir(repo: str | Path) -> Path:
+    """Allocate a fresh session leaf under the repository's session root."""
     root = default_session_root(repo)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -407,7 +409,7 @@ async def run_oneshot(
     session_dir = (
         explicit_session_dir
         if explicit_session_dir is not None
-        else _allocate_session_dir(repo)
+        else allocate_session_dir(repo)
     )
     preflight(resolved, repo, session_dir)
     plan = build_plan(resolved, repo, session_dir)

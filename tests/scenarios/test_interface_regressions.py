@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 from pathlib import Path
 
-from cambium import cli, oneshot, repl, session, tui
+from cambium import cli, oneshot, repl, session, stats, tui
 from cambium.render import render_json_result, render_text_result
 from cambium.store import EventStore
 from cambium.supervisor import PlanResult, TaskResult
@@ -19,6 +20,23 @@ class _FlushStream(io.StringIO):
 
     def flush(self) -> None:
         self.flushes += 1
+
+
+_EVENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS events (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT    NOT NULL,
+    payload      TEXT    NOT NULL,
+    ts           TEXT,
+    monotonic_ms INTEGER,
+    task_id      TEXT,
+    worker_id    TEXT,
+    generation   INTEGER,
+    request_id   TEXT
+)"""
+
+
+def _succeeded_run(_config: oneshot.OneShotConfig) -> PlanResult:
+    return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
 
 def _no_change_result() -> PlanResult:
@@ -157,3 +175,102 @@ def test_cli_session_show_renderer_failure_is_clean(capsys, tmp_path):
     assert "cambium session:" in captured.err
     assert "Traceback" not in captured.err
     assert "secret-must-not-be-printed" not in captured.err
+
+
+def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
+    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+        return _succeeded_run(_config)
+
+    monkeypatch.setattr(oneshot, "run_oneshot", run)
+    session_dir = oneshot.allocate_session_dir(oneshot.resolve_repo(tmp_path))
+    db = session_dir / ".cambium" / "events.db"
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db) as connection:
+        connection.execute(_EVENTS_SCHEMA)
+        for payload in (
+            {
+                "turn": 1,
+                "provider": "p1",
+                "model": "opencode-go/deepseek-v4-flash",
+                "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+            },
+            {
+                "turn": 2,
+                "provider": "p1",
+                "model": "opencode-go/deepseek-v4-flash",
+                "usage": {"input_tokens": 30, "output_tokens": 20, "total_tokens": 50},
+            },
+        ):
+            connection.execute(
+                "INSERT INTO events(kind, payload) VALUES(?, ?)",
+                ("usage_event", json.dumps(payload, sort_keys=True)),
+            )
+    out = _FlushStream()
+    err = _FlushStream()
+    code = tui.run_tui(
+        oneshot.OneShotConfig(repo=tmp_path, session_root=session_dir),
+        input_stream=io.StringIO("hi\n"),
+        output_stream=out,
+        error_stream=err,
+    )
+    value = out.getvalue()
+    assert code == 0
+    assert err.getvalue() == ""
+    assert "plan_status={succeeded}" in value
+    assert "stats: calls=2 tokens=200 in=130 out=70 cached=0 last_turn=+50" in value
+    assert "model=opencode-go/deepseek-v4-flash" in value
+    assert f"worktree={session_dir / 'wt'}" in value
+
+
+def test_tui_without_usage_events_prints_no_stats_line(monkeypatch, tmp_path):
+    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+        return _succeeded_run(_config)
+
+    monkeypatch.setattr(oneshot, "run_oneshot", run)
+    session_dir = oneshot.allocate_session_dir(oneshot.resolve_repo(tmp_path))
+    out = _FlushStream()
+    err = _FlushStream()
+    code = tui.run_tui(
+        oneshot.OneShotConfig(repo=tmp_path, session_root=session_dir),
+        input_stream=io.StringIO("hi\n"),
+        output_stream=out,
+        error_stream=err,
+    )
+    value = out.getvalue()
+    assert code == 0
+    assert err.getvalue() == ""
+    assert "plan_status={succeeded}" in value
+    assert "stats:" not in value
+
+
+def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
+    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+        return _succeeded_run(_config)
+
+    def _fail_stats(_session_dir):
+        raise RuntimeError("stats backend unavailable")
+
+    monkeypatch.setattr(oneshot, "run_oneshot", run)
+    monkeypatch.setattr(stats, "session_usage_stats", _fail_stats)
+    out = _FlushStream()
+    err = _FlushStream()
+    code = tui.run_tui(
+        oneshot.OneShotConfig(repo=tmp_path),
+        input_stream=io.StringIO("hi\n"),
+        output_stream=out,
+        error_stream=err,
+    )
+    value = out.getvalue()
+    assert code == 0
+    assert err.getvalue() == ""
+    assert "plan_status={succeeded}" in value
+    assert "stats:" not in value
+
+
+def test_oneshot_allocate_session_dir(tmp_path):
+    first = oneshot.allocate_session_dir(tmp_path)
+    second = oneshot.allocate_session_dir(tmp_path)
+    assert first.parent == oneshot.default_session_root(tmp_path)
+    assert first.is_dir()
+    assert second.is_dir()
+    assert first != second
