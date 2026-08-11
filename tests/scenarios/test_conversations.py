@@ -139,7 +139,10 @@ def test_close_drains_and_reopen_reads_all_rows(tmp_path) -> None:
         reopened.close()
 
 
+@pytest.mark.slow
 def test_crash_durability_reopen_keeps_committed_rows(tmp_path) -> None:
+    # Crash durability is a genuine process-boundary property: the writer
+    # subprocess calls os._exit(9) mid-append, which in-process cannot show.
     path = tmp_path / "crash" / "conversations.db"
     count = 50
     script = (
