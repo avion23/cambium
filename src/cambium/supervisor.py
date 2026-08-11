@@ -211,7 +211,9 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     """Return worker usage_event fields whose values must not enter durable events.
 
     Field names only; values are never echoed back. Unknown fields fail the
-    whole event so a schema drift cannot smuggle data into the log.
+    whole event so a schema drift cannot smuggle data into the log. Known
+    usage counts must be finite and non-negative; rejecting the whole event
+    keeps invalid values out of the routing-debt ledger.
     """
     unknown = sorted(set(msg) - ({"type", "task_id", "generation"} | _USAGE_EVENT_FORWARD_FIELDS))
     if unknown:
@@ -238,8 +240,7 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
         not isinstance(usage, dict)
         or any(
             key not in _PROVIDER_METADATA_USAGE_FIELDS
-            or isinstance(value, bool)
-            or not isinstance(value, (int, float))
+            or not _valid_usage_count(value)
             for key, value in usage.items()
         )
     ):
@@ -475,6 +476,15 @@ _PROVIDER_METADATA_USAGE_FIELDS = frozenset(
 )
 
 
+def _valid_usage_count(value: Any) -> bool:
+    """Return whether a provider token count is finite and non-negative."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
+
+
 def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
     """Return only validated provider-key names declared by a task."""
     values: list[Any] = []
@@ -587,7 +597,11 @@ def _worker_environment(
 
 
 def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
-    """Keep only scalar provider provenance safe for event serialization."""
+    """Keep only scalar provider provenance safe for event serialization.
+
+    Invalid known usage counts are omitted at this untrusted result boundary;
+    no negative or non-finite count is serialized.
+    """
     if not isinstance(value, dict):
         return None
     provider = value.get("provider")
@@ -604,8 +618,7 @@ def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
         key: count
         for key, count in usage.items()
         if key in _PROVIDER_METADATA_USAGE_FIELDS
-        and isinstance(count, (int, float))
-        and not isinstance(count, bool)
+        and _valid_usage_count(count)
     }
     return {
         "provider": provider,

@@ -108,6 +108,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -597,6 +598,29 @@ def _atomic_json_write(path: Path, content: str) -> None:
                 pass
 
 
+def _valid_usage_count(value: Any) -> bool:
+    """Return whether a provider token count is finite and non-negative."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
+
+
+def _invalid_usage_fields(usage: dict[str, Any] | None) -> tuple[str, ...]:
+    """Return recognized provider usage fields with unsafe numeric values.
+
+    Unknown provider usage fields remain omitted as before; the worker only
+    accepts the scalar token-count fields in ``_USAGE_COUNT_FIELDS``.
+    """
+    if not isinstance(usage, dict):
+        return ()
+    return tuple(sorted(
+        key for key, value in usage.items()
+        if key in _USAGE_COUNT_FIELDS and not _valid_usage_count(value)
+    ))
+
+
 def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
     if not isinstance(usage, dict):
         return {}
@@ -604,8 +628,7 @@ def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
         key: value
         for key, value in usage.items()
         if key in _USAGE_COUNT_FIELDS
-        and isinstance(value, (int, float))
-        and not isinstance(value, bool)
+        and _valid_usage_count(value)
     }
 
 
@@ -701,37 +724,61 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
 
 
 def _usage_total(usage: dict[str, Any] | None) -> int | None:
-    """Return the usable token total for one completion, or ``None`` (fail closed)."""
+    """Return one completion's usable token total, or ``None`` (fail closed).
+
+    A recognized invalid count rejects the whole completion instead of being
+    silently omitted.  This is the strict ingestion choice: the caller fails
+    the attempt before emitting an event or updating cumulative usage.
+    """
     if not isinstance(usage, dict):
         return None
+    if _invalid_usage_fields(usage):
+        return None
     total = usage.get("total_tokens")
-    if isinstance(total, (int, float)) and not isinstance(total, bool):
+    if _valid_usage_count(total):
         return int(total)
     inputs = usage.get("input_tokens", usage.get("prompt_tokens"))
     outputs = usage.get("output_tokens", usage.get("completion_tokens"))
     if (
-        isinstance(inputs, (int, float))
-        and not isinstance(inputs, bool)
-        and isinstance(outputs, (int, float))
-        and not isinstance(outputs, bool)
+        _valid_usage_count(inputs)
+        and _valid_usage_count(outputs)
     ):
         return int(inputs) + int(outputs)
     return None
 
 
 def _accumulate_usage(cumulative: dict[str, int], usage: dict[str, Any] | None) -> dict[str, int]:
+    """Add one validated completion without letting a stale total poison it.
+
+    ``total_tokens`` in the cumulative snapshot is a normalized running total:
+    each call contributes its explicit total when present, otherwise its
+    input+output sum.  It is not a sum of only the calls that reported an
+    explicit ``total_tokens`` field.
+    """
+    if _invalid_usage_fields(usage):
+        return cumulative
     for key, value in _usage_counts(usage).items():
+        if key == "total_tokens":
+            continue
         cumulative[key] = cumulative.get(key, 0) + int(value)
+    total = _usage_total(usage)
+    if total is not None:
+        previous_total = cumulative.get("total_tokens", 0)
+        if not _valid_usage_count(previous_total):
+            previous_total = 0
+        cumulative["total_tokens"] = int(previous_total) + total
     return cumulative
 
 
 def _cumulative_total(cumulative: dict[str, int]) -> int:
     total = cumulative.get("total_tokens")
-    if total is not None:
-        return total
-    return cumulative.get("input_tokens", cumulative.get("prompt_tokens", 0)) + cumulative.get(
-        "output_tokens", cumulative.get("completion_tokens", 0)
-    )
+    if _valid_usage_count(total):
+        return int(total)
+    inputs = cumulative.get("input_tokens", cumulative.get("prompt_tokens"))
+    outputs = cumulative.get("output_tokens", cumulative.get("completion_tokens"))
+    if _valid_usage_count(inputs) and _valid_usage_count(outputs):
+        return int(inputs) + int(outputs)
+    return 0
 
 
 def _transcript_chars(transcript: list[dict[str, Any]]) -> int:
@@ -1362,14 +1409,22 @@ async def _run_agent_loop(
                     outcome, "failed", "provider response model mismatch",
                     turn - 1, cumulative_usage, transcript,
                 )
-            if writer is not None:
-                await _emit_usage_event(writer, config, _success_usage_event(result, turn))
+            invalid_usage_fields = _invalid_usage_fields(result.usage)
+            if invalid_usage_fields:
+                # Strict choice: reject the attempt rather than omit a bad
+                # provider count and continue with a misleading budget/debt.
+                return _loop_result(
+                    outcome, "failed", "provider usage contains invalid token counts",
+                    turn - 1, cumulative_usage, transcript,
+                )
             total = _usage_total(result.usage)
             if total is None:
                 return _loop_result(
                     outcome, "failed", "provider usage missing usable token counts",
                     turn - 1, cumulative_usage, transcript,
                 )
+            if writer is not None:
+                await _emit_usage_event(writer, config, _success_usage_event(result, turn))
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
             if _cumulative_total(cumulative_usage) > config.max_tokens:
                 return _loop_result(
