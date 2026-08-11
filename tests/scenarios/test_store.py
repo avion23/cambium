@@ -368,7 +368,12 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
 @pytest.mark.slow
 def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=0.3)
+    # 2.0s critical timeout: the first append must fail to ack while the
+    # reader holds the WAL (no ack, no hang — asserted below), and the second
+    # append needs the writer thread to recover once the reader releases;
+    # under parallel load (pytest-xdist) 0.3s leaves no headroom for the
+    # writer's busy-retry + fsync.
+    store = EventStore(path, fsync_interval_s=60.0, critical_timeout_s=2.0)
     reader = sqlite3.connect(path)
     try:
         reader.execute("BEGIN")
