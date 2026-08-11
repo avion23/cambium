@@ -35,6 +35,8 @@ from .diffundo import (
     _tool_call_arguments,
 )
 
+from .provider_config import AuthMode, Protocol
+
 # isort: on
 
 _GENERATION_FIELDS = (
@@ -637,6 +639,9 @@ class _CambiumLMMixin:
                     "cooldown_s": provider.cooldown_s,
                     "price_per_1m_in": provider.price_per_1m_in,
                     "price_per_1m_out": provider.price_per_1m_out,
+                    "auth": provider.auth.value,
+                    "protocol": provider.protocol.value,
+                    "reasoning_effort": provider.reasoning_effort,
                 }
             )
         return json.dumps(
@@ -678,6 +683,11 @@ class _CambiumLMMixin:
                     cooldown_s=provider["cooldown_s"],
                     price_per_1m_in=provider["price_per_1m_in"],
                     price_per_1m_out=provider["price_per_1m_out"],
+                    auth=AuthMode(provider.get("auth", AuthMode.API_KEY.value)),
+                    protocol=Protocol(
+                        provider.get("protocol", Protocol.CHAT_COMPLETIONS.value)
+                    ),
+                    reasoning_effort=provider.get("reasoning_effort"),
                 )
                 for provider in raw_providers
             ]

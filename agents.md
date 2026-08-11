@@ -77,6 +77,13 @@ is pinned to the `CODEX_CHATGPT_PROFILE` module constants, requires protocol
 `codex_responses`, and rejects `base_url`/`api_key_env` in the file so a
 modified provider file can never redirect the bearer token.
 
+The `codex_responses` transport (`src/cambium/diffundo.py`) posts the
+Responses-API shape to the profile endpoint, streams SSE `output_text` deltas,
+and maps errors to retryable / CONFIG-quarantine / refusal classes. The bearer
+token and ChatGPT account id come from an injected `CredentialSource` only
+(absent -> AUTH_ERROR fail-closed); optional `reasoning_effort` (codex entry
+sets "max") rides the request body.
+
 ### Usage evidence
 
 `supervisor.run_plan` resolves un-pinned provider tasks (`model_candidates`)

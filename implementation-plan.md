@@ -130,3 +130,15 @@ issuer contract, and `import_codex_cli_session` for the existing
 `~/.codex/auth.json` session. The codex CLI's own client id is passed in
 (`--client-id`), never hardcoded; `cambium auth oauth` (W4) consumes it.
 
+The codex OAuth transport/entitlement flow is the follow-on (plan v2 W1).
+
+### Codex responses transport adapter (implemented, W1 adapter slice)
+
+`diffundo.py` speaks `codex_responses` when `ProviderConfig.protocol` says so:
+chat prompts convert to the Responses-API body (system->developer,
+`input_text` parts, flattened function tools, `store:false`/`stream:true`, no
+`max_output_tokens`), SSE output is assembled from `output_text.delta`, and
+errors classify as retryable outage / CONFIG-quarantine (`model_not_found`,
+machine-readable model/parameter 400) / refusal. Bearer credentials are
+injected via `CredentialSource` (absent -> AUTH_ERROR) and `reasoning_effort`
+is a normal provider-config field.
