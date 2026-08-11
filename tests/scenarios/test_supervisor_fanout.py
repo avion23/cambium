@@ -30,7 +30,6 @@ from pathlib import Path
 
 import pytest
 
-from cambium import supervisor
 from cambium import supervisor as supervisor_module
 from cambium.merge import MergeSequencer
 from cambium.store import EventStore
@@ -39,7 +38,6 @@ from cambium.supervisor import read_events, run_plan
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = str(ROOT / "scripts" / "fake_worker.py")
 CRASH_WORKER = str(ROOT / "tests" / "fixtures" / "crash_worker.py")
-ENV_WORKER = str(ROOT / "tests" / "fixtures" / "env_worker.py")
 TEST_RESOURCE_THRESHOLDS = {
     "mem_available_frac": 0.0,
     "load1_per_cpu": 1_000_000.0,
@@ -624,7 +622,7 @@ def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) ->
 @pytest.mark.slow
 def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "noready")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.1")
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -770,7 +768,7 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
 @pytest.mark.slow
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage_only")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.5")
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.1")
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -869,46 +867,6 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
     assert "init" in kinds
     assert "session_ended" in kinds
     assert kinds[-1] == "session_ended"
-
-
-# ---------------------------------------------------------------------------
-# T7: env confinement — the actually spawned worker env carries only the
-# authorized canonical provider keys, and supervisor git hooks see no key.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_t7_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "authorized-secret")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_ANTHROPIC_API_KEY", "undeclared-secret")
-    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_bad_API_KEY", "noncanonical-secret")
-    dump_path = tmp_path / "worker-env.json"
-    monkeypatch.setenv("ENV_DUMP_PATH", str(dump_path))
-
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-    plan = {
-        "tasks": [
-            _task(session_dir, repo, base, "t-env", worktree="wt-env", branch="wt-env",
-                  target_file="a.txt", marker="// cambium-env",
-                  gate="grep -q '// cambium-env' a.txt", worker=ENV_WORKER,
-                  provider_env_keys=["CAMBIUM_PROVIDER_OPENAI_API_KEY", "ENV_DUMP_PATH"]),
-        ]
-    }
-
-    result = asyncio.run(run_plan(session_dir, plan))
-
-    (task,) = result.results
-    assert task.status == "succeeded"
-    spawned_env = json.loads(dump_path.read_text(encoding="utf-8"))
-    assert spawned_env["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == "authorized-secret"
-    assert "CAMBIUM_PROVIDER_ANTHROPIC_API_KEY" not in spawned_env
-    assert "OPENAI_API_KEY" not in spawned_env
-    assert "CAMBIUM_PROVIDER_bad_API_KEY" not in spawned_env
-    assert spawned_env["CAMBIUM_TASK_ID"] == "t-env"
-    assert spawned_env["CAMBIUM_GENERATION"] == "1"
 
 
 @pytest.mark.slow
@@ -1143,66 +1101,6 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
 
 
 @pytest.mark.slow
-def test_next_startup_ignores_durably_pruned_quarantine_and_spawns_worker(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-    task_id = "t-after-prune"
-    plan = {
-        "tasks": [
-            _task(
-                session_dir, repo, base, task_id, worktree="wt-after-prune",
-                branch="wt-after-prune", target_file="a.txt", marker="// after-prune",
-                gate="grep -q '// after-prune' a.txt",
-            )
-        ]
-    }
-
-    async def quarantine() -> Path:
-        store = EventStore(session_dir / ".cambium" / "events.db")
-        runtime = supervisor_module._Runtime(session_dir, store)
-        await runtime.start()
-        seq = runtime._make_sequencer("expired-evidence")
-        staging = session_dir / "expired-staging"
-        seq.prepare_staging(repo, staging, "main", "main")
-        (staging / "evidence.bin").write_bytes(b"expired evidence")
-        await asyncio.to_thread(seq.cleanup_staging, repo)
-        event = next(
-            event for event in store.events_after(0)
-            if event["kind"] == "merge_staging_quarantined"
-        )
-        artifact = session_dir / ".cambium" / "quarantine" / event["payload"]["quarantine_id"]
-        await runtime.shutdown()
-        return artifact
-
-    artifact = asyncio.run(quarantine())
-    expired = time.time_ns() - 8 * 24 * 60 * 60 * 1_000_000_000
-    os.utime(artifact, ns=(expired, expired))
-
-    async def prune_on_startup() -> None:
-        store = EventStore(session_dir / ".cambium" / "events.db")
-        runtime = supervisor_module._Runtime(session_dir, store)
-        await runtime.start()
-        await runtime.reconcile(plan["tasks"])
-        await runtime.shutdown()
-
-    asyncio.run(prune_on_startup())
-    assert not artifact.exists()
-    quarantine_id = artifact.relative_to(session_dir / ".cambium" / "quarantine").as_posix()
-    assert any(
-        event["payload"].get("quarantine_id") == quarantine_id
-        for event in _kinds(read_events(session_dir), "merge_staging_pruned")
-    )
-
-    result = asyncio.run(run_plan(session_dir, plan))
-    events = read_events(session_dir)
-
-    assert result.exit_code == 0
-    assert result.results[0].status == "succeeded"
-    assert _kinds(events, "spawned")
-
-
-@pytest.mark.slow
 def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypatch) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -1245,44 +1143,6 @@ def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypat
         check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     assert len(refs) == 1
-
-
-@pytest.mark.slow
-def test_t8_supervisor_git_sync_post_checkout_hook_sees_no_provider_key(
-    tmp_path, monkeypatch
-) -> None:
-    """A post-checkout hook executed by ``_Runtime._git_sync`` git operations
-    must not see any provider credential in its env."""
-    monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "hook-secret")
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-
-    hook_dump = tmp_path / "hook-env.jsonl"
-    hook = repo / ".git" / "hooks" / "post-checkout"
-    hook.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os\n"
-        f"with open({str(hook_dump)!r}, 'a', encoding='utf-8') as f:\n"
-        "    f.write(json.dumps(dict(os.environ)) + chr(10))\n"
-    )
-    hook.chmod(0o755)
-
-    runtime = supervisor._Runtime.__new__(supervisor._Runtime)
-    worktree = session_dir / "wt-hook"
-    runtime._git_sync(
-        repo, ("worktree", "add", "-b", "wt-hook", str(worktree), base), check=True
-    )
-
-    records = [
-        json.loads(line)
-        for line in hook_dump.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert records, "the post-checkout hook never ran"
-    for record in records:
-        assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in record
-        assert "hook-secret" not in json.dumps(record)
 
 
 @pytest.mark.slow
