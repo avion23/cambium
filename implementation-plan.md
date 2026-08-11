@@ -99,7 +99,6 @@ implemented as a bounded session-scoped warm pool:
   other exits kill as before. Restart generations always spawn fresh;
   pooled workers are killed at session end (run_plan finally / shutdown).
 
-<<<<<<< HEAD
 ### Provider auth/protocol tagging (implemented, W1 config slice)
 
 `ProviderConfig` carries tagged `auth` (`api_key` | `codex_chatgpt`) and
@@ -108,9 +107,8 @@ the tags load unchanged. `codex_chatgpt` entries are pinned to the
 `CODEX_CHATGPT_PROFILE` constants in `provider_config.py` — they require
 protocol `codex_responses`, reject `base_url`/`api_key_env` in the file, and
 the transport later derives the endpoint from the profile, not from config.
-The codex OAuth transport/entitlement flow is the follow-on (plan v2 W1).
-=======
-### OAuth dynamic secret redaction (ADOPT, implemented)
+
+### OAuth dynamic secret redaction (implemented, W1 redact slice)
 
 `Redactor.register_secret(value)` registers an exact value at any time
 (thread-safe, idempotent), so a session redactor that snapshots provider
@@ -120,4 +118,15 @@ values at session start can still redact OAuth tokens rotated mid-session.
 field names (`access_token`, `refresh_token`, `id_token`,
 `authorization_code`, `code_verifier`, `device_auth_id`, `user_code`) are
 structured secret names in JSON-looking text. Covered by fast scenario tests.
->>>>>>> wt-redact
+
+### Codex-subscription OAuth module (W2, implemented)
+
+`src/cambium/oauth.py` lands the wave-2 credential layer ahead of the
+provider_config/diffundo/CLI wiring: a hardened per-provider `OAuthStore`
+(fail-closed corruption, explicit `repair()`), a flock'd `TokenManager`
+refresh transaction with a persistent per-provider lock file and
+last-good-on-429/5xx/timeout policy, the `DeviceFlow` against the pinned
+issuer contract, and `import_codex_cli_session` for the existing
+`~/.codex/auth.json` session. The codex CLI's own client id is passed in
+(`--client-id`), never hardcoded; `cambium auth oauth` (W4) consumes it.
+
