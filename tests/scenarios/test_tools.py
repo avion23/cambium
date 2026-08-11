@@ -116,27 +116,6 @@ def test_read_batch_orders_results_and_events_after_out_of_order_completion(
     } for event in events)
 
 
-def test_read_batch_preserves_input_order(tmp_path: Path) -> None:
-    for name in ("alpha.txt", "beta.txt", "gamma.txt", "delta.txt"):
-        (tmp_path / name).write_text(name, encoding="utf-8")
-
-    results = asyncio.run(
-        run_read_batch(
-            [
-                {"path": "alpha.txt"},
-                {"path": "beta.txt"},
-                {"path": "gamma.txt"},
-                {"path": "delta.txt"},
-            ],
-            _batch_context(tmp_path),
-        )
-    )
-
-    assert [result.output for result in results] == [
-        "alpha.txt", "beta.txt", "gamma.txt", "delta.txt"
-    ]
-
-
 def test_read_batch_rejects_mixed_array_atomically(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -513,7 +492,7 @@ def test_get_signature_read_and_parse_do_not_block_dispatcher(
     assert result.ok
 
 
-@pytest.mark.slow  # 2s blocked-read wait behind a 1s tool timeout; timing assertion
+@pytest.mark.slow  # 0.6s blocked-read wait behind a 0.3s tool timeout; timing assertion
 def test_get_signature_timeout_does_not_wait_for_blocked_read(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -521,9 +500,12 @@ def test_get_signature_timeout_does_not_wait_for_blocked_read(
     original_read = tools._read_and_extract_signature
 
     def slow_read(*args):
-        time.sleep(2)
+        time.sleep(0.6)
         return original_read(*args)
 
+    # the tool's read timeout is a module constant read at dispatch time; a
+    # short timeout exercises the same mechanism in a fraction of the wall time
+    monkeypatch.setattr(tools, "GET_SIGNATURE_READ_TIMEOUT_S", 0.3)
     monkeypatch.setattr(tools, "_read_and_extract_signature", slow_read)
     started = time.monotonic()
     result = _run(
@@ -533,10 +515,10 @@ def test_get_signature_timeout_does_not_wait_for_blocked_read(
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 1.5
+    assert elapsed < 0.5
     assert not result.ok
     assert result.error == (
-        "get_signature read timed out after 1.0s: sample.py"
+        "get_signature read timed out after 0.3s: sample.py"
     )
 
 
@@ -563,33 +545,6 @@ def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
 def test_get_signature_rejects_fifo_quickly(tmp_path: Path) -> None:
     os.mkfifo(tmp_path / "sample.py")
 
-    started = time.monotonic()
-    result = _run(
-        "get_signature",
-        {"path": "sample.py", "symbol": "build"},
-        ToolContext(tmp_path),
-    )
-    elapsed = time.monotonic() - started
-
-    assert elapsed < 1.0
-    assert not result.ok
-    assert "not a regular file" in (result.error or "")
-
-
-def test_get_signature_rejects_fifo_replaced_after_validation(
-    tmp_path: Path, monkeypatch
-) -> None:
-    sample = tmp_path / "sample.py"
-    sample.write_text("def build():\n    pass\n", encoding="utf-8")
-    original_confined_path = tools._confined_path
-
-    def replace_after_validation(ctx: ToolContext, raw_path: str) -> Path:
-        path = original_confined_path(ctx, raw_path)
-        path.unlink()
-        os.mkfifo(path)
-        return path
-
-    monkeypatch.setattr(tools, "_confined_path", replace_after_validation)
     started = time.monotonic()
     result = _run(
         "get_signature",

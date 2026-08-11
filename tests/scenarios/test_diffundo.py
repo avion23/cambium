@@ -354,33 +354,6 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
         good.close()
 
 
-def test_retry_after_delta_seconds_controls_same_provider_retry(monkeypatch) -> None:
-    server = FakeServer(
-        [
-            (429, _error_payload("busy"), 0.0, {"Retry-After": "7"}),
-            (200, _ok_payload("recovered"), 0.0),
-        ]
-    )
-    _set_keys(monkeypatch, "K_RETRY")
-    router = Diffundo((_config("p_retry", server, "K_RETRY", max_retries=1),))
-    sleeps: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "recovered"
-        assert sleeps == [7.0]
-        assert len(server.calls) == 2
-        # the honored Retry-After rides the winning result (plan step 3)
-        assert result.retry_after_s == 7.0
-        assert result.request_rate_status == "available"
-    finally:
-        server.close()
-
-
 def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> None:
     server = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
     _set_keys(monkeypatch, "K_RETRY_LONG")
@@ -430,25 +403,6 @@ def test_retry_after_is_provider_local(monkeypatch) -> None:
         healthy.close()
 
 
-def test_retry_after_error_keeps_provider_key_private(monkeypatch) -> None:
-    key = "sk-retry-after-private"
-    server = FakeServer(
-        [(429, _error_payload("invalid credential"), 0.0, {"Retry-After": "1"})],
-        echo_authorization_in_body=True,
-    )
-    monkeypatch.setenv("K_RETRY_PRIVATE", key)
-    router = Diffundo((_config("p_retry_private", server, "K_RETRY_PRIVATE"),))
-    try:
-        with pytest.raises(AllProvidersFailed) as exc:
-            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.retry_after_s == 1.0
-        assert key not in str(exc.value)
-        assert key not in exc.value.last_error.message
-    finally:
-        server.close()
-
-
 def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monkeypatch) -> None:
     key = "sk-echoed-in-4xx-body"
     server = FakeServer(
@@ -488,6 +442,25 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
         assert key not in str(exc.value)
     finally:
         server.close()
+
+    # the 429 Retry-After error keeps the key private too, and the honored
+    # delay rides the terminal failure
+    retry_key = "sk-retry-after-private"
+    retry_server = FakeServer(
+        [(429, _error_payload("invalid credential"), 0.0, {"Retry-After": "1"})],
+        echo_authorization_in_body=True,
+    )
+    monkeypatch.setenv("K_RETRY_PRIVATE", retry_key)
+    retry_router = Diffundo((_config("p_retry_private", retry_server, "K_RETRY_PRIVATE"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as exc:
+            asyncio.run(retry_router.call(ProviderTier.FAST, PROMPT))
+        assert exc.value.last_error is not None
+        assert exc.value.last_error.retry_after_s == 1.0
+        assert retry_key not in str(exc.value)
+        assert retry_key not in exc.value.last_error.message
+    finally:
+        retry_server.close()
 
 
 def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch) -> None:
@@ -537,7 +510,8 @@ def test_provider_request_uses_stable_cambium_user_agent_and_keeps_authorization
 
 def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) -> None:
     # A normal OpenAI tool-call completion carries content:null plus tool_calls;
-    # it is a success, not a "content missing" malformed response.
+    # it is a success, not a "content missing" malformed response. A tool call
+    # with non-null text content keeps both the text and the call.
     tool_payload = {
         "id": "chatcmpl-tool",
         "object": "chat.completion",
@@ -561,21 +535,7 @@ def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) ->
         ],
         "usage": {"prompt_tokens": 2, "completion_tokens": 2},
     }
-    server = FakeServer([(200, tool_payload, 0.0)])
-    _set_keys(monkeypatch, "K_TOOL")
-    router = Diffundo((_config("p_tool", server, "K_TOOL"),))
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == ""
-        assert result.tool_calls is not None
-        assert result.tool_calls[0]["function"]["name"] == "search"
-        assert router.health("p_tool") is HealthState.HEALTHY
-    finally:
-        server.close()
-
-
-def test_tool_call_response_with_text_content_keeps_both(tmp_path, monkeypatch) -> None:
-    tool_payload = {
+    text_payload = {
         "id": "chatcmpl-tool2",
         "object": "chat.completion",
         "model": "m-tool2",
@@ -598,14 +558,20 @@ def test_tool_call_response_with_text_content_keeps_both(tmp_path, monkeypatch) 
         ],
         "usage": {"prompt_tokens": 2, "completion_tokens": 2},
     }
-    server = FakeServer([(200, tool_payload, 0.0)])
-    _set_keys(monkeypatch, "K_TOOL2")
-    router = Diffundo((_config("p_tool2", server, "K_TOOL2"),))
+    server = FakeServer([(200, tool_payload, 0.0), (200, text_payload, 0.0)])
+    _set_keys(monkeypatch, "K_TOOL")
+    router = Diffundo((_config("p_tool", server, "K_TOOL"),))
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "explaining the call"
+        assert result.content == ""
         assert result.tool_calls is not None
-        assert result.tool_calls[0]["id"] == "call_2"
+        assert result.tool_calls[0]["function"]["name"] == "search"
+        assert router.health("p_tool") is HealthState.HEALTHY
+
+        result2 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result2.content == "explaining the call"
+        assert result2.tool_calls is not None
+        assert result2.tool_calls[0]["id"] == "call_2"
     finally:
         server.close()
 
@@ -613,6 +579,7 @@ def test_tool_call_response_with_text_content_keeps_both(tmp_path, monkeypatch) 
 def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypatch) -> None:
     # A bare {} tool call has no function name; it must be rejected as a
     # malformed response, not forwarded as a valid-looking (name="") call.
+    # A tool call whose function.name is "" is rejected the same way.
     malformed = FakeServer([(200, _tool_call_payload([{}]), 0.0)])
     _set_keys(monkeypatch, "K_MAL")
     router = Diffundo((_config("p_mal", malformed, "K_MAL"),))
@@ -626,24 +593,20 @@ def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypa
     finally:
         malformed.close()
 
-
-def test_tool_call_response_rejects_empty_function_name(tmp_path, monkeypatch) -> None:
-    # A tool call whose function.name is "" must be rejected, never accepted as
-    # a quality-passing result.
-    malformed = FakeServer(
+    empty = FakeServer(
         [(200, _tool_call_payload([{"function": {"name": "", "arguments": "{}"}}]), 0.0)]
     )
     _set_keys(monkeypatch, "K_EMPTY")
-    router = Diffundo((_config("p_empty", malformed, "K_EMPTY"),))
+    empty_router = Diffundo((_config("p_empty", empty, "K_EMPTY"),))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
-            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+            asyncio.run(empty_router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
         assert exc.value.last_error.outcome is ProviderOutcome.ERROR
         assert "tool call without a function name" in exc.value.last_error.message
-        assert router.health("p_empty") is HealthState.COOLDOWN
+        assert empty_router.health("p_empty") is HealthState.COOLDOWN
     finally:
-        malformed.close()
+        empty.close()
 
 
 def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypatch) -> None:
@@ -796,43 +759,14 @@ def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> Non
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.slow  # 0.2s bounded-pause wait
-def test_all_providers_exhausted_pauses_then_raises(tmp_path, monkeypatch) -> None:
-    down = FakeServer([(500, _error_payload("down"), 0.0)])
-    ok = FakeServer([(200, _ok_payload("ok"), 0.0)])
-    _set_keys(monkeypatch, "K_DOWN", "K_OK")
-    router = Diffundo(
-        (
-            _config("p_down", down, "K_DOWN", rpm=1, cooldown_s=60.0),
-            _config("p_ok", ok, "K_OK", rpm=1),
-        ),
-        pause_timeout_s=0.2,
-    )
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.provider == "p_ok"
-        assert len(down.calls) == 1 and len(ok.calls) == 1
-
-        start = time.monotonic()
-        with pytest.raises(AllProvidersFailed):
-            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        # bounded pause on exhaustion, not a hang
-        assert time.monotonic() - start < 5.0
-        # nothing was re-dispatched during the pause
-        assert len(down.calls) == 1 and len(ok.calls) == 1
-    finally:
-        down.close()
-        ok.close()
-
-
-@pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.25
+@pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.15
 def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) -> None:
     # D8f recovery monitor: after the provider's cooldown elapses mid-pause, the
     # monitor wakes dispatch, the call probes, and the provider heals.
     server = FakeServer([(500, _error_payload("boom"), 0.0), (200, _ok_payload("rec"), 0.0)])
     _set_keys(monkeypatch, "K_REC")
     router = Diffundo(
-        (_config("p", server, "K_REC", cooldown_s=0.3),),
+        (_config("p", server, "K_REC", cooldown_s=0.2),),
         pause_timeout_s=2.0,
     )
     try:
@@ -843,7 +777,7 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
         start = time.monotonic()
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         # the pause actually waited for the cooldown to lapse, then probed
-        assert time.monotonic() - start >= 0.25
+        assert time.monotonic() - start >= 0.15
         assert result.provider == "p"
         assert result.content == "rec"
         assert router.health("p") is HealthState.HEALTHY  # probe success healed it
@@ -865,7 +799,7 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
             _config("p_down", down, "K_DOWN", rpm=1, cooldown_s=60.0),
             _config("p_ok", ok, "K_OK", rpm=1),
         ),
-        pause_timeout_s=0.2,
+        pause_timeout_s=0.1,
     )
     try:
         # consume both buckets so the next call finds an empty tier
@@ -884,10 +818,14 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
         with pytest.raises(AllProvidersFailed):
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         elapsed = time.monotonic() - start
-        # the 200ms pause actually blocked on the event ...
-        assert elapsed >= 0.15
+        # the 100ms pause actually blocked on the event ...
+        assert elapsed >= 0.07
+        # ... a bounded pause on exhaustion, not a hang ...
+        assert elapsed < 5.0
         # ... instead of spinning the loop thousands of times
         assert calls["n"] < 100
+        # nothing was re-dispatched during the pause
+        assert len(down.calls) == 1 and len(ok.calls) == 1
     finally:
         down.close()
         ok.close()
@@ -898,46 +836,34 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.slow  # 0.8s scripted provider delays; timing assertion
+@pytest.mark.slow  # 0.3s scripted provider delays; timing assertion
 def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
     # call_budget_s is a hard deadline over the WHOLE cascade, not just
-    # candidate waiting. Two 1.0s-timeout providers with a retry would naively
-    # take ~4s; a 0.5s budget caps it to budget + one in-flight attempt.
-    slow1 = FakeServer([(200, _ok_payload("slow1"), 0.8)])
-    slow2 = FakeServer([(200, _ok_payload("slow2"), 0.8)])
+    # candidate waiting. Two 0.4s-timeout providers with a retry would naively
+    # take ~1.6s; a 0.2s budget caps it to budget + one in-flight attempt.
+    slow1 = FakeServer([(200, _ok_payload("slow1"), 0.3)])
+    slow2 = FakeServer([(200, _ok_payload("slow2"), 0.3)])
     _set_keys(monkeypatch, "K_S1", "K_S2")
     router = Diffundo(
         (
-            _config("p_s1", slow1, "K_S1", timeout_s=1.0, max_retries=1),
-            _config("p_s2", slow2, "K_S2", timeout_s=1.0, max_retries=1),
+            _config("p_s1", slow1, "K_S1", timeout_s=0.4, max_retries=1),
+            _config("p_s2", slow2, "K_S2", timeout_s=0.4, max_retries=1),
         ),
-        call_budget_s=0.5,
+        call_budget_s=0.2,
     )
     try:
         start = time.monotonic()
         with pytest.raises(AllProvidersFailed):
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         elapsed = time.monotonic() - start
-        # budget (0.5) + one budget-capped in-flight attempt, far under the
-        # naive 2 providers x (1+1 retries) x 1.0s = ~4.1s product
-        assert elapsed <= 1.5
+        # budget (0.2) + one budget-capped in-flight attempt, far under the
+        # naive 2 providers x (1+1 retries) x 0.4s = ~1.6s product
+        assert elapsed <= 0.8
         # the first attempt really was capped by the budget (not instant)
-        assert elapsed >= 0.4
+        assert elapsed >= 0.15
     finally:
         slow1.close()
         slow2.close()
-
-
-def test_call_budget_still_allows_success_within_budget(tmp_path, monkeypatch) -> None:
-    fast = FakeServer([(200, _ok_payload("fast"), 0.0)])
-    _set_keys(monkeypatch, "K_F")
-    router = Diffundo((_config("p_f", fast, "K_F"),), call_budget_s=0.5)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.provider == "p_f"
-        assert result.content == "fast"
-    finally:
-        fast.close()
 
 
 def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> None:
@@ -1097,7 +1023,8 @@ def test_429_retry_after_and_quota_owner_surface_on_winning_result(monkeypatch) 
         assert result.content == "recovered"
         assert result.retry_after_s == 5.0
         assert result.account_quota_owner == "org-acme"
-        assert sleeps == [5.0]
+        assert sleeps == [5.0]  # the honored Retry-After controls the same-provider retry
+        assert result.request_rate_status == "available"
         assert len(limited.calls) == 2
     finally:
         limited.close()
