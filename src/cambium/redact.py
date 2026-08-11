@@ -15,8 +15,10 @@ provider variables are added only when the caller names them explicitly.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from enum import Enum
 from os import PathLike
@@ -34,6 +36,7 @@ __all__ = [
     "build_session_redactor",
     "build_worker_env",
     "is_secret_name",
+    "sanitize_oauth_document",
 ]
 
 _DEFAULT_REPLACEMENT = "***"
@@ -74,7 +77,8 @@ REDACT_KEYS = re.compile(
     r"(?i)(?<![a-z0-9])(?:api[_-]?key|token|secret|password|passwd|"
     r"passphrase|credential|credentials|authorization|proxy-authorization|"
     r"auth|cookie|set-cookie|session|sessionid|sid|csrf|xsrf|jwt|oauth|"
-    r"bearer|private[_-]?key|access[_-]?key|client[_-]?secret)(?![a-z0-9])"
+    r"bearer|private[_-]?key|access[_-]?key|client[_-]?secret|"
+    r"code_verifier|user_code)(?![a-z0-9])"
 )
 
 # The value patterns are intentionally shape-based.  Do not add a generic
@@ -242,6 +246,10 @@ _SECRET_EXACT_NAMES = frozenset(
         "access_token",
         "refresh_token",
         "id_token",
+        "authorization_code",
+        "code_verifier",
+        "device_auth_id",
+        "user_code",
         "session_token",
         "bearer_token",
         "oauth_token",
@@ -276,6 +284,33 @@ _SECRET_NAME_PARTS = frozenset(
         "xsrf",
     }
 )
+
+# OAuth document fields whose values are credentials.  The token-bearing
+# names are exact structured matches only: ``code`` or ``verifier`` alone
+# are never secret parts, so ``status_code`` and ``country_code`` stay
+# benign while ``code_verifier`` and ``user_code`` redact.
+_OAUTH_FIELD_NAMES = frozenset(
+    {
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "authorization_code",
+        "code_verifier",
+        "device_auth_id",
+        "user_code",
+    }
+)
+_OAUTH_ACCOUNT_NAMES = frozenset({"account_id", "accountid"})
+# Distinct from the default ``***`` marker so sanitized OAuth documents
+# read as field redactions rather than pattern hits.
+_OAUTH_TOKEN_REPLACEMENT = "<redacted>"
+
+
+def _oauth_account_fingerprint(value: str) -> str:
+    """Return a stable account identifier: the first 8 hex of SHA-256."""
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
 
 _COOKIE_FIELD_NAMES = frozenset({"cookie", "cookies", "set_cookie", "set_cookies"})
 _MULTIWORD_CONTEXT_NAMES = frozenset(
@@ -1216,11 +1251,13 @@ class Redactor:
     ``patterns`` defaults to :data:`DEFAULT_PATTERNS`.  A caller-supplied
     pattern collection is authoritative: only those patterns run for string
     values, while secret-named structured keys remain whole-value redaction
-    boundaries.  ``secret_values`` is an immutable set of exact, case-sensitive
-    values that is applied additively as unbounded substrings before the
-    configured pattern behavior; ``whole_values`` is an immutable set of exact
-    values that is replaced only when a whole string equals one of them, so a
-    prose-like credential never corrupts a larger benign diagnostic. Use
+    boundaries.  ``secret_values`` seeds the exact-value registry with
+    case-sensitive values applied additively as unbounded substrings before the
+    configured pattern behavior; more values can be registered at any time with
+    :meth:`register_secret`, which covers credentials rotated after
+    construction.  ``whole_values`` is an immutable set of exact values that is
+    replaced only when a whole string equals one of them, so a prose-like
+    credential never corrupts a larger benign diagnostic. Use
     :meth:`redact_protocol_record` when a caller owns a protocol envelope and
     must explicitly allow exact values in selected top-level fields.
     ``replacement`` is inserted literally, even when it contains backslashes
@@ -1254,6 +1291,7 @@ class Redactor:
             raise TypeError("whole_values must contain strings")
         if any(not value for value in whole):
             raise ValueError("whole_values must not contain empty strings")
+        self._lock = threading.Lock()
         self._secret_values = registered
         self._whole_values = whole
         self._exact_value_pattern = _exact_value_pattern(registered)
@@ -1261,9 +1299,35 @@ class Redactor:
 
     @property
     def secret_values(self) -> frozenset[str]:
-        """Return the immutable exact-value registry captured at construction."""
+        """Return a snapshot of the registered exact values.
+
+        The returned frozenset is immutable; :meth:`register_secret` installs a
+        new snapshot under the internal lock, so a concurrent reader never sees
+        a half-updated registry.
+        """
 
         return self._secret_values
+
+    def register_secret(self, value: str) -> None:
+        """Register *value* for exact substring redaction at any time.
+
+        Thread-safe and idempotent: the value joins the exact-value replacement
+        set immediately, so a credential rotated after the redactor was built
+        (for example a session-scoped OAuth token) is redacted by later
+        :meth:`redact`, :meth:`redact_escaped`, and :meth:`redact_mapping`
+        calls.  Registering a value that is already present is a no-op.
+        """
+
+        if not isinstance(value, str):
+            raise TypeError("secret value must be a string")
+        if not value:
+            raise ValueError("secret value must not be empty")
+        with self._lock:
+            if value in self._secret_values:
+                return
+            updated = self._secret_values | {value}
+            self._secret_values = updated
+            self._exact_value_pattern = _exact_value_pattern(updated)
 
     def _redact_exact_values(self, text: str) -> str:
         if self._exact_value_pattern is None:
@@ -1395,11 +1459,13 @@ def build_session_redactor(
     *,
     whole_values: Iterable[str] | None = None,
 ) -> Redactor:
-    """Build one immutable, session-scoped Redactor from a secret-value snapshot.
+    """Build one session-scoped Redactor from a secret-value snapshot.
 
-    The snapshot is captured at construction and can never change afterwards.
-    A session builds a single instance here and hands it to its EventStore so
-    persisted event records redact the same exact values.
+    The snapshot is captured at construction.  A session builds a single
+    instance here and hands it to its EventStore so persisted event records
+    redact the same exact values; credentials rotated mid-session (for example
+    OAuth tokens) are registered on the same instance with ``register_secret``
+    and are redacted by every later call.
 
     ``secret_values`` are registered for substring redaction in free-text
     values; structured protocol fields keep their exact values and use only
@@ -1409,6 +1475,53 @@ def build_session_redactor(
     """
 
     return Redactor(secret_values=secret_values, whole_values=whole_values)
+
+
+def sanitize_oauth_document(
+    doc: Mapping, *, redactor: Redactor | None = None
+) -> dict[object, object]:
+    """Return a redacted copy of an OAuth document.
+
+    Token-bearing OAuth fields (``access_token``, ``refresh_token``,
+    ``id_token``, ``authorization_code``, ``code_verifier``,
+    ``device_auth_id``, ``user_code``) are replaced outright with
+    ``<redacted>`` regardless of value shape; ``account_id`` is replaced by a
+    stable fingerprint (the first 8 hex characters of its SHA-256).  Nested
+    mappings and sequences are walked, and every remaining string value passes
+    through the supplied *redactor* — or the default shape patterns when none
+    is given — so a rotated token never survives in request objects, headers,
+    response bodies, or exception text.  Keys and the input mapping itself are
+    left untouched.
+    """
+
+    if not isinstance(doc, Mapping):
+        raise TypeError("doc must be a mapping")
+    effective = redactor if redactor is not None else Redactor()
+    return _sanitize_oauth_node(doc, effective)
+
+
+def _sanitize_oauth_node(node: object, redactor: Redactor) -> object:
+    if isinstance(node, str):
+        return redactor.redact(node)
+    if isinstance(node, Mapping):
+        result: dict[object, object] = {}
+        for key, value in node.items():
+            name = key if isinstance(key, str) else None
+            if name is not None:
+                normalised = _normalise_name(name)
+                if normalised in _OAUTH_FIELD_NAMES:
+                    result[key] = _OAUTH_TOKEN_REPLACEMENT
+                    continue
+                if normalised in _OAUTH_ACCOUNT_NAMES and isinstance(value, str):
+                    result[key] = _oauth_account_fingerprint(value)
+                    continue
+            result[key] = _sanitize_oauth_node(value, redactor)
+        return result
+    if isinstance(node, list):
+        return [_sanitize_oauth_node(item, redactor) for item in node]
+    if isinstance(node, tuple):
+        return tuple(_sanitize_oauth_node(item, redactor) for item in node)
+    return node
 
 
 # Explicitly safe runtime variable names.  Their values are constructed by

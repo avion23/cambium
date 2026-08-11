@@ -98,3 +98,14 @@ implemented as a bounded session-scoped warm pool:
   a clean reuse-ready generation returns its live process to the pool, all
   other exits kill as before. Restart generations always spawn fresh;
   pooled workers are killed at session end (run_plan finally / shutdown).
+
+### OAuth dynamic secret redaction (ADOPT, implemented)
+
+`Redactor.register_secret(value)` registers an exact value at any time
+(thread-safe, idempotent), so a session redactor that snapshots provider
+values at session start can still redact OAuth tokens rotated mid-session.
+`sanitize_oauth_document(doc)` returns a copy with token fields replaced by
+`<redacted>` and `account_id` reduced to the first 8 hex of SHA-256; the OAuth
+field names (`access_token`, `refresh_token`, `id_token`,
+`authorization_code`, `code_verifier`, `device_auth_id`, `user_code`) are
+structured secret names in JSON-looking text. Covered by fast scenario tests.
