@@ -68,6 +68,17 @@ child imports resolve without an install.
 Root `conftest.py` exports `src` on `PYTHONPATH` so scenario subprocesses
 import `cambium` without a manual export.
 
+### Usage evidence
+
+`scripts/usage_evidence.py` aggregates durable per-call usage events
+across session stores (positional session dirs and/or `--repo <path>`,
+which globs `.cambium/sessions/*`) into per-provider routing evidence:
+request counts, tokens, latency, cost, provider-reported cache-hit
+rate, prompt-prefix stability, Retry-After, request-rate status,
+failure reasons, and quota owners (`--json` for machine-readable
+output). Sessions without usage events are skipped; missing event DBs
+warn and exit 0.
+
 ## Current entry points and behavior
 
 - `supervisor.run_plan` validates a flat task list, starts one runtime, and
