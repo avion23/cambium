@@ -49,6 +49,26 @@ def _provider_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return parsed
+
+
 _COMMAND_NAMES = frozenset(
     {
         "auth",
@@ -119,19 +139,19 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--max-wall-s",
-        type=float,
+        type=_positive_float,
         metavar="SECONDS",
         help="per-task wall-clock budget in seconds (default 300)",
     )
     parser.add_argument(
         "--max-tokens",
-        type=int,
+        type=_positive_int,
         metavar="N",
         help="total token budget across the run (default 200000)",
     )
     parser.add_argument(
         "--max-turns",
-        type=int,
+        type=_positive_int,
         metavar="N",
         help="maximum agent-loop turns (default 20)",
     )
@@ -492,6 +512,10 @@ def _run_bare_prompt(command_line: list[str]) -> int:
     return _run_oneshot(parser.parse_args(normalized))
 
 
+def _budget_or_default(value: float | int | None, default: float | int) -> float | int:
+    return default if value is None else value
+
+
 def _run_oneshot(args: argparse.Namespace) -> int:
     oneshot = _import_or_fail("cambium.oneshot", "run")
     if oneshot is None:
@@ -508,9 +532,15 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         provider=args.provider,
         model=args.model,
         auto=getattr(args, "auto", False),
-        max_wall_s=getattr(args, "max_wall_s", None) or oneshot.DEFAULT_WALL_BUDGET_S,
-        max_tokens=getattr(args, "max_tokens", None) or oneshot.DEFAULT_MAX_TOKENS,
-        max_turns=getattr(args, "max_turns", None) or oneshot.DEFAULT_MAX_TURNS,
+        max_wall_s=_budget_or_default(
+            getattr(args, "max_wall_s", None), oneshot.DEFAULT_WALL_BUDGET_S
+        ),
+        max_tokens=_budget_or_default(
+            getattr(args, "max_tokens", None), oneshot.DEFAULT_MAX_TOKENS
+        ),
+        max_turns=_budget_or_default(
+            getattr(args, "max_turns", None), oneshot.DEFAULT_MAX_TURNS
+        ),
     )
     try:
         value = oneshot.run_oneshot(config)
