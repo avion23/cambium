@@ -174,6 +174,22 @@ def expected_split_counts(manifest) -> dict[str, int]:
     }
 
 
+def label_field(manifest) -> str:
+    """The dataset label boolean from module.json; the v1 default is ``decompose``.
+
+    The bench harness and baseline schema carry the generic
+    ``decompose_true``/``decompose_false`` class-balance names. A module
+    whose domain label is a different boolean declares the optional
+    ``label_field`` (for example ``review``) in its manifest; the engine
+    consistency check compares the CLI prediction on that field.
+    """
+    manifest_data = json.loads(
+        (manifest.package_dir / "module.json").read_text(encoding="utf-8")
+    )
+    value = manifest_data.get("label_field")
+    return value if isinstance(value, str) and value else "decompose"
+
+
 def check_module(manifest) -> None:
     module_name = manifest.module_name
     datasets = manifest.package_dir / "datasets"
@@ -184,6 +200,7 @@ def check_module(manifest) -> None:
         "canary": datasets / "canaries.jsonl",
     }
     expected = expected_split_counts(manifest)
+    label = label_field(manifest)
     assert isinstance(meta, dict), "meta.json: not an object"
     meta_schema_version = meta.get("schema_version")
     meta_dataset_version = meta.get("dataset_version")
@@ -226,7 +243,7 @@ def check_module(manifest) -> None:
             inp, exp = r["input"], r["expected"]
             assert isinstance(inp.get("task"), str) and inp["task"].strip(), f"{rid}: task"
             assert isinstance(inp.get("context"), str), f"{rid}: context"
-            assert isinstance(exp.get("decompose"), bool), f"{rid}: decompose"
+            assert isinstance(exp.get(label), bool), f"{rid}: expected.{label}"
             assert isinstance(exp.get("reason"), str), f"{rid}: reason"
             assert (
                 isinstance(r["expected_confidence"], (int, float))
@@ -263,7 +280,7 @@ def check_module(manifest) -> None:
                 f"cross-split duplicate (task,context): {task_ids[key]} vs {r['id']}"
             )
             task_ids[key] = r["id"]
-            payload = (r["input"]["task"], r["input"]["context"], r["expected"]["decompose"])
+            payload = (r["input"]["task"], r["input"]["context"], r["expected"][label])
             digest = hashlib.sha256(json.dumps(payload).encode()).hexdigest()
             assert digest not in data_hashes, (
                 f"duplicate data payload: {data_hashes[digest]} vs {r['id']}"
@@ -274,7 +291,7 @@ def check_module(manifest) -> None:
 
     # --- class balance + difficulty spread ------------------------------------
     for split, records in all_records.items():
-        counts = Counter(r["expected"]["decompose"] for r in records)
+        counts = Counter(r["expected"][label] for r in records)
         print(
             f"balance {split}: true={counts[True]} false={counts[False]} "
             f"(true {counts[True] / len(records):.2%})"
@@ -285,7 +302,7 @@ def check_module(manifest) -> None:
     for split in ("train", "eval"):
         for r in all_records[split]:
             ev, why = evidence_band(r["input"]["task"], r["input"]["context"])
-            spread[f"{split}:{r['expected']['decompose']}:ev{ev}"] += 1
+            spread[f"{split}:{r['expected'][label]}:ev{ev}"] += 1
             for w in why:
                 spread_detail[w] += 1
     print("difficulty spread (evidence bands by split/label):")
@@ -329,7 +346,7 @@ def check_module(manifest) -> None:
                 bad.append(record["input"]["task"])
             prediction = result.get("prediction")
             assert isinstance(prediction, dict), f"{split} {record['id']}: missing prediction"
-            assert prediction.get("decompose") == record["expected"]["decompose"], (
+            assert prediction.get(label) == record["expected"][label], (
                 f"{split} {record['id']}: decision mismatch"
             )
         assert not bad, f"{split}: {len(bad)} engine mismatches: {bad[:3]}"

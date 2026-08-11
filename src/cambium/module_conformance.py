@@ -851,15 +851,38 @@ def _validate_dataset_integrity(
     }
     total_records = sum(split_counts.values())
     canary_records = records_by_split.get("canaries", [])
+    manifest_path = spec.path / "module.json"
+    declared_label_field = None
+    try:
+        manifest_data = _load_json(manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        manifest_data = None
+    if isinstance(manifest_data, dict) and "label_field" in manifest_data:
+        declared_label_field = manifest_data["label_field"]
+        if not isinstance(declared_label_field, str) or not declared_label_field:
+            findings.append(
+                AuditFinding(
+                    "dataset-integrity",
+                    manifest_path,
+                    0,
+                    "label_field",
+                    "must be a non-empty string when present",
+                )
+            )
+    label_field = (
+        declared_label_field
+        if isinstance(declared_label_field, str) and declared_label_field
+        else "decompose"
+    )
     labels = {
         True: sum(
-            record.get("expected", {}).get("decompose") is True
+            record.get("expected", {}).get(label_field) is True
             for records in records_by_split.values()
             for _, record in records
             if isinstance(record.get("expected"), dict)
         ),
         False: sum(
-            record.get("expected", {}).get("decompose") is False
+            record.get("expected", {}).get(label_field) is False
             for records in records_by_split.values()
             for _, record in records
             if isinstance(record.get("expected"), dict)

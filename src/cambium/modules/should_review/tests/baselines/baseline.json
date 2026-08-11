@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "module": "should_review",
+  "dataset_version": "1.0.0",
+  "split_digests": {
+    "train": "49ba6034ce45452b44f60e814c118d6cf3632e25af2bb6141afb4e23c73ce983",
+    "eval": "4bccdabad90becd67cfe105f78c3990a1f27b28c361cfc33f16d170756524991",
+    "canaries": "bbca06e7f8fb04d960ed220d1fbc2114ea1cbe522f86500aa77308c764cd0c5a"
+  },
+  "git_sha": "f1daa7d4658b3427f94b631e8d0bcf9a85c02e48",
+  "date": "2026-08-11T03:44:45Z",
+  "python": "3.14.7",
+  "pytest": "9.1.1",
+  "metric": {
+    "train": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 40
+    },
+    "eval": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 10
+    },
+    "canaries": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 5
+    }
+  },
+  "canaries": {
+    "total": 5,
+    "kinds_present": [
+      "ambiguous_calibration",
+      "format_only_hack",
+      "keyword_hack",
+      "must_review",
+      "trivially_atomic"
+    ],
+    "taxonomy_coverage": 0.8,
+    "failed": 0
+  },
+  "dataset": {
+    "records": 55,
+    "duplicate_ids": 0,
+    "cross_split_leaks": 0,
+    "decompose_true": 29,
+    "decompose_false": 26,
+    "canaries": 5
+  },
+  "tests": {
+    "count": 65,
+    "wall_seconds": {
+      "p50": 0.001471,
+      "p90": 0.133593,
+      "max": 0.250083
+    },
+    "by_nodeid": {
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_all_55_records_score_perfectly": 0.003659,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_backward_compat_falls_back_to_pairs": 0.001555,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_baseline_anchors_metadata_and_content": 0.000239,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_bench_falls_back_after_load_rejects_split_version_drift": 0.176966,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_canaries_excluded_from_train_and_eval": 0.001313,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_canary_flag_filtered_from_train_file": 0.00057,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_cross_split_collision_rejected": 0.000741,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_dataset_version_defaults_when_meta_missing": 0.001045,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_dataset_version_read_from_meta": 0.000816,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_duplicate_ids_rejected": 0.000522,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_evaluate_split_async_inside_event_loop": 0.001014,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_evaluate_split_rejects_running_event_loop": 0.000334,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_evaluate_split_reports_mean_std_count": 0.002075,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_invalid_meta_rejected_by_load_and_load_split": 0.00096,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_load_all_bundle": 0.001804,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_meta_directory_rejected_by_load_and_load_split": 0.000518,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_meta_json_non_object_rejected": 0.000875,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_metadata_deletion_race_cannot_disable_version_validation[load]": 0.000713,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_metadata_deletion_race_cannot_disable_version_validation[load_split]": 0.000621,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_missing_id_rejected_in_split_file": 0.000415,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_non_finite_meta_json_constants_rejected[-Infinity]": 0.000958,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_non_finite_meta_json_constants_rejected[Infinity]": 0.001138,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_non_finite_meta_json_constants_rejected[NaN]": 0.000843,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_schema_version_mismatch_rejected": 0.00103,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_split_loader_accepts_split_file_path": 0.001471,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_split_loads_return_expected_counts": 0.001512,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_split_record_version_drift_rejected_by_loader": 0.001322,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_split_record_versions_match_meta": 0.000733,
+      "src/cambium/modules/should_review/tests/test_dataset_splits.py::test_validation_errors_report_actual_file": 0.000437,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_applies_optional_context_default": 0.132987,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_context_suppression": 0.134518,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_decide_operation_requires_inputs_array": 0.124257,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_decide_operation_returns_results_array": 0.133859,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_evaluate_operation_returns_scores": 0.133416,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_handles_max_length_task": 0.132014,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_handles_unicode_task": 0.130068,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_output_is_deterministic": 0.250083,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_duplicate_context_fields": 0.126903,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_duplicate_fields_inside_nested_object": 0.133301,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_duplicate_task_fields": 0.125017,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload0-unknown input field]": 0.125207,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload1-input.task is required]": 0.128089,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload2-input.task must be a string]": 0.125677,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload3-input.task must not be empty]": 0.130867,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload4-input.task must not be empty]": 0.12452,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload5-input.context must be a string]": 0.123452,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_invalid_typed_input[payload6-input.context must be a string]": 0.136719,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_rejects_unknown_operation": 0.133352,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_returns_json_error_for_invalid_input_document[[]]": 0.130089,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_returns_json_error_for_invalid_input_document[]": 0.128252,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_returns_json_error_for_invalid_input_document[{\"task\": \"one\"} {\"task\": \"two\"}]": 0.132038,
+      "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_returns_one_wire_object_and_no_diagnostics_on_success": 0.167441,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_canary_entries_are_processed": 0.00325,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_dataset_is_loadable_and_schema_valid": 0.001693,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_decision_members_exist": 0.000124,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_decompose_mirror_must_agree_with_review": 0.000358,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_engine_tolerates_leading_separators": 0.000142,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_eval_aggregate_meets_declared_threshold": 0.00128,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_loader_maps_wire_boolean_to_decision": 0.000395,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_malformed_record_is_rejected": 0.000468,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_metric_matches_enum_decisions": 0.000148,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_missing_expected_reason_is_rejected": 0.000473,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_module_scores_perfect_on_its_dataset": 0.003716,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_review_property_is_read_only_compat_shim": 0.000304,
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_subprocess_network_client_is_denied": 0.000157
+    }
+  },
+  "drift_thresholds": {
+    "metric_mean_delta": 0.05,
+    "wall_p90_ratio": 1.5,
+    "wall_p90_abs_slack": 0.0,
+    "canary_failed_delta": 0,
+    "dataset": {
+      "duplicate_ids": 0,
+      "cross_split_leaks": 0
+    }
+  }
+}

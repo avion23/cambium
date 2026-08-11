@@ -1,0 +1,8 @@
+{
+  "contract_version": 1,
+  "module_name": "should_review",
+  "cli_module": "cambium.modules.should_review",
+  "protocol": "json-v1",
+  "dataset_schema_version": 1,
+  "label_field": "review"
+}

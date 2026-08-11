@@ -30,6 +30,8 @@ def _one_discovered_module() -> str:
 
 
 def test_split_digests_anchor_metadata_baseline_and_content() -> None:
+    if "example" not in module_conformance.discover_modules():
+        pytest.skip("reference module cambium.modules.example is absent")
     module_path = module_conformance.MODULES_DIR / _one_discovered_module()
     metadata = json.loads((module_path / "datasets" / "meta.json").read_text(encoding="utf-8"))
     baseline = json.loads(
@@ -46,6 +48,8 @@ def test_split_digests_anchor_metadata_baseline_and_content() -> None:
 
 
 def test_gate_accepts_module_scoped_baseline() -> None:
+    if "example" not in module_conformance.discover_modules():
+        pytest.skip("reference module cambium.modules.example is absent")
     name = _one_discovered_module()
     spec = module_conformance.validate_module(name)
 
@@ -363,6 +367,8 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
     """
     if not module_conformance.discover_modules():
         pytest.skip("no decision modules are installed; nothing to delete")
+    if "example" not in module_conformance.discover_modules():
+        pytest.skip("reference module cambium.modules.example is absent")
     copy = tmp_path / "repo"
     copy.mkdir()
     ignore = shutil.ignore_patterns(
