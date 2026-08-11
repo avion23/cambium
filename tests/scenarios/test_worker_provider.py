@@ -395,7 +395,12 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         repo = session_dir / "repo"
         base = _make_repo(repo)
         task = _task(session_dir, repo, base, config_path)
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
         merged = subprocess.run(
             ["git", "-C", str(repo), "show", "refs/heads/main:target.txt"],
@@ -482,7 +487,12 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         repo = session_dir / "repo"
         base = _make_repo(repo)
         task = _task(session_dir, repo, base, config_path)
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
         root_result = json.loads(
             (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
@@ -540,7 +550,12 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(
         base = _make_repo(repo)
         task = _task(session_dir, repo, base, config_path)
         task["max_restarts"] = 0
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
 
         assert result.exit_code != 0
@@ -597,7 +612,12 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
         base = _make_repo(repo)
         task = _task(session_dir, repo, base, config_path)
         task["max_restarts"] = 0
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
 
         assert result.exit_code != 0
@@ -676,7 +696,12 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
         _enqueue('{"type":"finish","summary":"edited target.txt and delegated a child"}')
 
         task = _task(session_dir, repo, base, config_path)
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
 
         assert result.exit_code == 0
@@ -722,7 +747,12 @@ def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch)
         base = _make_repo(repo)
         task = _task(session_dir, repo, base, config_path)
         task["max_restarts"] = 0
-        result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [task]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
 
         assert result.exit_code != 0

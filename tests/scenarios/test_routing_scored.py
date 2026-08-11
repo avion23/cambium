@@ -440,7 +440,12 @@ def test_task_assigned_event_carries_requirements(tmp_path, monkeypatch) -> None
             "max_restarts": 0,
             "heartbeat_interval_s": 0.05,
         }
-        result = asyncio.run(run_plan(session_dir, {"tasks": [spec]}))
+        result = asyncio.run(
+            run_plan(
+                session_dir, {"tasks": [spec]},
+                routing_state_path=str(tmp_path / "routing-state.json"),
+            )
+        )
         events = read_events(session_dir)
         assert result.exit_code == 0, result
         assigned = [

@@ -538,14 +538,15 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
                             "failed_requests": 0,
                             "cost": 0.0,
                             "retry_after_count": 0,
-                            "last_seen": 0.0,
+                            # fresh timestamp: the P3 time-decay (24h half-life)
+                            # must not zero a seed that represents live debt
+                            "last_seen": time.time(),
                         }
                     },
                 }
             ),
             encoding="utf-8",
         )
-        monkeypatch.setenv("CAMBIUM_ROUTING_STATE_PATH", str(state_path))
         _set_provider_env(monkeypatch, config_path)
 
         session_dir = tmp_path / "session"
@@ -566,7 +567,12 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
         # the batch pass resolves the whole wave against the persisted
         # snapshot in one go (H1): B's seeded 1M tokens make it 5% utilized,
         # so every task in the wave is pre-assigned to A
-        result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
+        result = asyncio.run(
+            run_plan(
+                session_dir, plan, max_concurrent_tasks=1,
+                routing_state_path=state_path,
+            )
+        )
         events = read_events(session_dir)
 
         assert result.exit_code == 0
@@ -705,9 +711,6 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
                 ("provider-b", server_b, PROVIDER_KEY_B, "m1"),
             ],
         )
-        monkeypatch.setenv(
-            "CAMBIUM_ROUTING_STATE_PATH", str(tmp_path / "routing-state.json")
-        )
         _set_provider_env(monkeypatch, config_path)
 
         session_dir = tmp_path / "session"
@@ -779,12 +782,6 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
 # --------------------------------------------------------------------------- #
 
 
-def test_debt_store_default_path_honors_env(monkeypatch, tmp_path) -> None:
-    target = tmp_path / "routing-state.json"
-    monkeypatch.setenv("CAMBIUM_ROUTING_STATE_PATH", str(target))
-    assert DebtStore().path == target.resolve()
-
-
 def test_debt_store_decays_aged_entries_on_load(tmp_path) -> None:
     import time
 
@@ -810,22 +807,23 @@ def test_debt_store_decays_aged_entries_on_load(tmp_path) -> None:
 def test_ledger_save_failure_does_not_block_session_result(tmp_path, monkeypatch) -> None:
     """If the routing-state save raises (disk full, permissions), the session
     result must still be written and the failure reported as a log event —
-    never propagated past the supervisor's result boundary."""
-    from cambium import supervisor as supervisor_module
+    never propagated past the supervisor's result boundary.
 
+    The failure is induced with a real condition: the ledger path's parent is
+    a regular file, so ``save``'s ``mkdir(parents=True)`` raises
+    ``NotADirectoryError`` (an OSError) — no stubbing.
+    """
     server = FakeServer([(200, _finish_payload("done", model="m1", total_tokens=26), 0.0)])
     try:
         config_path = _provider_config_file(
             tmp_path / "providers.json",
             [("provider-a", server, PROVIDER_KEY_A, "m1")],
         )
-        monkeypatch.setenv("CAMBIUM_ROUTING_STATE_PATH", str(tmp_path / "routing-state.json"))
         _set_provider_env(monkeypatch, config_path)
-
-        def _explode(self) -> None:
-            raise OSError("disk full (simulated)")
-
-        monkeypatch.setattr(supervisor_module.DebtStore, "save", _explode)
+        # a regular file where the ledger's parent directory would need to be
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        blocked_state = blocker / "routing-state.json"
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -838,7 +836,12 @@ def test_ledger_save_failure_does_not_block_session_result(tmp_path, monkeypatch
                 )
             ]
         }
-        result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
+        result = asyncio.run(
+            run_plan(
+                session_dir, plan, max_concurrent_tasks=1,
+                routing_state_path=blocked_state,
+            )
+        )
         events = read_events(session_dir)
 
         assert result.exit_code == 0
@@ -850,6 +853,6 @@ def test_ledger_save_failure_does_not_block_session_result(tmp_path, monkeypatch
             for e in events
             if e["kind"] == "log" and "routing-state save failed" in e["payload"].get("message", "")
         ]
-        assert logged and "disk full (simulated)" in logged[0]
+        assert logged and "routing-state save failed" in logged[0]
     finally:
         server.close()

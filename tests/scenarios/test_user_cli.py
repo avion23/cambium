@@ -769,18 +769,19 @@ def test_oversized_prompt_is_rejected_before_session_allocation(
     assert not sessions_root.exists() or not list(sessions_root.iterdir())
 
 
-def test_parser_maps_run_auto_flag_to_one_shot_config(monkeypatch, tmp_path: Path) -> None:
-    captured: list[oneshot.OneShotConfig] = []
-
-    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
-        captured.append(config)
-        return _plan_result()
-
-    monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
-
-    assert cli.main(
-        ["run", "--repo", str(tmp_path / "repo"), "--auto", "fix the bug"]
-    ) == 0
-    assert captured[0].auto is True
-    assert captured[0].provider is None
-    assert captured[0].model is None
+def test_run_parser_auto_flag_and_budget_flags() -> None:
+    """--auto/--max-wall-s/--max-turns/--max-turns map onto the run parser."""
+    parser = cli._build_parser()
+    args = parser.parse_args(
+        ["run", "--repo", ".", "--auto", "--max-wall-s", "900",
+         "--max-tokens", "500000", "--max-turns", "40", "fix the bug"]
+    )
+    assert args.auto is True
+    assert args.max_wall_s == 900
+    assert args.max_tokens == 500000
+    assert args.max_turns == 40
+    # --provider/--model stay available for the pinned mode
+    pinned = parser.parse_args(["run", "--provider", "demo", "--model", "m1", "p"])
+    assert pinned.auto is False
+    assert pinned.provider == "demo"
+    assert pinned.model == "m1"

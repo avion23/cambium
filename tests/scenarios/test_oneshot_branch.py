@@ -163,71 +163,76 @@ def _write_providers(path: Path) -> Path:
     return path
 
 
-def test_auto_mode_candidates_and_plan_shape(monkeypatch, tmp_path: Path) -> None:
+def _stored_auth(tmp_path: Path) -> Any:
+    """A real AuthStore at a scratch path with one stored provider key."""
+    from cambium.auth import AuthStore
+
+    store = AuthStore(tmp_path / "auth.json")
+    store.set_provider("pa", "secret-a")
+    return store
+
+
+def test_auto_mode_candidates_and_plan_shape(tmp_path: Path) -> None:
     """--auto builds model_candidates from providers with stored credentials
     and leaves the (provider, model, tier) to the supervisor resolution."""
+    from cambium.oneshot import _resolve_provider
+
     repo = _repo(tmp_path / "repo")
     config_path = _write_providers(tmp_path / "providers.json")
-    # only provider pa has a stored credential
-    stored = {"CAMBIUM_PROVIDER_PA_API_KEY": "secret-a"}
+    # only provider pa has a stored credential (real AuthStore, injected)
+    store = _stored_auth(tmp_path)
 
-    def _stored(name: str) -> dict[str, str]:
-        if name not in stored:
-            raise ValueError("provider credential is not configured")
-        return {name: stored[name]}
-
-    monkeypatch.setattr(oneshot, "_stored_provider_environment", _stored)
-
-    captured: dict[str, Any] = {}
-
-    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
-        captured.update(plan)
-        return PlanResult(
-            (TaskResult(task_id="oneshot", status="succeeded", exit_code=0),)
-        )
-
-    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
     config = oneshot.OneShotConfig(
         prompt="run one auto task",
         repo=repo,
         auto=True,
         provider_config_path=config_path,
     )
-    asyncio.run(oneshot.run_oneshot(config))
+    resolved, environment = _resolve_provider(config, repo, auth_store=store)
 
-    spec = captured["tasks"][0]
-    assert spec["model_candidates"] == ["model-a"]  # pb has no stored key
-    assert spec["fanout_config"] == {}  # resolution fills model + tier
-    assert spec["provider_env_keys"] == ["CAMBIUM_PROVIDER_PA_API_KEY"]
+    assert resolved.model_candidates == ("model-a",)  # pb has no stored key
+    assert resolved.fanout_config == {}  # resolution fills model + tier
+    assert resolved.provider_env_keys == ("CAMBIUM_PROVIDER_PA_API_KEY",)
+    assert environment == {"CAMBIUM_PROVIDER_PA_API_KEY": "secret-a"}
+    # the plan the supervisor sees carries the candidates for resolution
+    plan = oneshot.build_plan(resolved, repo, tmp_path / "session")
+    spec = plan["tasks"][0]
+    assert spec["model_candidates"] == ["model-a"]
+    assert spec["fanout_config"] == {}
 
 
-def test_auto_mode_rejects_pinned_provider_or_model(monkeypatch, tmp_path: Path) -> None:
+def test_auto_mode_rejects_pinned_provider_or_model(tmp_path: Path) -> None:
+    from cambium.oneshot import _resolve_provider
+
     repo = _repo(tmp_path / "repo")
     config = oneshot.OneShotConfig(
         prompt="p", repo=repo, auto=True, provider="pa",
         provider_config_path=_write_providers(tmp_path / "providers.json"),
     )
     try:
-        asyncio.run(oneshot.run_oneshot(config))
+        _resolve_provider(config, repo, auth_store=_stored_auth(tmp_path))
     except ValueError as exc:
         assert "cannot be combined" in str(exc)
     else:
         raise AssertionError("auto + provider must be rejected")
 
 
-def test_auto_mode_requires_stored_credential(monkeypatch, tmp_path: Path) -> None:
+def test_auto_mode_requires_stored_credential(tmp_path: Path) -> None:
+    from cambium.oneshot import _resolve_provider
+
     repo = _repo(tmp_path / "repo")
-    config_path = _write_providers(tmp_path / "providers.json")
-    monkeypatch.setattr(
-        oneshot, "_stored_provider_environment",
-        lambda name: (_ for _ in ()).throw(ValueError("not configured")),
-    )
     config = oneshot.OneShotConfig(
-        prompt="p", repo=repo, auto=True, provider_config_path=config_path,
+        prompt="p", repo=repo, auto=True,
+        provider_config_path=_write_providers(tmp_path / "providers.json"),
     )
+    # a real, EMPTY AuthStore: every provider's credential lookup fails
+    from cambium.auth import AuthStore
+
+    empty = AuthStore(tmp_path / "empty-auth.json")
     try:
-        asyncio.run(oneshot.run_oneshot(config))
+        _resolve_provider(config, repo, auth_store=empty)
     except ValueError as exc:
         assert "stored credentials" in str(exc)
     else:
         raise AssertionError("auto with no stored credentials must fail closed")
+

@@ -177,10 +177,7 @@ class DebtStore:
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
-        if path is None:
-            env_path = os.environ.get("CAMBIUM_ROUTING_STATE_PATH")
-            path = env_path if env_path else DEFAULT_ROUTING_STATE_PATH
-        self._path = Path(path).expanduser()
+        self._path = Path(path) if path is not None else DEFAULT_ROUTING_STATE_PATH
         self._debts: dict[str, ProviderDebt] = {}
         self._dirty = False
 

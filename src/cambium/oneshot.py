@@ -75,6 +75,7 @@ class OneShotConfig:
     model: str | None = None
     auto: bool = False
     model_candidates: tuple[str, ...] = ()
+    routing_state_path: str | Path | None = None
     provider_config_path: str | Path | None = None
     task_id: str | None = None
     worktree_path: str | Path | None = None
@@ -185,15 +186,18 @@ def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
     return path.resolve()
 
 
-def _stored_provider_environment(env_name: str) -> dict[str, str]:
+def _stored_provider_environment(
+    env_name: str, auth_store: AuthStore | None = None
+) -> dict[str, str]:
     """Return one selected credential without changing ``os.environ``."""
     if not is_provider_env_name(env_name):
         raise ValueError("provider credential is not configured")
     value = os.environ.get(env_name)
     if value:
         return {env_name: value}
+    store = auth_store if auth_store is not None else AuthStore()
     try:
-        launch_environment = AuthStore().launch_environment(base={})
+        launch_environment = store.launch_environment(base={})
     except AuthError as exc:
         raise ValueError("provider credential is unavailable") from exc
     value = launch_environment.get(env_name)
@@ -203,9 +207,15 @@ def _stored_provider_environment(env_name: str) -> dict[str, str]:
 
 
 def _resolve_provider(
-    config: OneShotConfig, repo: Path
+    config: OneShotConfig,
+    repo: Path,
+    auth_store: AuthStore | None = None,
 ) -> tuple[OneShotConfig, dict[str, str]]:
-    """Resolve one configured provider and prepare a non-global credential handoff."""
+    """Resolve one configured provider and prepare a non-global credential handoff.
+
+    ``auth_store`` is injected for callers that own their credential store
+    (tests, sandboxes); the production default is the real ``AuthStore``.
+    """
     marker_mode = (
         config.provider is None
         and config.model is None
@@ -230,7 +240,7 @@ def _resolve_provider(
             if not candidate.enabled:
                 continue
             try:
-                environment.update(_stored_provider_environment(candidate.api_key_env))
+                environment.update(_stored_provider_environment(candidate.api_key_env, auth_store))
             except ValueError:
                 continue
             stored.append(candidate)
@@ -264,7 +274,7 @@ def _resolve_provider(
     if config.provider is None and config.provider_env_keys:
         environment: dict[str, str] = {}
         for env_name in config.provider_env_keys:
-            environment.update(_stored_provider_environment(env_name))
+            environment.update(_stored_provider_environment(env_name, auth_store))
         return config, environment
 
     config_path = _provider_config_path(config, repo)
@@ -301,7 +311,7 @@ def _resolve_provider(
         provider_env_keys=(selected.api_key_env,),
         fanout_config=fanout_config,
     )
-    return resolved, _stored_provider_environment(selected.api_key_env)
+    return resolved, _stored_provider_environment(selected.api_key_env, auth_store)
 
 
 def _allocate_session_dir(repo: Path) -> Path:
@@ -404,11 +414,22 @@ async def run_oneshot(
     )
     preflight(resolved, repo, session_dir)
     plan = build_plan(resolved, repo, session_dir)
+    # The usage-debt ledger is repo-scoped by default so real runs keep
+    # cross-session burn per repository without touching a user-global file;
+    # tests against temporary repos are isolated automatically.
+    routing_state_path = (
+        resolved.routing_state_path
+        if resolved.routing_state_path is not None
+        else repo / ".cambium" / "routing-state.json"
+    )
     if provider_environment:
         return await supervisor.run_plan(
             session_dir,
             plan,
             on_event=on_event,
             provider_environment=provider_environment,
+            routing_state_path=routing_state_path,
         )
-    return await supervisor.run_plan(session_dir, plan, on_event=on_event)
+    return await supervisor.run_plan(
+        session_dir, plan, on_event=on_event, routing_state_path=routing_state_path
+    )

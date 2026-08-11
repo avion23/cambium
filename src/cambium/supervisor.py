@@ -3013,6 +3013,7 @@ async def run_plan(
     provider_environment: Mapping[str, str] | None = None,
     max_width: int | None = None,
     max_concurrent_tasks: int | None = None,
+    routing_state_path: str | Path | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3075,7 +3076,12 @@ async def run_plan(
         # Usage-debt ledger for admission balancing (solution C): load the
         # persisted state once, feed it live from usage_event rows, and
         # persist again when the session ends.
-        debt_store = DebtStore()
+        # Usage-debt ledger for admission balancing (solution C): load the
+        # persisted state once, feed it live from usage_event rows, and
+        # persist again when the session ends. The path is injected so the
+        # caller owns where routing evidence lives (oneshot defaults it to a
+        # repo-scoped file; tests pass scratch paths).
+        debt_store = DebtStore(routing_state_path)
         debt_store.load()
         runtime = _Runtime(
             session_dir,
@@ -3119,18 +3125,22 @@ async def run_plan(
             )
         finally:
             try:
-                await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
-            finally:
                 if debt_store.dirty:
                     try:
                         await asyncio.to_thread(debt_store.save)
                     except Exception as exc:  # noqa: BLE001
                         # A ledger save failure (disk full, permissions) must
                         # never discard the session result: report and continue.
+                        # Emitted while the event store is still open — after
+                        # shutdown the record could not be persisted.
                         await runtime.emit(
                             "log", task_id=None,
                             message=f"routing-state save failed: {exc}",
                         )
+            finally:
+                await runtime.shutdown(
+                    session_status="cancelled" if cancelled else "ended"
+                )
         result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
         session_id = str(session_dir.resolve())
         await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)
