@@ -1,5 +1,10 @@
 """Strict, env-keyed provider configuration loading for Diffundo.
 
+Provider entries carry a tagged ``auth``/``protocol`` mode: the legacy
+``api_key`` + ``chat_completions`` pair is unchanged, and ``codex_chatgpt``
+entries are pinned to ``CODEX_CHATGPT_PROFILE`` and must not carry
+``base_url``/``api_key_env`` (the profile fixes the endpoint and token flow).
+
 ``DEFAULT_SAMPLE`` documents the JSON shape without creating or writing a
 configuration file. Provider files contain API-key environment variable names
 only. The values are deliberately not inspected while loading; Diffundo reads
@@ -19,6 +24,7 @@ import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -27,6 +33,35 @@ from .auth import validate_derived_env_name, validate_provider_id
 
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
+
+
+class AuthMode(Enum):
+    """How a provider authenticates; ``API_KEY`` is the unchanged default."""
+
+    API_KEY = "api_key"
+    CODEX_CHATGPT = "codex_chatgpt"
+
+
+class Protocol(Enum):
+    """Wire protocol spoken with a provider; ``CHAT_COMPLETIONS`` is the
+    unchanged default."""
+
+    CHAT_COMPLETIONS = "chat_completions"
+    CODEX_RESPONSES = "codex_responses"
+
+
+# Pinned Codex-ChatGPT OAuth profile (codex-oauth plan W1). A provider tagged
+# ``auth=codex_chatgpt`` always targets this endpoint; providers.json must not
+# override it (see _validate_provider_mapping) so a modified provider file can
+# never redirect the bearer token to an attacker URL. Tests inject a loopback
+# profile only by constructing ProviderConfig directly; the pinned constants
+# are not configurable from providers.json.
+CODEX_CHATGPT_PROFILE: dict[str, object] = {
+    "issuer": "https://auth.openai.com",
+    "api_origin": "https://chatgpt.com",
+    "api_path": "/backend-api/codex/responses",
+    "scopes": ["openid", "profile", "email", "offline_access"],
+}
 
 DEFAULT_PROVIDER_PATH = Path(".cambium/providers.json")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -47,6 +82,8 @@ _PROVIDER_FIELDS = frozenset(
         "cooldown_s",
         "price",
         "token_window_allowance",
+        "auth",
+        "protocol",
     }
 )
 _DEFAULTS: dict[str, object] = {
@@ -180,6 +217,41 @@ def _diffundo_types() -> tuple[type[ProviderConfig], type[ProviderTier]]:
     return ProviderConfig, ProviderTier
 
 
+def _parse_auth_mode(raw: dict[str, object], location: str) -> AuthMode:
+    """Parse the optional ``auth`` tag; an explicit malformed value fails closed.
+
+    An absent tag defaults to ``AuthMode.API_KEY``; a present tag that is not a
+    valid mode name is an error, never a silent default.
+    """
+    value = raw.get("auth", AuthMode.API_KEY.value)
+    if not isinstance(value, str):
+        raise _error(f"{location}.auth", "must be an auth mode name")
+    try:
+        return AuthMode(value)
+    except ValueError as exc:
+        choices = ", ".join(sorted(member.value for member in AuthMode))
+        raise _error(
+            f"{location}.auth", f"invalid auth mode {value!r}; expected {choices}"
+        ) from exc
+
+
+def _parse_protocol(raw: dict[str, object], location: str) -> Protocol:
+    """Parse the optional ``protocol`` tag; an explicit malformed value fails
+    closed. An absent tag defaults to ``Protocol.CHAT_COMPLETIONS``; a present
+    tag that is not a valid protocol name is an error, never a silent default.
+    """
+    value = raw.get("protocol", Protocol.CHAT_COMPLETIONS.value)
+    if not isinstance(value, str):
+        raise _error(f"{location}.protocol", "must be a protocol name")
+    try:
+        return Protocol(value)
+    except ValueError as exc:
+        choices = ", ".join(sorted(member.value for member in Protocol))
+        raise _error(
+            f"{location}.protocol", f"invalid protocol {value!r}; expected {choices}"
+        ) from exc
+
+
 def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     location = f"providers[{index}]"
     if not isinstance(raw, dict):
@@ -189,9 +261,7 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     if unknown:
         raise _error(location, f"unknown field(s): {', '.join(map(repr, unknown))}")
 
-    missing = sorted(
-        field for field in ("name", "tier", "base_url", "api_key_env") if field not in raw
-    )
+    missing = sorted(field for field in ("name", "tier") if field not in raw)
     if missing:
         raise _error(location, f"missing required field(s): {', '.join(missing)}")
 
@@ -208,10 +278,36 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         choices = ", ".join(sorted(_VALID_TIERS))
         raise _error(f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}")
 
-    base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
-    api_key_env = _validate_api_key_env(
-        raw["api_key_env"], f"{location}.api_key_env", name
-    )
+    auth = _parse_auth_mode(raw, location)
+    protocol = _parse_protocol(raw, location)
+    if auth is AuthMode.CODEX_CHATGPT:
+        if protocol is not Protocol.CODEX_RESPONSES:
+            raise _error(
+                f"{location}.protocol",
+                f"auth {AuthMode.CODEX_CHATGPT.value!r} requires protocol "
+                f"{Protocol.CODEX_RESPONSES.value!r}",
+            )
+        # The pinned profile fixes the endpoint and token flow; a modified
+        # provider file must never redirect the bearer token to another URL.
+        for forbidden in ("base_url", "api_key_env"):
+            if forbidden in raw:
+                raise _error(
+                    f"{location}.{forbidden}",
+                    f"must not be set with auth {AuthMode.CODEX_CHATGPT.value!r}: "
+                    "the pinned CODEX_CHATGPT_PROFILE fixes the endpoint and token flow",
+                )
+        base_url = ""
+        api_key_env = ""
+    else:
+        missing = sorted(
+            field for field in ("base_url", "api_key_env") if field not in raw
+        )
+        if missing:
+            raise _error(location, f"missing required field(s): {', '.join(missing)}")
+        base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
+        api_key_env = _validate_api_key_env(
+            raw["api_key_env"], f"{location}.api_key_env", name
+        )
 
     values = {**_DEFAULTS, **raw}
     timeout_s = _require_number(values["timeout_s"], f"{location}.timeout_s")
@@ -266,6 +362,8 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
         "cooldown_s": cooldown_s,
         "price": price,
         "token_window_allowance": token_window_allowance,
+        "auth": auth,
+        "protocol": protocol,
     }
 
 
@@ -295,13 +393,16 @@ def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
         env_name = mapping["api_key_env"]
         if not isinstance(env_name, str):
             raise TypeError("validated provider environment name is not a string")
-        previous = env_names.get(env_name)
-        if previous is not None:
-            raise _error(
-                f"providers[{index}].name",
-                f"provider mapping collides with provider {previous!r}",
-            )
-        env_names[env_name] = name
+        # Only api_key providers carry an env-var name; codex_chatgpt providers
+        # share the empty marker and must not collide with each other.
+        if env_name:
+            previous = env_names.get(env_name)
+            if previous is not None:
+                raise _error(
+                    f"providers[{index}].name",
+                    f"provider mapping collides with provider {previous!r}",
+                )
+            env_names[env_name] = name
         mappings.append(mapping)
     return mappings
 
@@ -344,6 +445,8 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
         "priority": values["priority"],
         "cooldown_s": values["cooldown_s"],
         "token_window_allowance": values["token_window_allowance"],
+        "auth": values["auth"],
+        "protocol": values["protocol"],
     }
     price = values["price"]
     provider_fields = {field.name for field in fields(ProviderConfig)}
@@ -501,8 +604,11 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "AuthMode",
+    "CODEX_CHATGPT_PROFILE",
     "DEFAULT_PROVIDER_PATH",
     "DEFAULT_SAMPLE",
+    "Protocol",
     "ProviderConfig",
     "ProviderEnvSpec",
     "ProviderSelectionError",

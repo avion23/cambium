@@ -74,7 +74,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import __version__
-from .provider_config import is_loopback_host
+from .provider_config import AuthMode, Protocol, is_loopback_host
 
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
@@ -149,7 +149,13 @@ class ProviderOutcome(Enum):
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
     """Static provider description. ``api_key_env`` is an env-var NAME, never a
-    key value; the value is resolved from the environment at call time (D7)."""
+    key value; the value is resolved from the environment at call time (D7).
+
+    ``auth``/``protocol`` tag the provider mode: the legacy ``API_KEY`` +
+    ``CHAT_COMPLETIONS`` pair is unchanged; a ``CODEX_CHATGPT`` provider is
+    pinned to ``CODEX_CHATGPT_PROFILE`` and carries empty ``base_url``/
+    ``api_key_env`` (the transport derives the endpoint from the profile).
+    """
 
     name: str
     tier: ProviderTier
@@ -168,6 +174,8 @@ class ProviderConfig:
     # allowance for one balancing window; 0/absent falls back to the
     # routing.DEFAULT_TOKEN_WINDOW_ALLOWANCE placeholder.
     token_window_allowance: float = 0.0
+    auth: AuthMode = AuthMode.API_KEY
+    protocol: Protocol = Protocol.CHAT_COMPLETIONS
 
 
 @dataclass(frozen=True, slots=True)
