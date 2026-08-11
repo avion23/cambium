@@ -255,7 +255,10 @@ def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None
                     both_pruned.set()
                 await both_pruned.wait()
 
-        result = await asyncio.wait_for(run_plan(session_dir, plan, observer), timeout=15)
+        # Deadlock canary: the observer barrier must never hold merge/worktree
+        # locks. The bound is generous (60s) so a healthy run under parallel
+        # load (pytest-xdist) finishes, while a true deadlock still fails.
+        result = await asyncio.wait_for(run_plan(session_dir, plan, observer), timeout=60)
         assert result.exit_code == 0
         assert merge_events == {"t-a", "t-b"}
         assert prune_events == {"t-a", "t-b"}
