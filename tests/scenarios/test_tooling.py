@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_DIR = str(REPO_ROOT / "src")
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
 _CREDENTIAL_ENV_RE = re.compile(
     r"(api|key|token|secret|password|passwd|credential|authorization)", re.IGNORECASE
@@ -24,8 +25,10 @@ _CREDENTIAL_ENV_RE = re.compile(
 
 
 def _run_doctor(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return subprocess.run(
-        [*DOCTOR, *args], cwd=cwd, capture_output=True, text=True, timeout=300
+        [*DOCTOR, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=300
     )
 
 

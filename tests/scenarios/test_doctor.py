@@ -9,11 +9,13 @@ and keep a non-required empty key a WARN.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_DIR = str(REPO_ROOT / "src")
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
 
 
@@ -43,8 +45,10 @@ def _write_config(tmp_path: Path, required: bool) -> Path:
 
 
 def _run_doctor(cwd: Path) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return subprocess.run(
-        DOCTOR, cwd=cwd, capture_output=True, text=True, timeout=300
+        DOCTOR, cwd=cwd, env=env, capture_output=True, text=True, timeout=300
     )
 
 
