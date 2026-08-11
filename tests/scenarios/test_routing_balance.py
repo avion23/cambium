@@ -508,8 +508,9 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
     tmp_path, monkeypatch
 ) -> None:
     """Two providers serve two candidate models; the ledger favours B, so the
-    first ``model_candidates`` task is assigned A (lowest utilization), its
-    usage feeds the ledger, and the next admission is assigned B."""
+    batch pre-assignment pass (H1) assigns every task in the wave to A (the
+    lowest-utilization provider) in one pass from the persisted snapshot, and
+    the workers' usage still folds into the durable ledger."""
     server_a = FakeServer(
         [(200, _finish_payload("done on A", model="m1", total_tokens=2_000_000), 0.0)]
     )
@@ -563,8 +564,9 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
                 ),
             ]
         }
-        # serialize admissions so the second task resolves after the first
-        # task's usage events reached the supervisor ledger
+        # the batch pass resolves the whole wave against the persisted
+        # snapshot in one go (H1): B's seeded 1M tokens make it 5% utilized,
+        # so every task in the wave is pre-assigned to A
         result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
         events = read_events(session_dir)
 
@@ -578,28 +580,24 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
             if event["kind"] == "task_assigned" and "assigned_provider" in event["payload"]
         ]
         assert [payload["assigned_provider"] for payload in assigned] == [
-            "provider-a", "provider-b",
+            "provider-a", "provider-a",
         ]
-        assert {payload["model"] for payload in assigned} == {"m1", "m2"}
-        by_provider = {payload["assigned_provider"]: payload for payload in assigned}
-        assert by_provider["provider-a"]["model"] == "m1"
-        assert by_provider["provider-b"]["model"] == "m2"
+        assert {payload["model"] for payload in assigned} == {"m1"}
 
-        # one provider call per task, carrying the assigned model
-        assert len(server_a.calls) == 1
-        assert len(server_b.calls) == 1
-        assert server_a.calls[0]["model"] == "m1"
-        assert server_b.calls[0]["model"] == "m2"
+        # both workers call the assigned provider with the assigned model
+        assert len(server_a.calls) == 2
+        assert len(server_b.calls) == 0
+        assert all(call["model"] == "m1" for call in server_a.calls)
 
-        # usage fed the durable ledger: A folded its own 2M tokens; B kept its
-        # seeded 1M plus its own small usage
+        # usage fed the durable ledger: A folded both tasks' 2M tokens; B kept
+        # its seeded 1M untouched
         ledger = DebtStore(state_path)
         ledger.load()
         debts = ledger.as_mapping()
-        assert debts["provider-a"].tokens == 2_000_000
-        assert debts["provider-a"].requests == 1
-        assert debts["provider-b"].tokens == 1_001_000
-        assert debts["provider-b"].requests == 11
+        assert debts["provider-a"].tokens == 4_000_000
+        assert debts["provider-a"].requests == 2
+        assert debts["provider-b"].tokens == 1_000_000
+        assert debts["provider-b"].requests == 10
     finally:
         server_a.close()
         server_b.close()
