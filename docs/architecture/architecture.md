@@ -59,7 +59,10 @@ Non-critical store records can be dropped under the store overflow policy.
    custom bounded loop. Each turn calls `Diffundo`, requires exactly one strict
    JSON action (`plan`, `tool_call`, or `finish`), validates permissions and
    tool arguments, dispatches the tool, emits a `tool_event` and checkpoint,
-   and then creates one fenced result commit. The agent is instructed to emit a
+   and then, when the agent changed files, creates one fenced result commit.
+   A provider loop that finished cleanly with no non-`.cambium` changes is a
+   successful no-op: it owns zero commits and no empty commit is made; the
+   summary is carried in the result and rendered output. The agent is instructed to emit a
    short `plan` action before any `tool_call`, and the plan is retained in the
    transcript. The transcript is summarized without an LLM call (dropping old
    turns plus a synthetic dropped-message marker, keeping the plan) whenever it
@@ -111,8 +114,9 @@ Do not use those names as current architecture components.
 1. The caller owns the session directory and supplies plan records.
 2. The supervisor owns validation, worker handles, generations, event
    admission, restart decisions, and publication order.
-3. A worker owns its worktree edits, provider calls, tool context, and commit;
-   it cannot publish `main` directly.
+3. A worker owns its worktree edits, provider calls, tool context, and at most
+   one fenced commit (zero for a clean no-change finish); it cannot publish
+   `main` directly.
 4. The merge sequencer owns staging, expected-old checks, quarantine, and
    cleanup. A conflict, non-fast-forward, or cleanup violation does not
    advance `main`.
