@@ -233,6 +233,35 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             ["paths"],
         ),
     },
+    {
+        "name": "delegate",
+        "description": (
+            "Propose a child task for supervisor validation; the child is admitted "
+            "only after this task completes with a result envelope."
+        ),
+        "parameters": _parameters(
+            {
+                "child_task_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Stable id for the proposed child task.",
+                },
+                "kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Tree kind of the proposed child task.",
+                },
+                "spec": {
+                    "type": "object",
+                    "description": (
+                        "The child's task spec (task, repo, worktree_path, branch, "
+                        "target_file, marker); the supervisor re-validates it."
+                    ),
+                },
+            },
+            ["child_task_id", "kind", "spec"],
+        ),
+    },
 ]
 
 
