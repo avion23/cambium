@@ -2447,6 +2447,10 @@ class _Runtime:
                 deadline=pong_deadline,
             ):
                 timeout_phase = "pong"
+                await self.emit(
+                    "protocol", task_id=task_id, generation=generation,
+                    note="missing correlated pong after EOF", expected=pong_rid,
+                )
                 return False
             while loop.time() < pong_deadline:
                 remaining = pong_deadline - loop.time()
