@@ -46,6 +46,7 @@ their exact pre-H2 behavior.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -53,6 +54,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
 
 from .diffundo import ProviderTier
 
@@ -163,8 +169,18 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
         debt.latency_total_s = float(latency_total_s)
     last_seen = entry.get("last_seen")
     if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
-        debt.last_seen = float(last_seen)
+        try:
+            parsed_last_seen = float(last_seen)
+        except (OverflowError, ValueError):
+            pass
+        else:
+            if math.isfinite(parsed_last_seen):
+                debt.last_seen = parsed_last_seen
     return debt
+
+
+def _copy_debts(debts: Mapping[str, ProviderDebt]) -> dict[str, ProviderDebt]:
+    return {name: replace(debt) for name, debt in debts.items()}
 
 
 class DebtStore:
@@ -173,12 +189,19 @@ class DebtStore:
     ``load`` replaces memory with the persisted ledger (a missing or corrupt
     file is an empty ledger); ``record`` folds live usage events into the
     in-memory accumulator; ``save`` atomically rewrites the ledger file
-    (``mkstemp`` in the same directory + fsync + ``os.replace``).
+    (``mkstemp`` in the same directory + fsync + ``os.replace``). Saves take a
+    per-ledger lock and merge session deltas with the current on-disk ledger so
+    concurrent sessions do not overwrite one another's usage.
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
         self._path = Path(path) if path is not None else DEFAULT_ROUTING_STATE_PATH
         self._debts: dict[str, ProviderDebt] = {}
+        # ``_baseline_debts`` is the in-memory view loaded at session start;
+        # ``_source_debts`` is the un-decayed on-disk snapshot used to tell an
+        # unchanged ledger from one another session has already updated.
+        self._baseline_debts: dict[str, ProviderDebt] = {}
+        self._source_debts: dict[str, ProviderDebt] = {}
         self._dirty = False
 
     @property
@@ -196,6 +219,83 @@ class DebtStore:
     #: windows are measured; see module docstring).
     _DECAY_HALF_LIFE_HOURS = 24.0
 
+    def _read_persisted_debts(self) -> dict[str, ProviderDebt]:
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return {}
+        if not (
+            isinstance(raw, Mapping)
+            and raw.get("version") == _ROUTING_STATE_VERSION
+            and isinstance(raw.get("providers"), Mapping)
+        ):
+            return {}
+        return {
+            name: _debt_from_mapping(name, entry)
+            for name, entry in raw["providers"].items()
+            if isinstance(name, str) and isinstance(entry, Mapping)
+        }
+
+    @staticmethod
+    def _merge_provider_debt(
+        base: ProviderDebt,
+        local: ProviderDebt,
+        baseline: ProviderDebt | None,
+    ) -> ProviderDebt:
+        """Add this session's cumulative-field delta to ``base``."""
+        int_fields = (
+            "tokens",
+            "requests",
+            "failed_requests",
+            "retry_after_count",
+            "cache_hit_count",
+            "latency_count",
+        )
+        float_fields = ("cost", "latency_total_s")
+        updates: dict[str, Any] = {}
+        for field in (*int_fields, *float_fields):
+            before = getattr(baseline, field, 0) if baseline is not None else 0
+            updates[field] = getattr(base, field) + getattr(local, field) - before
+
+        last_seen = base.last_seen
+        if local.last_seen is not None and (
+            last_seen is None or local.last_seen > last_seen
+        ):
+            last_seen = local.last_seen
+        updates["last_seen"] = last_seen
+        return replace(base, **updates)
+
+    def _merge_with_current(
+        self, current: Mapping[str, ProviderDebt]
+    ) -> dict[str, ProviderDebt]:
+        merged: dict[str, ProviderDebt] = {}
+        for name in set(current) | set(self._debts):
+            on_disk = current.get(name)
+            local = self._debts.get(name)
+            if local is None:
+                if on_disk is not None:
+                    merged[name] = replace(on_disk)
+                continue
+
+            baseline = self._baseline_debts.get(name)
+            source = self._source_debts.get(name)
+            if on_disk is None:
+                base = baseline if baseline is not None else ProviderDebt()
+            elif source is not None and on_disk == source:
+                # No other session changed this provider. Preserve the local
+                # load-time decay, then add this session's usage delta.
+                base = baseline if baseline is not None else ProviderDebt()
+            else:
+                # Another session has already merged its usage. Add only this
+                # session's delta to that newer snapshot.
+                base = on_disk
+            merged[name] = self._merge_provider_debt(base, local, baseline)
+        return merged
+
     def load(self) -> None:
         """Replace memory with the persisted ledger; tolerate a bad file.
 
@@ -204,42 +304,34 @@ class DebtStore:
         is scaled by ``0.5 ** (age_hours / 24)`` where age is measured from
         the entry's ``last_seen`` timestamp.
         """
-        try:
-            text = self._path.read_text(encoding="utf-8")
-        except OSError:
-            self._debts = {}
-            return
-        try:
-            raw = json.loads(text)
-        except ValueError:
-            self._debts = {}
-            return
+        persisted = self._read_persisted_debts()
         debts: dict[str, ProviderDebt] = {}
-        if (
-            isinstance(raw, Mapping)
-            and raw.get("version") == _ROUTING_STATE_VERSION
-            and isinstance(raw.get("providers"), Mapping)
-        ):
-            now = time.time()
-            for name, entry in raw["providers"].items():
-                if isinstance(name, str) and isinstance(entry, Mapping):
-                    debt = _debt_from_mapping(name, entry)
-                    age_hours = max(0.0, (now - debt.last_seen) / 3600.0)
-                    factor = 0.5 ** (age_hours / self._DECAY_HALF_LIFE_HOURS)
-                    # Only decay meaningfully-aged entries: fresh data (same
-                    # session) must round-trip untouched, and a <1% decay is
-                    # below any selection-relevant resolution anyway.
-                    if factor <= 0.99:
-                        debt = replace(
-                            debt,
-                            tokens=round(debt.tokens * factor),
-                            requests=round(debt.requests * factor),
-                            failed_requests=round(debt.failed_requests * factor),
-                            retry_after_count=round(debt.retry_after_count * factor),
-                            cost=debt.cost * factor,
-                        )
-                    debts[name] = debt
+        now = time.time()
+        for name, debt in persisted.items():
+            if debt.last_seen is None or not math.isfinite(debt.last_seen):
+                # Missing or malformed timestamps cannot provide an age. Keep
+                # the valid usage fields and skip decay for this entry.
+                debts[name] = debt
+                continue
+            age_hours = max(0.0, (now - debt.last_seen) / 3600.0)
+            factor = 0.5 ** (age_hours / self._DECAY_HALF_LIFE_HOURS)
+            # Only decay meaningfully-aged entries: fresh data (same
+            # session) must round-trip untouched, and a <1% decay is
+            # below any selection-relevant resolution anyway.
+            if factor <= 0.99:
+                debt = replace(
+                    debt,
+                    tokens=round(debt.tokens * factor),
+                    requests=round(debt.requests * factor),
+                    failed_requests=round(debt.failed_requests * factor),
+                    retry_after_count=round(debt.retry_after_count * factor),
+                    cost=debt.cost * factor,
+                )
+            debts[name] = debt
         self._debts = debts
+        self._baseline_debts = _copy_debts(debts)
+        self._source_debts = _copy_debts(persisted)
+        self._dirty = False
 
     def record(self, event: Mapping[str, Any]) -> None:
         """Fold one usage event into the in-memory accumulator."""
@@ -259,42 +351,57 @@ class DebtStore:
 
     def save(self) -> None:
         """Atomically persist the ledger (redacted counts/tokens only)."""
-        payload = {
-            "version": _ROUTING_STATE_VERSION,
-            "providers": {
-                name: {
-                    "tokens": debt.tokens,
-                    "requests": debt.requests,
-                    "failed_requests": debt.failed_requests,
-                    "cost": debt.cost,
-                    "retry_after_count": debt.retry_after_count,
-                    "cache_hit_count": debt.cache_hit_count,
-                    "latency_total_s": debt.latency_total_s,
-                    "latency_count": debt.latency_count,
-                    "last_seen": debt.last_seen,
-                }
-                for name, debt in sorted(self._debts.items())
-            },
-        }
-        content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, self._path)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
+        lock_path = self._path.with_name(f".{self._path.name}.lock")
+        with lock_path.open("a+", encoding="ascii", newline="\n") as lock:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                debts = self._merge_with_current(self._read_persisted_debts())
+                payload = {
+                    "version": _ROUTING_STATE_VERSION,
+                    "providers": {
+                        name: {
+                            "tokens": debt.tokens,
+                            "requests": debt.requests,
+                            "failed_requests": debt.failed_requests,
+                            "cost": debt.cost,
+                            "retry_after_count": debt.retry_after_count,
+                            "cache_hit_count": debt.cache_hit_count,
+                            "latency_total_s": debt.latency_total_s,
+                            "latency_count": debt.latency_count,
+                            "last_seen": debt.last_seen,
+                        }
+                        for name, debt in sorted(debts.items())
+                    },
+                }
+                content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent
+                )
+                temporary_path = Path(temporary_name)
                 try:
-                    temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
+                    with os.fdopen(
+                        descriptor, "w", encoding="utf-8", newline="\n"
+                    ) as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary_path, self._path)
+                    temporary_path = None
+                finally:
+                    if temporary_path is not None:
+                        try:
+                            temporary_path.unlink()
+                        except FileNotFoundError:
+                            pass
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        self._debts = _copy_debts(debts)
+        self._baseline_debts = _copy_debts(debts)
+        self._source_debts = _copy_debts(debts)
+        self._dirty = False
 
 
 def _window_allowance(provider: Any) -> float:
