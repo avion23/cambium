@@ -35,6 +35,12 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests", "src"]
 pythonpath = ["src"]
+# Default run is the fast tier: subprocess/process-boundary integration
+# scenarios opt out via the `slow` marker and run with `pytest -m slow`.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: subprocess/process-boundary integration scenario; run with -m slow",
+]
 
 [tool.ruff]
 line-length = 100

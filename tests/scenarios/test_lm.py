@@ -18,14 +18,15 @@ from cambium.diffundo import CallResult, ProviderTier
 from cambium.lm import ArchitectusLM, CambiumLM
 from cambium.tasktree import build_tree
 
-try:
-    import dspy
-except ImportError:
-    dspy = None
-
 
 def _require_dspy() -> None:
-    if dspy is None:
+    """Import dspy lazily: every dspy-consuming scenario is slow-tier, so the
+    default fast run must not pay the ~2s dspy import at collection."""
+    global dspy  # noqa: PLW0603
+    try:
+        import dspy  # noqa: PLC0415
+    except ImportError:
+        dspy = None  # type: ignore[assignment]
         pytest.skip("dspy extra is not installed")
 
 

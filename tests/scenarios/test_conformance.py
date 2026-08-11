@@ -63,6 +63,7 @@ def _worker_commit(repo: Path, base: str, branch: str, worktree: Path, name: str
     return _git(worktree, "rev-parse", "HEAD").stdout.strip()
 
 
+@pytest.mark.slow
 def test_real_worker_result_correlates_and_exit_has_no_request_id(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
@@ -152,6 +153,7 @@ def test_event_store_ddl_matches_architecture_and_keeps_iso_ts_text(tmp_path: Pa
         assert connection.execute("SELECT ts FROM events").fetchone()[0] == iso_ts
 
 
+@pytest.mark.slow
 def test_merge_rejects_invalid_old_values_non_fast_forward_and_quarantine(tmp_path):
     repo = tmp_path / "repo"
     base = _init_repo(repo)

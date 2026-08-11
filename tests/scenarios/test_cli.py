@@ -101,6 +101,7 @@ def test_doctor_exits_zero_on_healthy_repo(tmp_path, monkeypatch, capsys) -> Non
     assert "0 fail" in captured.out
 
 
+@pytest.mark.slow
 def test_bench_report_honors_bench_root(tmp_path, monkeypatch) -> None:
     bench_root = tmp_path / "baselines"
     module_baseline = REPO_ROOT / "src/cambium/modules/example/tests/baselines/baseline.json"
@@ -112,6 +113,7 @@ def test_bench_report_honors_bench_root(tmp_path, monkeypatch) -> None:
     assert module_baseline.read_bytes() == before
 
 
+@pytest.mark.slow
 def test_bench_gate_fails_closed_without_pre_existing_anchor(
     tmp_path, monkeypatch, capsys
 ) -> None:

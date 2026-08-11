@@ -296,6 +296,7 @@ def _write_env_probe_module(tmp_path: Path) -> Path:
 
 
 @REQUIRES_EXAMPLE
+@pytest.mark.slow
 def test_report_writes_valid_baseline(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
@@ -792,6 +793,7 @@ def test_scripts_use_the_neutral_module_boundary() -> None:
     assert "'decompose': False" in generated.stdout
 
 
+@pytest.mark.slow
 def test_gate_fails_closed_without_pre_existing_anchor(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
@@ -927,6 +929,7 @@ def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
     assert "timing run exited" in capsys.readouterr().err
 
 
+@pytest.mark.slow
 def test_gate_passes_without_drift(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
@@ -940,6 +943,7 @@ def test_gate_passes_without_drift(tmp_path, monkeypatch) -> None:
     assert "DRIFT" not in gate.stdout
 
 
+@pytest.mark.slow
 def test_gate_fails_on_metric_drift(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
@@ -965,6 +969,7 @@ def test_gate_fails_on_metric_drift(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_gate_fails_and_preserves_anchor_on_dataset_version_change(
     tmp_path, monkeypatch
 ) -> None:
@@ -998,6 +1003,7 @@ def test_gate_fails_and_preserves_anchor_on_dataset_version_change(
     assert fresh["dataset_version"] == "fixture-1"
 
 
+@pytest.mark.slow
 def test_reanchor_mode_requires_pre_existing_anchor(tmp_path, monkeypatch) -> None:
     """Explicit re-anchor is a review operation: it needs an anchor to replace."""
     import cambium.bench as bench
@@ -1011,6 +1017,7 @@ def test_reanchor_mode_requires_pre_existing_anchor(tmp_path, monkeypatch) -> No
     assert not (bench_root / "fixture_module" / "baseline.json").exists()
 
 
+@pytest.mark.slow
 def test_gate_honors_cli_metric_delta_override(tmp_path, monkeypatch) -> None:
     """--bench-metric-delta must override the anchor thresholds on a gate run."""
     import cambium.bench as bench
@@ -1040,6 +1047,7 @@ def test_gate_honors_cli_metric_delta_override(tmp_path, monkeypatch) -> None:
     assert "DRIFT" not in ok.stdout  # drop 0.005 <= 0.01
 
 
+@pytest.mark.slow
 def test_missing_modules_dir_fails_closed_for_report_and_gate(
     tmp_path, monkeypatch
 ) -> None:
