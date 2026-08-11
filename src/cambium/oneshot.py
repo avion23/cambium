@@ -55,6 +55,11 @@ class OneShotConfig:
     ``provider_env_keys`` and ``fanout_config`` are internal, non-secret plan
     fields.  Normal callers set ``provider`` and optionally ``model``; the
     runner resolves those fields against the existing provider configuration.
+
+    ``auto`` is the routing mode (solution C): the supervisor selects the
+    (provider, model, tier) from ``model_candidates`` against the usage-debt
+    ledger instead of pinning one provider here. ``model_candidates`` is
+    internal (filled from the enabled configured providers when ``auto``).
     """
 
     prompt: str = ""
@@ -62,6 +67,8 @@ class OneShotConfig:
     session_root: str | Path | None = None
     provider: str | None = None
     model: str | None = None
+    auto: bool = False
+    model_candidates: tuple[str, ...] = ()
     provider_config_path: str | Path | None = None
     task_id: str | None = None
     worktree_path: str | Path | None = None
@@ -201,6 +208,44 @@ def _resolve_provider(
     if marker_mode:
         return config, {}
 
+    if config.auto:
+        if config.provider is not None or config.model is not None:
+            raise ValueError("auto mode cannot be combined with --provider or --model")
+        config_path = _provider_config_path(config, repo)
+        try:
+            providers = load_providers(config_path)
+        except (OSError, ProviderSelectionError, ValueError) as exc:
+            raise ValueError(f"provider selection failed: {exc}") from exc
+        environment: dict[str, str] = {}
+        stored: list[Any] = []
+        for candidate in providers:
+            if not candidate.enabled:
+                continue
+            try:
+                environment.update(_stored_provider_environment(candidate.api_key_env))
+            except ValueError:
+                continue
+            stored.append(candidate)
+        if not stored:
+            raise ValueError(
+                "auto mode requires at least one enabled provider with stored "
+                "credentials; run `cambium auth set <provider> --stdin` first"
+            )
+        resolved = replace(
+            config,
+            provider=None,
+            model=None,
+            provider_config_path=config_path,
+            # The fanout model/tier are left to the supervisor's routing
+            # resolution (solution C) so the ledger balances the pick.
+            fanout_config={},
+            provider_env_keys=tuple(candidate.api_key_env for candidate in stored),
+            model_candidates=tuple(
+                sorted({candidate.model for candidate in stored})
+            ),
+        )
+        return resolved, environment
+
     if (
         config.fanout_config is not None
         and config.provider is None
@@ -312,6 +357,8 @@ def build_plan(
         "max_wall_s": config.max_wall_s,
         "max_restarts": config.max_restarts,
     }
+    if config.model_candidates:
+        spec["model_candidates"] = list(config.model_candidates)
     if config.fanout_config is not None:
         spec["fanout_config"] = dict(config.fanout_config)
     if config.provider_config_path is not None and config.fanout_config is not None:

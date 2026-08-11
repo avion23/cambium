@@ -110,6 +110,13 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="prompt to run against the repository",
     )
     _add_agent_arguments(parser)
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="route the run through the usage-debt selector (solution C): the "
+        "supervisor picks (provider, model, tier) from all enabled configured "
+        "providers with stored credentials instead of pinning --provider/--model",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -482,6 +489,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         session_root=args.session_dir,
         provider=args.provider,
         model=args.model,
+        auto=getattr(args, "auto", False),
     )
     try:
         value = oneshot.run_oneshot(config)

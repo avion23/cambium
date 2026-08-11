@@ -767,3 +767,20 @@ def test_oversized_prompt_is_rejected_before_session_allocation(
         )
 
     assert not sessions_root.exists() or not list(sessions_root.iterdir())
+
+
+def test_parser_maps_run_auto_flag_to_one_shot_config(monkeypatch, tmp_path: Path) -> None:
+    captured: list[oneshot.OneShotConfig] = []
+
+    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
+        captured.append(config)
+        return _plan_result()
+
+    monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
+
+    assert cli.main(
+        ["run", "--repo", str(tmp_path / "repo"), "--auto", "fix the bug"]
+    ) == 0
+    assert captured[0].auto is True
+    assert captured[0].provider is None
+    assert captured[0].model is None
