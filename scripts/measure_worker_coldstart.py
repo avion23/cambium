@@ -18,7 +18,7 @@ the durable event chain (arch §6.3):
 
     task_assigned -> spawned -> init -> ready -> run_task -> result -> exit
                                                         merge_started -> merge_committed
-                                                                       -> worktree_pruned -> session_ended
+                                                        -> worktree_pruned -> session_ended
 
 Reported deltas (milliseconds):
 
@@ -292,9 +292,12 @@ def _print_summary(records: list[dict]) -> None:
     print("=" * 72)
     print("COLD vs WARM (cold = run 0; warm = median of runs 1..N-1)")
     print("=" * 72)
-    print(f"  spawn_to_ready  cold={_fmt_ms(cold.get('spawn_to_ready_ms'))} ms"
+    cold_spawn = cold.get('spawn_to_ready_ms')
+    delta = (cold_spawn - warm_spawn
+             if warm_spawn is not None and cold_spawn is not None else None)
+    print(f"  spawn_to_ready  cold={_fmt_ms(cold_spawn)} ms"
           f"  warm={_fmt_ms(warm_spawn)} ms"
-          f"  delta={_fmt_ms((cold.get('spawn_to_ready_ms') - warm_spawn) if warm_spawn is not None and cold.get('spawn_to_ready_ms') is not None else None)} ms")
+          f"  delta={_fmt_ms(delta)} ms")
     print(f"  init_to_ready   cold={_fmt_ms(cold.get('init_to_ready_ms'))} ms"
           f"  warm={_fmt_ms(warm_init)} ms")
     print(f"  plan wall       cold={_fmt_ms(cold.get('wall_ms'))} ms"
@@ -336,12 +339,13 @@ def _print_reuse_projection(records: list[dict]) -> None:
     print("=" * 72)
     print("REUSE PROJECTION (what a persistent-worker pool would save per task)")
     print("=" * 72)
-    print(f"  marker task (measured here):")
+    print("  marker task (measured here):")
     print(f"    warm spawn_to_ready   = {marker_warm:7.1f} ms")
     print(f"    reuse floor (IPC)     = {REUSE_IPC_FLOOR_MS:7.1f} ms")
+    pct = (100.0 * marker_saving / marker_warm) if marker_warm else 0.0
     print(f"    saving per task       = {marker_saving:7.1f} ms"
-          f"  ({(100.0 * marker_saving / marker_warm) if marker_warm else 0.0:5.1f} % of spawn_to_ready)")
-    print(f"  provider-loop task (projected from docs/research/worker-coldstart.md):")
+          f"  ({pct:5.1f} % of spawn_to_ready)")
+    print("  provider-loop task (projected from docs/research/worker-coldstart.md):")
     print(f"    dspy spawn_to_ready   = {DSPY_SPAWN_TO_READY_MS:7.1f} ms")
     dspy_saving = max(0.0, DSPY_SPAWN_TO_READY_MS - REUSE_IPC_FLOOR_MS)
     print(f"    reuse floor (IPC)     = {REUSE_IPC_FLOOR_MS:7.1f} ms")
