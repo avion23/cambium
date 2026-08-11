@@ -240,9 +240,12 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
         target_file="b.txt", marker="// child-marker", worker=str(dump_worker),
         provider_env_keys=["FAKE_MODE", "CONTEXT_DUMP_PATH"],
     )
+    # The root declares CONTEXT_DUMP_PATH itself so the child may inherit it:
+    # children inherit, never exceed, the parent's provider_env_keys.
     root = _task(
         session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
         target_file="a.txt", marker="// parent-marker",
+        provider_env_keys=["FAKE_MODE", "CONTEXT_DUMP_PATH"],
         proposed_children=[_child_proposal(child)],
     )
 

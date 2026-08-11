@@ -1207,21 +1207,29 @@ class _Runtime:
             "depends_on": [parent_task_id],
             "spec": child_spec,
         })
+        try:
+            if self._task_group is None:
+                raise RuntimeError("no active task group")
+            self._task_group.create_task(self.supervise_task(child_spec))
+        except RuntimeError as exc:
+            # Group already closed/cancelled: roll the tree back so the child
+            # is not left durably admitted but never spawned, and record the
+            # rejection instead.
+            self._session_tasks[:] = [
+                task for task in self._session_tasks
+                if task.get("spec") is not child_spec
+            ]
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
+            )
+            return
         await self.emit(
             "child_admitted", task_id=parent_task_id, request_id=request_id,
             parent_task_id=parent_task_id, child_task_id=child_task_id,
             child_kind=kind, branch=child_spec.get("branch"),
         )
-        if self._task_group is None:
-            await self.emit(
-                "log", task_id=parent_task_id, request_id=request_id,
-                message=(
-                    f"child {child_task_id} admitted but no active task group; "
-                    "not spawned"
-                ),
-            )
-            return
-        self._task_group.create_task(self.supervise_task(child_spec))
 
     # -- per-task supervision ------------------------------------------------
 
@@ -1243,6 +1251,20 @@ class _Runtime:
         finally:
             if spec["task_id"] in self._results:
                 await self._prune_worktree(spec)
+            # Proposals buffered but never processed (the parent ended without
+            # a result envelope) are dropped with a durable rejection so they
+            # neither leak nor vanish silently.
+            pending = self._pending_children.pop(spec["task_id"], [])
+            for proposal in pending:
+                await self.emit(
+                    "child_rejected", task_id=spec["task_id"],
+                    request_id=proposal.get("request_id"),
+                    parent_task_id=spec["task_id"],
+                    child_task_id=proposal["child_task_id"],
+                    child_kind=proposal.get("kind"),
+                    reason="ParentTerminatedWithoutResult",
+                    message="parent ended without a result envelope; proposal dropped",
+                )
 
     async def _supervise(self, spec: dict[str, Any]) -> None:
         task_id = spec["task_id"]
@@ -1409,6 +1431,10 @@ class _Runtime:
         generation = handle.generation
         cmd = self._worker_command(spec)
         env = self._worker_env(spec, generation)
+        # A new generation is a fresh worker process: proposals buffered by a
+        # previous, dead generation are stale and must not be admitted when a
+        # later generation delivers its result.
+        self._pending_children.pop(task_id, None)
 
         async def _report_outbound_message_too_long() -> None:
             await self.emit(
@@ -2287,6 +2313,12 @@ def _child_spec(
     child_spec["task_id"] = proposal["child_task_id"]
     child_spec["kind"] = proposal["kind"]
     child_spec["parent_task_id"] = parent_spec["task_id"]
+    # Children inherit, never exceed, the parent's environment access: a
+    # worker must not widen provider_env_keys beyond what its parent (or the
+    # plan) already had.
+    parent_keys = set(parent_spec.get("provider_env_keys") or ())
+    child_keys = set(child_spec.get("provider_env_keys") or ())
+    child_spec["provider_env_keys"] = sorted(child_keys & parent_keys)
     child_spec["parent_envelope"] = parent_envelope
     return _validate_plan_task(session_dir, child_spec)
 
