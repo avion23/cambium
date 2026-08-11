@@ -29,8 +29,8 @@ A multi-word command line that is not a known command is a prompt:
 
 See [`docs/architecture/user-cli.md`](docs/architecture/user-cli.md) for the
 exact run, bare-prompt, repl, tui, and session workflows, provider selection
-from `.cambium/providers.json`, and how stored credentials are handed to
-workers in memory.
+from the trusted user config (`~/.config/cambium/providers.json`), and how
+stored credentials are handed to workers in memory.
 
 ## Quickstart
 

@@ -41,10 +41,14 @@ Options:
 - `--repo PATH` — repository to work in, default `.` (current directory).
   The path is expanded and resolved; `oneshot.preflight` requires it to be an
   existing directory whose `.git` exists and whose `refs/heads/main` resolves.
-- `--session-dir DIR` — a concrete session leaf. When omitted, a fresh leaf
-  named `run-*` is created with mode `0700` under
-  `<repo>/.cambium/sessions/` (one leaf per run; two default runs never share
-  a directory).
+- `--session-dir DIR` — a fresh concrete session leaf. The leaf is used as-is
+  and must not already contain run artifacts: `run_oneshot` rejects a leaf
+  that already has `plan.json`, `.cambium/events.db`, or
+  `.cambium/result.json` (`one-shot session directory has already been
+  used`). There is no one-shot resume: a used or interrupted leaf is rejected,
+  never continued. When omitted, a fresh leaf named `run-*` is created with
+  mode `0700` under `<repo>/.cambium/sessions/` (one leaf per run; two
+  default runs never share a directory).
 - `--provider` / `--model` — select one configured provider (see §7).
   Provider ids are validated against `[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?`.
 - `--json` — print the rendered result as JSON instead of the text line.
@@ -63,12 +67,12 @@ output is the filtered `{"results": [...]}` record. Exit codes: `0` success,
 `2` for config/preflight errors (`cambium run: <message>`), `130` on
 `KeyboardInterrupt`, otherwise the result exit code.
 
-Without `--provider`/`--model`, the task is a deterministic marker task; the
-CLI does not expose the `target_file`/`marker` fields such a task requires, so
-a plain run fails at the worker boundary with
-`marker task requires target_file and marker`. Provider runs (`--provider` or
-`--model`, or an internal `fanout_config`) use the bounded Diffundo worker
-loop instead.
+Without `--provider`/`--model`, the run still resolves a provider: it
+auto-selects the first enabled provider from the trusted user config (see
+§7). The marker task (`target_file` plus `marker`) is an internal
+`OneShotConfig` path only; the CLI does not expose those fields, so a plain
+run never becomes a marker task. Provider runs use the bounded Diffundo
+worker loop.
 
 ## 3. Bare multi-word prompt
 
@@ -95,16 +99,18 @@ stops the loop; every other line is a prompt. Each prompt runs through
 `oneshot.run_oneshot` with a fresh immutable config
 (`dataclasses.replace(config, prompt=...)`), so a failed or mutated run never
 changes the shared config. Each result is printed as one rendered text line.
-The exit code is `0` unless at least one prompt failed, in which case it is
-`1`; per-prompt failures print `repl: <error>` to stderr and continue.
+The exit code is `1` if any result failed (a nonzero result exit code or a
+per-prompt exception), otherwise `0`; per-prompt failures print
+`repl: <error>` to stderr and continue.
 
 ## 5. `cambium tui`
 
 `tui.run_tui` is the same one-shot-per-line loop with a `cambium> ` prompt
 written and flushed before each read. Blank lines are skipped; per-prompt
 errors print `cambium: <error>` to stderr and continue. Exit codes: `0` on
-EOF, `0` on `BrokenPipeError`, `130` on `KeyboardInterrupt`, `1` if the
-backend modules cannot be imported.
+EOF when every prompt succeeded, `1` on EOF if any result failed, `0` on
+`BrokenPipeError`, `130` on `KeyboardInterrupt`, `1` if the backend modules
+cannot be imported.
 
 ## 6. `cambium session list/latest/show`
 
@@ -131,12 +137,17 @@ that default `run` leaves are created under.
 
 ## 7. Provider selection and credential handoff
 
-### `.cambium/providers.json` selection
+### Provider configuration selection
 
 `oneshot._provider_config_path` resolves the provider file in this order:
-`config.provider_config_path` (not exposed by the CLI), then the
-`CAMBIUM_PROVIDERS` environment variable, then `<repo>/.cambium/providers.json`.
-Relative paths resolve against the current directory. The file is one JSON
+`config.provider_config_path` (the library override, not exposed by the CLI),
+then the `CAMBIUM_PROVIDERS` environment variable, then the trusted user
+config `<effective-user-home>/.config/cambium/providers.json`. Relative paths
+resolve against the current directory. The target repository's
+`.cambium/providers.json` is never consulted: a default run auto-selects from
+the trusted user config, and a repo-local provider file is not implicitly
+trusted. `CAMBIUM_PROVIDERS` and the library `provider_config_path` are the
+intentional overrides. The file is one JSON
 object with a `providers` list; each entry has the required fields `name`,
 `tier` (`fast|balanced|strong|reasoning`), `base_url` (http(s); plaintext http
 only for loopback hosts), and `api_key_env` — which must equal the derived
@@ -174,11 +185,13 @@ and exceptions never expose it.
 ### In-memory handoff, never in `plan.json`
 
 For a provider run, `oneshot._stored_provider_environment` builds an in-memory
-mapping `{derived_env_name: key_value}` (unless the variable is already set in
-the process environment, which wins). `run_oneshot` passes that mapping
-directly to `supervisor.run_plan(..., provider_environment=...)`. It is not
-part of the plan: `plan.json` carries only the `provider_env_keys` names and
-the `provider_config_path`; `_write_plan` writes it with mode `0600`. The
+mapping `{derived_env_name: key_value}`. The canonical environment credential
+wins: when the derived `CAMBIUM_PROVIDER_<PROVIDER>_API_KEY` variable is
+already set in the process environment, that value is used; otherwise the
+value is read from the `AuthStore`. `run_oneshot` passes that mapping directly
+to `supervisor.run_plan(..., provider_environment=...)`. It is not part of the
+plan: `plan.json` carries only the `provider_env_keys` names and the
+`provider_config_path`; `_write_plan` writes it with mode `0600`. The
 supervisor forwards only the declared names' values into each worker
 subprocess environment (`_worker_environment`), and the session redactor
 registers every forwarded value so it is redacted from durable events. Key
