@@ -174,7 +174,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-turns",
         type=_positive_int,
         metavar="N",
-        help="maximum agent-loop turns (default 20)",
+        help="maximum agent-loop turns (default 50)",
     )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
