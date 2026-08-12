@@ -21,6 +21,8 @@ from typing import Any
 
 from .auth import scrub_environment
 
+LINT_TIMEOUT_S = 10
+
 
 def _location_value(diagnostic: dict[str, Any], direct: str, nested: str) -> Any:
     location = diagnostic.get("location")
@@ -95,7 +97,10 @@ def format_diags(diags: list[dict], *, max_lines: int = 20) -> str:
 class LintDiag:
     """Small Ruff subprocess adapter used by the worker's edit loop."""
 
-    def __init__(self, lint_cmd: list[str] | None = None) -> None:
+    def __init__(
+        self, lint_cmd: list[str] | None = None, *, timeout_s: float = LINT_TIMEOUT_S
+    ) -> None:
+        self.timeout_s = timeout_s
         if lint_cmd is None:
             ruff = shutil.which("ruff")
             self.lint_cmd = (
@@ -112,13 +117,23 @@ class LintDiag:
         """Run Ruff against exactly one file and return at most 50 findings."""
         if self.lint_cmd is None:
             return []
-        result = subprocess.run(
-            [*self.lint_cmd, str(path)],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=scrub_environment(),
-        )
+        try:
+            result = subprocess.run(
+                [*self.lint_cmd, str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=scrub_environment(),
+                timeout=self.timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return [{
+                "path": str(path),
+                "line": None,
+                "col": None,
+                "message": f"lint timed out after {self.timeout_s}s",
+                "code": "lint-timeout",
+            }]
         return _parse_diagnostics(path, result.stdout)
 
     def lint_files(self, paths: list[Path]) -> dict[Path, list[dict]]:
