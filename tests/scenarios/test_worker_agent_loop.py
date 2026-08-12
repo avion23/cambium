@@ -191,9 +191,7 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     assert "read_batch" in tool_names
 
 
-def test_finish_after_code_change_without_verification_is_rejected(
-    tmp_path: Path,
-) -> None:
+def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
@@ -202,7 +200,8 @@ def test_finish_after_code_change_without_verification_is_rejected(
             '{"type":"plan","steps":["write note.txt"]}',
             '{"type":"tool_call","name":"write_file","arguments":'
             '{"path":"note.txt","content":"hello\\n"}}',
-            '{"type":"finish","summary":"wrote note.txt"}',
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}',
+            '{"type":"finish","summary":"tests failed anyway"}',
             '{"type":"finish","summary":"still unverified"}',
             '{"type":"tool_call","name":"read_file","arguments":{"path":"note.txt"}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
@@ -214,8 +213,8 @@ def test_finish_after_code_change_without_verification_is_rejected(
 
     assert outcome["status"] == "succeeded"
     assert outcome["summary"] == "verified"
-    assert outcome["turn"] == 7
-    assert len(router.prompts) == 7
+    assert outcome["turn"] == 8
+    assert len(router.prompts) == 8
     rejected = [
         message["content"]
         for message in outcome["transcript"]
@@ -223,6 +222,33 @@ def test_finish_after_code_change_without_verification_is_rejected(
     ]
     assert len(rejected) == 2
     assert "did not run a successful verification command" in rejected[0]
+
+
+def test_finish_after_edit_without_verification_attempt_succeeds(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["edit alpha.txt"]}',
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"alpha.txt","old_string":"alpha-content","new_string":"ALPHA"}}',
+            '{"type":"finish","summary":"edited, no tests available"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["summary"] == "edited, no tests available"
+    assert outcome["turn"] == 3
+    assert len(router.prompts) == 3
+    assert not any(
+        "finish rejected" in message["content"]
+        for message in outcome["transcript"]
+    )
 
 
 def test_finish_after_verified_change_succeeds(tmp_path: Path) -> None:
