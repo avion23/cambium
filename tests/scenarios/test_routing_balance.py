@@ -787,7 +787,15 @@ def test_debt_store_decays_aged_entries_on_load(tmp_path) -> None:
 
     path = tmp_path / "routing-state.json"
     store = DebtStore(path)
-    store.record({"provider": "p1", "usage": {"total_tokens": 400}})
+    for _ in range(4):
+        store.record(
+            {
+                "provider": "p1",
+                "usage": {"total_tokens": 100},
+                "provider_cache_hit": True,
+                "latency_s": 2.0,
+            }
+        )
     store.save()
     # age the entry 48h (two 24h half-lives) and reload: 400 -> 100
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -795,7 +803,12 @@ def test_debt_store_decays_aged_entries_on_load(tmp_path) -> None:
     path.write_text(json.dumps(raw), encoding="utf-8")
     loaded = DebtStore(path)
     loaded.load()
-    assert loaded.as_mapping()["p1"].tokens == 100
+    entry = loaded.as_mapping()["p1"]
+    assert entry.tokens == 100
+    assert entry.requests == 1
+    assert entry.cache_hit_count == 1
+    assert entry.latency_count == 1
+    assert entry.latency_total_s == pytest.approx(2.0)
 
 
 # --------------------------------------------------------------------------- #

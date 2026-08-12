@@ -10,9 +10,9 @@ kind ``usage_event``) shows huge provider differences:
 
 ``Diffundo`` now accepts a usage-debt snapshot (``ProviderDebt`` counters as
 recorded by ``routing.DebtStore``) and refines order WITHIN an equal-priority
-run by measured quality (``diffundo._debt_quality_score``): a higher
-cache-hit rate and a lower mean latency win. Config priority stays the
-primary ordering key; a provider with no fresh debt scores a neutral weight
+run by measured quality (``selection.quality_score``): success confidence,
+latency-SLO compliance, cost, then latency/cache evidence decide. Config
+priority stays the primary ordering key; a provider with no fresh debt is neutral and
 so it keeps its config-priority position instead of being pinned to the
 bottom permanently. Health states are untouched: a cooldown/quarantined
 provider is skipped exactly as before.
@@ -40,9 +40,9 @@ from cambium.diffundo import (
     ProviderConfig,
     ProviderStatus,
     ProviderTier,
-    _debt_quality_score,
 )
 from cambium.routing import ProviderDebt
+from cambium.selection import quality_score
 
 # --------------------------------------------------------------------------- #
 # Fake provider server (http.server in a thread — no network)
@@ -209,20 +209,20 @@ def _three_servers() -> tuple[FakeServer, FakeServer, FakeServer]:
 # --------------------------------------------------------------------------- #
 
 
-def test_debt_quality_score_ranks_measured_data_and_neutral_defaults() -> None:
+def test_quality_score_ranks_measured_data_and_neutral_defaults() -> None:
     now = time.time()
     debt = _measured_debt()
-    scores = {name: _debt_quality_score(entry, now=now) for name, entry in debt.items()}
+    scores = {name: quality_score(entry, now=now) for name, entry in debt.items()}
     # codex sorts below opencode-go and zai when measured data exists
-    assert scores["opencode-go"] > scores["zai"] > scores["codex"]
+    assert scores["opencode-go"] < scores["zai"] < scores["codex"]
 
     # no data / empty entry -> neutral 0.0 (never a penalty)
-    assert _debt_quality_score(None, now=now) == 0.0
-    assert _debt_quality_score(ProviderDebt(), now=now) == 0.0
+    assert quality_score(None, now=now) is None
+    assert quality_score(ProviderDebt(), now=now) is None
 
-    # stale data (last seen older than a week) -> neutral 0.0
-    stale_now = now + 8 * 24 * 3600
-    assert _debt_quality_score(debt["codex"], now=stale_now) == 0.0
+    # stale data -> no ordering evidence
+    stale_now = now + 2 * 24 * 3600
+    assert quality_score(debt["codex"], now=stale_now) is None
 
     # a raw mapping entry works too (not just ProviderDebt)
     mapping = {
@@ -232,7 +232,7 @@ def test_debt_quality_score_ranks_measured_data_and_neutral_defaults() -> None:
         "latency_count": 5,
         "last_seen": now,
     }
-    assert _debt_quality_score(mapping, now=now) > 0.0
+    assert quality_score(mapping, now=now) is not None
 
 
 # --------------------------------------------------------------------------- #
