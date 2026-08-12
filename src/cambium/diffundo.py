@@ -79,6 +79,17 @@ item stays byte-identical as the transcript grows. The parse path is proven
 correct (the reported hits decode to ``provider_cache_hit=True``); the sparse
 ``cached_tokens`` is the codex backend's own behavior, not a prefix churn or
 a parse failure.
+
+**Cache-control fields are rejected by this endpoint (live-probed).** The
+GPT-5.6 caching controls from the standard Responses API are not accepted by
+the consumer ``/backend-api/codex/responses`` endpoint: ``prompt_cache_options``
+returns ``400 Unsupported parameter: prompt_cache_options`` and
+``prompt_cache_breakpoint`` returns ``400 prompt_cache_breakpoint is not
+supported on this model``. ``prompt_cache_key`` is accepted but reports
+``cached_tokens: 0`` even for a byte-identical 24k-token prefix re-sent three
+times, so it does not enable caching here either. Do not emit these fields:
+the endpoint's sparse caching is its own behavior and cannot be controlled
+from the request shape. The worker bounds transcript growth directly instead.
 """
 
 from __future__ import annotations
