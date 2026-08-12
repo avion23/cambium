@@ -989,8 +989,13 @@ class ArchitectusLM:
     """Adapt CambiumLM to Architectus's asynchronous ``decide`` port."""
 
     _SYSTEM_PROMPT = (
-        "You are Architectus. Return only a JSON array of action objects for the next "
-        "scheduling wave. Do not include markdown."
+        "You are Architectus, the task-tree scheduler. Return only a compact JSON array "
+        "of action objects for the next scheduling wave; no markdown, no prose. Every "
+        "action object must be exactly {\"action\": \"<kind>\", \"task_id\": \"<existing "
+        "id>\"} with kind one of: spawn, steer, aggregate, replan, reset_retry, "
+        "abort_subtree. The task_id must be one of the task ids listed in "
+        "tree_state.nodes; never invent an id or a kind. Prefer spawning the ready "
+        "nodes first."
     )
 
     def __init__(self, lm: CambiumLM) -> None:

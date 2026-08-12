@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import importlib
 import inspect
+import json
 import os
 import sqlite3
 import subprocess
@@ -20,6 +21,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .auth import (
@@ -94,6 +96,7 @@ _COMMAND_NAMES = frozenset(
         "repl",
         "tui",
         "session",
+        "architectus",
     }
 )
 
@@ -176,6 +179,39 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
+def _add_architectus_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dry-run",
+        "--scripted",
+        dest="dry_run",
+        action="store_true",
+        help="run one deterministic scripted decision wave (no live LLM, no credentials)",
+    )
+    parser.add_argument(
+        "--provider",
+        type=_provider_argument,
+        metavar="PROVIDER",
+        help="provider id for the live decision call (default: first enabled configured provider)",
+    )
+    parser.add_argument(
+        "--tier",
+        metavar="TIER",
+        help="provider tier for the live call (default: the selected provider's tier)",
+    )
+    parser.add_argument(
+        "--waves",
+        type=_positive_int,
+        metavar="N",
+        default=1,
+        help="number of decision waves to run (default 1)",
+    )
+    parser.add_argument(
+        "--task",
+        metavar="TASK",
+        help="root goal for the fixture task tree (default: a docstring fixture task)",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(
         prog="cambium",
@@ -183,7 +219,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,tasktree,module-test,version,run,repl,tui,session}",
+        metavar="{auth,supervisor,doctor,bench,tasktree,module-test,version,run,repl,tui,session,architectus}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -357,6 +393,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "tasktree",
         help="read a plan from a file or stdin and print its topological order",
     )
+    architectus = commands.add_parser(
+        "architectus",
+        help="run one live or scripted Architectus decision session",
+        description="Run a live or scripted Architectus decomposition session: build one "
+        "fixture TaskTree, run one or more decision waves through the pure core, and print "
+        "the resulting action intents. Use --dry-run/--scripted for a deterministic run "
+        "that needs no provider credentials.",
+    )
+    _add_architectus_arguments(architectus)
     module_test = commands.add_parser(
         "module-test",
         help="run one module's isolated conformance gate",
@@ -872,6 +917,151 @@ def _run_session(args: argparse.Namespace) -> int:
     raise AssertionError(f"unhandled session command: {args.session_command!r}")
 
 
+def _architectus_provider_config_path() -> Path:
+    """Resolve the trusted provider-config path for a live decision call.
+
+    Mirrors the one-shot resolver: ``CAMBIUM_PROVIDERS`` when set, otherwise
+    the user-level ``<home>/.config/cambium/providers.json``. The target
+    repository's own provider file is never consulted.
+    """
+    from .auth import effective_home
+
+    configured = os.environ.get("CAMBIUM_PROVIDERS")
+    path = (
+        Path(configured).expanduser()
+        if configured
+        else effective_home() / ".config" / "cambium" / "providers.json"
+    )
+    return path.resolve()
+
+
+def _live_architectus_llm(
+    provider: str | None, tier: str | None
+) -> tuple[Any, str, str]:
+    """Construct one live :class:`ArchitectusLM` from the trusted provider config.
+
+    The returned triple is ``(llm, provider name, tier label)``. API-key
+    providers resolve their credential from the environment or the AuthStore
+    and stage it process-locally (never logged); ``codex_chatgpt`` providers
+    inject the stored OAuth access token through Diffundo's CredentialSource.
+    The Diffundo router is pinned to the selected provider's model so the call
+    has one deterministic candidate instead of cascading across providers.
+    """
+    from .auth import AuthStore
+    from .diffundo import CredentialSource, Diffundo, ProviderTier
+    from .lm import ArchitectusLM, CambiumLM
+    from .oauth import OAuthStore
+    from .provider_config import (
+        AuthMode,
+        ProviderSelectionError,
+        load_providers,
+        select_provider,
+    )
+
+    config_path = _architectus_provider_config_path()
+    try:
+        providers = load_providers(config_path)
+        selected = select_provider(providers, name=provider)
+    except (OSError, ProviderSelectionError, ValueError) as exc:
+        raise ValueError(f"provider selection failed: {exc}") from exc
+
+    tier_value = tier or selected.tier.value
+    try:
+        selected_tier = ProviderTier(tier_value)
+    except ValueError as exc:
+        raise ValueError(f"unsupported provider tier {tier_value!r}") from exc
+
+    options: dict[str, Any] = {}
+    if selected.auth is AuthMode.CODEX_CHATGPT:
+        doc = OAuthStore().read_document(selected.name)
+        if doc is None:
+            raise ValueError(
+                f"provider {selected.name!r} has no stored oauth session; "
+                "run `cambium auth oauth <provider>` first"
+            )
+        options["credential_source"] = CredentialSource(
+            access_token=doc.access_token, account_id=doc.account_id
+        )
+    else:
+        env_name = selected.api_key_env
+        api_key = os.environ.get(env_name)
+        if not api_key:
+            try:
+                api_key = AuthStore().launch_environment(base={}).get(env_name)
+            except AuthError as exc:
+                raise ValueError("provider credential is unavailable") from exc
+        if not api_key:
+            raise ValueError(
+                f"provider {selected.name!r} has no stored credential; "
+                "run `cambium auth set <provider> --stdin` first"
+            )
+        os.environ[env_name] = api_key
+
+    diffundo = Diffundo(providers, **options)
+    lm = CambiumLM(diffundo, selected_tier, model=selected.model)
+    return ArchitectusLM(lm), selected.name, selected_tier.value
+
+
+async def _architectus_waves(core: Any, waves: int) -> list[list[dict[str, Any]]]:
+    """Run ``waves`` decision waves and return the admitted action lists."""
+    results: list[list[dict[str, Any]]] = []
+    for _ in range(waves):
+        actions = await core.step([{"kind": "tick"}])
+        if not isinstance(actions, list) or not all(
+            isinstance(action, dict) for action in actions
+        ):
+            raise ValueError("decision actions are not a JSON array of action objects")
+        results.append(actions)
+    return results
+
+
+def _run_architectus(args: argparse.Namespace) -> int:
+    """Run one live or scripted Architectus decomposition session end-to-end."""
+    from .architectus import ArchitectusCore, ScriptedLLM
+    from .tasktree import build_tree
+
+    task = (
+        args.task
+        or "Add a docstring to the build_tree function in src/cambium/tasktree.py"
+    )
+    tree = build_tree(
+        {
+            "tasks": [
+                {
+                    "task_id": "root",
+                    "kind": "FEATURE",
+                    "depends_on": [],
+                    "spec": {"goal": task},
+                }
+            ]
+        }
+    )
+    if args.dry_run:
+        llm = ScriptedLLM([{"action": "spawn", "task_id": "root"}])
+        provider_name = "scripted"
+        tier_label = "scripted"
+    else:
+        try:
+            llm, provider_name, tier_label = _live_architectus_llm(
+                args.provider, args.tier
+            )
+        except (AuthError, OSError, ValueError) as exc:
+            print(f"cambium architectus: {exc}", file=sys.stderr)
+            return 2
+
+    core = ArchitectusCore(llm, tree=tree)
+    try:
+        waves = asyncio.run(_architectus_waves(core, args.waves))
+    except Exception as exc:  # noqa: BLE001
+        print(f"cambium architectus: decision wave failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"provider: {provider_name} (tier: {tier_label})")
+    for index, actions in enumerate(waves, start=1):
+        print(f"wave {index}: {json.dumps(actions, sort_keys=True)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch one unified Cambium CLI invocation and return its exit code."""
     command_line = sys.argv[1:] if argv is None else argv
@@ -903,6 +1093,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_tui(args)
     if args.command == "session":
         return _run_session(args)
+    if args.command == "architectus":
+        return _run_architectus(args)
     if args.command == "version":
         print(__version__)
         return 0
