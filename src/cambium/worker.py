@@ -1715,14 +1715,21 @@ async def _run_agent_loop(
             no_progress_actions = 0
             if action["type"] == "finish":
                 transcript.append({"role": "assistant", "content": action_content})
-                if code_changed and verification_failed and not verified_after_change:
+                if code_changed and not verified_after_change:
+                    reason = (
+                        "finish rejected: you changed code but did not run a "
+                        "successful verification command; run the tests (e.g. "
+                        "run_shell) before finishing"
+                        if not verification_failed
+                        else (
+                            "finish rejected: your verification command failed; "
+                            "run the tests successfully (e.g. run_shell) before "
+                            "finishing"
+                        )
+                    )
                     transcript.append({
                         "role": "user",
-                        "content": (
-                            "finish rejected: you changed code but did not run a "
-                            "successful verification command; run the tests (e.g. "
-                            "run_shell) before finishing"
-                        ),
+                        "content": reason,
                     })
                     progress.tool = "finish"
                     continue
