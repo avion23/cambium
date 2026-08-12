@@ -1,11 +1,10 @@
-"""Capability/quality-constrained model selection with shadow prices (H2) scenarios.
+"""Capability/quality-constrained model selection scenarios.
 
 H2 builds on the merged solution-C ledger and H1 lanes: when a task declares
 ``requirements``, :func:`score_providers` filters candidates strictly by
 capability (``quality == "high"`` keeps only ``ProviderTier.STRONG``
-providers) and ranks the eligible providers by a weighted score of normalized
-utilization, cache-hit rate, expected latency, and a shadow price
-(``utilization**2`` — tokens grow scarcer as a window fills). A weak-tier
+providers) and ranks eligible providers with the shared pure selection
+objective. A weak-tier
 provider is never substituted for one that fails the task's constraints, and
 unknown requirement keys fail closed. Without ``requirements`` the supervisor
 keeps the exact ``select_lane`` behavior from H1.
@@ -163,11 +162,11 @@ def test_score_providers_strict_filter_applies_in_batch_preassignment(
 
 
 # --------------------------------------------------------------------------- #
-# 2. scored ordering: cache/latency decide ties; shadow price amplifies
+# 2. scored ordering: shared quality objective
 # --------------------------------------------------------------------------- #
 
 
-def test_score_providers_ranks_cache_and_latency_then_shadow_price() -> None:
+def test_score_providers_ranks_shared_quality_objective() -> None:
     providers = [_pc("a", "m1"), _pc("b", "m2")]
     # equal utilization (0 tokens): A has 9/10 cache hits and 2s avg latency,
     # B has 1/10 cache hits and 20s avg latency -> A must win on
@@ -184,13 +183,13 @@ def test_score_providers_ranks_cache_and_latency_then_shadow_price() -> None:
     assert scored[0][0] == "a"
     score_a, score_b = scored[0][2], scored[1][2]
     assert score_a < score_b
-    # B near its window cap: shadow price (utilization**2) raises B's score,
-    # so A wins even harder
+    # Token utilization is an admission-balancing concern and does not change
+    # the quality ranking used when requirements select this path.
     debt["b"].tokens = int(0.9 * DEFAULT_TOKEN_WINDOW_ALLOWANCE)
     scored = score_providers(providers, ["m1", "m2"], debt)
     assert scored[0][0] == "a"
-    assert scored[1][2] > score_b  # B's shadow term made B strictly worse
-    assert scored[0][2] == score_a  # A's own score is unchanged
+    assert scored[1][2] == score_b
+    assert scored[0][2] == score_a
 
 
 # --------------------------------------------------------------------------- #

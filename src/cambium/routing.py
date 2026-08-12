@@ -38,13 +38,10 @@ providers; ``min_context_window`` keeps only providers whose
 without a declared capacity never satisfies it, so a task is never bound to a
 provider that cannot fit its context; unknown requirement keys raise
 ``ValueError`` so a task never silently downgrades) and then ranks the
-eligible providers by a weighted score of normalized utilization, cache-hit
-rate, expected latency, and a shadow price (utilization squared — tokens grow
-scarcer as a window fills).
-The weights are module constants (:data:`W_UTIL` etc.), documented
-placeholders until measured quality/latency data exists (implementation-plan
-step 3/5). Without ``requirements``, ``select_primary``/``select_lane`` keep
-their exact pre-H2 behavior.
+eligible providers with the pure lexicographic quality objective in
+``cambium.selection``. Without ``requirements``,
+``select_primary``/``select_lane`` keep their exact pre-H2 behavior and use
+normalized utilization for admission balancing, not provider quality.
 """
 
 from __future__ import annotations
@@ -65,6 +62,7 @@ except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None
 
 from .diffundo import ProviderTier
+from .selection import DEFAULT_WEIGHTS, QualityWeights, order_candidates
 
 # Placeholder weekly-equivalent token window per provider. No measured quota
 # contract exists yet (implementation-plan step 3); a provider config may
@@ -73,14 +71,14 @@ DEFAULT_TOKEN_WINDOW_ALLOWANCE = 20_000_000
 DEFAULT_ROUTING_STATE_PATH = Path.home() / ".config" / "cambium" / "routing-state.json"
 _ROUTING_STATE_VERSION = 1
 
-# Placeholder scoring weights for score_providers (H2). No measured
-# quality/latency evidence exists yet (implementation-plan step 3/5): these
-# are documented placeholders until usage/quota data is stable.
-W_UTIL = 0.6
-W_CACHE = 0.2
-W_LATENCY = 0.1
-W_SHADOW = 0.1
-REFERENCE_LATENCY_S = 30.0
+# Compatibility aliases for callers that imported the former scoring
+# constants. QualityWeights is the single tuning type; score_providers no
+# longer combines these unlike units in a weighted sum.
+W_UTIL = DEFAULT_WEIGHTS.utilization_weight
+W_CACHE = DEFAULT_WEIGHTS.cache_weight
+W_LATENCY = DEFAULT_WEIGHTS.latency_weight
+W_SHADOW = DEFAULT_WEIGHTS.shadow_weight
+REFERENCE_LATENCY_S = DEFAULT_WEIGHTS.latency_slo_s
 _REQUIREMENT_KEYS = frozenset({"quality", "min_context_window"})
 
 
@@ -329,6 +327,9 @@ class DebtStore:
                     requests=round(debt.requests * factor),
                     failed_requests=round(debt.failed_requests * factor),
                     retry_after_count=round(debt.retry_after_count * factor),
+                    cache_hit_count=round(debt.cache_hit_count * factor),
+                    latency_total_s=debt.latency_total_s * factor,
+                    latency_count=round(debt.latency_count * factor),
                     cost=debt.cost * factor,
                 )
             debts[name] = debt
@@ -596,21 +597,13 @@ def score_providers(
     a cheaper/underused provider that fails the task's constraints is never
     substituted (and no eligible provider raises, fail-closed).
 
-    Eligible providers then score with the documented placeholder weights
-    (:data:`W_UTIL`, :data:`W_CACHE`, :data:`W_LATENCY`, :data:`W_SHADOW`):
-
-    ``score = W_UTIL*utilization_norm + W_CACHE*(1 - cache_hit_rate)
-    + W_LATENCY*latency_norm + W_SHADOW*shadow_price``
-
-    where ``utilization_norm`` is tokens/window allowance (existing),
-    ``cache_hit_rate`` is ``cache_hit_count/requests`` (0.0 when no requests),
-    ``latency_norm`` is average call latency divided by
-    :data:`REFERENCE_LATENCY_S` (0.0 when no data), and ``shadow_price`` is
-    ``utilization_norm**2`` — tokens grow scarcer as a window fills. Lower
-    score wins. H1 lane filtering applies when ``lanes`` is passed: a provider
-    whose lane is at or above its effective in-flight cap is skipped. Returns
-    the eligible ``(provider_name, model, score)`` triples sorted ascending by
-    (score, config index), so the caller takes the head deterministically.
+    Eligible providers use :func:`cambium.selection.order_candidates`, whose
+    lexicographic quality key is success confidence, latency-SLO compliance,
+    expected cost per successful turn, then a normalized latency/cache
+    tie-break. Missing evidence preserves config position. H1 lane filtering
+    applies when ``lanes`` is passed. Returns eligible
+    ``(provider_name, model, score)`` triples, where the float score is the
+    zero-based rank retained for API compatibility.
     """
     requirements = validate_requirements(requirements)
     candidates = tuple(candidates)
@@ -618,8 +611,9 @@ def score_providers(
         raise ValueError("model_candidates must be a non-empty list of model ids")
     require_strong = requirements.get("quality") == "high"
     min_context_window = requirements.get("min_context_window")
-    scored: list[tuple[float, int, str, str]] = []
-    for index, provider in enumerate(providers):
+    eligible: list[Any] = []
+    models: dict[str, str] = {}
+    for provider in providers:
         if not getattr(provider, "enabled", True):
             continue
         model = getattr(provider, "model", "")
@@ -644,30 +638,25 @@ def score_providers(
                 )
                 if lane.in_flight >= lane.effective_in_flight_cap(retry_after_count):
                     continue
-        current = debt.get(provider.name) if debt is not None else None
-        utilization = _normalized_utilization(provider, debt)
-        requests = current.requests if current is not None else 0
-        cache_hit_rate = (current.cache_hit_count / requests) if requests else 0.0
-        latency_norm = 0.0
-        if current is not None and current.latency_count:
-            latency_norm = (
-                current.latency_total_s / current.latency_count
-            ) / REFERENCE_LATENCY_S
-        shadow_price = utilization ** 2
-        score = (
-            W_UTIL * utilization
-            + W_CACHE * (1.0 - cache_hit_rate)
-            + W_LATENCY * latency_norm
-            + W_SHADOW * shadow_price
-        )
-        scored.append((score, index, provider.name, model))
-    if not scored:
+        eligible.append(provider)
+        models[provider.name] = model
+    if not eligible:
         raise ValueError(
             f"model_candidates {list(candidates)!r} match no enabled configured "
             "provider satisfying task requirements"
         )
-    scored.sort(key=lambda item: (item[0], item[1]))
-    return [(name, model, score) for score, _index, name, model in scored]
+    ordered = order_candidates(
+        eligible,
+        debt=debt,
+        incumbent=None,
+        rotation_offset=0,
+        now=time.time(),
+        weights=DEFAULT_WEIGHTS,
+    )
+    return [
+        (provider.name, models[provider.name], float(rank))
+        for rank, provider in enumerate(ordered)
+    ]
 
 
 
@@ -677,6 +666,7 @@ __all__ = [
     "DebtStore",
     "LaneState",
     "ProviderDebt",
+    "QualityWeights",
     "REFERENCE_LATENCY_S",
     "W_CACHE",
     "W_LATENCY",

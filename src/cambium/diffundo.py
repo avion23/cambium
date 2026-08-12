@@ -30,11 +30,12 @@ only:
   evidence of a local response cache (D1): the router always requests
   ``cache=False`` and ``provider_cache_hit`` records only what the provider
   reports.
-- **Weighted ordering (measured quality).** A ``Diffundo`` may be given a
+- **Measured-quality ordering.** A ``Diffundo`` may be given a
   usage-debt snapshot (``ProviderDebt`` counters as folded by
   ``routing.DebtStore``). Config priority stays the primary cascade ordering
-  key; measured quality — cache-hit rate and mean latency, see
-  ``_debt_quality_score`` — only refines order WITHIN an equal-priority run,
+  key; ``selection.order_candidates`` uses success confidence, latency-SLO
+  compliance, expected cost per successful turn, then a normalized tie-break
+  to refine order only WITHIN an equal-priority run,
   so the measured evidence (e.g. codex's 12.5% cache-hit / p50 7.21s latency)
   moves it below better providers. A provider with no fresh debt scores a
   neutral weight and keeps its config-priority position instead of being
@@ -114,6 +115,7 @@ from urllib.parse import urlparse
 
 from . import __version__
 from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
+from .selection import order_candidates
 
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
@@ -1064,61 +1066,6 @@ def _codex_config_400(message: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Measured-quality ordering (weighted routing)
-# --------------------------------------------------------------------------- #
-
-# Quality-weight constants for ordering the cascade within an equal-priority
-# run from measured usage debt: a higher cache-hit rate and a lower mean call
-# latency make a provider preferred. A provider with no fresh debt scores a
-# neutral 0.0 (no penalty), so config-priority order applies and a data-less
-# provider is never pinned to the bottom permanently.
-_QUALITY_CACHE_WEIGHT = 0.6
-_QUALITY_LATENCY_WEIGHT = 0.4
-_QUALITY_LATENCY_REFERENCE_S = 30.0
-_QUALITY_MAX_AGE_S = 7 * 24 * 3600  # a week of wall time
-
-
-def _debt_field(entry: Any, name: str, default: Any) -> Any:
-    """Read one counter from a debt entry (ProviderDebt or raw mapping)."""
-    if isinstance(entry, Mapping):
-        return entry.get(name, default)
-    return getattr(entry, name, default)
-
-
-def _debt_quality_score(entry: Any, *, now: float) -> float:
-    """Quality preference for one provider from its measured usage debt.
-
-    Higher is better: cache-hit rate (``cache_hit_count / requests``) raises
-    the score, mean call latency (``latency_total_s / latency_count``) lowers
-    it, both clamped to ``[0, 1]`` before weighting. Returns ``0.0`` (neutral)
-    when the entry carries no usable signal — no requests, or last seen too
-    long ago (stale) — so a provider with no recorded data keeps its config
-    priority position instead of being pushed to the bottom permanently.
-    """
-    if entry is None:
-        return 0.0
-    requests = _debt_field(entry, "requests", 0)
-    if not isinstance(requests, int) or requests <= 0:
-        return 0.0
-    last_seen = _debt_field(entry, "last_seen", None)
-    if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
-        if now - float(last_seen) > _QUALITY_MAX_AGE_S:
-            return 0.0
-    cache_hits = _debt_field(entry, "cache_hit_count", 0)
-    if not isinstance(cache_hits, int) or cache_hits < 0:
-        cache_hits = 0
-    cache_hit_rate = min(1.0, cache_hits / requests)
-    latency_norm = 0.0
-    latency_count = _debt_field(entry, "latency_count", 0)
-    if isinstance(latency_count, int) and latency_count > 0:
-        latency_total = _debt_field(entry, "latency_total_s", 0.0)
-        if isinstance(latency_total, (int, float)) and not isinstance(latency_total, bool):
-            mean_latency = max(0.0, float(latency_total)) / latency_count
-            latency_norm = min(1.0, mean_latency / _QUALITY_LATENCY_REFERENCE_S)
-    return _QUALITY_CACHE_WEIGHT * cache_hit_rate - _QUALITY_LATENCY_WEIGHT * latency_norm
-
-
-# --------------------------------------------------------------------------- #
 # Diffundo router
 # --------------------------------------------------------------------------- #
 
@@ -1166,14 +1113,14 @@ class Diffundo:
         # stays on one provider (prompt-prefix caching) and never bounces
         # back to a recovered provider.
         self._rotation = rotation_seed
-        self._primary_provider: ProviderConfig | None = None
+        self._primary_provider: str | None = None
         if primary_provider is not None:
             # Supervisor-level admission balancing (solution C) presets the
             # per-subagent sticky primary from the task's assigned provider;
             # an absent name falls back to the seeded first pick below.
             for provider in self._providers:
                 if provider.name == primary_provider:
-                    self._primary_provider = provider
+                    self._primary_provider = provider.name
                     break
         self._call_budget_s = call_budget_s
         self._pause_timeout_s = pause_timeout_s
@@ -1240,7 +1187,7 @@ class Diffundo:
                     )
                 # The provider that served owns the task's context from here
                 # on (prompt-prefix caching locality).
-                self._primary_provider = provider
+                self._primary_provider = provider.name
                 return result
             raise AllProvidersFailed(tried, last_error)
 
@@ -1300,57 +1247,13 @@ class Diffundo:
             if not runtime.bucket.has_token():
                 continue
             out.append(provider)
-        # Config priority stays the primary ordering key; measured quality
-        # (cache-hit rate, mean latency from the injected debt) only refines
-        # order WITHIN an equal-priority run. Providers with no fresh debt
-        # score a neutral weight, so they keep their config-priority position
-        # instead of being pushed to the bottom permanently.
-        out.sort(
-            key=lambda provider: (
-                provider.priority,
-                -self._quality_weight(provider),
-            )
+        return order_candidates(
+            out,
+            debt=dict(self._debt) if self._debt is not None else None,
+            incumbent=self._primary_provider,
+            rotation_offset=self._rotation,
+            now=time.time(),
         )
-        if self._primary_provider is not None:
-            # Bound provider leads while eligible; otherwise plain priority
-            # order applies and the serving fallback becomes the new binding.
-            if self._primary_provider in out:
-                out = [
-                    self._primary_provider,
-                    *(p for p in out if p is not self._primary_provider),
-                ]
-            return out
-        # First pick: rotate the lowest equal-priority run by the seeded
-        # offset so concurrent subagents start at different providers;
-        # priority ordering across groups is preserved.
-        if len(out) > 1:
-            rotated: list[ProviderConfig] = []
-            run_start = 0
-            while run_start < len(out):
-                run_end = run_start + 1
-                while (
-                    run_end < len(out)
-                    and out[run_end].priority == out[run_start].priority
-                ):
-                    run_end += 1
-                run = out[run_start:run_end]
-                if len(run) > 1:
-                    offset = self._rotation % len(run)
-                    run = run[offset:] + run[:offset]
-                rotated.extend(run)
-                run_start = run_end
-            out = rotated
-        return out
-
-    def _quality_weight(self, provider: ProviderConfig) -> float:
-        """Quality preference (higher wins) for one candidate from the injected
-        usage-debt snapshot; 0.0 (neutral) when the provider has no fresh data."""
-        if self._debt is None:
-            return 0.0
-        entry = next(
-            (value for name, value in self._debt if name == provider.name), None
-        )
-        return _debt_quality_score(entry, now=time.time())
 
     async def _await_candidates(
         self,
