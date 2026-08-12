@@ -55,6 +55,20 @@ from ``ProviderConfig.api_key_env``) at call time. A provider tagged protocol
 SSE; its bearer token and optional ChatGPT account id come only from an
 injected ``CredentialSource`` (a codex provider without one fails closed).
 All blocking I/O runs off the event loop via ``asyncio.to_thread``.
+
+**Codex prefix caching is provider-side — no in-repo churn source exists.**
+Measured across the harness the codex responses endpoint reports
+``cached_tokens`` on only 7/56 calls (12.5%), with sparse, non-monotonic
+per-turn hits (e.g. 4/24 in one session), while the same byte-stable
+in-session prompt prefix hits on essentially every call after the first on
+the chat providers (opencode-go 109/110, zai 48/49). The prefix Cambium sends
+to codex is byte-stable in-session: ``prompt_prefix_bytes`` is constant per
+session (e.g. 24/24 calls at 5385), ``_codex_request_body`` emits a fixed
+field order with no per-call timestamps or ids, and the leading ``developer``
+item stays byte-identical as the transcript grows. The parse path is proven
+correct (the reported hits decode to ``provider_cache_hit=True``); the sparse
+``cached_tokens`` is the codex backend's own behavior, not a prefix churn or
+a parse failure.
 """
 
 from __future__ import annotations
@@ -855,6 +869,12 @@ def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dic
     ``stream: true`` — and rejects chat extras (``max_output_tokens``, bare
     string input). Only the documented fields are emitted: prompt extras
     (``max_tokens`` etc.) never leak into the body.
+
+    The body serializes deterministically: fixed insertion order, no per-call
+    timestamps or request ids, and a byte-stable leading ``developer`` item
+    for the system prompt, so the request head cannot churn the provider's
+    exact-prefix cache key (D8c). The codex backend's sparse
+    ``cached_tokens`` is provider-side (see module docstring).
     """
     body: dict[str, Any] = {
         "model": provider.model,

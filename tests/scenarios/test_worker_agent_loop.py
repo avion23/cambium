@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 
 from cambium import worker
-from cambium.diffundo import ProviderTier
+from cambium.diffundo import ProviderTier, prompt_prefix_bytes, validate_prompt_structure
 from cambium.fencing import write_generation
 
 
@@ -151,6 +151,67 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
     assert prompt2["messages"][-1]["content"] == "Continue."
     # The static system prefix is unchanged across transcripts.
     assert prompt2["messages"][0]["content"] == messages[0]["content"]
+
+
+def test_build_agent_prompt_static_head_is_byte_stable_across_tasks() -> None:
+    """D8c: the system-prompt head must be byte-identical across tasks and
+    transcripts; only the trailing ``Task:`` line may vary (provider
+    exact-prefix caching keys on the stable head)."""
+    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
+    identity = "codex/gpt-5.6-luna"
+    task_a = "task alpha"
+    task_b = "task bravo longer"
+    prompt_a = worker._build_agent_prompt(task_a, tools, [], model_identity=identity)
+    prompt_b = worker._build_agent_prompt(task_b, tools, [], model_identity=identity)
+    content_a = prompt_a["messages"][0]["content"]
+    content_b = prompt_b["messages"][0]["content"]
+    head_a, _, tail_a = content_a.rpartition("Task: ")
+    head_b, _, tail_b = content_b.rpartition("Task: ")
+    assert head_a == head_b
+    assert tail_a == task_a
+    assert tail_b == task_b
+    # The byte-length difference is exactly the task-text byte-length
+    # difference (the 5385-vs-5387 cross-session observation is this, by
+    # design, never a volatile token in the head).
+    bytes_a = len(content_a.encode("utf-8"))
+    bytes_b = len(content_b.encode("utf-8"))
+    assert bytes_b - bytes_a == len(task_b.encode("utf-8")) - len(task_a.encode("utf-8"))
+    # prompt_prefix_bytes mirrors the system-message byte length exactly.
+    assert prompt_prefix_bytes(prompt_a) == bytes_a
+    assert prompt_prefix_bytes(prompt_b) == bytes_b
+
+
+def test_build_agent_prompt_head_is_byte_stable_across_transcript_growth() -> None:
+    """A growing transcript (tool loop) never changes the leading system
+    message, so the in-session prefix stays byte-stable per turn."""
+    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
+    identity = "codex/gpt-5.6-luna"
+    task = "read the files and finish"
+    fresh = worker._build_agent_prompt(task, tools, [], model_identity=identity)
+    grown = worker._build_agent_prompt(
+        task,
+        tools,
+        [
+            {"role": "user", "content": "Begin."},
+            {"role": "assistant", "content": '{"type": "tool_call", "name": "read_batch"}'},
+            {"role": "user", "content": "tool read_batch ok=true"},
+        ],
+        model_identity=identity,
+    )
+    assert grown["messages"][0]["content"] == fresh["messages"][0]["content"]
+    assert prompt_prefix_bytes(grown) == prompt_prefix_bytes(fresh)
+
+
+def test_build_agent_prompt_head_passes_d8c_lint() -> None:
+    """The static head (first 3 lines) carries no volatile timestamp or
+    request_id token; dynamic content sits at the bottom (D8c)."""
+    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
+    prompt = worker._build_agent_prompt(
+        "a task", tools, [], model_identity="codex/gpt-5.6-luna"
+    )
+    validate_prompt_structure(prompt)  # raises PromptStructureError on churn
+    head = prompt["messages"][0]["content"]
+    assert "\nTask: " in head  # dynamic content is the final line, not the head
 
 
 
