@@ -8,6 +8,9 @@ requires-python = ">=3.14"
 # import pytest at runtime (bench.py, module_conformance.py).
 dependencies = ["pytest>=9"]
 
+[project.scripts]
+cambium = "cambium.cli:main"
+
 [project.optional-dependencies]
 dspy = ["dspy>=3.3.0,<3.4"]
 # ast: focused alias for consumers that need only the optional tree-sitter
