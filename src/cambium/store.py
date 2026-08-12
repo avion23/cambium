@@ -118,7 +118,11 @@ _WRITER_BUSY_TIMEOUT_MS = 5000
 _CHECKPOINT_BUSY_TIMEOUT_MS = 20
 _CHECKPOINT_RETRY_SLEEP_S = 0.02
 _SEQUENCE_PERSIST_RETRY_SLEEP_S = 0.01
-_CLOSE_JOIN_TIMEOUT_S = 1.0
+# The close join must cover the writer's own busy-checkpoint retry budget
+# (``checkpoint_busy_retry_s``): a WAL busy at close (a reader overlapping a
+# checkpoint) legitimately holds the writer for up to that budget, and a
+# shorter close deadline would fail a healthy session spuriously.
+_CLOSE_JOIN_TIMEOUT_S = 12.0
 _CLOSE_STOP_JOIN_TIMEOUT_S = 0.1
 
 _SENTINEL = object()

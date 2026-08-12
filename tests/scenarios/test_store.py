@@ -475,7 +475,9 @@ def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monke
 
     def stalled_fsync(self) -> None:
         fsync_started.set()
-        release.wait(5.0)
+        # Stall longer than the close join budget (_CLOSE_JOIN_TIMEOUT_S=12.0)
+        # so the force-stop verdict is pinned even with headroom.
+        release.wait(15.0)
         real_fsync(self)
 
     def append_critical() -> None:
