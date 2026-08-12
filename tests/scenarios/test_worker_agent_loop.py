@@ -260,6 +260,26 @@ def test_build_agent_prompt_parent_envelope_bounds_oversized_fields() -> None:
     assert "Parent task context:" not in content
 
 
+def test_bounded_parent_envelope_drops_non_string_list_items() -> None:
+    """Non-string list items (dicts, nested lists) can carry unbounded content
+    past the char cap; they are dropped, never stringified into the prompt."""
+    bounded = worker._bounded_parent_envelope(
+        {
+            "summary": "ok",
+            "files_changed": [
+                "a.py",
+                {"path": "b.py", "blob": "z" * 900_000},
+                ["nested", "list"],
+                42,
+            ],
+            "commits": ["abc", {"sha": "x" * 500_000}],
+        }
+    )
+    assert bounded is not None
+    assert bounded["files_changed"] == ["a.py"]
+    assert bounded["commits"] == ["abc"]
+
+
 
 def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"

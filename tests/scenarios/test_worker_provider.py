@@ -914,6 +914,47 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
 
 
 @pytest.mark.slow
+def test_worker_token_budget_binds_total_only_usage(tmp_path) -> None:
+    """A provider that reports only total_tokens (no prompt/completion split)
+    still binds the budget: each turn's whole total counts as new work, so the
+    budget can never be bypassed."""
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        _enqueue(
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["target.txt"]}}',
+            usage={"total_tokens": 1000},
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"fixture\\n",'
+            '"new_string":"fixture\\n// token-limit\\n"}}',
+            usage={"total_tokens": 1000},
+        )
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        _make_repo(repo)
+        env = _worker_env(config_path, session_dir)
+        init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
+        result, _messages, rc, _stderr = asyncio.run(
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
+                          branch="tokens-total")
+        )
+
+        assert result["status"] == "failed"
+        assert "token budget exceeded" in result["failure_reason"]
+        assert rc == 0
+        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
+        with REQUEST_LOCK:
+            assert len(REQUESTS) == 2
+    finally:
+        server.close()
+
+
+@pytest.mark.slow
 def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()

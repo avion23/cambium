@@ -566,12 +566,13 @@ def _bounded_parent_envelope(value: Any) -> dict[str, Any] | None:
             bounded[key] = _cap_utf8(value[key], MAX_ENVELOPE_FIELD_CHARS)
     for key in ("files_changed", "commits"):
         if isinstance(value.get(key), list):
-            bounded[key] = [
+            items = [
                 _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
+                for item in value[key]
                 if isinstance(item, str)
-                else item
-                for item in value[key][:MAX_ENVELOPE_ITEMS]
-            ]
+            ][:MAX_ENVELOPE_ITEMS]
+            if items:
+                bounded[key] = items
     if not bounded:
         return None
     return bounded
@@ -1644,11 +1645,22 @@ async def _run_agent_loop(
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
             prompt_tokens = _usage_prompt_tokens(result.usage)
             completion_tokens = _usage_completion_tokens(result.usage)
-            if prompt_tokens is not None:
+            if prompt_tokens is None:
+                # Provider reports no prompt/completion split (e.g. only an
+                # explicit total): count the whole total as new work so the
+                # budget still binds (fail-conservative, matches pre-change
+                # behavior).
+                budget_new_tokens += total
+                previous_prompt_tokens = 0
+            else:
                 budget_new_tokens += max(0, prompt_tokens - previous_prompt_tokens)
                 previous_prompt_tokens = prompt_tokens
-            if completion_tokens is not None:
-                budget_new_tokens += completion_tokens
+                if completion_tokens is not None:
+                    budget_new_tokens += completion_tokens
+                else:
+                    # Completion missing but a total is present: the remainder
+                    # is output-side work.
+                    budget_new_tokens += max(0, total - prompt_tokens)
             if budget_new_tokens > config.max_tokens:
                 return _loop_result(
                     outcome, "failed", "token budget exceeded",
