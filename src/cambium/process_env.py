@@ -79,6 +79,9 @@ def build_subprocess_env(
         "LC_ALL": "C",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": "/dev/null",
     }
     if worktree is not None:
         # Do not expose or use the supervisor user's HOME in a child.  Git
