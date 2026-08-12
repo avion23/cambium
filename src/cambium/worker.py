@@ -1468,6 +1468,7 @@ async def _run_agent_loop(
     budget_usd = _fanout_budget_usd(config.fanout_config)
     no_progress_actions = 0
     verified_after_change = False
+    verification_failed = False
     code_changed = False
     try:
         for turn in range(1, config.max_turns + 1):
@@ -1571,7 +1572,7 @@ async def _run_agent_loop(
             no_progress_actions = 0
             if action["type"] == "finish":
                 transcript.append({"role": "assistant", "content": action_content})
-                if code_changed and not verified_after_change:
+                if code_changed and verification_failed and not verified_after_change:
                     transcript.append({
                         "role": "user",
                         "content": (
@@ -1615,8 +1616,13 @@ async def _run_agent_loop(
                 if name in ("write_file", "edit_file"):
                     code_changed = True
                     verified_after_change = False
+                    verification_failed = False
                 elif name == "run_shell":
                     verified_after_change = True
+                    verification_failed = False
+            elif name == "run_shell":
+                verification_failed = True
+                verified_after_change = False
             transcript.append({"role": "assistant", "content": action_content})
             if trailing:
                 transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
