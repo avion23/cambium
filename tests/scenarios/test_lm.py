@@ -642,6 +642,47 @@ def test_per_call_max_tokens_reaches_diffundo() -> None:
     assert diffundo.calls[0]["prompt"]["max_tokens"] == 1
 
 
+@pytest.mark.parametrize(
+    ("budget", "error", "message"),
+    [
+        (-1, ValueError, "budget_usd must be >= 0"),
+        (True, TypeError, "budget_usd must be an exact builtin number"),
+    ],
+)
+def test_request_budget_extension_rejects_invalid_values(
+    budget: object, error: type[Exception], message: str
+) -> None:
+    _require_dspy()
+    import dspy
+
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"extensions": {"budget_usd": budget}},
+    )
+
+    with pytest.raises(error, match=message):
+        lm(request=request)
+
+
+def test_request_budget_extension_uses_validated_value() -> None:
+    _require_dspy()
+    import dspy
+
+    diffundo = FakeDiffundo()
+    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
+    request = dspy.LMRequest(
+        model="request-model",
+        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        config={"extensions": {"budget_usd": 10**1000}},
+    )
+
+    lm(request=request)
+    assert diffundo.calls[0]["budget_usd"] == 10**1000
+    assert type(diffundo.calls[0]["budget_usd"]) is int
+
+
 @pytest.mark.parametrize("entry_point", ["call", "acall"])
 def test_explicit_request_response_format_credentials_are_rejected(entry_point: str) -> None:
     _require_dspy()

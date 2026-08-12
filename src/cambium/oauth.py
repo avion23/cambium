@@ -56,6 +56,7 @@ OAUTH_VERSION = 1
 OAUTH_FILE_NAME = "oauth.json"
 MAX_OAUTH_DOC_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 16 * 1024
+MAX_OAUTH_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_ISSUER = "https://auth.openai.com"
 DEFAULT_EXPIRES_IN_S = 3600.0
 DEFAULT_REFRESH_MARGIN_S = 60.0
@@ -712,10 +713,12 @@ def _request(
     )
     try:
         with _opener_for_issuer(issuer).open(request, timeout=timeout_s) as response:
-            return response.status, response.read()
+            return response.status, _read_response(response)
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read()
+            body = _read_response(exc)
+        except OAuthError:
+            raise
         except Exception:
             body = b""
         return exc.code, body
@@ -728,6 +731,13 @@ def _request(
         raise OAuthError("oauth request timed out") from exc
     except (OSError, ValueError) as exc:
         raise OAuthError(f"oauth request failed: {exc}") from exc
+
+
+def _read_response(response: Any) -> bytes:
+    body = response.read(MAX_OAUTH_RESPONSE_BYTES + 1)
+    if len(body) > MAX_OAUTH_RESPONSE_BYTES:
+        raise OAuthError(f"oauth response exceeds {MAX_OAUTH_RESPONSE_BYTES} byte limit")
+    return body
 
 
 def _parse_json_object(data: bytes) -> dict[str, Any]:

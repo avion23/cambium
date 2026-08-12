@@ -831,6 +831,31 @@ def test_device_flow_http_timeout(tmp_path: Path) -> None:
             flow.run(max_wait_s=10.0)
 
 
+def test_oauth_response_larger_than_cap_is_rejected() -> None:
+    class OversizedHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            body = b"x" * (oauth.MAX_OAUTH_RESPONSE_BYTES + 1)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), OversizedHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    issuer = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with pytest.raises(OAuthError, match="response exceeds"):
+            oauth._request(issuer, "/token", payload={}, form=False, timeout_s=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_transient_secrets_never_appear_in_reprs_or_errors(tmp_path: Path) -> None:
     with _fake_issuer() as server:
         server.fake.exchange_status = 500

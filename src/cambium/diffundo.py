@@ -8,8 +8,8 @@ only:
 - **D1 — no local cache.** ``Diffundo`` is a stateless router; the only state is
   per-provider cooldown timers, circuit-breaker health, and token buckets
   (architecture §8.1, §9.2). There is no response store anywhere in the module.
-- **D8c — prompt prefix layout.** ``validate_prompt_structure`` lints the prompt
-  head (first 3 lines of the leading message) for volatile tokens — timestamps
+- **D8c — prompt prefix layout.** ``validate_prompt_structure`` lints the full
+  leading message for volatile tokens — timestamps
   and ``request_id`` — that would churn a provider's exact-prefix cache key.
 - **D8f — token bucket + pause-on-exhaustion.** Each provider carries a token
   bucket refilled at ``rpm`` tokens/minute; an empty bucket marks the provider
@@ -126,6 +126,7 @@ _URL_CREDENTIALS_RE = re.compile(
     re.IGNORECASE,
 )
 _REDACTED = "[REDACTED]"
+MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
 _CLOUDFLARE_1010_RE = re.compile(
     r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
     r"error\s*(?:code\s*)?[:#-]?\s*1010|browser(?:['’]s)?\s+signature))",
@@ -271,6 +272,7 @@ class CallResult:
     request_rate_status: str | None = None
     account_quota_owner: str | None = None
     prompt_prefix_bytes: int | None = None
+    prompt_prefix_tokens_estimate: int | None = None
     provider_cache_hit: bool | None = None
 
 
@@ -355,15 +357,15 @@ def _prompt_head(prompt: dict[str, Any]) -> str:
 
 
 def validate_prompt_structure(prompt: dict[str, Any]) -> None:
-    """Raise when volatile tokens appear in the first 3 lines (D8c).
+    """Raise when volatile tokens appear in the leading message (D8c).
 
     Provider-side prefix caches are exact-prefix content-addressed; timestamps
     and ``request_id`` values at the top churn the prefix key. Static,
     byte-stable content must sit at the top and dynamic content at the bottom,
-    so only the first 3 lines of the leading message are linted.
+    so the full leading message is linted.
     """
     head = _prompt_head(prompt)
-    for idx, line in enumerate(head.splitlines()[:3], start=1):
+    for idx, line in enumerate(head.splitlines(), start=1):
         if _TIMESTAMP_RE.search(line):
             raise PromptStructureError(
                 f"line {idx}: volatile timestamp token in the static prefix; "
@@ -395,6 +397,28 @@ def prompt_prefix_bytes(prompt: dict[str, Any]) -> int | None:
             if isinstance(content, str):
                 return len(content.encode("utf-8"))
     return None
+
+
+def prompt_prefix_estimate_tokens(prompt: dict[str, Any]) -> int | None:
+    """Estimated tokens in the leading system prefix using UTF-8 bytes / 4.
+
+    This standard heuristic is routing evidence, not tokenizer output.
+    """
+    prefix_bytes = prompt_prefix_bytes(prompt)
+    if prefix_bytes is None:
+        return None
+    return prefix_bytes // 4
+
+
+def _read_provider_response(response: Any, provider: str) -> bytes:
+    body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
+        raise ProviderError(
+            provider,
+            ProviderOutcome.ERROR,
+            f"response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit",
+        )
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -546,6 +570,7 @@ class _RawResponse:
             retry_after_s=retry_after_s,
             account_quota_owner=account_quota_owner,
             prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+            prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
             provider_cache_hit=_provider_cache_hit(usage),
         )
 
@@ -593,6 +618,7 @@ class _CodexRawResponse(_RawResponse):
             retry_after_s=retry_after_s,
             account_quota_owner=account_quota_owner,
             prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+            prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
             provider_cache_hit=_provider_cache_hit(usage),
         )
 
@@ -1532,11 +1558,16 @@ class Diffundo:
         http_cause: _SanitizedHTTPError | None = None
         try:
             with opener.open(request, timeout=timeout_s) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                response_body = _read_provider_response(response, provider.name)
+                payload = json.loads(response_body.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             status = exc.code
             try:
-                error_body = exc.read().decode("utf-8", errors="replace")
+                error_body = _read_provider_response(exc, provider.name).decode(
+                    "utf-8", errors="replace"
+                )
+            except ProviderError:
+                raise
             except Exception:
                 error_body = ""
             safe_body = _redact_error_text(error_body, api_key)[:500]
@@ -1647,11 +1678,15 @@ class Diffundo:
         http_cause: _SanitizedHTTPError | None = None
         try:
             with opener.open(request, timeout=timeout_s) as response:
-                stream = response.read().decode("utf-8")
+                stream = _read_provider_response(response, provider.name).decode("utf-8")
         except urllib.error.HTTPError as exc:
             status = exc.code
             try:
-                error_body = exc.read().decode("utf-8", errors="replace")
+                error_body = _read_provider_response(exc, provider.name).decode(
+                    "utf-8", errors="replace"
+                )
+            except ProviderError:
+                raise
             except Exception:
                 error_body = ""
             safe_body = _redact_error_text(error_body, access_token)[:500]

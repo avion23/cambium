@@ -384,6 +384,20 @@ def test_codex_request_body_conversion_is_exact() -> None:
         server.close()
 
 
+def test_codex_stream_larger_than_provider_cap_is_rejected() -> None:
+    from cambium.diffundo import MAX_PROVIDER_RESPONSE_BYTES
+
+    server = CodexServer([(200, "x" * (MAX_PROVIDER_RESPONSE_BYTES + 1), 0.0)])
+    router = _router(server)
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert raised.value.last_error is not None
+        assert "response exceeds" in raised.value.last_error.message
+    finally:
+        server.close()
+
+
 def test_codex_reasoning_effort_absent_omits_reasoning_field() -> None:
     server = CodexServer([(200, _ok_stream(), 0.0)])
     router = Diffundo(
