@@ -905,9 +905,48 @@ def test_worker_git_worktree_hook_does_not_receive_provider_key(
     )
 
     assert returncode == 0, stderr
-    assert record.exists(), "the post-checkout hook never ran"
-    hook_environment = record.read_text(encoding="utf-8").splitlines()
-    assert not any(line.startswith(f"{provider_name}=") for line in hook_environment)
+    assert not record.exists(), "worker git command executed a repository hook"
+
+
+def test_worker_git_argv_disables_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    worker.git("status")
+
+    assert calls == [["git", "-c", "core.hooksPath=/dev/null", "status"]]
+
+
+def test_worker_fenced_git_argv_disables_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, argv: list[str], **_kwargs: Any) -> None:
+            calls.append(argv)
+
+        def poll(self) -> int:
+            return 0
+
+        def communicate(self) -> tuple[str, str]:
+            return "", ""
+
+    monkeypatch.setattr(worker, "validate_worker_generation", lambda *_args: True)
+    monkeypatch.setattr(worker.subprocess, "Popen", FakePopen)
+
+    worker._fenced_git(tmp_path, 1, "commit", "-m", "message")
+
+    assert calls == [
+        ["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "message"]
+    ]
 
 
 # ---------------------------------------------------------------------------
