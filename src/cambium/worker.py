@@ -186,6 +186,12 @@ _DIFFUNDO_OPTIONS = frozenset(
         "retry_base_delay_s",
     }
 )
+# Paths (matched by first component) that are incidental build/cache
+# artifacts of the agent's tool use and are never intentional changes.
+CACHE_ARTIFACT_COMPONENTS = frozenset({
+    ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", ".tox",
+    ".coverage", ".cache", ".venv", ".mise", ".python-version",
+})
 
 logger = logging.getLogger(__name__)
 
@@ -1771,6 +1777,11 @@ def _finalize_worktree(
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
             if not path or path == ".cambium" or path.startswith(".cambium/"):
+                continue
+            if (
+                path.endswith(".pyc")
+                or path.split("/", 1)[0] in CACHE_ARTIFACT_COMPONENTS
+            ):
                 continue
             if line[:2] == "!!":
                 ignored.append(path)

@@ -13,6 +13,7 @@ import json
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -522,3 +523,124 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     assert "max turns exceeded" not in outcome["failure_reason"]
     assert outcome["turn"] == 3  # failed on the 3rd consecutive invalid action
     assert len(router.prompts) == 3  # no further router calls
+
+
+# ---------------------------------------------------------------------------
+# Publish scan: incidental cache/build artifacts never block or enter the commit
+# ---------------------------------------------------------------------------
+
+
+def _base_commit(worktree: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _finalize_worktree_outcome(
+    worktree: Path, config: worker.AgentConfig, run: dict[str, Any]
+) -> dict[str, Any]:
+    return worker._finalize_worktree(
+        run=run,
+        config=config,
+        worktree=worktree,
+        generation=config.generation,
+        worker_identity="test-worker",
+        stop=threading.Event(),
+        loop_outcome={
+            "status": "succeeded",
+            "summary": "verified edit",
+            "turn": 3,
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            "provider": "loopback-provider",
+            "model": "loopback-model",
+            "latency_s": 0.01,
+            "transcript": [],
+            "commits_so_far": [],
+        },
+    )
+
+
+def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    (worktree / "main.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8"
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "add", "main.py"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", "add main.py"],
+        check=True,
+        capture_output=True,
+    )
+    base_commit = _base_commit(worktree)
+    config = replace(_agent_config(worktree), base_commit=base_commit)
+
+    # The agent's real change, left uncommitted in the worktree.
+    (worktree / "main.py").write_text(
+        "def add(a, b):\n    return a - b\n", encoding="utf-8"
+    )
+    # Incidental artifacts of the agent's verification tool use.
+    pytest_cache = worktree / ".pytest_cache"
+    pytest_cache.mkdir()
+    (pytest_cache / ".gitignore").write_text("*\n", encoding="utf-8")
+    (pytest_cache / "CACHEDIR.TAG").write_text("", encoding="utf-8")
+    (pytest_cache / "README.md").write_text("", encoding="utf-8")
+    pycache = worktree / "src" / "__pycache__"
+    pycache.mkdir(parents=True)
+    (pycache / "x.cpython-312.pyc").write_bytes(b"\x00")
+
+    run = {"request_id": "test", "scratch_repo": str(repo)}
+    outcome = _finalize_worktree_outcome(worktree, config, run)
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["failure_reason"] is None
+    assert outcome["files_changed"] == ["main.py"]
+    assert len(outcome["commits"]) == 1
+    sha = outcome["commits"][0]
+    committed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(worktree),
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            sha,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert committed == ["main.py"]
+    assert "main.py" in outcome["diff"]
+    assert not any(
+        ".pyc" in name or "__pycache__" in name or ".pytest_cache" in name
+        for name in committed
+    )
+
+
+def test_finalize_worktree_only_cache_artifacts_is_true_noop(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    base_commit = _base_commit(worktree)
+    config = replace(_agent_config(worktree), base_commit=base_commit)
+
+    pytest_cache = worktree / ".pytest_cache"
+    pytest_cache.mkdir()
+    (pytest_cache / ".gitignore").write_text("*\n", encoding="utf-8")
+    (pytest_cache / "CACHEDIR.TAG").write_text("", encoding="utf-8")
+
+    run = {"request_id": "test", "scratch_repo": str(repo)}
+    outcome = _finalize_worktree_outcome(worktree, config, run)
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["failure_reason"] is None
+    assert outcome["commits"] == []
+    assert outcome["files_changed"] == []
+    assert _base_commit(worktree) == base_commit
