@@ -1066,10 +1066,12 @@ def import_codex_cli_session(path: str | Path | None = None) -> OAuthDoc:
     Reads ``~/.codex/auth.json`` (or ``path``) in the real codex format:
     ``{"auth_mode": "chatgpt", "tokens": {access_token, refresh_token,
     account_id, id_token}}``. Only the access token, refresh token, account
-    id, and an expiry derived from the id_token ``exp`` claim are kept; the
-    id_token and any email are never stored. The returned document's
-    ``expires_at`` is ``0.0`` when no expiry can be derived, which forces a
-    refresh on the first ``ensure_fresh`` call.
+    id, and an expiry are kept; the id_token and any email are never stored.
+    The expiry is derived from the access token's ``exp`` claim, falling back
+    to the id_token ``exp`` claim when the access token has no usable ``exp``.
+    The returned document's ``expires_at`` is ``0.0`` when neither token
+    yields a usable ``exp``, which forces a refresh on the first
+    ``ensure_fresh`` call.
     """
     target = codex_cli_auth_path() if path is None else Path(path)
     try:
@@ -1103,18 +1105,23 @@ def import_codex_cli_session(path: str | Path | None = None) -> OAuthDoc:
         if not isinstance(account_id, str) or not account_id:
             raise OAuthError("codex cli session account_id is invalid")
         _validate_token(account_id, "account id")
-    expires_at = 0.0
-    id_token = tokens.get("id_token")
-    if isinstance(id_token, str) and id_token:
-        claims = _decode_jwt_payload(id_token)
-        if claims is not None:
-            exp = claims.get("exp")
-            if (
-                isinstance(exp, (int, float))
-                and not isinstance(exp, bool)
-                and _finite(exp)
-            ):
-                expires_at = float(exp)
+    def _usable_exp(token: Any) -> float:
+        """Return a valid ``exp`` epoch-seconds claim from a JWT, else 0.0."""
+        if not isinstance(token, str) or not token:
+            return 0.0
+        claims = _decode_jwt_payload(token)
+        if claims is None:
+            return 0.0
+        exp = claims.get("exp")
+        if (
+            isinstance(exp, (int, float))
+            and not isinstance(exp, bool)
+            and _finite(exp)
+        ):
+            return float(exp)
+        return 0.0
+
+    expires_at = _usable_exp(access_token) or _usable_exp(tokens.get("id_token"))
     return OAuthDoc(
         provider="codex",
         access_token=access_token,
