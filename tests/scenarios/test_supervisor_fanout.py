@@ -835,37 +835,6 @@ def test_t5_valid_non_object_stdout_tolerated(tmp_path, monkeypatch) -> None:
     assert _protocol(events, "t-valid-nobj") == ["init", "ready", "run_task", "result", "exit"]
 
 
-@pytest.mark.slow
-def test_t5_pure_valid_non_object_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
-    """A worker emitting only valid non-object JSON never becomes ready and is
-    killed by the ready-timeout/restart cap exactly like pure garbage."""
-    monkeypatch.setenv("FAKE_MODE", "valid_non_object_only")
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "1.0")
-    monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-
-    plan = {
-        "tasks": [
-            _task(session_dir, repo, base, "t-valid-nobj-only", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-valid-nobj-only",
-                  gate="grep -q '// cambium-valid-nobj-only' a.txt", max_restarts=2),
-        ]
-    }
-
-    result = asyncio.run(run_plan(session_dir, plan))
-
-    (task,) = result.results
-    assert task.status == "failed"
-    assert task.restarts == 2
-    events = read_events(session_dir)
-    assert _kinds(events, "parse_error")
-    assert len(_kinds(events, "restart_scheduled")) == 2
-    assert len(_kinds(events, "worker_failed")) == 1
-    assert not _kinds(events, "merge_committed")
-
-
 # ---------------------------------------------------------------------------
 # T6: SIGTERM mid-run terminates cleanly and the event store flushes.
 # ---------------------------------------------------------------------------

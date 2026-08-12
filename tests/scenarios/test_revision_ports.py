@@ -324,9 +324,14 @@ def test_rp6_conversation_append_failure_is_visible(tmp_path, monkeypatch) -> No
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
     root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker")
+                 target_file="a.txt", marker="// root-marker", max_restarts=0)
     child = _task(session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-                  target_file="b.txt", marker="// child-marker")
+                  target_file="b.txt", marker="// child-marker", max_restarts=0)
+    # The append failure interrupts the parent's result handling before its
+    # reuse_ready is read, so the supervise finally would otherwise wait the
+    # full WORKER_EXIT_WAIT_S for a pooled worker that never exits. The pool's
+    # own behavior is covered in test_worker_pool.py.
+    monkeypatch.setenv("CAMBIUM_WARM_POOL_SIZE", "0")
     core = ArchitectusCore(
         ScriptedLLM([{"action": "spawn", "task_id": "c1"}]),
         tree=_core_tree(root, child),

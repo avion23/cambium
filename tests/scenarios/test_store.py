@@ -461,6 +461,9 @@ def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) ->
 @pytest.mark.slow
 def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
+    # Shrink the close join budget so the force-stop verdict is pinned
+    # quickly instead of paying the full production 12.0s budget.
+    monkeypatch.setattr(store_module, "_CLOSE_JOIN_TIMEOUT_S", 1.0)
     # max_queue_size=2: the close sentinel is admitted immediately (one slot
     # free alongside the stalled non-critical item), so close() spends its
     # deadline on the writer join rather than on the sentinel admission wait;
@@ -475,9 +478,9 @@ def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monke
 
     def stalled_fsync(self) -> None:
         fsync_started.set()
-        # Stall longer than the close join budget (_CLOSE_JOIN_TIMEOUT_S=12.0)
-        # so the force-stop verdict is pinned even with headroom.
-        release.wait(15.0)
+        # Stall longer than the close join budget (1.0s here) so the
+        # force-stop verdict is pinned even with headroom.
+        release.wait(3.0)
         real_fsync(self)
 
     def append_critical() -> None:

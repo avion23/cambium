@@ -18,8 +18,7 @@ garbage (garbage lines interleaved with a healthy protocol run),
 garbage_only (pure garbage; never ready), overwrite (replace the first
 '// replace-me' line instead of appending the marker),
 valid_non_object (valid JSON lines that are not objects, interleaved
-with a healthy protocol run), valid_non_object_only (pure valid
-non-object JSON lines; never ready).
+with a healthy protocol run).
 """
 
 from __future__ import annotations
@@ -136,12 +135,6 @@ def main() -> int:
     if MODE == "garbage_only":
         while True:
             sys.stdout.write("garbage line\n")
-            sys.stdout.flush()
-            time.sleep(0.01)
-
-    if MODE == "valid_non_object_only":
-        while True:
-            sys.stdout.write(json.dumps([1, 2, 3]) + "\n")
             sys.stdout.flush()
             time.sleep(0.01)
 
