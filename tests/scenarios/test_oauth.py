@@ -501,6 +501,57 @@ def test_import_codex_cli_session_edge_cases(tmp_path: Path) -> None:
     assert doc.expires_at == 0.0  # no derivable expiry -> refresh on first use
 
 
+def test_import_codex_cli_session_expiry_prefers_access_token(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            _codex_session(
+                tokens={
+                    "access_token": _jwt({"exp": 2000000000}),
+                    "id_token": _jwt({"exp": 1900000000}),
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    doc = import_codex_cli_session(path)
+    assert doc.expires_at == 2000000000.0  # access-token exp wins over id_token exp
+
+
+def test_import_codex_cli_session_expiry_falls_back_to_id_token(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            _codex_session(
+                tokens={
+                    "access_token": _jwt({}),
+                    "id_token": _jwt({"exp": 1900000000}),
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    doc = import_codex_cli_session(path)
+    assert doc.expires_at == 1900000000.0  # access token has no exp -> id_token used
+
+
+def test_import_codex_cli_session_expiry_zero_when_neither_token_usable(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            _codex_session(
+                tokens={
+                    "access_token": _jwt({}),
+                    "id_token": _jwt({}),
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    doc = import_codex_cli_session(path)
+    assert doc.expires_at == 0.0  # no usable exp -> refresh on first use
+
+
 # --------------------------------------------------------------------------- #
 # TokenManager refresh transaction
 # --------------------------------------------------------------------------- #
