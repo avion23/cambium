@@ -730,13 +730,22 @@ def build_launch_environment(
 
 
 def scrub_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Remove credential-like variables from a subprocess environment."""
+    """Remove credential-like variables from a subprocess environment.
+
+    ``GIT_CONFIG_*`` variables are always preserved: they carry no secrets
+    and the credential-name regex would otherwise strip ``GIT_CONFIG_KEY_0``
+    while leaving its paired ``GIT_CONFIG_COUNT`` set, which git rejects
+    with "unable to parse command-line config".
+    """
     source = os.environ if base is None else base
     return {
         name: value
         for name, value in source.items()
-        if not name.startswith(("CAMBIUM_PROVIDER_", "CAMBIUM_OAUTH_"))
-        and not _CREDENTIAL_NAME_RE.search(name)
+        if name.startswith("GIT_CONFIG_")
+        or (
+            not name.startswith(("CAMBIUM_PROVIDER_", "CAMBIUM_OAUTH_"))
+            and not _CREDENTIAL_NAME_RE.search(name)
+        )
     }
 
 

@@ -833,12 +833,19 @@ def test_device_flow_http_timeout(tmp_path: Path) -> None:
 
 def test_oauth_response_larger_than_cap_is_rejected() -> None:
     class OversizedHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
         def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
             body = b"x" * (oauth.MAX_OAUTH_RESPONSE_BYTES + 1)
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def log_message(self, *args: object) -> None:
             pass
