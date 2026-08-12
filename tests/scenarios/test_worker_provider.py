@@ -183,6 +183,34 @@ def _provider_config(path: Path, base_url: str) -> Path:
     return path
 
 
+def _weighted_provider_config(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": name,
+                        "tier": "fast",
+                        "base_url": "http://127.0.0.1:1",
+                        "api_key_env": f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+                        "timeout_s": 1.0,
+                        "max_retries": 0,
+                        "rpm": 120,
+                        "enabled": True,
+                        "model": "loopback-model",
+                        "priority": 0,
+                        "cooldown_s": 1.0,
+                        "price": 0.0,
+                    }
+                    for name in ("bad", "good")
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[str, Any]:
     task = {
         "task_id": "worker-provider",
@@ -342,6 +370,55 @@ def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
         "heartbeat": {"interval_s": 0.05},
         **extra,
     }
+
+
+def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _weighted_provider_config(tmp_path / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
+    init = {
+        "task_id": "weighted-worker",
+        "fanout_config": {"tier": "fast", "model": "loopback-model"},
+    }
+
+    neutral_config = worker.AgentConfig.from_init(init)
+    neutral_router, tier, model, _identity = worker._provider_router(
+        neutral_config.fanout_config,
+        debt=neutral_config.debt,
+    )
+    assert [provider.name for provider in neutral_router._candidates(tier, model)] == [
+        "bad",
+        "good",
+    ]
+
+    weighted_config = worker.AgentConfig.from_init(
+        {
+            **init,
+            "debt": {
+                "bad": {
+                    "requests": 10,
+                    "cache_hit_count": 0,
+                    "latency_total_s": 300.0,
+                    "latency_count": 10,
+                },
+                "good": {
+                    "requests": 10,
+                    "cache_hit_count": 10,
+                    "latency_total_s": 10.0,
+                    "latency_count": 10,
+                },
+            },
+        }
+    )
+    weighted_router, tier, model, _identity = worker._provider_router(
+        weighted_config.fanout_config,
+        debt=weighted_config.debt,
+    )
+    assert [provider.name for provider in weighted_router._candidates(tier, model)] == [
+        "good",
+        "bad",
+    ]
 
 
 # ---------------------------------------------------------------------------

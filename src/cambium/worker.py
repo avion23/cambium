@@ -118,6 +118,7 @@ import tempfile
 import threading
 import time
 import zlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -377,7 +378,8 @@ def _oauth_env_suffix(provider: str) -> str:
 
 
 def _provider_router(
-    config: dict[str, Any], *, assigned_provider: str | None = None
+    config: dict[str, Any], *, assigned_provider: str | None = None,
+    debt: Mapping[str, Any] | None = None,
 ) -> tuple[Diffundo, ProviderTier, str, str]:
     providers = load_providers(_provider_path())
     section = _fanout_section(config)
@@ -416,6 +418,8 @@ def _provider_router(
                 "falling back to the seeded primary pick",
                 assigned_provider,
             )
+    if debt:
+        options["debt"] = debt
     codex_providers = [
         provider for provider in providers
         if getattr(provider, "auth", None) is AuthMode.CODEX_CHATGPT
@@ -485,6 +489,7 @@ class AgentConfig:
     # Supervisor-level admission balancing (solution C): the provider this
     # task was assigned at admission; presets Diffundo's sticky primary.
     assigned_provider: str | None = None
+    debt: Mapping[str, Any] | None = None
     provider_env_keys: tuple[str, ...] = ()
     redactor: Redactor | None = None
     # Dynamic child admission: the parent's strict-key envelope (summary,
@@ -515,6 +520,9 @@ class AgentConfig:
         if assigned_provider is not None and not isinstance(assigned_provider, str):
             raise ValueError("init assigned_provider must be a string")
         provider_env_keys = _provider_env_keys(init.get("provider_env_keys"))
+        debt = init.get("debt")
+        if debt is not None and not isinstance(debt, dict):
+            raise ValueError("init debt must be a mapping")
         session_id = os.environ.get("CAMBIUM_SESSION_ID")
         checkpoint_root = (
             Path(session_id).resolve() / ".cambium" / "checkpoints" if session_id else None
@@ -527,6 +535,7 @@ class AgentConfig:
             base_commit=base_commit if isinstance(base_commit, str) else None,
             fanout_config=_provider_fanout_config(init),
             assigned_provider=assigned_provider,
+            debt=debt or None,
             max_turns=_positive_int(init.get("max_turns"), "init max_turns", DEFAULT_MAX_TURNS),
             max_tokens=_positive_int(
                 init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS
@@ -614,6 +623,7 @@ def _merge_task_config(
         base_commit=base_commit if isinstance(base_commit, str) else None,
         fanout_config=fanout_config,
         assigned_provider=config.assigned_provider,
+        debt=config.debt,
         max_turns=max_turns,
         max_tokens=max_tokens,
         shell_permission=config.shell_permission,
@@ -641,6 +651,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         base_commit=run.get("base_commit"),
         fanout_config=_provider_fanout_config(run),
         assigned_provider=None,
+        debt=None,
         max_turns=_positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS),
         max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
         shell_permission=False,
@@ -1789,7 +1800,9 @@ async def _do_provider_work(
         })
     try:
         router, tier, model, model_identity = _provider_router(
-            config.fanout_config, assigned_provider=config.assigned_provider
+            config.fanout_config,
+            assigned_provider=config.assigned_provider,
+            debt=config.debt,
         )
     except Exception as exc:
         return _loop_failure_outcome({
