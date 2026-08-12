@@ -875,6 +875,11 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        # New-token accounting: only the prompt delta between turns plus the
+        # completion count against the budget. The transcript grows between
+        # the two calls (1000 -> 1600 prompt tokens), so the second turn's
+        # 600 new input tokens plus 0 completion push the 1500 budget over
+        # before the edit_file action is executed.
         _enqueue(
             '{"type":"tool_call","name":"read_batch","arguments":'
             '{"paths":["target.txt"]}}',
@@ -884,7 +889,7 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// token-limit\\n"}}',
-            usage={"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
+            usage={"prompt_tokens": 1600, "completion_tokens": 0, "total_tokens": 1600},
         )
 
         session_dir = tmp_path / "session"

@@ -815,6 +815,36 @@ def _action_trailing(content: str) -> str:
     return text[end:].strip()
 
 
+def _usage_prompt_tokens(usage: dict[str, Any] | None) -> int | None:
+    """Return one completion's prompt-side token count, or ``None``.
+
+    Prefers ``prompt_tokens``, then ``input_tokens``; ``None`` when the usage
+    reports neither as a valid count.
+    """
+    if not isinstance(usage, dict):
+        return None
+    for key in ("prompt_tokens", "input_tokens"):
+        value = usage.get(key)
+        if _valid_usage_count(value):
+            return int(value)
+    return None
+
+
+def _usage_completion_tokens(usage: dict[str, Any] | None) -> int | None:
+    """Return one completion's output-side token count, or ``None``.
+
+    Prefers ``completion_tokens``, then ``output_tokens``; ``None`` when the
+    usage reports neither as a valid count.
+    """
+    if not isinstance(usage, dict):
+        return None
+    for key in ("completion_tokens", "output_tokens"):
+        value = usage.get(key)
+        if _valid_usage_count(value):
+            return int(value)
+    return None
+
+
 def _usage_total(usage: dict[str, Any] | None) -> int | None:
     """Return one completion's usable token total, or ``None`` (fail closed).
 
@@ -1463,6 +1493,13 @@ async def _run_agent_loop(
     }
     wall_deadline = time.monotonic() + config.max_wall_s
     cumulative_usage: dict[str, int] = {}
+    # New-token budget accounting: the full transcript is re-sent every turn,
+    # so counting each turn's whole prompt against the budget is O(turns^2).
+    # Only the prompt delta versus the previous turn plus the completion are
+    # new work; the first turn counts its whole prompt. This is a separate
+    # accumulator so the durable cumulative_usage snapshot is unchanged.
+    budget_new_tokens = 0
+    previous_prompt_tokens = 0
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
     lint_diag = LintDiag()
@@ -1535,7 +1572,14 @@ async def _run_agent_loop(
             if writer is not None:
                 await _emit_usage_event(writer, config, _success_usage_event(result, turn))
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
-            if _cumulative_total(cumulative_usage) > config.max_tokens:
+            prompt_tokens = _usage_prompt_tokens(result.usage)
+            completion_tokens = _usage_completion_tokens(result.usage)
+            if prompt_tokens is not None:
+                budget_new_tokens += max(0, prompt_tokens - previous_prompt_tokens)
+                previous_prompt_tokens = prompt_tokens
+            if completion_tokens is not None:
+                budget_new_tokens += completion_tokens
+            if budget_new_tokens > config.max_tokens:
                 return _loop_result(
                     outcome, "failed", "token budget exceeded",
                     turn, cumulative_usage, transcript,
