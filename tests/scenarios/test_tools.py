@@ -27,35 +27,35 @@ def _run(name: str, args: dict, ctx: ToolContext):
     return asyncio.run(run_tool(name, args, ctx))
 
 
-def test_read_file_happy_path_and_cap(tmp_path: Path) -> None:
+def test_read_batch_happy_path_and_cap(tmp_path: Path) -> None:
     (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
-    result = _run("read_file", {"path": "hello.txt"}, ToolContext(tmp_path))
+    result = _run("read_batch", {"paths": ["hello.txt"]}, ToolContext(tmp_path))
 
     assert result.ok
-    assert result.output == "hello\n"
+    assert result.output == "--- hello.txt ---\nhello\n"
     assert result.error is None
     assert isinstance(result.duration_ms, int)
 
     (tmp_path / "large.txt").write_bytes(b"x" * (MAX_READ_BYTES + 1))
-    capped = _run("read_file", {"path": "large.txt"}, ToolContext(tmp_path))
+    capped = _run("read_batch", {"paths": ["large.txt"]}, ToolContext(tmp_path))
 
     assert capped.ok
-    assert "[file truncated]" in capped.output
-    assert len(capped.output.encode()) <= MAX_READ_BYTES
+    assert "--- large.txt ---" in capped.output
+    assert "[output truncated]" in capped.output
+    assert len(capped.output.encode()) <= MAX_OUTPUT_BYTES
 
 
-def test_read_file_rejects_path_escape(tmp_path: Path) -> None:
-    result = _run("read_file", {"path": "../outside.txt"}, ToolContext(tmp_path))
+def test_read_batch_rejects_path_escape(tmp_path: Path) -> None:
+    result = _run("read_batch", {"paths": ["../outside.txt"]}, ToolContext(tmp_path))
 
     assert not result.ok
-    assert result.error is not None
-    assert "escapes worktree" in result.error
+    assert "escapes worktree" in result.output
 
 
 def _batch_context(tmp_path: Path, events: list[dict] | None = None) -> ToolContext:
     return ToolContext(
         tmp_path,
-        init={"tools": ["read_file"]},
+        init={"tools": ["read_batch"]},
         emit=events.append if events is not None else None,
     )
 
@@ -229,14 +229,14 @@ def test_read_batch_concurrency_is_bounded(tmp_path: Path, monkeypatch) -> None:
     assert state["peak"] <= tools.BATCH_READ_MAX_CONCURRENCY
 
 
-def test_read_batch_requires_read_file_in_init_tools(tmp_path: Path) -> None:
+def test_read_batch_requires_read_batch_in_init_tools(tmp_path: Path) -> None:
     results = asyncio.run(
         run_read_batch([{"path": "anything.txt"}], ToolContext(tmp_path))
     )
 
     assert len(results) == 1
     assert not results[0].ok
-    assert "read_file is not offered in init.tools" in (results[0].error or "")
+    assert "read_batch is not offered in init.tools" in (results[0].error or "")
 
 
 class _LintFeedback:
@@ -639,10 +639,14 @@ def test_tool_lint_result_does_not_contain_provider_key(tmp_path: Path, monkeypa
 
 
 def test_run_tool_validates_before_dispatch_and_rejects_unknown_tools(tmp_path: Path) -> None:
-    invalid = _run("read_file", {}, ToolContext(tmp_path))
+    invalid = _run("read_batch", {}, ToolContext(tmp_path))
     assert not invalid.ok
-    assert invalid.error == "validation failed: missing 'path' (string)"
+    assert invalid.error == "validation failed: missing 'paths' (array)"
 
     unknown = _run("does_not_exist", {}, ToolContext(tmp_path))
     assert not unknown.ok
     assert unknown.error == "unknown tool: 'does_not_exist'"
+
+    removed = _run("read_file", {"path": "anything.txt"}, ToolContext(tmp_path))
+    assert not removed.ok
+    assert removed.error == "unknown tool: 'read_file'"

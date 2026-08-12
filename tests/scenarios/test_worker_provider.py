@@ -1,7 +1,7 @@
 """Worker-side provider-backed agent loop drives the edit and publish path.
 
 The fake OpenAI server returns a scripted sequence of strict JSON actions
-(``tool_call`` read_file -> tool_call edit_file -> finish). The worker runs
+(``tool_call`` read_batch -> tool_call edit_file -> finish). The worker runs
 its bounded agent loop, emits ``tool_event``/``checkpoint`` IPC, makes exactly
 one fenced worker-owned commit, and the supervisor gates and merges it.
 """
@@ -353,7 +353,7 @@ def _agent_init(config_path: Path, **extra: Any) -> dict[str, Any]:
 def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
     tmp_path, monkeypatch
 ) -> None:
-    """read_file -> edit_file -> finish: 3 model calls, one merge, no leaks.
+    """read_batch -> edit_file -> finish: 3 model calls, one merge, no leaks.
 
     The provider config lives at the default ``.cambium/providers.json`` under
     the supervisor cwd; ``CAMBIUM_PROVIDERS`` is unset so the supervisor
@@ -377,7 +377,8 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
             os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
         )
         _enqueue(
-            '{"type":"tool_call","name":"read_file","arguments":{"path":"notes.txt"}}',
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["notes.txt"]}}',
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         )
         _enqueue(
@@ -419,7 +420,7 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
             assert all(request["model"] == "loopback-model" for request in REQUESTS)
 
         tool_events = [e for e in events if e["kind"] == "tool_event"]
-        assert [e["payload"]["tool"] for e in tool_events] == ["read_file", "edit_file"]
+        assert [e["payload"]["tool"] for e in tool_events] == ["read_batch", "edit_file"]
         assert all(e["payload"]["ok"] is True for e in tool_events)
         assert [e["payload"]["turn"] for e in tool_events] == [1, 2]
         assert all(isinstance(e["payload"]["duration_ms"], int) for e in tool_events)
@@ -465,7 +466,7 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         event_text = json.dumps(events)
         assert PROVIDER_SECRET not in event_text
         assert "You are Cambium's autonomous coding agent." not in event_text
-        # read_file output must never reach the durable event log
+        # read_batch output must never reach the durable event log
         assert "output-sentinel-7x9q" not in event_text
     finally:
         server.close()
@@ -845,7 +846,8 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         for _ in range(3):
             _enqueue(
-                '{"type":"tool_call","name":"read_file","arguments":{"path":"target.txt"}}'
+                '{"type":"tool_call","name":"read_batch","arguments":'
+                '{"paths":["target.txt"]}}'
             )
 
         session_dir = tmp_path / "session"
@@ -874,7 +876,8 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _enqueue(
-            '{"type":"tool_call","name":"read_file","arguments":{"path":"target.txt"}}',
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["target.txt"]}}',
             usage={"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
         )
         _enqueue(
@@ -1060,7 +1063,8 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _enqueue(
-            '{"type":"tool_call","name":"read_file","arguments":{"path":"notes.txt"}}'
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["notes.txt"]}}'
         )
         _enqueue(
             '{"type":"tool_call","name":"edit_file","arguments":'
@@ -1071,7 +1075,7 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
             # 0.5s tool window vs the 0.05s heartbeat cadence: under load the
-            # heartbeat loop must still tick at least once inside read_file/
+            # heartbeat loop must still tick at least once inside read_batch/
             # edit_file for the tool-carrying heartbeat assertions to hold.
             RESPONSE_DELAY_S = 0.5
 
@@ -1095,7 +1099,7 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
         assert len(result["commits"]) == 1
 
         tool_events = [m for m in messages if m["type"] == "tool_event"]
-        assert [m["tool"] for m in tool_events] == ["read_file", "edit_file"]
+        assert [m["tool"] for m in tool_events] == ["read_batch", "edit_file"]
         assert [m["turn"] for m in tool_events] == [1, 2]
         assert all(m["ok"] is True for m in tool_events)
         assert all(isinstance(m["duration_ms"], int) for m in tool_events)
@@ -1120,6 +1124,6 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
 
         heartbeats = [m for m in messages if m["type"] == "heartbeat"]
         assert any(hb.get("turn", 0) >= 1 for hb in heartbeats)
-        assert any(hb.get("tool") == "read_file" for hb in heartbeats)
+        assert any(hb.get("tool") == "read_batch" for hb in heartbeats)
     finally:
         server.close()

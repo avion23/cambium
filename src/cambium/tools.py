@@ -699,7 +699,6 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
 TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "delegate": _delegate,
-    "read_file": _read_file,
     "read_batch": _read_batch,
     "write_file": _write_file,
     "edit_file": _edit_file,
@@ -723,7 +722,7 @@ async def _run_read_result(args: dict[str, Any], ctx: ToolContext) -> ToolResult
     except Exception as exc:
         return ToolResult(
             ok=False,
-            error=f"read_file failed: {exc}",
+            error=f"read_batch failed: {exc}",
             duration_ms=_duration_ms(started_ns),
         )
     return ToolResult(
@@ -753,7 +752,7 @@ async def _emit_read_batch_event(
         return
     event = {
         "type": "tool_event",
-        "tool": "read_file",
+        "tool": "read_batch",
         "batch_index": batch_index,
         "batch_size": batch_size,
         "ok": result.ok,
@@ -767,7 +766,7 @@ async def _emit_read_batch_event(
 async def run_read_batch(
     calls: Sequence[dict[str, Any]], ctx: ToolContext
 ) -> tuple[ToolResult, ...]:
-    """Validate and execute a batch of confined ``read_file`` calls.
+    """Validate and execute a batch of confined reads in one ``read_batch`` call.
 
     Validation covers the complete input before any file is opened, including
     every path's containment inside the worktree. Eligible reads run
@@ -780,42 +779,47 @@ async def run_read_batch(
         return ()
 
     schema = next(
-        (candidate for candidate in TOOL_SCHEMAS if candidate.get("name") == "read_file"),
+        (candidate for candidate in TOOL_SCHEMAS if candidate.get("name") == "read_batch"),
         None,
     )
     if schema is None:
         return _batch_failure_results(
-            batch_size, "read_file batch rejected atomically: read_file schema is unavailable"
+            batch_size, "read_batch batch rejected atomically: read_batch schema is unavailable"
         )
 
-    validation_errors = [validate_tool_call(schema, call) for call in batch]
     offered_tools = ctx.init.get("tools") if isinstance(ctx.init, Mapping) else None
     read_offered = isinstance(offered_tools, Sequence) and not isinstance(
         offered_tools, (str, bytes, bytearray)
-    ) and "read_file" in offered_tools
+    ) and "read_batch" in offered_tools
 
     preflight_errors: list[str] = []
     if not read_offered:
-        preflight_errors.append("read_file is not offered in init.tools")
-    for batch_index, errors in enumerate(validation_errors):
-        preflight_errors.extend(
-            f"batch_index {batch_index}: {error}" for error in errors
-        )
+        preflight_errors.append("read_batch is not offered in init.tools")
     for batch_index, call in enumerate(batch):
         if not isinstance(call, dict):
+            preflight_errors.append(
+                f"batch_index {batch_index}: validation failed: tool call must be an object"
+            )
             continue
         arguments = _read_batch_arguments(call)
         if not isinstance(arguments, dict):
+            preflight_errors.append(
+                f"batch_index {batch_index}: validation failed: arguments must be an object"
+            )
             continue
         raw_path = arguments.get("path")
-        if not isinstance(raw_path, str) or not raw_path:
+        errors = validate_tool_call(schema, {"paths": [raw_path]})
+        preflight_errors.extend(
+            f"batch_index {batch_index}: {error}" for error in errors
+        )
+        if errors:
             continue
         try:
             _confined_path(ctx, raw_path)
         except _ToolFailure as exc:
             preflight_errors.append(f"batch_index {batch_index}: {exc}")
     if preflight_errors:
-        reason = "read_file batch rejected atomically: " + "\n".join(preflight_errors)
+        reason = "read_batch batch rejected atomically: " + "\n".join(preflight_errors)
         return _batch_failure_results(batch_size, reason)
 
     semaphore = asyncio.Semaphore(BATCH_READ_MAX_CONCURRENCY)
@@ -834,7 +838,7 @@ async def run_read_batch(
         if isinstance(gathered_result, asyncio.CancelledError):
             raise gathered_result
         if isinstance(gathered_result, Exception):
-            results.append(ToolResult(ok=False, error=f"read_file failed: {gathered_result}"))
+            results.append(ToolResult(ok=False, error=f"read_batch failed: {gathered_result}"))
         else:
             results.append(gathered_result)
 

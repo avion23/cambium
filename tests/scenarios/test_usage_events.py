@@ -1,6 +1,6 @@
 """Durable per-call provider usage events (implementation plan step 3).
 
-One scenario drives a scripted provider session (tool_call read_file ->
+One scenario drives a scripted provider session (tool_call read_batch ->
 tool_call edit_file -> finish -> failing call) through the real supervisor +
 worker subprocess + fake OpenAI server, then replays the session's EventStore:
 
@@ -259,7 +259,8 @@ def test_durable_usage_events_redacted_and_missing_fields_omitted(
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _set_provider_env(monkeypatch, config_path)
         _enqueue(
-            '{"type":"tool_call","name":"read_file","arguments":{"path":"notes.txt"}}'
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["notes.txt"]}}'
         )
         # turn 2: 429 with Retry-After + reported quota owner, then a same-provider
         # retry succeeds (max_retries=1)
