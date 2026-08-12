@@ -2362,6 +2362,23 @@ class _Runtime:
                             except (ProcessLookupError, PermissionError, OSError):
                                 pass
                         continue
+                    if not isinstance(msg, dict):
+                        # A valid JSON line that is not an object cannot be a
+                        # protocol message; count and skip it up to the same
+                        # bound as unparseable lines (agents.md boundary
+                        # invariants: framing never fails supervision on
+                        # non-object JSON).
+                        parse_errors += 1
+                        await self.emit(
+                            "parse_error", task_id=task_id, generation=generation,
+                            message="valid JSON line is not an object",
+                        )
+                        if parse_errors > MAX_PARSE_ERRORS:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError, OSError):
+                                pass
+                        continue
                     await messages.put(msg)
             except (ValueError, asyncio.LimitOverrunError) as exc:
                 message_too_long = True
@@ -3958,13 +3975,17 @@ def _sh(*args: str, cwd: str | Path | None = None) -> None:
     )
 
 
-async def _amain_plan(session_dir: Path, plan: dict[str, Any]) -> int:
+async def _amain_plan(
+    session_dir: Path, plan: dict[str, Any], *, conversations: bool = False
+) -> int:
     loop = asyncio.get_running_loop()
 
     def print_event(record: dict[str, Any]) -> None:
         print(f'{record["kind"]:>16}  {json.dumps(record["payload"])}', flush=True)
 
-    task = asyncio.ensure_future(run_plan(session_dir, plan, on_event=print_event))
+    task = asyncio.ensure_future(
+        run_plan(session_dir, plan, on_event=print_event, conversations=conversations)
+    )
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, task.cancel)
@@ -4002,6 +4023,12 @@ def main(argv: list[str] | None = None) -> int:
             "else the built-in demo)"
         ),
     )
+    parser.add_argument(
+        "--conversations",
+        action="store_true",
+        help="persist child-revision conversations at "
+        "<session-dir>/.cambium/conversations.db for the session",
+    )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)
     if args.plan:
@@ -4011,7 +4038,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in tasks:
             _ensure_repo_initialized(Path(task["repo"]).resolve())
         try:
-            return asyncio.run(_amain_plan(session_dir, plan))
+            return asyncio.run(_amain_plan(session_dir, plan, conversations=args.conversations))
         except KeyboardInterrupt:
             return 130
     if args.task_spec:
@@ -4024,7 +4051,9 @@ def main(argv: list[str] | None = None) -> int:
     plan_task = _slice_to_plan_task(task_spec)
     _ensure_repo_initialized(Path(plan_task["repo"]))
     try:
-        return asyncio.run(_amain_plan(session_dir, {"tasks": [plan_task]}))
+        return asyncio.run(
+            _amain_plan(session_dir, {"tasks": [plan_task]}, conversations=args.conversations)
+        )
     except KeyboardInterrupt:
         return 130
 

@@ -195,10 +195,10 @@ stdout and to a file under /tmp; the source repo is never written.
 
 - IPC framing is bounded and correlated by `request_id` (generation is not
   enforced for message correlation). Malformed lines that fail JSON parsing are
-  counted and skipped up to a bound; a valid JSON line that is not an object
-  currently fails supervision (open defect). Fatal framing, missing correlated
-  results, non-zero exits, and deadline failures fail or restart the task
-  according to the boundary policy.
+  counted and skipped up to a bound; a valid JSON line that is not an object is
+  counted and skipped the same way (never fails supervision). Fatal framing,
+  missing correlated results, non-zero exits, and deadline failures fail or
+  restart the task according to the boundary policy.
 - A merge conflict, non-fast-forward, stale expected-old ref, or quarantine
   violation never publishes `main`.
 - A provider-backed task may complete successfully with a conversational/

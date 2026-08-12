@@ -16,7 +16,10 @@ Behavior variants for scenario tests, selected by env ``FAKE_MODE``:
 healthy (default), exit5, noexit, noresult, badrid, noready,
 garbage (garbage lines interleaved with a healthy protocol run),
 garbage_only (pure garbage; never ready), overwrite (replace the first
-'// replace-me' line instead of appending the marker).
+'// replace-me' line instead of appending the marker),
+valid_non_object (valid JSON lines that are not objects, interleaved
+with a healthy protocol run), valid_non_object_only (pure valid
+non-object JSON lines; never ready).
 """
 
 from __future__ import annotations
@@ -123,9 +126,22 @@ def main() -> int:
             sys.stdout.write("not-json-" + ("x" * 60) + "\n")
         sys.stdout.flush()
 
+    if MODE == "valid_non_object":
+        for _ in range(3):
+            sys.stdout.write(json.dumps([1, 2, 3]) + "\n")
+            sys.stdout.write(json.dumps("hello") + "\n")
+            sys.stdout.write(json.dumps(42) + "\n")
+        sys.stdout.flush()
+
     if MODE == "garbage_only":
         while True:
             sys.stdout.write("garbage line\n")
+            sys.stdout.flush()
+            time.sleep(0.01)
+
+    if MODE == "valid_non_object_only":
+        while True:
+            sys.stdout.write(json.dumps([1, 2, 3]) + "\n")
             sys.stdout.flush()
             time.sleep(0.01)
 

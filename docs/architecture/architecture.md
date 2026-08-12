@@ -103,9 +103,18 @@ depth/width bounds, and deep-copies each input `spec` into frozen node records.
 waves; a flat plan keeps the one-`TaskGroup` fan-out under the default
 CPU-count cap.
 
-`architectus.ArchitectusCore` is tested with injected LLMs but has no caller in
-`run_plan`. Dynamic decomposition and the conversation store are not wired into
-that path; `orchestrator.py` is a skeleton. Persistent worker reuse is absent.
+`architectus.ArchitectusCore` is the injected decision port: `run_plan`
+accepts an optional `architectus` argument (an `ArchitectusCore` or an
+`aggregate`/`step` adapter) and an optional `conversations` flag that opens
+`ConversationStore` at `<session_dir>/.cambium/conversations.db`. When the
+port is configured, each admitted parent's terminal envelope feeds
+`aggregate`/`step` and the resulting typed proposals are routed through the
+existing `_admit_child` revision validation (never the live tree directly);
+every admitted/rejected revision is appended to the conversation store.
+`orchestrator.py` forwards both options from its stabilized public `run`
+surface, and `cambium supervisor --conversations` exposes the flag on the
+CLI. With neither backend configured, `run_plan` is byte-for-byte the
+historical behavior. Persistent worker reuse is absent.
 
 `doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
 auth coverage, optional event and conversation databases, module datasets, and
@@ -217,7 +226,7 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan` for plans without `depends_on`; static ready-node waves with width-bounded admission for plans with `depends_on`; one-task adapter retained |
 | Worker/IPC | `src/cambium/worker.py`, `ipc.py` | Marker mode, custom provider loop, bounded NDJSON |
 | Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
-| Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic admission remains follow-on |
+| Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic child admission wired through the injected decision port (`ArchitectusCore` or `aggregate`/`step` adapter) with conversation persistence, exposed by `Orchestrator.run` and `cambium supervisor --conversations` |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
 | Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` | CLI diagnostics and example evaluation exist |

@@ -116,6 +116,12 @@ def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="task-spec JSON path (compatibility flag for the slice supervisor)",
     )
+    parser.add_argument(
+        "--conversations",
+        action="store_true",
+        help="persist child-revision conversations at "
+        "<session-dir>/.cambium/conversations.db for the session",
+    )
 
 
 def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
@@ -368,6 +374,8 @@ def _supervisor_args(args: argparse.Namespace) -> list[str]:
     elif args.plan is not None:
         delegated_flag = "--plan" if _supervisor_has_plan_mode() else "--task-spec"
         delegated.extend((delegated_flag, args.plan))
+    if getattr(args, "conversations", False):
+        delegated.append("--conversations")
     return delegated
 
 
