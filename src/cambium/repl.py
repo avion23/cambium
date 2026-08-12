@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from . import oneshot, render
 from .oneshot import OneShotConfig
@@ -86,7 +86,17 @@ def run_repl(
                 readline.add_history(prompt)
             try:
                 prompt_config = _config_for_prompt(config, prompt)
-                result = _run(oneshot.run_oneshot(prompt_config))
+                events: list[dict[str, Any]] = []
+
+                def _live_sink(record: dict[str, Any]) -> None:
+                    events.append(record)
+                    output_stream.write(render.render_event_line(record) + "\n")
+                    status = render.render_live_status_line(events)
+                    if status:
+                        output_stream.write(status + "\n")
+                    output_stream.flush()
+
+                result = _run(oneshot.run_oneshot(prompt_config, on_event=_live_sink))
                 rendered = render.render_text_result(result)
                 if result.exit_code != 0:
                     failed = True

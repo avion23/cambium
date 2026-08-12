@@ -7,6 +7,7 @@ import inspect
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 _PROMPT = "cambium> "
 _EXIT_EOF = 0
@@ -53,7 +54,17 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
                     else oneshot.allocate_session_dir(oneshot.resolve_repo(config.repo))
                 )
                 prompt_config = replace(config, prompt=prompt, session_root=session_dir)
-                response = _run(oneshot.run_oneshot(prompt_config))
+                events: list[dict[str, Any]] = []
+
+                def _live_sink(record: dict[str, Any]) -> None:
+                    events.append(record)
+                    out.write(render.render_event_line(record) + "\n")
+                    status = render.render_live_status_line(events)
+                    if status:
+                        out.write(status + "\n")
+                    out.flush()
+
+                response = _run(oneshot.run_oneshot(prompt_config, on_event=_live_sink))
                 text = render.render_text_result(response)
                 if response.exit_code != 0:
                     failed = True

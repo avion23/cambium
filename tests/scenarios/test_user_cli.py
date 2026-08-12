@@ -243,7 +243,7 @@ def test_render_rejects_non_mapping_entries_in_results() -> None:
 def test_repl_and_tui_make_a_new_config_per_prompt(monkeypatch, tmp_path: Path) -> None:
     configs: list[oneshot.OneShotConfig] = []
 
-    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
+    async def fake_run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         configs.append(config)
         return _plan_result()
 
@@ -275,7 +275,7 @@ def test_repl_and_tui_return_nonzero_for_failed_plan_result(monkeypatch, tmp_pat
         (TaskResult(task_id="oneshot", status="failed", exit_code=1, reason="failed"),)
     )
 
-    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
+    async def fake_run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         return failed
 
     monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
