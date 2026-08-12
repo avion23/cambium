@@ -151,6 +151,8 @@ HEARTBEAT_INTERVAL_S = 1.0
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
+# Consecutive non-progress actions (valid plans AND invalid/unparseable
+# actions) before the agent loop fails fast.
 MAX_CONSECUTIVE_PLANS = 2
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
 EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
@@ -741,7 +743,10 @@ def _action_keys(parsed: dict[str, Any], required: frozenset[str]) -> bool:
 
 
 def _parse_agent_action(content: str) -> dict[str, Any]:
-    """Strictly parse one agent action; raises ``ValueError`` on any deviation.
+    """Strictly parse ONE agent action; a response may carry several
+    concatenated JSON actions, in which case the first complete action is
+    used (trailing actions are ignored and surfaced to the loop).  Raises
+    ``ValueError`` on any deviation.
 
     Accepted shapes (each may optionally carry a ``thought`` field for
     reasoning; the action fields themselves must be exact):
@@ -753,7 +758,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     if not text:
         raise ValueError("empty agent action")
     try:
-        parsed = json.loads(text)
+        parsed, _end = json.JSONDecoder().raw_decode(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError(f"action is not valid JSON: {exc}") from None
     if not isinstance(parsed, dict):
@@ -789,6 +794,25 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError("finish summary must be a non-empty string")
         return {"type": "finish", "summary": summary}
     raise ValueError(f"unknown agent action type: {action_type!r}")
+
+
+_TRAILING_ACTION_NOTE = (
+    "only the first action was executed; trailing JSON was ignored — "
+    "emit exactly one JSON action per turn"
+)
+
+
+def _action_trailing(content: str) -> str:
+    """Return the non-whitespace content AFTER the first complete JSON object,
+    or "" when there is none or the content cannot be parsed at all."""
+    text = content.strip()
+    if not text:
+        return ""
+    try:
+        _obj, end = json.JSONDecoder().raw_decode(text)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        return ""
+    return text[end:].strip()
 
 
 def _usage_total(usage: dict[str, Any] | None) -> int | None:
@@ -1442,7 +1466,7 @@ async def _run_agent_loop(
     tools = _exposed_tool_schemas(config)
     lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
-    consecutive_plans = 0
+    no_progress_actions = 0
     try:
         for turn in range(1, config.max_turns + 1):
             progress.turn = turn
@@ -1518,20 +1542,31 @@ async def _run_agent_loop(
             except ValueError as exc:
                 transcript.append({"role": "assistant", "content": action_content})
                 transcript.append({"role": "user", "content": f"invalid action: {exc}"})
-                consecutive_plans = 0
-                continue
-            if action["type"] == "plan":
-                consecutive_plans += 1
-                if consecutive_plans > MAX_CONSECUTIVE_PLANS:
+                no_progress_actions += 1
+                if no_progress_actions > MAX_CONSECUTIVE_PLANS:
                     return _loop_result(
                         outcome, "failed",
-                        f"agent made no progress: {consecutive_plans} consecutive plan actions without a tool call",
+                        f"agent made no progress: {no_progress_actions} consecutive "
+                        "actions without a tool call",
+                        turn, cumulative_usage, transcript,
+                    )
+                continue
+            trailing = _action_trailing(result.content)
+            if action["type"] == "plan":
+                no_progress_actions += 1
+                if no_progress_actions > MAX_CONSECUTIVE_PLANS:
+                    return _loop_result(
+                        outcome, "failed",
+                        f"agent made no progress: {no_progress_actions} consecutive "
+                        "actions without a tool call",
                         turn, cumulative_usage, transcript,
                     )
                 transcript.append({"role": "assistant", "content": action_content})
+                if trailing:
+                    transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                 progress.tool = "plan"
                 continue
-            consecutive_plans = 0
+            no_progress_actions = 0
             if action["type"] == "finish":
                 transcript.append({"role": "assistant", "content": action_content})
                 return {
@@ -1564,6 +1599,8 @@ async def _run_agent_loop(
                 # (implementation-plan step 2's dynamic admission).
                 await _emit_delegated_child(writer, config, arguments)
             transcript.append({"role": "assistant", "content": action_content})
+            if trailing:
+                transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
             transcript.append({"role": "user", "content": _tool_observation(name, tool_result)})
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
