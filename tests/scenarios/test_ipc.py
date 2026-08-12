@@ -519,8 +519,15 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             assert hb["type"] == "heartbeat"
 
             await w.send({"type": "check_health", "request_id": "health-1"})
-            ok = await w.recv()
-            assert ok["type"] == "ok"
+            # The heartbeat loop (1s cadence) may emit one more heartbeat
+            # between the first recv and the worker processing check_health;
+            # drain heartbeats until the ack lands (load-sensitive).
+            ok = None
+            for _ in range(4):
+                ok = await w.recv()
+                if ok["type"] == "ok":
+                    break
+            assert ok is not None and ok["type"] == "ok"
             assert ok["request_id"] == "health-1"  # ok echoes the request_id
             assert ok["generation"] == 5
             assert ok["task_id"] == "ipc-health"
