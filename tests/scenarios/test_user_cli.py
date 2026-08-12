@@ -9,6 +9,7 @@ import stat
 import subprocess
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -512,6 +513,110 @@ def test_session_show_does_not_materialize_event_log(tmp_path: Path) -> None:
     # streamed by cambium.supervisor.read_events, not preloaded here.
     assert view.events == ()
     assert view.result["summary"] == "events"
+
+
+def _write_lifecycle_events(path: Path, events: list[dict[str, Any]]) -> None:
+    """Persist a multi-task lifecycle event log under ``path/.cambium``."""
+    state = path / ".cambium"
+    store = EventStore(state / "events.db", fsync_interval_s=0.01)
+    try:
+        for event in events:
+            store.append(event)
+    finally:
+        store.close()
+
+
+def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "mix"
+    _write_lifecycle_events(
+        session_dir,
+        [
+            # alpha: still running at generation 2, turn 7, provider codex
+            {"kind": "task_assigned", "task_id": "alpha", "generation": 1},
+            {"kind": "spawned", "task_id": "alpha", "generation": 1},
+            {"kind": "ready", "task_id": "alpha", "generation": 1},
+            {"kind": "run_task", "task_id": "alpha", "generation": 1},
+            {"kind": "heartbeat", "task_id": "alpha", "generation": 1,
+             "payload": {"turn": 3}},
+            {"kind": "usage_event", "task_id": "alpha", "generation": 1,
+             "payload": {"provider": "codex", "turn": 4}},
+            {"kind": "tool_event", "task_id": "alpha", "generation": 1,
+             "payload": {"turn": 7}},
+            {"kind": "heartbeat", "task_id": "alpha", "generation": 2,
+             "payload": {"turn": 7}},
+            # beta: worker failed at generation 1
+            {"kind": "spawned", "task_id": "beta", "generation": 1},
+            {"kind": "worker_failed", "task_id": "beta", "generation": 1},
+            # gamma: merged successfully
+            {"kind": "spawned", "task_id": "gamma", "generation": 1},
+            {"kind": "result", "task_id": "gamma", "generation": 1,
+             "payload": {"status": "succeeded"}},
+            # delta: assigned but never spawned
+            {"kind": "task_assigned", "task_id": "delta", "generation": 1},
+        ],
+    )
+
+    assert cli.main(["session", "status", "--session-dir", str(root), "mix"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 4
+    alpha = next(line for line in lines if line.startswith("alpha"))
+    assert "running" in alpha and "gen=2" in alpha and "turn=7" in alpha and "codex" in alpha
+    beta = next(line for line in lines if line.startswith("beta"))
+    assert "failed" in beta and "gen=1" in beta
+    gamma = next(line for line in lines if line.startswith("gamma"))
+    assert "done" in gamma
+    delta = next(line for line in lines if line.startswith("delta"))
+    assert "queued" in delta
+
+
+def test_session_status_rejects_missing_event_log(capsys, tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "empty"
+    session_dir.mkdir(parents=True)  # no .cambium/events.db on purpose
+
+    assert cli.main(["session", "status", "--session-dir", str(root), "empty"]) == 1
+    captured = capsys.readouterr()
+    assert "cambium session:" in captured.err
+    assert "event log is missing" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_session_resume_rejects_missing_plan(capsys, tmp_path: Path) -> None:
+    session_dir = tmp_path / "crashed"
+    (session_dir / ".cambium").mkdir(parents=True)
+
+    assert cli.main(["session", "resume", str(session_dir)]) == 1
+    captured = capsys.readouterr()
+    assert "cambium session:" in captured.err
+    assert "without a persisted plan" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_session_resume_delegates_to_supervisor_main(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    from cambium import supervisor
+
+    session_dir = tmp_path / "crashed"
+    (session_dir / ".cambium").mkdir(parents=True)
+    (session_dir / "plan.json").write_text(
+        json.dumps({"tasks": [{"task_id": "t1", "task": "x"}]}), encoding="utf-8"
+    )
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_main(argv=None):
+        calls.append((list(argv or []), {}))
+        return 130
+
+    monkeypatch.setattr(supervisor, "main", fake_main)
+
+    assert cli.main(["session", "resume", str(session_dir)]) == 130
+    assert capsys.readouterr().out == ""
+    assert calls == [
+        (["--session-dir", str(session_dir.resolve()), "--plan",
+          str((session_dir / "plan.json").resolve())], {})
+    ]
 
 
 def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(

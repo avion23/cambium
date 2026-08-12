@@ -375,6 +375,23 @@ def test_scrub_environment_removes_oauth_values_without_mutating_source() -> Non
     assert base["CAMBIUM_OAUTH_ACCOUNT_CODEX"] == "account-id"
 
 
+def test_scrub_environment_preserves_git_config_variables() -> None:
+    base = {
+        "PATH": "/bin",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": "/dev/null",
+        "CAMBIUM_PROVIDER_OPENAI_API_KEY": "sk-secret",
+    }
+
+    environment = auth.scrub_environment(base)
+
+    assert environment["GIT_CONFIG_COUNT"] == "1"
+    assert environment["GIT_CONFIG_KEY_0"] == "core.hooksPath"
+    assert environment["GIT_CONFIG_VALUE_0"] == "/dev/null"
+    assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in environment
+
+
 def test_supervisor_worker_env_allows_only_declared_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -394,7 +411,13 @@ def test_supervisor_worker_env_allows_only_declared_provider_credentials(
     )
 
     assert environment["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == SECRET
-    assert environment["PATH"] == os.defpath
+    assert environment["PATH"] == os.pathsep.join(
+        [
+            os.defpath,
+            str(Path(__file__).resolve().parents[2] / ".venv" / "bin"),
+            str(Path.home() / ".local" / "bin"),
+        ]
+    )
     assert environment["CAMBIUM_TASK_ID"] == "task"
     assert environment["CAMBIUM_GENERATION"] == "3"
     assert "CAMBIUM_PROVIDER_ANTHROPIC_API_KEY" not in environment

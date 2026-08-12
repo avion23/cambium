@@ -298,6 +298,68 @@ _WORKER_ACTIVE_INC = frozenset({"spawned"})
 _WORKER_ACTIVE_DEC = frozenset({"exit", "reuse_ready", "worker_failed"})
 
 
+def render_subagent_status(events: Any) -> str:
+    """Render the per-subagent live status table for one session event log.
+
+    ``events`` is a sequence of already-redacted event records (mappings with
+    at least ``kind``, ``task_id``, ``generation`` and ``payload`` keys) in
+    durable order.  For every distinct ``task_id`` the latest lifecycle event
+    decides the state: ``spawned``/``ready``/``run_task``/``heartbeat``/
+    ``tool_event``/``checkpoint`` make it ``running``; a terminal ``result``,
+    ``worker_failed`` or ``exit`` settles ``done``/``failed``/``exited``;
+    ``task_assigned`` with no spawn yet is ``queued``.  The turn counter comes
+    from the newest ``heartbeat``/``usage_event``/``tool_event`` payload and the
+    active_provider from the newest ``usage_event``.  Returns one line per
+    sub-agent in first-appearance order, or ``""`` when there are no events.
+    """
+    states: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        task_id = event.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        record = states.get(task_id)
+        if record is None:
+            record = {"state": "queued", "generation": 0, "turn": 0, "provider": ""}
+            states[task_id] = record
+            order.append(task_id)
+        kind = event.get("kind")
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        generation = event.get("generation")
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            record["generation"] = max(record["generation"], generation)
+        if kind in ("spawned", "ready", "run_task", "heartbeat", "tool_event", "checkpoint"):
+            record["state"] = "running"
+        elif kind == "result":
+            status = payload.get("status")
+            record["state"] = "done" if status == "succeeded" else "failed"
+        elif kind == "worker_failed":
+            record["state"] = "failed"
+        elif kind == "exit":
+            record["state"] = "exited"
+        elif kind == "reuse_ready":
+            if record["state"] not in ("done", "failed", "exited"):
+                record["state"] = "done"
+        for event_kind in ("heartbeat", "usage_event", "tool_event"):
+            if kind == event_kind:
+                turn = payload.get("turn")
+                if isinstance(turn, int) and not isinstance(turn, bool):
+                    record["turn"] = max(record["turn"], turn)
+        if kind == "usage_event":
+            provider = payload.get("provider")
+            if isinstance(provider, str) and provider:
+                record["provider"] = provider
+    if not order:
+        return ""
+    return "\n".join(
+        f"{task_id:<24} {record['state']:<9} gen={record['generation']} "
+        f"turn={record['turn']} provider={record['provider']}"
+        for task_id, record in ((tid, states[tid]) for tid in order)
+    )
+
+
 def render_tokens_per_s(events: Any) -> str:
     """Render tokens/second throughput from the latest usable ``usage_event``.
 
@@ -392,6 +454,7 @@ __all__ = [
     "render_event_line",
     "render_json_result",
     "render_live_status_line",
+    "render_subagent_status",
     "render_text_result",
     "render_tokens_per_s",
     "render_usage_stats_line",

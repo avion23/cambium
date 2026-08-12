@@ -71,8 +71,16 @@ def build_subprocess_env(
     names = _names(allowed_keys)
     env = {
         # ``os.defpath`` contains the system locations needed by git, sh, and
-        # the standard command-line tools.  The host's PATH is never copied.
-        "PATH": os.defpath,
+        # the standard command-line tools.  The host's PATH is never copied,
+        # but the project's own tool dirs are appended so repo tools such as
+        # ``ruff`` resolve for the worker.
+        "PATH": os.pathsep.join(
+            [
+                os.defpath,
+                str(Path(__file__).resolve().parents[2] / ".venv" / "bin"),
+                str(Path.home() / ".local" / "bin"),
+            ]
+        ),
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
         "PYTHONUNBUFFERED": "1",
         "LANG": "C",
