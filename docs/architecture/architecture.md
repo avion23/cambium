@@ -10,7 +10,8 @@ live gap table.
 
 Cambium runs directly from source; no wheel is built and no install is
 required or supported. The CLI routes `auth`, `supervisor`, `doctor`, `bench`,
-`tasktree`, `module-test`, `version`, `run`, `repl`, `tui`, and `session`
+`tasktree`, `module-test`, `version`, `run`, `repl`, `tui`, `session`, and
+`architectus`
 (`session list/latest/show` reads completed session results).
 `cambium.__init__` exports only `__version__`; there is no public session API.
 
@@ -124,7 +125,8 @@ shipped default sample), not the trusted user config
 `~/.config/cambium/providers.json` that `run` selects providers from.
 `resources.py` is deleted; there is no `CompileGate` and
 no `ResourceBudget` class. `module_conformance` provides an
-isolated module-test gate. `modules/example` has deterministic decision logic,
+isolated module-test gate. `modules/example` and `modules/should_review` have
+deterministic decision logic,
 train/eval/canary data, split metrics, and a JSON CLI with `decide` and
 `evaluate` operations. There is no `eval_cache.py`.
 
@@ -229,7 +231,7 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic child admission wired through the injected decision port (`ArchitectusCore` or `aggregate`/`step` adapter) with conversation persistence, exposed by `Orchestrator.run` and `cambium supervisor --conversations` |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
 | Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
-| Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/` | CLI diagnostics and example evaluation exist |
+| Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
 
 Any target moves to current only after a caller and focused failure test
 demonstrate it. Keep public names and status mappings stable once a host API is

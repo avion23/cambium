@@ -147,7 +147,7 @@ worktree.
 Run the live gate:
 
 ```console
-uv run --extra test cambium module-test <package_name>
+PYTHONPATH=src python3.14 -m cambium.cli module-test NAME
 ```
 
 `module_conformance` validates tracked layout/manifest, dataset and baseline
@@ -261,7 +261,7 @@ not be documented until its package entry point and tests exist.
 
 ### A.5 Conformance and wheel review
 
-Run `cambium module-test <package_name>` from the checkout and from an
+Run `cambium module-test NAME` from the checkout and from an
 installed wheel. Confirm the gate discovers only the package's colocated tests,
 rejects arbitrary pytest arguments, validates manifest/dataset/baseline files,
 probes the JSON CLI, and scans sibling/reverse imports. Confirm the offline

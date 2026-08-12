@@ -60,7 +60,8 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
-`module-test`, `version`, `run`, `repl`, `tui`, and `session` (`session
+`module-test`, `version`, `run`, `repl`, `tui`, `session`, and `architectus`
+(`session
 list/latest/show` reads completed session results); prefer it over the internal
 supervisor module.
 Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
@@ -167,10 +168,17 @@ stdout and to a file under /tmp; the source repo is never written.
 - Worker-exposed `run_shell` and inspection-only `git_op` run without an
   `ApprovalGate` or `CompileGate`; mutating Git operations are not
   worker-exposed. `approval.py` and `resources.py` are deleted.
-- `tasktree.build_tree` validates dependency specs; `run_plan` does not
-  schedule a DAG. Architectus and the conversation store are not wired into
-  `run_plan`.
-- `cambium.oauth` (new module, not yet wired into the CLI) provides Codex
+- `tasktree.build_tree` validates dependency specs. `run_plan` builds a plan
+  that carries `depends_on` into one validated `TaskTree` and dispatches
+  static ready-node waves (width-bounded admission; a failed node cascades so
+  descendants are never spawned); a flat plan (no `depends_on`) keeps the
+  one-`TaskGroup` fan-out. `run_plan` accepts an optional `architectus`
+  decision port (an `ArchitectusCore` or an `aggregate`/`step` adapter) and a
+  `conversations` flag that opens `ConversationStore` at
+  `<session-dir>/.cambium/conversations.db`; `cambium supervisor
+  --conversations` exposes the flag on the CLI, and `cambium architectus`
+  runs one live or scripted Architectus decision session directly.
+- `cambium.oauth` provides Codex
   ChatGPT-subscription OAuth: a hardened per-provider `OAuthStore`
   (`~/.local/share/cambium/oauth.json`, 0700 dir/0600 file, fail-closed
   corruption with explicit `repair()`), a flock'd `TokenManager` refresh
@@ -211,11 +219,12 @@ stdout and to a file under /tmp; the source repo is never written.
 
 ## Checks and handoff
 
-Module tests are example data-in/data-out pairs: deterministic module input
-produces the expected module output. The scenario suite also covers process,
-git, persistence, and concurrency behavior. Run the narrowest real check, then
-the affected package check when a boundary changes. Useful system commands from
-the repository root:
+Module tests are per-module data-in/data-out pairs: deterministic module
+input produces the expected module output, gated by `cambium module-test
+NAME` for the `example` and `should_review` modules. The scenario suite also
+covers process, git, persistence, and concurrency behavior. Run the narrowest
+real check, then the affected package check when a boundary changes. Useful
+system commands from the repository root:
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo

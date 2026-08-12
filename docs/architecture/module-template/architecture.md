@@ -194,9 +194,10 @@ failure exits non-zero and canary pass rate gates promotion.
 Run:
 
 ```console
-PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test <package_name>
+PYTHONPATH=src python3.14 -m cambium.cli module-test NAME
 # reference:
-PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test example
+PYTHONPATH=src python3.14 -m cambium.cli module-test example
+PYTHONPATH=src python3.14 -m cambium.cli module-test should_review
 ```
 
 The live `module_conformance` gate validates tracked layout, datasets,
@@ -217,7 +218,7 @@ Each baseline JSON must contain `schema_version`, logical `module`,
 and version must match `datasets/meta.json` and exact split bytes. The module
 package in the source layout includes package code, `__main__.py`,
 `architecture.md`, datasets, metadata, colocated tests, and baseline; the
-source-layout probe runs `cambium module-test <package_name>`. The tool is
+source-layout probe runs `cambium module-test NAME`. The tool is
 developed and run directly from source; no wheel is built or supported.
 
 ## 10. Optimization plan
