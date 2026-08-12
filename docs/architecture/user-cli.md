@@ -202,6 +202,14 @@ reads the environment or a key value.
 - `cambium auth list` prints `provider<TAB>derived-env-name` per stored
   provider, never a key value.
 - `cambium auth remove PROVIDER` deletes one stored key.
+- `cambium auth oauth [PROVIDER]` manages one provider's Codex ChatGPT OAuth
+  session: `--status` prints the local expiry and an account fingerprint (no
+  refresh, no secrets), `--logout` removes the local oauth session without
+  claiming remote revocation, `--import-codex-cli` imports the existing codex
+  CLI session from `~/.codex/auth.json` as provider `codex`, and the bare
+  device flow runs an interactive login (client id from `--client-id` or
+  `CAMBIUM_CODEX_CLIENT_ID`); the device code is shown only on the
+  controlling TTY and never logged.
 - `cambium auth run supervisor --session-dir DIR` execs
   `cambium.supervisor` with a scrubbed environment containing only the stored
   provider keys; keys travel in the environment, never in argv.
@@ -234,7 +242,7 @@ diagnostics.
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir DIR \
-    [--plan PATH | --task-spec PATH]
+    [--plan PATH | --task-spec PATH] [--conversations]
 ```
 
 `--session-dir` is required and names the concrete session leaf. Without
@@ -242,7 +250,9 @@ PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir DIR \
 one marker worker (`task_id` `demo-001`) against a seeded repository under
 `DIR/scratch` that appends a marker line to `hello.txt`. `--plan` is passed as
 a plan when the installed supervisor exposes `run_plan`, otherwise as a
-task-spec (compatibility with the slice supervisor). Publication advances the
+task-spec (compatibility with the slice supervisor). `--conversations`
+persists child-revision conversations at
+`<session-dir>/.cambium/conversations.db`. Publication advances the
 working repository's `refs/heads/main` only; it does not refresh a checkout.
 
 ## 9. Session artifacts

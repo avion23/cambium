@@ -21,8 +21,10 @@ The entry point (`src/cambium/cli.py`) dispatches these commands:
 - `supervisor --session-dir DIR` — run one supervisor session from a plan, a
   task spec, or the built-in deterministic demo.
 - `auth set|remove PROVIDER` — manage stored provider credentials; `set` reads
-  the key from stdin with `--stdin`. Only `set` and `remove` take a
-  `PROVIDER` positional; `auth list` takes none.
+  the key from stdin with `--stdin`. `auth list` prints configured providers;
+  `auth oauth [PROVIDER]` manages one provider's Codex OAuth session; `auth
+  run supervisor` runs the supervisor with the stored keys. `set` and `remove`
+  take a `PROVIDER` positional; `oauth` takes an optional one.
 - `doctor`, `bench`, `tasktree`, `module-test`, `version` — diagnostics and
   tooling.
 
