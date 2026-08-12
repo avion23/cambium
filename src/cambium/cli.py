@@ -388,6 +388,31 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SESSION",
         help="session id to show",
     )
+    session_status = session_commands.add_parser(
+        "status",
+        help="show the live per-subagent status of one session",
+        description="Read one session's durable event log and render the current "
+        "state of every sub-agent (task) that ran or is running in it.",
+    )
+    session_status.add_argument("--session-dir", metavar="DIR", help="session directory")
+    session_status.add_argument(
+        "session_id",
+        metavar="SESSION",
+        help="session id whose sub-agents to inspect",
+    )
+    session_resume = session_commands.add_parser(
+        "resume",
+        help="resume a crashed or interrupted session from its persisted plan",
+        description="Re-run one supervisor session against an existing session "
+        "directory. The persisted plan.json drives the re-entry; completed tasks "
+        "whose merge was already reconciled are skipped, and interrupted tasks are "
+        "re-spawned from their base commit.",
+    )
+    session_resume.add_argument(
+        "session_id",
+        metavar="SESSION",
+        help="session directory to resume (must contain plan.json)",
+    )
 
     commands.add_parser(
         "tasktree",
@@ -880,7 +905,7 @@ def _run_session(args: argparse.Namespace) -> int:
         return 1
     root = (
         Path(args.session_dir).expanduser().resolve()
-        if args.session_dir is not None
+        if getattr(args, "session_dir", None) is not None
         else session.session_root(Path.cwd())
     )
     if args.session_command == "list":
@@ -914,6 +939,39 @@ def _run_session(args: argparse.Namespace) -> int:
             return 1
         print(rendered)
         return 0
+    if args.session_command == "status":
+        from . import supervisor
+
+        candidate = Path(args.session_id).expanduser()
+        path = candidate if candidate.is_absolute() else root / candidate
+        if not (path / ".cambium" / "events.db").is_file():
+            print(
+                f"cambium session: event log is missing: "
+                f"{path / '.cambium' / 'events.db'}",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            events = supervisor.read_events(path)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            print(f"cambium session: {exc}", file=sys.stderr)
+            return 1
+        text = render.render_subagent_status(events)
+        print(text)
+        return 0
+    if args.session_command == "resume":
+        from . import supervisor
+
+        path = Path(args.session_id).expanduser().resolve()
+        plan = path / "plan.json"
+        if not plan.is_file():
+            print(
+                f"cambium session: cannot resume without a persisted plan: {plan}",
+                file=sys.stderr,
+            )
+            return 1
+        code = supervisor.main(["--session-dir", str(path), "--plan", str(plan)])
+        return 130 if code == 130 else code
     raise AssertionError(f"unhandled session command: {args.session_command!r}")
 
 

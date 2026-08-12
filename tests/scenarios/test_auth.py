@@ -394,7 +394,13 @@ def test_supervisor_worker_env_allows_only_declared_provider_credentials(
     )
 
     assert environment["CAMBIUM_PROVIDER_OPENAI_API_KEY"] == SECRET
-    assert environment["PATH"] == os.defpath
+    assert environment["PATH"] == os.pathsep.join(
+        [
+            os.defpath,
+            str(Path(__file__).resolve().parents[2] / ".venv" / "bin"),
+            str(Path.home() / ".local" / "bin"),
+        ]
+    )
     assert environment["CAMBIUM_TASK_ID"] == "task"
     assert environment["CAMBIUM_GENERATION"] == "3"
     assert "CAMBIUM_PROVIDER_ANTHROPIC_API_KEY" not in environment
