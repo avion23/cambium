@@ -1467,6 +1467,8 @@ async def _run_agent_loop(
     lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
     no_progress_actions = 0
+    verified_after_change = False
+    code_changed = False
     try:
         for turn in range(1, config.max_turns + 1):
             progress.turn = turn
@@ -1569,6 +1571,17 @@ async def _run_agent_loop(
             no_progress_actions = 0
             if action["type"] == "finish":
                 transcript.append({"role": "assistant", "content": action_content})
+                if code_changed and not verified_after_change:
+                    transcript.append({
+                        "role": "user",
+                        "content": (
+                            "finish rejected: you changed code but did not run a "
+                            "successful verification command; run the tests (e.g. "
+                            "run_shell) before finishing"
+                        ),
+                    })
+                    progress.tool = "finish"
+                    continue
                 return {
                     **outcome,
                     "status": "succeeded",
@@ -1598,6 +1611,12 @@ async def _run_agent_loop(
                 # validates and admits at this task's terminal envelope
                 # (implementation-plan step 2's dynamic admission).
                 await _emit_delegated_child(writer, config, arguments)
+            if tool_result.ok:
+                if name in ("write_file", "edit_file"):
+                    code_changed = True
+                    verified_after_change = False
+                elif name == "run_shell":
+                    verified_after_change = True
             transcript.append({"role": "assistant", "content": action_content})
             if trailing:
                 transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
