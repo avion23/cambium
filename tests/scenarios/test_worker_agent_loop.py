@@ -206,6 +206,19 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         '{"type":"finish","summary":"done","thought":"verified"}'
     ) == {"type": "finish", "summary": "done"}
 
+    # Concatenated actions: the FIRST complete object is parsed; the rest is
+    # surfaced via _action_trailing.
+    assert worker._parse_agent_action(
+        '{"type":"finish","summary":"done"}'
+        '{"type":"tool_call","name":"read_file","arguments":{"path":"a.py"}}'
+    ) == {"type": "finish", "summary": "done"}
+    assert worker._action_trailing(
+        '{"type":"finish","summary":"done"}'
+        '{"type":"tool_call","name":"read_file","arguments":{"path":"a.py"}}'
+    ).startswith('{"type":"tool_call"')
+    assert worker._action_trailing('{"type":"plan","steps":["a"]}') == ""
+    assert worker._action_trailing('{"type":"plan"') == ""
+
     for bad in (
         '{"type":"plan"}',
         '{"type":"plan","steps":[]}',
@@ -365,7 +378,6 @@ def test_consecutive_plan_actions_fail_fast_with_no_progress_reason(
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
     assert outcome["status"] == "failed"
-    assert "plan" in outcome["failure_reason"]
     assert "no progress" in outcome["failure_reason"]
     assert outcome["turn"] == 3  # failed on the 3rd consecutive plan
     assert len(router.prompts) == 3  # no further router calls
@@ -395,3 +407,55 @@ def test_plan_then_tool_resets_consecutive_plan_counter(tmp_path: Path) -> None:
     assert outcome["summary"] == "read the file"
     assert outcome["turn"] == 5
     assert len(router.prompts) == 5
+
+
+def test_concatenated_actions_first_action_parsed_trailing_noted(tmp_path: Path) -> None:
+    """A response carrying several concatenated JSON actions parses as the
+    first action, notes the ignored trailing JSON to the model, and continues
+    instead of failing as invalid."""
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["read both files"]}'
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["alpha.txt","beta.txt"]}}',
+            '{"type":"finish","summary":"read both files"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["summary"] == "read both files"
+    assert outcome["turn"] == 2
+    assert len(router.prompts) == 2
+    assert any(
+        "trailing JSON was ignored" in message["content"]
+        for message in outcome["transcript"]
+    )
+
+
+def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> None:
+    """Invalid (unparseable) actions count toward the no-progress guard and
+    fail fast at the 3rd consecutive one instead of burning the turn budget."""
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan"',
+            '{"type":"plan"',
+            '{"type":"plan"',
+            '{"type":"finish","summary":"must never be reached"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "failed"
+    assert "no progress" in outcome["failure_reason"]
+    assert "max turns exceeded" not in outcome["failure_reason"]
+    assert outcome["turn"] == 3  # failed on the 3rd consecutive invalid action
+    assert len(router.prompts) == 3  # no further router calls
