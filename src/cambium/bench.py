@@ -9,6 +9,13 @@ Modes::
     pytest -p cambium.bench --bench=gate        # fail (exit 1) on drift
     pytest -p cambium.bench --bench=re-anchor   # explicitly record a new baseline
 
+The standalone CLI additionally supports ``quality``
+(``python -m cambium.bench quality``), which measures task SUCCESS RATE by
+running a fixed set of known-good coding prompts against a scratch git repo
+(``<cwd>/.cambium/quality-repo``) and reports per-prompt outcomes plus an
+aggregate success-rate line.  When no provider credentials are configured it
+skips cleanly and exits 0.
+
 A ``gate`` run never writes a baseline: a dataset_version change is a hard
 regression that fails the gate and preserves the old anchor. Recording a new
 baseline is an explicit, separate operation (``report`` or ``re-anchor``).
@@ -47,21 +54,25 @@ import argparse
 import asyncio
 import datetime as _dt
 import hashlib
+import inspect
 import json
 import math
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from cambium.auth import scrub_environment
+from cambium.auth import AuthError, scrub_environment
 from cambium.modules.base import (
     DatasetError,
     ModuleBoundaryError,
@@ -117,6 +128,10 @@ else:
 # Standalone runtime baselines live under the invocation directory so an
 # installed wheel run never writes into the checkout or the package.
 RUNTIME_BASELINE_DIR = Path.cwd() / ".cambium" / "baselines"
+# The quality benchmark owns its scratch repository under the same runtime
+# root; the repo is rebuilt before every prompt so each prompt measures the
+# identical pristine fixture.
+QUALITY_REPO_DIR = Path.cwd() / ".cambium" / "quality-repo"
 
 SPLITS = ("train", "eval", "canaries")
 
@@ -172,6 +187,212 @@ def percentiles(times: list[float]) -> dict[str, float]:
         "p90": round(qs[89], 6),
         "max": round(ordered[-1], 6),
     }
+
+
+# --------------------------------------------------------------------------
+# Quality benchmark: task success rate over a fixed fixture repo
+# --------------------------------------------------------------------------
+
+# One tiny self-contained fixture: a calculator module whose ``square()`` is a
+# TODO, and a test suite that fails until it is implemented. The fixture is a
+# minimal real task the provider agent must read, fix, and verify.
+QUALITY_CALCULATOR = textwrap.dedent(
+    """\
+    \"\"\"A tiny calculator used by the cambium bench quality fixture.\"\"\"
+
+
+    def square(x: int) -> int:
+        \"\"\"Return x * x.
+
+        TODO: implement square so tests/test_calculator.py passes.
+        \"\"\"
+        raise NotImplementedError("square() is not implemented")
+    """
+)
+
+QUALITY_TEST = textwrap.dedent(
+    """\
+    from calculator import square
+
+
+    def test_square_positive() -> None:
+        assert square(3) == 9
+
+
+    def test_square_negative() -> None:
+        assert square(-4) == 16
+
+
+    def test_square_zero() -> None:
+        assert square(0) == 0
+    """
+)
+
+# A small FIXED set of known-good prompts, each asking for the same one-line
+# fix so every prompt exercises the full read-fix-verify loop independently
+# (the scratch repo is rebuilt pristine before each prompt).
+QUALITY_PROMPTS: tuple[tuple[str, str], ...] = (
+    (
+        "quality-square-1",
+        "tests/test_calculator.py is failing. Read the failing test, implement "
+        "square() in calculator.py, and verify by running the test suite.",
+    ),
+    (
+        "quality-square-2",
+        "Fix the failing test suite in this repository: implement "
+        "calculator.square() so that all tests in tests/test_calculator.py pass, "
+        "then run pytest to confirm.",
+    ),
+    (
+        "quality-square-3",
+        "Complete the TODO in calculator.py: implement square(x) to return x*x. "
+        "Make sure tests/test_calculator.py passes by running the tests.",
+    ),
+)
+
+
+def _build_quality_repo(root: Path) -> Path:
+    """Create a pristine git repo at ``root`` holding the quality fixture.
+
+    The repo is initialized with a ``main`` branch and seeded user identity,
+    and contains one commit with ``calculator.py`` plus the failing
+    ``tests/test_calculator.py``. A pre-existing directory at ``root`` is
+    removed first so every prompt in a quality run measures the identical
+    pristine fixture regardless of what an earlier prompt committed.
+    """
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    (root / "tests").mkdir()
+    (root / "calculator.py").write_text(QUALITY_CALCULATOR)
+    (root / "tests" / "test_calculator.py").write_text(QUALITY_TEST)
+    for command in (
+        ("init", "-b", "main"),
+        ("config", "user.name", "Cambium Quality Bench"),
+        ("config", "user.email", "cambium-bench@localhost"),
+        ("add", "."),
+        ("commit", "-m", "quality fixture: failing square()"),
+    ):
+        result = subprocess.run(
+            ["git", "-C", str(root), *command],
+            capture_output=True,
+            text=True,
+            env=scrub_environment(),
+            timeout=60,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "no diagnostic output").strip()
+            raise ModuleBoundaryError(
+                f"quality fixture: `git {' '.join(command)}` exited "
+                f"{result.returncode}: {detail[:300]}"
+            )
+    return root
+
+
+def _is_provider_selection_error(exc: Exception) -> bool:
+    """True when a oneshot resolution error means no provider is usable.
+
+    ``run_oneshot`` surfaces a missing or disabled provider as a ``ValueError``
+    whose message names the selection or credential failure. ``AuthError`` is
+    credential-domain by construction.
+    """
+    if isinstance(exc, AuthError):
+        return True
+    return isinstance(exc, ValueError) and any(
+        marker in str(exc)
+        for marker in (
+            "provider selection",
+            "provider credential",
+            "auto mode requires at least one enabled provider",
+        )
+    )
+
+
+def _run_one_quality_prompt(
+    repo: Path, task_id: str, prompt: str
+) -> dict[str, Any] | None:
+    """Run one prompt against ``repo``; None when no provider is configured."""
+    from cambium.oneshot import OneShotConfig, run_oneshot
+
+    config = OneShotConfig(prompt=prompt, repo=str(repo), task_id=task_id)
+    started = time.monotonic()
+    try:
+        value = run_oneshot(config)
+        result = asyncio.run(value) if inspect.isawaitable(value) else value
+    except (AuthError, OSError, ValueError) as exc:
+        if _is_provider_selection_error(exc):
+            return None
+        raise
+    wall_s = time.monotonic() - started
+    first = result.results[0] if getattr(result, "results", None) else None
+    if first is not None:
+        exit_code = first.exit_code
+        status = first.status
+        merge_sha = first.merge_sha
+    else:
+        exit_code = getattr(result, "exit_code", 1)
+        status = "failed"
+        merge_sha = None
+    return {
+        "task_id": task_id,
+        "prompt": prompt,
+        "exit_code": exit_code,
+        "status": status,
+        "merge_sha": merge_sha,
+        "wall_s": wall_s,
+    }
+
+
+def _run_quality_prompts(root: Path) -> list[dict[str, Any]] | None:
+    """Run every fixed prompt on a fresh fixture repo; None when provider missing."""
+    records: list[dict[str, Any]] = []
+    for task_id, prompt in QUALITY_PROMPTS:
+        repo = _build_quality_repo(root)
+        record = _run_one_quality_prompt(repo, task_id, prompt)
+        if record is None:
+            return None
+        records.append(record)
+    return records
+
+
+def quality_aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Success/total, success percentage, and mean wall seconds over a run.
+
+    A prompt counts as a success only when its exit code is 0 AND its status
+    is ``"succeeded"``, mirroring the supervisor's task verdict.
+    """
+    total = len(records)
+    successes = sum(
+        1
+        for record in records
+        if record.get("exit_code") == 0 and record.get("status") == "succeeded"
+    )
+    pct = round(successes / total * 100, 1) if total else 0.0
+    walls = [float(record.get("wall_s", 0.0)) for record in records]
+    avg_wall_s = round(sum(walls) / len(walls), 1) if walls else 0.0
+    return {
+        "success_rate": f"{successes}/{total}",
+        "pct": pct,
+        "avg_wall_s": avg_wall_s,
+    }
+
+
+def format_quality_report(records: list[dict[str, Any]]) -> str:
+    """Deterministic text report: one line per prompt plus the aggregate line."""
+    lines = []
+    for record in records:
+        merge_sha = record.get("merge_sha") or "-"
+        lines.append(
+            f"cambium bench quality: task {record['task_id']}: "
+            f"exit_code={record['exit_code']} status={record['status']} "
+            f"merge_sha={merge_sha} wall_s={record['wall_s']:.1f}"
+        )
+    aggregate = quality_aggregate(records)
+    lines.append(
+        f"cambium bench quality: success_rate={aggregate['success_rate']} "
+        f"pct={aggregate['pct']} avg_wall_s={aggregate['avg_wall_s']}"
+    )
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -933,16 +1154,45 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
         return measured
 
 
+def _run_quality(args: argparse.Namespace) -> int:
+    """Run the fixed quality fixture prompts and report task success rate.
+
+    Returns 0 on a completed run and on a clean skip; 1 only when the fixture
+    itself cannot be prepared or a prompt run fails for a reason other than
+    missing provider credentials.
+    """
+    root = args.bench_root if args.bench_root is not None else QUALITY_REPO_DIR
+    try:
+        records = _run_quality_prompts(root)
+    except (AuthError, ModuleBoundaryError, OSError, ValueError) as exc:
+        print(
+            f"cambium bench quality: ERROR {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    if records is None:
+        print(
+            "cambium bench quality: no configured provider credentials for this "
+            "repository; skipping the quality run"
+        )
+        return 0
+    print(format_quality_report(records))
+    return 0
+
+
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m cambium.bench",
-        description="Run the Cambium benchmark report, drift gate, or explicit re-anchor.",
+        description=(
+            "Run the Cambium benchmark report, drift gate, explicit re-anchor, "
+            "or the task-success-rate quality run."
+        ),
     )
     parser.add_argument(
         "mode",
         nargs="?",
         default="report",
-        metavar="{report,gate,re-anchor}",
+        metavar="{report,gate,re-anchor,quality}",
     )
     parser.add_argument(
         "--full",
@@ -959,7 +1209,8 @@ def _cli_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="DIR",
-        help="baseline root override (default: .cambium/baselines/, gitignored)",
+        help="runtime root override (default: .cambium/baselines/; quality uses "
+        "it as the scratch-repo root, default .cambium/quality-repo/; gitignored)",
     )
     parser.add_argument(
         "--bench-metric-delta",
@@ -977,11 +1228,16 @@ def _cli_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI form: ``python -m cambium.bench report|gate|re-anchor``."""
+    """CLI form: ``python -m cambium.bench report|gate|re-anchor|quality``."""
     args = _cli_parser().parse_args(sys.argv[1:] if argv is None else argv)
     mode = args.mode
+    if mode == "quality":
+        return _run_quality(args)
     if mode not in ("report", "gate", "re-anchor"):
-        print("usage: python -m cambium.bench report|gate|re-anchor", file=sys.stderr)
+        print(
+            "usage: python -m cambium.bench report|gate|re-anchor|quality",
+            file=sys.stderr,
+        )
         return 2
     thresholds = dict(DEFAULT_THRESHOLDS)
     # The standalone CLI compares two live measurements (the recorded report

@@ -1133,3 +1133,95 @@ def test_cli_gate_fails_and_preserves_anchor_on_dataset_version_change(
     assert "re-anchored fixture_module: 0.0.0 -> fixture-1" in capsys.readouterr().out
     fresh = json.loads(anchor_path.read_text())
     assert fresh["dataset_version"] == "fixture-1"
+
+
+# ---------------------------------------------------------------------------
+# bench quality: fixture repo builder and report formatter (pure helpers only;
+# the live provider run is never invoked in tests)
+# ---------------------------------------------------------------------------
+
+
+def test_quality_repo_builder_creates_main_branch_and_fixture(tmp_path) -> None:
+    import cambium.bench as bench
+
+    repo = bench._build_quality_repo(tmp_path / "quality-repo")
+    assert (repo / ".git").is_dir()
+    assert (repo / "calculator.py").is_file()
+    assert (repo / "tests" / "test_calculator.py").is_file()
+
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "refs/heads/main"],
+        capture_output=True,
+        text=True,
+    )
+    assert branch.returncode == 0, branch.stderr
+
+    calculator = (repo / "calculator.py").read_text()
+    assert "TODO" in calculator
+    assert "def square" in calculator
+    test = (repo / "tests" / "test_calculator.py").read_text()
+    assert "assert square(3) == 9" in test
+
+
+def test_quality_report_formatter_aggregate_math() -> None:
+    import cambium.bench as bench
+
+    records = [
+        {
+            "task_id": "quality-square-1",
+            "prompt": "implement square()",
+            "exit_code": 0,
+            "status": "succeeded",
+            "merge_sha": "abc123",
+            "wall_s": 12.4,
+        },
+        {
+            "task_id": "quality-square-2",
+            "prompt": "fix the failing test",
+            "exit_code": 0,
+            "status": "succeeded",
+            "merge_sha": "def456",
+            "wall_s": 9.8,
+        },
+        {
+            "task_id": "quality-square-3",
+            "prompt": "complete the TODO",
+            "exit_code": 1,
+            "status": "failed",
+            "merge_sha": None,
+            "wall_s": 14.7,
+        },
+    ]
+    report = bench.format_quality_report(records)
+    lines = report.splitlines()
+    assert len(lines) == 4
+    assert lines[0] == (
+        "cambium bench quality: task quality-square-1: "
+        "exit_code=0 status=succeeded merge_sha=abc123 wall_s=12.4"
+    )
+    assert lines[1] == (
+        "cambium bench quality: task quality-square-2: "
+        "exit_code=0 status=succeeded merge_sha=def456 wall_s=9.8"
+    )
+    assert lines[2] == (
+        "cambium bench quality: task quality-square-3: "
+        "exit_code=1 status=failed merge_sha=- wall_s=14.7"
+    )
+    assert lines[3] == (
+        "cambium bench quality: success_rate=2/3 pct=66.7 avg_wall_s=12.3"
+    )
+
+
+def test_quality_aggregate_requires_both_exit_code_zero_and_succeeded() -> None:
+    import cambium.bench as bench
+
+    records = [
+        {"exit_code": 0, "status": "failed", "wall_s": 1.0},
+        {"exit_code": 1, "status": "succeeded", "wall_s": 2.0},
+        {"exit_code": 1, "status": "failed", "wall_s": 3.0},
+    ]
+    assert bench.quality_aggregate(records) == {
+        "success_rate": "0/3",
+        "pct": 0.0,
+        "avg_wall_s": 2.0,
+    }
