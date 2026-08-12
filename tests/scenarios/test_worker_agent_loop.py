@@ -71,6 +71,18 @@ class _ScriptedRouter:
         return _FakeCallResult(self.responses.pop(0))
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_env_float_rejects_non_finite_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    default = 17.5
+    monkeypatch.setenv("CAMBIUM_TEST_FLOAT", value)
+
+    result = worker._env_float("CAMBIUM_TEST_FLOAT", default)
+
+    assert result is default
+
+
 def _make_worktree(repo: Path, branch: str = "agent-loop") -> Path:
     repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
@@ -503,6 +515,33 @@ def test_summarize_transcript_large_trimmed_keeps_plan_and_marker(tmp_path: Path
         ["assistant", "user"] * 6
     )
     assert "f7.py" in tail[-2]["content"]
+
+
+def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    (worktree / "large.txt").write_text("x" * 20_000, encoding="utf-8")
+    budget = 5_000
+    config = replace(_agent_config(worktree), max_transcript_chars=budget)
+    read = (
+        '{"type":"tool_call","name":"read_batch","arguments":'
+        '{"paths":["large.txt"]}}'
+    )
+    router = _ScriptedRouter(
+        ['{"type":"plan","steps":["inspect repeatedly","finish"]}']
+        + [read] * 7
+        + ['{"type":"finish","summary":"bounded transcript"}']
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert len(router.prompts) == 9
+    for prompt in router.prompts:
+        transcript = prompt["messages"][1:]
+        if transcript and transcript[-1].get("content") in {"Begin.", "Continue."}:
+            transcript = transcript[:-1]
+        assert worker._transcript_chars(transcript) <= budget
 
 
 # ---------------------------------------------------------------------------

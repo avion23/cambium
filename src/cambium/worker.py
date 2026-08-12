@@ -206,9 +206,10 @@ def _env_float(name: str, default: float) -> float:
     if value is None:
         return default
     try:
-        return float(value)
+        parsed = float(value)
     except ValueError:
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
@@ -218,7 +219,11 @@ async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
 
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
     proc = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, env=scrub_environment()
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=scrub_environment(),
     )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
@@ -232,7 +237,7 @@ def _fenced_git(
     """Run mutating git while continuously enforcing the generation fence."""
     _require_generation(worktree, generation)
     proc = subprocess.Popen(
-        ["git", *args],
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1895,6 +1900,8 @@ def _finalize_worktree(
         status_proc = subprocess.run(
             [
                 "git",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "status",
                 "--porcelain=v1",
                 "--untracked-files=all",
