@@ -165,6 +165,8 @@ MAX_OBSERVATION_BYTES = 64 * 1024
 MAX_CMD_BYTES = 512
 MAX_TRANSCRIPT_CHARS = 120_000
 TRANSCRIPT_KEEP_TURNS = 6
+MAX_ENVELOPE_FIELD_CHARS = 2_000
+MAX_ENVELOPE_ITEMS = 16
 INSPECTION_GIT_OPS = frozenset({"status", "diff", "log"})
 _USAGE_COUNT_FIELDS = frozenset(
     {
@@ -485,6 +487,10 @@ class AgentConfig:
     assigned_provider: str | None = None
     provider_env_keys: tuple[str, ...] = ()
     redactor: Redactor | None = None
+    # Dynamic child admission: the parent's strict-key envelope (summary,
+    # files_changed, commits, ...) rendered as a bounded prompt block so a
+    # child starts from the parent's outcome without inheriting its session.
+    parent_envelope: dict[str, Any] | None = None
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -541,7 +547,34 @@ class AgentConfig:
             ),
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
+            parent_envelope=_bounded_parent_envelope(init.get("parent_envelope")),
         )
+
+
+def _bounded_parent_envelope(value: Any) -> dict[str, Any] | None:
+    """Return a strict-key parent envelope with bounded text fields, or None.
+
+    The supervisor sends the strict ``_ENVELOPE_KEYS`` set; the worker bounds
+    each text field so a malformed or oversized parent payload can never inflate
+    the child prompt. Missing/overlong fields are trimmed, not rejected.
+    """
+    if not isinstance(value, dict):
+        return None
+    bounded: dict[str, Any] = {}
+    for key in ("parent_task_id", "summary", "status"):
+        if isinstance(value.get(key), str):
+            bounded[key] = _cap_utf8(value[key], MAX_ENVELOPE_FIELD_CHARS)
+    for key in ("files_changed", "commits"):
+        if isinstance(value.get(key), list):
+            bounded[key] = [
+                _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
+                if isinstance(item, str)
+                else item
+                for item in value[key][:MAX_ENVELOPE_ITEMS]
+            ]
+    if not bounded:
+        return None
+    return bounded
 
 
 def _merge_task_config(
@@ -569,6 +602,9 @@ def _merge_task_config(
     base_commit = config.base_commit or run.get("base_commit")
     task = config.task if config.task.strip() else str(run.get("task", ""))
     fanout_config = config.fanout_config or _provider_fanout_config(run)
+    parent_envelope = config.parent_envelope or _bounded_parent_envelope(
+        run.get("parent_envelope")
+    )
     return AgentConfig(
         task_id=config.task_id,
         generation=config.generation,
@@ -587,6 +623,7 @@ def _merge_task_config(
         max_transcript_chars=config.max_transcript_chars,
         provider_env_keys=config.provider_env_keys,
         redactor=config.redactor,
+        parent_envelope=parent_envelope,
     )
 
 
@@ -614,6 +651,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         checkpoint_root=None,
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
+        parent_envelope=_bounded_parent_envelope(run.get("parent_envelope")),
     )
 
 
@@ -991,11 +1029,38 @@ def _summarize_transcript(
     return _fit_transcript_to_budget(kept, budget)
 
 
+def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
+    """Render a bounded parent-outcome block appended to the system prompt.
+
+    The block carries the parent's summary, changed files, and commits so a
+    child starts from the parent's outcome without inheriting its session.
+    Fields are already bounded by ``_bounded_parent_envelope``; this renders
+    them as a compact, deterministic text block.
+    """
+    lines = ["Parent task context:"]
+    if isinstance(parent_envelope.get("parent_task_id"), str):
+        lines.append(f"parent: {parent_envelope['parent_task_id']}")
+    summary = parent_envelope.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"parent summary: {summary}")
+    files = parent_envelope.get("files_changed")
+    if isinstance(files, list) and files:
+        lines.append("parent files changed: " + ", ".join(map(str, files)))
+    commits = parent_envelope.get("commits")
+    if isinstance(commits, list) and commits:
+        lines.append("parent commits: " + ", ".join(map(str, commits)))
+    status = parent_envelope.get("status")
+    if isinstance(status, str) and status.strip():
+        lines.append(f"parent status: {status}")
+    return "\n".join(lines)
+
+
 def _build_agent_prompt(
     task: str,
     tools: list[dict[str, Any]],
     transcript: list[dict[str, Any]],
     model_identity: str = "",
+    parent_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     system_lines = [
         "You are Cambium's autonomous coding agent.",
@@ -1034,6 +1099,8 @@ def _build_agent_prompt(
         json.dumps(tools, sort_keys=True),
         f"Task: {task}",
     ])
+    if parent_envelope:
+        system_lines.append(_parent_envelope_lines(parent_envelope))
     messages = [{"role": "system", "content": "\n".join(system_lines)}]
     messages.extend(transcript)
     if not messages or messages[-1].get("role") != "user":
@@ -1523,7 +1590,10 @@ async def _run_agent_loop(
                 )
             _require_generation(worktree, config.generation)
             transcript = _summarize_transcript(transcript, config.max_transcript_chars)
-            prompt = _build_agent_prompt(config.task, tools, transcript, model_identity)
+            prompt = _build_agent_prompt(
+                config.task, tools, transcript, model_identity,
+                parent_envelope=config.parent_envelope,
+            )
             try:
                 result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
             except Exception as exc:

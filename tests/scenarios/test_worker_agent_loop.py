@@ -214,6 +214,52 @@ def test_build_agent_prompt_head_passes_d8c_lint() -> None:
     assert "\nTask: " in head  # dynamic content is the final line, not the head
 
 
+def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
+    """Design C: a child's system prompt carries the parent's summary, changed
+    files, and commits as a compact block after the Task line, never the
+    parent's raw transcript."""
+    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
+    envelope = {
+        "parent_task_id": "parent-1",
+        "summary": "added the token budget",
+        "files_changed": ["src/a.py", "src/b.py"],
+        "commits": ["abc123"],
+        "status": "succeeded",
+    }
+    prompt = worker._build_agent_prompt(
+        "continue the work", tools, [], parent_envelope=envelope
+    )
+    content = prompt["messages"][0]["content"]
+    head, _, tail = content.rpartition("Task: ")
+    assert tail.startswith("continue the work\nParent task context:")
+    assert "parent summary: added the token budget" in content
+    assert "parent files changed: src/a.py, src/b.py" in content
+    assert "parent commits: abc123" in content
+    assert "parent status: succeeded" in content
+
+
+def test_build_agent_prompt_parent_envelope_bounds_oversized_fields() -> None:
+    """A malformed or oversized parent payload is bounded, not rejected, and
+    an empty envelope renders no parent block at all."""
+    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
+    bounded = worker._bounded_parent_envelope(
+        {
+            "summary": "x" * 100_000,
+            "files_changed": [f"f{i}.py" for i in range(1000)],
+            "status": "succeeded",
+        }
+    )
+    assert bounded is not None
+    assert len(bounded["summary"]) <= worker.MAX_ENVELOPE_FIELD_CHARS
+    assert len(bounded["files_changed"]) <= worker.MAX_ENVELOPE_ITEMS
+    assert worker._bounded_parent_envelope("not a dict") is None
+    assert worker._bounded_parent_envelope({"unknown_key": 1}) is None
+    content = worker._build_agent_prompt(
+        "task", tools, [], parent_envelope=None
+    )["messages"][0]["content"]
+    assert "Parent task context:" not in content
+
+
 
 def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
