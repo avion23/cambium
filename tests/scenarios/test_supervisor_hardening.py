@@ -1054,3 +1054,23 @@ def test_oversized_stdout_line_fails_custos_reader(
         event["kind"] == "protocol" and event["payload"].get("note") == "MessageTooLong"
         for event in read_events(session_dir)
     )
+
+
+def test_status_line_is_fence_allows_cache_artifacts() -> None:
+    """Cache/build artifacts (pytest/__pycache__) are fence-equivalent and
+    never block worktree prune or publish; real changes are not."""
+    fence = supervisor_module._status_line_is_fence
+    for line in (
+        "!! .pytest_cache/.gitignore",
+        "!! .pytest_cache/CACHEDIR.TAG",
+        "?? src/__pycache__/x.cpython-312.pyc",
+        "!! .mypy_cache/.gitignore",
+        " M .cambium/generation",
+    ):
+        assert fence(line) is True, line
+    for line in (
+        " M src/calculator.py",
+        "?? tests/new_test.py",
+        " M .gitignore",
+    ):
+        assert fence(line) is False, line

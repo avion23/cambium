@@ -83,7 +83,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from cambium.fencing import next_generation, read_generation, write_generation
+from cambium.fencing import (
+    is_cache_artifact_path,
+    next_generation,
+    read_generation,
+    write_generation,
+)
 from cambium.process_env import build_subprocess_env
 from cambium.provider_config import (
     DEFAULT_PROVIDER_PATH,
@@ -304,11 +309,14 @@ _TIMEOUT_PHASES = ("ready", "wall", "heartbeat", "pong", "stdin")
 
 
 def _status_line_is_fence(line: str) -> bool:
-    """Whether a porcelain status line only touches the supervisor's fence dir."""
+    """Whether a porcelain status line only touches the supervisor's fence dir
+    or an incidental cache/build artifact of the agent's tool use."""
     if len(line) < 4 or line[2] != " ":
         return False
     path = line[3:].strip()
-    return path == ".cambium" or path.startswith(".cambium/")
+    if path == ".cambium" or path.startswith(".cambium/"):
+        return True
+    return is_cache_artifact_path(path)
 
 
 def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) -> float:

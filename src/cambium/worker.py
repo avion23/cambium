@@ -132,7 +132,7 @@ from cambium.diffundo import (
     ProviderTier,
     prompt_prefix_bytes,
 )
-from cambium.fencing import validate_worker_generation
+from cambium.fencing import is_cache_artifact_path, validate_worker_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
@@ -183,15 +183,9 @@ _DIFFUNDO_OPTIONS = frozenset(
         "breaker_window_size",
         "breaker_failure_threshold",
         "open_backoff_base",
-        "retry_base_delay_s",
-    }
-)
-# Paths (matched by first component) that are incidental build/cache
-# artifacts of the agent's tool use and are never intentional changes.
-CACHE_ARTIFACT_COMPONENTS = frozenset({
-    ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", ".tox",
-    ".coverage", ".cache", ".venv", ".mise", ".python-version",
-})
+         "retry_base_delay_s",
+     }
+ )
 
 logger = logging.getLogger(__name__)
 
@@ -1779,8 +1773,7 @@ def _finalize_worktree(
             if not path or path == ".cambium" or path.startswith(".cambium/"):
                 continue
             if (
-                path.endswith(".pyc")
-                or path.split("/", 1)[0] in CACHE_ARTIFACT_COMPONENTS
+                is_cache_artifact_path(path)
             ):
                 continue
             if line[:2] == "!!":

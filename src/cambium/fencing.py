@@ -18,6 +18,20 @@ except ImportError:  # pragma: no cover - exercised on Windows
 
 FENCE_FILE = ".cambium/generation"
 
+# Paths (matched by first component) that are incidental build/cache
+# artifacts of the agent's tool use and are never intentional changes.
+CACHE_ARTIFACT_COMPONENTS = frozenset({
+    ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", ".tox",
+    ".coverage", ".cache", ".venv", ".mise", ".python-version",
+})
+
+
+def is_cache_artifact_path(path: str) -> bool:
+    """Whether a porcelain status path is an incidental cache/build artifact."""
+    if path.endswith(".pyc"):
+        return True
+    return path.split("/", 1)[0] in CACHE_ARTIFACT_COMPONENTS
+
 
 def read_generation(worktree: Path) -> int:
     """Return the worktree's generation, or ``0`` when the fence is invalid."""
