@@ -10,9 +10,12 @@ document. It covers only the implemented workflows, not targets.
 
 `cambium.cli.main` is the single entry point. The parser exposes the fixed
 command set `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
-`module-test`, `version`, `run`, `repl`, `tui`, `session` (`session` further
-requires `list`, `latest`, or `show`). The CLI runs directly from source with
-the system interpreter:
+`module-test`, `version`, `run`, `repl`, `tui`, `session`, `architectus`
+(`session` further requires `list`, `latest`, or `show`; `architectus` runs
+one live or scripted Architectus decision session with
+`--dry-run`/`--scripted`, `--provider`, `--tier`, `--waves N`, and
+`--task TASK`). The CLI runs directly from source with the system
+interpreter:
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli --help
@@ -58,8 +61,9 @@ Options:
 - `--max-wall-s SECONDS` — per-task wall-clock budget in seconds (default
   `300`, matching `cambium run --help` at this commit).
 - `--max-tokens N` — total token budget across the run (default `200000`).
-- `--max-turns N` — maximum agent-loop turns (default `20` at this commit;
-  `cambium run --help` reports the same).
+- `--max-turns N` — maximum agent-loop turns (default `50` from
+  `oneshot.DEFAULT_MAX_TURNS`; `cambium run --help` still prints `20`, a stale
+  help string).
 - `--json` — print the rendered result as JSON instead of the text line.
 
 Pipeline (`oneshot.run_oneshot`): preflight the repo and prompt, resolve the
@@ -180,10 +184,23 @@ resolve against the current directory. The target repository's
 the trusted user config, and a repo-local provider file is not implicitly
 trusted. `CAMBIUM_PROVIDERS` and the library `provider_config_path` are the
 intentional overrides. The file is one JSON
-object with a `providers` list; each entry has the required fields `name`,
-`tier` (`fast|balanced|strong|reasoning`), `base_url` (http(s); plaintext http
-only for loopback hosts), and `api_key_env` — which must equal the derived
-canonical name `CAMBIUM_PROVIDER_<PROVIDER>_API_KEY`. Unknown fields,
+object with a `providers` list; each entry carries the required fields `name`,
+`tier` (`fast|balanced|strong|reasoning`), and the tagged
+`auth`/`protocol` mode. A legacy `auth: "api_key"` + `protocol:
+"chat_completions"` entry (the default mode) requires `base_url` (http(s);
+plaintext http only for loopback hosts) and `api_key_env`, which must equal
+the derived canonical name `CAMBIUM_PROVIDER_<PROVIDER>_API_KEY`. An
+`auth: "codex_chatgpt"` entry is pinned to the `CODEX_CHATGPT_PROFILE`
+module constants and must use `protocol: "codex_responses"`; it must not
+carry `base_url` or `api_key_env`, and optional `reasoning_effort` rides the
+request body. The complete field set is `name`, `tier`, `base_url`,
+`api_key_env`, `auth`, `protocol`, `model`, `priority`, `enabled`,
+`required` (doctor metadata: a missing key is a warning unless `true`),
+`timeout_s` (default `30.0`), `max_retries` (default `2`), `rpm` (default
+`60`), `cooldown_s` (default `60.0`), `price` (default `0.0`),
+`token_window_allowance` (default `0.0`, admission-balancing window),
+`context_window` (default `0`, declared token capacity for
+`min_context_window` tasks), and `reasoning_effort`. Unknown fields,
 duplicate names, colliding env names, and invalid values are rejected by
 `provider_config.load_providers`. The file contains environment-variable
 names only, never key values.

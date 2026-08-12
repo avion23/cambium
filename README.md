@@ -20,6 +20,10 @@ The entry point (`src/cambium/cli.py`) dispatches these commands:
   `.cambium/result.json` and `.cambium/events.db` artifacts.
 - `supervisor --session-dir DIR` — run one supervisor session from a plan, a
   task spec, or the built-in deterministic demo.
+- `architectus [--dry-run|--scripted] [--provider PROVIDER] [--tier TIER]
+  [--waves N] [--task TASK]` — run one live or scripted Architectus decision
+  session: build one fixture TaskTree, run one or more decision waves through
+  the pure core, and print the resulting action intents.
 - `auth set|remove PROVIDER` — manage stored provider credentials; `set` reads
   the key from stdin with `--stdin`. `auth list` prints configured providers;
   `auth oauth [PROVIDER]` manages one provider's Codex OAuth session; `auth

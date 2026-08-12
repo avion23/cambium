@@ -229,7 +229,7 @@ Architectus integration test yet.
 The module conformance command is:
 
 ```console
-PYTHONPATH=src uv run --python 3.14 python -m cambium.cli module-test example
+PYTHONPATH=src python3.14 -m cambium.cli module-test example
 ```
 
 It validates tracked layout, manifest, dataset and baseline schema/digests,
@@ -244,7 +244,7 @@ architecture, and freeze metadata.
 The historical verification command for the colocated suite is:
 
 ```console
-uv run --python 3.14.7 --extra test pytest src/cambium/modules/example/tests -v
+python3.14 -m pytest src/cambium/modules/example/tests -v
 ```
 
 The committed baseline records Python `3.14.7`, pytest `9.1.1`, metric means
