@@ -124,7 +124,7 @@ from .routing import (
     select_lane,
     validate_requirements,
 )
-from .store import CRITICAL_KINDS, EventStore
+from .store import CRITICAL_KINDS, EventStore, read_events_file
 from .tasktree import (
     _ENVELOPE_KEYS,
     MAX_WIDTH,
@@ -321,9 +321,12 @@ def _status_line_is_fence(line: str) -> bool:
 
 def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) -> float:
     spec_value = task_spec.get(key)
-    if spec_value is not None:
-        return float(spec_value)
-    return float(os.environ.get(env, default))
+    value = spec_value if spec_value is not None else os.environ.get(env, default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid {key}: {value!r}") from None
+    return parsed if math.isfinite(parsed) else default
 
 
 def _warm_pool_size() -> int:
@@ -891,11 +894,7 @@ def _session_redactor(
 
 def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
     """Replay the session's durable event log from ``after_seq`` (arch §6.3)."""
-    store = EventStore(Path(session_dir) / ".cambium" / "events.db")
-    try:
-        return store.events_after(after_seq)
-    finally:
-        store.close()
+    return read_events_file(Path(session_dir) / ".cambium" / "events.db", after_seq)
 
 
 def _open_store(session_dir: Path, *, redactor: Redactor | None = None) -> EventStore:

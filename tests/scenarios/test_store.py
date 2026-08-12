@@ -32,6 +32,7 @@ from cambium.store import (
     StoreError,
     StoreInitError,
     StoreTimeout,
+    read_events_file,
 )
 
 
@@ -161,6 +162,40 @@ def test_events_after_returns_only_newer_ordered(tmp_path) -> None:
         assert store.events_after(6) == []
     finally:
         store.close()
+
+
+def test_read_events_file_is_noncreating_read_only_observer(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "existing" / "events.db"
+    store = _open(path)
+    try:
+        store.append({"kind": "result", "payload": {"done": True}})
+    finally:
+        store.close()
+
+    def fail_side_effect(*args, **kwargs):
+        raise AssertionError("read-only event replay caused a writer-side effect")
+
+    monkeypatch.setattr(store_module.os, "chmod", fail_side_effect)
+    monkeypatch.setattr(store_module.Path, "mkdir", fail_side_effect)
+    monkeypatch.setattr(store_module.threading.Thread, "start", fail_side_effect)
+
+    assert read_events_file(path, 0) == [{
+        "seq": 1,
+        "kind": "result",
+        "payload": {"done": True},
+        "ts": None,
+        "monotonic_ms": None,
+        "task_id": None,
+        "worker_id": None,
+        "generation": None,
+        "request_id": None,
+    }]
+
+    missing = tmp_path / "missing" / "events.db"
+    assert read_events_file(missing, 0) == []
+    assert not missing.parent.exists()
 
 
 def test_close_drains_pending_appends(tmp_path) -> None:
