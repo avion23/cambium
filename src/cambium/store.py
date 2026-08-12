@@ -129,6 +129,20 @@ _SENTINEL = object()
 _TIMER = object()
 
 
+def read_events_file(db_path: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
+    """Read durable events without creating or modifying store state."""
+    path = Path(db_path)
+    if not path.is_file():
+        return []
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        rows = conn.execute(_SELECT_AFTER, (after_seq,)).fetchall()
+    finally:
+        conn.close()
+    return [EventStore._row_to_event(row) for row in rows]
+
+
 def _make_private_dir(path: Path) -> None:
     """Ensure a session-owned directory is not readable by other local users."""
     try:
