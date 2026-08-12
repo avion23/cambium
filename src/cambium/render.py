@@ -1,6 +1,6 @@
 """Pure renderers for Cambium results, events, and usage stats lines.
 
-The four public functions are side-effect free and deterministic.  They
+The seven public functions are side-effect free and deterministic.  They
 accept the canonical ``cambium.results.Result``, the supervisor result
 dataclasses (``TaskResult``, ``SliceResult``, ``PlanResult``), or a
 JSON-like mapping holding one of those records.  Untyped mappings are
@@ -294,9 +294,105 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     return f"{prefix}  {_dumps(payload)}"
 
 
+_WORKER_ACTIVE_INC = frozenset({"spawned"})
+_WORKER_ACTIVE_DEC = frozenset({"exit", "reuse_ready", "worker_failed"})
+
+
+def render_tokens_per_s(events: Any) -> str:
+    """Render tokens/second throughput from the latest usable ``usage_event``.
+
+    ``events`` is a sequence of already-redacted event records (mappings with
+    at least ``kind`` and ``payload`` keys).  For every ``usage_event`` whose
+    payload ``latency_s`` is a positive finite number, the rate is that
+    event's ``payload.usage.total_tokens`` divided by its ``latency_s``; the
+    LATEST such rate is returned as ``"tokens/s=12.3"`` with one decimal.
+    The guard is applied per event, so a single usage_event is handled
+    identically: its own ``total_tokens`` and ``latency_s`` define the rate.
+    Events with a missing, non-numeric, or non-finite ``total_tokens``, or
+    with a missing, zero, negative, or non-finite ``latency_s``, are skipped.
+    Returns ``""`` when no usable usage_event exists.
+    """
+    rate: float | None = None
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        if event.get("kind") != "usage_event":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        latency_s = payload.get("latency_s")
+        if isinstance(latency_s, bool) or not isinstance(latency_s, (int, float)):
+            continue
+        if not math.isfinite(latency_s) or latency_s <= 0:
+            continue
+        usage = payload.get("usage")
+        if not isinstance(usage, Mapping):
+            continue
+        total_tokens = usage.get("total_tokens")
+        if isinstance(total_tokens, bool) or not isinstance(total_tokens, (int, float)):
+            continue
+        if not math.isfinite(total_tokens):
+            continue
+        rate = float(total_tokens) / float(latency_s)
+    if rate is None:
+        return ""
+    return f"tokens/s={rate:.1f}"
+
+
+def render_active_workers(events: Any) -> str:
+    """Render the count of concurrently-active worker processes.
+
+    ``events`` is a sequence of already-redacted event records (mappings with
+    at least ``kind`` and ``payload`` keys).  A running count starts at 0 and
+    is clamped at 0 (never negative).  Each ``spawned`` event increments the
+    count by one: it announces that a worker process was launched.  A
+    ``ready`` event marks that the same process reached its ready state and
+    does not change the count (the process was already counted at
+    ``spawned``).  Each ``exit``, ``reuse_ready``, or ``worker_failed`` event
+    decrements the count by one: a worker that exits, is recycled into the
+    idle pool, or fails is no longer actively running one task.  Returns
+    ``"subagents=3"`` when the count is nonzero, else ``""``.
+    """
+    count = 0
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        kind = event.get("kind")
+        if kind in _WORKER_ACTIVE_INC:
+            count += 1
+        elif kind in _WORKER_ACTIVE_DEC:
+            count = max(0, count - 1)
+    if count == 0:
+        return ""
+    return f"subagents={count}"
+
+
+def render_live_status_line(events: Any) -> str:
+    """Render the tokens/s and active-worker counts as one live line.
+
+    ``events`` is a sequence of already-redacted event records (see
+    ``render_tokens_per_s``).  The non-empty parts from
+    ``render_tokens_per_s`` and ``render_active_workers`` are joined with
+    ``" · "`` and prefixed with ``"live: "``.  Returns ``""`` when both parts
+    are empty.
+    """
+    parts = [
+        part
+        for part in (render_tokens_per_s(events), render_active_workers(events))
+        if part
+    ]
+    if not parts:
+        return ""
+    return "live: " + " · ".join(parts)
+
+
 __all__ = [
+    "render_active_workers",
     "render_event_line",
     "render_json_result",
+    "render_live_status_line",
     "render_text_result",
+    "render_tokens_per_s",
     "render_usage_stats_line",
 ]

@@ -34,7 +34,7 @@ def _history_entries(content: str) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _fake_oneshot(monkeypatch) -> None:
-    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
+    async def fake_run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         return _plan_result()
 
     monkeypatch.setattr(oneshot, "run_oneshot", fake_run)

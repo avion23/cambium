@@ -53,7 +53,7 @@ def _no_change_result() -> PlanResult:
 
 
 def test_no_change_completion_returns_success_across_user_interfaces(monkeypatch, tmp_path):
-    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+    async def run(_config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         return _no_change_result()
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
@@ -77,7 +77,7 @@ def test_no_change_completion_returns_success_across_user_interfaces(monkeypatch
 
 
 def test_tui_backend_exception_then_eof_returns_failure(monkeypatch, tmp_path):
-    async def run(_config: oneshot.OneShotConfig):
+    async def run(_config: oneshot.OneShotConfig, on_event=None):
         raise RuntimeError("backend unavailable")
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
@@ -96,7 +96,7 @@ def test_tui_backend_exception_then_eof_returns_failure(monkeypatch, tmp_path):
 
 
 def test_repl_backend_exception_flushes_and_returns_failure(monkeypatch, tmp_path):
-    async def run(config: oneshot.OneShotConfig) -> PlanResult:
+    async def run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         if config.prompt == "bad":
             raise RuntimeError("backend unavailable")
         return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
@@ -178,7 +178,7 @@ def test_cli_session_show_renderer_failure_is_clean(capsys, tmp_path):
 
 
 def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
-    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+    async def run(_config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         return _succeeded_run(_config)
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
@@ -226,7 +226,7 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
 
 
 def test_tui_without_usage_events_prints_no_stats_line(monkeypatch, tmp_path):
-    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+    async def run(_config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         return _succeeded_run(_config)
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
@@ -247,7 +247,7 @@ def test_tui_without_usage_events_prints_no_stats_line(monkeypatch, tmp_path):
 
 
 def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
-    async def run(_config: oneshot.OneShotConfig) -> PlanResult:
+    async def run(_config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         return _succeeded_run(_config)
 
     def _fail_stats(_session_dir):
