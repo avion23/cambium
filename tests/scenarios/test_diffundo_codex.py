@@ -38,6 +38,8 @@ from cambium.diffundo import (
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
+    _codex_input_item,
+    _codex_request_body,
 )
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +402,56 @@ def test_codex_reasoning_effort_absent_omits_reasoning_field() -> None:
         }
     finally:
         server.close()
+
+
+def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
+    """D8c: the same prompt serializes to the same request bytes every call —
+    fixed field order, no per-call timestamps or ids — so the body head cannot
+    churn a provider's exact-prefix cache key."""
+    config = _codex_config(None)
+    first = _codex_request_body(config, TOOL_PROMPT)
+    second = _codex_request_body(config, TOOL_PROMPT)
+    assert json.dumps(first) == json.dumps(second)
+    # fixed insertion order: model, input, store, stream, then tools, then
+    # tool_choice, then reasoning
+    assert list(first.keys()) == [
+        "model", "input", "store", "stream", "tools", "tool_choice", "reasoning",
+    ]
+
+
+def test_codex_body_leading_developer_item_is_byte_stable_as_transcript_grows() -> None:
+    """The leading system message converts to a byte-identical developer item
+    on every turn of a tool loop; only the trailing input items grow."""
+    config = _codex_config(None)
+    system = "You are Cambium's autonomous coding agent.\nReturn exactly one JSON object."
+    prompt_turn1 = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Begin."},
+        ]
+    }
+    prompt_turn4 = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Begin."},
+            {"role": "assistant", "content": '{"type": "plan", "steps": ["read", "edit"]}'},
+            {"role": "user", "content": "tool read_batch ok=true"},
+            {"role": "assistant", "content": '{"type": "tool_call", "name": "write_file"}'},
+            {"role": "user", "content": "tool write_file ok=true"},
+            {"role": "assistant", "content": '{"type": "finish", "summary": "done"}'},
+            {"role": "user", "content": "Continue."},
+        ]
+    }
+    body1 = _codex_request_body(config, prompt_turn1)
+    body4 = _codex_request_body(config, prompt_turn4)
+    assert body1["input"][0] == body4["input"][0]
+    assert body1["input"][0] == {
+        "role": "developer",
+        "content": [{"type": "input_text", "text": system}],
+    }
+    assert _codex_input_item(prompt_turn1["messages"][0]) == body1["input"][0]
+    # the head serialization is byte-identical across the growing transcript
+    assert json.dumps(body1["input"][0]) == json.dumps(body4["input"][0])
 
 
 # --------------------------------------------------------------------------- #
