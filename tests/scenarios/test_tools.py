@@ -276,6 +276,32 @@ def test_write_file_rejects_path_escape(tmp_path: Path) -> None:
     assert "escapes worktree" in (result.error or "")
 
 
+def test_write_file_rejects_symlink_swapped_parent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    parent = tmp_path / "parent"
+    outside = tmp_path / "outside"
+    parent.mkdir()
+    outside.mkdir()
+    original_confined_path = tools._confined_path
+
+    def swap_after_validation(ctx: ToolContext, raw_path: str) -> Path:
+        path = original_confined_path(ctx, raw_path)
+        parent.rmdir()
+        parent.symlink_to(outside, target_is_directory=True)
+        return path
+
+    monkeypatch.setattr(tools, "_confined_path", swap_after_validation)
+    result = _run(
+        "write_file",
+        {"path": "parent/escaped.txt", "content": "no"},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert not (outside / "escaped.txt").exists()
+
+
 def test_edit_file_requires_exactly_one_occurrence(tmp_path: Path) -> None:
     path = tmp_path / "edit.txt"
     path.write_text("one\none\n", encoding="utf-8")
@@ -337,6 +363,27 @@ def test_grep_code_falls_back_to_stdlib_regex(tmp_path: Path, monkeypatch) -> No
 
     assert result.ok
     assert "sample.py:2:needle here" in result.output
+
+
+def test_grep_code_timeout_falls_back_to_stdlib_regex(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "sample.py").write_text("needle here\n", encoding="utf-8")
+    monkeypatch.setattr(tools.shutil, "which", lambda _name: "/fake/rg")
+
+    def timed_out(*args, **kwargs):
+        assert kwargs["timeout"] == tools.GREP_TIMEOUT_S
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(tools.subprocess, "run", timed_out)
+    result = _run(
+        "grep_code",
+        {"pattern": "needle", "path": None},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    assert "sample.py:1:needle here" in result.output
 
 
 def test_grep_code_rejects_path_escape(tmp_path: Path) -> None:
@@ -597,6 +644,52 @@ def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     assert result.ok
     assert "[output truncated]" in result.output
     assert len(result.output.encode()) <= MAX_OUTPUT_BYTES
+
+
+@pytest.mark.slow  # real subprocess tree and timeout
+def test_run_shell_timeout_kills_background_grandchild(tmp_path: Path) -> None:
+    pid_file = tmp_path / "grandchild.pid"
+    script = (
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    pid = os.fork()\n"
+        "    if pid == 0:\n"
+        "        open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "        time.sleep(60)\n"
+        "    os._exit(0)\n"
+        "os.waitpid(pid, 0)\n"
+        "time.sleep(60)\n"
+    )
+    result = _run(
+        "run_shell",
+        {"cmd": [sys.executable, "-c", script, str(pid_file)], "timeout_s": 1},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert "timed out" in (result.error or "")
+    grandchild_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
+
+
+@pytest.mark.slow  # python linter subprocess and bounded timeout
+def test_write_file_reports_lint_timeout(tmp_path: Path) -> None:
+    from cambium.lint_diag import LintDiag
+
+    lint = LintDiag(
+        lint_cmd=[sys.executable, "-c", "import time; time.sleep(60)"],
+        timeout_s=0.1,
+    )
+    result = _run(
+        "write_file",
+        {"path": "new.py", "content": "ok\n"},
+        ToolContext(tmp_path, lint=lint),
+    )
+
+    assert result.ok
+    assert "lint-timeout lint timed out after 0.1s" in result.output
 
 
 @pytest.mark.slow  # python interpreter spawn; asserts subprocess execution

@@ -12,11 +12,12 @@ import json
 import keyword
 import os
 import re
+import secrets
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
-import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future
@@ -36,6 +37,7 @@ MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
 GET_SIGNATURE_READ_TIMEOUT_S = 1.0
+GREP_TIMEOUT_S = 10
 BATCH_READ_MAX_CONCURRENCY = 4
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
@@ -279,37 +281,93 @@ def _display_path(ctx: ToolContext, path: Path) -> str:
     return relative.as_posix() or "."
 
 
-def _read_text(path: Path) -> str:
+def _read_text(ctx: ToolContext, path: Path) -> str:
+    descriptor: int | None = None
     try:
-        return path.read_text(encoding="utf-8")
+        descriptor = _open_confined_read_fd(ctx, path)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = None
+            return handle.read()
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {path}") from exc
     except IsADirectoryError as exc:
         raise _ToolFailure(f"path is a directory: {path}") from exc
     except UnicodeDecodeError as exc:
         raise _ToolFailure(f"file is not valid UTF-8: {path}") from exc
+    except OSError as exc:
+        raise _ToolFailure(f"could not read {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
+def _open_confined_parent_fd(ctx: ToolContext, path: Path) -> tuple[int, str]:
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        temporary_path = Path(temporary_name)
+        components = path.relative_to(ctx._root).parts
+    except ValueError as exc:
+        raise _ToolFailure(f"path escapes worktree: {path!r}") from exc
+    if not components:
+        raise IsADirectoryError(path)
+
+    root_fd = ctx._root_fd
+    if root_fd is None:
+        raise _ToolFailure("worktree context is closed")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directory_fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            try:
+                next_directory_fd = os.open(component, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                next_directory_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_directory_fd
+        return directory_fd, components[-1]
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _atomic_write(ctx: ToolContext, path: Path, content: str) -> None:
+    directory_fd, filename = _open_confined_parent_fd(ctx, path)
+    temporary_name: str | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        while True:
+            candidate = f".{filename}.{secrets.token_hex(8)}.tmp"
+            try:
+                descriptor = os.open(candidate, flags, 0o600, dir_fd=directory_fd)
+                temporary_name = candidate
+                break
+            except FileExistsError:
+                continue
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        temporary_path = None
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
     finally:
-        if temporary_path is not None:
+        if temporary_name is not None:
             try:
-                temporary_path.unlink()
+                os.unlink(temporary_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
+        os.close(directory_fd)
 
 
 def _read_file_sync(ctx: ToolContext, path: Path, display_path: str) -> _Outcome:
@@ -361,12 +419,12 @@ def _lint_feedback(ctx: ToolContext, path: Path) -> str:
 async def _write_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     path = _confined_path(ctx, args["path"])
     try:
-        _atomic_write(path, args["content"])
+        await asyncio.to_thread(_atomic_write, ctx, path, args["content"])
     except OSError as exc:
         raise _ToolFailure(f"could not write {_display_path(ctx, path)}: {exc}") from exc
 
     output = f"wrote {_display_path(ctx, path)}"
-    feedback = _lint_feedback(ctx, path)
+    feedback = await asyncio.to_thread(_lint_feedback, ctx, path)
     if feedback:
         output += f"\nLint diagnostics:\n{feedback}"
     return _Outcome(ok=True, output=output)
@@ -384,7 +442,7 @@ def _edit_context(content: str, old_string: str) -> str:
 
 async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     path = _confined_path(ctx, args["path"])
-    content = _read_text(path)
+    content = await asyncio.to_thread(_read_text, ctx, path)
     old_string = args["old_string"]
     occurrences = content.count(old_string)
     if occurrences != 1:
@@ -396,10 +454,14 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
     replacement = content.replace(old_string, args["new_string"], 1)
     try:
-        _atomic_write(path, replacement)
+        await asyncio.to_thread(_atomic_write, ctx, path, replacement)
     except OSError as exc:
         raise _ToolFailure(f"could not edit {_display_path(ctx, path)}: {exc}") from exc
-    return _Outcome(ok=True, output=f"edited {_display_path(ctx, path)}")
+    output = f"edited {_display_path(ctx, path)}"
+    feedback = await asyncio.to_thread(_lint_feedback, ctx, path)
+    if feedback:
+        output += f"\nLint diagnostics:\n{feedback}"
+    return _Outcome(ok=True, output=output)
 
 
 def _search_files(root: Path) -> list[Path]:
@@ -466,8 +528,9 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
             capture_output=True,
             text=True,
             check=False,
+            timeout=GREP_TIMEOUT_S,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         output = await asyncio.to_thread(_grep_fallback, args["pattern"], root, Path(ctx.cwd))
         return _Outcome(ok=True, output=output)
     except OSError as exc:
@@ -574,15 +637,33 @@ def _process_output(stdout: Any, stderr: Any) -> str:
 async def _run_process(
     command: list[str], cwd: Path, timeout_s: int
 ) -> subprocess.CompletedProcess[str]:
-    return await asyncio.to_thread(
-        subprocess.run,
-        command,
+    process = await asyncio.create_subprocess_exec(
+        *command,
         cwd=cwd,
         env=scrub_environment(),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_s,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = await process.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise subprocess.TimeoutExpired(
+            command, timeout_s, output=stdout.decode(errors="replace"),
+            stderr=stderr.decode(errors="replace")
+        ) from exc
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
     )
 
 
