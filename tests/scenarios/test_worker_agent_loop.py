@@ -136,7 +136,7 @@ async def _drive_loop(
 
 def test_build_agent_prompt_last_message_is_always_user() -> None:
     """Payloads must not end on a system/assistant message (ZAI/GLM 1214)."""
-    prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_file"}], [])
+    prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], [])
     messages = prompt["messages"]
     assert messages[0]["role"] == "system"
     assert messages[-1]["role"] == "user"
@@ -146,7 +146,7 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
         {"role": "user", "content": "Begin."},
         {"role": "assistant", "content": "{\"type\": \"plan\", \"steps\": []}"},
     ]
-    prompt2 = worker._build_agent_prompt("edit a.txt", [{"name": "read_file"}], plan_transcript)
+    prompt2 = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], plan_transcript)
     assert prompt2["messages"][-1]["role"] == "user"
     assert prompt2["messages"][-1]["content"] == "Continue."
     # The static system prefix is unchanged across transcripts.
@@ -191,6 +191,17 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     assert "read_batch" in tool_names
 
 
+def test_exposed_tool_schemas_offer_batch_reading_only(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = replace(_agent_config(worktree), shell_permission=False)
+
+    tool_names = [schema["name"] for schema in worker._exposed_tool_schemas(config)]
+
+    assert "read_batch" in tool_names
+    assert "read_file" not in tool_names
+
+
 def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
@@ -203,7 +214,8 @@ def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}',
             '{"type":"finish","summary":"tests failed anyway"}',
             '{"type":"finish","summary":"still unverified"}',
-            '{"type":"tool_call","name":"read_file","arguments":{"path":"note.txt"}}',
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["note.txt"]}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
             '{"type":"finish","summary":"verified"}',
         ]
@@ -284,9 +296,9 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         '{"type":"plan","steps":["a"],"thought":"reasoning"}'
     ) == {"type": "plan", "steps": ["a"]}
     assert worker._parse_agent_action(
-        '{"type":"tool_call","name":"read_file","arguments":{"path":"a.py"},'
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]},'
         '"thought":"need context"}'
-    ) == {"type": "tool_call", "name": "read_file", "arguments": {"path": "a.py"}}
+    ) == {"type": "tool_call", "name": "read_batch", "arguments": {"paths": ["a.py"]}}
     assert worker._parse_agent_action(
         '{"type":"finish","summary":"done","thought":"verified"}'
     ) == {"type": "finish", "summary": "done"}
@@ -295,11 +307,11 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     # surfaced via _action_trailing.
     assert worker._parse_agent_action(
         '{"type":"finish","summary":"done"}'
-        '{"type":"tool_call","name":"read_file","arguments":{"path":"a.py"}}'
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
     ) == {"type": "finish", "summary": "done"}
     assert worker._action_trailing(
         '{"type":"finish","summary":"done"}'
-        '{"type":"tool_call","name":"read_file","arguments":{"path":"a.py"}}'
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
     ).startswith('{"type":"tool_call"')
     assert worker._action_trailing('{"type":"plan","steps":["a"]}') == ""
     assert worker._action_trailing('{"type":"plan"') == ""
@@ -309,7 +321,7 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         '{"type":"plan","steps":[]}',
         '{"type":"plan","steps":["ok", 3]}',
         '{"type":"plan","steps":["ok"],"extra":1}',
-        '{"type":"tool_call","name":"read_file","arguments":{},"extra":1}',
+        '{"type":"tool_call","name":"read_batch","arguments":{},"extra":1}',
         '{"type":"finish","summary":"done","extra":1}',
     ):
         with pytest.raises(ValueError):
@@ -332,8 +344,8 @@ def test_summarize_transcript_large_trimmed_keeps_plan_and_marker(tmp_path: Path
             {
                 "role": "assistant",
                 "content": (
-                    '{"type":"tool_call","name":"read_file",'
-                    f'"arguments":{{"path":"f{index}.py"}}}}'
+                    '{"type":"tool_call","name":"read_batch",'
+                    f'"arguments":{{"paths":["f{index}.py"]}}}}'
                 ),
             }
         )
@@ -485,7 +497,7 @@ def test_plan_then_tool_resets_consecutive_plan_counter(tmp_path: Path) -> None:
         [
             '{"type":"plan","steps":["read alpha"]}',
             '{"type":"plan","steps":["read alpha again"]}',
-            '{"type":"tool_call","name":"read_file","arguments":{"path":"alpha.txt"}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"plan","steps":["one more plan before finishing"]}',
             '{"type":"finish","summary":"read the file"}',
         ]

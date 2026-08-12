@@ -119,14 +119,6 @@ def _parameters(properties: dict[str, dict[str, Any]], required: list[str]) -> d
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
-        "name": "read_file",
-        "description": "Read a UTF-8 text file inside the worker worktree.",
-        "parameters": _parameters(
-            {"path": {"type": "string", "description": "Path to the file."}},
-            ["path"],
-        ),
-    },
-    {
         "name": "write_file",
         "description": "Write UTF-8 text content to a file inside the worker worktree.",
         "parameters": _parameters(
@@ -220,7 +212,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "read_batch",
         "description": (
             "Read multiple UTF-8 text files inside the worker worktree in one call. "
-            "Prefer this over several read_file calls when related files are needed."
+            "Reading files individually is not available; batch reads are the only "
+            "way to read files."
         ),
         "parameters": _parameters(
             {

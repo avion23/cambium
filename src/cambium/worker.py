@@ -987,7 +987,8 @@ def _build_agent_prompt(
         "Your FIRST action must be a short plan: list the concrete steps before any "
         "tool_call.",
         "Approach:",
-        "- Prefer the batch read tool (read_batch) to read related files in one call.",
+        "- Reading uses only the batch read tool (read_batch); individual file "
+        "reads are unavailable, so read all needed files in one batch call.",
         "- Read the relevant files before editing; verify each change before moving on.",
         "- If a tool call fails, diagnose the error and retry with a corrected call.",
         "- When the task changes code, run the relevant tests via run_shell; only emit "

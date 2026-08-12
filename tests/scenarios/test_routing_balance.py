@@ -694,8 +694,8 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
             (
                 200,
                 _ok_payload(
-                    '{"type":"tool_call","name":"read_file",'
-                    '"arguments":{"path":"target.txt"}}',
+                    '{"type":"tool_call","name":"read_batch",'
+                    '"arguments":{"paths":["target.txt"]}}',
                     model="m1",
                 ),
                 0.0,
