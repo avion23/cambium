@@ -735,7 +735,8 @@ def scrub_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
     return {
         name: value
         for name, value in source.items()
-        if not name.startswith("CAMBIUM_PROVIDER_") and not _CREDENTIAL_NAME_RE.search(name)
+        if not name.startswith(("CAMBIUM_PROVIDER_", "CAMBIUM_OAUTH_"))
+        and not _CREDENTIAL_NAME_RE.search(name)
     }
 
 

@@ -526,9 +526,8 @@ def _hook_records(dump: Path) -> list[dict]:
     ]
 
 
-def test_post_checkout_hook_during_staging_sees_no_provider_key(tmp_path, monkeypatch) -> None:
-    """A post-checkout hook run by MergeSequencer git operations (worktree add /
-    checkout) must not see any provider credential in its environment."""
+def test_post_checkout_hook_does_not_run_during_staging(tmp_path, monkeypatch) -> None:
+    """MergeSequencer git operations must disable repository hooks."""
     monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "hook-secret")
     repo = tmp_path / "repo"
     base = _init_repo(repo)
@@ -544,11 +543,7 @@ def test_post_checkout_hook_during_staging_sees_no_provider_key(tmp_path, monkey
     assert staged is not None
     seq.cleanup_staging(repo)
 
-    records = _hook_records(dump)
-    assert records, "the post-checkout hook never ran during staging"
-    for record in records:
-        assert "CAMBIUM_PROVIDER_OPENAI_API_KEY" not in record
-        assert "hook-secret" not in json.dumps(record)
+    assert _hook_records(dump) == []
 
 
 def _quarantined(seq: MergeSequencer) -> tuple[dict, Path]:
@@ -1158,7 +1153,7 @@ def test_sparse_dirty_staging_is_preserved(tmp_path) -> None:
     assert _run(destination, "sparse-checkout", "list").stdout.strip() == "keep"
 
 
-def test_hook_generated_staging_is_quarantined_before_publish(tmp_path) -> None:
+def test_hook_cannot_generate_content_during_staging(tmp_path) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
     _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
@@ -1168,9 +1163,6 @@ def test_hook_generated_staging_is_quarantined_before_publish(tmp_path) -> None:
     staging = tmp_path / "staging"
     seq = MergeSequencer(task_id="hook-generated", session_dir=tmp_path)
     seq.prepare_staging(repo, staging, "worker", "main")
-    with pytest.raises(StagingCleanupError, match="quarantined before publish"):
-        seq.ensure_staging_clean(repo)
-    payload, destination = _quarantined(seq)
-    assert (destination / "hook-secret-name.txt").read_text() == "hook evidence"
-    assert "hook-secret-name" not in repr(payload)
-    assert "hook evidence" not in repr(payload)
+    seq.ensure_staging_clean(repo)
+
+    assert not (staging / "hook-secret-name.txt").exists()

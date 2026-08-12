@@ -360,6 +360,21 @@ def test_launch_environment_scrubs_inherited_credentials() -> None:
     assert "CAMBIUM_PROVIDER_OLD_API_KEY" not in environment
 
 
+def test_scrub_environment_removes_oauth_values_without_mutating_source() -> None:
+    base = {
+        "PATH": "/bin",
+        "CAMBIUM_TASK_ID": "task",
+        "CAMBIUM_OAUTH_ACCESS_CODEX": "live-access-token",
+        "CAMBIUM_OAUTH_ACCOUNT_CODEX": "account-id",
+    }
+
+    environment = auth.scrub_environment(base)
+
+    assert environment == {"PATH": "/bin", "CAMBIUM_TASK_ID": "task"}
+    assert base["CAMBIUM_OAUTH_ACCESS_CODEX"] == "live-access-token"
+    assert base["CAMBIUM_OAUTH_ACCOUNT_CODEX"] == "account-id"
+
+
 def test_supervisor_worker_env_allows_only_declared_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
