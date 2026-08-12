@@ -12,7 +12,7 @@ and cascade-design contracts:
    call -> DISABLED (cascade-design §2.4, first-call included).
 4. token bucket: rpm=1 -> second call cascades (D8f).
 5. all providers exhausted -> pause (bounded) then AllProvidersFailed.
-6. prompt guard: volatile timestamp/request_id in the top 3 lines rejected,
+6. prompt guard: volatile timestamp/request_id in the static head rejected,
    static top accepted (D8c).
 7. no local cache: the instance has no mutable mapping attribute (D1).
 """
@@ -38,6 +38,10 @@ from cambium.diffundo import (
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
+    PromptStructureError,
+    prompt_prefix_bytes,
+    prompt_prefix_estimate_tokens,
+    validate_prompt_structure,
 )
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +225,29 @@ def _config(
 def _set_keys(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
     for name in names:
         monkeypatch.setenv(name, f"sk-test-{name}")
+
+
+def test_prompt_structure_rejects_timestamp_on_line_five() -> None:
+    prompt = {
+        "messages": [
+            {
+                "role": "system",
+                "content": "stable 1\nstable 2\nstable 3\nstable 4\n2026-08-12T10:30:00Z",
+            }
+        ]
+    }
+
+    with pytest.raises(PromptStructureError, match=r"line 5: volatile timestamp token"):
+        validate_prompt_structure(prompt)
+
+
+def test_prompt_prefix_token_estimate_uses_utf8_bytes() -> None:
+    prompt = {"messages": [{"role": "system", "content": "abcé"}]}
+    expected_bytes = len("abcé".encode("utf-8"))
+
+    assert prompt_prefix_bytes(prompt) == expected_bytes
+    assert prompt_prefix_estimate_tokens(prompt) == expected_bytes // 4
+    assert prompt_prefix_estimate_tokens(PROMPT) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -1106,8 +1133,27 @@ def test_usage_metric_fields_follow_provider_reports(tmp_path, monkeypatch) -> N
         expected_prefix = len(STATIC_HEAD["messages"][0]["content"].encode("utf-8"))
         # stable prefix across turns of the same fixed prompt fixture
         assert r1.prompt_prefix_bytes == r2.prompt_prefix_bytes == expected_prefix
+        assert r1.prompt_prefix_tokens_estimate == expected_prefix // 4
+        assert r2.prompt_prefix_tokens_estimate == expected_prefix // 4
         assert r3.prompt_prefix_bytes is None  # no leading system message
+        assert r3.prompt_prefix_tokens_estimate is None
         assert r3.estimated_cost_usd == 0.0  # no usage -> zero cost
         assert r3.request_rate_status == "available"
+    finally:
+        server.close()
+
+
+def test_chat_response_larger_than_provider_cap_is_rejected(monkeypatch) -> None:
+    from cambium.diffundo import MAX_PROVIDER_RESPONSE_BYTES
+
+    oversized = _ok_payload("x" * (MAX_PROVIDER_RESPONSE_BYTES + 1))
+    server = FakeServer([(200, oversized, 0.0)])
+    _set_keys(monkeypatch, "K_OVERSIZED")
+    router = Diffundo((_config("p_oversized", server, "K_OVERSIZED"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert raised.value.last_error is not None
+        assert "response exceeds" in raised.value.last_error.message
     finally:
         server.close()

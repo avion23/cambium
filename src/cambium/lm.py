@@ -855,8 +855,7 @@ class _CambiumLMMixin:
                 model = self._validate_model(requested_model)
             requested_budget = extensions.get("budget_usd")
             if requested_budget is not None:
-                self._validate_budget(requested_budget)
-                budget_usd = float(requested_budget)
+                budget_usd = self._validate_budget(requested_budget)
         return prompt, model, budget_usd
 
     @staticmethod
@@ -871,6 +870,8 @@ class _CambiumLMMixin:
             raise TypeError("budget_usd must be an exact builtin number")
         if type(budget_usd) is float and not math.isfinite(budget_usd):
             raise ValueError("budget_usd must be finite")
+        if budget_usd is not None and budget_usd < 0:
+            raise ValueError("budget_usd must be >= 0")
         return budget_usd
 
     @staticmethod
@@ -926,6 +927,15 @@ class _CambiumLMMixin:
                 "tier": result.tier.value,
                 "latency_s": result.latency_s,
                 "prompt_prefix_bytes": result.prompt_prefix_bytes,
+                **(
+                    {
+                        "prompt_prefix_tokens_estimate": (
+                            result.prompt_prefix_tokens_estimate
+                        )
+                    }
+                    if result.prompt_prefix_tokens_estimate is not None
+                    else {}
+                ),
                 "provider_cache_hit": result.provider_cache_hit,
             },
         )
