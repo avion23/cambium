@@ -30,6 +30,16 @@ only:
   evidence of a local response cache (D1): the router always requests
   ``cache=False`` and ``provider_cache_hit`` records only what the provider
   reports.
+- **Weighted ordering (measured quality).** A ``Diffundo`` may be given a
+  usage-debt snapshot (``ProviderDebt`` counters as folded by
+  ``routing.DebtStore``). Config priority stays the primary cascade ordering
+  key; measured quality — cache-hit rate and mean latency, see
+  ``_debt_quality_score`` — only refines order WITHIN an equal-priority run,
+  so the measured evidence (e.g. codex's 12.5% cache-hit / p50 7.21s latency)
+  moves it below better providers. A provider with no fresh debt scores a
+  neutral weight and keeps its config-priority position instead of being
+  pinned to the bottom permanently. Health states are untouched: the weight
+  affects only ORDER among healthy available providers.
 
 Provider health transitions implemented here are: UNKNOWN -> HEALTHY on first
 success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN (probe) ->
@@ -1043,6 +1053,61 @@ def _codex_config_400(message: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Measured-quality ordering (weighted routing)
+# --------------------------------------------------------------------------- #
+
+# Quality-weight constants for ordering the cascade within an equal-priority
+# run from measured usage debt: a higher cache-hit rate and a lower mean call
+# latency make a provider preferred. A provider with no fresh debt scores a
+# neutral 0.0 (no penalty), so config-priority order applies and a data-less
+# provider is never pinned to the bottom permanently.
+_QUALITY_CACHE_WEIGHT = 0.6
+_QUALITY_LATENCY_WEIGHT = 0.4
+_QUALITY_LATENCY_REFERENCE_S = 30.0
+_QUALITY_MAX_AGE_S = 7 * 24 * 3600  # a week of wall time
+
+
+def _debt_field(entry: Any, name: str, default: Any) -> Any:
+    """Read one counter from a debt entry (ProviderDebt or raw mapping)."""
+    if isinstance(entry, Mapping):
+        return entry.get(name, default)
+    return getattr(entry, name, default)
+
+
+def _debt_quality_score(entry: Any, *, now: float) -> float:
+    """Quality preference for one provider from its measured usage debt.
+
+    Higher is better: cache-hit rate (``cache_hit_count / requests``) raises
+    the score, mean call latency (``latency_total_s / latency_count``) lowers
+    it, both clamped to ``[0, 1]`` before weighting. Returns ``0.0`` (neutral)
+    when the entry carries no usable signal — no requests, or last seen too
+    long ago (stale) — so a provider with no recorded data keeps its config
+    priority position instead of being pushed to the bottom permanently.
+    """
+    if entry is None:
+        return 0.0
+    requests = _debt_field(entry, "requests", 0)
+    if not isinstance(requests, int) or requests <= 0:
+        return 0.0
+    last_seen = _debt_field(entry, "last_seen", None)
+    if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
+        if now - float(last_seen) > _QUALITY_MAX_AGE_S:
+            return 0.0
+    cache_hits = _debt_field(entry, "cache_hit_count", 0)
+    if not isinstance(cache_hits, int) or cache_hits < 0:
+        cache_hits = 0
+    cache_hit_rate = min(1.0, cache_hits / requests)
+    latency_norm = 0.0
+    latency_count = _debt_field(entry, "latency_count", 0)
+    if isinstance(latency_count, int) and latency_count > 0:
+        latency_total = _debt_field(entry, "latency_total_s", 0.0)
+        if isinstance(latency_total, (int, float)) and not isinstance(latency_total, bool):
+            mean_latency = max(0.0, float(latency_total)) / latency_count
+            latency_norm = min(1.0, mean_latency / _QUALITY_LATENCY_REFERENCE_S)
+    return _QUALITY_CACHE_WEIGHT * cache_hit_rate - _QUALITY_LATENCY_WEIGHT * latency_norm
+
+
+# --------------------------------------------------------------------------- #
 # Diffundo router
 # --------------------------------------------------------------------------- #
 
@@ -1074,6 +1139,7 @@ class Diffundo:
         primary_provider: str | None = None,
         credential_source: CredentialSource | None = None,
         codex_profile: Mapping[str, object] | None = None,
+        debt: Mapping[str, Any] | None = None,
     ) -> None:
         self._providers = tuple(providers)
         self._runtimes = tuple(
@@ -1111,6 +1177,15 @@ class Diffundo:
         self._credential_source = credential_source
         self._codex_profile = (
             dict(CODEX_CHATGPT_PROFILE) if codex_profile is None else dict(codex_profile)
+        )
+        # Measured-usage debt snapshot (weighted routing): provider name ->
+        # ProviderDebt-like counters (requests, cache_hit_count,
+        # latency_total_s/latency_count, last_seen) used to order the cascade
+        # within an equal-priority run by measured quality. None/empty keeps
+        # the pure config-priority order. Stored as an immutable item tuple so
+        # no attribute is a mutable mapping (D1).
+        self._debt: tuple[tuple[str, Any], ...] | None = (
+            tuple(debt.items()) if debt else None
         )
 
     # -- public API --------------------------------------------------------- #
@@ -1190,7 +1265,8 @@ class Diffundo:
 
     def _candidates(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
         """Tier-matching, capability-filtered, health/bucket-eligible providers,
-        sorted by priority ascending (arch §9.1/§9.2 step 1)."""
+        sorted by priority ascending, refined by measured quality within an
+        equal-priority run (arch §9.1/§9.2 step 1, weighted routing)."""
         now = time.monotonic()
         out: list[ProviderConfig] = []
         for runtime in self._runtimes:
@@ -1213,7 +1289,17 @@ class Diffundo:
             if not runtime.bucket.has_token():
                 continue
             out.append(provider)
-        out.sort(key=lambda provider: provider.priority)
+        # Config priority stays the primary ordering key; measured quality
+        # (cache-hit rate, mean latency from the injected debt) only refines
+        # order WITHIN an equal-priority run. Providers with no fresh debt
+        # score a neutral weight, so they keep their config-priority position
+        # instead of being pushed to the bottom permanently.
+        out.sort(
+            key=lambda provider: (
+                provider.priority,
+                -self._quality_weight(provider),
+            )
+        )
         if self._primary_provider is not None:
             # Bound provider leads while eligible; otherwise plain priority
             # order applies and the serving fallback becomes the new binding.
@@ -1244,6 +1330,16 @@ class Diffundo:
                 run_start = run_end
             out = rotated
         return out
+
+    def _quality_weight(self, provider: ProviderConfig) -> float:
+        """Quality preference (higher wins) for one candidate from the injected
+        usage-debt snapshot; 0.0 (neutral) when the provider has no fresh data."""
+        if self._debt is None:
+            return 0.0
+        entry = next(
+            (value for name, value in self._debt if name == provider.name), None
+        )
+        return _debt_quality_score(entry, now=time.time())
 
     async def _await_candidates(
         self,
