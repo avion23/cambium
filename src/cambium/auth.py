@@ -19,7 +19,9 @@ import pwd
 import re
 import secrets
 import stat
+import sys
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -177,6 +179,12 @@ def derived_env_name(provider: str) -> str:
     provider = validate_provider_id(provider)
     normalized = re.sub(r"[._-]+", "_", provider.upper())
     return f"CAMBIUM_PROVIDER_{normalized}_API_KEY"
+
+
+def oauth_env_suffix(provider: str) -> str:
+    """Normalize a provider id for CAMBIUM_OAUTH_* environment names."""
+    validate_provider_id(provider)
+    return re.sub(r"[._-]+", "_", provider.upper())
 
 
 def is_provider_env_name(value: object) -> bool:
@@ -412,12 +420,34 @@ def _open_secure_file(dir_fd: int, name: str) -> int:
         if exc.errno == errno.ELOOP:
             raise AuthStoreError("auth store file must not be a symlink") from exc
         raise AuthStoreError("could not open the auth store file") from exc
+    valid = False
     try:
         _validate_file_stat(os.fstat(fd))
-    except Exception:
-        os.close(fd)
-        raise
+        valid = True
+    finally:
+        if not valid:
+            os.close(fd)
     return fd
+
+
+@contextmanager
+def _exclusive_lock(directory_fd: int):
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        raise AuthStoreError("could not lock the auth store") from exc
+    try:
+        yield
+    finally:
+        primary = sys.exception()
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        except OSError as exc:
+            release_error = AuthStoreError("could not unlock the auth store")
+            if primary is not None:
+                primary.add_note(f"auth store lock release failed: {exc}")
+            else:
+                raise release_error from exc
 
 
 def _read_fd(fd: int) -> bytes:
@@ -603,8 +633,6 @@ class AuthStore:
         finally:
             os.close(directory_fd)
 
-    load = read
-
     def save(self, document: AuthDocument) -> None:
         if not isinstance(document, AuthDocument):
             raise AuthSchemaError("auth store document is invalid")
@@ -612,18 +640,9 @@ class AuthStore:
         if directory_fd is None:
             raise AuthStoreError("auth store directory is unavailable")
         try:
-            try:
-                fcntl.flock(directory_fd, fcntl.LOCK_EX)
-            except OSError as exc:
-                raise AuthStoreError("could not lock the auth store") from exc
-            try:
+            with _exclusive_lock(directory_fd):
                 _verify_directory_path(self._path.parent, directory_fd)
                 _atomic_write(directory_fd, self._path.name, document)
-            finally:
-                try:
-                    fcntl.flock(directory_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
         finally:
             os.close(directory_fd)
 
@@ -634,20 +653,11 @@ class AuthStore:
         if directory_fd is None:
             raise AuthStoreError("auth store directory is unavailable")
         try:
-            try:
-                fcntl.flock(directory_fd, fcntl.LOCK_EX)
-            except OSError as exc:
-                raise AuthStoreError("could not lock the auth store") from exc
-            try:
+            with _exclusive_lock(directory_fd):
                 current = _read_document_if_present(directory_fd, self._path.name)
                 values = current.as_mapping()
                 values[provider] = {"api_key": api_key}
                 self.save_document_in_locked_directory(directory_fd, values)
-            finally:
-                try:
-                    fcntl.flock(directory_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
         finally:
             os.close(directory_fd)
 
@@ -657,11 +667,7 @@ class AuthStore:
         if directory_fd is None:
             return False
         try:
-            try:
-                fcntl.flock(directory_fd, fcntl.LOCK_EX)
-            except OSError as exc:
-                raise AuthStoreError("could not lock the auth store") from exc
-            try:
+            with _exclusive_lock(directory_fd):
                 current = _read_document_if_present(directory_fd, self._path.name)
                 values = current.as_mapping()
                 if provider not in values:
@@ -669,11 +675,6 @@ class AuthStore:
                 del values[provider]
                 self.save_document_in_locked_directory(directory_fd, values)
                 return True
-            finally:
-                try:
-                    fcntl.flock(directory_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
         finally:
             os.close(directory_fd)
 

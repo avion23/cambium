@@ -219,12 +219,8 @@ def _validate_api_key_env(value: object, location: str, provider: str) -> str:
 
 
 def _diffundo_types() -> tuple[type[ProviderConfig], type[ProviderTier]]:
-    try:
-        from .diffundo import ProviderConfig, ProviderTier
-    except ModuleNotFoundError as exc:
-        if exc.name != "cambium.diffundo":
-            raise
-        raise ImportError("diffundo not merged yet") from exc
+    from .diffundo import ProviderConfig, ProviderTier
+
     return ProviderConfig, ProviderTier
 
 
@@ -621,26 +617,14 @@ def env_report(
     }
 
 
-def __getattr__(name: str) -> object:
-    if name == "ProviderConfig":
-        provider_config, _ = _diffundo_types()
-        return provider_config
-    if name == "ProviderTier":
-        _, provider_tier = _diffundo_types()
-        return provider_tier
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 __all__ = [
     "AuthMode",
     "CODEX_CHATGPT_PROFILE",
     "DEFAULT_PROVIDER_PATH",
     "DEFAULT_SAMPLE",
     "Protocol",
-    "ProviderConfig",
     "ProviderEnvSpec",
     "ProviderSelectionError",
-    "ProviderTier",
     "env_report",
     "is_loopback_host",
     "load_provider_specs",

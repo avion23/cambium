@@ -123,7 +123,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cambium.auth import scrub_environment
+from cambium.auth import oauth_env_suffix, scrub_environment
 from cambium.diffundo import (
     AllProvidersFailed,
     CallResult,
@@ -208,8 +208,10 @@ def _env_float(name: str, default: float) -> float:
     try:
         parsed = float(value)
     except ValueError:
-        return default
-    return parsed if math.isfinite(parsed) else default
+        raise ValueError(f"invalid {name}: expected a finite number") from None
+    if not math.isfinite(parsed):
+        raise ValueError(f"invalid {name}: expected a finite number")
+    return parsed
 
 
 async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
@@ -373,15 +375,6 @@ def _model_identity(
     return model
 
 
-def _oauth_env_suffix(provider: str) -> str:
-    """Normalize a provider id into its ``CAMBIUM_OAUTH_*`` env suffix.
-
-    Mirrors ``supervisor._oauth_env_suffix`` so the supervisor's injected
-    env vars and the worker's lookup agree byte-for-byte.
-    """
-    return re.sub(r"[._-]+", "_", provider.upper())
-
-
 def _provider_router(
     config: dict[str, Any], *, assigned_provider: str | None = None,
     authorized_providers: tuple[str, ...] = (),
@@ -441,7 +434,7 @@ def _provider_router(
                 "credential sources (unsupported)"
             )
         codex = codex_providers[0]
-        suffix = _oauth_env_suffix(codex.name)
+        suffix = oauth_env_suffix(codex.name)
         access = os.environ.get(f"CAMBIUM_OAUTH_ACCESS_{suffix}")
         account = os.environ.get(f"CAMBIUM_OAUTH_ACCOUNT_{suffix}")
         if not access:

@@ -13,7 +13,8 @@ credentials) at ``~/.config/cambium/routing-state.json``, written atomically
 (temp file + ``os.replace``), plus an in-memory session accumulator the
 supervisor feeds live as redacted ``usage_event`` rows arrive, so later
 admissions in the same session see updated debt. A missing or corrupt ledger
-file loads as an empty ledger.
+file loads as empty only when absent. Unreadable, malformed, and unsupported
+ledgers raise an error.
 
 The window allowance defaults to :data:`DEFAULT_TOKEN_WINDOW_ALLOWANCE`
 (20M tokens, a placeholder until real quota contracts are measured,
@@ -216,18 +217,18 @@ class DebtStore:
     def _read_persisted_debts(self) -> dict[str, ProviderDebt]:
         try:
             text = self._path.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
             return {}
         try:
             raw = json.loads(text)
-        except ValueError:
-            return {}
+        except ValueError as exc:
+            raise ValueError(f"invalid routing ledger JSON: {self._path}") from exc
         if not (
             isinstance(raw, Mapping)
             and raw.get("version") == _ROUTING_STATE_VERSION
             and isinstance(raw.get("providers"), Mapping)
         ):
-            return {}
+            raise ValueError(f"invalid routing ledger schema: {self._path}")
         return {
             name: _debt_from_mapping(name, entry)
             for name, entry in raw["providers"].items()
@@ -291,7 +292,7 @@ class DebtStore:
         return merged
 
     def load(self) -> None:
-        """Replace memory with the persisted ledger; tolerate a bad file.
+        """Replace memory with the persisted ledger.
 
         Applies exponential time-decay to recorded debt so cross-session
         accumulation cannot permanently skew max-min selection: each counter

@@ -98,7 +98,7 @@ from cambium.provider_config import (
 from cambium.system_health import can_run_heavy
 
 from .architectus import ActionKind, ArchitectusCore
-from .auth import MIN_API_KEY_BYTES, scrub_environment
+from .auth import MIN_API_KEY_BYTES, oauth_env_suffix, scrub_environment
 from .conversations import ConversationStore
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
@@ -325,7 +325,9 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
         parsed = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"invalid {key}: {value!r}") from None
-    return parsed if math.isfinite(parsed) else default
+    if not math.isfinite(parsed):
+        raise ValueError(f"invalid {key}: value must be finite")
+    return parsed
 
 
 def _warm_pool_size() -> int:
@@ -336,7 +338,7 @@ def _warm_pool_size() -> int:
     try:
         size = int(value)
     except ValueError:
-        return DEFAULT_WARM_POOL_SIZE
+        raise ValueError("invalid CAMBIUM_WARM_POOL_SIZE: expected an integer") from None
     return max(0, size)
 
 
@@ -491,7 +493,7 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 15.0
 DEFAULT_HEARTBEAT_TIMEOUT_S = 90.0
 DEFAULT_WALL_BUDGET_S = 300.0
 DEFAULT_MAX_RESTARTS = 3
-DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
 RESTART_BASE_DELAY_S = 1.0
 RESTART_MAX_DELAY_S = 30.0
@@ -573,11 +575,6 @@ def _validate_provider_credential(value: object) -> None:
         raise ValueError("provider credential is not valid UTF-8") from exc
     if len(encoded) < MIN_API_KEY_BYTES:
         raise ValueError("provider credential is too short")
-
-
-def _oauth_env_suffix(provider: str) -> str:
-    """Normalize a provider id into its ``CAMBIUM_OAUTH_*`` environment suffix."""
-    return re.sub(r"[._-]+", "_", provider.upper())
 
 
 def _fanout_provider_names(spec: Mapping[str, Any]) -> frozenset[str]:
@@ -760,10 +757,10 @@ def _oauth_worker_environment(
                 f"task references codex_chatgpt provider {provider!r} but its "
                 f"oauth session could not be ensured fresh: {exc}{hint}"
             ) from None
-        additions[f"CAMBIUM_OAUTH_ACCESS_{_oauth_env_suffix(provider)}"] = access_token
+        additions[f"CAMBIUM_OAUTH_ACCESS_{oauth_env_suffix(provider)}"] = access_token
         access_values.append(access_token)
         if account_id:
-            additions[f"CAMBIUM_OAUTH_ACCOUNT_{_oauth_env_suffix(provider)}"] = account_id
+            additions[f"CAMBIUM_OAUTH_ACCOUNT_{oauth_env_suffix(provider)}"] = account_id
     return additions, access_values
 
 
