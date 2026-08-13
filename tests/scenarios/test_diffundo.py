@@ -34,11 +34,11 @@ from cambium.diffundo import (
     CallResult,
     Diffundo,
     HealthState,
+    PromptStructureError,
     ProviderConfig,
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
-    PromptStructureError,
     prompt_prefix_bytes,
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
@@ -243,7 +243,7 @@ def test_prompt_structure_rejects_timestamp_on_line_five() -> None:
 
 def test_prompt_prefix_token_estimate_uses_utf8_bytes() -> None:
     prompt = {"messages": [{"role": "system", "content": "abcé"}]}
-    expected_bytes = len("abcé".encode("utf-8"))
+    expected_bytes = len("abcé".encode())
 
     assert prompt_prefix_bytes(prompt) == expected_bytes
     assert prompt_prefix_estimate_tokens(prompt) == expected_bytes // 4
