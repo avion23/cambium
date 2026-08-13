@@ -22,7 +22,7 @@ EventStore path, so provider usage/quota evidence is durable without ever
 exposing credentials.
 
 ``run_plan`` drives a multi-task plan and returns a ``PlanResult``;
-``run_session`` is a thin one-task adapter that keeps the historical
+``run_session`` is a one-task adapter that keeps the historical
 ``SliceResult`` return shape. ``cambium.store`` and ``cambium.merge`` are
 hard runtime dependency contracts: import failure fails at load.
 
@@ -438,12 +438,9 @@ def _slice_to_plan_task(spec: dict[str, Any]) -> dict[str, Any]:
         plan_task["max_wall_s"] = plan_task.pop("wall_budget_s")
     if "spec" in plan_task:
         plan_task["task"] = plan_task.pop("spec")
-    if plan_task.get("fanout_config"):
-        task = plan_task.get("task")
-        if not isinstance(task, str) or not task.strip():
-            raise ValueError("run_session provider mode requires a non-empty task")
-    elif not isinstance(plan_task.get("task"), str) or not plan_task["task"].strip():
-        plan_task["task"] = "run one task"
+    task = plan_task.get("task")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("run_session requires a non-empty task")
     plan_task.setdefault("max_restarts", 0)
     return plan_task
 
@@ -471,7 +468,7 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
 
 
 # =====================================================================
-# Custos — multi-worker supervisor runtime
+# Multi-worker supervisor runtime
 # (docs/architecture/architecture.md §5.3, §7.1-§7.8;
 #  docs/research/custos-asyncio-design.md)
 #
@@ -1077,7 +1074,7 @@ class _GenOutcome:
 
 
 class _Runtime:
-    """Custos: the multi-worker supervisor. One instance per run_plan session.
+    """Multi-worker supervisor. One instance per run_plan session.
 
     All WorkerHandle mutation happens on the event loop from the supervise
     tasks; disk I/O (event store writes, git calls) escapes via asyncio.to_thread.
@@ -1097,6 +1094,7 @@ class _Runtime:
         oauth_store: OAuthStore | None = None,
         architectus: Any = None,
         conversations: Any = None,
+        warm_pool_size: int | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1135,7 +1133,9 @@ class _Runtime:
         # Eval-3 ADOPT warm pool: idle reuse-ready worker processes. The pool
         # is bounded by ``_warm_pool_size`` (0 disables) and never survives
         # this runtime (shutdown kills every pooled process).
-        self._warm_pool_size = _warm_pool_size()
+        self._warm_pool_size = (
+            _warm_pool_size() if warm_pool_size is None else warm_pool_size
+        )
         self._pool: list[_PooledWorker] = []
         # Decision port and revision conversation persistence (step 2 items
         # 23-24): both optional; None keeps the historical byte-for-byte path.
@@ -1592,10 +1592,13 @@ class _Runtime:
             "max_wall_s": wall_budget,
         }
         if not spec.get("fanout_config"):
+            write_marker = spec.get("write_marker", True)
+            if not isinstance(write_marker, bool):
+                raise ValueError(f"task {spec['task_id']} write_marker must be a boolean")
             payload.update(
                 target_file=spec.get("target_file"),
                 marker=spec.get("marker"),
-                write_marker=bool(spec.get("write_marker", True)),
+                write_marker=write_marker,
             )
         # Dynamic child admission: the child's context is its own spec plus
         # the parent's envelope; a child may itself declare proposals.
@@ -1937,16 +1940,6 @@ class _Runtime:
             return
         try:
             await self._supervise(spec)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self.emit(
-                "worker_failed", task_id=spec["task_id"], reason=f"supervisor error: {exc!r}"
-            )
-            self._results[spec["task_id"]] = TaskResult(
-                task_id=spec["task_id"], status="failed", exit_code=1,
-                reason=f"supervisor error: {exc.__class__.__name__}",
-            )
         finally:
             # Lane release (H1): every task that holds a lane reservation
             # (batch pre-assignment or admission-time assignment) frees it on
@@ -3284,7 +3277,26 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
             spec["requirements"] = requirements
     spec.setdefault("base_commit", None)
     spec.setdefault("write_marker", True)
+    if not isinstance(spec["write_marker"], bool):
+        raise ValueError(f"task {task_id} write_marker must be a boolean")
     return spec
+
+
+def _validate_task_repositories(specs: Sequence[Mapping[str, Any]]) -> None:
+    """Verify plan repositories without changing their files or Git metadata."""
+    for spec in specs:
+        task_id = spec["task_id"]
+        repo = Path(spec["repo"])
+        if not repo.is_dir():
+            raise ValueError(f"task {task_id} repo is not a directory")
+        probe = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD^{commit}"],
+            capture_output=True,
+            text=True,
+            env=_strip_sensitive_env(scrub_environment(), worktree=repo),
+        )
+        if probe.returncode != 0:
+            raise ValueError(f"task {task_id} repo must contain a git commit")
 
 
 def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None:
@@ -3766,6 +3778,7 @@ async def run_plan(
     oauth_store: OAuthStore | None = None,
     architectus: Any = None,
     conversations: bool | None = None,
+    warm_pool_size: int | None = None,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3831,8 +3844,13 @@ async def run_plan(
         raise ValueError("max_concurrent_tasks must be a non-negative int or None")
     if max_concurrent_tasks is None:
         max_concurrent_tasks = max(1, os.process_cpu_count() or os.cpu_count() or 1)
+    if warm_pool_size is not None and (
+        type(warm_pool_size) is not int or warm_pool_size < 0
+    ):
+        raise ValueError("warm_pool_size must be a non-negative int or None")
 
     _validate_provider_environment(specs, provider_environment, oauth_store=oauth_store)
+    _validate_task_repositories(specs)
     tree, width_limit = _resolve_hierarchy(specs, plan, max_width)
 
     admission = _SessionAdmission(session_dir)
@@ -3874,6 +3892,7 @@ async def run_plan(
             oauth_store=oauth_store,
             architectus=architectus,
             conversations=conversations_store,
+            warm_pool_size=warm_pool_size,
         )
         await runtime.start()
         runtime.set_session_tasks(specs)
@@ -3901,10 +3920,6 @@ async def run_plan(
                         tg.create_task(runtime.supervise_task(spec))
         except asyncio.CancelledError:
             cancelled = True
-        except BaseExceptionGroup as exc_group:
-            await runtime.emit(
-                "log", task_id=None, message=f"task group exception: {exc_group}"
-            )
         finally:
             try:
                 if debt_store.dirty:
@@ -3988,7 +4003,11 @@ def _sh(*args: str, cwd: str | Path | None = None) -> None:
 
 
 async def _amain_plan(
-    session_dir: Path, plan: dict[str, Any], *, conversations: bool = False
+    session_dir: Path,
+    plan: dict[str, Any],
+    *,
+    conversations: bool = False,
+    warm_pool_size: int = 0,
 ) -> int:
     loop = asyncio.get_running_loop()
 
@@ -3996,7 +4015,13 @@ async def _amain_plan(
         print(f'{record["kind"]:>16}  {json.dumps(record["payload"])}', flush=True)
 
     task = asyncio.ensure_future(
-        run_plan(session_dir, plan, on_event=print_event, conversations=conversations)
+        run_plan(
+            session_dir,
+            plan,
+            on_event=print_event,
+            conversations=conversations,
+            warm_pool_size=warm_pool_size,
+        )
     )
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -4022,18 +4047,27 @@ async def _amain_plan(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Cambium supervisor")
     parser.add_argument("--session-dir", required=True)
-    parser.add_argument(
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
         "--plan",
         help="path to plan JSON {\"tasks\": [{\"task_id\", \"task\", \"repo\", "
         "\"worktree_path\", \"branch\", \"base_commit\", ...}]} "
         "(multi-worker mode)",
     )
-    parser.add_argument(
+    inputs.add_argument(
         "--task-spec",
         help=(
-            "path to task spec JSON (one-task mode; default: <session-dir>/task.json, "
-            "else the built-in demo)"
+            "path to task spec JSON (one-task mode)"
         ),
+    )
+    inputs.add_argument(
+        "--demo", action="store_true", help="run the built-in mutating demo"
+    )
+    parser.add_argument(
+        "--warm-pool-size",
+        type=int,
+        default=0,
+        help="maximum reusable idle workers (default: 0)",
     )
     parser.add_argument(
         "--conversations",
@@ -4043,31 +4077,39 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)
-    if args.plan:
-        plan = json.loads(Path(args.plan).read_text())
+    if args.warm_pool_size < 0:
+        print("cambium supervisor: --warm-pool-size must be non-negative", file=sys.stderr)
+        return 2
+    try:
+        if args.plan:
+            plan = json.loads(Path(args.plan).read_text())
+        elif args.task_spec:
+            task_spec = json.loads(Path(args.task_spec).read_text())
+            plan = {"tasks": [_slice_to_plan_task(task_spec)]}
+        else:
+            task_spec = _builtin_demo_spec(session_dir)
+            _bootstrap_demo_repo(Path(task_spec["repo"]), task_spec["target_file"])
+            plan = {"tasks": [_slice_to_plan_task(task_spec)]}
         tasks = _plan_tasks(plan)
         _reject_duplicate_task_ids(tasks)
-        for task in tasks:
-            _ensure_repo_initialized(Path(task["repo"]).resolve())
+        if not tasks:
+            raise ValueError("plan contains no tasks")
+        specs = [_validate_plan_task(session_dir, task) for task in tasks]
+        _validate_task_repositories(specs)
         try:
-            return asyncio.run(_amain_plan(session_dir, plan, conversations=args.conversations))
+            return asyncio.run(
+                _amain_plan(
+                    session_dir,
+                    plan,
+                    conversations=args.conversations,
+                    warm_pool_size=args.warm_pool_size,
+                )
+            )
         except KeyboardInterrupt:
             return 130
-    if args.task_spec:
-        task_spec = json.loads(Path(args.task_spec).read_text())
-    elif (session_dir / "task.json").exists():
-        task_spec = json.loads((session_dir / "task.json").read_text())
-    else:
-        task_spec = _builtin_demo_spec(session_dir)
-        _bootstrap_demo_repo(Path(task_spec["repo"]), task_spec["target_file"])
-    plan_task = _slice_to_plan_task(task_spec)
-    _ensure_repo_initialized(Path(plan_task["repo"]))
-    try:
-        return asyncio.run(
-            _amain_plan(session_dir, {"tasks": [plan_task]}, conversations=args.conversations)
-        )
-    except KeyboardInterrupt:
-        return 130
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"cambium supervisor: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
