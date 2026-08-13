@@ -430,7 +430,7 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
 def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
     tmp_path, monkeypatch
 ) -> None:
-    """read_batch -> edit_file -> finish: 3 model calls, one merge, no leaks.
+    """read_batch -> edit_file -> run_shell -> finish: 4 model calls, one merge, no leaks.
 
     The provider config lives at the default ``.cambium/providers.json`` under
     the supervisor cwd; ``CAMBIUM_PROVIDERS`` is unset so the supervisor
@@ -465,6 +465,10 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
             usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
         )
         _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":'
+            '{"cmd":["true"]}}'
+        )
+        _enqueue(
             '{"type":"finish","summary":"read target.txt and appended a provider marker"}',
             usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21},
         )
@@ -492,21 +496,24 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         assert merged.endswith("// provider-alpha\n")
 
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 3
+            assert len(REQUESTS) == 4
             assert all(value == f"Bearer {PROVIDER_SECRET}" for value in REQUEST_AUTHORIZATION)
             assert all(request["model"] == "loopback-model" for request in REQUESTS)
 
         tool_events = [e for e in events if e["kind"] == "tool_event"]
-        assert [e["payload"]["tool"] for e in tool_events] == ["read_batch", "edit_file"]
+        assert [e["payload"]["tool"] for e in tool_events] == [
+            "read_batch", "edit_file", "run_shell"
+        ]
         assert all(e["payload"]["ok"] is True for e in tool_events)
-        assert [e["payload"]["turn"] for e in tool_events] == [1, 2]
+        assert [e["payload"]["turn"] for e in tool_events] == [1, 2, 3]
         assert all(isinstance(e["payload"]["duration_ms"], int) for e in tool_events)
 
         checkpoints = [e for e in events if e["kind"] == "checkpoint"]
-        assert [e["payload"]["turn"] for e in checkpoints] == [1, 2, 3]
+        assert [e["payload"]["turn"] for e in checkpoints] == [1, 2, 3, 4]
         assert checkpoints[0]["payload"]["commits_so_far"] == []
         assert checkpoints[1]["payload"]["commits_so_far"] == []
-        final_commits = checkpoints[2]["payload"]["commits_so_far"]
+        assert checkpoints[2]["payload"]["commits_so_far"] == []
+        final_commits = checkpoints[3]["payload"]["commits_so_far"]
         assert len(final_commits) == 1
         final_sha = final_commits[0]
         assert (
@@ -531,9 +538,9 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
             "provider": "loopback-provider",
             "model": "loopback-model",
             "usage": {
-                "prompt_tokens": 36,
-                "completion_tokens": 18,
-                "total_tokens": 54,
+                "prompt_tokens": 53,
+                "completion_tokens": 27,
+                "total_tokens": 80,
             },
             "latency_s": metadata["latency_s"],
         }
@@ -683,6 +690,10 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
             '{"path":"notes.txt","old_string":"output-sentinel-7x9q\\n",'
             '"new_string":"output-sentinel-7x9q\\n// dirty-after-commit\\n"}}'
         )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":'
+            '{"cmd":["true"]}}'
+        )
         _enqueue('{"type":"finish","summary":"committed directly then edited"}')
 
         session_dir = tmp_path / "session"
@@ -771,6 +782,10 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
             + json.dumps(delegate_args)
             + "}"
         )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":'
+            '{"cmd":["true"]}}'
+        )
         _enqueue('{"type":"finish","summary":"edited target.txt and delegated a child"}')
 
         task = _task(session_dir, repo, base, config_path)
@@ -857,6 +872,10 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":'
+            '{"cmd":["true"]}}'
+        )
         _enqueue('{"type":"finish","summary":"edited target.txt"}')
 
         session_dir = tmp_path / "slice-provider"
@@ -870,7 +889,7 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
         assert result.status == "succeeded"
         assert result.exit_code == 0
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 2
+            assert len(REQUESTS) == 3
             assert REQUESTS[0]["model"] == "loopback-model"
             system = REQUESTS[0]["messages"][0]["content"]
             assert system.startswith("You are Cambium's autonomous coding agent.")
@@ -1138,16 +1157,14 @@ def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
+        # Shell is denied here, so keep this transcript free of code edits:
+        # finish must remain valid without verification while the no-existence
+        # assertion below proves the denied command never executed.
         _enqueue(
             '{"type":"tool_call","name":"run_shell",'
             '"arguments":{"cmd":["touch","should-not-exist"]}}'
         )
-        _enqueue(
-            '{"type":"tool_call","name":"edit_file","arguments":'
-            '{"path":"target.txt","old_string":"fixture\\n",'
-            '"new_string":"fixture\\n// provider-alpha\\n"}}'
-        )
-        _enqueue('{"type":"finish","summary":"edited target.txt"}')
+        _enqueue('{"type":"finish","summary":"shell command denied"}')
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -1164,13 +1181,16 @@ def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
         assert result["status"] == "succeeded"
         assert rc == 0
         assert not (session_dir / "wt" / "should-not-exist").exists()
-        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == (
-            "fixture\n// provider-alpha\n"
-        )
+        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
         tool_events = [m for m in messages if m["type"] == "tool_event"]
-        assert [m["tool"] for m in tool_events] == ["edit_file"]
+        assert tool_events == []
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 3
+            assert len(REQUESTS) == 2
+            assert any(
+                "action rejected: run_shell is not permitted by this worker's permissions"
+                in message.get("content", "")
+                for message in REQUESTS[1]["messages"]
+            )
     finally:
         server.close()
 
@@ -1188,13 +1208,19 @@ def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":'
+            '{"cmd":["true"]}}'
+        )
         _enqueue('{"type":"finish","summary":"edited target.txt"}')
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
         _make_repo(repo)
         env = _worker_env(config_path, session_dir)
-        init = _agent_init(config_path, spec=TASK_TEXT)
+        init = _agent_init(
+            config_path, permissions={"shell": True, "network": False}, spec=TASK_TEXT
+        )
         result, messages, rc, _stderr = asyncio.run(
             _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
                           branch="strict")
@@ -1203,12 +1229,12 @@ def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
         assert result["status"] == "succeeded"
         assert rc == 0
         tool_events = [m for m in messages if m["type"] == "tool_event"]
-        assert [m["tool"] for m in tool_events] == ["edit_file"]
+        assert [m["tool"] for m in tool_events] == ["edit_file", "run_shell"]
         assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == (
             "fixture\n// provider-alpha\n"
         )
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 4
+            assert len(REQUESTS) == 5
     finally:
         server.close()
 
@@ -1233,6 +1259,10 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
+        _enqueue(
+            '{"type":"tool_call","name":"run_shell","arguments":'
+            '{"cmd":["true"]}}'
+        )
         _enqueue('{"type":"finish","summary":"read and edited target.txt"}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
@@ -1248,7 +1278,7 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
         init = _agent_init(
             config_path,
             heartbeat={"interval_s": 0.05},
-            permissions={"shell": False, "network": False},
+            permissions={"shell": True, "network": False},
             spec=TASK_TEXT,
         )
         result, messages, rc, stderr = asyncio.run(
@@ -1261,18 +1291,19 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
         assert len(result["commits"]) == 1
 
         tool_events = [m for m in messages if m["type"] == "tool_event"]
-        assert [m["tool"] for m in tool_events] == ["read_batch", "edit_file"]
-        assert [m["turn"] for m in tool_events] == [1, 2]
+        assert [m["tool"] for m in tool_events] == ["read_batch", "edit_file", "run_shell"]
+        assert [m["turn"] for m in tool_events] == [1, 2, 3]
         assert all(m["ok"] is True for m in tool_events)
         assert all(isinstance(m["duration_ms"], int) for m in tool_events)
         # tool_event carries name/safe-cmd only; never tool output/content
         assert all("output-sentinel-7x9q" not in m["cmd"] for m in tool_events)
 
         checkpoints = [m for m in messages if m["type"] == "checkpoint"]
-        assert [m["turn"] for m in checkpoints] == [1, 2, 3]
+        assert [m["turn"] for m in checkpoints] == [1, 2, 3, 4]
         assert checkpoints[0]["commits_so_far"] == []
         assert checkpoints[1]["commits_so_far"] == []
-        final = checkpoints[2]
+        assert checkpoints[2]["commits_so_far"] == []
+        final = checkpoints[3]
         assert final["commits_so_far"] == result["commits"]
         for cp in checkpoints:
             path = Path(cp["state_ref"])
