@@ -3,7 +3,7 @@
 # Cambium self-bootstrap end-to-end self-check (deterministic marker mode).
 #
 # Driver contract:
-#   - builds a disposable clone of /home/ubuntu/cambium at
+#   - builds a disposable clone of the script's repository (or --repo) at
 #     /tmp/opencode/cambium-e2e — the repository cambium is asked to work on
 #   - seeds local git identity (user.name/user.email) and gc.auto 0 in the
 #     clone (the supervisor never seeds identity in an existing repo; the
@@ -28,6 +28,14 @@ set -euo pipefail
 
 REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="python3.14"
+REPO="$REAL"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo) REPO="$2"; shift 2 ;;
+        *) printf 'e2e-selfcheck: FAIL: unknown argument: %s\n' "$1" >&2; exit 1 ;;
+    esac
+done
 
 CLONE=/tmp/opencode/cambium-e2e
 SESSION=/tmp/opencode/cambium-e2e-session
@@ -50,8 +58,8 @@ command -v git >/dev/null 2>&1 || fail "git is required"
 rm -rf "$CLONE" "$SESSION"
 mkdir -p "$SESSION"
 
-note "cloning /home/ubuntu/cambium -> $CLONE"
-git clone -q /home/ubuntu/cambium "$CLONE" || fail "git clone of /home/ubuntu/cambium failed"
+note "cloning $REPO -> $CLONE"
+git clone -q "$REPO" "$CLONE" || fail "git clone of $REPO failed"
 
 note "seeding local git identity and gc.auto 0 in the disposable clone"
 git -C "$CLONE" config user.name "cambium-e2e" || fail "cannot seed user.name"

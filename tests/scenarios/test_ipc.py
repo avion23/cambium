@@ -44,6 +44,7 @@ from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
     read_message,
+    write_message,
 )
 
 MARKER = "// cambium-ipc"
@@ -54,6 +55,20 @@ DIFF_CAP_BYTES = 64 * 1024
 # stress-loop signal of the 20x regression test while making the drain
 # negligible.
 TEST_HEARTBEAT_INTERVAL_S = 0.02
+
+
+def test_write_message_rejects_oversized_frame_without_writing() -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+
+        def write(self, frame: bytes) -> None:
+            self.frames.append(frame)
+
+    writer = Writer()
+    with pytest.raises(MessageTooLong):
+        write_message(writer, {"value": "x" * MAX_LINE_BYTES})
+    assert writer.frames == []
 
 
 def _make_scratch(repo: Path) -> str:

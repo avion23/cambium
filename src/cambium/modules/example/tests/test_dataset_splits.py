@@ -1,9 +1,8 @@
 """Split-aware dataset tests for the should_decompose example module.
 
 Covers the v1 three-file splits (train/eval/canaries), canary exclusion
-from train/eval, backward-compat fallback to ``example_pairs.jsonl``,
-the ``meta.json`` versions, and engine consistency over all 260 records
-(the check_dataset_v1.py methodology, inlined).
+from train/eval, required split files, the ``meta.json`` versions, and engine
+consistency over all 260 records (the check_dataset_v1.py methodology, inlined).
 """
 
 from __future__ import annotations
@@ -85,20 +84,12 @@ def test_canary_flag_filtered_from_train_file(tmp_path) -> None:
     assert not examples[0].canary
 
 
-def test_backward_compat_falls_back_to_example_pairs(tmp_path) -> None:
+def test_missing_split_files_are_rejected(tmp_path) -> None:
     src = _fresh_copy(tmp_path)
     for name in ("train.jsonl", "eval.jsonl", "canaries.jsonl"):
         (src / name).unlink()
-    loader = ExampleDatasetLoader(src)
-    train = loader.load_split(Split.TRAIN)
-    eval_ = loader.load_split(Split.EVAL)
-    assert len(train) == EXAMPLE_PAIRS_COUNT - EXAMPLE_PAIRS_CANARIES
-    assert len(eval_) == EXAMPLE_PAIRS_COUNT - EXAMPLE_PAIRS_CANARIES
-    assert all(not ex.canary for ex in train)
-    assert all(not ex.canary for ex in eval_)
-    canaries = loader.load_split(Split.CANARIES)
-    assert len(canaries) == EXAMPLE_PAIRS_CANARIES
-    assert all(ex.canary for ex in canaries)
+    with pytest.raises(DatasetError, match="split file is missing"):
+        ExampleDatasetLoader(src).load_split(Split.TRAIN)
 
 
 def test_legacy_load_still_returns_all_examples() -> None:

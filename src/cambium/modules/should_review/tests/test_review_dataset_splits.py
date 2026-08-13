@@ -85,37 +85,12 @@ def test_canary_flag_filtered_from_train_file(tmp_path) -> None:
     assert not examples[0].canary
 
 
-def test_backward_compat_falls_back_to_pairs(tmp_path) -> None:
+def test_missing_split_files_are_rejected(tmp_path) -> None:
     src = _fresh_copy(tmp_path)
     for name in ("train.jsonl", "eval.jsonl", "canaries.jsonl"):
         (src / name).unlink()
-    pairs = [
-        {
-            "id": "p-1",
-            "input": {"task": "I cannot finish the migration.", "context": ""},
-            "expected": {"review": True, "decompose": True, "reason": "refusal"},
-            "canary": True,
-            "canary_info": {"kind": "must_review"},
-        },
-        {
-            "id": "p-2",
-            "input": {"task": "Rename one function.", "context": ""},
-            "expected": {"review": False, "decompose": False, "reason": "atomic"},
-        },
-    ]
-    (src / "should_review_pairs.jsonl").write_text(
-        "".join(json.dumps(record) + "\n" for record in pairs), encoding="utf-8"
-    )
-    loader = ExampleDatasetLoader(src)
-    train = loader.load_split(Split.TRAIN)
-    eval_ = loader.load_split(Split.EVAL)
-    assert len(train) == 1
-    assert len(eval_) == 1
-    assert all(not ex.canary for ex in train)
-    assert all(not ex.canary for ex in eval_)
-    canaries = loader.load_split(Split.CANARIES)
-    assert len(canaries) == 1
-    assert all(ex.canary for ex in canaries)
+    with pytest.raises(DatasetError, match="split file is missing"):
+        ExampleDatasetLoader(src).load_split(Split.TRAIN)
 
 
 def test_dataset_version_read_from_meta(tmp_path) -> None:

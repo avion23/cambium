@@ -157,8 +157,14 @@ def _baseline_path(
 # --------------------------------------------------------------------------
 
 
-def _git_sha() -> str:
-    """Full SHA of the tree the run was executed in, or "" when unavailable."""
+def _git_sha() -> str | None:
+    """Full SHA of the current HEAD, or ``None`` when git provenance is unavailable.
+
+    ``None`` (not an empty string) marks unavailable provenance so a missing
+    SHA is distinguishable from a real one; a ``null`` baseline ``git_sha``
+    records that the run could not capture tree identity. Provenance-dependent
+    callers must handle ``None``.
+    """
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -167,9 +173,9 @@ def _git_sha() -> str:
             text=True,
             timeout=10,
         )
-    except Exception:
-        return ""
-    return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
 
 
 def _utc_now_iso() -> str:

@@ -30,6 +30,14 @@ set -euo pipefail
 
 REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="python3.14"
+REPO="$REAL"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo) REPO="$2"; shift 2 ;;
+        *) printf 'external-provider-smoke: FAIL: unknown argument: %s\n' "$1" >&2; exit 1 ;;
+    esac
+done
 
 CLONE=/tmp/opencode/cambium-external-smoke
 SESSION=/tmp/opencode/cambium-external-smoke-session
@@ -79,8 +87,8 @@ PY
 rm -rf "$CLONE" "$SESSION" "$FAIL_SESSION"
 mkdir -p "$SESSION" "$FAIL_SESSION"
 
-note "cloning /home/ubuntu/cambium -> $CLONE"
-git clone -q /home/ubuntu/cambium "$CLONE" || fail "git clone of /home/ubuntu/cambium failed"
+note "cloning $REPO -> $CLONE"
+git clone -q "$REPO" "$CLONE" || fail "git clone of $REPO failed"
 
 note "seeding local git identity and gc.auto 0 in the disposable clone"
 git -C "$CLONE" config user.name "cambium-ext-smoke" || fail "cannot seed user.name"

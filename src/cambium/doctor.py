@@ -29,9 +29,12 @@ import sys
 import urllib.error
 import urllib.request
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
+from types import SimpleNamespace
+from typing import Any
 from urllib.parse import quote
 
 from . import auth
@@ -48,7 +51,6 @@ from .oauth import (
 from .provider_config import (
     DEFAULT_SAMPLE,
     AuthMode,
-    env_report,
     load_provider_specs,
     load_providers,
     validate_provider_specs,
@@ -211,12 +213,46 @@ def _provider_config_path(cwd: Path) -> tuple[Path, bool]:
     return cwd / ".cambium" / "providers.json", False
 
 
-def check_provider_env(cwd: Path) -> tuple[Status, str]:
-    """Check provider key presence without printing environment names or values.
+@dataclass(frozen=True, slots=True)
+class _DoctorProvider:
+    """Provider fields used by credential diagnostics."""
 
-    A provider with a missing ``api_key_env`` is WARN by default. Configurations
-    may set ``required: true`` to make that missing key FAIL; ``required`` must
-    be a boolean and invalid provider configuration always FAILs.
+    name: str
+    required: bool
+    api_key_env: str
+    auth: AuthMode | None
+
+
+def _oauth_session_present(store: OAuthStore, name: str) -> bool:
+    """Return whether the OAuth store holds a session for ``name``."""
+    try:
+        store.validate(name)
+    except OAuthMissingError:
+        return False
+    return True
+
+
+def _doctor_providers(
+    specs: Sequence[Any], providers: Sequence[Any]
+) -> tuple[_DoctorProvider, ...]:
+    return tuple(
+        _DoctorProvider(
+            spec.name,
+            spec.required,
+            spec.api_key_env,
+            getattr(provider, "auth", None),
+        )
+        for spec, provider in zip(specs, providers, strict=True)
+    )
+
+
+def check_provider_env(cwd: Path) -> tuple[Status, str]:
+    """Check provider credential presence without printing names or values.
+
+    API-key providers are present when their ``api_key_env`` variable is set;
+    OAuth (``codex_chatgpt``) providers are present when the OAuth store holds
+    a usable session. A missing credential is WARN by default; a missing
+    required provider is FAIL. Invalid provider configuration always FAILs.
     """
 
     path, explicit = _provider_config_path(cwd)
@@ -224,7 +260,8 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
         if not path.is_file():
             return Status.FAIL, f"{path}: provider config path is not a file"
         try:
-            providers = load_provider_specs(path)
+            specs = load_provider_specs(path)
+            configured = load_providers(path)
         except (OSError, ValueError) as exc:
             return Status.FAIL, f"{path}: provider config validation failed: {exc}"
         source = str(path)
@@ -232,35 +269,46 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
         return Status.FAIL, f"{path}: configured provider file does not exist"
     else:
         try:
-            providers = validate_provider_specs(DEFAULT_SAMPLE)
+            specs = validate_provider_specs(DEFAULT_SAMPLE)
+            configured = [
+                SimpleNamespace(auth=AuthMode(item.get("auth", "api_key")))
+                for item in DEFAULT_SAMPLE["providers"]
+            ]
         except ValueError as exc:  # The shipped sample is still a config input.
             return Status.FAIL, f"default provider sample validation failed: {exc}"
         source = "default sample"
 
-    presence = env_report(providers)
+    providers = _doctor_providers(specs, configured)
+    oauth_store = OAuthStore()
+    try:
+        presence = {
+            p.name: (
+                _oauth_session_present(oauth_store, p.name)
+                if p.auth is AuthMode.CODEX_CHATGPT
+                else bool(os.environ.get(p.api_key_env))
+            )
+            for p in providers
+        }
+    except OAuthError as exc:
+        return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
     states = ", ".join(
-        f"{provider.name}={'set' if presence[provider.name] else 'missing'}"
-        for provider in providers
+        f"{p.name}={'set' if presence[p.name] else 'missing'}" for p in providers
     )
     missing_required = [
-        provider.name
-        for provider in providers
-        if provider.required and not presence[provider.name]
+        p.name for p in providers if p.required and not presence[p.name]
     ]
     missing_optional = [
-        provider.name
-        for provider in providers
-        if not provider.required and not presence[provider.name]
+        p.name for p in providers if not p.required and not presence[p.name]
     ]
     if missing_required:
         return Status.FAIL, (
-            f"{source}: {states}; required provider key missing for "
+            f"{source}: {states}; required provider credential missing for "
             f"{', '.join(missing_required)}"
         )
     if missing_optional:
         return Status.WARN, (
-            f"{source}: {states}; missing provider key is WARN unless required=true "
-            f"({', '.join(missing_optional)})"
+            f"{source}: {states}; missing provider credential is WARN unless "
+            f"required=true ({', '.join(missing_optional)})"
         )
     return Status.PASS, f"{source}: {states or 'no providers'}"
 
@@ -303,116 +351,142 @@ def check_auth_schema(path: Path | None = None) -> tuple[Status, str]:
     return Status.PASS, f"auth store schema valid ({len(document.providers)} provider entries)"
 
 
-def _doctor_provider_specs(cwd: Path) -> tuple[str, tuple[object, ...]]:
+def _doctor_provider_specs(cwd: Path) -> tuple[str, tuple[_DoctorProvider, ...]]:
     path, explicit = _provider_config_path(cwd)
     if path.exists():
         if not path.is_file():
             raise ValueError("provider config path is not a file")
-        return str(path), load_provider_specs(path)
-    if explicit:
+        specs = load_provider_specs(path)
+        configured = load_providers(path)
+        source = str(path)
+    elif explicit:
         raise ValueError("configured provider file does not exist")
-    return "default sample", validate_provider_specs(DEFAULT_SAMPLE)
+    else:
+        specs = validate_provider_specs(DEFAULT_SAMPLE)
+        configured = [
+            SimpleNamespace(auth=AuthMode(item.get("auth", "api_key")))
+            for item in DEFAULT_SAMPLE["providers"]
+        ]
+        source = "default sample"
+    return source, _doctor_providers(specs, configured)
 
 
 def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, str]:
-    """Compare configured providers with stored entries; never use the network."""
+    """Compare configured providers with stored credentials; never use the network.
+
+    API-key providers are covered when the auth store holds their entry; OAuth
+    (``codex_chatgpt``) providers are covered when the OAuth store holds a
+    usable session (their credential is never an auth-store entry).
+    """
     target = _auth_path(path)
     try:
-        source, raw_specs = _doctor_provider_specs(cwd)
+        source, providers = _doctor_provider_specs(cwd)
     except (OSError, ValueError) as exc:
         return Status.SKIP, f"auth coverage skipped: provider config validation failed: {exc}"
 
-    metadata = auth.inspect_metadata(target)
-    if not metadata.directory_exists:
-        return Status.WARN, "auth store coverage is unavailable because the directory is absent"
-    if metadata.issue is not None or not metadata.directory_secure:
-        return Status.FAIL, "auth store coverage cannot be checked on insecure metadata"
-    if not metadata.file_exists:
-        return Status.WARN, "auth store coverage is unavailable because the file is absent"
-    if not metadata.file_secure:
-        return Status.FAIL, "auth store coverage cannot be checked on insecure metadata"
+    oauth_store = OAuthStore()
     try:
-        document = AuthStore(target).read()
-    except AuthError as exc:
-        return Status.FAIL, f"auth store coverage cannot be checked: {exc}"
+        auth_names = set(AuthStore(target).read().provider_names())
+    except AuthError:
+        auth_names = set()  # Insecure or unreadable store metadata is check 9-11's finding.
 
-    specs = tuple(raw_specs)
-    stored = {credential.provider: credential for credential in document.providers}
-    missing_required = [
-        spec.name for spec in specs if spec.required and spec.name not in stored
-    ]
-    missing_optional = [
-        spec.name for spec in specs if not spec.required and spec.name not in stored
-    ]
+    try:
+        coverage = {
+            p.name: (
+                _oauth_session_present(oauth_store, p.name)
+                if p.auth is AuthMode.CODEX_CHATGPT
+                else p.name in auth_names
+            )
+            for p in providers
+        }
+    except OAuthError as exc:
+        return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
+
+    def covered(p: _DoctorProvider) -> bool:
+        return coverage[p.name]
+
+    missing_required = [p.name for p in providers if p.required and not covered(p)]
+    missing_optional = [p.name for p in providers if not p.required and not covered(p)]
     present = [
-        f"{spec.name}={spec.api_key_env}"
-        for spec in specs
-        if spec.name in stored
+        f"{p.name}={'oauth' if p.auth is AuthMode.CODEX_CHATGPT else p.api_key_env}"
+        for p in providers
+        if covered(p)
     ]
-    configured_names = {spec.name for spec in specs}
-    extra = sorted(name for name in stored if name not in configured_names)
+    configured_names = {p.name for p in providers}
+    extra = sorted(name for name in auth_names if name not in configured_names)
 
+    states = ", ".join(
+        f"{p.name}={'covered' if covered(p) else 'missing'}" for p in providers
+    )
     if missing_required:
         detail = (
-            f"{source}: required providers missing from auth store: "
+            f"{source}: {states}; required provider credential missing for "
             f"{', '.join(missing_required)}"
         )
         if present:
-            detail += f"; configured entries: {', '.join(present)}"
+            detail += f"; covered: {', '.join(present)}"
         return Status.FAIL, detail
     if missing_optional:
         detail = (
-            f"{source}: optional providers missing from auth store: "
-            f"{', '.join(missing_optional)}"
+            f"{source}: {states}; missing provider credential is WARN unless "
+            f"required=true ({', '.join(missing_optional)})"
         )
         if present:
-            detail += f"; configured entries: {', '.join(present)}"
+            detail += f"; covered: {', '.join(present)}"
         return Status.WARN, detail
     if extra:
         return Status.WARN, f"{source}: unconfigured auth entries: {', '.join(extra)}"
     if present:
-        return Status.PASS, (
-            f"{source}: auth coverage complete; configured entries: {', '.join(present)}"
-        )
+        return Status.PASS, f"{source}: auth coverage complete; covered: {', '.join(present)}"
     return Status.PASS, f"{source}: auth coverage complete"
 
 
 def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status, str]:
     """Distinguish configured providers from providers the one-shot CLI can run.
 
-    A provider is runnable when the one-shot CLI can resolve its key without
-    reading a value: the ``api_key_env`` variable is set to a non-empty value,
-    or the auth store holds the provider name (the fixed ``cambium auth run``
-    profile injects stored keys into the launch environment). A configured
-    provider that is not runnable is reported as a WARN; the ``required`` flag
-    decides FAIL in the provider-env check. The report uses provider metadata
-    and auth-store names only and never exposes a key value.
+    A provider is runnable when the one-shot CLI can resolve its credential
+    without reading a value: an API-key provider is runnable when its
+    ``api_key_env`` variable is set or the auth store holds the provider name
+    (the fixed ``cambium auth run`` profile injects stored keys into the
+    launch environment); an OAuth (``codex_chatgpt``) provider is runnable
+    when the OAuth store holds a usable session. A configured provider that
+    is not runnable is WARN; the ``required`` flag decides FAIL in the
+    provider-env check. The report uses provider metadata and store names
+    only and never exposes a key value.
     """
     target = _auth_path(path)
     try:
-        source, raw_specs = _doctor_provider_specs(cwd)
+        source, providers = _doctor_provider_specs(cwd)
     except (OSError, ValueError) as exc:
         return Status.SKIP, (
             f"provider runnable skipped: provider config validation failed: {exc}"
         )
-    specs = tuple(raw_specs)
-    if not specs:
+    if not providers:
         return Status.PASS, f"{source}: no configured providers"
 
+    oauth_store = OAuthStore()
     try:
-        stored = set(AuthStore(target).read().provider_names())
+        auth_names = set(AuthStore(target).read().provider_names())
     except AuthError:
-        stored = set()  # Insecure or unreadable store metadata is check 9-11's finding.
+        auth_names = set()  # Insecure or unreadable store metadata is check 9-11's finding.
 
-    presence = env_report(specs)
-    runnable = [
-        spec.name for spec in specs if presence[spec.name] or spec.name in stored
-    ]
-    not_runnable = [
-        spec.name
-        for spec in specs
-        if not (presence[spec.name] or spec.name in stored)
-    ]
+    try:
+        readiness = {
+            p.name: (
+                _oauth_session_present(oauth_store, p.name)
+                if p.auth is AuthMode.CODEX_CHATGPT
+                else bool(os.environ.get(p.api_key_env)) or p.name in auth_names
+            )
+            for p in providers
+        }
+    except OAuthError as exc:
+        return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
+
+    def runnable_for(p: _DoctorProvider) -> bool:
+        return readiness[p.name]
+
+    runnable = [p.name for p in providers if runnable_for(p)]
+    not_runnable = [p.name for p in providers if not runnable_for(p)]
     if not_runnable:
         detail = f"{source}: configured but not runnable: {', '.join(not_runnable)}"
         if runnable:

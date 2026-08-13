@@ -1,12 +1,14 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cambium"
 version = "0.1.0"
 description = "Multi-agent coding-agent harness"
 readme = "README.md"
 requires-python = ">=3.14"
-# pytest is a runtime dependency: `cambium bench` and `cambium module-test`
-# import pytest at runtime (bench.py, module_conformance.py).
-dependencies = ["pytest>=9"]
+dependencies = []
 
 [project.scripts]
 cambium = "cambium.cli:main"
@@ -16,10 +18,11 @@ dspy = ["dspy>=3.3.0,<3.4"]
 # ast: focused alias for consumers that need only the optional tree-sitter
 # Python parser; the stdlib ast backend remains the core fallback.
 ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
-# test: what CI runs — the AST backend on top of the runtime pytest dependency.
+# test: what CI runs, including commands that use the pytest-based harness.
 # dspy is pinned here (and in dev) so the default isolated test install runs
 # the CambiumLM scenarios instead of skipping 113 tests.
 test = [
+    "pytest>=9",
     "tree-sitter>=0.26",
     "tree-sitter-python>=0.25",
     "dspy>=3.3.0,<3.4",
@@ -31,6 +34,7 @@ test = [
 # pytest-xdist powers `pytest -n auto` for the parallel tiers (verified: the
 # whole suite is xdist-safe; slow tier 92s -> ~35s on 4 cores).
 dev = [
+    "pytest>=9",
     "ruff>=0.12",
     "tree-sitter>=0.26",
     "tree-sitter-python>=0.25",
