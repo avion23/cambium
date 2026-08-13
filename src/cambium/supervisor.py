@@ -98,7 +98,7 @@ from cambium.provider_config import (
 from cambium.system_health import can_run_heavy
 
 from .architectus import ActionKind, ArchitectusCore
-from .auth import MIN_API_KEY_BYTES, scrub_environment
+from .auth import MIN_API_KEY_BYTES, oauth_env_suffix, scrub_environment
 from .conversations import ConversationStore
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
@@ -120,8 +120,7 @@ from .routing import (
     DebtStore,
     LaneState,
     ProviderDebt,
-    score_providers,
-    select_lane,
+    resolve_assignment,
     validate_requirements,
 )
 from .store import CRITICAL_KINDS, EventStore, read_events_file
@@ -326,7 +325,9 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
         parsed = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"invalid {key}: {value!r}") from None
-    return parsed if math.isfinite(parsed) else default
+    if not math.isfinite(parsed):
+        raise ValueError(f"invalid {key}: value must be finite")
+    return parsed
 
 
 def _warm_pool_size() -> int:
@@ -337,7 +338,7 @@ def _warm_pool_size() -> int:
     try:
         size = int(value)
     except ValueError:
-        return DEFAULT_WARM_POOL_SIZE
+        raise ValueError("invalid CAMBIUM_WARM_POOL_SIZE: expected an integer") from None
     return max(0, size)
 
 
@@ -492,7 +493,7 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 15.0
 DEFAULT_HEARTBEAT_TIMEOUT_S = 90.0
 DEFAULT_WALL_BUDGET_S = 300.0
 DEFAULT_MAX_RESTARTS = 3
-DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
 RESTART_BASE_DELAY_S = 1.0
 RESTART_MAX_DELAY_S = 30.0
@@ -576,11 +577,6 @@ def _validate_provider_credential(value: object) -> None:
         raise ValueError("provider credential is too short")
 
 
-def _oauth_env_suffix(provider: str) -> str:
-    """Normalize a provider id into its ``CAMBIUM_OAUTH_*`` environment suffix."""
-    return re.sub(r"[._-]+", "_", provider.upper())
-
-
 def _fanout_provider_names(spec: Mapping[str, Any]) -> frozenset[str]:
     """Provider names a task references through fanout_config or assignment."""
     names: set[str] = set()
@@ -602,14 +598,16 @@ def _fanout_provider_names(spec: Mapping[str, Any]) -> frozenset[str]:
 def _codex_oauth_provider_names(
     spec: Mapping[str, Any], source: Mapping[str, str]
 ) -> frozenset[str]:
-    """The referenced providers whose loaded config tags ``auth=codex_chatgpt``.
+    """The authorized codex_chatgpt providers that need an OAuth token injected.
 
-    A config that cannot be loaded yields no names: the worker's own config
-    load surfaces file errors at its boundary (transport authoritative), so
-    this preflight only adds the oauth-document gate on top of a loadable
-    config.
+    Identity is carried by provider name (``authorized_providers``) so OAuth
+    providers are never dropped the way env-key filtering dropped them. When a
+    task carries no authorized set (legacy plans) the referenced-provider and
+    fanout fallbacks preserve the prior behavior. A config that cannot be
+    loaded yields no names: the worker's own config load surfaces file errors
+    at its boundary (transport authoritative), so this preflight only adds the
+    oauth-document gate on top of a loadable config.
     """
-    referenced = _fanout_provider_names(spec)
     try:
         providers = load_providers(_provider_config_path(source, spec))
     except (OSError, ValueError):
@@ -619,6 +617,13 @@ def _codex_oauth_provider_names(
         for provider in providers
         if provider.auth is AuthMode.CODEX_CHATGPT
     )
+    authorized_raw = spec.get("authorized_providers")
+    if isinstance(authorized_raw, (list, tuple)):
+        authorized = frozenset(
+            name for name in authorized_raw if isinstance(name, str) and name
+        )
+        return codex & authorized
+    referenced = _fanout_provider_names(spec)
     if referenced:
         return codex & referenced
     # No explicit provider restriction: the worker loads every configured
@@ -752,10 +757,10 @@ def _oauth_worker_environment(
                 f"task references codex_chatgpt provider {provider!r} but its "
                 f"oauth session could not be ensured fresh: {exc}{hint}"
             ) from None
-        additions[f"CAMBIUM_OAUTH_ACCESS_{_oauth_env_suffix(provider)}"] = access_token
+        additions[f"CAMBIUM_OAUTH_ACCESS_{oauth_env_suffix(provider)}"] = access_token
         access_values.append(access_token)
         if account_id:
-            additions[f"CAMBIUM_OAUTH_ACCOUNT_{_oauth_env_suffix(provider)}"] = account_id
+            additions[f"CAMBIUM_OAUTH_ACCOUNT_{oauth_env_suffix(provider)}"] = account_id
     return additions, access_values
 
 
@@ -2283,6 +2288,7 @@ class _Runtime:
             "budget": {"max_wall_s": wall_budget, "max_restarts": DEFAULT_MAX_RESTARTS},
             "permissions": {"shell": True, "network": False},
             "provider_env_keys": list(spec.get("provider_env_keys", ())),
+            "authorized_providers": list(spec.get("authorized_providers", ())),
         }
         if self._debt_store is not None:
             debt = self._debt_store.as_mapping()
@@ -3265,6 +3271,16 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     if not isinstance(provider_env_keys, (list, tuple)):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
     spec["provider_env_keys"] = list(provider_env_keys)
+    authorized_providers = spec.get("authorized_providers", ())
+    if (
+        isinstance(authorized_providers, (str, bytes))
+        or not isinstance(authorized_providers, (list, tuple))
+        or not all(isinstance(name, str) and name for name in authorized_providers)
+    ):
+        raise ValueError(
+            f"task {task_id} authorized_providers must be a list of names"
+        )
+    spec["authorized_providers"] = list(authorized_providers)
     model_candidates = spec.get("model_candidates")
     if model_candidates is not None:
         if not isinstance(model_candidates, (list, tuple)) or not model_candidates or not all(
@@ -3301,36 +3317,19 @@ def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None
         lanes[provider.name] = LaneState(rpm_allowance=float(rpm or 60))
 
 
-def _assigned_tier(
-    providers: Sequence[Any], provider_name: str, pinned_tier: str | None
-) -> str:
-    """The call tier for an assigned provider: the provider's own tier (or the
-    caller-pinned tier when the provider matched it). The worker routes calls
-    by tier, so the assignment and the call tier must agree."""
-    if isinstance(pinned_tier, str) and pinned_tier:
-        return pinned_tier
-    for provider in providers:
-        if provider.name == provider_name:
-            return provider.tier.value
-    raise ValueError(f"assigned provider {provider_name!r} not found among candidates")
-
-
 def _resolve_model_candidates(
     spec: dict[str, Any], debt: Mapping[str, Any], lanes: dict[str, LaneState]
 ) -> bool:
     """Resolve a task's (provider, model) when it declares ``model_candidates``
     and its fanout_config carries no pinned model.
 
-    The pick comes from the usage-debt ledger against the same provider config
-    the worker will load, before the model filter partitions the pool (solution
-    C), and skips providers whose lane is at or above its effective in-flight
-    cap (H1). When the task declares ``requirements``, the pick is the lowest
-    ``routing.score_providers`` score among providers that satisfy the task's
-    capability constraints (H2, STRICT filter); otherwise it is the max-min
-    ``routing.select_lane`` pick as before. Mutates ``spec`` in place: writes
-    the chosen model into ``fanout_config`` and records the chosen provider as
-    ``assigned_provider``. Returns True when an assignment was written; pinned
-    tasks (``fanout_config.model`` set) and tasks without a fanout_config are
+    The pure pick lives in :func:`cambium.routing.resolve_assignment`; this
+    function loads the provider config, restricts the pool to the task's
+    authorized provider identities (carried by name, so OAuth providers are
+    never dropped the way env-key filtering dropped them), and applies the
+    returned assignment to ``spec`` at the runtime edge (mutates
+    ``fanout_config`` and records ``assigned_provider``). Returns True when an
+    assignment was written; pinned tasks and tasks without a fanout_config are
     left untouched and return False.
     """
     fanout_config = spec.get("fanout_config")
@@ -3343,42 +3342,52 @@ def _resolve_model_candidates(
     ):
         return False
     providers = load_providers(_provider_config_path(os.environ, spec))
-    authorized_provider_keys = _provider_env_keys(spec)
-    if authorized_provider_keys:
-        # Auto-mode plans carry only the provider environment names whose
-        # credentials were loaded for this run.  Model ids are not unique
-        # provider identities, so keep the routing, lane, and worker
-        # assignment pool on that same authorized set.
-        providers = [
-            provider
-            for provider in providers
-            if provider.api_key_env in authorized_provider_keys
-        ]
+    authorized_raw = spec.get("authorized_providers")
+    authorized = (
+        frozenset(name for name in authorized_raw if isinstance(name, str) and name)
+        if isinstance(authorized_raw, (list, tuple))
+        else None
+    )
+    if authorized is None:
+        # Legacy auto-mode plans carried only env-key names. Keep them working
+        # by deriving identity from the env keys, but prefer the explicit
+        # authorized carrier when present (OAuth providers have no env name).
+        authorized_provider_keys = _provider_env_keys(spec)
+        if authorized_provider_keys:
+            providers = [
+                provider
+                for provider in providers
+                if provider.api_key_env in authorized_provider_keys
+            ]
     # A caller-pinned tier is a hard constraint: only providers in that tier
     # may serve the task, so the assignment can never contradict it.
-    pinned_tier = fanout_config.get("tier")
-    if isinstance(pinned_tier, str) and pinned_tier:
-        providers = [p for p in providers if p.tier.value == pinned_tier]
+    raw_pinned_tier = fanout_config.get("tier")
+    pinned_tier = raw_pinned_tier if isinstance(raw_pinned_tier, str) and raw_pinned_tier else None
     _ensure_lanes(lanes, providers)
     requirements = spec.get("requirements")
-    if requirements:
-        # H2: capability/quality-constrained scoring — pick the lowest score
-        # among providers that satisfy the task's requirements (STRICT filter,
-        # fail-closed); never fall back to a provider that fails them.
-        provider_name, model, _score = score_providers(
-            providers, candidates, debt, lanes, requirements=requirements
-        )[0]
-    else:
-        provider_name, model = select_lane(providers, candidates, debt, lanes)
+    try:
+        assignment = resolve_assignment(
+            providers,
+            candidates,
+            debt,
+            lanes,
+            requirements=requirements if requirements else None,
+            authorized=authorized,
+            pinned_tier=pinned_tier,
+        )
+    except ValueError as exc:
+        raise ValueError(f"task {spec.get('task_id')}: provider assignment failed: {exc}") from exc
+    if assignment is None:
+        return False
     # The (provider, model, tier) assignment is one atomic unit: the worker
     # routes calls by tier, so the assigned provider's tier must be the call
     # tier or the assignment is filtered out before any request is sent.
     spec["fanout_config"] = {
         **fanout_config,
-        "model": model,
-        "tier": _assigned_tier(providers, provider_name, pinned_tier),
+        "model": assignment.model,
+        "tier": assignment.tier,
     }
-    spec["assigned_provider"] = provider_name
+    spec["assigned_provider"] = assignment.provider
     return True
 
 
