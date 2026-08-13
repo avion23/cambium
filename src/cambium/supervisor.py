@@ -118,6 +118,7 @@ from .redact import (
 from .results import EXIT_CODES, Result, write_result
 from .routing import (
     DebtStore,
+    LaneCapacityExhausted,
     LaneState,
     ProviderDebt,
     resolve_assignment,
@@ -3399,7 +3400,7 @@ def _resolve_model_candidates(
     authorized_raw = spec.get("authorized_providers")
     authorized = (
         frozenset(name for name in authorized_raw if isinstance(name, str) and name)
-        if isinstance(authorized_raw, (list, tuple))
+        if isinstance(authorized_raw, (list, tuple)) and authorized_raw
         else None
     )
     if authorized is None:
@@ -3464,7 +3465,11 @@ def _preassign_lanes(
     """
     batch_debt = {name: replace(entry) for name, entry in (debt or {}).items()}
     for spec in specs:
-        if not _resolve_model_candidates(spec, batch_debt, lanes):
+        try:
+            assigned = _resolve_model_candidates(spec, batch_debt, lanes)
+        except LaneCapacityExhausted:
+            continue
+        if not assigned:
             continue
         provider_name = spec["assigned_provider"]
         lanes[provider_name].in_flight += 1

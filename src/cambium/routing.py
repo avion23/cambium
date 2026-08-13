@@ -433,6 +433,10 @@ class ProviderAssignment:
     tier: str
 
 
+class LaneCapacityExhausted(ValueError):
+    """No eligible provider currently has a spare admission lane."""
+
+
 def resolve_assignment(
     providers: Sequence[Any],
     candidates: Sequence[str],
@@ -580,7 +584,7 @@ def select_lane(
                 continue
         serving.append((index, provider))
     if not serving:
-        raise ValueError(
+        raise LaneCapacityExhausted(
             f"model_candidates {list(candidates)!r} match no enabled configured "
             "provider with a spare lane"
         )
@@ -667,6 +671,7 @@ def score_providers(
     require_strong = requirements.get("quality") == "high"
     min_context_window = requirements.get("min_context_window")
     eligible: list[Any] = []
+    capability_matches = 0
     models: dict[str, str] = {}
     for provider in providers:
         if not getattr(provider, "enabled", True):
@@ -682,8 +687,9 @@ def score_providers(
                 isinstance(capacity, bool)
                 or not isinstance(capacity, (int, float))
                 or capacity < min_context_window
-            ):
+                ):
                 continue
+        capability_matches += 1
         if lanes is not None:
             lane = lanes.get(provider.name)
             if lane is not None:
@@ -696,6 +702,11 @@ def score_providers(
         eligible.append(provider)
         models[provider.name] = model
     if not eligible:
+        if capability_matches:
+            raise LaneCapacityExhausted(
+                f"model_candidates {list(candidates)!r} match no enabled configured "
+                "provider with a spare lane"
+            )
         raise ValueError(
             f"model_candidates {list(candidates)!r} match no enabled configured "
             "provider satisfying task requirements"
@@ -719,6 +730,7 @@ __all__ = [
     "DEFAULT_ROUTING_STATE_PATH",
     "DEFAULT_TOKEN_WINDOW_ALLOWANCE",
     "DebtStore",
+    "LaneCapacityExhausted",
     "LaneState",
     "ProviderAssignment",
     "ProviderDebt",
