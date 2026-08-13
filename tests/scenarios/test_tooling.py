@@ -135,8 +135,11 @@ def test_doctor_warns_on_missing_optional_provider_key(tmp_path, monkeypatch) ->
     result = _run_doctor(cwd=tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Provider env" in result.stdout
-    assert "missing provider key is WARN" in result.stdout
+    assert re.search(
+        r"Provider env\s+WARN\s+.*test-provider=missing; "
+        r"missing provider credential is WARN unless required=true \(test-provider\)",
+        result.stdout,
+    )
     assert "0 fail" in result.stdout
 
 
@@ -150,7 +153,11 @@ def test_doctor_fails_on_missing_required_provider_key(tmp_path, monkeypatch) ->
     result = _run_doctor(cwd=tmp_path)
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "required provider key missing" in result.stdout
+    assert re.search(
+        r"Provider env\s+FAIL\s+.*test-provider=missing; "
+        r"required provider credential missing for test-provider",
+        result.stdout,
+    )
     assert re.search(r"Summary: .* [1-9]\d* fail", result.stdout)
 
 
