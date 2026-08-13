@@ -88,10 +88,13 @@ def run_repl(
                 prompt_config = _config_for_prompt(config, prompt)
                 events: list[dict[str, Any]] = []
 
-                def _live_sink(record: dict[str, Any]) -> None:
-                    events.append(record)
+                def _live_sink(
+                    record: dict[str, Any],
+                    _events: list[dict[str, Any]] = events,
+                ) -> None:
+                    _events.append(record)
                     output_stream.write(render.render_event_line(record) + "\n")
-                    status = render.render_live_status_line(events)
+                    status = render.render_live_status_line(_events)
                     if status:
                         output_stream.write(status + "\n")
                     output_stream.flush()

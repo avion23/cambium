@@ -15,17 +15,54 @@ _EXIT_INTERRUPT = 130
 _EXIT_BROKEN_PIPE = 0
 _EXIT_BACKEND_MISSING = 1
 _EXIT_RUN_FAILED = 1
+_ANSI_CLEAR = "\033[2J\033[H"
 
 
 def _run(value):
     return asyncio.run(value) if inspect.isawaitable(value) else value
 
 
-def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None) -> int:
+def _is_tty(stream: Any) -> bool:
+    try:
+        return bool(getattr(stream, "isatty", lambda: False)())
+    except (AttributeError, OSError):
+        return False
+
+
+def _write_line(out: Any, line: str) -> None:
+    if line:
+        out.write(line)
+        if not line.endswith("\n"):
+            out.write("\n")
+
+
+def _dashboard_lines(session_dir: Path, events: list[dict[str, Any]], render, stats) -> list[str]:
+    lines = [f"session: {session_dir}"]
+    elapsed = render.render_elapsed(events)
+    if elapsed:
+        lines[0] += f" · {elapsed}"
+    status = render.render_subagent_status(events)
+    if status:
+        lines.extend(status.splitlines())
+    live = render.render_live_status_line(events)
+    if live:
+        lines.append(live)
+    usage = render.render_usage_stats_line(stats.usage_stats_from_events(events))
+    if usage:
+        lines.append(usage)
+    if events:
+        lines.append(render.render_event_line(events[-1]))
+    return lines
+
+
+def run_tui(
+    config, *, input_stream=None, output_stream=None, error_stream=None, quiet=False
+) -> int:
     """Run the line-oriented terminal loop and return an exit code."""
     source = sys.stdin if input_stream is None else input_stream
     out = sys.stdout if output_stream is None else output_stream
     err = sys.stderr if error_stream is None else error_stream
+    dashboard = _is_tty(out) and not quiet
 
     try:
         from cambium import oneshot, render, stats
@@ -56,12 +93,20 @@ def run_tui(config, *, input_stream=None, output_stream=None, error_stream=None)
                 prompt_config = replace(config, prompt=prompt, session_root=session_dir)
                 events: list[dict[str, Any]] = []
 
-                def _live_sink(record: dict[str, Any]) -> None:
-                    events.append(record)
-                    out.write(render.render_event_line(record) + "\n")
-                    status = render.render_live_status_line(events)
-                    if status:
-                        out.write(status + "\n")
+                def _live_sink(
+                    record: dict[str, Any],
+                    _events: list[dict[str, Any]] = events,
+                    _session_dir: Path = session_dir,
+                ) -> None:
+                    _events.append(record)
+                    if dashboard:
+                        out.write(_ANSI_CLEAR)
+                        for line in _dashboard_lines(_session_dir, _events, render, stats):
+                            _write_line(out, line)
+                    elif not quiet:
+                        _write_line(out, render.render_event_line(record))
+                        status = render.render_live_status_line(_events)
+                        _write_line(out, status)
                     out.flush()
 
                 response = _run(oneshot.run_oneshot(prompt_config, on_event=_live_sink))

@@ -358,6 +358,57 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     return f"{prefix}  {_dumps(payload)}"
 
 
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _event_timestamp(event: Mapping[str, Any], key: str) -> float | None:
+    value = event.get(key)
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    return _finite_number(value)
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"elapsed={hours}h{minutes}m{seconds}s"
+    if minutes:
+        return f"elapsed={minutes}m{seconds}s"
+    return f"elapsed={seconds}s"
+
+
+def render_elapsed(events: Any) -> str:
+    """Render elapsed time from the first and last event timestamps.
+
+    ``monotonic_ms`` is preferred when both endpoints provide a finite value;
+    otherwise numeric ``ts`` values are interpreted as seconds. Returns ``""``
+    when the first and last events have no usable common timestamp.
+    """
+    if events is None:
+        return ""
+    records = [event for event in events if isinstance(event, Mapping)]
+    if not records:
+        return ""
+    for key, divisor in (("monotonic_ms", 1000.0), ("ts", 1.0)):
+        first = _event_timestamp(records[0], key)
+        last = _event_timestamp(records[-1], key)
+        if first is not None and last is not None:
+            return _format_elapsed(max(0.0, (last - first) / divisor))
+    return ""
+
+
 _WORKER_ACTIVE_INC = frozenset({"spawned"})
 _WORKER_ACTIVE_DEC = frozenset({"exit", "reuse_ready", "worker_failed"})
 
@@ -373,24 +424,49 @@ def render_subagent_status(events: Any) -> str:
     ``worker_failed`` or ``exit`` settles ``done``/``failed``/``exited``;
     ``task_assigned`` with no spawn yet is ``queued``.  The turn counter comes
     from the newest ``heartbeat``/``usage_event``/``tool_event`` payload and the
-    active_provider from the newest ``usage_event``.  Returns one line per
-    sub-agent in first-appearance order, or ``""`` when there are no events.
+    active_provider from the newest ``usage_event``. Token and cost columns sum
+    the task's ``usage_event`` rows. A final totals line includes all task
+    usage and elapsed time. Returns one line per sub-agent in first-appearance
+    order, or ``""`` when there are no sub-agents.
     """
+    if events is None:
+        return ""
+    event_records = [event for event in events if isinstance(event, Mapping)]
     states: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    for event in events:
-        if not isinstance(event, Mapping):
-            continue
+    total_tokens = 0
+    total_cost = 0.0
+    for event in event_records:
+        kind = event.get("kind")
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        usage_tokens = 0
+        usage_cost = 0.0
+        if kind == "usage_event":
+            usage = payload.get("usage")
+            if isinstance(usage, Mapping):
+                tokens = _finite_number(usage.get("total_tokens"))
+                if tokens is not None:
+                    usage_tokens = int(tokens)
+                    total_tokens += usage_tokens
+            cost = _finite_number(payload.get("estimated_cost_usd"))
+            if cost is not None and cost >= 0:
+                usage_cost = cost
+                total_cost += cost
         task_id = event.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             continue
         record = states.get(task_id)
         if record is None:
-            record = {"state": "queued", "generation": 0, "turn": 0, "provider": ""}
+            record = {
+                "state": "queued",
+                "generation": 0,
+                "turn": 0,
+                "provider": "",
+                "tokens": 0,
+                "cost": 0.0,
+            }
             states[task_id] = record
             order.append(task_id)
-        kind = event.get("kind")
-        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
         generation = event.get("generation")
         if isinstance(generation, int) and not isinstance(generation, bool):
             record["generation"] = max(record["generation"], generation)
@@ -415,13 +491,22 @@ def render_subagent_status(events: Any) -> str:
             provider = payload.get("provider")
             if isinstance(provider, str) and provider:
                 record["provider"] = provider
+            record["tokens"] += usage_tokens
+            record["cost"] += usage_cost
     if not order:
         return ""
-    return "\n".join(
+    lines = [
         f"{task_id:<24} {record['state']:<9} gen={record['generation']} "
-        f"turn={record['turn']} provider={record['provider']}"
+        f"turn={record['turn']} provider={record['provider']} "
+        f"tokens={record['tokens']} cost=${record['cost']:.6f}"
         for task_id, record in ((tid, states[tid]) for tid in order)
-    )
+    ]
+    elapsed = render_elapsed(event_records)
+    totals = f"totals: tokens={total_tokens} cost=${total_cost:.6f}"
+    if elapsed:
+        totals += f" {elapsed}"
+    lines.append(totals)
+    return "\n".join(lines)
 
 
 def render_tokens_per_s(events: Any) -> str:
@@ -516,6 +601,7 @@ def render_live_status_line(events: Any) -> str:
 __all__ = [
     "render_active_workers",
     "render_event_line",
+    "render_elapsed",
     "render_json_result",
     "render_live_status_line",
     "render_subagent_status",

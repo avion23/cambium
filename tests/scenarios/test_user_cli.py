@@ -559,7 +559,7 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
 
     assert cli.main(["session", "status", "--session-dir", str(root), "mix"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 4
+    assert len(lines) == 5
     alpha = next(line for line in lines if line.startswith("alpha"))
     assert "running" in alpha and "gen=2" in alpha and "turn=7" in alpha and "codex" in alpha
     beta = next(line for line in lines if line.startswith("beta"))
@@ -568,6 +568,8 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
     assert "done" in gamma
     delta = next(line for line in lines if line.startswith("delta"))
     assert "queued" in delta
+    totals = next(line for line in lines if line.startswith("totals:"))
+    assert totals == "totals: tokens=0 cost=$0.000000"
 
 
 def test_session_status_rejects_missing_event_log(capsys, tmp_path: Path) -> None:
