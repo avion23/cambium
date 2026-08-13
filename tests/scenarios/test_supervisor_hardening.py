@@ -16,7 +16,6 @@ import pytest
 import cambium.supervisor as supervisor_module
 from cambium.fencing import read_generation, validate_worker_generation, write_generation
 from cambium.supervisor import (
-    DuplicateTaskIDError,
     SessionAlreadyRunningError,
     read_events,
     run_plan,
@@ -1037,8 +1036,12 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps({"tasks": [task, task]}), encoding="utf-8")
 
-    with pytest.raises(DuplicateTaskIDError, match="duplicate"):
-        supervisor_module.main(["--session-dir", str(session_dir), "--plan", str(plan_path)])
+    assert (
+        supervisor_module.main(
+            ["--session-dir", str(session_dir), "--plan", str(plan_path)]
+        )
+        == 2
+    )
 
     assert not hook_report.exists()
     assert subprocess.run(

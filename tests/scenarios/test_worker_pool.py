@@ -326,7 +326,9 @@ def test_supervisor_pool_reuses_worker_across_tasks(tmp_path: Path, monkeypatch)
         ]
     }
 
-    result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
+    result = asyncio.run(
+        run_plan(session_dir, plan, max_concurrent_tasks=1, warm_pool_size=2)
+    )
 
     assert result.exit_code == 0
     assert {r.task_id for r in result.results} == {"t-a", "t-b"}
@@ -393,7 +395,7 @@ def test_restarted_generation_spawns_fresh_never_reuses_pool(
         ]
     }
 
-    result = asyncio.run(run_plan(session_dir, plan))
+    result = asyncio.run(run_plan(session_dir, plan, warm_pool_size=2))
 
     crash_result = next(r for r in result.results if r.task_id == "t-crash")
     assert crash_result.status == "failed"
@@ -440,7 +442,9 @@ def test_pool_disabled_size_zero_keeps_single_init_behavior(
         ]
     }
 
-    result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1))
+    result = asyncio.run(
+        run_plan(session_dir, plan, max_concurrent_tasks=1, warm_pool_size=0)
+    )
 
     assert result.exit_code == 0
     assert all(r.status == "succeeded" for r in result.results)
@@ -470,7 +474,7 @@ def test_session_end_kills_idle_pooled_workers(tmp_path: Path, monkeypatch) -> N
         ]
     }
 
-    result = asyncio.run(run_plan(session_dir, plan))
+    result = asyncio.run(run_plan(session_dir, plan, warm_pool_size=2))
 
     assert result.exit_code == 0
     assert result.results[0].status == "succeeded"
