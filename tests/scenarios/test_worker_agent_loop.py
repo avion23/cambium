@@ -78,9 +78,11 @@ def test_env_float_rejects_non_finite_values(
     default = 17.5
     monkeypatch.setenv("CAMBIUM_TEST_FLOAT", value)
 
-    result = worker._env_float("CAMBIUM_TEST_FLOAT", default)
+    with pytest.raises(ValueError, match="finite"):
+        worker._env_float("CAMBIUM_TEST_FLOAT", default)
 
-    assert result is default
+    monkeypatch.delenv("CAMBIUM_TEST_FLOAT")
+    assert worker._env_float("CAMBIUM_TEST_FLOAT", default) is default
 
 
 def _make_worktree(repo: Path, branch: str = "agent-loop") -> Path:

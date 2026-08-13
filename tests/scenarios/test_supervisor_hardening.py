@@ -107,10 +107,11 @@ def _kinds(events: list[dict], kind: str) -> list[dict]:
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_cfg_float_nonfinite_value_uses_default(value: float) -> None:
-    assert supervisor_module._cfg_float(
-        {"max_wall_s": value}, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", 42.0
-    ) == 42.0
+def test_cfg_float_nonfinite_value_is_rejected(value: float) -> None:
+    with pytest.raises(ValueError, match="must be finite"):
+        supervisor_module._cfg_float(
+            {"max_wall_s": value}, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", 42.0
+        )
 
 
 def test_cfg_float_malformed_value_names_key() -> None:
