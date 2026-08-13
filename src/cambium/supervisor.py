@@ -1972,6 +1972,12 @@ class _Runtime:
             self._results[spec["task_id"]] = TaskResult(
                 task_id=spec["task_id"], status="failed", exit_code=1, reason=reason
             )
+        except WorktreeRecoveryError:
+            reason = "worktree_recovery_failed"
+            await self.emit("worker_failed", task_id=spec["task_id"], reason=reason)
+            self._results[spec["task_id"]] = TaskResult(
+                task_id=spec["task_id"], status="failed", exit_code=1, reason=reason
+            )
         finally:
             # Lane release (H1): every task that holds a lane reservation
             # (batch pre-assignment or admission-time assignment) frees it on
