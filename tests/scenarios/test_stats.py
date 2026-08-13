@@ -8,8 +8,15 @@ from dataclasses import asdict
 
 import pytest
 
-from cambium.render import _human_count, render_usage_stats_line
-from cambium.stats import UsageStats, session_usage_stats, usage_stats_from_events
+from cambium.render import _human_count, render_usage_breakdown, render_usage_stats_line
+from cambium.stats import (
+    UsageBreakdown,
+    UsageStats,
+    session_usage_breakdown,
+    session_usage_stats,
+    usage_breakdown_from_events,
+    usage_stats_from_events,
+)
 
 _EVENTS_SCHEMA = """CREATE TABLE events (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,6 +44,12 @@ def _insert_event(
         "INSERT INTO events(seq, kind, payload) VALUES(?, ?, ?)",
         (seq, kind, json.dumps(payload, sort_keys=True)),
     )
+
+
+def _usage_payload(**values: object) -> dict[str, object]:
+    payload: dict[str, object] = {"turn": 1}
+    payload.update(values)
+    return payload
 
 
 def test_usage_stats_from_events_empty_sequence_is_none() -> None:
@@ -455,3 +468,216 @@ def test_render_usage_stats_line_mapping_matches_dataclass_line() -> None:
 def test_render_usage_stats_line_raises_type_error_for_other_input() -> None:
     with pytest.raises(TypeError):
         render_usage_stats_line(42)
+
+
+def test_usage_stats_from_events_accumulates_estimated_cost() -> None:
+    events = [
+        _event(
+            "usage_event",
+            {
+                "turn": 1,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+                "model": "m",
+                "provider": "p",
+                "estimated_cost_usd": 0.0015,
+            },
+        ),
+        _event(
+            "usage_event",
+            {
+                "turn": 2,
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+                "model": "m",
+                "provider": "p",
+                "estimated_cost_usd": 0.0005,
+            },
+        ),
+        _event(
+            "usage_event",
+            {
+                "turn": 3,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "model": "m",
+                "provider": "p",
+                "estimated_cost_usd": "garbage",
+            },
+        ),
+    ]
+    stats = usage_stats_from_events(events)
+    assert stats is not None
+    assert stats.estimated_cost_usd == pytest.approx(0.002)
+    assert stats.calls == 3
+
+
+def test_usage_stats_from_events_ignores_negative_cost() -> None:
+    stats = usage_stats_from_events(
+        [
+            _event(
+                "usage_event",
+                {
+                    "turn": 1,
+                    "usage": {"total_tokens": 5},
+                    "provider": "p",
+                    "estimated_cost_usd": -0.5,
+                },
+            )
+        ]
+    )
+    assert stats is not None
+    assert stats.estimated_cost_usd == 0.0
+
+
+def test_usage_breakdown_from_events_groups_by_task_and_provider() -> None:
+    events = [
+        _event(
+            "usage_event",
+            _usage_payload(
+                usage={"total_tokens": 100}, provider="p1", model="m", estimated_cost_usd=0.001
+            ),
+            task_id="t1",
+        ),
+        _event(
+            "usage_event",
+            _usage_payload(
+                usage={"total_tokens": 50}, provider="p2", model="m", estimated_cost_usd=0.0005
+            ),
+            task_id="t1",
+        ),
+        _event(
+            "usage_event",
+            _usage_payload(
+                usage={"total_tokens": 25}, provider="p1", model="m", estimated_cost_usd=0.00025
+            ),
+            task_id="t2",
+        ),
+        _event("checkpoint", {"t": 1}),
+    ]
+    breakdown = usage_breakdown_from_events(events)
+    assert breakdown is not None
+    assert [name for name, _ in breakdown.by_task] == ["t1", "t2"]
+    assert [name for name, _ in breakdown.by_provider] == ["p1", "p2"]
+    by_task = dict(breakdown.by_task)
+    by_provider = dict(breakdown.by_provider)
+    assert by_task["t1"].total_tokens == 150
+    assert by_task["t1"].estimated_cost_usd == pytest.approx(0.0015)
+    assert by_task["t2"].total_tokens == 25
+    assert by_task["t2"].estimated_cost_usd == pytest.approx(0.00025)
+    assert by_provider["p1"].total_tokens == 125
+    assert by_provider["p1"].estimated_cost_usd == pytest.approx(0.00125)
+    assert by_provider["p2"].total_tokens == 50
+    assert breakdown.total.calls == 3
+    assert breakdown.total.total_tokens == 175
+    assert breakdown.total.estimated_cost_usd == pytest.approx(0.00175)
+
+
+def test_usage_breakdown_from_events_rows_without_task_or_provider_contribute_to_total() -> None:
+    events = [
+        _event(
+            "usage_event",
+            _usage_payload(usage={"total_tokens": 10}, provider="p1", estimated_cost_usd=0.001),
+            task_id="t1",
+        ),
+        _event(
+            "usage_event",
+            _usage_payload(usage={"total_tokens": 10}, estimated_cost_usd=0.001),
+        ),
+    ]
+    breakdown = usage_breakdown_from_events(events)
+    assert breakdown is not None
+    assert len(breakdown.by_task) == 1
+    assert dict(breakdown.by_task)["t1"].total_tokens == 10
+    assert breakdown.total.calls == 2
+    assert breakdown.total.total_tokens == 20
+
+
+def test_usage_breakdown_from_events_no_usage_is_none() -> None:
+    assert usage_breakdown_from_events([_event("checkpoint", {"t": 1})]) is None
+    assert usage_breakdown_from_events([]) is None
+
+
+def test_session_usage_breakdown_aggregates_durable_log(tmp_path) -> None:
+    db = tmp_path / ".cambium" / "events.db"
+    db.parent.mkdir()
+    connection = sqlite3.connect(db)
+    connection.execute(_EVENTS_SCHEMA)
+    _insert_event(
+        connection,
+        "usage_event",
+        _usage_payload(usage={"total_tokens": 100}, provider="p1", estimated_cost_usd=0.001),
+        1,
+    )
+    _insert_event(
+        connection,
+        "usage_event",
+        _usage_payload(usage={"total_tokens": 50}, provider="p2", estimated_cost_usd=0.0005),
+        2,
+    )
+    connection.commit()
+    connection.close()
+    breakdown = session_usage_breakdown(tmp_path)
+    assert breakdown is not None
+    assert [name for name, _ in breakdown.by_provider] == ["p1", "p2"]
+    assert breakdown.total.total_tokens == 150
+    assert breakdown.total.estimated_cost_usd == pytest.approx(0.0015)
+
+
+def test_session_usage_breakdown_missing_db_is_none(tmp_path) -> None:
+    assert session_usage_breakdown(tmp_path) is None
+
+
+def test_session_usage_breakdown_missing_table_is_none(tmp_path) -> None:
+    db = tmp_path / ".cambium" / "events.db"
+    db.parent.mkdir()
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE other (x TEXT)")
+    connection.commit()
+    connection.close()
+    assert session_usage_breakdown(tmp_path) is None
+
+
+def test_render_usage_breakdown_from_dataclass() -> None:
+    breakdown = UsageBreakdown(
+        by_task=(("t1", UsageStats(2, 1, 100, 50, 0, 150, 150, "m", "p1", 0.0015)),),
+        by_provider=(("p1", UsageStats(2, 1, 100, 50, 0, 150, 150, "m", "p1", 0.0015)),),
+        total=UsageStats(2, 1, 100, 50, 0, 150, 150, "m", "p1", 0.0015),
+    )
+    text = render_usage_breakdown(breakdown)
+    lines = text.splitlines()
+    expected = "stats: calls=2 · tokens=150 (in=100 out=50 cached=0) · last_turn=+150 · model=m"
+    assert lines[0] == f"usage: {expected} · cost=$0.001500"
+    assert lines[1] == f"t1: {expected} · cost=$0.001500"
+    assert lines[2] == f"p1: {expected} · cost=$0.001500"
+
+
+def test_render_usage_breakdown_cost_line_only_when_positive() -> None:
+    breakdown = UsageBreakdown(
+        by_task=(("t1", UsageStats(1, 1, 10, 5, 0, 15, 15, "m", "p1", 0.0)),),
+        by_provider=(),
+        total=UsageStats(1, 1, 10, 5, 0, 15, 15, "m", "p1", 0.0),
+    )
+    text = render_usage_breakdown(breakdown)
+    assert "cost=$" not in text
+    assert text.splitlines()[0].startswith("usage: stats:")
+
+
+def test_render_usage_breakdown_from_mapping_matches_dataclass() -> None:
+    breakdown = UsageBreakdown(
+        by_task=(("t1", UsageStats(2, 1, 100, 50, 0, 150, 150, "m", "p1", 0.0015)),),
+        by_provider=(("p1", UsageStats(2, 1, 100, 50, 0, 150, 150, "m", "p1", 0.0015)),),
+        total=UsageStats(2, 1, 100, 50, 0, 150, 150, "m", "p1", 0.0015),
+    )
+    as_mapping = {
+        "total": asdict(breakdown.total),
+        "by_task": [(name, asdict(stats)) for name, stats in breakdown.by_task],
+        "by_provider": [(name, asdict(stats)) for name, stats in breakdown.by_provider],
+    }
+    assert render_usage_breakdown(as_mapping) == render_usage_breakdown(breakdown)
+
+
+def test_render_usage_breakdown_none_is_empty() -> None:
+    assert render_usage_breakdown(None) == ""
+
+
+def test_render_usage_breakdown_raises_type_error_for_other_input() -> None:
+    with pytest.raises(TypeError):
+        render_usage_breakdown(42)

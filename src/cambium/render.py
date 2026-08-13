@@ -266,6 +266,70 @@ def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
     return "stats: " + " · ".join(groups)
 
 
+def render_usage_breakdown(breakdown: Any) -> str:
+    """Render a ``cambium.stats.UsageBreakdown`` as a deterministic report.
+
+    Accepts the ``UsageBreakdown`` dataclass or a JSON-like mapping with the
+    same fields (``total`` plus ``by_task``/``by_provider`` as iterables of
+    ``(name, UsageStats)`` pairs). One header line with the session totals, one
+    line per task group and one per provider group. Returns ``""`` when the
+    breakdown is None.
+    """
+    if breakdown is None:
+        return ""
+    by_task: Any = ()
+    by_provider: Any = ()
+    total: Any = None
+    if is_dataclass(breakdown) and not isinstance(breakdown, type):
+        by_task = getattr(breakdown, "by_task", ())
+        by_provider = getattr(breakdown, "by_provider", ())
+        total = getattr(breakdown, "total", None)
+    elif isinstance(breakdown, Mapping):
+        raw = dict(breakdown)
+        by_task = list(raw.get("by_task") or ())
+        by_provider = list(raw.get("by_provider") or ())
+        total = raw.get("total")
+    else:
+        raise TypeError(
+            "render_usage_breakdown requires a cambium.stats.UsageBreakdown "
+            "dataclass or a JSON-like mapping"
+        )
+
+    def _amount(value: Any) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            return 0.0
+        return value
+
+    def _group_line(name: str, stats: Any) -> str:
+        line = render_usage_stats_line(stats)
+        cost = 0.0
+        if is_dataclass(stats) and not isinstance(stats, type):
+            cost = _amount(getattr(stats, "estimated_cost_usd", None))
+        elif isinstance(stats, Mapping):
+            cost = _amount(stats.get("estimated_cost_usd"))
+        if cost > 0:
+            line = f"{line} · cost=${cost:.6f}"
+        return f"{name}: {line}"
+
+    lines: list[str] = [f"usage: {render_usage_stats_line(total)}"]
+    if total is not None and (isinstance(total, Mapping) or is_dataclass(total)):
+        cost = 0.0
+        if is_dataclass(total) and not isinstance(total, type):
+            cost = _amount(getattr(total, "estimated_cost_usd", None))
+        elif isinstance(total, Mapping):
+            cost = _amount(total.get("estimated_cost_usd"))
+        if cost > 0:
+            lines[0] = f"{lines[0]} · cost=${cost:.6f}"
+    for name, stats in by_task:
+        lines.append(_group_line(name, stats))
+    for name, stats in by_provider:
+        lines.append(_group_line(name, stats))
+    return "\n".join(lines)
+
+
 def render_event_line(event: Mapping[str, Any]) -> str:
     """Render one redacted event record as one deterministic line.
 
@@ -457,5 +521,6 @@ __all__ = [
     "render_subagent_status",
     "render_text_result",
     "render_tokens_per_s",
+    "render_usage_breakdown",
     "render_usage_stats_line",
 ]

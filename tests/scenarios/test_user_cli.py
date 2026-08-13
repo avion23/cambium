@@ -582,6 +582,60 @@ def test_session_status_rejects_missing_event_log(capsys, tmp_path: Path) -> Non
     assert "Traceback" not in captured.err
 
 
+def test_session_usage_renders_per_task_and_provider(capsys, tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "usage"
+
+    def _usage(task_id: str, provider: str, turn: int, total: int, cost: float) -> dict[str, Any]:
+        return {
+            "kind": "usage_event",
+            "task_id": task_id,
+            "generation": 1,
+            "payload": {
+                "provider": provider,
+                "turn": turn,
+                "usage": {"total_tokens": total},
+                "estimated_cost_usd": cost,
+            },
+        }
+
+    _write_lifecycle_events(
+        session_dir,
+        [
+            _usage("alpha", "p1", 1, 100, 0.0015),
+            _usage("alpha", "p1", 2, 50, 0.0005),
+            _usage("beta", "p2", 1, 25, 0.00025),
+            {"kind": "checkpoint", "task_id": "beta", "generation": 1, "payload": {"t": 1}},
+        ],
+    )
+
+    assert cli.main(["session", "usage", "--session-dir", str(root), "usage"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 5
+    assert lines[0].startswith("usage: stats:")
+    assert "calls=3" in lines[0]
+    alpha = next(line for line in lines if line.startswith("alpha:"))
+    assert "calls=2" in alpha and "cost=$0.002000" in alpha
+    beta = next(line for line in lines if line.startswith("beta:"))
+    assert "calls=1" in beta and "cost=$0.000250" in beta
+    p1 = next(line for line in lines if line.startswith("p1:"))
+    assert "calls=2" in p1
+    p2 = next(line for line in lines if line.startswith("p2:"))
+    assert "calls=1" in p2
+
+
+def test_session_usage_rejects_missing_event_log(capsys, tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "empty"
+    session_dir.mkdir(parents=True)  # no .cambium/events.db on purpose
+
+    assert cli.main(["session", "usage", "--session-dir", str(root), "empty"]) == 1
+    captured = capsys.readouterr()
+    assert "cambium session:" in captured.err
+    assert "no usage event log" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_session_resume_rejects_missing_plan(capsys, tmp_path: Path) -> None:
     session_dir = tmp_path / "crashed"
     (session_dir / ".cambium").mkdir(parents=True)

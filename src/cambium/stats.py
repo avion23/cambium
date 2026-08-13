@@ -202,8 +202,8 @@ def usage_breakdown_from_events(events: Sequence[Mapping[str, Any]]) -> UsageBre
     task_id or provider contribute only to the totals. None when no
     usage_event record exists.
     """
-    task_events: dict[str, list[dict[str, Any]]] = {}
-    provider_events: dict[str, list[dict[str, Any]]] = {}
+    task_events: dict[str, list[Mapping[str, Any]]] = {}
+    provider_events: dict[str, list[Mapping[str, Any]]] = {}
     task_order: list[str] = []
     provider_order: list[str] = []
     for event in events:
@@ -279,4 +279,11 @@ def session_usage_breakdown(session_dir: str | Path) -> UsageBreakdown | None:
     return usage_breakdown_from_events(events)
 
 
-__all__ = ["UsageBreakdown", "UsageStats", "session_usage_breakdown", "session_usage_stats", "usage_breakdown_from_events", "usage_stats_from_events"]
+__all__ = [
+    "UsageBreakdown",
+    "UsageStats",
+    "session_usage_breakdown",
+    "session_usage_stats",
+    "usage_breakdown_from_events",
+    "usage_stats_from_events",
+]

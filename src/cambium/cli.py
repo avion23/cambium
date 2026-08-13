@@ -413,6 +413,18 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SESSION",
         help="session directory to resume (must contain plan.json)",
     )
+    session_usage = session_commands.add_parser(
+        "usage",
+        help="show aggregated token and cost usage of one session",
+        description="Aggregate the usage_event rows of one session's durable event "
+        "log, grouped by task and by provider, with estimated cost.",
+    )
+    session_usage.add_argument("--session-dir", metavar="DIR", help="session directory")
+    session_usage.add_argument(
+        "session_id",
+        metavar="SESSION",
+        help="session id whose usage to aggregate",
+    )
 
     commands.add_parser(
         "tasktree",
@@ -958,6 +970,24 @@ def _run_session(args: argparse.Namespace) -> int:
             return 1
         text = render.render_subagent_status(events)
         print(text)
+        return 0
+    if args.session_command == "usage":
+        from . import stats as stats_module
+
+        candidate = Path(args.session_id).expanduser()
+        path = candidate if candidate.is_absolute() else root / candidate
+        try:
+            breakdown = stats_module.session_usage_breakdown(path)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            print(f"cambium session: {exc}", file=sys.stderr)
+            return 1
+        if breakdown is None:
+            print(
+                f"cambium session: no usage event log for {path}",
+                file=sys.stderr,
+            )
+            return 1
+        print(render.render_usage_breakdown(breakdown))
         return 0
     if args.session_command == "resume":
         from . import supervisor
