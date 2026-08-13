@@ -3924,7 +3924,11 @@ async def run_plan(
         # caller owns where routing evidence lives (oneshot defaults it to a
         # repo-scoped file; tests pass scratch paths).
         debt_store = DebtStore(routing_state_path)
-        debt_store.load()
+        routing_state_load_error: OSError | None = None
+        try:
+            debt_store.load()
+        except OSError as exc:
+            routing_state_load_error = exc
         conversations_store = None
         try:
             if conversations:
@@ -3949,6 +3953,11 @@ async def run_plan(
             warm_pool_size=warm_pool_size,
         )
         await runtime.start()
+        if routing_state_load_error is not None:
+            await runtime.emit(
+                "log", task_id=None,
+                message=f"routing-state load failed: {routing_state_load_error}",
+            )
         runtime.set_session_tasks(specs)
         cancelled = False
         try:
