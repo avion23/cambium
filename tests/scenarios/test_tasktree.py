@@ -55,6 +55,14 @@ def _run_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_unified_cli_rejects_tasktree() -> None:
+    from cambium import cli
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["tasktree"])
+    assert raised.value.code == 2
+
+
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_prints_topological_order_json_lines() -> None:
     plan = _plan([

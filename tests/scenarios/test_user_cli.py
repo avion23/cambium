@@ -107,18 +107,12 @@ def test_unknown_single_token_is_not_reinterpreted_as_a_prompt(capsys) -> None:
     assert "invalid command arguments" in capsys.readouterr().err
 
 
-def test_bare_prompt_dispatches_multiple_words(monkeypatch, capsys) -> None:
-    captured: list[oneshot.OneShotConfig] = []
-
-    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
-        captured.append(config)
-        return _plan_result()
-
-    monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
-
-    assert cli.main(["make", "the", "change"]) == 0
-    assert captured[0].prompt == "make the change"
-    assert "plan=tasks:1" in capsys.readouterr().out
+def test_bare_prompt_is_rejected_regardless_of_token_count(capsys) -> None:
+    for command_line in (["make"], ["make", "the", "change"]):
+        with pytest.raises(SystemExit) as raised:
+            cli.main(command_line)
+        assert raised.value.code == 2
+        assert "invalid command arguments" in capsys.readouterr().err
 
 
 def test_run_oneshot_delegates_async_at_supervisor_boundary(monkeypatch, tmp_path: Path) -> None:
@@ -251,19 +245,19 @@ def test_repl_and_tui_make_a_new_config_per_prompt(monkeypatch, tmp_path: Path) 
     monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
     base = oneshot.OneShotConfig(repo=tmp_path / "repo", provider="demo")
     repl_out = StringIO()
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         base,
         input_stream=StringIO("first\n/exit\n"),
         output_stream=repl_out,
         error_stream=StringIO(),
-    ) == 0
+    )) == 0
     tui_out = StringIO()
-    assert tui.run_tui(
+    assert asyncio.run(tui.run_tui(
         base,
         input_stream=StringIO("second\n"),
         output_stream=tui_out,
         error_stream=StringIO(),
-    ) == 0
+    )) == 0
 
     assert [config.prompt for config in configs] == ["first", "second"]
     assert all(config.repo == base.repo and config.provider == base.provider for config in configs)
@@ -282,18 +276,18 @@ def test_repl_and_tui_return_nonzero_for_failed_plan_result(monkeypatch, tmp_pat
     monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
     base = oneshot.OneShotConfig(repo=tmp_path / "repo", provider="demo")
 
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         base,
         input_stream=StringIO("failed\n/exit\n"),
         output_stream=StringIO(),
         error_stream=StringIO(),
-    ) == 1
-    assert tui.run_tui(
+    )) == 1
+    assert asyncio.run(tui.run_tui(
         base,
         input_stream=StringIO("failed\n"),
         output_stream=StringIO(),
         error_stream=StringIO(),
-    ) == 1
+    )) == 1
 
 
 def test_default_provider_config_ignores_target_repository_config(
@@ -676,6 +670,9 @@ def test_session_resume_delegates_to_supervisor_main(
         (["--session-dir", str(session_dir.resolve()), "--plan",
           str((session_dir / "plan.json").resolve())], {})
     ]
+    delegated = calls[0][0]
+    assert delegated.count("--plan") == 1
+    assert delegated[delegated.index("--session-dir") + 1] == str(session_dir.resolve())
 
 
 def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
@@ -979,11 +976,15 @@ def test_run_parser_combined_provider_model_forms() -> None:
     conflicting = parser.parse_args(
         ["run", "--provider", "demo:demo-model", "--model", "other/other-model", "p"]
     )
-    with pytest.raises(ValueError, match="different models"):
+    with pytest.raises(ValueError, match="conflicting models") as model_error:
         cli._split_provider_model(conflicting.provider, conflicting.model)
+    assert "demo-model" not in str(model_error.value)
+    assert "other-model" not in str(model_error.value)
 
-    with pytest.raises(ValueError, match="different providers"):
+    with pytest.raises(ValueError, match="conflicting providers") as provider_error:
         cli._split_provider_model("demo", "other/other-model")
+    assert "demo" not in str(provider_error.value)
+    assert "other" not in str(provider_error.value)
 
     with pytest.raises(SystemExit):
         parser.parse_args(["run", "--model", "demo/", "p"])

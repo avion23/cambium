@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 from cambium import cli, oneshot, repl, session, stats, tui
 from cambium.render import render_json_result, render_text_result
@@ -58,44 +61,39 @@ def test_no_change_completion_returns_success_across_user_interfaces(monkeypatch
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
     tui_out = _FlushStream()
-    assert tui.run_tui(
+    assert asyncio.run(tui.run_tui(
         oneshot.OneShotConfig(repo=tmp_path),
         input_stream=io.StringIO("hi\n"),
         output_stream=tui_out,
         error_stream=io.StringIO(),
-    ) == 0
+    )) == 0
     assert "plan_status={succeeded}" in tui_out.getvalue()
     assert "I reviewed the repository but changed nothing." in tui_out.getvalue()
 
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         oneshot.OneShotConfig(repo=tmp_path),
         input_stream=io.StringIO("hi\n/exit\n"),
         output_stream=io.StringIO(),
         error_stream=io.StringIO(),
-    ) == 0
+    )) == 0
     assert cli.main(["run", "hi", "--repo", str(tmp_path)]) == 0
 
 
-def test_tui_backend_exception_then_eof_returns_failure(monkeypatch, tmp_path):
+def test_tui_programming_error_terminates(monkeypatch, tmp_path):
     async def run(_config: oneshot.OneShotConfig, on_event=None):
         raise RuntimeError("backend unavailable")
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
     out = _FlushStream()
     err = _FlushStream()
-    code = tui.run_tui(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n"),
-        output_stream=out,
-        error_stream=err,
-    )
-
-    assert code == 1
-    assert err.getvalue() == "cambium: backend unavailable\n"
-    assert err.flushes == 1
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        asyncio.run(tui.run_tui(
+            oneshot.OneShotConfig(repo=tmp_path),
+            input_stream=io.StringIO("hi\n"), output_stream=out, error_stream=err,
+        ))
 
 
-def test_repl_backend_exception_flushes_and_returns_failure(monkeypatch, tmp_path):
+def test_repl_programming_error_terminates(monkeypatch, tmp_path):
     async def run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
         if config.prompt == "bad":
             raise RuntimeError("backend unavailable")
@@ -104,17 +102,11 @@ def test_repl_backend_exception_flushes_and_returns_failure(monkeypatch, tmp_pat
     monkeypatch.setattr(oneshot, "run_oneshot", run)
     out = _FlushStream()
     err = _FlushStream()
-    code = repl.run_repl(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("bad\nok\n"),
-        output_stream=out,
-        error_stream=err,
-    )
-
-    assert code == 1
-    assert err.getvalue() == "repl: backend unavailable\n"
-    assert err.flushes == 1
-    assert out.flushes == 1
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        asyncio.run(repl.run_repl(
+            oneshot.OneShotConfig(repo=tmp_path), input_stream=io.StringIO("bad\nok\n"),
+            output_stream=out, error_stream=err,
+        ))
 
 
 def test_nested_plan_result_renders_reason_summary_and_safe_json():
@@ -207,12 +199,12 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
             )
     out = _FlushStream()
     err = _FlushStream()
-    code = tui.run_tui(
+    code = asyncio.run(tui.run_tui(
         oneshot.OneShotConfig(repo=tmp_path, session_root=session_dir),
         input_stream=io.StringIO("hi\n"),
         output_stream=out,
         error_stream=err,
-    )
+    ))
     value = out.getvalue()
     assert code == 0
     assert err.getvalue() == ""
@@ -233,12 +225,12 @@ def test_tui_without_usage_events_prints_no_stats_line(monkeypatch, tmp_path):
     session_dir = oneshot.allocate_session_dir(oneshot.resolve_repo(tmp_path))
     out = _FlushStream()
     err = _FlushStream()
-    code = tui.run_tui(
+    code = asyncio.run(tui.run_tui(
         oneshot.OneShotConfig(repo=tmp_path, session_root=session_dir),
         input_stream=io.StringIO("hi\n"),
         output_stream=out,
         error_stream=err,
-    )
+    ))
     value = out.getvalue()
     assert code == 0
     assert err.getvalue() == ""
@@ -279,12 +271,12 @@ def test_tui_tty_renders_refreshed_dashboard(monkeypatch, tmp_path):
     out = _FlushStream()
     monkeypatch.setattr(out, "isatty", lambda: True)
 
-    code = tui.run_tui(
+    code = asyncio.run(tui.run_tui(
         oneshot.OneShotConfig(repo=tmp_path),
         input_stream=io.StringIO("hi\n"),
         output_stream=out,
         error_stream=io.StringIO(),
-    )
+    ))
 
     value = out.getvalue()
     assert code == 0
@@ -303,21 +295,21 @@ def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
         return _succeeded_run(_config)
 
     def _fail_stats(_session_dir):
-        raise RuntimeError("stats backend unavailable")
+        raise sqlite3.DatabaseError("stats backend unavailable")
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
     monkeypatch.setattr(stats, "session_usage_stats", _fail_stats)
     out = _FlushStream()
     err = _FlushStream()
-    code = tui.run_tui(
+    code = asyncio.run(tui.run_tui(
         oneshot.OneShotConfig(repo=tmp_path),
         input_stream=io.StringIO("hi\n"),
         output_stream=out,
         error_stream=err,
-    )
+    ))
     value = out.getvalue()
     assert code == 0
-    assert err.getvalue() == ""
+    assert "cambium tui: usage stats unavailable:" in err.getvalue()
     assert "plan_status={succeeded}" in value
     assert "stats:" not in value
 

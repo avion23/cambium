@@ -12,7 +12,6 @@ import asyncio
 import getpass
 import hashlib
 import importlib
-import inspect
 import json
 import os
 import sqlite3
@@ -20,6 +19,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,14 @@ from .oauth import (
     OAuthStore,
     import_codex_cli_session,
 )
+
+
+class ExitCode(IntEnum):
+    SUCCESS = 0
+    FAILURE = 1
+    USAGE = 2
+    TEMPORARY_FAILURE = 75
+    INTERRUPTED = 130
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -99,19 +107,13 @@ def _split_provider_model(
         and model_name is not None
         and provider_model != model_name
     ):
-        raise ValueError(
-            f"--provider and --model name different models: "
-            f"{provider_model!r} vs {model_name!r}"
-        )
+        raise ValueError("--provider and --model specify conflicting models")
     if (
         provider_name is not None
         and model_provider is not None
         and provider_name != model_provider
     ):
-        raise ValueError(
-            f"--provider and --model name different providers: "
-            f"{provider_name!r} vs {model_provider!r}"
-        )
+        raise ValueError("--provider and --model specify conflicting providers")
     return (
         provider_name if provider_name is not None else model_provider,
         provider_model if provider_model is not None else model_name,
@@ -169,28 +171,6 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
-_COMMAND_NAMES = frozenset(
-    {
-        "auth",
-        "supervisor",
-        "doctor",
-        "bench",
-        "module-test",
-        "version",
-        "run",
-        "repl",
-        "tui",
-        "session",
-        "architectus",
-    }
-)
-
-
-# sysexits.h EX_TEMPFAIL: the session admission lock is held by another live
-# supervisor. The condition is transient; callers may retry the same run.
-_EXIT_SESSION_BUSY = 75
-
-
 def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-dir", required=True, metavar="DIR")
     parser.add_argument(
@@ -223,19 +203,13 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "prompt",
-        metavar="PROMPT",
-        help="prompt to run against the repository",
-    )
+def _add_routing_budget_arguments(parser: argparse.ArgumentParser) -> None:
     _add_agent_arguments(parser)
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="route the run through the usage-debt selector (solution C): the "
-        "supervisor picks (provider, model, tier) from all enabled configured "
-        "providers with stored credentials instead of pinning --provider/--model",
+        help="select from enabled providers with stored credentials using "
+        "recorded usage instead of pinning --provider/--model",
     )
     parser.add_argument(
         "--max-wall-s",
@@ -255,6 +229,15 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="N",
         help="maximum agent-loop turns (default 50)",
     )
+
+
+def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "prompt",
+        metavar="PROMPT",
+        help="prompt to run against the repository",
+    )
+    _add_routing_budget_arguments(parser)
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -264,13 +247,19 @@ def _add_architectus_arguments(parser: argparse.ArgumentParser) -> None:
         "--scripted",
         dest="dry_run",
         action="store_true",
-        help="run one deterministic scripted decision wave (no live LLM, no credentials)",
+        help="run one deterministic scripted step (no live LLM or credentials)",
     )
     parser.add_argument(
         "--provider",
-        type=_provider_argument,
-        metavar="PROVIDER",
-        help="provider id for the live decision call (default: first enabled configured provider)",
+        type=_agent_provider_argument,
+        metavar="PROVIDER[:MODEL]",
+        help="provider id, optionally with a model (NAME:MODEL)",
+    )
+    parser.add_argument(
+        "--model",
+        type=_agent_model_argument,
+        metavar="[PROVIDER/]MODEL",
+        help="model name, optionally with a provider (PROVIDER/MODEL)",
     )
     parser.add_argument(
         "--tier",
@@ -287,7 +276,7 @@ def _add_architectus_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--task",
         metavar="TASK",
-        help="root goal for the fixture task tree (default: a docstring fixture task)",
+        help="root task (default: add a docstring to the task-tree builder)",
     )
 
 
@@ -306,7 +295,7 @@ def _build_parser() -> argparse.ArgumentParser:
     supervisor = commands.add_parser(
         "supervisor",
         help="run the supervisor",
-        description="Run one Cambium supervisor session.",
+        description="Run one session using the supervisor module's built-in plan.",
     )
     _add_supervisor_arguments(supervisor)
 
@@ -342,34 +331,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "codex CLI session import for a codex_chatgpt provider. The device "
         "code is shown only on the controlling TTY and never logged.",
     )
-    auth_oauth.add_argument(
-        "provider",
-        nargs="?",
-        type=_provider_argument,
-        metavar="PROVIDER",
-        help="provider id (not needed with --import-codex-cli)",
-    )
-    auth_oauth.add_argument(
+    oauth_commands = auth_oauth.add_subparsers(dest="oauth_command", required=True)
+    oauth_login = oauth_commands.add_parser("login", help="start a device-flow login")
+    oauth_login.add_argument("provider", type=_provider_argument, metavar="PROVIDER")
+    oauth_login.add_argument(
         "--client-id",
         metavar="ID",
         help="codex client id for the device flow (or CAMBIUM_CODEX_CLIENT_ID)",
     )
-    auth_oauth.add_argument(
-        "--status",
-        action="store_true",
-        help="local session status: expiry and account fingerprint only "
-        "(no refresh, no secrets)",
-    )
-    auth_oauth.add_argument(
-        "--logout",
-        action="store_true",
-        help="remove the local oauth session (no remote revocation is claimed)",
-    )
-    auth_oauth.add_argument(
-        "--import-codex-cli",
-        action="store_true",
-        help="import the existing codex CLI session from ~/.codex/auth.json "
-        "as provider 'codex'",
+    for operation in ("status", "logout"):
+        operation_parser = oauth_commands.add_parser(operation)
+        operation_parser.add_argument("provider", type=_provider_argument, metavar="PROVIDER")
+    oauth_commands.add_parser(
+        "import-codex-cli",
+        help="import the existing codex CLI session as provider 'codex'",
     )
 
     auth_commands.add_parser("list", help="list configured providers and derived names")
@@ -430,14 +405,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="start an interactive prompt session",
         description="Start an interactive Cambium prompt session.",
     )
-    _add_agent_arguments(repl)
+    _add_routing_budget_arguments(repl)
 
     tui = commands.add_parser(
         "tui",
         help="start the terminal dashboard",
         description="Start the Cambium terminal dashboard.",
     )
-    _add_agent_arguments(tui)
+    _add_routing_budget_arguments(tui)
     tui.add_argument(
         "--quiet",
         action="store_true",
@@ -474,15 +449,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     session_status = session_commands.add_parser(
         "status",
-        help="show the live per-subagent status of one session",
+        help="show the live task status of one session",
         description="Read one session's durable event log and render the current "
-        "state of every sub-agent (task) that ran or is running in it.",
+        "state of every task that ran or is running in it.",
     )
     session_status.add_argument("--session-dir", metavar="DIR", help="session directory")
     session_status.add_argument(
         "session_id",
         metavar="SESSION",
-        help="session id whose sub-agents to inspect",
+        help="session id whose tasks to inspect",
     )
     session_resume = session_commands.add_parser(
         "resume",
@@ -514,7 +489,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "architectus",
         help="run one live or scripted Architectus decision session",
         description="Run a live or scripted Architectus decomposition session: build one "
-        "fixture TaskTree, run one or more decision waves through the pure core, and print "
+        "task tree, run one or more steps through the core, and print "
         "the resulting action intents. Use --dry-run/--scripted for a deterministic run "
         "that needs no provider credentials.",
     )
@@ -554,14 +529,31 @@ def _run_doctor(args: argparse.Namespace) -> int:
 
 
 def _run_auth_set(args: argparse.Namespace) -> int:
+    from .oneshot import OneShotConfig, _provider_config_path
+    from .provider_config import ProviderSelectionError, load_providers, select_provider
+
     try:
+        providers = load_providers(_provider_config_path(OneShotConfig(), Path.cwd()))
+        select_provider(providers, name=args.provider)
         key = read_stdin_key() if args.stdin else getpass.getpass("API key: ")
         AuthStore().set_provider(args.provider, key)
-    except (AuthError, EOFError, KeyboardInterrupt, OSError):
+    except KeyboardInterrupt:
+        print("cambium auth: credential input interrupted", file=sys.stderr)
+        return ExitCode.INTERRUPTED
+    except EOFError:
+        print("cambium auth: credential input ended before a key was read", file=sys.stderr)
+        return ExitCode.FAILURE
+    except (ProviderSelectionError, ValueError) as exc:
+        print(f"cambium auth: provider configuration is invalid: {exc}", file=sys.stderr)
+        return ExitCode.USAGE
+    except AuthSchemaError as exc:
+        print(f"cambium auth: credential is invalid: {exc}", file=sys.stderr)
+        return ExitCode.USAGE
+    except (AuthError, OSError):
         print("cambium auth: could not store provider credential", file=sys.stderr)
-        return 1
+        return ExitCode.FAILURE
     print(f"stored provider {args.provider}")
-    return 0
+    return ExitCode.SUCCESS
 
 
 def _run_auth_remove(args: argparse.Namespace) -> int:
@@ -573,8 +565,8 @@ def _run_auth_remove(args: argparse.Namespace) -> int:
     if removed:
         print(f"removed provider {args.provider}")
     else:
-        print(f"provider {args.provider} is not configured")
-    return 0
+        print(f"provider {args.provider} is not configured (no change)")
+    return ExitCode.SUCCESS
 
 
 def _run_auth_list() -> int:
@@ -731,38 +723,15 @@ def _run_auth_oauth_device(
 
 
 def _run_auth_oauth(args: argparse.Namespace) -> int:
-    mode = sum(
-        bool(getattr(args, flag, False))
-        for flag in ("status", "logout", "import_codex_cli")
-    )
-    if mode > 1:
-        print(
-            "cambium auth: choose exactly one of --status, --logout, "
-            "--import-codex-cli, or the device flow",
-            file=sys.stderr,
-        )
-        return 2
-    if args.import_codex_cli:
-        if args.provider is not None and args.provider != "codex":
-            print(
-                "cambium auth: --import-codex-cli imports the session as provider "
-                "'codex'; no provider argument is accepted",
-                file=sys.stderr,
-            )
-            return 2
+    if args.oauth_command == "import-codex-cli":
         return _run_auth_oauth_import(OAuthStore())
-    if args.provider is None:
-        print(
-            "cambium auth: oauth requires a provider for the device flow, "
-            "--status, or --logout",
-            file=sys.stderr,
-        )
-        return 2
     store = OAuthStore()
-    if args.status:
+    if args.oauth_command == "status":
         return _run_auth_oauth_status(store, args.provider)
-    if args.logout:
+    if args.oauth_command == "logout":
         return _run_auth_oauth_logout(store, args.provider)
+    if args.oauth_command != "login":
+        raise AssertionError(f"unhandled oauth command: {args.oauth_command!r}")
     client_id = args.client_id or os.environ.get("CAMBIUM_CODEX_CLIENT_ID", "")
     return _run_auth_oauth_device(args.provider, client_id, store=store)
 
@@ -847,53 +816,17 @@ def _import_or_fail(module_name: str, command: str):
         raise
 
 
-def _looks_like_prompt(first: str) -> bool:
-    return bool(first) and not first.startswith("-") and first not in _COMMAND_NAMES
-
-
-def _bare_prompt_allowed(command_line: list[str]) -> bool:
-    """Allow natural-language bare prompts without hiding command typos.
-
-    A single shell token without whitespace is treated as a command and is
-    parsed by the root parser.  A quoted sentence, or multiple bare words,
-    uses the prompt path.  Known commands and leading options are always
-    preserved by :func:`main`.
-    """
-    if not command_line or not _looks_like_prompt(command_line[0]):
-        return False
-    if any(char.isspace() for char in command_line[0]):
-        return True
-    return sum(not token.startswith("-") for token in command_line[:2]) > 1
-
-
 def _prompt_text(value: str | list[str]) -> str:
     if isinstance(value, str):
         return value
     return " ".join(value)
 
 
-def _run_bare_prompt(command_line: list[str]) -> int:
-    parser = _SafeArgumentParser(prog="cambium run")
-    _add_run_arguments(parser)
-    prompt_words: list[str] = []
-    remainder: list[str] = []
-    index = 0
-    while index < len(command_line):
-        token = command_line[index]
-        if token.startswith("--"):
-            remainder.extend(command_line[index:])
-            break
-        prompt_words.append(token)
-        index += 1
-    normalized = [" ".join(prompt_words), *remainder]
-    return _run_oneshot(parser.parse_args(normalized))
-
-
 def _budget_or_default(value: float | int | None, default: float | int) -> float | int:
     return default if value is None else value
 
 
-def _run_oneshot(args: argparse.Namespace) -> int:
+async def _run_oneshot(args: argparse.Namespace) -> int:
     oneshot = _import_or_fail("cambium.oneshot", "run")
     if oneshot is None:
         return 1
@@ -925,8 +858,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         print(f"cambium run: {exc}", file=sys.stderr)
         return 2
     try:
-        value = oneshot.run_oneshot(config)
-        result = asyncio.run(value) if inspect.isawaitable(value) else value
+        result = await oneshot.run_oneshot(config)
     except KeyboardInterrupt:
         return 130
     except SessionAlreadyRunningError as exc:
@@ -934,7 +866,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         # Report one sanitized diagnostic (no traceback) and return the
         # documented temporary-failure exit code so callers can retry.
         print(f"cambium run: {exc}", file=sys.stderr)
-        return _EXIT_SESSION_BUSY
+        return ExitCode.TEMPORARY_FAILURE
     except (AuthError, OSError, ValueError) as exc:
         print(f"cambium run: {exc}", file=sys.stderr)
         return 2
@@ -946,7 +878,7 @@ def _run_oneshot(args: argparse.Namespace) -> int:
     return exit_code if type(exit_code) is int else 1
 
 
-def _run_repl(args: argparse.Namespace) -> int:
+async def _run_repl(args: argparse.Namespace) -> int:
     repl = _import_or_fail("cambium.repl", "repl")
     if repl is None:
         return 1
@@ -962,11 +894,15 @@ def _run_repl(args: argparse.Namespace) -> int:
         session_root=args.session_dir,
         provider=provider,
         model=model,
+        auto=args.auto,
+        max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
+        max_tokens=_budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS),
+        max_turns=_budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS),
     )
-    return repl.run_repl(config)
+    return await repl.run_repl(config)
 
 
-def _run_tui(args: argparse.Namespace) -> int:
+async def _run_tui(args: argparse.Namespace) -> int:
     tui = _import_or_fail("cambium.tui", "tui")
     if tui is None:
         return 1
@@ -982,8 +918,12 @@ def _run_tui(args: argparse.Namespace) -> int:
         session_root=args.session_dir,
         provider=provider,
         model=model,
+        auto=args.auto,
+        max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
+        max_tokens=_budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS),
+        max_turns=_budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS),
     )
-    return tui.run_tui(config, quiet=getattr(args, "quiet", False))
+    return await tui.run_tui(config, quiet=getattr(args, "quiet", False))
 
 
 def _run_session(args: argparse.Namespace) -> int:
@@ -1084,25 +1024,13 @@ def _run_session(args: argparse.Namespace) -> int:
 
 
 def _architectus_provider_config_path() -> Path:
-    """Resolve the trusted provider-config path for a live decision call.
+    from .oneshot import OneShotConfig, _provider_config_path
 
-    Mirrors the one-shot resolver: ``CAMBIUM_PROVIDERS`` when set, otherwise
-    the user-level ``<home>/.config/cambium/providers.json``. The target
-    repository's own provider file is never consulted.
-    """
-    from .auth import effective_home
-
-    configured = os.environ.get("CAMBIUM_PROVIDERS")
-    path = (
-        Path(configured).expanduser()
-        if configured
-        else effective_home() / ".config" / "cambium" / "providers.json"
-    )
-    return path.resolve()
+    return _provider_config_path(OneShotConfig(), Path.cwd())
 
 
 def _live_architectus_llm(
-    provider: str | None, tier: str | None
+    provider: str | None, model: str | None, tier: str | None
 ) -> tuple[Any, str, str]:
     """Construct one live :class:`ArchitectusLM` from the trusted provider config.
 
@@ -1113,7 +1041,6 @@ def _live_architectus_llm(
     The Diffundo router is pinned to the selected provider's model so the call
     has one deterministic candidate instead of cascading across providers.
     """
-    from .auth import AuthStore
     from .diffundo import CredentialSource, Diffundo, ProviderTier
     from .lm import ArchitectusLM, CambiumLM
     from .oauth import OAuthStore
@@ -1124,14 +1051,19 @@ def _live_architectus_llm(
         select_provider,
     )
 
+    provider, model = _split_provider_model(provider, model)
     config_path = _architectus_provider_config_path()
     try:
         providers = load_providers(config_path)
+        if provider is None and model is not None:
+            providers = [candidate for candidate in providers if candidate.model == model]
         selected = select_provider(providers, name=provider)
     except (OSError, ProviderSelectionError, ValueError) as exc:
         raise ValueError(f"provider selection failed: {exc}") from exc
 
     tier_value = tier or selected.tier.value
+    if model is not None and selected.model != model:
+        raise ValueError("selected model is not configured for the provider")
     try:
         selected_tier = ProviderTier(tier_value)
     except ValueError as exc:
@@ -1150,18 +1082,10 @@ def _live_architectus_llm(
         )
     else:
         env_name = selected.api_key_env
-        api_key = os.environ.get(env_name)
-        if not api_key:
-            try:
-                api_key = AuthStore().launch_environment(base={}).get(env_name)
-            except AuthError as exc:
-                raise ValueError("provider credential is unavailable") from exc
-        if not api_key:
+        if not os.environ.get(env_name):
             raise ValueError(
-                f"provider {selected.name!r} has no stored credential; "
-                "run `cambium auth set <provider> --stdin` first"
+                "API-key Architectus calls require a credential-source interface"
             )
-        os.environ[env_name] = api_key
 
     diffundo = Diffundo(providers, **options)
     lm = CambiumLM(diffundo, selected_tier, model=selected.model)
@@ -1181,7 +1105,7 @@ async def _architectus_waves(core: Any, waves: int) -> list[list[dict[str, Any]]
     return results
 
 
-def _run_architectus(args: argparse.Namespace) -> int:
+async def _run_architectus(args: argparse.Namespace) -> int:
     """Run one live or scripted Architectus decomposition session end-to-end."""
     from .architectus import ArchitectusCore, ScriptedLLM
     from .tasktree import build_tree
@@ -1209,7 +1133,7 @@ def _run_architectus(args: argparse.Namespace) -> int:
     else:
         try:
             llm, provider_name, tier_label = _live_architectus_llm(
-                args.provider, args.tier
+                args.provider, args.model, args.tier
             )
         except (AuthError, OSError, ValueError) as exc:
             print(f"cambium architectus: {exc}", file=sys.stderr)
@@ -1217,9 +1141,9 @@ def _run_architectus(args: argparse.Namespace) -> int:
 
     core = ArchitectusCore(llm, tree=tree)
     try:
-        waves = asyncio.run(_architectus_waves(core, args.waves))
-    except Exception as exc:  # noqa: BLE001
-        print(f"cambium architectus: decision wave failed: {exc}", file=sys.stderr)
+        waves = await _architectus_waves(core, args.waves)
+    except (OSError, ValueError) as exc:
+        print(f"cambium architectus: decision step failed: {exc}", file=sys.stderr)
         return 1
 
     print(f"provider: {provider_name} (tier: {tier_label})")
@@ -1228,38 +1152,41 @@ def _run_architectus(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+async def async_main(argv: list[str] | None = None) -> int:
     """Dispatch one unified Cambium CLI invocation and return its exit code."""
     command_line = sys.argv[1:] if argv is None else argv
-    if _bare_prompt_allowed(command_line):
-        return _run_bare_prompt(command_line)
-
     args = _build_parser().parse_args(command_line)
 
-    if args.command == "supervisor":
-        return _run_supervisor(args)
-    if args.command == "auth":
-        return _run_auth(args)
-    if args.command == "doctor":
-        return _run_doctor(args)
-    if args.command == "bench":
-        return _run_bench(args)
-    if args.command == "module-test":
-        return _run_module_test(args)
-    if args.command == "run":
-        return _run_oneshot(args)
-    if args.command == "repl":
-        return _run_repl(args)
-    if args.command == "tui":
-        return _run_tui(args)
-    if args.command == "session":
-        return _run_session(args)
-    if args.command == "architectus":
-        return _run_architectus(args)
-    if args.command == "version":
-        print(__version__)
-        return 0
-    raise AssertionError(f"unhandled command: {args.command!r}")
+    match args.command:
+        case "run":
+            return await _run_oneshot(args)
+        case "repl":
+            return await _run_repl(args)
+        case "tui":
+            return await _run_tui(args)
+        case "architectus":
+            return await _run_architectus(args)
+        case "supervisor":
+            return _run_supervisor(args)
+        case "auth":
+            return _run_auth(args)
+        case "doctor":
+            return _run_doctor(args)
+        case "bench":
+            return _run_bench(args)
+        case "module-test":
+            return _run_module_test(args)
+        case "session":
+            return _run_session(args)
+        case "version":
+            print(__version__)
+            return ExitCode.SUCCESS
+        case _:
+            raise AssertionError(f"unhandled command: {args.command!r}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(async_main(argv))
 
 
 if __name__ == "__main__":
