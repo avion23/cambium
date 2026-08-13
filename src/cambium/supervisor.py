@@ -1094,7 +1094,7 @@ class _Runtime:
         oauth_store: OAuthStore | None = None,
         architectus: Any = None,
         conversations: Any = None,
-        warm_pool_size: int | None = None,
+        warm_pool_size: int = 0,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1133,9 +1133,7 @@ class _Runtime:
         # Eval-3 ADOPT warm pool: idle reuse-ready worker processes. The pool
         # is bounded by ``_warm_pool_size`` (0 disables) and never survives
         # this runtime (shutdown kills every pooled process).
-        self._warm_pool_size = (
-            _warm_pool_size() if warm_pool_size is None else warm_pool_size
-        )
+        self._warm_pool_size = warm_pool_size
         self._pool: list[_PooledWorker] = []
         # Decision port and revision conversation persistence (step 2 items
         # 23-24): both optional; None keeps the historical byte-for-byte path.
@@ -3778,7 +3776,7 @@ async def run_plan(
     oauth_store: OAuthStore | None = None,
     architectus: Any = None,
     conversations: bool | None = None,
-    warm_pool_size: int | None = None,
+    warm_pool_size: int = 0,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3844,10 +3842,8 @@ async def run_plan(
         raise ValueError("max_concurrent_tasks must be a non-negative int or None")
     if max_concurrent_tasks is None:
         max_concurrent_tasks = max(1, os.process_cpu_count() or os.cpu_count() or 1)
-    if warm_pool_size is not None and (
-        type(warm_pool_size) is not int or warm_pool_size < 0
-    ):
-        raise ValueError("warm_pool_size must be a non-negative int or None")
+    if type(warm_pool_size) is not int or warm_pool_size < 0:
+        raise ValueError("warm_pool_size must be a non-negative int")
 
     _validate_provider_environment(specs, provider_environment, oauth_store=oauth_store)
     _validate_task_repositories(specs)
@@ -4045,7 +4041,9 @@ async def _amain_plan(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Cambium supervisor")
+    parser = argparse.ArgumentParser(
+        prog="cambium supervisor", description="Cambium supervisor"
+    )
     parser.add_argument("--session-dir", required=True)
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument(
