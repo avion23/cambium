@@ -13,7 +13,8 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ from .auth import (
     scrub_environment,
 )
 from .ipc import MAX_LINE_BYTES
-from .provider_config import ProviderSelectionError, load_providers, select_provider
+from .provider_config import AuthMode, ProviderSelectionError, load_providers, select_provider
 from .session import session_root
 from .supervisor import (
     DEFAULT_MAX_TOKENS,
@@ -44,9 +45,38 @@ from .supervisor import (
 # test suite) while wall/token budgets and --max-turns still bound the loop.
 DEFAULT_MAX_TURNS = 50
 
+
+class RoutingMode(Enum):
+    """How a one-shot run selects its provider.
+
+    CASCADE (the default) builds a credential-backed cascade over every
+    enabled provider with a usable credential and lets admission balancing
+    pick the (provider, model, tier). USAGE_BALANCED is the same candidate
+    set resolved against the usage-debt ledger explicitly.
+    """
+
+    CASCADE = "cascade"
+    USAGE_BALANCED = "usage_balanced"
+
+
+class SessionMode(Enum):
+    """Admission policy for the session leaf a one-shot run targets.
+
+    NEW refuses a leaf that already holds run artifacts; RESUME re-runs an
+    existing leaf (used by `session resume`). One admission function serves
+    both so the entry points cannot diverge.
+    """
+
+    NEW = "new"
+    RESUME = "resume"
+
+
 __all__ = [
     "EventSink",
     "OneShotConfig",
+    "RoutingMode",
+    "SessionMode",
+    "admit_session",
     "allocate_session_dir",
     "build_plan",
     "default_session_root",
@@ -66,14 +96,21 @@ class OneShotConfig:
     when it is ``None``, :func:`run_oneshot` allocates a fresh leaf under the
     repository's default session root.
 
-    ``provider_env_keys`` and ``fanout_config`` are internal, non-secret plan
-    fields.  Normal callers set ``provider`` and optionally ``model``; the
-    runner resolves those fields against the existing provider configuration.
+    ``routing_mode`` selects the provider-routing policy: CASCADE builds a
+    credential-backed cascade over authorized providers; USAGE_BALANCED
+    resolves the (provider, model, tier) from ``model_candidates`` against the
+    usage-debt ledger. The deprecated ``auto`` boolean alias maps
+    ``True`` to USAGE_BALANCED and is retained until cli.py is rewired to pass
+    ``routing_mode`` directly.
 
-    ``auto`` is the routing mode (solution C): the supervisor selects the
-    (provider, model, tier) from ``model_candidates`` against the usage-debt
-    ledger instead of pinning one provider here. ``model_candidates`` is
-    internal (filled from the enabled configured providers when ``auto``).
+    ``provider_env_keys``, ``authorized_providers``, ``assigned_provider``,
+    and ``fanout_config`` are internal, non-secret plan fields.  Normal
+    callers set ``provider`` and optionally ``model``; the runner resolves
+    those fields against the existing provider configuration.
+    ``authorized_providers`` is the typed credential-availability boundary:
+    the providers (API-key or OAuth) this run actually holds a usable
+    credential for, carried by name so the supervisor and worker never infer
+    identity from environment-variable names (which drops OAuth providers).
     """
 
     prompt: str = ""
@@ -81,8 +118,11 @@ class OneShotConfig:
     session_root: str | Path | None = None
     provider: str | None = None
     model: str | None = None
-    auto: bool = False
+    routing_mode: RoutingMode = RoutingMode.CASCADE
     model_candidates: tuple[str, ...] = ()
+    authorized_providers: tuple[str, ...] = ()
+    assigned_provider: str | None = None
+    session_mode: SessionMode = SessionMode.NEW
     routing_state_path: str | Path | None = None
     provider_config_path: str | Path | None = None
     task_id: str | None = None
@@ -98,6 +138,13 @@ class OneShotConfig:
     max_restarts: int = 0
     target_file: str | None = None
     marker: str | None = None
+    # Deprecated boolean alias for ``routing_mode``; cli.py is migrated in a
+    # separate change. ``True`` selects USAGE_BALANCED.
+    auto: bool | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if self.auto:
+            object.__setattr__(self, "routing_mode", RoutingMode.USAGE_BALANCED)
 
     @property
     def task(self) -> str:
@@ -222,21 +269,64 @@ def _is_codex_oauth_provider(provider: Any) -> bool:
     store, never in the worker env — so the oneshot resolver must not try to
     look up an API key for them.
     """
-    from cambium.provider_config import AuthMode
-
     return getattr(provider, "auth", None) is AuthMode.CODEX_CHATGPT
 
 
 def _oauth_doc_present(provider_name: str) -> bool:
-    """Local-only check that the OAuth store holds a document for the provider."""
-    from cambium.oauth import OAuthStore
+    """Local-only check that the OAuth store holds a document for the provider.
 
+    Only an explicit missing document yields ``False``; a corrupt, unreadable,
+    or wrong-permission store propagates as an error so eligibility never
+    hides store corruption behind a silent ``False``.
+    """
+    from cambium.oauth import OAuthMissingError, OAuthStore
+
+    store = OAuthStore()
     try:
-        store = OAuthStore()
         document = store.read_document(provider_name)
-    except Exception:
+    except OAuthMissingError:
         return False
     return document is not None
+
+
+def _provider_credential_ready(
+    provider: Any, auth_store: AuthStore
+) -> bool:
+    """One credential-availability boundary over the separate stores.
+
+    API-key providers are ready when their environment name resolves to a
+    stored or in-env credential; OAuth providers are ready when the local
+    OAuth store holds a document for them. The function never returns a
+    credential value and never changes process-global state.
+    """
+    if _is_codex_oauth_provider(provider):
+        return _oauth_doc_present(provider.name)
+    env_name = getattr(provider, "api_key_env", "")
+    if not is_provider_env_name(env_name):
+        return False
+    if os.environ.get(env_name):
+        return True
+    try:
+        launch_environment = auth_store.launch_environment(base={})
+    except AuthError:
+        return False
+    return bool(launch_environment.get(env_name))
+
+
+def _authorized_provider_names(
+    providers: list[Any], auth_store: AuthStore
+) -> list[Any]:
+    """Return the enabled providers with a usable credential, in config order.
+
+    This is the single place that decides which provider identities a run may
+    route to; the names are carried (not env-key names) so OAuth providers are
+    never dropped and the supervisor/worker agree on the candidate set.
+    """
+    return [
+        provider
+        for provider in providers
+        if getattr(provider, "enabled", True) and _provider_credential_ready(provider, auth_store)
+    ]
 
 
 def _resolve_provider(
@@ -259,7 +349,7 @@ def _resolve_provider(
     if marker_mode:
         return config, {}
 
-    cascade = config.auto or (
+    cascade = config.routing_mode is RoutingMode.USAGE_BALANCED or (
         config.provider is None
         and config.model is None
         and config.fanout_config is None
@@ -267,46 +357,48 @@ def _resolve_provider(
     )
     if cascade:
         if config.provider is not None or config.model is not None:
-            raise ValueError("auto mode cannot be combined with --provider or --model")
+            raise ValueError("routing mode cannot be combined with --provider or --model")
         config_path = _provider_config_path(config, repo)
         try:
             providers = load_providers(config_path)
         except (OSError, ProviderSelectionError, ValueError) as exc:
             raise ValueError(f"provider selection failed: {exc}") from exc
-        environment: dict[str, str] = {}
-        stored: list[Any] = []
-        for candidate in providers:
-            if not candidate.enabled:
-                continue
-            if _is_codex_oauth_provider(candidate):
-                # OAuth-authenticated: eligible when the local store holds a
-                # document; the credential is never an env key.
-                if _oauth_doc_present(candidate.name):
-                    stored.append(candidate)
-                continue
-            try:
-                environment.update(_stored_provider_environment(candidate.api_key_env, auth_store))
-            except ValueError:
-                continue
-            stored.append(candidate)
-        if not stored:
+        store = auth_store if auth_store is not None else AuthStore()
+        authorized = _authorized_provider_names(providers, store)
+        codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
+        if len(codex_authorized) > 1:
             raise ValueError(
-                "no enabled provider with stored credentials; run "
-                "`cambium auth set <provider> --stdin` first"
+                "multiple codex_chatgpt providers have stored oauth sessions; "
+                "only one is supported per run"
             )
+        if not authorized:
+            raise ValueError(
+                "no enabled provider with stored credentials; configure an "
+                "API key or OAuth session"
+            )
+        environment: dict[str, str] = {}
+        for candidate in authorized:
+            if _is_codex_oauth_provider(candidate):
+                continue
+            environment.update(_stored_provider_environment(candidate.api_key_env, store))
         resolved = replace(
             config,
             provider=None,
             model=None,
             provider_config_path=config_path,
+            authorized_providers=tuple(candidate.name for candidate in authorized),
             # The fanout model/tier are left to the supervisor's routing
-            # resolution (solution C) so the ledger balances the pick.
+            # resolution so the ledger balances the pick; the worker requires
+            # a concrete (tier, model) which admission always writes before
+            # spawn.
             fanout_config={},
             provider_env_keys=tuple(
-                candidate.api_key_env for candidate in stored if candidate.api_key_env
+                candidate.api_key_env
+                for candidate in authorized
+                if not _is_codex_oauth_provider(candidate) and candidate.api_key_env
             ),
             model_candidates=tuple(
-                sorted({candidate.model for candidate in stored})
+                sorted({candidate.model for candidate in authorized})
             ),
         )
         return resolved, environment
@@ -319,7 +411,7 @@ def _resolve_provider(
         raise ValueError("provider mode requires a selected provider")
 
     if config.provider is None and config.provider_env_keys:
-        environment: dict[str, str] = {}
+        environment = {}
         for env_name in config.provider_env_keys:
             environment.update(_stored_provider_environment(env_name, auth_store))
         return config, environment
@@ -347,21 +439,39 @@ def _resolve_provider(
             f"model {effective_model!r} is not configured for provider {selected.name!r}"
         )
 
+    # AUDIT-001: an explicit provider is pinned as the assigned primary; same-
+    # tier authorized siblings remain as fallback candidates behind it. The
+    # authorized set is every provider with a usable credential so a sibling
+    # cascade never routes to a provider whose credential was never loaded.
+    store = auth_store if auth_store is not None else AuthStore()
+    authorized = _authorized_provider_names(providers, store)
+    codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
+    if len(codex_authorized) > 1:
+        raise ValueError(
+            "multiple codex_chatgpt providers have stored oauth sessions; "
+            "only one is supported per run"
+        )
     fanout_config = dict(config.fanout_config or {})
     fanout_config["tier"] = selected.tier.value
     fanout_config["model"] = effective_model
+    environment = {}
+    if not _is_codex_oauth_provider(selected):
+        environment.update(_stored_provider_environment(selected.api_key_env, store))
     resolved = replace(
         config,
         provider=selected.name,
         model=effective_model,
+        assigned_provider=selected.name,
         provider_config_path=config_path,
-        provider_env_keys=() if _is_codex_oauth_provider(selected) else (selected.api_key_env,),
+        authorized_providers=tuple(candidate.name for candidate in authorized),
+        provider_env_keys=(
+            ()
+            if _is_codex_oauth_provider(selected)
+            else (selected.api_key_env,)
+        ),
         fanout_config=fanout_config,
     )
-    if _is_codex_oauth_provider(selected):
-        # Credential comes from the OAuth store at spawn; preflight validates.
-        return resolved, {}
-    return resolved, _stored_provider_environment(selected.api_key_env, auth_store)
+    return resolved, environment
 
 
 def allocate_session_dir(repo: str | Path) -> Path:
@@ -416,7 +526,13 @@ def build_plan(
         "max_tokens": int(config.max_tokens),
         "max_turns": int(config.max_turns),
         "max_restarts": config.max_restarts,
+        "routing_mode": config.routing_mode.value,
+        "session_mode": config.session_mode.value,
     }
+    if config.authorized_providers:
+        spec["authorized_providers"] = list(config.authorized_providers)
+    if config.assigned_provider is not None:
+        spec["assigned_provider"] = config.assigned_provider
     if config.model_candidates:
         spec["model_candidates"] = list(config.model_candidates)
     if config.fanout_config is not None:
@@ -432,6 +548,20 @@ def build_plan(
     return {"tasks": [spec]}
 
 
+def admit_session(config: OneShotConfig, session_dir: Path) -> None:
+    """One session-admission policy for every entry point (AUDIT-002).
+
+    NEW refuses a leaf that already holds run artifacts (a fresh one-shot
+    must never overwrite a used session); RESUME re-runs an existing leaf
+    (used by `session resume`). The supervisor re-verifies the NEW contract
+    under the admission lock; this function is the single source for the
+    policy so run/REPL/TUI/resume cannot diverge.
+    """
+    if config.session_mode is SessionMode.RESUME:
+        return
+    _reject_reused_session(session_dir)
+
+
 async def run_oneshot(
     config: OneShotConfig, on_event: EventSink | None = None
 ) -> PlanResult:
@@ -445,7 +575,7 @@ async def run_oneshot(
     )
     if explicit_session_dir is not None:
         preflight(config, repo, explicit_session_dir)
-        _reject_reused_session(explicit_session_dir)
+        admit_session(config, explicit_session_dir)
 
     resolved, provider_environment = _resolve_provider(config, repo)
     session_dir = (
@@ -463,6 +593,7 @@ async def run_oneshot(
         if resolved.routing_state_path is not None
         else repo / ".cambium" / "routing-state.json"
     )
+    reject_reused = resolved.session_mode is SessionMode.NEW
     if provider_environment:
         return await supervisor.run_plan(
             session_dir,
@@ -470,12 +601,12 @@ async def run_oneshot(
             on_event=on_event,
             provider_environment=provider_environment,
             routing_state_path=routing_state_path,
-            reject_reused_session=True,
+            reject_reused_session=reject_reused,
         )
     return await supervisor.run_plan(
         session_dir,
         plan,
         on_event=on_event,
         routing_state_path=routing_state_path,
-        reject_reused_session=True,
+        reject_reused_session=reject_reused,
     )

@@ -384,9 +384,13 @@ def _oauth_env_suffix(provider: str) -> str:
 
 def _provider_router(
     config: dict[str, Any], *, assigned_provider: str | None = None,
+    authorized_providers: tuple[str, ...] = (),
     debt: Mapping[str, Any] | None = None,
 ) -> tuple[Diffundo, ProviderTier, str, str]:
     providers = load_providers(_provider_path())
+    if authorized_providers:
+        authorized = frozenset(authorized_providers)
+        providers = [provider for provider in providers if provider.name in authorized]
     section = _fanout_section(config)
     tier_value = _fanout_value(config, section, "tier")
     model = _fanout_value(config, section, "model")
@@ -413,16 +417,12 @@ def _provider_router(
     if isinstance(task_id, str) and task_id:
         options.setdefault("rotation_seed", zlib.crc32(task_id.encode("utf-8")))
     if assigned_provider is not None:
-        if any(provider.name == assigned_provider for provider in providers):
-            # Supervisor-level admission balancing (solution C): preset the
-            # per-subagent sticky primary to the task's assigned provider.
-            options["primary_provider"] = assigned_provider
-        else:
-            logger.warning(
-                "assigned_provider %r is not in the loaded providers; "
-                "falling back to the seeded primary pick",
-                assigned_provider,
+        if not any(provider.name == assigned_provider for provider in providers):
+            raise ValueError(
+                f"assigned_provider {assigned_provider!r} is not an authorized "
+                "configured provider"
             )
+        options["primary_provider"] = assigned_provider
     if debt:
         options["debt"] = debt
     codex_providers = [
@@ -494,6 +494,7 @@ class AgentConfig:
     # Supervisor-level admission balancing (solution C): the provider this
     # task was assigned at admission; presets Diffundo's sticky primary.
     assigned_provider: str | None = None
+    authorized_providers: tuple[str, ...] = ()
     debt: Mapping[str, Any] | None = None
     provider_env_keys: tuple[str, ...] = ()
     redactor: Redactor | None = None
@@ -525,6 +526,7 @@ class AgentConfig:
         if assigned_provider is not None and not isinstance(assigned_provider, str):
             raise ValueError("init assigned_provider must be a string")
         provider_env_keys = _provider_env_keys(init.get("provider_env_keys"))
+        authorized_providers = _provider_env_keys(init.get("authorized_providers"))
         debt = init.get("debt")
         if debt is not None and not isinstance(debt, dict):
             raise ValueError("init debt must be a mapping")
@@ -540,6 +542,7 @@ class AgentConfig:
             base_commit=base_commit if isinstance(base_commit, str) else None,
             fanout_config=_provider_fanout_config(init),
             assigned_provider=assigned_provider,
+            authorized_providers=authorized_providers,
             debt=debt or None,
             max_turns=_positive_int(init.get("max_turns"), "init max_turns", DEFAULT_MAX_TURNS),
             max_tokens=_positive_int(
@@ -628,6 +631,7 @@ def _merge_task_config(
         base_commit=base_commit if isinstance(base_commit, str) else None,
         fanout_config=fanout_config,
         assigned_provider=config.assigned_provider,
+        authorized_providers=config.authorized_providers,
         debt=config.debt,
         max_turns=max_turns,
         max_tokens=max_tokens,
@@ -656,6 +660,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         base_commit=run.get("base_commit"),
         fanout_config=_provider_fanout_config(run),
         assigned_provider=None,
+        authorized_providers=_provider_env_keys(run.get("authorized_providers")),
         debt=None,
         max_turns=_positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS),
         max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
@@ -1814,6 +1819,7 @@ async def _do_provider_work(
         router, tier, model, model_identity = _provider_router(
             config.fanout_config,
             assigned_provider=config.assigned_provider,
+            authorized_providers=config.authorized_providers,
             debt=config.debt,
         )
     except Exception as exc:

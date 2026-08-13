@@ -71,14 +71,6 @@ DEFAULT_TOKEN_WINDOW_ALLOWANCE = 20_000_000
 DEFAULT_ROUTING_STATE_PATH = Path.home() / ".config" / "cambium" / "routing-state.json"
 _ROUTING_STATE_VERSION = 1
 
-# Compatibility aliases for callers that imported the former scoring
-# constants. QualityWeights is the single tuning type; score_providers no
-# longer combines these unlike units in a weighted sum.
-W_UTIL = DEFAULT_WEIGHTS.utilization_weight
-W_CACHE = DEFAULT_WEIGHTS.cache_weight
-W_LATENCY = DEFAULT_WEIGHTS.latency_weight
-W_SHADOW = DEFAULT_WEIGHTS.shadow_weight
-REFERENCE_LATENCY_S = DEFAULT_WEIGHTS.latency_slo_s
 _REQUIREMENT_KEYS = frozenset({"quality", "min_context_window"})
 
 
@@ -426,6 +418,68 @@ def _normalized_utilization(
     return tokens / _window_allowance(provider)
 
 
+@dataclass(frozen=True)
+class ProviderAssignment:
+    """The resolved (provider, model, tier) for one task (AUDIT-063).
+
+    A pure value: ``resolve_assignment`` computes it from the candidate set
+    and ledger without reading state or mutating the task; the supervisor
+    applies it to the task at the runtime edge only.
+    """
+
+    provider: str
+    model: str
+    tier: str
+
+
+def resolve_assignment(
+    providers: Sequence[Any],
+    candidates: Sequence[str],
+    debt: Mapping[str, ProviderDebt] | None,
+    lanes: Mapping[str, LaneState] | None,
+    *,
+    requirements: Mapping[str, Any] | None = None,
+    authorized: frozenset[str] | None = None,
+    pinned_tier: str | None = None,
+) -> ProviderAssignment | None:
+    """Pure (provider, model, tier) selection for one un-pinned task.
+
+    Filters the loaded ``providers`` to the authorized identity set (carried
+    by name so OAuth providers are never dropped), the candidate models, an
+    optional pinned tier, and lane capacity, then picks via
+    :func:`select_lane` (max-min admission) or :func:`score_providers` (when
+    the task declares requirements). Returns ``None`` when no provider
+    remains; the caller decides whether that is a hard failure. Raises
+    ``ValueError`` when the filtered pool is empty after authorization but a
+    selection was required.
+    """
+    pool = list(providers)
+    if authorized is not None:
+        pool = [p for p in pool if p.name in authorized]
+    if pinned_tier:
+        pool = [p for p in pool if p.tier.value == pinned_tier]
+    if requirements:
+        provider_name, model, _score = score_providers(
+            pool, candidates, debt, lanes, requirements=requirements
+        )[0]
+    else:
+        provider_name, model = select_lane(pool, candidates, debt, lanes or {})
+    tier = _assignment_tier(pool, provider_name, pinned_tier)
+    return ProviderAssignment(provider=provider_name, model=model, tier=tier)
+
+
+def _assignment_tier(
+    providers: Sequence[Any], provider_name: str, pinned_tier: str | None
+) -> str:
+    """The call tier for an assigned provider (mirrors worker routing)."""
+    if isinstance(pinned_tier, str) and pinned_tier:
+        return pinned_tier
+    for provider in providers:
+        if provider.name == provider_name:
+            return provider.tier.value
+    raise ValueError(f"assigned provider {provider_name!r} not found among candidates")
+
+
 def select_primary(
     providers: Sequence[Any],
     candidates: Sequence[str],
@@ -665,15 +719,12 @@ __all__ = [
     "DEFAULT_TOKEN_WINDOW_ALLOWANCE",
     "DebtStore",
     "LaneState",
+    "ProviderAssignment",
     "ProviderDebt",
     "QualityWeights",
-    "REFERENCE_LATENCY_S",
-    "W_CACHE",
-    "W_LATENCY",
-    "W_SHADOW",
-    "W_UTIL",
     "score_providers",
     "select_lane",
     "select_primary",
+    "resolve_assignment",
     "validate_requirements",
 ]
