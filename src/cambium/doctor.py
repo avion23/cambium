@@ -390,15 +390,25 @@ def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, st
     except AuthError:
         auth_names = set()  # Insecure or unreadable store metadata is check 9-11's finding.
 
+    try:
+        coverage = {
+            p.name: (
+                _oauth_session_present(oauth_store, p.name)
+                if p.auth is AuthMode.CODEX_CHATGPT
+                else p.name in auth_names
+            )
+            for p in providers
+        }
+    except OAuthError as exc:
+        return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
+
     def covered(p: _DoctorProvider) -> bool:
-        if p.auth is AuthMode.CODEX_CHATGPT:
-            return _oauth_session_present(oauth_store, p.name)
-        return p.name in auth_names
+        return coverage[p.name]
 
     missing_required = [p.name for p in providers if p.required and not covered(p)]
     missing_optional = [p.name for p in providers if not p.required and not covered(p)]
     present = [
-        f"{p.name}={'oauth' if p.auth is AuthMode.CODEX_CHATGPT else 'auth-store'}"
+        f"{p.name}={'oauth' if p.auth is AuthMode.CODEX_CHATGPT else p.api_key_env}"
         for p in providers
         if covered(p)
     ]
@@ -460,10 +470,20 @@ def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status
     except AuthError:
         auth_names = set()  # Insecure or unreadable store metadata is check 9-11's finding.
 
+    try:
+        readiness = {
+            p.name: (
+                _oauth_session_present(oauth_store, p.name)
+                if p.auth is AuthMode.CODEX_CHATGPT
+                else bool(os.environ.get(p.api_key_env)) or p.name in auth_names
+            )
+            for p in providers
+        }
+    except OAuthError as exc:
+        return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
+
     def runnable_for(p: _DoctorProvider) -> bool:
-        if p.auth is AuthMode.CODEX_CHATGPT:
-            return _oauth_session_present(oauth_store, p.name)
-        return bool(os.environ.get(p.api_key_env)) or p.name in auth_names
+        return readiness[p.name]
 
     runnable = [p.name for p in providers if runnable_for(p)]
     not_runnable = [p.name for p in providers if not runnable_for(p)]
