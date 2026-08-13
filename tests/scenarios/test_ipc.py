@@ -71,6 +71,35 @@ def _make_scratch(repo: Path) -> str:
     ).stdout.strip()
 
 
+def _install_blocking_clean_filter(
+    repo: Path, started: Path, release: Path
+) -> None:
+    """Make ``git add hello.txt`` block via a clean filter until ``release``.
+
+    A clean filter is a repository-local git config (not a hook), so it still
+    runs under ``core.hooksPath=/dev/null``. The filter touches ``started`` and
+    then spins until ``release`` exists, holding the worker's fenced ``git add``
+    open so a test can advance the generation mid-operation.
+    """
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "filter.cambiumblock.clean",
+         f"sh -c ': > {shlex.quote(str(started))}; "
+         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; cat'"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "filter.cambiumblock.smudge", "cat"],
+        check=True,
+    )
+    (repo / ".gitattributes").write_text("hello.txt filter=cambiumblock\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitattributes"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "blocking filter"],
+        check=True,
+        capture_output=True,
+    )
+
+
 def _run_task_msg(session_dir: Path, *, run_rid: str, **overrides: object) -> dict:
     msg: dict = {
         "type": "run_task",
@@ -617,14 +646,7 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
     base = _make_scratch(scratch)
     hook_started = tmp_path / "hook-started"
     hook_release = tmp_path / "hook-release"
-    hook = scratch / ".git" / "hooks" / "pre-commit"
-    hook.write_text(
-        "#!/bin/sh\n"
-        f": > {shlex.quote(str(hook_started))}\n"
-        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
-        encoding="utf-8",
-    )
-    hook.chmod(0o755)
+    _install_blocking_clean_filter(scratch, hook_started, hook_release)
     worktree = session_dir / "wt"
 
     async def scenario() -> None:
@@ -679,14 +701,7 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     base = _make_scratch(scratch)
     hook_started = tmp_path / "post-commit-started"
     hook_release = tmp_path / "post-commit-release"
-    hook = scratch / ".git" / "hooks" / "post-commit"
-    hook.write_text(
-        "#!/bin/sh\n"
-        f": > {shlex.quote(str(hook_started))}\n"
-        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
-        encoding="utf-8",
-    )
-    hook.chmod(0o755)
+    _install_blocking_clean_filter(scratch, hook_started, hook_release)
     worktree = session_dir / "wt"
 
     async def scenario() -> None:
@@ -780,14 +795,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     write_generation(worktree, 1)
     hook_started = tmp_path / "post-commit-started"
     hook_release = tmp_path / "post-commit-release"
-    hook = scratch / ".git" / "hooks" / "post-commit"
-    hook.write_text(
-        "#!/bin/sh\n"
-        f": > {shlex.quote(str(hook_started))}\n"
-        f"while [ ! -e {shlex.quote(str(hook_release))} ]; do sleep 0.01; done\n",
-        encoding="utf-8",
-    )
-    hook.chmod(0o755)
+    _install_blocking_clean_filter(scratch, hook_started, hook_release)
 
     from cambium import worker as worker_module
 

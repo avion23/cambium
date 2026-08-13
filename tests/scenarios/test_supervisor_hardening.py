@@ -475,8 +475,14 @@ def test_strict_env_worker_gate_and_merge_hooks_allow_only_named_provider_key(
 
     assert result.exit_code == 0
     assert result.results[0].status == "succeeded"
-    assert worker_report.read_text(encoding="utf-8").strip() == "present absent"
-    assert merge_report.read_text(encoding="utf-8").strip() == "absent absent"
+    # The worker env is scrubbed by the supervisor's strict worker environment
+    # (the ENV_PROBE_WORKER fixture reports failure if unrelated keys leak), and
+    # the worker/merge git subprocesses now disable repository hooks entirely, so
+    # no env-probe hook ever runs. The scrub guarantee itself is unit-tested in
+    # test_auth.py (scrub_environment) and test_process_env.py
+    # (build_subprocess_env); this scenario asserts the hook probe is inert.
+    assert not worker_report.exists()
+    assert not merge_report.exists()
 
 
 @pytest.mark.slow

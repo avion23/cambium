@@ -670,8 +670,15 @@ def test_run_shell_timeout_kills_background_grandchild(tmp_path: Path) -> None:
     assert not result.ok
     assert "timed out" in (result.error or "")
     grandchild_pid = int(pid_file.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(grandchild_pid, 0)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"grandchild {grandchild_pid} survived the process-group kill")
 
 
 @pytest.mark.slow  # python linter subprocess and bounded timeout
