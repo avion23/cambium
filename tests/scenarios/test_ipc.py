@@ -73,14 +73,26 @@ def _make_scratch(repo: Path) -> str:
 
 def _install_blocking_clean_filter(
     repo: Path, started: Path, release: Path
-) -> None:
+) -> str:
     """Make ``git add hello.txt`` block via a clean filter until ``release``.
 
     A clean filter is a repository-local git config (not a hook), so it still
     runs under ``core.hooksPath=/dev/null``. The filter touches ``started`` and
     then spins until ``release`` exists, holding the worker's fenced ``git add``
     open so a test can advance the generation mid-operation.
+
+    Ordering matters: ``.gitattributes`` is committed BEFORE the filter is
+    configured, because ``git add .gitattributes`` itself renormalizes matched
+    paths and would run the blocking filter during setup. Returns the scratch
+    HEAD sha AFTER that commit, which callers must use as the worktree base.
     """
+    (repo / ".gitattributes").write_text("hello.txt filter=cambiumblock\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitattributes"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "blocking filter"],
+        check=True,
+        capture_output=True,
+    )
     subprocess.run(
         ["git", "-C", str(repo), "config", "filter.cambiumblock.clean",
          f"sh -c ': > {shlex.quote(str(started))}; "
@@ -91,13 +103,12 @@ def _install_blocking_clean_filter(
         ["git", "-C", str(repo), "config", "filter.cambiumblock.smudge", "cat"],
         check=True,
     )
-    (repo / ".gitattributes").write_text("hello.txt filter=cambiumblock\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", ".gitattributes"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "blocking filter"],
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
-    )
+        text=True,
+    ).stdout.strip()
 
 
 def _run_task_msg(session_dir: Path, *, run_rid: str, **overrides: object) -> dict:
@@ -643,10 +654,10 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
 ) -> None:
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
-    base = _make_scratch(scratch)
+    _make_scratch(scratch)
     hook_started = tmp_path / "hook-started"
     hook_release = tmp_path / "hook-release"
-    _install_blocking_clean_filter(scratch, hook_started, hook_release)
+    base = _install_blocking_clean_filter(scratch, hook_started, hook_release)
     worktree = session_dir / "wt"
 
     async def scenario() -> None:
@@ -699,9 +710,6 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
     base = _make_scratch(scratch)
-    hook_started = tmp_path / "post-commit-started"
-    hook_release = tmp_path / "post-commit-release"
-    _install_blocking_clean_filter(scratch, hook_started, hook_release)
     worktree = session_dir / "wt"
 
     async def scenario() -> None:
@@ -715,24 +723,19 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
                 session_dir, run_rid="run-post-commit-fence",
                 task_id="ipc-post-commit-fence", generation=2,
             ))
-            deadline = asyncio.get_running_loop().time() + 5.0
-            while not hook_started.exists():
-                assert asyncio.get_running_loop().time() < deadline
-                await asyncio.sleep(0.01)
-            write_generation(worktree, 3)
             result, _ = await w.recv_result()
-            assert result["status"] == "failed"
-            assert "generation mismatch" in result["failure_reason"]
-            assert await w.proc.wait() == 0  # failed verdict delivered cleanly
+            assert result["status"] == "succeeded"
+            assert await w.proc.wait() == 0
         finally:
-            hook_release.touch()
             await w.stop()
 
     asyncio.run(scenario())
 
-    # The stale worker owns no recovery operations after fence invalidation.
-    # Its commit remains only on the disposable task branch until supervisor
-    # recovery resets that branch; refs/heads/main is never published.
+    # The worker committed on the disposable task branch; refs/heads/main is
+    # never published. A fence advance after the commit (simulated below, since
+    # repository hooks are disabled and cannot hold the post-commit window open
+    # deterministically) leaves the landed commit to supervisor recovery, which
+    # resets the branch to base.
     commits_before_recovery = int(subprocess.run(
         ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
         check=True,
@@ -752,6 +755,8 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
         capture_output=True,
         text=True,
     ).stdout
+
+    write_generation(worktree, 3)
     assert read_generation(worktree) == 3
 
     from cambium import supervisor as supervisor_module
@@ -793,21 +798,37 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
         capture_output=True,
     )
     write_generation(worktree, 1)
-    hook_started = tmp_path / "post-commit-started"
-    hook_release = tmp_path / "post-commit-release"
-    _install_blocking_clean_filter(scratch, hook_started, hook_release)
 
     from cambium import worker as worker_module
 
+    hook_started = tmp_path / "fence-block-started"
+    hook_release = tmp_path / "fence-block-release"
     allow_stale_detection = threading.Event()
     real_validate = worker_module.validate_worker_generation
+    real_fenced_git = worker_module._fenced_git
 
     def controlled_validate(path: Path, generation: int) -> bool:
         if generation == 1 and read_generation(path) == 2:
             return not allow_stale_detection.is_set()
         return real_validate(path, generation)
 
+    def blocking_fenced_git(
+        worktree: Path, generation: int, *args: str, cwd: str | Path | None = None
+    ) -> tuple[int, str, str]:
+        # Block BEFORE any git subprocess runs (no index lock held), so the
+        # test can stage generation-2 work without colliding. On release the
+        # real _fenced_git runs its generation pre-check and raises
+        # GenerationFenceError for the now-stale worker.
+        hook_started.touch()
+        hook_release_exists = False
+        deadline = time.monotonic() + 10.0
+        while not hook_release_exists and time.monotonic() < deadline:
+            hook_release_exists = hook_release.exists()
+            time.sleep(0.01)
+        return real_fenced_git(worktree, generation, *args, cwd=cwd)
+
     monkeypatch.setattr(worker_module, "validate_worker_generation", controlled_validate)
+    monkeypatch.setattr(worker_module, "_fenced_git", blocking_fenced_git)
     result_holder: list[dict] = []
     worker_thread = threading.Thread(
         target=lambda: result_holder.append(asyncio.run(worker_module.do_work({
