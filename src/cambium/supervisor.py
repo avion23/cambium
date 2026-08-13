@@ -99,7 +99,7 @@ from cambium.system_health import can_run_heavy
 
 from .architectus import ActionKind, ArchitectusCore
 from .auth import MIN_API_KEY_BYTES, oauth_env_suffix, scrub_environment
-from .conversations import ConversationStore
+from .conversations import ConversationStore, ConversationStoreError
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
 from .oauth import (
@@ -948,6 +948,10 @@ class WorktreeRecoveryError(RuntimeError):
     """A destructive worktree recovery command failed."""
 
 
+class ConversationAppendError(RuntimeError):
+    """A revision could not be persisted to the conversation store."""
+
+
 class SessionAlreadyRunningError(RuntimeError):
     """Another supervisor already owns the requested session."""
 
@@ -1721,14 +1725,35 @@ class _Runtime:
             "depends_on": [parent_task_id],
             "spec": child_spec,
         })
-        try:
-            if self._task_group is None:
-                raise RuntimeError("no active task group")
-            self._task_group.create_task(self.supervise_task(child_spec))
-        except RuntimeError as exc:
+        if self._task_group is None:
+            exc = RuntimeError("no active task group")
             # Group already closed/cancelled: roll the tree back so the child
             # is not left durably admitted but never spawned, and record the
             # rejection instead.
+            self._session_tasks[:] = [
+                task for task in self._session_tasks
+                if task.get("spec") is not child_spec
+            ]
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected", parent_task_id=parent_task_id,
+                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                reason="NoActiveTaskGroup", proposal=proposal,
+            )
+            return
+        await self._record_revision_conversation(
+            outcome="admitted", parent_task_id=parent_task_id,
+            child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+            proposal=proposal,
+        )
+        try:
+            self._task_group.create_task(self.supervise_task(child_spec))
+        except RuntimeError as exc:
+            # Group closed after the check: roll back the in-memory admission.
             self._session_tasks[:] = [
                 task for task in self._session_tasks
                 if task.get("spec") is not child_spec
@@ -1748,11 +1773,6 @@ class _Runtime:
             "child_admitted", task_id=parent_task_id, request_id=request_id,
             parent_task_id=parent_task_id, child_task_id=child_task_id,
             child_kind=kind, branch=child_spec.get("branch"),
-        )
-        await self._record_revision_conversation(
-            outcome="admitted", parent_task_id=parent_task_id,
-            child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-            proposal=proposal,
         )
 
     async def _record_revision_conversation(
@@ -1786,14 +1806,17 @@ class _Runtime:
         if reason is not None:
             record["reason"] = reason
         record["proposal"] = self._redact_proposal(proposal)
-        await asyncio.to_thread(
-            self._conversations.append,
-            child_task_id,
-            "system",
-            json.dumps(record, sort_keys=True, default=str),
-            kind="system",
-            meta={"parent_task_id": parent_task_id},
-        )
+        try:
+            await asyncio.to_thread(
+                self._conversations.append,
+                child_task_id,
+                "system",
+                json.dumps(record, sort_keys=True, default=str),
+                kind="system",
+                meta={"parent_task_id": parent_task_id},
+            )
+        except (ConversationStoreError, RuntimeError) as exc:
+            raise ConversationAppendError("conversation store append failed") from exc
 
     def _redact_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
         """Redact a propose_child wire record without flattening its structure."""
@@ -2663,10 +2686,19 @@ class _Runtime:
                         parent_envelope = self._redact_envelope(
                             self._strict_envelope(spec, msg)
                         )
-                        for proposal in pending:
-                            await self._admit_child(spec, proposal, parent_envelope)
-                        if self._admission_port is not None:
-                            await self._admit_port_proposals(spec, parent_envelope)
+                        try:
+                            for proposal in pending:
+                                await self._admit_child(spec, proposal, parent_envelope)
+                            if self._admission_port is not None:
+                                await self._admit_port_proposals(spec, parent_envelope)
+                        except ConversationAppendError:
+                            reason = "conversation_store_append_failed"
+                            await self.emit(
+                                "worker_failed", task_id=task_id,
+                                generation=generation, reason=reason,
+                            )
+                            await _kill_worker(proc)
+                            return _GenOutcome(clean=False, fatal=True, reason=reason)
                     if spec.get("parent_task_id") is not None:
                         child_result = self._strict_envelope(spec, msg)
                         await self.emit(
