@@ -207,6 +207,8 @@ def _read_usage_rows(
         kind = row[0]
         raw_payload = row[-1]
         payload = json.loads(raw_payload)
+        if not isinstance(payload, Mapping):
+            raise ValueError("usage_event payload is not a JSON object")
         record: dict[str, Any] = {"kind": kind, "payload": payload}
         if with_task_id and row[1] is not None:
             record["task_id"] = row[1]

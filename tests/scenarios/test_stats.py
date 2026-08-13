@@ -355,6 +355,21 @@ def test_session_usage_stats_rejects_undecodable_payloads(tmp_path) -> None:
         session_usage_stats(session_dir)
 
 
+def test_session_usage_stats_rejects_non_object_payload(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    db = session_dir / ".cambium" / "events.db"
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db) as connection:
+        connection.execute(_EVENTS_SCHEMA)
+        connection.execute(
+            "INSERT INTO events(seq, kind, payload) VALUES(?, ?, ?)",
+            (1, "usage_event", "[]"),
+        )
+
+    with pytest.raises(ValueError, match="not a JSON object"):
+        session_usage_stats(session_dir)
+
+
 def test_render_usage_stats_line_from_dataclass() -> None:
     stats = UsageStats(2, 2, 2870, 347, 0, 3217, 1606, "p/m", "p")
     assert render_usage_stats_line(stats, worktree="/wt") == (

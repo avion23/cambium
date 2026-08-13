@@ -220,7 +220,7 @@ class _DoctorProvider:
     name: str
     required: bool
     api_key_env: str
-    auth: AuthMode
+    auth: AuthMode | None
 
 
 def _oauth_session_present(store: OAuthStore, name: str) -> bool:
@@ -240,7 +240,7 @@ def _doctor_providers(
             spec.name,
             spec.required,
             spec.api_key_env,
-            getattr(provider, "auth", AuthMode.API_KEY),
+            getattr(provider, "auth", None),
         )
         for spec, provider in zip(specs, providers, strict=True)
     )
