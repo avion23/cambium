@@ -66,6 +66,14 @@ def test_module_test_rejects_arbitrary_pytest_arguments(capsys) -> None:
     assert "usage:" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("option", ["--plan", "--task-spec"])
+def test_unified_supervisor_rejects_module_input_options(option, capsys, tmp_path) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["supervisor", "--session-dir", str(tmp_path), option, "input.json"])
+    assert raised.value.code == 2
+    assert "invalid command arguments" in capsys.readouterr().err
+
+
 def test_architectus_scripted_dry_run_prints_actions_and_exits_zero(capsys) -> None:
     """The scripted architectus path needs no credentials or live LLM."""
     assert cli.main(["architectus", "--dry-run"]) == 0

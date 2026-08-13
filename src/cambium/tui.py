@@ -2,24 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-import inspect
+import sqlite3
 import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 _PROMPT = "cambium> "
-_EXIT_EOF = 0
-_EXIT_INTERRUPT = 130
-_EXIT_BROKEN_PIPE = 0
-_EXIT_BACKEND_MISSING = 1
-_EXIT_RUN_FAILED = 1
 _ANSI_CLEAR = "\033[2J\033[H"
-
-
-def _run(value):
-    return asyncio.run(value) if inspect.isawaitable(value) else value
 
 
 def _is_tty(stream: Any) -> bool:
@@ -55,7 +45,7 @@ def _dashboard_lines(session_dir: Path, events: list[dict[str, Any]], render, st
     return lines
 
 
-def run_tui(
+async def run_tui(
     config, *, input_stream=None, output_stream=None, error_stream=None, quiet=False
 ) -> int:
     """Run the line-oriented terminal loop and return an exit code."""
@@ -69,7 +59,13 @@ def run_tui(
     except ImportError as exc:
         err.write(f"cambium tui: {exc}\n")
         err.flush()
-        return _EXIT_BACKEND_MISSING
+        from cambium.cli import ExitCode
+
+        return ExitCode.FAILURE
+
+    from cambium.auth import AuthError
+    from cambium.cli import ExitCode
+    from cambium.supervisor import SessionAlreadyRunningError
 
     failed = False
     try:
@@ -80,7 +76,7 @@ def run_tui(
             if line == "":
                 out.write("\n")
                 out.flush()
-                return _EXIT_RUN_FAILED if failed else _EXIT_EOF
+                return ExitCode.FAILURE if failed else ExitCode.SUCCESS
             prompt = line.rstrip("\r\n")
             if not prompt.strip():
                 continue
@@ -109,13 +105,15 @@ def run_tui(
                         _write_line(out, status)
                     out.flush()
 
-                response = _run(oneshot.run_oneshot(prompt_config, on_event=_live_sink))
+                response = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
                 text = render.render_text_result(response)
                 if response.exit_code != 0:
                     failed = True
-            except Exception as exc:
+            except BrokenPipeError:
+                return ExitCode.SUCCESS
+            except (AuthError, OSError, SessionAlreadyRunningError, ValueError) as exc:
                 failed = True
-                err.write(f"cambium: {exc}\n")
+                err.write(f"cambium tui: {exc}\n")
                 err.flush()
                 continue
             out.write(text)
@@ -130,7 +128,9 @@ def run_tui(
                 stats_line = render.render_usage_stats_line(
                     stats.session_usage_stats(session_dir), worktree=worktree
                 )
-            except Exception:
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                err.write(f"cambium tui: usage stats unavailable: {exc}\n")
+                err.flush()
                 stats_line = ""
             if stats_line:
                 out.write(stats_line)
@@ -140,13 +140,9 @@ def run_tui(
     except KeyboardInterrupt:
         out.write("\n")
         out.flush()
-        return _EXIT_INTERRUPT
+        return ExitCode.INTERRUPTED
     except BrokenPipeError:
-        return _EXIT_RUN_FAILED if failed else _EXIT_BROKEN_PIPE
-    except Exception as exc:
-        err.write(f"cambium: {exc}\n")
-        err.flush()
-        return _EXIT_RUN_FAILED if failed else _EXIT_BROKEN_PIPE
+        return ExitCode.SUCCESS
 
 
 __all__ = ["run_tui"]

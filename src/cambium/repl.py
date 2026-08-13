@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import os
 import sys
 from dataclasses import replace
@@ -11,7 +9,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import oneshot, render
+from .auth import AuthError
+from .cli import ExitCode
 from .oneshot import OneShotConfig
+from .supervisor import SessionAlreadyRunningError
 
 try:
     import readline
@@ -21,10 +22,6 @@ except ImportError:  # non-interactive fallback: no history
 
 def _config_for_prompt(config: OneShotConfig, prompt: str) -> OneShotConfig:
     return replace(config, prompt=prompt)
-
-
-def _run(value):
-    return asyncio.run(value) if inspect.isawaitable(value) else value
 
 
 def _history_path(config: OneShotConfig) -> Path:
@@ -57,7 +54,7 @@ def _save_history(path: Path) -> None:
         pass
 
 
-def run_repl(
+async def run_repl(
     config: OneShotConfig,
     *,
     input_stream: TextIO | None = None,
@@ -99,13 +96,15 @@ def run_repl(
                         output_stream.write(status + "\n")
                     output_stream.flush()
 
-                result = _run(oneshot.run_oneshot(prompt_config, on_event=_live_sink))
+                result = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
                 rendered = render.render_text_result(result)
                 if result.exit_code != 0:
                     failed = True
-            except Exception as exc:
+            except BrokenPipeError:
+                return ExitCode.SUCCESS
+            except (AuthError, OSError, SessionAlreadyRunningError, ValueError) as exc:
                 failed = True
-                error_stream.write(f"repl: {exc}\n")
+                error_stream.write(f"cambium repl: {exc}\n")
                 error_stream.flush()
                 continue
             try:
@@ -113,12 +112,14 @@ def run_repl(
                 if not rendered.endswith("\n"):
                     output_stream.write("\n")
                 output_stream.flush()
-            except Exception:
-                return 1 if failed else 0
+            except BrokenPipeError:
+                return ExitCode.SUCCESS
+    except KeyboardInterrupt:
+        return ExitCode.INTERRUPTED
     finally:
         if history_path is not None:
             _save_history(history_path)
-    return 1 if failed else 0
+    return ExitCode.FAILURE if failed else ExitCode.SUCCESS
 
 
 __all__ = ["run_repl"]
