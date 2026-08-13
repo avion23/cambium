@@ -298,15 +298,11 @@ def test_debt_store_round_trip_and_corrupt_tolerance(tmp_path) -> None:
     assert loaded.as_mapping()["p2"].tokens == 7
     assert loaded.dirty is False
 
-    # a corrupt file loads as an empty ledger without raising, and the store
-    # keeps working
+    # a corrupt file is reported, not silently reset to an empty ledger
     path.write_text("{not-json!!!", encoding="utf-8")
     corrupt = DebtStore(path)
-    corrupt.load()
-    assert corrupt.as_mapping() == {}
-    corrupt.record({"provider": "p3", "usage": {"total_tokens": 3}})
-    corrupt.save()
-    assert json.loads(path.read_text(encoding="utf-8"))["providers"]["p3"]["tokens"] == 3
+    with pytest.raises(ValueError, match="invalid routing ledger JSON"):
+        corrupt.load()
 
     # a missing file is an empty ledger
     missing = DebtStore(tmp_path / "missing.json")
