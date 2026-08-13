@@ -250,46 +250,45 @@ def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
     assert "parent status: succeeded" in content
 
 
-def test_build_agent_prompt_parent_envelope_bounds_oversized_fields() -> None:
-    """A malformed or oversized parent payload is bounded, not rejected, and
-    an empty envelope renders no parent block at all."""
+def test_parent_envelope_rejects_oversized_and_incomplete_fields() -> None:
+    """Strict parent envelopes reject malformed or oversized payloads."""
     tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    bounded = worker._bounded_parent_envelope(
-        {
+    with pytest.raises(worker.ParentEnvelopeError, match="summary.*field cap"):
+        worker._validate_parent_envelope({
+            "parent_task_id": "parent",
+            "unified_diff": "",
+            "diff_truncated": False,
             "summary": "x" * 100_000,
-            "files_changed": [f"f{i}.py" for i in range(1000)],
+            "metric_score": None,
+            "metric_breakdown": {},
+            "files_changed": [],
+            "commits": [],
             "status": "succeeded",
-        }
-    )
-    assert bounded is not None
-    assert len(bounded["summary"]) <= worker.MAX_ENVELOPE_FIELD_CHARS
-    assert len(bounded["files_changed"]) <= worker.MAX_ENVELOPE_ITEMS
-    assert worker._bounded_parent_envelope("not a dict") is None
-    assert worker._bounded_parent_envelope({"unknown_key": 1}) is None
+        })
+    with pytest.raises(worker.ParentEnvelopeError, match="must be an object"):
+        worker._validate_parent_envelope("not a dict")
+    with pytest.raises(worker.ParentEnvelopeError, match="unknown keys"):
+        worker._validate_parent_envelope({"unknown_key": 1})
     content = worker._build_agent_prompt(
         "task", tools, [], parent_envelope=None
     )["messages"][0]["content"]
     assert "Parent task context:" not in content
 
 
-def test_bounded_parent_envelope_drops_non_string_list_items() -> None:
-    """Non-string list items (dicts, nested lists) can carry unbounded content
-    past the char cap; they are dropped, never stringified into the prompt."""
-    bounded = worker._bounded_parent_envelope(
-        {
+def test_parent_envelope_rejects_non_string_list_items() -> None:
+    """Strict parent envelopes reject non-string list items."""
+    with pytest.raises(worker.ParentEnvelopeError, match="only strings"):
+        worker._validate_parent_envelope({
+            "parent_task_id": "parent",
+            "unified_diff": "",
+            "diff_truncated": False,
             "summary": "ok",
-            "files_changed": [
-                "a.py",
-                {"path": "b.py", "blob": "z" * 900_000},
-                ["nested", "list"],
-                42,
-            ],
-            "commits": ["abc", {"sha": "x" * 500_000}],
-        }
-    )
-    assert bounded is not None
-    assert bounded["files_changed"] == ["a.py"]
-    assert bounded["commits"] == ["abc"]
+            "metric_score": None,
+            "metric_breakdown": {},
+            "files_changed": ["a.py", {"path": "b.py"}],
+            "commits": ["abc"],
+            "status": "succeeded",
+        })
 
 
 

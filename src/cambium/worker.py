@@ -120,6 +120,7 @@ import time
 import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -156,7 +157,6 @@ MAX_SUMMARY_CHARS = 2_000
 # actions) before the agent loop fails fast.
 MAX_CONSECUTIVE_PLANS = 2
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
-EXIT_CODES = {"succeeded": 0, "failed": 1, "cancelled": 4}
 DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
 DEFAULT_MAX_WALL_S = 3600.0
@@ -168,6 +168,43 @@ MAX_TRANSCRIPT_CHARS = 120_000
 TRANSCRIPT_KEEP_TURNS = 6
 MAX_ENVELOPE_FIELD_CHARS = 2_000
 MAX_ENVELOPE_ITEMS = 16
+
+
+class TaskStatus(StrEnum):
+    """Terminal task outcome reported in the result envelope ``status`` field."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkerExitCode(IntEnum):
+    """Worker process exit codes for the result envelope and ``exit_message``.
+
+    The worker reports ``status`` as the domain verdict; ``exit_code`` is the
+    numeric encoding the supervisor reads off the wire. ``SUCCEEDED`` is 0 and
+    ``FAILED`` is 1; ``CANCELLED`` is 4 (a distinct non-success code so the
+    supervisor never misreads a cancelled task as a plain failure).
+    """
+
+    SUCCEEDED = 0
+    FAILED = 1
+    CANCELLED = 4
+
+
+_EXIT_CODE_BY_STATUS: Mapping[str, int] = {
+    TaskStatus.SUCCEEDED.value: WorkerExitCode.SUCCEEDED,
+    TaskStatus.FAILED.value: WorkerExitCode.FAILED,
+    TaskStatus.CANCELLED.value: WorkerExitCode.CANCELLED,
+}
+
+
+def _exit_code_for(status: str) -> int:
+    """Resolve one envelope status to its numeric exit code (fail-closed)."""
+    code = _EXIT_CODE_BY_STATUS.get(status)
+    return code if code is not None else WorkerExitCode.FAILED
+
+
 INSPECTION_GIT_OPS = frozenset({"status", "diff", "log"})
 _USAGE_COUNT_FIELDS = frozenset(
     {
@@ -195,6 +232,115 @@ logger = logging.getLogger(__name__)
 
 class GenerationFenceError(RuntimeError):
     """The worker no longer owns the persisted worktree generation."""
+
+
+_MISSING = object()
+
+
+class ParentEnvelopeError(ValueError):
+    """The parent envelope failed strict schema validation on the worker side."""
+
+
+class ChildProposalError(ValueError):
+    """A declared child proposal set failed schema validation."""
+
+
+_ENVELOPE_TEXT_KEYS = ("unified_diff", "summary", "status")
+_ENVELOPE_LIST_KEYS = ("files_changed", "commits")
+_ENVELOPE_KEYS = frozenset(
+    _ENVELOPE_TEXT_KEYS
+    + _ENVELOPE_LIST_KEYS
+    + ("parent_task_id", "diff_truncated", "metric_score", "metric_breakdown")
+)
+
+
+def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
+    """Validate a strict-key parent envelope, or return None for no parent.
+
+    The supervisor sends the strict ``_ENVELOPE_KEYS`` set with exact types
+    and fields bounded to ``MAX_ENVELOPE_FIELD_CHARS`` / ``MAX_ENVELOPE_ITEMS``.
+    A ``None`` or absent value means the task has no parent (valid). A present
+    dict must match the schema exactly: every expected key present with the
+    declared type, list items all strings, no unknown keys, and no overlong
+    field. Any deviation is a supervisor/corruption defect and raises
+    :class:`ParentEnvelopeError` rather than being silently trimmed.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ParentEnvelopeError(
+            f"parent_envelope must be an object, got {type(value).__name__}"
+        )
+    unknown = sorted(set(value) - _ENVELOPE_KEYS)
+    if unknown:
+        raise ParentEnvelopeError(f"parent_envelope has unknown keys: {unknown}")
+    validated: dict[str, Any] = {}
+    parent_task_id = value.get("parent_task_id", _MISSING)
+    if parent_task_id is _MISSING or not (
+        parent_task_id is None or isinstance(parent_task_id, str)
+    ):
+        raise ParentEnvelopeError(
+            "parent_envelope 'parent_task_id' must be a string or null"
+        )
+    validated["parent_task_id"] = parent_task_id
+    for key in _ENVELOPE_TEXT_KEYS:
+        field = value.get(key, _MISSING)
+        if field is _MISSING:
+            raise ParentEnvelopeError(f"parent_envelope missing required key {key!r}")
+        if not isinstance(field, str):
+            raise ParentEnvelopeError(
+                f"parent_envelope {key!r} must be a string, got {type(field).__name__}"
+            )
+        if len(field.encode("utf-8")) > MAX_ENVELOPE_FIELD_CHARS:
+            raise ParentEnvelopeError(f"parent_envelope {key!r} exceeds the field cap")
+        validated[key] = field
+    for key in _ENVELOPE_LIST_KEYS:
+        field = value.get(key, _MISSING)
+        if field is _MISSING:
+            raise ParentEnvelopeError(f"parent_envelope missing required key {key!r}")
+        if not isinstance(field, list):
+            raise ParentEnvelopeError(
+                f"parent_envelope {key!r} must be a list, got {type(field).__name__}"
+            )
+        if len(field) > MAX_ENVELOPE_ITEMS:
+            raise ParentEnvelopeError(f"parent_envelope {key!r} exceeds the item cap")
+        for item in field:
+            if not isinstance(item, str):
+                raise ParentEnvelopeError(
+                    f"parent_envelope {key!r} must contain only strings"
+                )
+            if len(item.encode("utf-8")) > MAX_ENVELOPE_FIELD_CHARS:
+                raise ParentEnvelopeError(
+                    f"parent_envelope {key!r} item exceeds the field cap"
+                )
+        validated[key] = list(field)
+    diff_truncated = value.get("diff_truncated", _MISSING)
+    if not isinstance(diff_truncated, bool):
+        raise ParentEnvelopeError("parent_envelope 'diff_truncated' must be a boolean")
+    validated["diff_truncated"] = diff_truncated
+    metric_score = value.get("metric_score", _MISSING)
+    if metric_score is _MISSING or isinstance(metric_score, bool) or not (
+        metric_score is None or isinstance(metric_score, (int, float))
+    ):
+        raise ParentEnvelopeError(
+            "parent_envelope 'metric_score' must be a number or null"
+        )
+    validated["metric_score"] = metric_score
+    metric_breakdown = value.get("metric_breakdown", _MISSING)
+    if not isinstance(metric_breakdown, dict):
+        raise ParentEnvelopeError("parent_envelope 'metric_breakdown' must be an object")
+    try:
+        encoded_breakdown = json.dumps(metric_breakdown, sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ParentEnvelopeError(
+            "parent_envelope 'metric_breakdown' must contain JSON values"
+        ) from exc
+    if len(encoded_breakdown) > MAX_ENVELOPE_FIELD_CHARS:
+        raise ParentEnvelopeError("parent_envelope 'metric_breakdown' exceeds the field cap")
+    validated["metric_breakdown"] = copy.deepcopy(metric_breakdown)
+    if not any(validated.values()):
+        return None
+    return validated
 
 
 def _monotonic_ms() -> int:
@@ -561,35 +707,8 @@ class AgentConfig:
             ),
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
-            parent_envelope=_bounded_parent_envelope(init.get("parent_envelope")),
+            parent_envelope=_validate_parent_envelope(init.get("parent_envelope")),
         )
-
-
-def _bounded_parent_envelope(value: Any) -> dict[str, Any] | None:
-    """Return a strict-key parent envelope with bounded text fields, or None.
-
-    The supervisor sends the strict ``_ENVELOPE_KEYS`` set; the worker bounds
-    each text field so a malformed or oversized parent payload can never inflate
-    the child prompt. Missing/overlong fields are trimmed, not rejected.
-    """
-    if not isinstance(value, dict):
-        return None
-    bounded: dict[str, Any] = {}
-    for key in ("parent_task_id", "summary", "status"):
-        if isinstance(value.get(key), str):
-            bounded[key] = _cap_utf8(value[key], MAX_ENVELOPE_FIELD_CHARS)
-    for key in ("files_changed", "commits"):
-        if isinstance(value.get(key), list):
-            items = [
-                _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
-                for item in value[key]
-                if isinstance(item, str)
-            ][:MAX_ENVELOPE_ITEMS]
-            if items:
-                bounded[key] = items
-    if not bounded:
-        return None
-    return bounded
 
 
 def _merge_task_config(
@@ -617,7 +736,7 @@ def _merge_task_config(
     base_commit = config.base_commit or run.get("base_commit")
     task = config.task if config.task.strip() else str(run.get("task", ""))
     fanout_config = config.fanout_config or _provider_fanout_config(run)
-    parent_envelope = config.parent_envelope or _bounded_parent_envelope(
+    parent_envelope = config.parent_envelope or _validate_parent_envelope(
         run.get("parent_envelope")
     )
     return AgentConfig(
@@ -668,7 +787,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         checkpoint_root=None,
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
-        parent_envelope=_bounded_parent_envelope(run.get("parent_envelope")),
+        parent_envelope=_validate_parent_envelope(run.get("parent_envelope")),
     )
 
 
@@ -1051,7 +1170,7 @@ def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
 
     The block carries the parent's summary, changed files, and commits so a
     child starts from the parent's outcome without inheriting its session.
-    Fields are already bounded by ``_bounded_parent_envelope``; this renders
+    Fields are already validated by ``_validate_parent_envelope``; this renders
     them as a compact, deterministic text block.
     """
     lines = ["Parent task context:"]
@@ -1378,7 +1497,11 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
         ):
             outcome["failure_reason"] = "invalid worker generation"
             return outcome
-        write_marker = bool(run.get("write_marker", True))
+        raw_write_marker = run.get("write_marker", True)
+        if not isinstance(raw_write_marker, bool):
+            outcome["failure_reason"] = "write_marker must be a boolean"
+            return outcome
+        write_marker = raw_write_marker
         provider_metadata: dict[str, Any] | None = None
 
         target_file = run.get("target_file")
@@ -1490,7 +1613,7 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
     except GenerationFenceError as exc:
         outcome["failure_reason"] = str(exc)
         return outcome
-    except Exception as exc:  # let-it-crash: report as a failure, not a hang
+    except (OSError, subprocess.SubprocessError) as exc:
         outcome["failure_reason"] = f"task crashed: {exc}"
         return outcome
 
@@ -2031,7 +2154,7 @@ def _finalize_worktree(
     except GenerationFenceError as exc:
         outcome["failure_reason"] = str(exc)
         return outcome
-    except Exception as exc:  # let-it-crash: report as a failure, not a hang
+    except (OSError, subprocess.SubprocessError) as exc:
         outcome["failure_reason"] = f"task crashed: {exc}"
         return outcome
 
@@ -2082,22 +2205,39 @@ async def _emit_proposed_children(
     resulting ``child_admitted`` / ``child_rejected`` events. Emitted after
     the task body finishes and before the result envelope, so the supervisor
     can admit children as soon as the parent's terminal envelope is known.
+
+    A malformed proposal set is a plan-spec defect, not silently skippable:
+    it raises :class:`ChildProposalError` so the task fails closed instead of
+    dropping revisions.
     """
     proposals = run.get("proposed_children")
-    if not isinstance(proposals, list):
+    if proposals is None:
         return
-    for proposal in proposals:
+    if not isinstance(proposals, list):
+        raise ChildProposalError(
+            f"proposed_children must be a list, got {type(proposals).__name__}"
+        )
+    for index, proposal in enumerate(proposals):
         if not isinstance(proposal, dict):
-            continue
+            raise ChildProposalError(
+                f"proposed_children[{index}] must be an object, "
+                f"got {type(proposal).__name__}"
+            )
         child_task_id = proposal.get("child_task_id")
         kind = proposal.get("kind")
         child_spec = proposal.get("spec")
         if not isinstance(child_task_id, str) or not child_task_id:
-            continue
+            raise ChildProposalError(
+                f"proposed_children[{index}].child_task_id must be a non-empty string"
+            )
         if not isinstance(kind, str) or not kind:
-            continue
+            raise ChildProposalError(
+                f"proposed_children[{index}].kind must be a non-empty string"
+            )
         if not isinstance(child_spec, dict):
-            continue
+            raise ChildProposalError(
+                f"proposed_children[{index}].spec must be an object"
+            )
         await send(writer, {
             "type": "propose_child",
             "request_id": make_request_id("propose"),
@@ -2187,7 +2327,7 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "task_id": outcome["task_id"],
         "generation": outcome["generation"],
         "status": status,
-        "exit_code": EXIT_CODES.get(status, 1),
+        "exit_code": _exit_code_for(status),
         "commits": outcome.get("commits", []),
         "files_changed": outcome.get("files_changed", []),
         "diff": outcome.get("diff", ""),
@@ -2213,6 +2353,33 @@ async def _emit_result(writer: asyncio.StreamWriter, outcome: dict[str, Any]) ->
         "reason": _exit_reason(outcome["status"]),
         "monotonic_ms": _monotonic_ms(),
     })
+
+
+async def _await_on_shutdown(
+    task: asyncio.Task[dict[str, Any]],
+    task_id: str,
+    generation: int,
+    request_id: str | None,
+) -> dict[str, Any]:
+    """Wait for the active task and preserve its terminal shutdown outcome."""
+    started_at = time.time()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        failure_reason = "task cancelled during worker shutdown"
+        status = TaskStatus.CANCELLED.value
+    except Exception as exc:
+        failure_reason = f"task failed during worker shutdown: {exc}"
+        status = TaskStatus.FAILED.value
+    return {
+        "request_id": request_id,
+        "task_id": task_id,
+        "generation": generation,
+        "status": status,
+        "failure_reason": failure_reason,
+        "started_at": started_at,
+        "ended_at": time.time(),
+    }
 
 
 async def _send_ok(
@@ -2308,6 +2475,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
     worker_reuse = bool(first.get("worker_reuse"))
 
     current: asyncio.Task[dict[str, Any]] | None = None
+    current_request_id: str | None = None
     stop = threading.Event()
 
     while True:
@@ -2327,6 +2495,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
         if current is not None and current in done:
             task = current
             current = None
+            current_request_id = None
             read_task.cancel()
             try:
                 await read_task
@@ -2383,7 +2552,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             return 0
         except MessageTooLong:
             return await _fatal(writer, {}, "wire line exceeded the length cap")
-        except Exception as exc:
+        except OSError as exc:
             return await _fatal(writer, {}, f"wire read failed: {exc}")
 
         if msg is None:
@@ -2460,6 +2629,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 # worker's local task context and never sent back over IPC.
                 task_run["fanout_config"] = init_fanout_config
             task_config = _merge_task_config(init_config, first, task_run)
+            current_request_id = msg["request_id"]
             current = asyncio.create_task(
                 _run_task(writer, task_run, task_id, generation, stop, task_config))
         elif mtype == "check_health":
@@ -2486,11 +2656,12 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 stop.set()
                 task = current
                 current = None
-                try:
-                    outcome = await task
-                    await _emit_result_envelope(writer, outcome)
-                except BaseException:
-                    pass
+                request_id = current_request_id
+                current_request_id = None
+                outcome = await _await_on_shutdown(
+                    task, task_id, generation, request_id
+                )
+                await _emit_result_envelope(writer, outcome)
             await send(writer, {
                 "type": "exit_message",
                 "task_id": task_id,
