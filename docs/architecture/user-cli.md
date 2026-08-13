@@ -53,17 +53,17 @@ Options:
   never continued. When omitted, a fresh leaf named `run-*` is created with
   mode `0700` under `<repo>/.cambium/sessions/` (one leaf per run; two
   default runs never share a directory).
-- `--provider` / `--model` — select one configured provider (see §7).
+- `--provider` / `--model` — prefer one configured provider and model (see
+  §7). Same-tier configured providers can serve as fallback after that
+  preference fails.
   Provider ids are validated against `[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?`.
-- `--auto` — route the run through the usage-debt selector (solution C): the
+- `--auto` — route the run through the usage-debt selector: the
   supervisor picks `(provider, model, tier)` from all enabled configured
   providers with stored credentials instead of pinning `--provider`/`--model`.
 - `--max-wall-s SECONDS` — per-task wall-clock budget in seconds (default
   `300`, matching `cambium run --help` at this commit).
 - `--max-tokens N` — total token budget across the run (default `200000`).
-- `--max-turns N` — maximum agent-loop turns (default `50` from
-  `oneshot.DEFAULT_MAX_TURNS`; `cambium run --help` still prints `20`, a stale
-  help string).
+- `--max-turns N` — maximum agent-loop turns (default `50`).
 - `--json` — print the rendered result as JSON instead of the text line.
 
 Pipeline (`oneshot.run_oneshot`): preflight the repo and prompt, resolve the
@@ -93,9 +93,11 @@ session admission lock is already held by another live supervisor
 (`cambium run: session is already running: ...`, a temporary failure callers
 may retry), `130` on `KeyboardInterrupt`, otherwise the result exit code.
 
-Without `--provider`/`--model`, the run still resolves a provider: it
-auto-selects the first enabled provider from the trusted user config (see
-§7). The marker task (`target_file` plus `marker`) is an internal
+Without `--provider`/`--model`, the run builds a cascade from every enabled
+provider in the trusted user config that has a usable API-key or OAuth
+credential. Admission selects a provider/model/tier from that set. `--auto`
+uses the same credential-backed set and explicitly enables usage-balanced
+routing. The marker task (`target_file` plus `marker`) is an internal
 `OneShotConfig` path only; the CLI does not expose those fields, so a plain
 run never becomes a marker task. Provider runs use the bounded Diffundo
 worker loop. A provider run may complete successfully with a
@@ -206,9 +208,10 @@ duplicate names, colliding env names, and invalid values are rejected by
 names only, never key values.
 
 `select_provider` is a pure decision: an explicit `name` wins (it must be
-enabled); otherwise the first enabled provider by ascending `priority` order
-— optionally restricted by `model` when only `--model` was given. It never
-reads the environment or a key value.
+enabled); otherwise the first enabled provider by ascending `priority` order,
+optionally restricted by tier. One-shot model-only selection performs its own
+exact-model filter before calling this function. It never reads the environment
+or a key value.
 
 ### `cambium auth`
 

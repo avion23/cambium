@@ -10,9 +10,9 @@ live gap table.
 
 Cambium runs directly from source; no wheel is built and no install is
 required or supported. The CLI routes `auth`, `supervisor`, `doctor`, `bench`,
-`tasktree`, `module-test`, `version`, `run`, `repl`, `tui`, `session`, and
-`architectus`
-(`session list/latest/show` reads completed session results).
+`module-test`, `version`, `run`, `repl`, `tui`, `session`, and `architectus`.
+The session surface includes `list`, `latest`, `show`, `status`, `resume`, and
+`usage`. Task-tree inspection remains available as `python -m cambium.tasktree`.
 `cambium.__init__` exports only `__version__`; there is no public session API.
 
 ### Plan and publication
@@ -85,11 +85,14 @@ contains optional DSPy-compatible `CambiumLM` and `ArchitectusLM` adapters;
 they are not a supervisor planner.
 
 `Diffundo` is a tiered provider router with health, configured RPM request-rate
-buckets, cooldown, circuit-breaker, and configured-priority ordering. A
-depleted bucket reports `RATE_LIMITED`. It has no local response cache. HTTP 429
-responses carry a parsed `Retry-After` delay into the same-provider retry path.
-Weighted routing and a production provider token, cost, and account-quota
-observability contract are not implemented.
+buckets, cooldown, circuit-breaker, and evidence-based candidate ordering. The
+ordering key uses success confidence, latency-SLO compliance, expected cost per
+successful turn, normalized latency/cache evidence, incumbent stickiness,
+rotation, debt, and configured order when evidence is absent. A depleted bucket
+reports `RATE_LIMITED`. It has no local response cache. HTTP 429 responses carry
+a parsed `Retry-After` delay into the same-provider retry path. One-shot runs
+store routing debt in `<repo>/.cambium/routing-state.json`; `DebtStore` itself
+defaults to `~/.config/cambium/routing-state.json` when no path is supplied.
 
 The escaped-secret bench canary was deleted by product decision; it is no
 longer a live blocker.
@@ -114,8 +117,9 @@ existing `_admit_child` revision validation (never the live tree directly);
 every admitted/rejected revision is appended to the conversation store.
 `orchestrator.py` forwards both options from its stabilized public `run`
 surface, and `cambium supervisor --conversations` exposes the flag on the
-CLI. With neither backend configured, `run_plan` is byte-for-byte the
-historical behavior. Persistent worker reuse is absent.
+CLI. With neither backend configured, `run_plan` keeps the normal execution
+path. A session-scoped warm pool defaults to one idle worker and can be disabled
+with `CAMBIUM_WARM_POOL_SIZE=0`.
 
 `doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
 auth coverage, optional event and conversation databases, module datasets, and
