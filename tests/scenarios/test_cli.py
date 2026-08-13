@@ -43,40 +43,6 @@ def _run(
     )
 
 
-class _PipedStdin:
-    """A non-TTY stdin pipe, matching the subprocess ``input_text`` contract."""
-
-    def __init__(self, payload: str) -> None:
-        self._payload = payload.encode()
-        self.buffer = self
-
-    def isatty(self) -> bool:
-        return False
-
-    def read(self) -> bytes:
-        return self._payload
-
-
-def _feed_stdin(monkeypatch: pytest.MonkeyPatch, payload: str) -> None:
-    monkeypatch.setattr(sys, "stdin", _PipedStdin(payload))
-
-
-def test_tasktree_reads_plan_from_stdin(monkeypatch, capsys) -> None:
-    plan = {
-        "tasks": [
-            {"task_id": "root", "kind": "FEATURE", "depends_on": []},
-            {"task_id": "leaf", "kind": "TEST", "depends_on": ["root"]},
-        ]
-    }
-    _feed_stdin(monkeypatch, json.dumps(plan))
-
-    assert cli.main(["tasktree"]) == 0
-
-    captured = capsys.readouterr()
-    assert captured.out == '"root"\n"leaf"\n'
-    assert captured.err == ""
-
-
 @pytest.mark.slow
 def test_module_test_runs_reference_module() -> None:
     # ``cambium module-test`` inherently runs the example module's real 57-test

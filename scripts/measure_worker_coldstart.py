@@ -38,7 +38,7 @@ dspy import figure recorded in docs/research/worker-coldstart.md, since a
 provider run needs credentials and is out of scope here).
 
 Self-contained: no provider calls, no credentials, no network. Uses the public
-supervisor API (``python -m cambium.cli supervisor``) the same way
+supervisor API (``python -m cambium.supervisor``) the same way
 scripts/e2e-selfcheck.sh does.
 """
 
@@ -213,7 +213,7 @@ def _run_one(
     plan_path.write_text(json.dumps(plan) + "\n", encoding="utf-8")
 
     cmd = [
-        python, "-u", "-m", "cambium.cli", "supervisor",
+        python, "-u", "-m", "cambium.supervisor",
         "--session-dir", str(session_dir), "--plan", str(plan_path),
     ]
     env = dict(os.environ)

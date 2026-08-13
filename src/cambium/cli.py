@@ -63,6 +63,92 @@ def _provider_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _split_provider_model(
+    provider: str | None, model: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve combined ``--provider NAME:MODEL`` / ``--model NAME/MODEL`` CLI
+    forms into separate provider and model values.
+
+    A model named through either form wins; naming conflicting models or
+    providers across both forms is an error.
+    """
+    provider_name: str | None = None
+    provider_model: str | None = None
+    if provider is not None:
+        if ":" in provider:
+            provider_name, provider_model = provider.split(":", 1)
+            if not provider_name or not provider_model:
+                raise ValueError("--provider must be NAME or NAME:MODEL")
+        else:
+            provider_name = provider
+            if not provider_name:
+                raise ValueError("--provider must be NAME or NAME:MODEL")
+    model_provider: str | None = None
+    model_name: str | None = None
+    if model is not None:
+        if "/" in model:
+            model_provider, model_name = model.split("/", 1)
+            if not model_provider or not model_name:
+                raise ValueError("--model must be MODEL or PROVIDER/MODEL")
+        else:
+            model_name = model
+            if not model_name:
+                raise ValueError("--model must be MODEL or PROVIDER/MODEL")
+    if (
+        provider_model is not None
+        and model_name is not None
+        and provider_model != model_name
+    ):
+        raise ValueError(
+            f"--provider and --model name different models: "
+            f"{provider_model!r} vs {model_name!r}"
+        )
+    if (
+        provider_name is not None
+        and model_provider is not None
+        and provider_name != model_provider
+    ):
+        raise ValueError(
+            f"--provider and --model name different providers: "
+            f"{provider_name!r} vs {model_provider!r}"
+        )
+    return (
+        provider_name if provider_name is not None else model_provider,
+        provider_model if provider_model is not None else model_name,
+    )
+
+
+def _agent_provider_argument(value: str) -> str:
+    """``--provider`` accepts ``NAME`` or ``NAME:MODEL`` (returns the raw value;
+    the handler splits it via :func:`_split_provider_model`)."""
+    try:
+        provider, _ = _split_provider_model(value, None)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    try:
+        validate_provider_id(provider)
+    except AuthSchemaError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
+def _agent_model_argument(value: str) -> str:
+    """``--model`` accepts ``MODEL`` or ``PROVIDER/MODEL`` (returns the raw
+    value; the handler splits it via :func:`_split_provider_model`)."""
+    try:
+        provider, model = _split_provider_model(None, value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not model:
+        raise argparse.ArgumentTypeError("model name is invalid")
+    if provider is not None:
+        try:
+            validate_provider_id(provider)
+        except AuthSchemaError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -89,7 +175,6 @@ _COMMAND_NAMES = frozenset(
         "supervisor",
         "doctor",
         "bench",
-        "tasktree",
         "module-test",
         "version",
         "run",
@@ -108,17 +193,6 @@ _EXIT_SESSION_BUSY = 75
 
 def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-dir", required=True, metavar="DIR")
-    plan = parser.add_mutually_exclusive_group()
-    plan.add_argument(
-        "--plan",
-        metavar="PATH",
-        help="plan JSON path (passed to supervisor plan mode when available)",
-    )
-    plan.add_argument(
-        "--task-spec",
-        metavar="PATH",
-        help="task-spec JSON path (compatibility flag for the slice supervisor)",
-    )
     parser.add_argument(
         "--conversations",
         action="store_true",
@@ -137,11 +211,16 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-dir", metavar="DIR", help="session directory")
     parser.add_argument(
         "--provider",
-        type=_provider_argument,
-        metavar="PROVIDER",
-        help="provider id",
+        type=_agent_provider_argument,
+        metavar="PROVIDER[:MODEL]",
+        help="provider id, optionally with a model (NAME:MODEL)",
     )
-    parser.add_argument("--model", metavar="MODEL", help="model name")
+    parser.add_argument(
+        "--model",
+        type=_agent_model_argument,
+        metavar="[PROVIDER/]MODEL",
+        help="model name, optionally with a provider (PROVIDER/MODEL)",
+    )
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -219,7 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,tasktree,module-test,version,run,repl,tui,session,architectus}",
+        metavar="{auth,supervisor,doctor,bench,module-test,version,run,repl,tui,session,architectus}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -431,10 +510,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="session id whose usage to aggregate",
     )
 
-    commands.add_parser(
-        "tasktree",
-        help="read a plan from a file or stdin and print its topological order",
-    )
     architectus = commands.add_parser(
         "architectus",
         help="run one live or scripted Architectus decision session",
@@ -456,26 +531,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _supervisor_args(args: argparse.Namespace) -> list[str]:
     delegated = ["--session-dir", args.session_dir]
-    if args.task_spec is not None:
-        delegated.extend(("--task-spec", args.task_spec))
-    elif args.plan is not None:
-        delegated_flag = "--plan" if _supervisor_has_plan_mode() else "--task-spec"
-        delegated.extend((delegated_flag, args.plan))
     if getattr(args, "conversations", False):
         delegated.append("--conversations")
     return delegated
-
-
-def _supervisor_has_plan_mode() -> bool:
-    """Return whether the installed supervisor exposes its plan runtime.
-
-    The vertical-slice supervisor uses ``--task-spec``.  The full supervisor
-    keeps that mode and adds ``--plan``.  The capability check lets this CLI
-    run against either implementation without reimplementing supervision.
-    """
-    from . import supervisor
-
-    return hasattr(supervisor, "run_plan")
 
 
 def _run_supervisor(args: argparse.Namespace) -> int:
@@ -844,23 +902,28 @@ def _run_oneshot(args: argparse.Namespace) -> int:
         return 1
     from .supervisor import SessionAlreadyRunningError
 
-    config = oneshot.OneShotConfig(
-        prompt=_prompt_text(args.prompt),
-        repo=args.repo,
-        session_root=args.session_dir,
-        provider=args.provider,
-        model=args.model,
-        auto=getattr(args, "auto", False),
-        max_wall_s=_budget_or_default(
-            getattr(args, "max_wall_s", None), oneshot.DEFAULT_WALL_BUDGET_S
-        ),
-        max_tokens=_budget_or_default(
-            getattr(args, "max_tokens", None), oneshot.DEFAULT_MAX_TOKENS
-        ),
-        max_turns=_budget_or_default(
-            getattr(args, "max_turns", None), oneshot.DEFAULT_MAX_TURNS
-        ),
-    )
+    try:
+        provider, model = _split_provider_model(args.provider, args.model)
+        config = oneshot.OneShotConfig(
+            prompt=_prompt_text(args.prompt),
+            repo=args.repo,
+            session_root=args.session_dir,
+            provider=provider,
+            model=model,
+            auto=getattr(args, "auto", False),
+            max_wall_s=_budget_or_default(
+                getattr(args, "max_wall_s", None), oneshot.DEFAULT_WALL_BUDGET_S
+            ),
+            max_tokens=_budget_or_default(
+                getattr(args, "max_tokens", None), oneshot.DEFAULT_MAX_TOKENS
+            ),
+            max_turns=_budget_or_default(
+                getattr(args, "max_turns", None), oneshot.DEFAULT_MAX_TURNS
+            ),
+        )
+    except ValueError as exc:
+        print(f"cambium run: {exc}", file=sys.stderr)
+        return 2
     try:
         value = oneshot.run_oneshot(config)
         result = asyncio.run(value) if inspect.isawaitable(value) else value
@@ -889,11 +952,16 @@ def _run_repl(args: argparse.Namespace) -> int:
         return 1
     from . import oneshot
 
+    try:
+        provider, model = _split_provider_model(args.provider, args.model)
+    except ValueError as exc:
+        print(f"cambium repl: {exc}", file=sys.stderr)
+        return 2
     config = oneshot.OneShotConfig(
         repo=args.repo,
         session_root=args.session_dir,
-        provider=args.provider,
-        model=args.model,
+        provider=provider,
+        model=model,
     )
     return repl.run_repl(config)
 
@@ -904,11 +972,16 @@ def _run_tui(args: argparse.Namespace) -> int:
         return 1
     from . import oneshot
 
+    try:
+        provider, model = _split_provider_model(args.provider, args.model)
+    except ValueError as exc:
+        print(f"cambium tui: {exc}", file=sys.stderr)
+        return 2
     config = oneshot.OneShotConfig(
         repo=args.repo,
         session_root=args.session_dir,
-        provider=args.provider,
-        model=args.model,
+        provider=provider,
+        model=model,
     )
     return tui.run_tui(config, quiet=getattr(args, "quiet", False))
 
@@ -1158,11 +1231,6 @@ def _run_architectus(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Dispatch one unified Cambium CLI invocation and return its exit code."""
     command_line = sys.argv[1:] if argv is None else argv
-    if command_line and command_line[0] == "tasktree":
-        from . import tasktree
-
-        return tasktree.main(command_line[1:])
-
     if _bare_prompt_allowed(command_line):
         return _run_bare_prompt(command_line)
 

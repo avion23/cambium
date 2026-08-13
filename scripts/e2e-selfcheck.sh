@@ -11,7 +11,7 @@
 #   - writes a one-task plan (worker cambium.worker, deterministic marker
 #     mode, no `gate` key, provider_env_keys [], max_wall_s 60,
 #     max_restarts 0, worktree_path under the session dir) and runs
-#     `python3.14 -m cambium.cli supervisor --session-dir "$SESSION" --plan
+#     `python3.14 -m cambium.supervisor --session-dir "$SESSION" --plan
 #     "$PLAN"` with PYTHONPATH pointing at this tree's src
 #   - verifies: supervisor exit 0; clone main advanced by exactly one commit
 #     touching only the e2e fixture with exactly one added line; worker
@@ -86,7 +86,7 @@ JSON
 
 note "running supervisor (harness src: $REAL/src)"
 set +e
-PYTHONPATH="$REAL/src" "$PY" -u -m cambium.cli supervisor --session-dir "$SESSION" --plan "$PLAN" 2>&1 | tee "$SUPERVISOR_LOG"
+PYTHONPATH="$REAL/src" "$PY" -u -m cambium.supervisor --session-dir "$SESSION" --plan "$PLAN" 2>&1 | tee "$SUPERVISOR_LOG"
 SUP_RC="${PIPESTATUS[0]}"
 set -e
 note "supervisor exit code: $SUP_RC"

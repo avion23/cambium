@@ -365,7 +365,10 @@ def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
     assert result.exit_code == 0
     task = captured["plan"]["tasks"][0]
     assert task["provider_env_keys"] == [env_name]
-    assert task["fanout_config"] == {"tier": "balanced", "model": "selected-model"}
+    # Cascade default: implicit mode leaves the (provider, model, tier) to the
+    # supervisor's routing resolution; only stored candidates are handed over.
+    assert task["fanout_config"] == {}
+    assert task["model_candidates"] == ["selected-model"]
     assert task["provider_config_path"] == str(config_path.resolve())
     assert captured["kwargs"]["provider_environment"] == {env_name: secret}
     assert secret not in json.dumps(captured["plan"])
@@ -422,7 +425,7 @@ def test_implicit_provider_selection_fails_before_launch_without_credential(
         raise AssertionError("credential preflight must happen before launch")
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", unexpected_run_plan)
-    with pytest.raises(ValueError, match="provider credential is not configured"):
+    with pytest.raises(ValueError, match="no enabled provider with stored credentials"):
         asyncio.run(oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo)))
     assert launched is False
 
@@ -946,3 +949,45 @@ def test_run_parser_auto_flag_and_budget_flags() -> None:
     assert pinned.auto is False
     assert pinned.provider == "demo"
     assert pinned.model == "m1"
+
+
+def test_run_parser_combined_provider_model_forms() -> None:
+    """--provider NAME:MODEL and --model PROVIDER/MODEL carry provider+model
+    in one string and resolve to separate values."""
+    parser = cli._build_parser()
+
+    provider_first = parser.parse_args(["run", "--provider", "demo:demo-model", "p"])
+    assert cli._split_provider_model(provider_first.provider, provider_first.model) == (
+        "demo",
+        "demo-model",
+    )
+
+    model_first = parser.parse_args(["run", "--model", "demo/demo-model", "p"])
+    assert cli._split_provider_model(model_first.provider, model_first.model) == (
+        "demo",
+        "demo-model",
+    )
+
+    agreeing = parser.parse_args(
+        ["run", "--provider", "demo:demo-model", "--model", "demo-model", "p"]
+    )
+    assert cli._split_provider_model(agreeing.provider, agreeing.model) == (
+        "demo",
+        "demo-model",
+    )
+
+    conflicting = parser.parse_args(
+        ["run", "--provider", "demo:demo-model", "--model", "other/other-model", "p"]
+    )
+    with pytest.raises(ValueError, match="different models"):
+        cli._split_provider_model(conflicting.provider, conflicting.model)
+
+    with pytest.raises(ValueError, match="different providers"):
+        cli._split_provider_model("demo", "other/other-model")
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--model", "demo/", "p"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--provider", "demo:", "p"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "--provider", "demo!bad:model", "p"])

@@ -1,9 +1,8 @@
 """TaskTree CLI scenarios (architecture §3.4/§3.7, D8a pipe contract).
 
-The CLI scenarios drive ``python -m cambium.tasktree`` (and the unified
-``cambium.cli tasktree`` entry point) as a real subprocess: pipe a plan in,
-get the topological order as JSON lines, with exit codes for cyclic plans,
-depth-bound violations, malformed JSON, and bad arguments.
+The CLI scenarios drive ``python -m cambium.tasktree`` as a real subprocess:
+pipe a plan in, get the topological order as JSON lines, with exit codes for
+cyclic plans, depth-bound violations, malformed JSON, and bad arguments.
 """
 
 from __future__ import annotations
@@ -47,20 +46,6 @@ def _run_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return subprocess.run(
         [sys.executable, "-m", "cambium.tasktree", *args],
-        input=payload,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(REPO_ROOT),
-        timeout=120,
-    )
-
-
-def _run_unified_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
-    return subprocess.run(
-        [sys.executable, "-m", "cambium.cli", "tasktree", *args],
         input=payload,
         capture_output=True,
         text=True,
@@ -161,21 +146,19 @@ def test_cli_no_args_prints_help_without_waiting_on_tty() -> None:
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
-def test_cli_entry_points_share_help_and_extra_argument_errors() -> None:
+def test_cli_help_and_extra_argument_errors() -> None:
     module_help = _run_cli("", "--help")
-    unified_help = _run_unified_cli("", "--help")
 
-    assert unified_help.returncode == module_help.returncode == 0
-    assert unified_help.stdout == module_help.stdout
-    assert unified_help.stderr == module_help.stderr == ""
+    assert module_help.returncode == 0
+    assert module_help.stdout.startswith("usage: python -m cambium.tasktree")
+    assert module_help.stderr == ""
 
     module_extra = _run_cli("", "plan.json", "TOP_SECRET_123")
-    unified_extra = _run_unified_cli("", "plan.json", "TOP_SECRET_123")
 
-    assert unified_extra.returncode == module_extra.returncode == 2
-    assert unified_extra.stdout == module_extra.stdout == ""
-    assert unified_extra.stderr == module_extra.stderr
-    assert "TOP_SECRET_123" not in unified_extra.stderr
+    assert module_extra.returncode == 2
+    assert module_extra.stdout == ""
+    assert "usage:" in module_extra.stderr
+    assert "TOP_SECRET_123" not in module_extra.stderr
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
@@ -221,13 +204,8 @@ def test_cli_cyclic_plan_exits_one_with_stderr() -> None:
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
-@pytest.mark.parametrize(
-    "runner",
-    [_run_cli, _run_unified_cli],
-    ids=["module-entry-point", "unified-entry-point"],
-)
-def test_cli_deep_chain_exits_one_with_clean_depth_error(runner) -> None:
-    result = runner(json.dumps(_chain_plan()))
+def test_cli_deep_chain_exits_one_with_clean_depth_error() -> None:
+    result = _run_cli(json.dumps(_chain_plan()))
 
     assert result.returncode == 1
     assert result.stdout == ""

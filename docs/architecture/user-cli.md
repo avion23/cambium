@@ -259,16 +259,17 @@ diagnostics.
 
 ```sh
 PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir DIR \
-    [--plan PATH | --task-spec PATH] [--conversations]
+    [--conversations]
 ```
 
-`--session-dir` is required and names the concrete session leaf. Without
-`--plan` or `--task-spec`, the supervisor runs its built-in deterministic demo:
-one marker worker (`task_id` `demo-001`) against a seeded repository under
-`DIR/scratch` that appends a marker line to `hello.txt`. `--plan` is passed as
-a plan when the installed supervisor exposes `run_plan`, otherwise as a
-task-spec (compatibility with the slice supervisor). `--conversations`
-persists child-revision conversations at
+`--session-dir` is required and names the concrete session leaf. The CLI
+supervisor subcommand is a thin adapter; the full plan-runtime surface
+(`--plan`, `--task-spec`) lives on the module entry point
+`python3.14 -m cambium.supervisor` (used by `session resume` and the e2e
+scripts). The built-in deterministic demo (one marker worker `task_id`
+`demo-001` against a seeded repository under `DIR/scratch` that appends a
+marker line to `hello.txt`) runs when no task spec or plan is supplied.
+`--conversations` persists child-revision conversations at
 `<session-dir>/.cambium/conversations.db`. Publication advances the
 working repository's `refs/heads/main` only; it does not refresh a checkout.
 

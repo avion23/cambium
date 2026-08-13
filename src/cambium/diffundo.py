@@ -1250,15 +1250,24 @@ class Diffundo:
     def _candidates(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
         """Tier-matching, capability-filtered, health/bucket-eligible providers,
         sorted by priority ascending, refined by measured quality within an
-        equal-priority run (arch §9.1/§9.2 step 1, weighted routing)."""
+        equal-priority run (arch §9.1/§9.2 step 1, weighted routing).
+
+        When ``model`` is pinned, providers in the same tier that declare a
+        different model are kept as ordered fallback candidates behind the
+        strict model matches, so a quota/rate-limit failure on the pinned
+        provider can cascade to a sibling instead of surfacing as
+        ``AllProvidersFailed``. If no provider declares the pinned model, the
+        pin is a configuration error and no candidate is returned.
+        """
         now = time.monotonic()
-        out: list[ProviderConfig] = []
+        eligible: list[ProviderConfig] = []
+        model_declared = model is None
         for runtime in self._runtimes:
             provider = runtime.provider
             if provider.tier is not tier or not provider.enabled:
                 continue
-            if model is not None and provider.model != model:
-                continue
+            if model is not None and provider.model == model:
+                model_declared = True
             if runtime.health is HealthState.DISABLED:
                 continue
             if runtime.health is HealthState.OPEN:
@@ -1272,9 +1281,20 @@ class Diffundo:
                 continue
             if not runtime.bucket.has_token():
                 continue
-            out.append(provider)
+            eligible.append(provider)
+        if model is None:
+            return self._order_candidates(eligible)
+        strict = [provider for provider in eligible if provider.model == model]
+        fallback = [provider for provider in eligible if provider.model != model]
+        if strict:
+            return self._order_candidates(strict) + self._order_candidates(fallback)
+        if model_declared:
+            return self._order_candidates(fallback)
+        return []
+
+    def _order_candidates(self, candidates: list[ProviderConfig]) -> list[ProviderConfig]:
         return order_candidates(
-            out,
+            candidates,
             debt=dict(self._debt) if self._debt is not None else None,
             incumbent=self._primary_provider,
             rotation_offset=self._rotation,

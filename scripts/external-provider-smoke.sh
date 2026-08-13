@@ -124,7 +124,7 @@ JSON
 
 note "running supervisor (provider config: $CONFIG)"
 set +e
-CAMBIUM_PROVIDERS="$CONFIG" PYTHONPATH="$REAL/src" "$PY" -u -m cambium.cli supervisor \
+CAMBIUM_PROVIDERS="$CONFIG" PYTHONPATH="$REAL/src" "$PY" -u -m cambium.supervisor \
     --session-dir "$SESSION" --plan "$PLAN" 2>&1 | tee "$SUPERVISOR_LOG"
 SUP_RC="${PIPESTATUS[0]}"
 set -e
@@ -194,7 +194,7 @@ cat > "$FAIL_PLAN" <<JSON
 JSON
 FAIL_BASE="$(git -C "$CLONE" rev-parse refs/heads/main)" || fail "cannot resolve fail-baseline main"
 set +e
-CAMBIUM_PROVIDERS="$CONFIG" PYTHONPATH="$REAL/src" "$PY" -u -m cambium.cli supervisor \
+CAMBIUM_PROVIDERS="$CONFIG" PYTHONPATH="$REAL/src" "$PY" -u -m cambium.supervisor \
     --session-dir "$FAIL_SESSION" --plan "$FAIL_PLAN" 2>&1 | tee "$FAIL_LOG"
 FAIL_RC="${PIPESTATUS[0]}"
 set -e

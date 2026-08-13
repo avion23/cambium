@@ -259,7 +259,13 @@ def _resolve_provider(
     if marker_mode:
         return config, {}
 
-    if config.auto:
+    cascade = config.auto or (
+        config.provider is None
+        and config.model is None
+        and config.fanout_config is None
+        and not config.provider_env_keys
+    )
+    if cascade:
         if config.provider is not None or config.model is not None:
             raise ValueError("auto mode cannot be combined with --provider or --model")
         config_path = _provider_config_path(config, repo)
@@ -285,8 +291,8 @@ def _resolve_provider(
             stored.append(candidate)
         if not stored:
             raise ValueError(
-                "auto mode requires at least one enabled provider with stored "
-                "credentials; run `cambium auth set <provider> --stdin` first"
+                "no enabled provider with stored credentials; run "
+                "`cambium auth set <provider> --stdin` first"
             )
         resolved = replace(
             config,

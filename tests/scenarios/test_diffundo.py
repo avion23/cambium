@@ -327,6 +327,65 @@ def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
             server.close()
 
 
+def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """A pinned model's matching provider failing mid-call cascades to a same
+    tier sibling that declares a different model (cascade fix), instead of
+    surfacing AllProvidersFailed."""
+    bad = FakeServer([(500, _error_payload("boom"), 0.0)])
+    sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
+    _set_keys(monkeypatch, "K_M2", "K_OTHER")
+    router = Diffundo(
+        (
+            _config("p_m2", bad, "K_M2", model="m2"),
+            _config("p_other", sibling, "K_OTHER", model="m-other"),
+        ),
+        pause_timeout_s=0.01,
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        assert isinstance(result, CallResult)
+        assert result.provider == "p_other"
+        assert result.model == "m-other"
+        assert result.content == "sibling served"
+        assert len(bad.calls) == 1  # strict match failed -> fell through
+        assert len(sibling.calls) == 1
+    finally:
+        bad.close()
+        sibling.close()
+
+
+def test_model_pin_unavailable_at_selection_falls_through_to_sibling(
+    tmp_path, monkeypatch
+) -> None:
+    """A pinned model whose only matching provider fails into COOLDOWN cascades
+    to the eligible same-tier sibling on the next selection."""
+    bad = FakeServer([(500, _error_payload("boom"), 0.0)])
+    sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
+    _set_keys(monkeypatch, "K_M2", "K_OTHER")
+    router = Diffundo(
+        (
+            _config("p_m2", bad, "K_M2", model="m2", cooldown_s=60),
+            _config("p_other", sibling, "K_OTHER", model="m-other"),
+        ),
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        assert first.provider == "p_other"
+        assert len(bad.calls) == 1
+        assert len(sibling.calls) == 1
+        # p_m2 is in COOLDOWN; the next selection relaxes straight to the sibling.
+        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        assert second.provider == "p_other"
+        assert len(bad.calls) == 1  # cooldown skipped the strict match
+        assert len(sibling.calls) == 2
+    finally:
+        bad.close()
+        sibling.close()
+
+
 # --------------------------------------------------------------------------- #
 # 3. circuit breaker
 # --------------------------------------------------------------------------- #
