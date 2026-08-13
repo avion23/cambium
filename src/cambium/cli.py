@@ -359,6 +359,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Start the Cambium terminal dashboard.",
     )
     _add_agent_arguments(tui)
+    tui.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress live event updates and print only completed results",
+    )
 
     session = commands.add_parser(
         "session",
@@ -905,7 +910,7 @@ def _run_tui(args: argparse.Namespace) -> int:
         provider=args.provider,
         model=args.model,
     )
-    return tui.run_tui(config)
+    return tui.run_tui(config, quiet=getattr(args, "quiet", False))
 
 
 def _run_session(args: argparse.Namespace) -> int:
