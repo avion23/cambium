@@ -1966,6 +1966,12 @@ class _Runtime:
             return
         try:
             await self._supervise(spec)
+        except InvalidBaseCommitError:
+            reason = "invalid_base_commit"
+            await self.emit("worker_failed", task_id=spec["task_id"], reason=reason)
+            self._results[spec["task_id"]] = TaskResult(
+                task_id=spec["task_id"], status="failed", exit_code=1, reason=reason
+            )
         finally:
             # Lane release (H1): every task that holds a lane reservation
             # (batch pre-assignment or admission-time assignment) frees it on
