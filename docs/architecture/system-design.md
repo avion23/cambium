@@ -18,9 +18,11 @@ stdin/stdout; one worker can die without taking down its siblings. The proposal
 combined Erlang/OTP one-for-one supervision, Temporal-style durable activities,
 Kahn-process/CSP channel semantics, and hill-climbable DSPy modules.
 
-The draft targeted Python 3.14 free-threaded (3.12+ without true parallelism)
-and claimed only stdlib, DSPy, and Git at runtime. Those are draft claims, not
-implementation facts; LiteLLM and sandbox dependencies are noted below.
+The draft targeted Python 3.14 free-threaded (3.12+ without true parallelism).
+The current core Python package has no mandatory third-party runtime library;
+it uses the Git executable. The `bench` and `module-test` commands require the
+`test` or `dev` extra because they use pytest. DSPy and tree-sitter adapters are
+optional extras. LiteLLM and sandbox dependencies below are historical plans.
 
 ## 1. Naming
 

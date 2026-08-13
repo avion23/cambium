@@ -6,7 +6,7 @@
 # edits.  This driver snapshots the *committed* state of a repository with
 # `git clone --shared` (working-tree tampering cannot reach a clone), makes
 # the copy read-only, and runs the requested eval from the copy with
-# PYTHONPATH pointing at the copy's src and the cambium venv interpreter.
+# PYTHONPATH pointing at the copy's src and the selected interpreter.
 # Nothing is ever written into the source repository: the source HEAD is
 # captured before the run and asserted unchanged afterwards.
 #
@@ -26,13 +26,13 @@
 #   pytest       full pytest suite (testpaths tests+src) from the copy
 #   all          module-test + bench + pytest
 #
-# Usage: isolated_eval.sh [--repo PATH] [--eval MODE] [--worktree PATH]
+# Usage: isolated_eval.sh [--repo PATH] [--python PATH] [--eval MODE] [--worktree PATH]
 #                         [--bench-root PATH]
 set -euo pipefail
 
 REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY=/home/ubuntu/cambium/.venv/bin/python
-REPO=/home/ubuntu/cambium
+PY="${PYTHON:-python3.14}"
+REPO="$REAL"
 EVAL=all
 WORKTREE=
 BENCH_ROOT=
@@ -55,6 +55,7 @@ trap cleanup EXIT
 while [ $# -gt 0 ]; do
     case "$1" in
         --repo) REPO="$2"; shift 2 ;;
+        --python) PY="$2"; shift 2 ;;
         --eval) EVAL="$2"; shift 2 ;;
         --worktree) WORKTREE="$2"; shift 2 ;;
         --bench-root) BENCH_ROOT="$2"; shift 2 ;;
@@ -70,7 +71,7 @@ esac
 
 [ -d "$REPO" ] || fail "--repo is not a directory: $REPO"
 [ -d "$REPO/src/cambium" ] || fail "--repo has no src/cambium: $REPO"
-[ -f "$PY" ] || fail "interpreter missing: $PY"
+command -v "$PY" >/dev/null 2>&1 || fail "interpreter missing: $PY"
 if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     fail "--repo is not a git checkout: $REPO"
 fi

@@ -67,10 +67,8 @@ class ExampleDatasetLoader(DatasetLoader):
     def load_split(self, split: Split) -> list[Example]:
         """Load one split from ``datasets/<split>.jsonl``.
 
-        Falls back to ``example_pairs.jsonl`` (the v2 flat format, no
-        envelope) when the split file is absent — backward compat. The
-        canaries split returns only canary records; the train/eval
-        splits exclude them (dataset-format.md §6).
+        The canaries split returns only canary records; the train/eval splits
+        exclude them (dataset-format.md §6).
         """
         meta = self._check_schema_version()
         return self._load_split(split, meta)
@@ -78,15 +76,9 @@ class ExampleDatasetLoader(DatasetLoader):
     def _load_split(self, split: Split, meta: dict) -> list[Example]:
         """Load one split using metadata captured by the public entry point."""
         split_path = self.datasets_dir / f"{split.value}.jsonl"
-        if split_path.is_file():
-            examples = self._load_path(split_path, meta=meta, require_envelope=True)
-        else:
-            fallback = self.datasets_dir / "example_pairs.jsonl"
-            if not fallback.is_file():
-                raise DatasetError(
-                    f"no dataset file for split {split.value} in {self.datasets_dir}"
-                )
-            examples = self._load_path(fallback, meta=meta)
+        if not split_path.is_file():
+            raise DatasetError(f"dataset split file is missing: {split_path}")
+        examples = self._load_path(split_path, meta=meta, require_envelope=True)
         if split is Split.CANARIES:
             examples = [ex for ex in examples if ex.canary]
         else:

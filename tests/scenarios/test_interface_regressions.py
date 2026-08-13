@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -22,19 +21,6 @@ class _FlushStream(io.StringIO):
 
     def flush(self) -> None:
         self.flushes += 1
-
-
-_EVENTS_SCHEMA = """CREATE TABLE IF NOT EXISTS events (
-    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind         TEXT    NOT NULL,
-    payload      TEXT    NOT NULL,
-    ts           TEXT,
-    monotonic_ms INTEGER,
-    task_id      TEXT,
-    worker_id    TEXT,
-    generation   INTEGER,
-    request_id   TEXT
-)"""
 
 
 def _succeeded_run(_config: oneshot.OneShotConfig) -> PlanResult:
@@ -206,8 +192,8 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
     session_dir = oneshot.allocate_session_dir(oneshot.resolve_repo(tmp_path))
     db = session_dir / ".cambium" / "events.db"
     db.parent.mkdir(parents=True)
-    with sqlite3.connect(db) as connection:
-        connection.execute(_EVENTS_SCHEMA)
+    store = EventStore(db)
+    try:
         for payload in (
             {
                 "turn": 1,
@@ -222,10 +208,9 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
                 "usage": {"input_tokens": 30, "output_tokens": 20, "total_tokens": 50},
             },
         ):
-            connection.execute(
-                "INSERT INTO events(kind, payload) VALUES(?, ?)",
-                ("usage_event", json.dumps(payload, sort_keys=True)),
-            )
+            store.append({"kind": "usage_event", "payload": payload})
+    finally:
+        store.close()
     out = _FlushStream()
     err = _FlushStream()
     code = tui.run_tui(
