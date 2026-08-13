@@ -461,17 +461,12 @@ def test_cli_device_flow_requires_client_id(tmp_path: Path) -> None:
     assert cli._run_auth_oauth_device("codex", "", store=OAuthStore(_store_path(tmp_path))) == 1
 
 
-def test_cli_oauth_dispatch_rejects_conflicting_modes() -> None:
-    import argparse
+def test_cli_oauth_parser_rejects_conflicting_subcommands(capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["auth", "oauth", "status", "codex", "logout"])
 
-    args = argparse.Namespace(
-        provider="codex",
-        client_id=None,
-        status=True,
-        logout=True,
-        import_codex_cli=False,
-    )
-    assert cli._run_auth_oauth(args) == 2
+    assert raised.value.code == 2
+    assert "invalid command arguments" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #

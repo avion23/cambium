@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -313,7 +314,9 @@ def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
     ))
     value = out.getvalue()
     assert code == 0
-    assert "cambium tui: usage stats unavailable:" in err.getvalue()
+    assert err.getvalue() == (
+        "cambium tui: usage stats unavailable: stats backend unavailable\n"
+    )
     assert "plan_status={succeeded}" in value
     assert "stats:" not in value
 
