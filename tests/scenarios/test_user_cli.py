@@ -480,36 +480,35 @@ def test_session_readers_and_cli_expose_paths_and_result_data(
     assert json.loads(capsys.readouterr().out)["summary"] == "new"
 
 
-def test_session_show_rejects_incomplete_session_without_event_db(
+def test_session_show_reads_result_without_event_db(
     capsys, tmp_path: Path
 ) -> None:
     root = tmp_path / "sessions"
     _write_result(root / "incomplete", 1.0)
-    # No events.db is created for this session on purpose.
+    event_db = root / "incomplete" / ".cambium" / "events.db"
 
-    assert (
-        cli.main(["session", "show", "--session-dir", str(root), "incomplete"]) == 1
-    )
+    assert cli.main(["session", "show", "--session-dir", str(root), "incomplete"]) == 0
     captured = capsys.readouterr()
-    assert "cambium session:" in captured.err
-    assert "missing" in captured.err
-    assert "Traceback" not in captured.err
+    result = json.loads(captured.out)
+    assert result["summary"] == "incomplete"
+    assert result["event_log_ref"] == f"sqlite:{event_db}"
+    assert captured.err == ""
 
-    with pytest.raises(FileNotFoundError, match="events.db"):
-        session.show_session(root / "incomplete")
+    view = session.show_session(root / "incomplete")
+    assert view.result == result
+    assert not event_db.exists()
 
 
 def test_session_show_does_not_materialize_event_log(tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     _write_result(root / "events", 1.0)
-    _write_events_db(root / "events")
+    event_db = root / "events" / ".cambium" / "events.db"
 
     view = session.show_session(root / "events")
 
-    # The view exposes only the result artifact; the durable event log is
-    # streamed by cambium.supervisor.read_events, not preloaded here.
-    assert view.events == ()
     assert view.result["summary"] == "events"
+    assert view.result["event_log_ref"] == f"sqlite:{event_db}"
+    assert not event_db.exists()
 
 
 def _write_lifecycle_events(path: Path, events: list[dict[str, Any]]) -> None:
