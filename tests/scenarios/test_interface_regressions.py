@@ -7,6 +7,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from cambium import cli, oneshot, repl, session, stats, tui
 from cambium.render import render_json_result, render_text_result
 from cambium.store import EventStore
@@ -146,7 +148,26 @@ def test_session_event_uri_encodes_query_and_fragment_chars(tmp_path):
     view = session.show_session(session_dir)
 
     assert view.path == session_dir.resolve()
-    assert view.events == ()
+    assert view.result == {"status": "done"}
+
+
+def test_session_listing_surfaces_invalid_results(tmp_path):
+    root = tmp_path / "sessions"
+    valid = root / "valid" / ".cambium"
+    invalid = root / "invalid" / ".cambium"
+    valid.mkdir(parents=True)
+    invalid.mkdir(parents=True)
+    (valid / "result.json").write_text('{"ended_at": 1}')
+    (invalid / "result.json").write_text("{not json")
+
+    entries = session.list_session_entries(root)
+
+    assert [entry.path.name for entry in entries] == ["valid", "invalid"]
+    assert entries[0].valid is True
+    assert entries[1].valid is False
+    assert entries[1].reason is not None
+    with pytest.raises(session.InvalidSessionError):
+        session.list_sessions(root)
 
 
 def test_cli_session_show_renderer_failure_is_clean(capsys, tmp_path):

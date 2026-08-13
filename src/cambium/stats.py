@@ -32,12 +32,16 @@ class UsageStats:
 
 
 def _is_count(value: Any) -> bool:
-    """Return whether a usage value is a countable (finite) number, not a bool."""
+    """Return whether a usage value is a finite, non-negative number, not a bool.
+
+    Negative values are not valid usage counts: a corrupt or mis-encoded row
+    must not subtract from a total.
+    """
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
+        return value >= 0
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
 
 
 def _row_turn(payload: Mapping[str, Any]) -> int | None:
@@ -77,6 +81,74 @@ def _row_cached(usage: Mapping[str, Any]) -> int:
     return int(value)
 
 
+def _row_cost(payload: Mapping[str, Any]) -> float:
+    value = payload.get("estimated_cost_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else 0.0
+
+
+@dataclass
+class _UsageAccumulator:
+    """Mutable per-group usage accumulator (total, task, or provider)."""
+
+    calls: int = 0
+    turns: int | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    total_tokens: int = 0
+    last_turn_tokens: int = 0
+    model: str | None = None
+    provider: str | None = None
+    estimated_cost_usd: float = 0.0
+
+
+def _accumulate(acc: _UsageAccumulator, payload: Mapping[str, Any]) -> None:
+    """Fold one usage_event payload's numbers into ``acc`` in place."""
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        usage = {}
+    acc.calls += 1
+    row_input = _row_input(usage)
+    row_output = _row_output(usage)
+    row_total = _row_total(usage)
+    acc.input_tokens += row_input
+    acc.output_tokens += row_output
+    acc.cached_tokens += _row_cached(usage)
+    acc.total_tokens += row_total
+    acc.estimated_cost_usd += _row_cost(payload)
+    turn = _row_turn(payload)
+    if turn is not None:
+        if acc.turns is None or turn > acc.turns:
+            acc.turns = turn
+            acc.last_turn_tokens = row_total
+        elif turn == acc.turns:
+            acc.last_turn_tokens += row_total
+    model = payload.get("model")
+    if isinstance(model, str) and model:
+        acc.model = model
+    provider = payload.get("provider")
+    if isinstance(provider, str) and provider:
+        acc.provider = provider
+
+
+def _stats_from_accumulator(acc: _UsageAccumulator) -> UsageStats:
+    return UsageStats(
+        calls=acc.calls,
+        turns=acc.turns,
+        input_tokens=acc.input_tokens,
+        output_tokens=acc.output_tokens,
+        cached_tokens=acc.cached_tokens,
+        total_tokens=acc.total_tokens,
+        last_turn_tokens=acc.last_turn_tokens,
+        model=acc.model,
+        provider=acc.provider,
+        estimated_cost_usd=round(acc.estimated_cost_usd, 6),
+    )
+
+
 def usage_stats_from_events(events: Sequence[Mapping[str, Any]]) -> UsageStats | None:
     """Aggregate the usage_event records of one session's event log.
 
@@ -84,102 +156,79 @@ def usage_stats_from_events(events: Sequence[Mapping[str, Any]]) -> UsageStats |
     ``cambium.supervisor.read_events``; input order is authoritative for the
     last model/provider selection. None when no usage_event record exists.
     """
-    calls = 0
-    turns: int | None = None
-    input_tokens = 0
-    output_tokens = 0
-    cached_tokens = 0
-    total_tokens = 0
-    last_turn_tokens = 0
-    model: str | None = None
-    provider: str | None = None
-    estimated_cost_usd = 0.0
+    acc = _UsageAccumulator()
     for event in events:
         if not isinstance(event, Mapping) or event.get("kind") != _USAGE_EVENT_KIND:
             continue
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
             continue
-        calls += 1
-        usage = payload.get("usage")
-        if not isinstance(usage, Mapping):
-            usage = {}
-        row_input = _row_input(usage)
-        row_output = _row_output(usage)
-        row_total = _row_total(usage)
-        input_tokens += row_input
-        output_tokens += row_output
-        cached_tokens += _row_cached(usage)
-        total_tokens += row_total
-        estimated_cost_usd += _row_cost(payload)
-        turn = _row_turn(payload)
-        if turn is not None:
-            if turns is None or turn > turns:
-                turns = turn
-                last_turn_tokens = row_total
-            elif turn == turns:
-                last_turn_tokens += row_total
-        value = payload.get("model")
-        if isinstance(value, str) and value:
-            model = value
-        value = payload.get("provider")
-        if isinstance(value, str) and value:
-            provider = value
-    if calls == 0:
-        return None
-    return UsageStats(
-        calls=calls,
-        turns=turns,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cached_tokens=cached_tokens,
-        total_tokens=total_tokens,
-        last_turn_tokens=last_turn_tokens,
-        model=model,
-        provider=provider,
-        estimated_cost_usd=round(estimated_cost_usd, 6),
-    )
+        _accumulate(acc, payload)
+    return None if acc.calls == 0 else _stats_from_accumulator(acc)
+
+
+def _events_table_exists(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    return row is not None
+
+
+def _read_usage_rows(
+    db: Path, *, with_task_id: bool
+) -> list[Mapping[str, Any]] | None:
+    """Read usage_event rows from ``db``; None when the events table is absent.
+
+    Connects read-only and returns None only for a missing ``events`` table
+    (equivalent to no usage rows). Any other database error — corrupt file,
+    unreadable rows, or inaccessible storage — propagates so callers can tell
+    corruption apart from absence. A row whose payload is not valid JSON is
+    corruption and raises ``ValueError`` rather than disappearing.
+    """
+    uri = f"file:{quote(str(db.resolve()), safe='/:')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        if not _events_table_exists(connection):
+            return None
+        if with_task_id:
+            rows = connection.execute(
+                "SELECT kind, task_id, payload FROM events WHERE kind = ? ORDER BY seq",
+                (_USAGE_EVENT_KIND,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT kind, payload FROM events WHERE kind = ? ORDER BY seq",
+                (_USAGE_EVENT_KIND,),
+            ).fetchall()
+    finally:
+        connection.close()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        kind = row[0]
+        raw_payload = row[-1]
+        payload = json.loads(raw_payload)
+        record: dict[str, Any] = {"kind": kind, "payload": payload}
+        if with_task_id and row[1] is not None:
+            record["task_id"] = row[1]
+        events.append(record)
+    return events
 
 
 def session_usage_stats(session_dir: str | Path) -> UsageStats | None:
     """Aggregate the usage_event rows of one session's durable event log.
 
-    Opens ``<session_dir>/.cambium/events.db`` read-only and returns None
-    when the file, the events table, or any usage_event row is absent. Never
-    writes or creates files.
+    Opens ``<session_dir>/.cambium/events.db`` read-only and returns None when
+    the file or the events table is absent (no usage rows). Corrupt or
+    inaccessible databases, and rows whose payload is not valid JSON, raise
+    instead of being hidden. Never writes or creates files.
     """
     db = Path(session_dir) / _EVENTS_DB_REL
     if not db.is_file():
         return None
-    uri = f"file:{quote(str(db.resolve()), safe='/:')}?mode=ro"
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(uri, uri=True)
-        rows = connection.execute(
-            "SELECT kind, payload FROM events WHERE kind = ? ORDER BY seq",
-            (_USAGE_EVENT_KIND,),
-        ).fetchall()
-    except sqlite3.Error:
+    events = _read_usage_rows(db, with_task_id=False)
+    if events is None:
         return None
-    finally:
-        if connection is not None:
-            connection.close()
-    events: list[dict[str, Any]] = []
-    for kind, raw_payload in rows:
-        try:
-            payload = json.loads(raw_payload)
-        except (TypeError, ValueError):
-            continue
-        events.append({"kind": kind, "payload": payload})
     return usage_stats_from_events(events)
-
-
-def _row_cost(payload: Mapping[str, Any]) -> float:
-    value = payload.get("estimated_cost_usd")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0.0
-    value = float(value)
-    return value if math.isfinite(value) and value >= 0 else 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +241,7 @@ class UsageBreakdown:
 
 
 def usage_breakdown_from_events(events: Sequence[Mapping[str, Any]]) -> UsageBreakdown | None:
-    """Aggregate usage_event records grouped by task and by provider.
+    """Aggregate usage_event records grouped by task and by provider in one pass.
 
     ``events`` is the already-redacted record sequence produced by
     ``cambium.supervisor.read_events``; input order is authoritative for
@@ -202,9 +251,10 @@ def usage_breakdown_from_events(events: Sequence[Mapping[str, Any]]) -> UsageBre
     task_id or provider contribute only to the totals. None when no
     usage_event record exists.
     """
-    task_events: dict[str, list[Mapping[str, Any]]] = {}
-    provider_events: dict[str, list[Mapping[str, Any]]] = {}
+    total = _UsageAccumulator()
+    task_accs: dict[str, _UsageAccumulator] = {}
     task_order: list[str] = []
+    provider_accs: dict[str, _UsageAccumulator] = {}
     provider_order: list[str] = []
     for event in events:
         if not isinstance(event, Mapping) or event.get("kind") != _USAGE_EVENT_KIND:
@@ -212,70 +262,52 @@ def usage_breakdown_from_events(events: Sequence[Mapping[str, Any]]) -> UsageBre
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
             continue
+        _accumulate(total, payload)
         task_id = event.get("task_id")
         if isinstance(task_id, str) and task_id:
-            if task_id not in task_events:
-                task_events[task_id] = []
+            acc = task_accs.get(task_id)
+            if acc is None:
+                acc = _UsageAccumulator()
+                task_accs[task_id] = acc
                 task_order.append(task_id)
-            task_events[task_id].append(event)
+            _accumulate(acc, payload)
         provider = payload.get("provider")
         if isinstance(provider, str) and provider:
-            if provider not in provider_events:
-                provider_events[provider] = []
+            acc = provider_accs.get(provider)
+            if acc is None:
+                acc = _UsageAccumulator()
+                provider_accs[provider] = acc
                 provider_order.append(provider)
-            provider_events[provider].append(event)
-    total = usage_stats_from_events(events)
-    if total is None:
+            _accumulate(acc, payload)
+    if total.calls == 0:
         return None
     return UsageBreakdown(
         by_task=tuple(
-            (task_id, usage_stats_from_events(task_events[task_id]) or _ZERO_STATS)
+            (task_id, _stats_from_accumulator(task_accs[task_id]))
             for task_id in task_order
         ),
         by_provider=tuple(
-            (provider, usage_stats_from_events(provider_events[provider]) or _ZERO_STATS)
+            (provider, _stats_from_accumulator(provider_accs[provider]))
             for provider in provider_order
         ),
-        total=total,
+        total=_stats_from_accumulator(total),
     )
-
-
-_ZERO_STATS = UsageStats(0, None, 0, 0, 0, 0, 0, None, None)
 
 
 def session_usage_breakdown(session_dir: str | Path) -> UsageBreakdown | None:
     """Aggregate a session's usage_event rows grouped by task and provider.
 
-    Opens ``<session_dir>/.cambium/events.db`` read-only and returns None
-    when the file, the events table, or any usage_event row is absent. Never
-    writes or creates files.
+    Opens ``<session_dir>/.cambium/events.db`` read-only and returns None when
+    the file or the events table is absent (no usage rows). Corrupt or
+    inaccessible databases, and rows whose payload is not valid JSON, raise
+    instead of being hidden. Never writes or creates files.
     """
     db = Path(session_dir) / _EVENTS_DB_REL
     if not db.is_file():
         return None
-    uri = f"file:{quote(str(db.resolve()), safe='/:')}?mode=ro"
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(uri, uri=True)
-        rows = connection.execute(
-            "SELECT kind, task_id, payload FROM events WHERE kind = ? ORDER BY seq",
-            (_USAGE_EVENT_KIND,),
-        ).fetchall()
-    except sqlite3.Error:
+    events = _read_usage_rows(db, with_task_id=True)
+    if events is None:
         return None
-    finally:
-        if connection is not None:
-            connection.close()
-    events: list[dict[str, Any]] = []
-    for kind, task_id, raw_payload in rows:
-        try:
-            payload = json.loads(raw_payload)
-        except (TypeError, ValueError):
-            continue
-        record: dict[str, Any] = {"kind": kind, "payload": payload}
-        if task_id is not None:
-            record["task_id"] = task_id
-        events.append(record)
     return usage_breakdown_from_events(events)
 
 

@@ -232,8 +232,8 @@ def test_usage_stats_from_events_tolerates_garbage_rows() -> None:
     assert stats.input_tokens == 0
     assert stats.output_tokens == 50
     assert stats.cached_tokens == 0
-    assert stats.total_tokens == -5
-    assert stats.last_turn_tokens == -5
+    assert stats.total_tokens == 50
+    assert stats.last_turn_tokens == 50
     assert stats.model is None
     assert stats.provider is None
 
@@ -252,6 +252,16 @@ def test_session_usage_stats_missing_table_is_none(tmp_path) -> None:
     with sqlite3.connect(db) as connection:
         connection.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)")
     assert session_usage_stats(session_dir) is None
+
+
+def test_session_usage_stats_corrupt_database_raises(tmp_path) -> None:
+    session_dir = tmp_path / "session"
+    db = session_dir / ".cambium" / "events.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        session_usage_stats(session_dir)
 
 
 def test_session_usage_stats_aggregates_durable_log(tmp_path) -> None:
@@ -325,7 +335,7 @@ def test_session_usage_stats_ignores_non_usage_kinds(tmp_path) -> None:
     assert stats.total_tokens == 15
 
 
-def test_session_usage_stats_skips_undecodable_payloads(tmp_path) -> None:
+def test_session_usage_stats_rejects_undecodable_payloads(tmp_path) -> None:
     session_dir = tmp_path / "session"
     db = session_dir / ".cambium" / "events.db"
     db.parent.mkdir(parents=True)
@@ -341,10 +351,8 @@ def test_session_usage_stats_skips_undecodable_payloads(tmp_path) -> None:
             {"turn": 1, "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}},
             seq=2,
         )
-    stats = session_usage_stats(session_dir)
-    assert stats is not None
-    assert stats.calls == 1
-    assert stats.total_tokens == 15
+    with pytest.raises(json.JSONDecodeError):
+        session_usage_stats(session_dir)
 
 
 def test_render_usage_stats_line_from_dataclass() -> None:
