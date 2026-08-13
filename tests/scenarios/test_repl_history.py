@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import stat
@@ -59,12 +60,12 @@ def test_non_tty_input_writes_no_history(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     config = oneshot.OneShotConfig(repo=repo)
 
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         config,
         input_stream=io.StringIO("hello\n/exit\n"),
         output_stream=io.StringIO(),
         error_stream=io.StringIO(),
-    ) == 0
+    )) == 0
 
     assert not _history_file(repo).exists()
 
@@ -74,12 +75,12 @@ def test_readline_unavailable_writes_no_history(monkeypatch, tmp_path: Path) -> 
     repo = tmp_path / "repo"
     config = oneshot.OneShotConfig(repo=repo)
 
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         config,
         input_stream=_tty_stream("hello\n/exit\n", monkeypatch),
         output_stream=io.StringIO(),
         error_stream=io.StringIO(),
-    ) == 0
+    )) == 0
 
     assert not _history_file(repo).exists()
 
@@ -90,12 +91,12 @@ def test_interactive_repl_saves_private_history_on_exit(
     repo = tmp_path / "repo"
     config = oneshot.OneShotConfig(repo=repo)
 
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         config,
         input_stream=_tty_stream("first prompt\n/exit\n", monkeypatch),
         output_stream=io.StringIO(),
         error_stream=io.StringIO(),
-    ) == 0
+    )) == 0
 
     history = _history_file(repo)
     assert history.is_file()
@@ -113,12 +114,12 @@ def test_interactive_repl_loads_history_and_saves_on_eof(
     readline.write_history_file(history)
     readline.clear_history()
 
-    assert repl.run_repl(
+    assert asyncio.run(repl.run_repl(
         oneshot.OneShotConfig(repo=repo),
         input_stream=_tty_stream("later prompt\n", monkeypatch),
         output_stream=io.StringIO(),
         error_stream=io.StringIO(),
-    ) == 0
+    )) == 0
 
     entries = _history_entries(history.read_text(encoding="utf-8"))
     assert "prior prompt" in entries
