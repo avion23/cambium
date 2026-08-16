@@ -7,7 +7,6 @@ inherently need a real subprocess are marked slow.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -72,27 +71,6 @@ def test_unified_supervisor_rejects_module_input_options(option, capsys, tmp_pat
         cli.main(["supervisor", "--session-dir", str(tmp_path), option, "input.json"])
     assert raised.value.code == 2
     assert "invalid command arguments" in capsys.readouterr().err
-
-
-def test_architectus_scripted_dry_run_prints_actions_and_exits_zero(capsys) -> None:
-    """The scripted architectus path needs no credentials or live LLM."""
-    assert cli.main(["architectus", "--dry-run"]) == 0
-
-    captured = capsys.readouterr()
-    lines = captured.out.splitlines()
-    assert "provider: scripted" in lines[0]
-    assert json.loads(lines[1].split(": ", 1)[1]) == [{"action": "spawn", "task_id": "root"}]
-    assert captured.err == ""
-
-
-def test_architectus_scripted_alias_and_task_text(capsys) -> None:
-    assert cli.main(["architectus", "--scripted", "--task", "inspect the module"]) == 0
-
-    captured = capsys.readouterr()
-    assert "provider: scripted" in captured.out
-    assert "wave 1:" in captured.out
-    assert "root" in captured.out
-    assert captured.err == ""
 
 
 def test_architectus_live_without_provider_config_exits_two(

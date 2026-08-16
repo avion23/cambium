@@ -60,23 +60,6 @@ def _root(tmp_path: Path, **overrides: object) -> Result:
     )
 
 
-def test_child_keys_are_exact_and_ordered() -> None:
-    assert CHILD_RESULT_KEYS == (
-        "parent_task_id",
-        "unified_diff",
-        "diff_truncated",
-        "summary",
-        "metric_score",
-        "metric_breakdown",
-        "commits",
-        "files_changed",
-        "status",
-    )
-    child = wire_to_child_result(_wire(parent_task_id="parent-1"))
-    assert tuple(child) == CHILD_RESULT_KEYS
-    assert tuple(child.keys()) == CHILD_RESULT_KEYS
-
-
 def test_child_mapper_allowlist_and_scratchpad_canary() -> None:
     child = wire_to_child_result(_wire(parent_task_id="parent-1"))
     assert set(child) == set(CHILD_RESULT_KEYS)

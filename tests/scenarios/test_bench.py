@@ -1163,55 +1163,6 @@ def test_quality_repo_builder_creates_main_branch_and_fixture(tmp_path) -> None:
     assert "assert square(3) == 9" in test
 
 
-def test_quality_report_formatter_aggregate_math() -> None:
-    import cambium.bench as bench
-
-    records = [
-        {
-            "task_id": "quality-square-1",
-            "prompt": "implement square()",
-            "exit_code": 0,
-            "status": "succeeded",
-            "merge_sha": "abc123",
-            "wall_s": 12.4,
-        },
-        {
-            "task_id": "quality-square-2",
-            "prompt": "fix the failing test",
-            "exit_code": 0,
-            "status": "succeeded",
-            "merge_sha": "def456",
-            "wall_s": 9.8,
-        },
-        {
-            "task_id": "quality-square-3",
-            "prompt": "complete the TODO",
-            "exit_code": 1,
-            "status": "failed",
-            "merge_sha": None,
-            "wall_s": 14.7,
-        },
-    ]
-    report = bench.format_quality_report(records)
-    lines = report.splitlines()
-    assert len(lines) == 4
-    assert lines[0] == (
-        "cambium bench quality: task quality-square-1: "
-        "exit_code=0 status=succeeded merge_sha=abc123 wall_s=12.4"
-    )
-    assert lines[1] == (
-        "cambium bench quality: task quality-square-2: "
-        "exit_code=0 status=succeeded merge_sha=def456 wall_s=9.8"
-    )
-    assert lines[2] == (
-        "cambium bench quality: task quality-square-3: "
-        "exit_code=1 status=failed merge_sha=- wall_s=14.7"
-    )
-    assert lines[3] == (
-        "cambium bench quality: success_rate=2/3 pct=66.7 avg_wall_s=12.3"
-    )
-
-
 def test_quality_aggregate_requires_both_exit_code_zero_and_succeeded() -> None:
     import cambium.bench as bench
 

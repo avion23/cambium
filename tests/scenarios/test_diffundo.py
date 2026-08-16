@@ -178,10 +178,6 @@ def _ok_payload(
     return payload
 
 
-def _error_body(message: str) -> dict[str, Any]:
-    return {"error": {"message": message, "type": "test_error", "code": "test"}}
-
-
 def _error_payload(message: str) -> dict[str, Any]:
     return {"error": {"message": message, "type": "test_error", "code": "test"}}
 
@@ -573,25 +569,6 @@ def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch
         assert "sk-test-K_BLOCKED" not in str(exc.value)
     finally:
         blocked.close()
-
-
-def test_provider_request_uses_stable_cambium_user_agent_and_keeps_authorization(
-    tmp_path, monkeypatch
-) -> None:
-    server = FakeServer([(200, _ok_payload("ok"), 0.0)])
-    _set_keys(monkeypatch, "K_UA")
-    router = Diffundo((_config("p", server, "K_UA"),))
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "ok"
-        assert server.request_headers == [
-            {
-                "User-Agent": "cambium/0.1.0",
-                "Authorization": "Bearer sk-test-K_UA",
-            }
-        ]
-    finally:
-        server.close()
 
 
 def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) -> None:

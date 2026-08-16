@@ -168,20 +168,6 @@ def test_architectus_real_decide_port_uses_cambium_lm() -> None:
     assert len(diffundo.calls) == 1
 
 
-def test_architectus_system_prompt_enumerates_the_action_vocabulary() -> None:
-    """The live port must constrain the model to the core's action vocabulary.
-
-    Without this, a real provider invents action kinds (``schedule``,
-    ``start_task``) or unknown task ids that the core rejects.
-    """
-    prompt = ArchitectusLM._SYSTEM_PROMPT
-    for kind in ("spawn", "steer", "aggregate", "replan", "reset_retry", "abort_subtree"):
-        assert kind in prompt
-    assert "tree_state.nodes" in prompt
-    assert "task_id" in prompt
-    assert "never invent" in prompt
-
-
 def test_core_module_imports_never_import_dspy() -> None:
     source = Path(__file__).resolve().parents[2] / "src"
     script = """

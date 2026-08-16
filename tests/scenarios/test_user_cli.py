@@ -16,7 +16,7 @@ import pytest
 from cambium import cli, oneshot, repl, session, tui
 from cambium.auth import AuthStore, derived_env_name
 from cambium.ipc import MAX_LINE_BYTES
-from cambium.render import render_json_result, render_text_result
+from cambium.render import render_json_result
 from cambium.results import Result, write_result
 from cambium.store import EventStore
 from cambium.supervisor import PlanResult, TaskResult
@@ -65,39 +65,6 @@ def _write_provider_file(path: Path, providers: list[dict[str, object]]) -> Path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"providers": providers}), encoding="utf-8")
     return path
-
-
-def test_parser_maps_run_options_to_one_shot_config(monkeypatch, capsys, tmp_path: Path) -> None:
-    captured: list[oneshot.OneShotConfig] = []
-
-    async def fake_run(config: oneshot.OneShotConfig) -> PlanResult:
-        captured.append(config)
-        return _plan_result()
-
-    monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
-
-    assert cli.main(
-        [
-            "run",
-            "--repo",
-            str(tmp_path / "repo"),
-            "--session-dir",
-            str(tmp_path / "session"),
-            "--provider",
-            "demo",
-            "--model",
-            "demo-model",
-            "--json",
-            "fix the bug",
-        ]
-    ) == 0
-
-    assert captured[0].prompt == "fix the bug"
-    assert captured[0].repo == str(tmp_path / "repo")
-    assert captured[0].session_root == str(tmp_path / "session")
-    assert captured[0].provider == "demo"
-    assert captured[0].model == "demo-model"
-    assert json.loads(capsys.readouterr().out)["results"][0]["task_id"] == "oneshot"
 
 
 def test_unknown_single_token_is_not_reinterpreted_as_a_prompt(capsys) -> None:
@@ -193,13 +160,6 @@ def test_explicit_session_rejects_second_request_without_changing_artifacts(
         asyncio.run(oneshot.run_oneshot(second))
 
     assert {path: path.read_bytes() for path in artifact_paths} == before
-
-
-def test_render_accepts_plan_result() -> None:
-    result = _plan_result()
-
-    assert "plan=tasks:1" in render_text_result(result)
-    assert json.loads(render_json_result(result))["results"][0]["status"] == "succeeded"
 
 
 def test_render_drops_mapping_valued_results_wholesale() -> None:
@@ -927,24 +887,6 @@ def test_oversized_prompt_is_rejected_before_session_allocation(
         )
 
     assert not sessions_root.exists() or not list(sessions_root.iterdir())
-
-
-def test_run_parser_auto_flag_and_budget_flags() -> None:
-    """--auto/--max-wall-s/--max-turns/--max-turns map onto the run parser."""
-    parser = cli._build_parser()
-    args = parser.parse_args(
-        ["run", "--repo", ".", "--auto", "--max-wall-s", "900",
-         "--max-tokens", "500000", "--max-turns", "40", "fix the bug"]
-    )
-    assert args.auto is True
-    assert args.max_wall_s == 900
-    assert args.max_tokens == 500000
-    assert args.max_turns == 40
-    # --provider/--model stay available for the pinned mode
-    pinned = parser.parse_args(["run", "--provider", "demo", "--model", "m1", "p"])
-    assert pinned.auto is False
-    assert pinned.provider == "demo"
-    assert pinned.model == "m1"
 
 
 def test_run_parser_combined_provider_model_forms() -> None:

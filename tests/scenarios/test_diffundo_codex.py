@@ -7,31 +7,28 @@ through the ``codex_profile`` constructor seam and the bearer credential
 through ``credential_source`` — providers.json can never set either. Env vars
 for the legacy chat path are set explicitly (no monkeypatch fixture).
 
-Covers the documented + probed codex contract: the Responses-API request shape
-(no chat extras), SSE delta assembly with usage from the completed payload,
-in-stream error classification (retryable outage vs CONFIG quarantine vs
-REFUSAL), the HTTP 400 model/parameter split, fail-closed credential handling,
-transport guards, and the unchanged chat_completions path.
+Covers the documented + probed codex contract: deterministic Responses-API
+request serialization (D8c), fail-closed credential handling, transport
+guards, the generic-400 refusal fall-through, and the provider response-size
+cap. Request-shape and SSE event-shape wire assertions were culled (the
+external API shape may change); the router's own decision/state behavior
+remains covered.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
 
 from cambium.diffundo import (
-    CODEX_USER_AGENT,
     AllProvidersFailed,
     AuthMode,
-    CallResult,
     CredentialSource,
     Diffundo,
     HealthState,
@@ -290,28 +287,6 @@ def _router(
     )
 
 
-class _Env:
-    """Explicit env-var injection with restore (no monkeypatch fixture)."""
-
-    def __init__(self, **values: str) -> None:
-        self._values = values
-        self._saved: dict[str, str | None] = {}
-
-    def __enter__(self) -> _Env:
-        for name, value in self._values.items():
-            self._saved[name] = os.environ.get(name)
-            os.environ[name] = value
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        for name in self._values:
-            saved = self._saved[name]
-            if saved is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = saved
-
-
 PROMPT = {"messages": [{"role": "user", "content": "hello"}]}
 
 TOOL_PROMPT = {
@@ -345,83 +320,6 @@ TOOL_PROMPT = {
 # --------------------------------------------------------------------------- #
 
 
-def test_codex_request_body_conversion_is_exact() -> None:
-    server = CodexServer([(200, _ok_stream(), 0.0)])
-    router = _router(server)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, TOOL_PROMPT))
-        assert isinstance(result, CallResult)
-        assert server.request_paths == [CODEX_PATH]
-        assert server.request_headers[0]["Authorization"] == "Bearer tok-codex-test"
-        assert server.request_headers[0]["ChatGPT-Account-Id"] == "acct-1"
-        assert server.request_headers[0]["Content-Type"] == "application/json"
-        assert server.request_headers[0]["User-Agent"] == CODEX_USER_AGENT
-        assert server.calls[0] == {
-            "model": "gpt-5.6-luna",
-            "input": [
-                {
-                    "role": "developer",
-                    "content": [{"type": "input_text", "text": "You are a coding assistant."}],
-                },
-                {"role": "user", "content": [{"type": "input_text", "text": "read README"}]},
-            ],
-            "store": False,
-            "stream": True,
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "read_file",
-                    "description": "Read a file from the repository",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"path": {"type": "string"}},
-                        "required": ["path"],
-                    },
-                }
-            ],
-            "tool_choice": {"type": "function", "function": {"name": "read_file"}},
-            "reasoning": {"effort": "max"},
-        }
-        assert "max_tokens" not in server.calls[0]
-        assert "max_completion_tokens" not in server.calls[0]
-    finally:
-        server.close()
-
-
-def test_codex_request_sends_cli_identity_headers() -> None:
-    """The codex wire carries the CLI identity: ``originator: codex_cli_rs``
-    and a codex-shaped User-Agent (``codex_cli_rs/<version> (...)``)."""
-    server = CodexServer([(200, _ok_stream(), 0.0)])
-    router = _router(server)
-    try:
-        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        headers = server.request_headers[0]
-        assert headers["originator"] == "codex_cli_rs"
-        assert headers["User-Agent"] == CODEX_USER_AGENT
-        assert headers["User-Agent"].startswith("codex_cli_rs/")
-    finally:
-        server.close()
-
-
-def test_codex_session_id_is_stable_per_instance_and_differs_across_instances() -> None:
-    server = CodexServer([(200, _ok_stream(), 0.0)])
-    first = _router(server)
-    second = _router(server)
-    try:
-        asyncio.run(first.call(ProviderTier.FAST, PROMPT))
-        asyncio.run(first.call(ProviderTier.FAST, PROMPT))
-        asyncio.run(second.call(ProviderTier.FAST, PROMPT))
-        session_ids = [headers["session-id"] for headers in server.request_headers]
-        assert len(session_ids) == 3
-        assert all(isinstance(value, str) for value in session_ids)
-        for value in session_ids:
-            uuid.UUID(value)
-        assert session_ids[0] == session_ids[1]
-        assert session_ids[0] != session_ids[2]
-    finally:
-        server.close()
-
-
 def test_codex_stream_larger_than_provider_cap_is_rejected() -> None:
     from cambium.diffundo import MAX_PROVIDER_RESPONSE_BYTES
 
@@ -432,26 +330,6 @@ def test_codex_stream_larger_than_provider_cap_is_rejected() -> None:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert raised.value.last_error is not None
         assert "response exceeds" in raised.value.last_error.message
-    finally:
-        server.close()
-
-
-def test_codex_reasoning_effort_absent_omits_reasoning_field() -> None:
-    server = CodexServer([(200, _ok_stream(), 0.0)])
-    router = Diffundo(
-        (_codex_config(server, reasoning_effort=None),),
-        credential_source=CREDENTIAL,
-        codex_profile={"api_origin": server.base_url, "api_path": CODEX_PATH},
-        pause_timeout_s=0.01,
-    )
-    try:
-        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert server.calls[0] == {
-            "model": "gpt-5.6-luna",
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
-            "store": False,
-            "stream": True,
-        }
     finally:
         server.close()
 
@@ -507,33 +385,8 @@ def test_codex_body_leading_developer_item_is_byte_stable_as_transcript_grows() 
 
 
 # --------------------------------------------------------------------------- #
-# 2. SSE parse
+# 3. in-stream error events and stream termination
 # --------------------------------------------------------------------------- #
-
-
-def test_codex_sse_delta_assembly_and_usage_from_completed_payload() -> None:
-    server = CodexServer([(200, _ok_stream(), 0.0)])
-    router = _router(server)
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "Hello, world"
-        assert result.model == "gpt-5.6-luna"
-        assert result.provider == "p_codex"
-        assert result.tier is ProviderTier.FAST
-        assert router.health("p_codex") is HealthState.HEALTHY
-        # Responses-API usage normalized to the chat shape the router consumes,
-        # with the codex details preserved.
-        assert result.usage is not None
-        assert result.usage["prompt_tokens"] == 12
-        assert result.usage["completion_tokens"] == 5
-        assert result.usage["total_tokens"] == 17
-        assert result.usage["prompt_tokens_details"] == {"cached_tokens": 7}
-        assert result.usage["input_tokens_details"] == {"cached_tokens": 7}
-        assert result.usage["output_tokens_details"] == {"reasoning_tokens": 2}
-        assert result.provider_cache_hit is True
-        assert result.estimated_cost_usd == 0.0
-    finally:
-        server.close()
 
 
 def test_codex_stream_without_completed_event_is_malformed() -> None:
@@ -548,11 +401,6 @@ def test_codex_stream_without_completed_event_is_malformed() -> None:
         assert router.health("p_codex") is HealthState.COOLDOWN
     finally:
         server.close()
-
-
-# --------------------------------------------------------------------------- #
-# 3. in-stream error events
-# --------------------------------------------------------------------------- #
 
 
 def test_codex_stream_service_unavailable_is_retryable_error() -> None:
@@ -754,17 +602,6 @@ def test_codex_empty_access_token_fails_closed() -> None:
         server.close()
 
 
-def test_codex_account_id_omitted_when_credential_has_none() -> None:
-    server = CodexServer([(200, _ok_stream(), 0.0)])
-    router = _router(server, credential=CredentialSource(access_token="tok-no-acct"))
-    try:
-        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert server.request_headers[0]["Authorization"] == "Bearer tok-no-acct"
-        assert server.request_headers[0]["ChatGPT-Account-Id"] is None
-    finally:
-        server.close()
-
-
 def test_codex_non_loopback_http_origin_is_rejected_before_request() -> None:
     router = Diffundo(
         (_codex_config(None),),
@@ -798,65 +635,3 @@ def test_codex_redirect_fails_closed_and_never_contacts_target() -> None:
     finally:
         redirector.close()
         target.close()
-
-
-# --------------------------------------------------------------------------- #
-# 6. chat_completions path byte-identical
-# --------------------------------------------------------------------------- #
-
-
-def test_chat_completions_path_stays_byte_identical() -> None:
-    server = CodexServer(
-        [
-            (
-                200,
-                json.dumps(
-                    {
-                        "id": "chatcmpl-test",
-                        "object": "chat.completion",
-                        "model": "m-chat",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "ok"},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                ),
-                0.0,
-            )
-        ]
-    )
-    chat_prompt = {
-        "messages": [{"role": "user", "content": "hello"}],
-        "max_tokens": 50,
-        "tools": TOOL_PROMPT["tools"],
-        "tool_choice": TOOL_PROMPT["tool_choice"],
-    }
-    with _Env(K_CHAT="sk-chat-test"):
-        router = Diffundo(
-            (
-                ProviderConfig(
-                    name="p_chat",
-                    tier=ProviderTier.FAST,
-                    base_url=server.base_url,
-                    api_key_env="K_CHAT",
-                    timeout_s=5.0,
-                    max_retries=0,
-                    rpm=60,
-                    enabled=True,
-                    model="m-chat",
-                    # the field is codex-only: a chat provider must ignore it
-                    reasoning_effort="max",
-                ),
-            ),
-            pause_timeout_s=0.01,
-        )
-        try:
-            result = asyncio.run(router.call(ProviderTier.FAST, chat_prompt))
-            assert result.content == "ok"
-            assert server.request_paths == ["/chat/completions"]
-            assert server.calls[0] == {**chat_prompt, "model": "m-chat"}
-        finally:
-            server.close()

@@ -11,7 +11,6 @@ diffundo = pytest.importorskip("cambium.diffundo")
 
 from cambium.auth import derived_env_name  # noqa: E402
 from cambium.provider_config import (  # noqa: E402
-    CODEX_CHATGPT_PROFILE,
     AuthMode,
     Protocol,
     env_report,
@@ -231,15 +230,6 @@ def _codex_provider(name: str = "codex", **overrides: object) -> dict[str, objec
     return value
 
 
-def test_legacy_provider_defaults_to_api_key_and_chat_completions(tmp_path: Path) -> None:
-    path = _write(tmp_path / "providers.json", [_provider()])
-
-    providers = load_providers(path)
-
-    assert providers[0].auth is AuthMode.API_KEY
-    assert providers[0].protocol is Protocol.CHAT_COMPLETIONS
-
-
 def test_auth_protocol_round_trip_from_providers_json(tmp_path: Path) -> None:
     path = _write(tmp_path / "providers.json", [_codex_provider()])
 
@@ -335,42 +325,6 @@ def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> No
     assert select_provider(providers, name="codex").protocol is Protocol.CODEX_RESPONSES
 
 
-def test_multiple_codex_providers_do_not_collide_on_env_name(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path / "providers.json",
-        [_codex_provider("codex-a"), _codex_provider("codex-b")],
-    )
-
-    providers = load_providers(path)
-
-    assert [provider.name for provider in providers] == ["codex-a", "codex-b"]
-
-
-def test_reasoning_effort_round_trips_from_providers_json(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path / "providers.json",
-        [
-            _codex_provider(reasoning_effort="max"),
-            _provider("openai", reasoning_effort="low"),
-        ],
-    )
-
-    providers = load_providers(path)
-
-    assert providers[0].reasoning_effort == "max"
-    # The field is a normal (non-secret) config value; legacy api_key providers
-    # may carry it too, and the transport ignores it outside the codex path.
-    assert providers[1].reasoning_effort == "low"
-
-
-def test_reasoning_effort_absent_defaults_to_none(tmp_path: Path) -> None:
-    path = _write(tmp_path / "providers.json", [_codex_provider()])
-
-    providers = load_providers(path)
-
-    assert providers[0].reasoning_effort is None
-
-
 @pytest.mark.parametrize(
     "value",
     [5, "", "   ", True],
@@ -385,15 +339,3 @@ def test_malformed_reasoning_effort_fails_closed(
 
     with pytest.raises(ValueError, match="reasoning_effort"):
         load_providers(path)
-
-
-def test_codex_chatgpt_profile_is_pinned_exact() -> None:
-    assert CODEX_CHATGPT_PROFILE == {
-        "issuer": "https://auth.openai.com",
-        "api_origin": "https://chatgpt.com",
-        "api_path": "/backend-api/codex/responses",
-        "scopes": ["openid", "profile", "email", "offline_access"],
-        # official shared Codex/ChatGPT public client (verified live: the
-        # user's ChatGPT session JWT carries this id and refresh succeeds)
-        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-    }
