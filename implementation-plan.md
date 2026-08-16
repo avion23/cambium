@@ -71,7 +71,7 @@ is not a branch ledger or merge log.
   rate-limit and accounting failures are visible without exposing credentials.
   [Met: durable redacted events + `usage_evidence.py` aggregate report.]
 
-## 4. External-provider smoke (COMMITTED; runs when credentials exist)
+## 4. External-provider smoke (VERIFIED; ran against live codex OAuth, 2026-08-16)
 
 - After step 3 is verified and credentials exist, run one disposable provider
   configuration through the custom worker loop, tool/checkpoint events, and
@@ -89,6 +89,17 @@ is not a branch ledger or merge log.
 - Local fake-provider fixtures can support regression tests, but they do not
   substitute for an external-provider run. [The script refuses loopback
   configs for exactly this reason.]
+- PASSED end-to-end: a `codex_responses` run against a live ChatGPT `pro`
+  OAuth session drove the provider-backed worker loop with real `usage_event`
+  rows, produced exactly one ref-only commit touching only the fixture, and
+  left `main` unchanged on the failure fixture. En route, the driver's plan
+  was fixed to derive tier/model from the supplied provider config (a direct
+  supervisor plan must declare both; `oneshot.py` resolves them before
+  dispatch), the fixtures were reworded so the model leaves the change
+  uncommitted (the worker owns the fenced commit) on the success path and
+  exercises the refuse-to-publish path on the failure path, and
+  `_codex_oauth_provider_names` now treats an empty `authorized_providers`
+  set as unrestricted so the codex OAuth token is injected for such tasks.
 
 ## 5. Follow-on evaluation
 
