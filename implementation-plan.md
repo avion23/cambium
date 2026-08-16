@@ -103,6 +103,17 @@ is not a branch ledger or merge log.
   fanout_config references a non-codex provider, so the supervisor injects no
   codex OAuth token and the worker's provider routing fails closed with a
   failed verdict before any model call.
+- Extended (2026-08-16): the driver now derives the plan's `provider_env_keys`
+  from each configured provider's `api_key_env`, so a config-backed API-key
+  provider reaches the worker through the supervisor's fail-closed allowlist
+  (values are session-redacted; codex-chatgpt providers still need no
+  forwarding). It then PASSED end-to-end against a live z.ai API-key provider
+  (`glm-5.3`, `https://api.z.ai/api/coding/paas/v4`): one ref-only commit
+  touching only the fixture, durable `usage_event` rows, unchanged `main` on
+  the failure fixture. En route a live probe found the coding-plan endpoint
+  normalizes a requested `glm-5.2` slug to `glm-5.3` in its response, which
+  the worker's strict `result.model == model` trust check rejects unless the
+  config names the model the endpoint actually reports.
 
 ## 5. Follow-on evaluation
 
