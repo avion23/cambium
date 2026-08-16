@@ -21,12 +21,14 @@ import json
 import os
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
 
 from cambium.diffundo import (
+    CODEX_USER_AGENT,
     AllProvidersFailed,
     AuthMode,
     CallResult,
@@ -119,6 +121,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "Authorization": self.headers.get("Authorization"),
                 "ChatGPT-Account-Id": self.headers.get("ChatGPT-Account-Id"),
                 "User-Agent": self.headers.get("User-Agent"),
+                "originator": self.headers.get("originator"),
+                "session-id": self.headers.get("session-id"),
             },
             self.path,
         )
@@ -351,7 +355,7 @@ def test_codex_request_body_conversion_is_exact() -> None:
         assert server.request_headers[0]["Authorization"] == "Bearer tok-codex-test"
         assert server.request_headers[0]["ChatGPT-Account-Id"] == "acct-1"
         assert server.request_headers[0]["Content-Type"] == "application/json"
-        assert server.request_headers[0]["User-Agent"] == "cambium/0.1.0"
+        assert server.request_headers[0]["User-Agent"] == CODEX_USER_AGENT
         assert server.calls[0] == {
             "model": "gpt-5.6-luna",
             "input": [
@@ -380,6 +384,40 @@ def test_codex_request_body_conversion_is_exact() -> None:
         }
         assert "max_tokens" not in server.calls[0]
         assert "max_completion_tokens" not in server.calls[0]
+    finally:
+        server.close()
+
+
+def test_codex_request_sends_cli_identity_headers() -> None:
+    """The codex wire carries the CLI identity: ``originator: codex_cli_rs``
+    and a codex-shaped User-Agent (``codex_cli_rs/<version> (...)``)."""
+    server = CodexServer([(200, _ok_stream(), 0.0)])
+    router = _router(server)
+    try:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        headers = server.request_headers[0]
+        assert headers["originator"] == "codex_cli_rs"
+        assert headers["User-Agent"] == CODEX_USER_AGENT
+        assert headers["User-Agent"].startswith("codex_cli_rs/")
+    finally:
+        server.close()
+
+
+def test_codex_session_id_is_stable_per_instance_and_differs_across_instances() -> None:
+    server = CodexServer([(200, _ok_stream(), 0.0)])
+    first = _router(server)
+    second = _router(server)
+    try:
+        asyncio.run(first.call(ProviderTier.FAST, PROMPT))
+        asyncio.run(first.call(ProviderTier.FAST, PROMPT))
+        asyncio.run(second.call(ProviderTier.FAST, PROMPT))
+        session_ids = [headers["session-id"] for headers in server.request_headers]
+        assert len(session_ids) == 3
+        assert all(isinstance(value, str) for value in session_ids)
+        for value in session_ids:
+            uuid.UUID(value)
+        assert session_ids[0] == session_ids[1]
+        assert session_ids[0] != session_ids[2]
     finally:
         server.close()
 

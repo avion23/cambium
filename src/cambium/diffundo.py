@@ -104,6 +104,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -133,6 +134,10 @@ _CLOUDFLARE_1010_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 USER_AGENT = f"cambium/{__version__}"
+# Codex-ChatGPT transport identity headers, matching the codex CLI wire shape:
+# the backend expects the CLI originator tag and a codex-shaped User-Agent.
+CODEX_ORIGINATOR = "codex_cli_rs"
+CODEX_USER_AGENT = "codex_cli_rs/1.0 (cambium; cambium)"
 # Light content scan for model refusals returned as a 200 completion (issue 4).
 # Documented heuristic: exact refusal phrases in the completion text are treated
 # as a REFUSAL fall-through so a refusing model never wins the cascade.
@@ -1162,6 +1167,10 @@ class Diffundo:
         self._codex_profile = (
             dict(CODEX_CHATGPT_PROFILE) if codex_profile is None else dict(codex_profile)
         )
+        # Stable per-instance session identity for the codex ``session-id``
+        # header: one worker process runs one task, so a per-instance UUID is
+        # a per-session id and must not rotate per request.
+        self._codex_session_id = str(uuid.uuid4())
         # Measured-usage debt snapshot (weighted routing): provider name ->
         # ProviderDebt-like counters (requests, cache_hit_count,
         # latency_total_s/latency_count, last_seen) used to order the cascade
@@ -1683,7 +1692,9 @@ class Diffundo:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
-            "User-Agent": USER_AGENT,
+            "User-Agent": CODEX_USER_AGENT,
+            "originator": CODEX_ORIGINATOR,
+            "session-id": self._codex_session_id,
         }
         if credential.account_id:
             headers["ChatGPT-Account-Id"] = credential.account_id

@@ -221,6 +221,7 @@ class _DoctorProvider:
     required: bool
     api_key_env: str
     auth: AuthMode | None
+    model: str
 
 
 def _oauth_session_present(store: OAuthStore, name: str) -> bool:
@@ -241,6 +242,7 @@ def _doctor_providers(
             spec.required,
             spec.api_key_env,
             getattr(provider, "auth", None),
+            str(getattr(provider, "model", "") or ""),
         )
         for spec, provider in zip(specs, providers, strict=True)
     )
@@ -292,7 +294,8 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
     except OAuthError as exc:
         return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
     states = ", ".join(
-        f"{p.name}={'set' if presence[p.name] else 'missing'}" for p in providers
+        f"{p.name}(model={p.model})={'set' if presence[p.name] else 'missing'}"
+        for p in providers
     )
     missing_required = [
         p.name for p in providers if p.required and not presence[p.name]

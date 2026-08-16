@@ -82,6 +82,17 @@ def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> N
     assert "0 fail" in result.stdout
 
 
+def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
+
+    status, detail = doctor.check_provider_env(tmp_path)
+
+    assert status is doctor.Status.WARN, detail
+    assert "test-provider(model=example-model)=missing" in detail
+
+
 def test_doctor_opens_session_databases_with_special_character_paths(tmp_path) -> None:
     session_dir = tmp_path / "session?query#fragment"
     events_db = session_dir / doctor.EVENTS_DB_REL
