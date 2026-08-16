@@ -265,6 +265,60 @@ def test_debt_store_round_trips_cache_and_latency_fields(tmp_path) -> None:
     assert entry.latency_count == 1
 
 
+def test_debt_store_persists_and_clears_quarantine_record(tmp_path) -> None:
+    path = tmp_path / "routing.json"
+    store = DebtStore(path)
+    store.record(
+        {
+            "provider": "p1",
+            "usage": {"total_tokens": 10},
+            "failure_reason": "config_error: The model x was not found",
+        }
+    )
+    assert store.as_mapping()["p1"].disable_reason == "config_error: The model x was not found"
+    assert store.as_mapping()["p1"].disable_at is not None
+    store.save()
+
+    loaded = DebtStore(path)
+    loaded.load()
+    entry = loaded.as_mapping()["p1"]
+    assert entry.disable_reason == "config_error: The model x was not found"
+    assert entry.disable_at is not None
+
+    # an auth_error failure reason also sets the record
+    store.record({"provider": "p1", "failure_reason": "auth_error: credential rejected"})
+    store.save()
+    loaded = DebtStore(path)
+    loaded.load()
+    entry = loaded.as_mapping()["p1"]
+    assert entry.disable_reason == "auth_error: credential rejected"
+    assert entry.disable_at is not None
+
+    # a success event (no failure_reason) clears both fields on the reloaded store
+    store.record({"provider": "p1", "usage": {"total_tokens": 5}})
+    store.save()
+    loaded = DebtStore(path)
+    loaded.load()
+    entry = loaded.as_mapping()["p1"]
+    assert entry.disable_reason is None
+    assert entry.disable_at is None
+
+    # a transient error leaves a previously-set record untouched
+    store.record({"provider": "p1", "failure_reason": "config_error: model not found again"})
+    store.save()
+    loaded = DebtStore(path)
+    loaded.load()
+    entry = loaded.as_mapping()["p1"]
+    assert entry.disable_reason == "config_error: model not found again"
+    loaded.record({"provider": "p1", "failure_reason": "error: transport failed"})
+    assert loaded.as_mapping()["p1"].disable_reason == "config_error: model not found again"
+    assert loaded.as_mapping()["p1"].disable_at is not None
+    loaded.save()
+    reloaded = DebtStore(path)
+    reloaded.load()
+    assert reloaded.as_mapping()["p1"].disable_reason == "config_error: model not found again"
+
+
 # --------------------------------------------------------------------------- #
 # 5. regression: select_primary keeps its contract alongside select_lane
 # --------------------------------------------------------------------------- #

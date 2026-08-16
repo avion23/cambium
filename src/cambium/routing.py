@@ -16,6 +16,11 @@ admissions in the same session see updated debt. A missing or corrupt ledger
 file loads as empty only when absent. Unreadable, malformed, and unsupported
 ledgers raise an error.
 
+The ledger also carries an optional per-provider quarantine record: the
+``failure_reason`` of the last ``config_error``/``auth_error`` call plus its
+timestamp, cleared by a later success, so ``cambium doctor`` can surface a
+durable disable reason.
+
 The window allowance defaults to :data:`DEFAULT_TOKEN_WINDOW_ALLOWANCE`
 (20M tokens, a placeholder until real quota contracts are measured,
 implementation-plan step 3); a provider config may override it per provider
@@ -83,6 +88,11 @@ class ProviderDebt:
     provider reports it); ``retry_after_count`` counts 429-style events
     (``request_rate_status == "cooldown"`` or a ``failure_reason`` containing
     ``429``). Only counts/tokens — never credentials — ever enter the ledger.
+
+    ``disable_reason``/``disable_at`` carry the durable quarantine record: a
+    ``config_error:``/``auth_error:`` failure reason sets both, a success
+    (no ``failure_reason``) clears both, and any other failure classification
+    leaves them unchanged.
     """
 
     tokens: int = 0
@@ -96,6 +106,10 @@ class ProviderDebt:
     latency_total_s: float = 0.0
     latency_count: int = 0
     last_seen: float | None = None
+    # Durable quarantine record: reason + timestamp of the last
+    # config_error/auth_error call, cleared by a later success.
+    disable_reason: str | None = None
+    disable_at: float | None = None
 
     def record(self, event: Mapping[str, Any]) -> None:
         """Fold one usage_event payload into this provider's debt."""
@@ -121,6 +135,17 @@ class ProviderDebt:
         failure_reason = event.get("failure_reason")
         if isinstance(failure_reason, str) and failure_reason:
             self.failed_requests += 1
+            if failure_reason.startswith(
+                "config_error:"
+            ) or failure_reason.startswith("auth_error:"):
+                # A quarantine-class failure: record the durable disable reason.
+                self.disable_reason = failure_reason
+                self.disable_at = time.time()
+        else:
+            # A success event clears any durable quarantine record; transient
+            # failure classifications leave it untouched.
+            self.disable_reason = None
+            self.disable_at = None
         if event.get("request_rate_status") == "cooldown" or (
             isinstance(failure_reason, str) and "429" in failure_reason
         ):
@@ -171,6 +196,22 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
         else:
             if math.isfinite(parsed_last_seen):
                 debt.last_seen = parsed_last_seen
+    disable_reason = entry.get("disable_reason")
+    if isinstance(disable_reason, str) and disable_reason:
+        debt.disable_reason = disable_reason
+    disable_at = entry.get("disable_at")
+    if (
+        isinstance(disable_at, (int, float))
+        and not isinstance(disable_at, bool)
+        and disable_at >= 0
+    ):
+        try:
+            parsed_disable_at = float(disable_at)
+        except (OverflowError, ValueError):
+            pass
+        else:
+            if math.isfinite(parsed_disable_at):
+                debt.disable_at = parsed_disable_at
     return debt
 
 
@@ -255,6 +296,17 @@ class DebtStore:
         for field in (*int_fields, *float_fields):
             before = getattr(baseline, field, 0) if baseline is not None else 0
             updates[field] = getattr(base, field) + getattr(local, field) - before
+
+        # Quarantine record: the most recent event wins. A config/auth error
+        # this session sets it; a success this session clears it (a success
+        # never increments ``failed_requests``, so ``failed < requests`` proves
+        # one occurred); any other failure leaves the on-disk record intact.
+        if local.disable_reason is not None:
+            updates["disable_reason"] = local.disable_reason
+            updates["disable_at"] = local.disable_at
+        elif local.failed_requests < local.requests:
+            updates["disable_reason"] = None
+            updates["disable_at"] = None
 
         last_seen = base.last_seen
         if local.last_seen is not None and (
@@ -356,22 +408,27 @@ class DebtStore:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 debts = self._merge_with_current(self._read_persisted_debts())
+                providers: dict[str, dict[str, Any]] = {}
+                for name, debt in sorted(debts.items()):
+                    entry: dict[str, Any] = {
+                        "tokens": debt.tokens,
+                        "requests": debt.requests,
+                        "failed_requests": debt.failed_requests,
+                        "cost": debt.cost,
+                        "retry_after_count": debt.retry_after_count,
+                        "cache_hit_count": debt.cache_hit_count,
+                        "latency_total_s": debt.latency_total_s,
+                        "latency_count": debt.latency_count,
+                        "last_seen": debt.last_seen,
+                    }
+                    if debt.disable_reason is not None:
+                        entry["disable_reason"] = debt.disable_reason
+                        if debt.disable_at is not None:
+                            entry["disable_at"] = debt.disable_at
+                    providers[name] = entry
                 payload = {
                     "version": _ROUTING_STATE_VERSION,
-                    "providers": {
-                        name: {
-                            "tokens": debt.tokens,
-                            "requests": debt.requests,
-                            "failed_requests": debt.failed_requests,
-                            "cost": debt.cost,
-                            "retry_after_count": debt.retry_after_count,
-                            "cache_hit_count": debt.cache_hit_count,
-                            "latency_total_s": debt.latency_total_s,
-                            "latency_count": debt.latency_count,
-                            "last_seen": debt.last_seen,
-                        }
-                        for name, debt in sorted(debts.items())
-                    },
+                    "providers": providers,
                 }
                 content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
                 descriptor, temporary_name = tempfile.mkstemp(

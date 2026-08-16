@@ -16,7 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cambium import doctor
+from cambium import doctor, routing
+from cambium.routing import DebtStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = str(REPO_ROOT / "src")
@@ -91,6 +92,46 @@ def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> No
 
     assert status is doctor.Status.WARN, detail
     assert "test-provider(model=example-model)=missing" in detail
+
+
+def test_doctor_provider_row_surfaces_durable_quarantine_reason(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
+    ledger_path = tmp_path / "routing-state.json"
+    ledger = DebtStore(ledger_path)
+    ledger.record(
+        {
+            "provider": "test-provider",
+            "failure_reason": "config_error: The model example-model was not found",
+        }
+    )
+    ledger.save()
+    monkeypatch.setattr(routing, "DEFAULT_ROUTING_STATE_PATH", ledger_path)
+
+    status, detail = doctor.check_provider_env(tmp_path)
+
+    assert status is doctor.Status.WARN, detail
+    assert (
+        "test-provider(model=example-model)=missing (disabled: config_error:"
+        in detail
+    )
+
+
+def test_doctor_ignores_corrupt_routing_ledger(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
+    ledger_path = tmp_path / "routing-state.json"
+    ledger_path.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(routing, "DEFAULT_ROUTING_STATE_PATH", ledger_path)
+
+    status, detail = doctor.check_provider_env(tmp_path)
+
+    assert status is doctor.Status.WARN, detail
+    assert "(disabled:" not in detail
 
 
 def test_doctor_opens_session_databases_with_special_character_paths(tmp_path) -> None:

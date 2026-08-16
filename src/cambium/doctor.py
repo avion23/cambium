@@ -55,6 +55,7 @@ from .provider_config import (
     load_providers,
     validate_provider_specs,
 )
+from .routing import DebtStore
 from .system_health import format_health, health
 
 MIN_PYTHON = (3, 14)
@@ -281,6 +282,19 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
         source = "default sample"
 
     providers = _doctor_providers(specs, configured)
+    disable_reasons: dict[str, str] = {}
+    try:
+        debt_store = DebtStore()
+        debt_store.load()
+        disable_reasons = {
+            name: debt.disable_reason
+            for name, debt in debt_store.as_mapping().items()
+            if debt.disable_reason is not None
+        }
+    except (OSError, ValueError):
+        # Advisory only: a missing/corrupt/unreadable routing ledger never
+        # fails the provider-env check; it just loses the annotation.
+        disable_reasons = {}
     oauth_store = OAuthStore()
     try:
         presence = {
@@ -295,6 +309,11 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
         return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
     states = ", ".join(
         f"{p.name}(model={p.model})={'set' if presence[p.name] else 'missing'}"
+        + (
+            f" (disabled: {disable_reasons[p.name]})"
+            if p.name in disable_reasons
+            else ""
+        )
         for p in providers
     )
     missing_required = [
