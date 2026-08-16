@@ -101,6 +101,25 @@ PY
 read -r SMOKE_TIER SMOKE_MODEL <<< "$TIER_MODEL"
 note "driving provider tier=$SMOKE_TIER model=$SMOKE_MODEL"
 
+# The worker env is a fail-closed allowlist: the supervisor forwards only the
+# credential names a task declares in provider_env_keys (values from its own
+# env, then scrubbed). Derive them from the config's providers so API-key
+# providers work; codex_chatgpt OAuth providers need no env forwarding (the
+# supervisor injects the access token from the OAuth store at spawn).
+PROVIDER_ENV_KEYS="$("$PY" - "$CONFIG" <<'PY' || true
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    config = json.load(fh)
+keys = [
+    provider.get("api_key_env")
+    for provider in config.get("providers", [])
+    if isinstance(provider.get("api_key_env"), str) and provider.get("api_key_env")
+]
+print(json.dumps(keys))
+PY
+)"
+[ -n "$PROVIDER_ENV_KEYS" ] || PROVIDER_ENV_KEYS="[]"
+
 # --- deterministic start: drop only this driver's disposable state ----------
 rm -rf "$CLONE" "$SESSION" "$FAIL_SESSION"
 mkdir -p "$SESSION" "$FAIL_SESSION"
@@ -136,7 +155,7 @@ cat > "$PLAN" <<JSON
       "ready_timeout_s": 30.0,
       "gate_timeout_s": 30.0,
       "heartbeat_interval_s": 1.0,
-      "provider_env_keys": [],
+      "provider_env_keys": $PROVIDER_ENV_KEYS,
       "fanout_config": {
         "tier": "$SMOKE_TIER",
         "model": "$SMOKE_MODEL",
