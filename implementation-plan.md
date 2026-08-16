@@ -95,11 +95,14 @@ is not a branch ledger or merge log.
   left `main` unchanged on the failure fixture. En route, the driver's plan
   was fixed to derive tier/model from the supplied provider config (a direct
   supervisor plan must declare both; `oneshot.py` resolves them before
-  dispatch), the fixtures were reworded so the model leaves the change
-  uncommitted (the worker owns the fenced commit) on the success path and
-  exercises the refuse-to-publish path on the failure path, and
+  dispatch), the success fixture was reworded so the model leaves the change
+  uncommitted (the worker owns the fenced commit), and
   `_codex_oauth_provider_names` now treats an empty `authorized_providers`
   set as unrestricted so the codex OAuth token is injected for such tasks.
+  The failure fixture is deterministic and model-independent: its
+  fanout_config references a non-codex provider, so the supervisor injects no
+  codex OAuth token and the worker's provider routing fails closed with a
+  failed verdict before any model call.
 
 ## 5. Follow-on evaluation
 
@@ -185,3 +188,26 @@ secrets), `--logout` (locked local removal, no remote revoke claim), and
 `--import-codex-cli` (imports `~/.codex/auth.json` as provider `codex`).
 `cambium doctor --oauth-live` is an opt-in live probe of issuer reachability
 and refreshability that consumes quota and never makes a model call.
+
+### Codex OAuth transport/entitlement flow (plan v2 W1, partially landed)
+
+The codex transport now matches the CLI's wire identity: `_codex_post_sync`
+sends `originator: codex_cli_rs`, a codex-shaped `User-Agent`
+(`codex_cli_rs/<version> (cambium; cambium)`), and a stable per-instance
+`session-id` (one worker process runs one task, so per-instance is
+per-session and never rotates per request). `_codex_request_body` is
+unchanged: `prompt_cache_key` is live-probed useless on this endpoint and
+`include`/`instructions` add nothing.
+
+Entitlement evidence (openai/codex sources + live probe): there is no
+client-side model-name translation — the configured slug goes on the wire
+verbatim — and no client header unlocks a model; the gate is server-side
+via the authenticated `/models` catalog filtered by account and
+`client_version`. A live `GET
+https://chatgpt.com/backend-api/codex/models?client_version=<codex-cli-ver>`
+with the pro-session token returns 200 and lists `gpt-5.6-luna`, confirming
+server-side entitlement to the pinned slug. `doctor`'s provider row now
+shows the configured model per provider. Surfacing the CONFIG_ERROR
+quarantine reason verbatim is deferred: the disable state is in-memory only
+and nothing persists it; that needs a persisted provider-disable record
+first.
