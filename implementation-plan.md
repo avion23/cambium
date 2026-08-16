@@ -189,7 +189,7 @@ secrets), `--logout` (locked local removal, no remote revoke claim), and
 `cambium doctor --oauth-live` is an opt-in live probe of issuer reachability
 and refreshability that consumes quota and never makes a model call.
 
-### Codex OAuth transport/entitlement flow (plan v2 W1, partially landed)
+### Codex OAuth transport/entitlement flow (plan v2 W1, landed)
 
 The codex transport now matches the CLI's wire identity: `_codex_post_sync`
 sends `originator: codex_cli_rs`, a codex-shaped `User-Agent`
@@ -207,7 +207,9 @@ via the authenticated `/models` catalog filtered by account and
 https://chatgpt.com/backend-api/codex/models?client_version=<codex-cli-ver>`
 with the pro-session token returns 200 and lists `gpt-5.6-luna`, confirming
 server-side entitlement to the pinned slug. `doctor`'s provider row now
-shows the configured model per provider. Surfacing the CONFIG_ERROR
-quarantine reason verbatim is deferred: the disable state is in-memory only
-and nothing persists it; that needs a persisted provider-disable record
-first.
+shows the configured model per provider. The CONFIG_ERROR/AUTH_ERROR
+quarantine reason is now durable: `DebtStore` records `disable_reason` and
+`disable_at` in `routing-state.json` on a `config_error:`/`auth_error:` usage
+failure, clears both on the next success, and `doctor`'s provider check
+appends `(disabled: <reason>)` to the row (advisory; a missing or corrupt
+ledger never fails the check).
