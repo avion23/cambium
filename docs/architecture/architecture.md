@@ -154,9 +154,9 @@ Do not use those names as current architecture components.
 IPC is bounded and correlated by request ID (generation is not enforced for
    message correlation). Fatal framing, oversized lines, missing correlated
    results, non-zero exits, and deadline failures follow the boundary-specific
-   supervisor policy; malformed lines that fail JSON parsing are counted and
-   skipped up to a bound, and a valid JSON line that is not an object currently
-   fails supervision (open defect). Tool schemas reject malformed calls.
+   supervisor policy; malformed lines that fail JSON parsing and valid JSON
+   lines that are not objects are counted as parse errors and skipped up to the
+   same bound, never failing supervision. Tool schemas reject malformed calls.
 
 Provider credentials are allowlisted environment values. They must not enter
 task specs, prompts persisted as events, logs, or result
@@ -169,24 +169,21 @@ tool run directly from source.
 
 ## 3. Target contracts and delivery order
 
-These are open contracts, not current interfaces. Hierarchy and dynamic
-admission are follow-on work; gates/containment are not prerequisites.
+These are open contracts, not current interfaces. Production hierarchy and
+dynamic admission are current behavior (see §1); the open contracts below are
+the delivery order for what remains.
 
 ### Production hierarchy and admission
 
-The smallest production slice is harness-owned: it receives one explicit,
-validated `TaskTree`, computes static ready-node waves, and admits only nodes
-whose dependencies and width limits are satisfied. Each child receives a fresh
-bounded context derived from its task and allowed parent envelope. Upward flow
-uses the strict envelope key set; sibling context and unbounded transcripts do
-not cross the boundary.
-
-Dynamic child admission follows the static slice. A parent may propose a typed
-tree revision, but the supervisor must validate and durably admit it before
-dispatch; a provider response cannot mutate the live tree in place. Wire the
-Architectus decision port and conversation persistence only with callers and
-failure tests. Prompt-prefix stability and provider cache-hit metrics are
-required acceptance measures for the provider path.
+Landed (see §1 and [`implementation-plan.md`](../../implementation-plan.md)
+steps 1–2): `run_plan` builds one validated `TaskTree` for plans with
+`depends_on`, computes static ready-node waves bounded by `max_width`, admits
+only nodes whose dependencies and width limits are satisfied, and gives each
+child a fresh bounded context (own spec + strict parent envelope). A parent may
+propose a typed tree revision (`propose_child`), but the supervisor validates
+and durably admits it before dispatch; a provider response cannot mutate the
+live tree in place. The Architectus decision port and conversation persistence
+are wired at that boundary.
 
 ### Per-worker containment and approval
 
@@ -195,19 +192,26 @@ decision; worktree/process-group isolation is the only worker boundary.
 
 ### Provider accounting before routing policy
 
-Define durable usage events, provider and model identity, token/cost fields,
-request-rate status, account-quota ownership, and privacy/redaction rules. Test
-Retry-After, `RATE_LIMITED`, token/cost accounting, and accounting failure
-first. Measure prompt-prefix stability and provider-reported cache-hit metrics
-on fixed prompt fixtures. Only then evaluate weighted routing; priority
-ordering remains the current policy.
+Landed (see §1 and [`implementation-plan.md`](../../implementation-plan.md)
+step 3): durable redacted usage events, provider and model identity, token/cost
+fields, request-rate status, account-quota ownership, privacy/redaction rules,
+Retry-After and `RATE_LIMITED` behavior, and prompt-prefix/cache-hit metrics are
+in place. Weighted routing remains a target: priority ordering stays the
+current policy until the usage and quota evidence from
+`scripts/usage_evidence.py` is stable.
 
 ### External-provider acceptance
 
 Run a disposable credentialed smoke through the worker loop, tool event,
 checkpoint, and ref-only merge. Keep credentials in the environment and
-network opt-in. Deployment credentials/configuration are external and
-ephemeral; doctor currently reports no runnable configured provider.
+network opt-in. The driver is committed (`scripts/external-provider-smoke.sh`)
+and passed against a live codex OAuth session (ChatGPT `pro`): a real
+`codex_responses` run produced usage events, exactly one ref-only commit
+touching only the fixture, and an unchanged main on the failure fixture. The
+smoke's fanout plan derives tier/model from the supplied provider config, and
+the supervisor injects the codex OAuth token for tasks whose
+`authorized_providers` set is empty (unrestricted). Deployment
+credentials/configuration are external and ephemeral.
 
 ## 4. Failure policy by boundary
 

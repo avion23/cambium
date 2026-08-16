@@ -616,7 +616,7 @@ def _codex_oauth_provider_names(
         if provider.auth is AuthMode.CODEX_CHATGPT
     )
     authorized_raw = spec.get("authorized_providers")
-    if isinstance(authorized_raw, (list, tuple)):
+    if isinstance(authorized_raw, (list, tuple)) and authorized_raw:
         authorized = frozenset(
             name for name in authorized_raw if isinstance(name, str) and name
         )

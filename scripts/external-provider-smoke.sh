@@ -82,6 +82,24 @@ print(" ".join(missing))
 PY
 )"
 [ -z "$MISSING_KEYS" ] || fail "credential env keys not set: $MISSING_KEYS"
+# The plan's fanout_config must declare the provider tier and model the worker
+# drives (oneshot.py resolves both before dispatch; a direct supervisor plan
+# supplies them here). Derive them from the first enabled provider in the
+# supplied config so the smoke works against any real provider configuration.
+TIER_MODEL="$("$PY" - "$CONFIG" <<'PY' || true
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    config = json.load(fh)
+for provider in config.get("providers", []):
+    if provider.get("enabled", True) and provider.get("tier") and provider.get("model"):
+        print(f"{provider['tier']} {provider['model']}")
+        break
+PY
+)"
+[ -n "$TIER_MODEL" ] || \
+    fail "no enabled provider in $CONFIG declares both tier and model"
+read -r SMOKE_TIER SMOKE_MODEL <<< "$TIER_MODEL"
+note "driving provider tier=$SMOKE_TIER model=$SMOKE_MODEL"
 
 # --- deterministic start: drop only this driver's disposable state ----------
 rm -rf "$CLONE" "$SESSION" "$FAIL_SESSION"
@@ -106,7 +124,7 @@ cat > "$PLAN" <<JSON
     {
       "task_id": "$TASK_ID",
       "worker": "cambium.worker",
-      "task": "append the smoke marker to the fixture file and commit",
+      "task": "append the smoke marker line 'cambium external-provider smoke marker' to the fixture file tests/fixtures/external-smoke/cambium-external-smoke-marker.txt; do NOT run any git commands — the change is committed by the framework",
       "repo": "$CLONE",
       "worktree_path": "$SESSION/wt-$TASK_ID",
       "branch": "$BRANCH",
@@ -120,7 +138,8 @@ cat > "$PLAN" <<JSON
       "heartbeat_interval_s": 1.0,
       "provider_env_keys": [],
       "fanout_config": {
-        "tier": "fast",
+        "tier": "$SMOKE_TIER",
+        "model": "$SMOKE_MODEL",
         "call_budget_s": 240.0,
         "pause_timeout_s": 10.0
       }
@@ -179,7 +198,7 @@ cat > "$FAIL_PLAN" <<JSON
     {
       "task_id": "ext-smoke-fail",
       "worker": "cambium.worker",
-      "task": "fail this run",
+      "task": "append the smoke marker line 'cambium external-provider smoke marker' to the fixture file tests/fixtures/external-smoke/cambium-external-smoke-marker.txt and commit it yourself with a git commit (any message); the task is complete only when the file is changed and committed",
       "repo": "$CLONE",
       "worktree_path": "$FAIL_SESSION/wt-fail",
       "branch": "wt-ext-smoke-fail",
@@ -192,7 +211,8 @@ cat > "$FAIL_PLAN" <<JSON
       "heartbeat_interval_s": 1.0,
       "provider_env_keys": [],
       "fanout_config": {
-        "tier": "fast",
+        "tier": "$SMOKE_TIER",
+        "model": "$SMOKE_MODEL",
         "call_budget_s": 60.0,
         "pause_timeout_s": 5.0
       }
