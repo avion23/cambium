@@ -192,13 +192,18 @@ for required in ("task_assigned", "spawned", "ready", "result", "merge_started",
 PY
 
 # --- acceptance 3: failure fixture leaves main UNCHANGED ---------------------
+# Deterministic fail-closed: the task's fanout_config references a non-codex
+# provider, so the supervisor injects no codex OAuth token and the worker's
+# provider routing fails closed ("CAMBIUM_OAUTH_ACCESS_CODEX is not set") with
+# a failed verdict before any model call. main never moves; the model's
+# behavior is irrelevant, so the fixture is reproducible.
 cat > "$FAIL_PLAN" <<JSON
 {
   "tasks": [
     {
       "task_id": "ext-smoke-fail",
       "worker": "cambium.worker",
-      "task": "append the smoke marker line 'cambium external-provider smoke marker' to the fixture file tests/fixtures/external-smoke/cambium-external-smoke-marker.txt and commit it yourself with a git commit (any message); the task is complete only when the file is changed and committed",
+      "task": "deterministic fail-closed probe: this task must never reach the model",
       "repo": "$CLONE",
       "worktree_path": "$FAIL_SESSION/wt-fail",
       "branch": "wt-ext-smoke-fail",
@@ -214,7 +219,8 @@ cat > "$FAIL_PLAN" <<JSON
         "tier": "$SMOKE_TIER",
         "model": "$SMOKE_MODEL",
         "call_budget_s": 60.0,
-        "pause_timeout_s": 5.0
+        "pause_timeout_s": 5.0,
+        "providers": [{"name": "openai"}]
       }
     }
   ]
