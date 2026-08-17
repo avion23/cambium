@@ -93,7 +93,7 @@ artifact, `tests.count` must equal the number of entries in `tests.by_nodeid`.
     "failed": 0
   },
   "dataset": {"records": 260, "duplicate_ids": 0, "cross_split_leaks": 0,
-               "decompose_true": 128, "decompose_false": 132, "canaries": 10},
+               "label_true": 128, "label_false": 132, "canaries": 10},
   "tests": {
     "count": 57,
     "wall_seconds": {"p50": 0.001504, "p90": 0.123111, "max": 0.162092},
@@ -299,7 +299,7 @@ block carries `mean`, population `std`, and `count` for `train`, `eval`, and
 `canaries`; an empty split is represented explicitly rather than silently
 dropped. The canary block carries `total`, `kinds_present`,
 `taxonomy_coverage`, and `failed`. The dataset block carries `records`,
-`duplicate_ids`, `cross_split_leaks`, `decompose_true`, `decompose_false`,
+`duplicate_ids`, `cross_split_leaks`, `label_true`, `label_false`,
 and `canaries`. The timing block carries p50/p90/max and optional node IDs.
 
 All numbers are finite and non-negative; rates are within `[0, 1]`, counts are
