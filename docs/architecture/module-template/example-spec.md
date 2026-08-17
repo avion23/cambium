@@ -249,8 +249,8 @@ python3.14 -m pytest src/cambium/modules/example/tests -v
 
 The committed baseline records Python `3.14.7`, pytest `9.1.1`, metric means
 1.0 (`count`: 200/50/10), canaries total 10 with `failed: 0`, and dataset total
-260 (`duplicate_ids`: 0, `cross_split_leaks`: 0, `decompose_true`: 128,
-`decompose_false`: 132). Its drift thresholds are `metric_mean_delta: 0.05`,
+260 (`duplicate_ids`: 0, `cross_split_leaks`: 0, `label_true`: 128,
+`label_false`: 132). Its drift thresholds are `metric_mean_delta: 0.05`,
 `wall_p90_ratio: 1.5`, `canary_failed_delta: 0`, and zero duplicate/leak
 counts. The baseline's recorded `git_sha` is data provenance, not a current
 tree claim.
@@ -338,8 +338,8 @@ as an owner reconciliation failure instead of repaired in documentation.
 
 Its split digests are the exact maps committed with the dataset; the baseline
 must copy them. The baseline summary currently records mean/std `1.0/0.0` for
-each split, counts 200/50/10, total 260 records, `decompose_true: 128`,
-`decompose_false: 132`, duplicate and cross-split counts of zero, 10 canaries,
+each split, counts 200/50/10, total 260 records, `label_true: 128`,
+`label_false: 132`, duplicate and cross-split counts of zero, 10 canaries,
 taxonomy coverage `1.0`, and `failed: 0`. Runtime fields are Python `3.14.7`
 and pytest `9.1.1`; drift thresholds are metric delta `0.05`, p90 ratio `1.5`,
 canary failure delta `0`, and zero duplicates/leaks. The baseline's recorded

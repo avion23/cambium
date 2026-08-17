@@ -18,7 +18,7 @@ dspy = ["dspy>=3.3.0,<3.4"]
 # ast: focused alias for consumers that need only the optional tree-sitter
 # Python parser; the stdlib ast backend remains the core fallback.
 ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
-# test: what CI runs, including commands that use the pytest-based harness.
+# test: what the local test harness runs, including commands that use the pytest-based harness.
 # dspy is pinned here (and in dev) so the default isolated test install runs
 # the CambiumLM scenarios instead of skipping 113 tests.
 test = [
