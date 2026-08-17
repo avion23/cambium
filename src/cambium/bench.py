@@ -525,9 +525,8 @@ async def _predict(manifest: ModuleManifest, records: list[dict]) -> list[Scored
     return scored
 
 
-def score_examples(module: Any, scored: list[ScoredRecord]) -> dict[str, float]:
+def score_examples(scored: list[ScoredRecord]) -> dict[str, float]:
     """Metric mean/std/count over records scored by the neutral CLI."""
-    del module  # Kept in the signature for the existing drift-test seam.
     scores = [example.score for example in scored]
     if not scores:
         return {"mean": 0.0, "std": 0.0, "count": 0}
@@ -541,7 +540,7 @@ def dataset_stats(records: list[dict], label_field: str = "decompose") -> dict[s
 
     Class balance counts the module's declared ``label_field`` (the v1
     default is ``decompose``); the baseline schema keeps the generic
-    ``decompose_true``/``decompose_false`` key names.
+    ``label_true``/``label_false`` key names.
     """
     ids = [r["id"] for r in records if isinstance(r.get("id"), str)]
     seen: dict[tuple[str, str], str] = {}
@@ -555,8 +554,8 @@ def dataset_stats(records: list[dict], label_field: str = "decompose") -> dict[s
         "records": len(records),
         "duplicate_ids": len(ids) - len(set(ids)),
         "cross_split_leaks": leaks,
-        "decompose_true": sum(1 for r in records if r["expected"].get(label_field) is True),
-        "decompose_false": sum(1 for r in records if r["expected"].get(label_field) is False),
+        "label_true": sum(1 for r in records if r["expected"].get(label_field) is True),
+        "label_false": sum(1 for r in records if r["expected"].get(label_field) is False),
         "canaries": sum(1 for r in records if _is_canary(r)),
     }
 
@@ -648,7 +647,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
             )
         for split in SPLITS:
             scored[split] = asyncio.run(_predict(manifest, raw[split]))
-            metric[split] = score_examples(manifest, scored[split])
+            metric[split] = score_examples(scored[split])
             if split == "canaries":
                 canary_scores = [
                     example.score
@@ -675,7 +674,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         canary_scores = []
     if combined:
         scored["combined"] = asyncio.run(_predict(manifest, raw["combined"]))
-        metric["combined"] = score_examples(manifest, scored["combined"])
+        metric["combined"] = score_examples(scored["combined"])
         canary_scores = [
             example.score
             for example in scored["combined"]

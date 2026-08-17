@@ -44,8 +44,8 @@
     "records": 55,
     "duplicate_ids": 0,
     "cross_split_leaks": 0,
-    "decompose_true": 29,
-    "decompose_false": 26,
+    "label_true": 29,
+    "label_false": 26,
     "canaries": 5
   },
   "tests": {

@@ -178,7 +178,7 @@ def label_field(manifest) -> str:
     """The dataset label boolean from the manifest; the v1 default is ``decompose``.
 
     The bench harness and baseline schema carry the generic
-    ``decompose_true``/``decompose_false`` class-balance names. A module
+    ``label_true``/``label_false`` class-balance names. A module
     whose domain label is a different boolean declares the optional
     ``label_field`` (for example ``review``) in its manifest; the engine
     consistency check compares the CLI prediction on that field.

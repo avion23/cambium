@@ -1061,8 +1061,8 @@ def _validate_dataset_integrity(
                 "records": total_records,
                 "duplicate_ids": 0,
                 "cross_split_leaks": 0,
-                "decompose_true": labels[True],
-                "decompose_false": labels[False],
+                "label_true": labels[True],
+                "label_false": labels[False],
                 "canaries": len(canary_records),
             }
             for field, expected in expected_dataset.items():

@@ -496,8 +496,8 @@ def test_dataset_stats_honors_label_field() -> None:
         },
     ]
     stats = bench.dataset_stats(records, "review")
-    assert stats["decompose_true"] == 1
-    assert stats["decompose_false"] == 1
+    assert stats["label_true"] == 1
+    assert stats["label_false"] == 1
 
 
 def test_cli_timeout_fails_without_combined_fallback(tmp_path, monkeypatch, capsys) -> None:
@@ -949,7 +949,7 @@ def test_gate_fails_on_metric_drift(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         bench,
         "score_examples",
-        lambda _module, scored: {"mean": 0.9, "std": 0.0, "count": len(scored)},
+        lambda scored: {"mean": 0.9, "std": 0.0, "count": len(scored)},
     )
     gate = run_plugin_bench(bench_root, "gate", tests=UNRELATED_TESTS)
     assert gate.returncode == 1, gate.stdout + gate.stderr
@@ -976,7 +976,7 @@ def test_gate_honors_cli_metric_delta_override(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         bench,
         "score_examples",
-        lambda _module, scored: {"mean": 0.98, "std": 0.0, "count": len(scored)},
+        lambda scored: {"mean": 0.98, "std": 0.0, "count": len(scored)},
     )
     fail = run_plugin_bench(bench_root, "gate", "--bench-metric-delta=0.01", tests=UNRELATED_TESTS)
     assert fail.returncode == 1, fail.stdout + fail.stderr
@@ -985,7 +985,7 @@ def test_gate_honors_cli_metric_delta_override(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         bench,
         "score_examples",
-        lambda _module, scored: {"mean": 0.995, "std": 0.0, "count": len(scored)},
+        lambda scored: {"mean": 0.995, "std": 0.0, "count": len(scored)},
     )
     ok = run_plugin_bench(bench_root, "gate", "--bench-metric-delta=0.01", tests=UNRELATED_TESTS)
     assert ok.returncode == 0, ok.stdout + ok.stderr
@@ -1080,7 +1080,7 @@ def test_cli_gate_drift_report_records_regressions(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(
         bench,
         "score_examples",
-        lambda _module, scored: {"mean": 0.9, "std": 0.0, "count": len(scored)},
+        lambda scored: {"mean": 0.9, "std": 0.0, "count": len(scored)},
     )
     assert bench.main(["gate", "--drift-report", "--bench-root", str(bench_root)]) == 1
     artifact = json.loads((bench_root / "drift-report.json").read_text())

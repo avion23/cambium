@@ -8,7 +8,9 @@ Every decision package that has a ``datasets`` directory also ships a
 ``module.json`` manifest.  The harness reads that JSON file as data; it never
 imports the decision package to discover its name or implementation.  The
 manifest fields are ``contract_version``, ``module_name``, ``cli_module``,
-``protocol`` (``"json-v1"``), and ``dataset_schema_version``.  The package's
+``protocol`` (``"json-v1"``), ``dataset_schema_version``, and the optional
+``label_field`` (the dataset record boolean the class balance counts; the v1
+default is ``decompose``).  The package's
 ``python -m`` entry implements that protocol: one JSON object in and one JSON
 object out.  The optional ``decide`` and ``evaluate`` operations are used by
 tooling; the default operation is one module decision.
@@ -407,10 +409,6 @@ def run_module_cli(
     return output
 
 
-class Output(Protocol):
-    """Typed prediction returned by a module's ``decide``."""
-
-
 @dataclass(frozen=True, slots=True)
 class Example:
     """One dataset record: input, expected, and (optional) prediction."""
@@ -442,7 +440,7 @@ class Module(ABC):
     name: str
 
     @abstractmethod
-    async def decide(self, input: Any) -> Output:
+    async def decide(self, input: Any) -> Any:
         """Run the module over one input; return a typed prediction."""
 
     @abstractmethod
