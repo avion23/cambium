@@ -460,8 +460,8 @@ def test_baseline_anchors_metadata_and_content() -> None:
     assert baseline["dataset"]["duplicate_ids"] == 0
     assert baseline["dataset"]["cross_split_leaks"] == 0
     assert baseline["dataset"]["canaries"] == 5
-    review_true = baseline["dataset"]["decompose_true"]
-    review_false = baseline["dataset"]["decompose_false"]
+    review_true = baseline["dataset"]["label_true"]
+    review_false = baseline["dataset"]["label_false"]
     assert review_true + review_false == 55
     assert baseline["canaries"]["failed"] == 0
     assert baseline["canaries"]["taxonomy_coverage"] > 0

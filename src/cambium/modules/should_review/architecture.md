@@ -74,14 +74,14 @@ JSON CLI probe, the bench harness (`operation: evaluate` reads the
 prediction), and the colocated tests.
 
 The v1 class-balance contract stays generic. The bench harness and the
-committed baseline schema carry `decompose_true` / `decompose_false` as the
+committed baseline schema carry `label_true` / `label_false` as the
 generic v1 class-balance field names (a bench contract, not a domain claim).
 `module.json` therefore declares `label_field: "review"`; the conformance gate
 counts class balance from `expected.review` and checks it against the
-baseline's `dataset.decompose_true` / `dataset.decompose_false`. Because the
-bench harness reads `expected.decompose` directly (unchanged, per review
-finding 1 Option A), every dataset record also carries `expected.decompose` as
-a mirror that must equal `expected.review`; the loader enforces the equality.
+baseline's `dataset.label_true` / `dataset.label_false`. The bench harness
+reads the manifest's `label_field` (`review`) for class balance;
+`expected.decompose` remains a v1-compat mirror in each record, and the loader
+still enforces `expected.decompose == expected.review`.
 The same `label_field` mechanism is applied to `scripts/check_dataset_v1.py`,
 the one remaining harness consumer that hardcodes the generic name.
 
@@ -310,10 +310,10 @@ registry, dispatch path, cache, or resource-budget abstraction is added.
   allowlist; the compatibility boolean `review` exists only at the boundary.
 - `decompose` is not reused as the wire label. `module.json` declares
   `label_field: "review"`, the conformance gate counts class balance from
-  `expected.review`, and the baseline carries `decompose_true`/`decompose_false`
+  `expected.review`, and the baseline carries `label_true`/`label_false`
   as generic v1 class-balance names. `expected.decompose` in each dataset record
-  is a mirror of `expected.review` consumed by the untouched bench harness
-  (`bench.py:328-329`); the loader enforces equality. `scripts/check_dataset_v1.py`
+  is a v1-compat mirror of `expected.review` enforced by the loader; the bench
+  harness reads `manifest.label_field` for class balance. `scripts/check_dataset_v1.py`
   reads the same `label_field` instead of hardcoding the generic name.
 - The JSON adapter is a process boundary: it rejects duplicate object keys,
   rejects unknown fields, emits no logs on stdout, and avoids importing

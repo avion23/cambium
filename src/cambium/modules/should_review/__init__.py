@@ -15,8 +15,9 @@ Each line of ``datasets/<split>.jsonl``::
      "expected": {"review": bool, "decompose": bool, "reason": str}}
 
 ``expected.review`` is the module's domain label; ``expected.decompose``
-mirrors it as the generic v1 class-balance field the bench harness reads
-(its baseline carries ``decompose_true``/``decompose_false``). The
+mirrors it as a v1-compat class-balance field (the loader enforces the
+mirror), while the bench harness reads the manifest's ``label_field``
+(``review``). The
 optional top-level ``canary`` boolean marks dataset-integrity entries
 planted to catch reward hacking in future evals: they are deliberately
 misaligned with surface heuristics (a keyword-greedy reviewer gets them
