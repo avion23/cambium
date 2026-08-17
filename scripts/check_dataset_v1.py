@@ -175,7 +175,7 @@ def expected_split_counts(manifest) -> dict[str, int]:
 
 
 def label_field(manifest) -> str:
-    """The dataset label boolean from module.json; the v1 default is ``decompose``.
+    """The dataset label boolean from the manifest; the v1 default is ``decompose``.
 
     The bench harness and baseline schema carry the generic
     ``decompose_true``/``decompose_false`` class-balance names. A module
@@ -183,11 +183,7 @@ def label_field(manifest) -> str:
     ``label_field`` (for example ``review``) in its manifest; the engine
     consistency check compares the CLI prediction on that field.
     """
-    manifest_data = json.loads(
-        (manifest.package_dir / "module.json").read_text(encoding="utf-8")
-    )
-    value = manifest_data.get("label_field")
-    return value if isinstance(value, str) and value else "decompose"
+    return manifest.label_field
 
 
 def check_module(manifest) -> None:

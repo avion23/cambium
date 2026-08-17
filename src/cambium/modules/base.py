@@ -167,6 +167,7 @@ class ModuleManifest:
     contract_version: int
     protocol: str
     dataset_schema_version: int
+    label_field: str = "decompose"
 
     @property
     def source_root(self) -> Path:
@@ -249,6 +250,12 @@ def load_module_manifest(
             f"module {name!r}: manifest field 'protocol' must be {MODULE_PROTOCOL!r}"
         )
 
+    label_field = data.get("label_field", "decompose")
+    if not isinstance(label_field, str) or not label_field:
+        raise ModuleContractError(
+            f"module {name!r}: manifest field 'label_field' must be a non-empty string"
+        )
+
     return ModuleManifest(
         package_dir=directory,
         package_name=name,
@@ -257,6 +264,7 @@ def load_module_manifest(
         contract_version=contract_version,
         protocol=protocol,
         dataset_schema_version=_manifest_int(data, "dataset_schema_version", path),
+        label_field=label_field,
     )
 
 

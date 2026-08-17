@@ -752,6 +752,24 @@ def _validate_dataset_integrity(
                         "top-level expected object is required (current wire schema is not data)",
                     )
                 )
+            expected_obj = record.get("expected")
+            module_label_field = manifest.label_field if manifest is not None else "decompose"
+            if (
+                isinstance(expected_obj, dict)
+                and module_label_field != "decompose"
+                and "decompose" in expected_obj
+                and expected_obj.get("decompose") is not expected_obj.get(module_label_field)
+            ):
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "decompose",
+                        f"expected.decompose must mirror expected.{module_label_field} "
+                        f"(label_field {module_label_field!r})",
+                    )
+                )
             if record.get("schema_version") != schema_version:
                 findings.append(
                     AuditFinding(
@@ -852,28 +870,18 @@ def _validate_dataset_integrity(
     total_records = sum(split_counts.values())
     canary_records = records_by_split.get("canaries", [])
     manifest_path = spec.path / "module.json"
-    declared_label_field = None
-    try:
-        manifest_data = _load_json(manifest_path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        manifest_data = None
-    if isinstance(manifest_data, dict) and "label_field" in manifest_data:
-        declared_label_field = manifest_data["label_field"]
-        if not isinstance(declared_label_field, str) or not declared_label_field:
-            findings.append(
-                AuditFinding(
-                    "dataset-integrity",
-                    manifest_path,
-                    0,
-                    "label_field",
-                    "must be a non-empty string when present",
-                )
+    label_field = manifest.label_field if manifest is not None else "decompose"
+    if not isinstance(label_field, str) or not label_field:
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                manifest_path,
+                0,
+                "label_field",
+                "must be a non-empty string when present",
             )
-    label_field = (
-        declared_label_field
-        if isinstance(declared_label_field, str) and declared_label_field
-        else "decompose"
-    )
+        )
+        label_field = "decompose"
     labels = {
         True: sum(
             record.get("expected", {}).get(label_field) is True

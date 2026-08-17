@@ -463,6 +463,43 @@ def test_split_version_drift_fallback_fails_gate(
     assert "legacy combined fallback was scored" in output
 
 
+def test_no_combined_fallback_re_raises_split_failure(tmp_path, monkeypatch) -> None:
+    """A module with no combined file re-raises the real split failure."""
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    datasets_dir = modules_dir / "fixture" / "datasets"
+    (datasets_dir / "train.jsonl").unlink()  # no combined file exists either
+
+    try:
+        bench.build_module_report("fixture")
+    except bench.ModuleBoundaryError as exc:
+        assert "no combined fallback file exists" in str(exc)
+    else:  # pragma: no cover - fail-loud guard
+        raise AssertionError("expected ModuleBoundaryError")
+
+
+def test_dataset_stats_honors_label_field() -> None:
+    import cambium.bench as bench
+
+    records = [
+        {
+            "id": "a",
+            "input": {"task": "t", "context": "c"},
+            "expected": {"review": True, "reason": "r"},
+        },
+        {
+            "id": "b",
+            "input": {"task": "t2", "context": "c2"},
+            "expected": {"review": False, "reason": "r"},
+        },
+    ]
+    stats = bench.dataset_stats(records, "review")
+    assert stats["decompose_true"] == 1
+    assert stats["decompose_false"] == 1
+
+
 def test_cli_timeout_fails_without_combined_fallback(tmp_path, monkeypatch, capsys) -> None:
     import cambium.bench as bench
 
@@ -793,7 +830,7 @@ def test_standalone_cli_report_records_module_test_timings(tmp_path, monkeypatch
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
 
     baseline = json.loads((bench_root / "should_decompose" / "baseline.json").read_text())
-    assert baseline["tests"]["count"] == 51
+    assert baseline["tests"]["count"] == 52
     assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
     assert baseline["tests"]["wall_seconds"]["p90"] > 0
     assert all(

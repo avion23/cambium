@@ -288,6 +288,8 @@ class ExampleDatasetLoader(DatasetLoader):
                 raise DatasetError(f"{path}:{line_no}: {key} must be an object")
         if not isinstance(record["input"].get("task"), str):
             raise DatasetError(f"{path}:{line_no}: input.task must be a string")
+        if not isinstance(record["input"].get("context"), str):
+            raise DatasetError(f"{path}:{line_no}: input.context must be a string")
         if not isinstance(record["expected"].get("decompose"), bool):
             raise DatasetError(
                 f"{path}:{line_no}: expected.decompose must be a boolean"

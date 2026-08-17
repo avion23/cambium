@@ -536,8 +536,13 @@ def score_examples(module: Any, scored: list[ScoredRecord]) -> dict[str, float]:
     return {"mean": round(mean, 6), "std": round(std, 6), "count": len(scores)}
 
 
-def dataset_stats(records: list[dict]) -> dict[str, int]:
-    """Duplicate ids, cross-split leaks, class balance over raw records."""
+def dataset_stats(records: list[dict], label_field: str = "decompose") -> dict[str, int]:
+    """Duplicate ids, cross-split leaks, class balance over raw records.
+
+    Class balance counts the module's declared ``label_field`` (the v1
+    default is ``decompose``); the baseline schema keeps the generic
+    ``decompose_true``/``decompose_false`` key names.
+    """
     ids = [r["id"] for r in records if isinstance(r.get("id"), str)]
     seen: dict[tuple[str, str], str] = {}
     leaks = 0
@@ -550,8 +555,8 @@ def dataset_stats(records: list[dict]) -> dict[str, int]:
         "records": len(records),
         "duplicate_ids": len(ids) - len(set(ids)),
         "cross_split_leaks": leaks,
-        "decompose_true": sum(1 for r in records if r["expected"]["decompose"] is True),
-        "decompose_false": sum(1 for r in records if r["expected"]["decompose"] is False),
+        "decompose_true": sum(1 for r in records if r["expected"].get(label_field) is True),
+        "decompose_false": sum(1 for r in records if r["expected"].get(label_field) is False),
         "canaries": sum(1 for r in records if _is_canary(r)),
     }
 
@@ -651,14 +656,19 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
                     if _is_canary(example.record)
                 ]
     except (DatasetError, ModuleSplitError) as exc:
+        pairs = datasets_dir / f"{pkg_name}_pairs.jsonl"
+        if not pairs.exists():
+            pairs = datasets_dir / "example_pairs.jsonl"
+        if not pairs.exists():
+            raise ModuleBoundaryError(
+                f"module {pkg_name!r}: three-split dataset unavailable ({exc}) and "
+                "no combined fallback file exists"
+            ) from exc
         combined = True
         note = (
             f"three-split dataset unavailable ({exc}); fell back to the combined "
             "file and split metrics are null"
         )
-        pairs = datasets_dir / f"{pkg_name}_pairs.jsonl"
-        if not pairs.exists():
-            pairs = datasets_dir / "example_pairs.jsonl"
         raw = {"combined": load_jsonl(pairs)}
         scored = {}
         metric = {split: None for split in SPLITS}
@@ -681,7 +691,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         "split_digests": _compute_split_digests(datasets_dir, meta),
         "metric": metric,
         "canaries": canary_stats(canary_records, canary_scores),
-        "dataset": dataset_stats(records),
+        "dataset": dataset_stats(records, manifest.label_field),
     }
     if note:
         report["note"] = note

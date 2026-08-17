@@ -156,6 +156,28 @@ def test_split_record_version_drift_rejected_by_loader(tmp_path) -> None:
         loader.load_split(Split.TRAIN)
 
 
+def test_non_string_context_rejected_by_loader(tmp_path) -> None:
+    src = tmp_path / "datasets"
+    src.mkdir()
+    (src / "meta.json").write_text(
+        json.dumps({"schema_version": 1, "dataset_version": "1.1.0"}) + "\n",
+        encoding="utf-8",
+    )
+    record = {
+        "id": "train-1",
+        "schema_version": 1,
+        "dataset_version": "1.1.0",
+        "input": {"task": "Do a thing.", "context": 42},
+        "expected": {"decompose": False, "reason": "atomic"},
+    }
+    train_path = src / "train.jsonl"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    loader = ExampleDatasetLoader(src)
+    with pytest.raises(DatasetError, match="input.context must be a string"):
+        loader.load_split(Split.TRAIN)
+
+
 def test_meta_directory_rejected_by_load_and_load_split(tmp_path) -> None:
     src = tmp_path / "datasets"
     src.mkdir()
