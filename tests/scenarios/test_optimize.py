@@ -199,6 +199,28 @@ def test_write_artifact_writes_state_and_current_link(tmp_path: Path, monkeypatc
     assert current.resolve() == version_dir.resolve()
 
 
+def test_baseline_means_reads_all_three_splits() -> None:
+    manifest = SimpleNamespace(
+        package_dir=Path("src/cambium/modules/example"),
+    )
+
+    means = optimize._baseline_means(manifest)
+
+    assert set(means) == {"train", "eval", "canaries"}
+    assert all(0.0 <= value <= 1.0 for value in means.values())
+
+
+def test_anti_reward_gap_rewards_honest_candidates() -> None:
+    final = {"eval_mean": 1.0, "train_mean": 1.0}
+    canaries = {"mean": 1.0}
+    baseline = {"train": 1.0, "eval": 1.0, "canaries": 1.0}
+
+    assert optimize._anti_reward_gap(final, canaries, baseline) == 0.0
+    assert optimize._anti_reward_gap(final, canaries, None) is None
+    assert optimize._anti_reward_gap(None, canaries, baseline) is None
+    assert optimize._anti_reward_gap(final, None, baseline) is None
+
+
 def test_main_dry_run_does_not_construct_an_lm(monkeypatch) -> None:
     def fail_constructor(*args, **kwargs):
         raise AssertionError("dry-run constructed an LM")

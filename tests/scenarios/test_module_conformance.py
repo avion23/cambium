@@ -472,9 +472,13 @@ def test_external_scan_excludes_dspy_scenarios(tmp_path: Path, monkeypatch) -> N
 
 
 def test_external_scan_flags_unlisted_module_scenario(tmp_path: Path, monkeypatch) -> None:
+    names = module_conformance.module_names()
+    if not names:
+        pytest.skip("no decision modules are installed; nothing to flag")
+    module_name = names[0]
     scenario = tmp_path / "tests" / "scenarios" / "test_unlisted_module.py"
     scenario.parent.mkdir(parents=True)
-    scenario.write_text("import cambium.modules.example\n", encoding="utf-8")
+    scenario.write_text(f"import cambium.modules.{module_name}\n", encoding="utf-8")
     monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
 
     findings = module_conformance.scan_external_module_files()

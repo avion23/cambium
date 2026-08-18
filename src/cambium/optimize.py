@@ -681,18 +681,24 @@ def _load_manifest(module_name: str) -> object:
         raise first_error
 
 
-def _baseline_mean(manifest: object) -> float:
+def _baseline_means(manifest: object) -> dict[str, float]:
     path = Path(manifest.package_dir) / "tests" / "baselines" / "baseline.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        value = data["metric"]["eval"]["mean"]
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise OptimizeError(f"cannot read eval baseline {path}: {exc}") from exc
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise OptimizeError(f"eval baseline {path} is not numeric")
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise OptimizeError(f"eval baseline {path} is outside [0, 1]")
-    return float(value)
+        raise OptimizeError(f"cannot read baseline {path}: {exc}") from exc
+    means: dict[str, float] = {}
+    for split in ("train", "eval", "canaries"):
+        try:
+            value = data["metric"][split]["mean"]
+        except (KeyError, TypeError) as exc:
+            raise OptimizeError(f"baseline {path} has no metric.{split}.mean") from exc
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise OptimizeError(f"baseline {path} metric.{split}.mean is not numeric")
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise OptimizeError(f"baseline {path} metric.{split}.mean is outside [0, 1]")
+        means[split] = float(value)
+    return means
 
 
 def _next_version(module_name: str) -> int:
@@ -763,7 +769,7 @@ def _partial_report(
     args: argparse.Namespace,
     ledger: _CostLedger,
     *,
-    baseline_mean: float | None = None,
+    baseline_means: dict[str, float] | None = None,
     stage_zero: dict | None = None,
     stage_bootstrap: dict | None = None,
     final: dict | None = None,
@@ -777,7 +783,7 @@ def _partial_report(
         "tier": args.tier,
         "budget_usd": args.budget_usd,
         "spent_usd": ledger.spent_usd,
-        "baseline_mean": baseline_mean,
+        "baseline": baseline_means,
         "stage_zero": stage_zero,
         "stage_bootstrap": stage_bootstrap,
         "final": final,
@@ -785,6 +791,21 @@ def _partial_report(
         "budget_exhausted": budget_exhausted,
         "gate_passed": False,
     }
+
+
+def _anti_reward_gap(
+    final: dict | None,
+    canaries: dict | None,
+    baseline_means: dict[str, float] | None,
+) -> float | None:
+    if final is None or canaries is None or baseline_means is None:
+        return None
+    try:
+        train_gain = final["train_mean"] - baseline_means["train"]
+        canary_gain = canaries["mean"] - baseline_means["canaries"]
+    except (KeyError, TypeError):
+        return None
+    return float(train_gain - canary_gain)
 
 
 def main(argv=None) -> int:
@@ -819,7 +840,7 @@ def main(argv=None) -> int:
 
     program: object | None = None
     ledger = _CostLedger(args.budget_usd)
-    baseline_mean: float | None = None
+    baseline_means: dict[str, float] | None = None
     stage_zero: dict | None = None
     stage_bootstrap: dict | None = None
     final: dict | None = None
@@ -827,7 +848,7 @@ def main(argv=None) -> int:
     try:
         program_class = load_program_class(manifest)
         loader = _load_dataset_loader(manifest)
-        baseline_mean = _baseline_mean(manifest)
+        baseline_means = _baseline_means(manifest)
         lm = _construct_lm(args.tier, args.budget_usd, ledger)
         program = program_class(lm)
         train_examples, val_examples = build_trainsets(loader, seed=args.seed)
@@ -849,7 +870,7 @@ def main(argv=None) -> int:
         canaries = score_split(program, _load_split(loader, "CANARIES"))
         gate_passed = (
             final["eval_mean"] >= 0.85
-            and final["eval_mean"] >= baseline_mean - 0.05
+            and final["eval_mean"] >= baseline_means["eval"] - 0.05
             and canaries["count"] > 0
             and canaries["mean"] == 1.0
         )
@@ -857,13 +878,18 @@ def main(argv=None) -> int:
             manifest,
             args,
             ledger,
-            baseline_mean=baseline_mean,
+            baseline_means=baseline_means,
             stage_zero=stage_zero,
             stage_bootstrap=stage_bootstrap,
             final=final,
             canaries=canaries,
         )
         report["gate_passed"] = gate_passed
+        report["anti_reward_gap"] = _anti_reward_gap(
+            final,
+            canaries,
+            baseline_means,
+        )
         artifact = write_artifact(
             manifest.module_name,
             _next_version(manifest.module_name),
@@ -884,12 +910,17 @@ def main(argv=None) -> int:
                 manifest,
                 args,
                 ledger,
-                baseline_mean=baseline_mean,
+                baseline_means=baseline_means,
                 stage_zero=stage_zero,
                 stage_bootstrap=stage_bootstrap,
                 final=final,
                 canaries=canaries,
                 budget_exhausted=True,
+            )
+            report["anti_reward_gap"] = _anti_reward_gap(
+                final,
+                canaries,
+                baseline_means,
             )
             try:
                 artifact = write_artifact(

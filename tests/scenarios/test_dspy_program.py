@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -42,9 +42,18 @@ def _decide(module: ShouldDecomposeModuleDSPy, task: str = "task") -> DecomposeO
 
 
 def test_importing_program_does_not_import_provider_sdk() -> None:
-    assert "openai" not in sys.modules
-    importlib.import_module("cambium.modules.example.dspy_program")
-    assert "openai" not in sys.modules
+    probe = (
+        "import sys; "
+        "import cambium.modules.example.dspy_program; "
+        "assert 'openai' not in sys.modules, sys.modules.get('openai')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_dspy_import_is_lazy() -> None:
