@@ -43,6 +43,12 @@ class OfflineLM(dspy.LM):
         ]
 
 
+def test_parser_defaults_to_fast_tier() -> None:
+    args = optimize._parser().parse_args(["should_decompose"])
+
+    assert args.tier == "fast"
+
+
 class OfflineProgram(dspy.Module):
     """Tiny real DSPy program used to exercise both optimizer stages."""
 
