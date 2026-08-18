@@ -759,7 +759,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer", choices=("zero", "bootstrap"), default="zero")
     parser.add_argument("--budget-usd", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tier", default="strong")
+    parser.add_argument("--tier", default="fast")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
