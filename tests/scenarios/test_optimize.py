@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import dspy
+import pytest
 
 from cambium import optimize
 from cambium.modules.base import Example
@@ -47,6 +49,15 @@ def test_parser_defaults_to_fast_tier() -> None:
     args = optimize._parser().parse_args(["should_decompose"])
 
     assert args.tier == "fast"
+    assert not args.include_transcript_candidates
+
+
+def test_parser_can_opt_in_to_transcript_candidates() -> None:
+    args = optimize._parser().parse_args(
+        ["should_decompose", "--include-transcript-candidates"]
+    )
+
+    assert args.include_transcript_candidates
 
 
 class OfflineProgram(dspy.Module):
@@ -192,7 +203,8 @@ def test_write_artifact_writes_state_and_current_link(tmp_path: Path, monkeypatc
         1,
         program,
         lm,
-        {"gate_passed": False, "eval_mean": 0.0},
+        {"gate_passed": True, "eval_mean": 1.0},
+        promote=True,
     )
 
     assert version_dir == Path("optimized/should_decompose/v1")
@@ -203,6 +215,167 @@ def test_write_artifact_writes_state_and_current_link(tmp_path: Path, monkeypatc
     current = Path("optimized/should_decompose/current")
     assert current.is_symlink()
     assert current.resolve() == version_dir.resolve()
+
+
+def test_rejected_artifact_does_not_replace_current_link(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    program = OfflineProgram(OfflineLM())
+    lm = OfflineLM()
+
+    approved = optimize.write_artifact(
+        "should_decompose",
+        1,
+        program,
+        lm,
+        {"gate_passed": True},
+        promote=True,
+    )
+    current = Path("optimized/should_decompose/current")
+    assert current.resolve() == approved.resolve()
+
+    rejected = optimize.write_artifact(
+        "should_decompose",
+        2,
+        OfflineProgram(OfflineLM()),
+        OfflineLM(),
+        {"gate_passed": False},
+        promote=True,
+    )
+
+    assert rejected.is_dir()
+    assert current.is_symlink()
+    assert current.resolve() == approved.resolve()
+
+
+def test_main_rejected_run_keeps_existing_current_link(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    manifest = SimpleNamespace(module_name="should_decompose")
+    loader = object()
+
+    monkeypatch.setattr(optimize, "_load_manifest", lambda _name: manifest)
+    monkeypatch.setattr(optimize, "load_program_class", lambda _manifest: OfflineProgram)
+    monkeypatch.setattr(optimize, "_load_dataset_loader", lambda _manifest: loader)
+    monkeypatch.setattr(optimize, "_baseline_means", lambda _manifest: {
+        "train": 1.0,
+        "eval": 1.0,
+        "canaries": 1.0,
+    })
+    monkeypatch.setattr(optimize, "_construct_lm", lambda *_args: OfflineLM())
+    monkeypatch.setattr(optimize, "build_trainsets", lambda _loader, seed: ([], []))
+    monkeypatch.setattr(optimize, "_load_split", lambda _loader, _name: [])
+    monkeypatch.setattr(
+        optimize,
+        "run_stage_zero",
+        lambda program, _train, _validation, seed: (
+            program,
+            {"eval_mean": 0.0, "train_mean": 0.0},
+        ),
+    )
+    monkeypatch.setattr(
+        optimize,
+        "score_split",
+        lambda _program, _examples: {"mean": 0.0, "std": 0.0, "count": 1},
+    )
+
+    approved = optimize.write_artifact(
+        "should_decompose",
+        1,
+        OfflineProgram(OfflineLM()),
+        OfflineLM(),
+        {"gate_passed": True},
+        promote=True,
+    )
+
+    assert optimize.main(["should_decompose", "--budget-usd", "0"]) == 1
+    current = Path("optimized/should_decompose/current")
+    assert current.resolve() == approved.resolve()
+    assert Path("optimized/should_decompose/v2/report.json").is_file()
+
+
+def test_missing_transcript_candidates_fail_only_when_opted_in(tmp_path: Path) -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "cambium"
+        / "modules"
+        / "example"
+        / "datasets"
+    )
+    datasets = tmp_path / "datasets"
+    shutil.copytree(source, datasets)
+    (datasets / "transcript_candidates.jsonl").unlink()
+    loader = optimize._import_target("cambium.modules.example.dataset").ExampleDatasetLoader(
+        datasets
+    )
+
+    train, validation = optimize.build_trainsets(loader, seed=17)
+    assert len(train) == 160
+    assert len(validation) == 40
+
+    with pytest.raises(optimize.OptimizeError, match="transcript candidate file is missing"):
+        optimize._augment_training_pool(loader, train, train + validation)
+
+
+def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "cambium"
+        / "modules"
+        / "example"
+        / "datasets"
+    )
+    datasets = tmp_path / "datasets"
+    shutil.copytree(source, datasets)
+    extra = {
+        "id": "test-candidate-unique",
+        "input": {"task": "Synthetic candidate only", "context": "candidate context"},
+        "expected": {"decompose": False, "reason": "test candidate"},
+    }
+    candidate_path = datasets / "transcript_candidates.jsonl"
+    with candidate_path.open("a", encoding="utf-8") as stream:
+        encoded = json.dumps(extra)
+        stream.write(encoded + "\n")
+        stream.write(json.dumps({**extra, "id": "test-candidate-duplicate"}) + "\n")
+
+    loader = optimize._import_target("cambium.modules.example.dataset").ExampleDatasetLoader(
+        datasets
+    )
+    frozen = (
+        loader.load_split(Split.TRAIN)
+        + loader.load_split(Split.EVAL)
+        + loader.load_split(Split.CANARIES)
+    )
+    train, validation = optimize.build_trainsets(loader, seed=17)
+
+    augmented, counts = optimize._augment_training_pool(loader, train, frozen)
+
+    assert counts == {
+        "loaded": 25,
+        "included": 13,
+        "excluded": 12,
+        "excluded_frozen": 11,
+        "excluded_duplicates": 1,
+    }
+    assert len(augmented) == len(train) + counts["included"]
+    assert len(validation) == 40
+    frozen_pairs = {(item.input.task, item.input.context) for item in frozen}
+    augmented_pairs = {(item.input.task, item.input.context) for item in augmented}
+    assert augmented_pairs.isdisjoint(
+        {(item.input.task, item.input.context) for item in loader.load_split(Split.EVAL)}
+    )
+    assert augmented_pairs.isdisjoint(
+        {(item.input.task, item.input.context) for item in loader.load_split(Split.CANARIES)}
+    )
+    assert sum(
+        item.input.task == "Synthetic candidate only" for item in augmented
+    ) == 1
+    assert all(
+        (item.input.task, item.input.context) in frozen_pairs
+        for item in validation
+    )
 
 
 def test_baseline_means_reads_all_three_splits() -> None:
