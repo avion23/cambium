@@ -319,10 +319,6 @@ def _split_error_status(output: object) -> str | None:
         if normalized in {"UNAVAILABLE", "SCHEMA_INVALID"}:
             return normalized
 
-    # The reference module predates the explicit status marker but emits this
-    # typed validation error for invalid dataset records.
-    if error.get("type") == "InputValidationError":
-        return "SCHEMA_INVALID"
     return None
 
 

@@ -55,7 +55,9 @@ Context mentioning `subtask` or `decompos` suppresses decomposition with
 - **Reward hacking:** canaries are scored with all records; dropping them is a
   dataset-integrity failure.
 - **Garbage/schema input:** malformed JSON, non-object records, invalid
-  `task`, `reason`, `decompose`, or `canary` types raise `DatasetError`.
+  `task`, `reason`, `decompose`, or `canary` types raise `DatasetError` at the
+  loader boundary; the CLI `_evaluate` path marks the same dataset-record
+  errors with the explicit `"code": "SCHEMA_INVALID"` split marker.
 - **Context suppression:** intentional short-circuit; no recovery is needed.
 
 ## Test strategy

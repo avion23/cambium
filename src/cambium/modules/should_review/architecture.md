@@ -89,11 +89,17 @@ the one remaining harness consumer that hardcodes the generic name.
 
 ```python
 class InputValidationError(ValueError): ...   # JSON CLI boundary, __main__.py
+class SchemaInvalidError(ValueError): ...     # dataset-record schema, __main__.py
 class DatasetError(ValueError): ...           # cambium.modules.base, loader boundary
 ```
 
 `InputValidationError` is raised and caught inside `__main__.main()` (the
-process boundary; it never escapes to the supervisor event loop).
+process boundary; it never escapes to the supervisor event loop).  A
+schema-invalid dataset record (bad `review`/`reason`/`canary`, malformed
+`input`) raises `SchemaInvalidError`; `__main__._write_error` marks those
+errors with the explicit `"code": "SCHEMA_INVALID"` split marker so the bench
+harness can fall back to the combined file without guessing from the error
+type.
 `DatasetError` is raised by `ExampleDatasetLoader` for unreadable files,
 malformed JSON, schema-invalid records, version drift, duplicate ids, and
 cross-split collisions.
@@ -196,7 +202,8 @@ fallback for backward compat and it is exercised by tests).
 |---|---|---|---|
 | Malformed JSON / non-object / duplicate keys at the CLI | exit 1, error object on stdout, diagnostic on stderr | `InputValidationError` / `json.JSONDecodeError` caught in `__main__.main` | caller resubmits a valid object; the boundary never defaults |
 | Invalid `input.task`/`input.context` (missing, empty, wrong type) | exit 1 with typed error | `_parse_input` at the CLI boundary | caller fixes the record |
-| Schema-invalid dataset record (bad `review`/`reason`, mirror drift) | `DatasetError` with file:line | `ExampleDatasetLoader._validate` | record owner fixes the JSONL and bumps `dataset_version` |
+| Schema-invalid dataset record at the CLI (`evaluate` on a bad record) | exit 1, error object with `"code": "SCHEMA_INVALID"` | `SchemaInvalidError` in `__main__._evaluate`/`_write_error` | record owner fixes the JSONL and bumps `dataset_version`; the bench harness falls back to the combined file |
+| Schema-invalid dataset record at the loader (bad `review`/`reason`, mirror drift) | `DatasetError` with file:line | `ExampleDatasetLoader._validate` | record owner fixes the JSONL and bumps `dataset_version` |
 | Version drift (record vs meta.json) | `DatasetError` | `_validate_record_versions` | bump `dataset_version` deliberately; never silently re-anchor |
 | Duplicate id / cross-split `(task, context)` | `DatasetError` | loader + conformance gate | deduplicate and re-run digests |
 | Over-review: keyword-dense atomic canaries | metric < 1.0 on `trivially_atomic`/`keyword_hack` | canary gate (`bench.canary_stats.failed`) | tune evidence weights; do not drop the canary |

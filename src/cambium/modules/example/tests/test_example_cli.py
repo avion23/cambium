@@ -170,6 +170,7 @@ def test_cli_decide_operation_requires_inputs_array() -> None:
     error = _one_json_object(result.stdout)["error"]
     assert error["type"] == "InputValidationError"
     assert "decide.inputs must be a JSON array" in error["message"]
+    assert "code" not in error
 
 
 def test_cli_evaluate_operation_returns_scores() -> None:
@@ -212,3 +213,47 @@ def test_cli_rejects_unknown_operation() -> None:
     assert error["type"] == "InputValidationError"
     assert "unknown operation: 'publish'" in error["message"]
     assert error["message"] in result.stderr
+    assert "code" not in error
+
+
+def test_cli_evaluate_record_schema_error_emits_split_code() -> None:
+    result = _run_cli(
+        json.dumps(
+            {
+                "operation": "evaluate",
+                "records": [
+                    {
+                        "input": {"task": "Do the thing"},
+                        "expected": {"decompose": "yes", "reason": "r"},
+                    }
+                ],
+            }
+        )
+    )
+
+    assert result.returncode != 0
+    error = _one_json_object(result.stdout)["error"]
+    assert error["code"] == "SCHEMA_INVALID"
+    assert error["type"] == "SchemaInvalidError"
+    assert "expected.decompose must be a boolean" in error["message"]
+
+
+def test_cli_evaluate_record_input_error_emits_split_code() -> None:
+    result = _run_cli(
+        json.dumps(
+            {
+                "operation": "evaluate",
+                "records": [
+                    {
+                        "input": {"task": 42},
+                        "expected": {"decompose": False, "reason": "r"},
+                    }
+                ],
+            }
+        )
+    )
+
+    assert result.returncode != 0
+    error = _one_json_object(result.stdout)["error"]
+    assert error["code"] == "SCHEMA_INVALID"
+    assert "input.task must be a string" in error["message"]

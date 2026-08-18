@@ -26,6 +26,10 @@ class InputValidationError(ValueError):
     """Raised when a JSON request does not match the module wire schema."""
 
 
+class SchemaInvalidError(ValueError):
+    """Raised when a dataset record does not match the module dataset schema."""
+
+
 def _reject_duplicate_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Reject duplicate JSON object member names instead of keeping the last value."""
     fields: dict[str, Any] = {}
@@ -89,21 +93,24 @@ async def _evaluate(
     results: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         if not isinstance(record, dict):
-            raise InputValidationError(f"record {index} must be a JSON object")
-        task_input = _parse_input(record.get("input"))
+            raise SchemaInvalidError(f"record {index} must be a JSON object")
+        try:
+            task_input = _parse_input(record.get("input"))
+        except InputValidationError as exc:
+            raise SchemaInvalidError(f"record {index}.input: {exc}") from exc
         expected = record.get("expected")
         if not isinstance(expected, dict):
-            raise InputValidationError(f"record {index}.expected must be a JSON object")
+            raise SchemaInvalidError(f"record {index}.expected must be a JSON object")
         expected_decompose = expected.get("decompose")
         if not isinstance(expected_decompose, bool):
-            raise InputValidationError(
+            raise SchemaInvalidError(
                 f"record {index}.expected.decompose must be a boolean"
             )
         if not isinstance(expected.get("reason"), str):
-            raise InputValidationError(f"record {index}.expected.reason must be a string")
+            raise SchemaInvalidError(f"record {index}.expected.reason must be a string")
         canary = record.get("canary", False)
         if not isinstance(canary, bool):
-            raise InputValidationError(f"record {index}.canary must be a boolean")
+            raise SchemaInvalidError(f"record {index}.canary must be a boolean")
         prediction = await module.decide(task_input)
         prediction_wire = _serialize_output(prediction)
         expected_typed = dict(expected)
@@ -133,14 +140,13 @@ def _write_json(payload: object) -> None:
 
 
 def _write_error(exc: Exception) -> int:
-    _write_json(
-        {
-            "error": {
-                "message": str(exc) or "module CLI failed",
-                "type": type(exc).__name__,
-            }
-        }
-    )
+    error: dict[str, Any] = {
+        "message": str(exc) or "module CLI failed",
+        "type": type(exc).__name__,
+    }
+    if isinstance(exc, SchemaInvalidError):
+        error["code"] = "SCHEMA_INVALID"
+    _write_json({"error": error})
     print(f"cambium.modules.example: {type(exc).__name__}: {exc}", file=sys.stderr)
     return 1
 
