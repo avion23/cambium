@@ -3,5 +3,6 @@
   "module_name": "should_decompose",
   "cli_module": "cambium.modules.example",
   "protocol": "json-v1",
-  "dataset_schema_version": 1
+  "dataset_schema_version": 1,
+  "dspy_program": "cambium.modules.example.dspy_program"
 }

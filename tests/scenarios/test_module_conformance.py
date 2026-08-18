@@ -444,3 +444,42 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_reverse_scan_excludes_optimizer_driver() -> None:
+    optimize_path = module_conformance.REPO_ROOT / "src" / "cambium" / "optimize.py"
+
+    assert optimize_path not in module_conformance._reverse_scan_paths()
+
+
+def test_external_scan_excludes_dspy_scenarios(tmp_path: Path, monkeypatch) -> None:
+    scenarios = tmp_path / "tests" / "scenarios"
+    scenarios.mkdir(parents=True)
+    for filename in ("test_dspy_program.py", "test_optimize.py"):
+        (scenarios / filename).write_text(
+            "import cambium.modules.example\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
+
+    findings = module_conformance.scan_external_module_files()
+    excluded = {
+        Path("tests/scenarios/test_dspy_program.py"),
+        Path("tests/scenarios/test_optimize.py"),
+    }
+
+    assert not {finding.path for finding in findings} & excluded
+
+
+def test_external_scan_flags_unlisted_module_scenario(tmp_path: Path, monkeypatch) -> None:
+    scenario = tmp_path / "tests" / "scenarios" / "test_unlisted_module.py"
+    scenario.parent.mkdir(parents=True)
+    scenario.write_text("import cambium.modules.example\n", encoding="utf-8")
+    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
+
+    findings = module_conformance.scan_external_module_files()
+
+    assert any(
+        finding.rule == "layout" and finding.path == Path("tests/scenarios/test_unlisted_module.py")
+        for finding in findings
+    )
