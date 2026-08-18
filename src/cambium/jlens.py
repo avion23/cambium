@@ -83,12 +83,18 @@ class JlenClient:
             raise JlenError(f"jlens score service failed: {exc}") from exc
 
     def signal(self, result: dict[str, Any], expected: list[str]) -> float:
-        """Normalize the per-layer rank of the expected decision into [0, 1].
+        """Normalize the score service response into [0, 1].
 
-        A rank of 1 (token is the model's top internal choice) yields 1.0;
-        rank 1000 or worse yields 0.0.  Layers that lack a usable rank are
-        ignored; an empty result scores 0.0.
+        Prefers the service's calibrated ``commitment`` (mean over layers of
+        P(correct commitment | rank)); falls back to a linear rank
+        normalization when no calibration was loaded. A rank of 1 (token is
+        the model's top internal choice) yields 1.0; rank 1000 or worse
+        yields 0.0.  Layers that lack a usable rank are ignored; an empty
+        result scores 0.0.
         """
+        commitment = result.get("commitment")
+        if isinstance(commitment, (int, float)) and not isinstance(commitment, bool):
+            return max(0.0, min(1.0, float(commitment)))
         layers = result.get("layers")
         if not isinstance(layers, dict) or not layers:
             return 0.0
