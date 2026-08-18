@@ -170,6 +170,7 @@ class ModuleManifest:
     protocol: str
     dataset_schema_version: int
     label_field: str = "decompose"
+    dspy_program: str = ""
 
     @property
     def source_root(self) -> Path:
@@ -258,6 +259,12 @@ def load_module_manifest(
             f"module {name!r}: manifest field 'label_field' must be a non-empty string"
         )
 
+    dspy_program = data.get("dspy_program", "")
+    if "dspy_program" in data and (not isinstance(dspy_program, str) or not dspy_program):
+        raise ModuleContractError(
+            f"module {name!r}: manifest field 'dspy_program' must be a non-empty string"
+        )
+
     return ModuleManifest(
         package_dir=directory,
         package_name=name,
@@ -267,6 +274,7 @@ def load_module_manifest(
         protocol=protocol,
         dataset_schema_version=_manifest_int(data, "dataset_schema_version", path),
         label_field=label_field,
+        dspy_program=dspy_program,
     )
 
 

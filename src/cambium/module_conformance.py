@@ -1803,7 +1803,13 @@ def _reverse_scan_paths() -> tuple[Path, ...]:
     paths = [
         path
         for path in sorted(PACKAGE_ROOT.glob("*.py"))
-        if path.name not in {"module_conformance.py", "cli.py"}
+        if path.name not in {
+            "module_conformance.py",
+            "cli.py",
+            # optimize.py is the sanctioned in-process DSPy consumer, like cli.py
+            # for module-test; it must import the module's dspy_program at runtime.
+            "optimize.py",
+        }
     ]
     for directory_name in (("scripts", "tools") if _repository_available() else ()):
         directory = REPO_ROOT / directory_name
@@ -2030,6 +2036,11 @@ def scan_external_module_files() -> tuple[AuditFinding, ...]:
             "src/cambium/module_conformance.py",
             "src/cambium/cli.py",
             "tests/scenarios/test_module_conformance.py",
+            # These scenarios intentionally import the example DSPy program and
+            # optimizer; DSPy pulls openai into sys.modules, so they cannot run inside
+            # the isolated module gate.
+            "tests/scenarios/test_dspy_program.py",
+            "tests/scenarios/test_optimize.py",
         }:
             continue
         if not lower.startswith(("scripts/", "tools/", "tests/")):
