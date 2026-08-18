@@ -28,6 +28,7 @@ import dspy
 
 from cambium import module_conformance
 from cambium.diffundo import Diffundo, ProviderTier
+from cambium.jlens import JlenClient, JlenError, render_messages
 from cambium.lm import CambiumLM
 from cambium.modules.base import Example, load_module_manifest
 
@@ -336,14 +337,112 @@ def _gold_parts(gold: object, program: object) -> tuple[object, dict[str, object
     return input_value, {"decompose": decision, "reason": reason}
 
 
-def make_dspy_metric(program) -> Callable:
+def _jlens_client_from_env() -> JlenClient | None:
+    """Build a jlens score client from CAMBIUM_JLENS_URL, or None if unset."""
+    base_url = os.environ.get("CAMBIUM_JLENS_URL", "").strip()
+    if not base_url:
+        return None
+    layers = None
+    raw_layers = os.environ.get("CAMBIUM_JLENS_LAYERS", "").strip()
+    if raw_layers:
+        parsed = []
+        for part in raw_layers.split(","):
+            part = part.strip()
+            if not part.isdigit():
+                parsed = []
+                break
+            parsed.append(int(part))
+        layers = parsed or None
+    return JlenClient(base_url, layers=layers)
+
+
+def _decision_strings(expected: Mapping[str, object]) -> tuple[list[str], list[str]]:
+    """Render the expected decision values and their enum siblings as strings."""
+    expected_strings: list[str] = []
+    for value in expected.values():
+        if isinstance(value, str):
+            expected_strings.append(value)
+            continue
+        rendered = getattr(value, "value", None)
+        if isinstance(rendered, str):
+            expected_strings.append(rendered)
+    alt_strings: list[str] = []
+    for value in expected.values():
+        decision_type = type(value)
+        members = getattr(decision_type, "__members__", None)
+        if not isinstance(members, Mapping):
+            continue
+        for member in members.values():
+            rendered = getattr(member, "value", None)
+            if (
+                isinstance(rendered, str)
+                and rendered not in expected_strings
+                and rendered not in alt_strings
+            ):
+                alt_strings.append(rendered)
+    return expected_strings, alt_strings
+
+
+def _fuse_jlens(
+    jlens_client: JlenClient,
+    expected: Mapping[str, object],
+    trace: object,
+    score: float,
+    weight: float,
+) -> float:
+    """Blend the exact-match score with the jlens readout signal.
+
+    The trace records every LM call as ``(predictor, inputs, pred)``; the
+    predictor's signature and current demos plus the call inputs reconstruct
+    the exact messages the LM saw.  The jlens signal is the normalized rank of
+    the expected decision token in the model's internal readout at the last
+    prompt position, averaged over the requested layers.  Any jlens failure
+    leaves the exact-match score unchanged.
+    """
+    if not isinstance(trace, (list, tuple)) or not trace:
+        return score
+    expected_strings, alt_strings = _decision_strings(expected)
+    if not expected_strings:
+        return score
+    for predictor, inputs, _ in reversed(trace):
+        if not hasattr(predictor, "signature"):
+            continue
+        try:
+            messages = render_messages(predictor, inputs)
+            result = jlens_client.score(messages, expected_strings, alt_strings)
+            jlens_score = jlens_client.signal(result, expected_strings)
+        except (JlenError, TypeError, ValueError, OSError):
+            return score
+        if not isinstance(jlens_score, (int, float)) or not math.isfinite(jlens_score):
+            return score
+        return weight * max(0.0, min(1.0, jlens_score)) + (1.0 - weight) * score
+    return score
+
+
+def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callable:
     """Adapt a DSPy metric call to the Cambium metric.
 
     The adapter returns a fraction in ``[0, 1]``.  DSPy's ``Evaluate`` displays
     that value as a percentage in its report, so the driver compares the
     adapter's normalized fraction rather than the displayed percentage.
+
+    When ``jlens_client`` is given (or ``CAMBIUM_JLENS_URL`` is set), the
+    exact-match score is blended with the jlens readout signal on the LM call
+    trace so that internally committed but textually loose predictions still
+    score above zero.
     """
     scorer = _metric_function(program)
+    if jlens_client is None:
+        jlens_client = _jlens_client_from_env()
+    jlens_weight = 0.5
+    raw_weight = os.environ.get("CAMBIUM_JLENS_WEIGHT", "").strip()
+    if raw_weight:
+        try:
+            jlens_weight = float(raw_weight)
+        except ValueError:
+            jlens_weight = 0.5
+    if not math.isfinite(jlens_weight) or not 0.0 <= jlens_weight <= 1.0:
+        jlens_weight = 0.5
 
     def metric(
         gold: object,
@@ -353,7 +452,7 @@ def make_dspy_metric(program) -> Callable:
         pred_trace: object = None,
         program_trace: object = None,
     ) -> float:
-        del trace, pred_name, pred_trace, program_trace
+        del pred_name, pred_trace, program_trace
         try:
             parts = _gold_parts(gold, program)
             prediction = _prediction_output(pred, program)
@@ -370,7 +469,10 @@ def make_dspy_metric(program) -> Callable:
                 return 0.0
             if not math.isfinite(score) or not 0.0 <= score <= 1.0:
                 return 0.0
-            return float(score)
+            score = float(score)
+            if jlens_client is not None:
+                score = _fuse_jlens(jlens_client, expected, trace, score, jlens_weight)
+            return score
         except Exception:
             return 0.0
 
