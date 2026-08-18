@@ -39,6 +39,7 @@ _MODULES_PREFIX = ".".join(("cambium", "modules"))
 _EXAMPLE_DATASET_TARGET = ".".join((_MODULES_PREFIX, "example", "dataset"))
 _EXAMPLE_DECIDE_TARGET = ".".join((_MODULES_PREFIX, "example", "decide"))
 _EXAMPLE_METRIC_TARGET = ".".join((_MODULES_PREFIX, "example", "metric"))
+_TRANSCRIPT_CANDIDATES_FILENAME = "transcript_candidates.jsonl"
 
 
 class OptimizeError(ValueError):
@@ -509,6 +510,97 @@ def _load_split(loader: object, name: str) -> list[Example]:
         raise OptimizeError(f"could not load the {name.lower()} split: {exc}") from exc
 
 
+def _loader_datasets_dir(loader: object) -> Path:
+    """Return the directory containing a loader's dataset files."""
+    datasets_dir = getattr(loader, "datasets_dir", _MISSING)
+    if datasets_dir is not _MISSING:
+        try:
+            return Path(datasets_dir)
+        except TypeError as exc:
+            raise OptimizeError("dataset loader has an invalid datasets_dir") from exc
+
+    path = getattr(loader, "path", _MISSING)
+    if path is _MISSING:
+        raise OptimizeError("dataset loader does not expose a dataset path")
+    try:
+        dataset_path = Path(path)
+    except TypeError as exc:
+        raise OptimizeError("dataset loader has an invalid dataset path") from exc
+    return dataset_path if dataset_path.is_dir() else dataset_path.parent
+
+
+def _load_transcript_candidates(loader: object) -> list[Example]:
+    """Load optional transcript candidates with the module's DatasetLoader."""
+    candidate_path = _loader_datasets_dir(loader) / _TRANSCRIPT_CANDIDATES_FILENAME
+    if not candidate_path.is_file():
+        raise OptimizeError(
+            f"transcript candidate file is missing for this module: {candidate_path}"
+        )
+
+    loader_class = type(loader)
+    try:
+        candidate_loader = loader_class(candidate_path)
+    except Exception as exc:
+        raise OptimizeError(
+            f"could not construct the dataset loader for transcript candidates: {exc}"
+        ) from exc
+    load = getattr(candidate_loader, "load", None)
+    if not callable(load):
+        raise OptimizeError("dataset loader does not provide load for transcript candidates")
+    try:
+        candidates = list(load())
+    except Exception as exc:
+        raise OptimizeError(f"could not load transcript candidates: {exc}") from exc
+    if any(getattr(candidate, "canary", False) for candidate in candidates):
+        raise OptimizeError("transcript candidate file contains a canary record")
+    return candidates
+
+
+def _canonical_input_pair(example: object) -> tuple[str, str]:
+    """Return the exact canonical ``(task, context)`` pair for one example."""
+    input_value = getattr(example, "input", _MISSING)
+    task = _read_field(input_value, "task")
+    context = _read_field(input_value, "context")
+    if not isinstance(task, str) or not isinstance(context, str):
+        raise OptimizeError("dataset example input must contain task and context strings")
+    return task, context
+
+
+def _augment_training_pool(
+    loader: object,
+    train_examples: list[Example],
+    frozen_examples: list[Example],
+    candidates: list[Example] | None = None,
+) -> tuple[list[Example], dict[str, int]]:
+    """Add non-overlapping transcript candidates to the training pool only."""
+    frozen_pairs = {_canonical_input_pair(example) for example in frozen_examples}
+    if candidates is None:
+        candidates = _load_transcript_candidates(loader)
+    candidate_pairs: set[tuple[str, str]] = set()
+    included: list[Example] = []
+    excluded_frozen = 0
+    excluded_duplicates = 0
+    for candidate in candidates:
+        pair = _canonical_input_pair(candidate)
+        if pair in frozen_pairs:
+            excluded_frozen += 1
+            continue
+        if pair in candidate_pairs:
+            excluded_duplicates += 1
+            continue
+        candidate_pairs.add(pair)
+        included.append(candidate)
+
+    counts = {
+        "loaded": len(candidates),
+        "included": len(included),
+        "excluded": excluded_frozen + excluded_duplicates,
+        "excluded_frozen": excluded_frozen,
+        "excluded_duplicates": excluded_duplicates,
+    }
+    return [*train_examples, *included], counts
+
+
 def build_trainsets(loader, seed=0, val_fraction=0.2) -> tuple[list, list]:
     """Load train records and deterministically carve a validation subset."""
     if isinstance(val_fraction, bool) or not isinstance(val_fraction, (int, float)):
@@ -706,8 +798,18 @@ def _safe_component(value: object, label: str) -> str:
     return text
 
 
-def write_artifact(module_name, version, program, lm, report) -> Path:
-    """Persist program state, LM state, and the run report atomically."""
+def write_artifact(
+    module_name,
+    version,
+    program,
+    lm,
+    report,
+    *,
+    promote: bool = False,
+) -> Path:
+    """Persist program state and report, optionally promoting the artifact."""
+    if not isinstance(promote, bool):
+        raise OptimizeError("promote must be a boolean")
     module_component = _safe_component(module_name, "module_name")
     version_component = _safe_component(version, "version")
     module_root = Path("optimized") / module_component
@@ -721,6 +823,10 @@ def write_artifact(module_name, version, program, lm, report) -> Path:
     _atomic_json_write(version_dir / "program.json", program_dump())
     _atomic_json_write(version_dir / "lm.json", lm_dump())
     _atomic_json_write(version_dir / "report.json", report)
+
+    approved = promote and isinstance(report, Mapping) and report.get("gate_passed") is True
+    if not approved:
+        return version_dir
 
     current = module_root / "current"
     temporary_link = module_root / f".current-{uuid.uuid4().hex}"
@@ -863,6 +969,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tier", default="fast")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--include-transcript-candidates",
+        action="store_true",
+        help="explicitly add reviewed transcript candidates to the training pool",
+    )
     return parser
 
 
@@ -877,8 +988,9 @@ def _partial_report(
     final: dict | None = None,
     canaries: dict | None = None,
     budget_exhausted: bool = False,
+    transcript_candidates: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    return {
+    report = {
         "module": getattr(manifest, "module_name", args.module_name),
         "optimizer": args.optimizer,
         "seed": args.seed,
@@ -893,6 +1005,9 @@ def _partial_report(
         "budget_exhausted": budget_exhausted,
         "gate_passed": False,
     }
+    if transcript_candidates is not None:
+        report["transcript_candidates"] = transcript_candidates
+    return report
 
 
 def _anti_reward_gap(
@@ -947,13 +1062,32 @@ def main(argv=None) -> int:
     stage_bootstrap: dict | None = None
     final: dict | None = None
     canaries: dict | None = None
+    transcript_candidates: dict[str, int] | None = None
     try:
+        candidate_records: list[Example] | None = None
+        if args.include_transcript_candidates:
+            loader = _load_dataset_loader(manifest)
+            candidate_records = _load_transcript_candidates(loader)
         program_class = load_program_class(manifest)
-        loader = _load_dataset_loader(manifest)
+        if not args.include_transcript_candidates:
+            loader = _load_dataset_loader(manifest)
         baseline_means = _baseline_means(manifest)
         lm = _construct_lm(args.tier, args.budget_usd, ledger)
         program = program_class(lm)
         train_examples, val_examples = build_trainsets(loader, seed=args.seed)
+        if args.include_transcript_candidates:
+            frozen_examples = [
+                *train_examples,
+                *val_examples,
+                *_load_split(loader, "EVAL"),
+                *_load_split(loader, "CANARIES"),
+            ]
+            train_examples, transcript_candidates = _augment_training_pool(
+                loader,
+                train_examples,
+                frozen_examples,
+                candidates=candidate_records,
+            )
         program, stage_zero = run_stage_zero(
             program,
             train_examples,
@@ -985,6 +1119,7 @@ def main(argv=None) -> int:
             stage_bootstrap=stage_bootstrap,
             final=final,
             canaries=canaries,
+            transcript_candidates=transcript_candidates,
         )
         report["gate_passed"] = gate_passed
         report["anti_reward_gap"] = _anti_reward_gap(
@@ -998,6 +1133,7 @@ def main(argv=None) -> int:
             program,
             lm,
             report,
+            promote=gate_passed,
         )
         print(
             f"cambium optimize: wrote {artifact}; gate_passed={gate_passed} "
@@ -1018,6 +1154,7 @@ def main(argv=None) -> int:
                 final=final,
                 canaries=canaries,
                 budget_exhausted=True,
+                transcript_candidates=transcript_candidates,
             )
             report["anti_reward_gap"] = _anti_reward_gap(
                 final,
@@ -1031,6 +1168,7 @@ def main(argv=None) -> int:
                     program,
                     lm,
                     report,
+                    promote=False,
                 )
             except Exception as artifact_error:
                 print(
