@@ -109,6 +109,10 @@ primary may be a pure function or deterministic rule engine; DSPy is not
 required for v2. `decide` is the replacement seam, so callers, loader, dataset,
 and metric remain stable.
 
+The rule engine remains the deployed decision path. A DSPy program is an
+optimization candidate only. It must clear the promotion gate before any
+promotion.
+
 ```python
 class Module(ABC):
     name: str
@@ -118,16 +122,58 @@ class Module(ABC):
 
 ### 5.2 Signature and replacement (when applicable)
 
-Document a future `dspy.Signature` or write `N/A — no DSPy seam in v2`.
+Document the module's `dspy.Signature` or write `N/A — no DSPy seam in v2`.
 Replacement modules use the same interface and read `dspy.Prediction`
-attributes directly. Configure a `CambiumLM` through `dspy.configure(lm=...)`;
-do not construct `dspy.LM` directly or mutate `dspy.settings.context`.
+attributes directly. The optimizer injects the LM into the program constructor;
+the program uses `dspy.context(lm=...)` for its call. Do not construct
+`dspy.LM`, configure a process-global DSPy setting, or mutate
+`dspy.settings.context` in the module package.
+
+#### DSPy program seam
+
+A module with this seam keeps `dspy_program.py` inside its module package. The
+reference `ShouldDecomposeModuleDSPy(dspy.Module)` has `name =
+"should_decompose"`, `__init__(self, lm)`, `async decide(input: TaskInput) ->
+DecomposeOutput`, and `metric(example: Example) -> float`. Its metric delegates
+to `should_decompose_metric`. Its signature takes `task` and `context` inputs
+and emits `decision: Literal["decompose", "do_not_decompose"]` and `reason:
+str`; map the literal to the domain enum and existing wire representation.
+Import `dspy` lazily inside functions. A top-level
+DSPy import pulls `openai` into `sys.modules` and trips the isolated module
+gate. The constructor receives the LM, and `decide` runs the DSPy call under
+`dspy.context(lm=...)`. It never imports `cambium.lm` or provider packages.
+When the output cannot be parsed, the reference program uses the conservative
+`DO_NOT_DECOMPOSE` result with confidence `0.0`.
+
+The neutral optimizer driver is:
+
+```console
+python3.14 -m cambium.optimize <module_name> --optimizer zero|bootstrap --budget-usd N [--seed N] [--tier NAME] [--dry-run]
+```
+
+It loads the program class from the optional `dspy_program` field in
+`module.json`. Stage 0 is zero-shot. Stage 1 is `BootstrapFewShot`. The driver
+enforces the USD budget. A candidate passes the promotion gate only when eval
+is at least `0.85`, eval is at least `baseline - 0.05`, and canaries pass at
+100%. It writes `optimized/<module>/v<N>/program.json`, `lm.json`, and
+`report.json`, with a `current` symlink for the promoted version. The report
+includes `train_gain - canary_gain` as an anti-reward-hacking diagnostic. A
+failed gate leaves the rule engine as the deployed path.
+
+The program file remains package-local. DSPy program tests live in
+`tests/scenarios/`, not the module's colocated tests directory; the conformance
+gate excepts these tests from `scan_external_module_files`. `optimize.py` is
+excepted from the reverse-import scan, like `cli.py`, because it is the neutral
+optimizer boundary. Scenario tests use the offline fake-LM pattern recorded in
+`docs/research/dspy-python-314.md`.
 
 ### 5.3 LLM and determinism
 
 All LLM calls route through `Diffundo` and its `CambiumLM`. State temperature,
 top-p, and seed policy; defaults are `temperature=0.0` for classifiers and
-evaluators and `0.2` for generative modules.
+evaluators and `0.2` for generative modules. The DSPy seam receives its
+injected LM from the optimizer; the module package does not import
+`cambium.lm` or provider packages.
 
 ## 6. Metric
 
@@ -176,6 +222,10 @@ Tests are colocated in `src/cambium/modules/<name>/tests/`, baselines in
 `tests/baselines/`, and shared runtime scenarios in `tests/scenarios/`. A
 module is removable by deleting its complete directory; shared scenarios stay.
 
+DSPy program tests are shared scenarios in `tests/scenarios/`, not tests under
+the module package. They are an explicit exception to the external-module file
+scan because the program itself remains in the module package.
+
 ### 9.1 Unit and integration tests
 
 Cover at least three happy paths, every failure mode, empty/max/unicode input,
@@ -210,6 +260,11 @@ such a tracer or provide an in-harness sandbox. Real containment is the deployme
 boundary.**
 Sibling imports and reverse imports from `bench.py`, `scripts/`, and `tools/` are static failures.
 
+The optional `dspy_program` manifest field identifies the package-local DSPy
+program for the optimizer. `src/cambium/optimize.py` is excepted from the
+reverse-import scan, like `src/cambium/cli.py`; the DSPy scenario tests are
+excepted from `scan_external_module_files`.
+
 ### 9.4 Baseline and removal
 
 Each baseline JSON must contain `schema_version`, logical `module`,
@@ -223,11 +278,21 @@ developed and run directly from source; no wheel is built or supported.
 
 ## 10. Optimization plan
 
-State optimizer (`dspy.SIMBA`, `dspy.GEPA`, or custom), train size, max steps,
-max demos, held-out threshold, and 100% canary gate. Human approval is
-required for promotion; retain `optimized/<name>/v<N-1>/` and promote by
-symlink swap for rollback. Optimize against pinned siblings and a single
-named model at the declared deterministic settings.
+State optimizer (`zero` or `bootstrap`), train size, max steps, max demos,
+held-out threshold, and 100% canary gate. Human approval is required for
+promotion; retain `optimized/<name>/v<N-1>/` and promote by symlink swap for
+rollback. Optimize against pinned siblings and a single named model at the
+declared deterministic settings.
+
+The optimizer command is `python3.14 -m cambium.optimize <module_name>
+--optimizer zero|bootstrap --budget-usd N [--seed N] [--tier NAME] [--dry-run]`.
+It runs stage 0 zero-shot and stage 1 `BootstrapFewShot`, loads the class named
+by the optional `dspy_program` manifest field, and enforces the USD budget. The
+promotion gate is eval `>= 0.85`, eval `>= baseline - 0.05`, and 100% canaries.
+Artifacts are `optimized/<module>/v<N>/{program.json,lm.json,report.json}`;
+`current` is the promoted-version symlink. Record `train_gain - canary_gain`
+in the report. The deterministic rule engine remains deployed until a DSPy
+candidate clears this gate and is promoted.
 
 ## 11. Open questions
 

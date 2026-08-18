@@ -14,6 +14,9 @@ subprocess, git, or IPC ownership. The v2 implementation is a rule engine;
 DSPy is a v2.1 replacement seam. The merge sequencer is not a comparable
 reference because it is deterministic and has no dataset or DSPy seam.
 
+The rule engine remains the deployed decision path. The DSPy program is an
+optimization candidate and must clear the promotion gate before any promotion.
+
 ## 1. Module identity
 
 | Field | Value |
@@ -86,6 +89,16 @@ def metric(self, example: Example) -> float: ...
 `decide` is the only DSPy replacement seam; callers, loader, dataset, and
 metric remain unchanged.
 
+`module.json` may contain the optional `dspy_program` field. It identifies the
+program class that `cambium.optimize` loads; when it is absent, the module uses
+the rule-engine path only. The reference DSPy seam for this module is
+`ShouldDecomposeModuleDSPy` in `dspy_program.py`. It is a `dspy.Module` with
+`name = "should_decompose"`, `__init__(self, lm)`,
+`async decide(input: TaskInput) -> DecomposeOutput`, and
+`metric(example: Example) -> float` delegating to
+`should_decompose_metric`. The `dspy` import is lazy, and the program does not
+import `cambium.lm` or provider packages.
+
 ### 3.4 Errors
 
 The v2 rule engine accepts any string and does not raise. `ExampleDatasetLoader`
@@ -93,8 +106,10 @@ raises `DatasetError` for unreadable/invalid JSONL, non-object records, missing
 `input`/`expected`, non-string `input.task` or `expected.reason`, non-boolean
 `expected.decompose` or `canary`, duplicate IDs, version drift, and
 cross-split collisions. A bad dataset aborts evaluation. `ModelUnavailable`
-and `MalformedLLMResponse` are v2.1 DSPy errors; the current code does not
-raise or implement their atomic fallback.
+and `MalformedLLMResponse` are v2.1 DSPy errors at the LM boundary. The DSPy
+program handles an unparseable output with the conservative
+`Decision.DO_NOT_DECOMPOSE` result, reason `"DSPy output unparseable"`, and
+confidence `0.0`; the v2 rule engine has no provider or model-failure path.
 
 ### 3.5 JSON CLI
 
@@ -125,6 +140,10 @@ Stateless across calls: the instance has only class attribute `name`; the rule
 engine is pure `(task, context) -> DecomposeOutput`. No cache, counter, or
 mutable process state exists.
 
+The optional DSPy candidate is separate from this deployed rule engine. It
+holds the injected LM and predictor on its instance; it does not own provider
+configuration or a process-global DSPy setting.
+
 ## 5. Decision rules (v2)
 
 The engine returns `DECOMPOSE` when total evidence is at least 2:
@@ -148,12 +167,30 @@ scoped` and confidence `0.7`. Wire output remains boolean.
 
 ### 5.1 DSPy seam (v2.1 target)
 
-A future `ShouldDecomposeModuleDSPy` implements the same async `decide`, uses
-`dspy.Signature(task, context -> decompose, reason)`, configures
-`dspy.configure(lm=CambiumLM(diffundo, tier="fast", temperature=0.0))`, and
-reads prediction attributes (`pred.decompose`, not `pred.dict()`). It preserves
-the enum/wire mapping and `should_decompose_metric`; it is not implemented in
-the current scaffold.
+`ShouldDecomposeModuleDSPy` implements the same async `decide` and has the
+following DSPy signature shape:
+
+```python
+from typing import Literal
+
+
+class ShouldDecomposeSignature(dspy.Signature):
+    task: str = dspy.InputField()
+    context: str = dspy.InputField()
+    decision: Literal["decompose", "do_not_decompose"] = dspy.OutputField()
+    reason: str = dspy.OutputField()
+```
+
+The program is constructed as `ShouldDecomposeModuleDSPy(lm)`. It keeps
+`name = "should_decompose"`, accepts the injected LM in `__init__(self, lm)`,
+and runs its call under `dspy.context(lm=...)`. It reads prediction attributes
+directly, preserves the enum/wire mapping, and delegates `metric` to
+`should_decompose_metric`. Import `dspy` lazily inside functions because a
+top-level import pulls `openai` into `sys.modules` and fails the isolated module
+gate. An unparseable output returns the conservative
+`Decision.DO_NOT_DECOMPOSE` result, reason `"DSPy output unparseable"`, and
+confidence `0.0`. The program does not import `cambium.lm` or provider
+packages.
 
 ## 6. Metric
 
@@ -226,6 +263,12 @@ duplicate keys, typed input errors, and one-object stdout behavior. Shared
 runtime scenarios remain in `tests/scenarios/`; there is no production
 Architectus integration test yet.
 
+DSPy program tests live in `tests/scenarios/`, not
+`src/cambium/modules/example/tests/`. The conformance gate excepts these
+scenario tests from `scan_external_module_files`; the program file remains in
+the module package. `src/cambium/optimize.py` is excepted from the
+reverse-import scan, like `src/cambium/cli.py`.
+
 The module conformance command is:
 
 ```console
@@ -257,21 +300,27 @@ tree claim.
 
 ## 10. Optimization plan (v2.1 target)
 
-Use SIMBA or GEPA on `train.jsonl` (200), score frozen `eval.jsonl` (threshold
-`≥ 0.85`), and require 100% canaries. Optimize one named model at
-`temperature=0.0`, with pinned siblings (none today), and keep the rule-engine
-baseline. Human approval promotes a prompt; retain
-`optimized/should_decompose/v<N-1>/` for rollback via symlink swap. No DSPy
-optimizer or standalone `eval.py` is claimed as current; the implemented CLI
-`operation: evaluate` and split metric functions are the available evaluation
-surfaces.
+Use `python3.14 -m cambium.optimize should_decompose --optimizer zero|bootstrap
+--budget-usd N [--seed N] [--tier NAME] [--dry-run]`. Stage 0 is zero-shot and
+stage 1 is `BootstrapFewShot`. The driver loads `ShouldDecomposeModuleDSPy`
+through the optional `dspy_program` manifest field and enforces the USD budget.
+The promotion gate is eval `≥ 0.85`, eval `≥ baseline - 0.05`, and 100%
+canaries. Optimize one named model at `temperature=0.0`, with pinned siblings
+(none today), and keep the rule-engine baseline. Human approval promotes a
+prompt; retain `optimized/should_decompose/v<N-1>/` for rollback via symlink
+swap. Each version writes
+`optimized/should_decompose/v<N>/{program.json,lm.json,report.json}` and the
+promoted version is addressed by the `current` symlink. Report
+`train_gain - canary_gain` as the anti-reward-hacking diagnostic. No separate
+`eval.py` is claimed; the implemented CLI `operation: evaluate` and split
+metric functions remain the v2 evaluation surfaces.
 
 ## 11. Open questions
 
 - Does a future caller provide worker-pool size or tier mix? (Architectus owner.)
 - Should confidence become a gate? It is currently unused and unscored.
-- Does the future DSPy seam coexist with or replace the rule engine? A config
-  selector is the current v2.1 assumption.
+- How will a future caller select a promoted DSPy artifact while retaining the
+  rule-engine rollback path? (Architectus owner.)
 
 ## 12. Changelog
 
@@ -391,9 +440,10 @@ baseline, and metadata.
 
 The deterministic engine, loader, metric, split files, baseline schema, JSON
 CLI, offline checks, import prohibitions, and removability checks are
-implemented surfaces. A production `Architectus.execute` caller, DSPy class,
-standalone module eval command, sibling stubs, optimized prompt artifacts,
-and end-to-end orchestrator exercise remain future work. The live checker
+implemented surfaces. A production `Architectus.execute` caller, the v2.1
+DSPy program and optimizer seam described in §§3.3, 5.1, and 10, standalone
+module eval command, sibling stubs, optimized prompt artifacts, and end-to-end
+orchestrator exercise remain future work. The live checker
 confirms that split records, metadata, and baseline use `dataset_version:
 "1.1.0"`; a future version or digest mismatch must fail and report the owner,
 not be silently re-anchored.
@@ -409,9 +459,12 @@ caller/CLI validation failure; the pure engine's tolerance of arbitrary string
 content is not a substitute for caller validation. A context containing an
 explicit prior decomposition is a successful intentional short-circuit, not a
 failure. Over- and under-decomposition are domain errors detected by canaries.
-Only a future DSPy implementation can produce `ModelUnavailable` or
-`MalformedLLMResponse`; the current rule engine has no such path. This avoids
-documenting an unimplemented atomic fallback as if it were live behavior.
+Only the DSPy implementation can produce `ModelUnavailable` or
+`MalformedLLMResponse`; the current rule engine has no such path. The reference
+program handles an unparseable model output with the conservative
+`Decision.DO_NOT_DECOMPOSE` result, reason `"DSPy output unparseable"`, and
+confidence `0.0`. This keeps the fallback in the candidate seam and does not
+change the deployed rule engine.
 
 ### B.2 Metric and canary review
 
@@ -429,16 +482,19 @@ after a schema/dataset version decision and held-out re-evaluation.
 
 The target optimization record names module version, optimizer, model, seed,
 temperature, dataset version, split digests, sibling pins, train/eval means,
-canary pass rate, and human approval. SIMBA/GEPA may read `train.jsonl`, but
-`eval.jsonl` remains held out and `canaries.jsonl` is loaded at promotion. The
-candidate must beat the rule-engine baseline on frozen eval (default target
-`0.85`) and pass all canaries. Optimize against a single named model at
-`temperature=0.0`, not a provider cascade, to avoid cross-model prompt
-transfer. A failed gate retains the existing deterministic engine. Promotion
-is a versioned pointer swap under `optimized/should_decompose/`; the previous
-pointer remains available for rollback. No sibling is currently pinned because
-this is the first module; later interface changes require re-evaluating every
-module that pins it.
+canary pass rate, and human approval. `cambium.optimize` selects stage 0
+zero-shot or stage 1 `BootstrapFewShot`; `train.jsonl` is the optimization
+input, `eval.jsonl` remains held out, and `canaries.jsonl` is loaded at
+promotion. The candidate must reach frozen eval `≥ 0.85`, remain within `0.05`
+of the rule-engine baseline, and pass all canaries. Enforce the USD budget.
+Optimize against a single named model at `temperature=0.0`, not a provider
+cascade, to avoid cross-model prompt transfer. Record `train_gain - canary_gain`
+as the reward-hacking diagnostic. A failed gate retains the existing
+deterministic engine. Promotion writes
+`optimized/should_decompose/v<N>/{program.json,lm.json,report.json}` and swaps
+the `current` symlink; the previous pointer remains available for rollback. No
+sibling is currently pinned because this is the first module; later interface
+changes require re-evaluating every module that pins it.
 
 The reference package is intentionally independently removable. Its imports
 may use `cambium.modules.base` and its own package, but not sibling decision
