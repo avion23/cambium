@@ -653,7 +653,7 @@ def _load_dataset_loader(manifest: object) -> object:
         candidates[0],
     )
     try:
-        return loader_class(manifest.package_dir)
+        return loader_class(Path(manifest.package_dir) / "datasets")
     except Exception as exc:
         raise OptimizeError(f"could not construct dataset loader: {exc}") from exc
 

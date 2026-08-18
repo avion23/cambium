@@ -216,6 +216,16 @@ def test_baseline_means_reads_all_three_splits() -> None:
     assert all(0.0 <= value <= 1.0 for value in means.values())
 
 
+def test_load_dataset_loader_uses_module_datasets_directory() -> None:
+    package_dir = Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example"
+    manifest = optimize.load_module_manifest(package_dir)
+
+    loader = optimize._load_dataset_loader(manifest)
+
+    assert loader.path == package_dir / "datasets"
+    assert loader.load_split(Split.TRAIN)
+
+
 def test_anti_reward_gap_rewards_honest_candidates() -> None:
     final = {"eval_mean": 1.0, "train_mean": 1.0}
     canaries = {"mean": 1.0}
