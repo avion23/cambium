@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from .auth import validate_derived_env_name, validate_provider_id
+from .auth import effective_home, validate_derived_env_name, validate_provider_id
 
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
@@ -69,7 +69,7 @@ CODEX_CHATGPT_PROFILE: dict[str, object] = {
     "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
 }
 
-DEFAULT_PROVIDER_PATH = Path(".cambium/providers.json")
+DEFAULT_PROVIDER_PATH = effective_home() / ".config" / "cambium" / "providers.json"
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _TOP_LEVEL_FIELDS = frozenset({"providers"})
 _PROVIDER_FIELDS = frozenset(
@@ -495,7 +495,7 @@ def _read_config(source: str | Path | None) -> object:
     if not path.is_file():
         raise FileNotFoundError(
             f"provider config file not found: {path} "
-            "(set CAMBIUM_PROVIDERS or create .cambium/providers.json)"
+            f"(set CAMBIUM_PROVIDERS or create {DEFAULT_PROVIDER_PATH})"
         )
 
     try:
@@ -538,7 +538,7 @@ def load_providers(source: str | Path | None = None) -> list[ProviderConfig]:
     """Load and strictly validate providers from a JSON configuration file.
 
     ``source`` overrides ``CAMBIUM_PROVIDERS``. With neither set, the loader
-    reads ``.cambium/providers.json`` relative to the current directory. The
+    reads :data:`DEFAULT_PROVIDER_PATH`, under the effective user's home. The
     presence of each ``api_key_env`` variable is intentionally not checked;
     Diffundo resolves key values at call time.
     """

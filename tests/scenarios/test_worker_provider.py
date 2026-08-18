@@ -432,9 +432,8 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
 ) -> None:
     """read_batch -> edit_file -> run_shell -> finish: 4 model calls, one merge, no leaks.
 
-    The provider config lives at the default ``.cambium/providers.json`` under
-    the supervisor cwd; ``CAMBIUM_PROVIDERS`` is unset so the supervisor
-    resolves the default path before the worker spawns.
+    The provider config is supplied through ``CAMBIUM_PROVIDERS`` so this
+    scenario stays isolated from the user's standard config path.
     """
     _reset_server()
     server = _FakeOpenAIServer()
@@ -442,10 +441,10 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         project = tmp_path / "project"
         project.mkdir()
         config_path = _provider_config(
-            project / ".cambium" / "providers.json", server.base_url
+            project / "providers.json", server.base_url
         )
         monkeypatch.chdir(project)
-        monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
         monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
@@ -743,10 +742,10 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
         project = tmp_path / "project"
         project.mkdir()
         config_path = _provider_config(
-            project / ".cambium" / "providers.json", server.base_url
+            project / "providers.json", server.base_url
         )
         monkeypatch.chdir(project)
-        monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+        monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
         monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")

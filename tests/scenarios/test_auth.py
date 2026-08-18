@@ -425,7 +425,7 @@ def test_supervisor_worker_env_allows_only_declared_provider_credentials(
     assert "CAMBIUM_PROVIDER_bad_API_KEY" not in environment
 
 
-def test_worker_environment_default_provider_path_is_absolute_under_cwd(
+def test_worker_environment_default_provider_path_is_under_effective_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
@@ -440,7 +440,9 @@ def test_worker_environment_default_provider_path_is_absolute_under_cwd(
 
     env = supervisor._worker_environment(spec, 1)
 
-    assert env["CAMBIUM_PROVIDERS"] == str((cwd / ".cambium" / "providers.json").resolve())
+    assert env["CAMBIUM_PROVIDERS"] == str(
+        (auth.effective_home() / ".config" / "cambium" / "providers.json").resolve()
+    )
 
 
 def test_worker_environment_relative_provider_path_resolves_against_cwd(

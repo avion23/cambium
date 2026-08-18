@@ -9,8 +9,10 @@ import pytest
 
 diffundo = pytest.importorskip("cambium.diffundo")
 
-from cambium.auth import derived_env_name  # noqa: E402
+from cambium import provider_config  # noqa: E402
+from cambium.auth import derived_env_name, effective_home  # noqa: E402
 from cambium.provider_config import (  # noqa: E402
+    DEFAULT_PROVIDER_PATH,
     AuthMode,
     Protocol,
     env_report,
@@ -43,6 +45,14 @@ def _write(path: Path, providers: list[dict[str, object]]) -> Path:
     return path
 
 
+def test_default_path_uses_effective_home_not_home_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", "/path-that-must-not-be-used")
+
+    assert DEFAULT_PROVIDER_PATH == effective_home() / ".config" / "cambium" / "providers.json"
+
+
 def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
     path = _write(tmp_path / "providers.json", [_provider()])
 
@@ -52,6 +62,29 @@ def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
     assert providers[0].name == "openai"
     assert providers[0].tier is diffundo.ProviderTier.STRONG
     assert providers[0].api_key_env == "CAMBIUM_PROVIDER_OPENAI_API_KEY"
+
+
+def test_explicit_source_overrides_environment_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment_path = _write(tmp_path / "environment.json", [_provider("environment")])
+    source_path = _write(tmp_path / "source.json", [_provider("source")])
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(environment_path))
+
+    providers = load_providers(source_path)
+
+    assert [provider.name for provider in providers] == ["source"]
+
+
+def test_environment_path_overrides_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path / "environment.json", [_provider("environment")])
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(path))
+
+    providers = load_providers()
+
+    assert [provider.name for provider in providers] == ["environment"]
 
 
 def test_generic_api_key_environment_name_is_rejected(tmp_path: Path) -> None:
@@ -102,14 +135,18 @@ def test_env_report_treats_empty_value_as_unconfigured(
 def test_default_path_missing_has_clear_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.chdir(tmp_path)
+    expected_path = tmp_path / "effective-home" / ".config" / "cambium" / "providers.json"
+    monkeypatch.setattr(provider_config, "DEFAULT_PROVIDER_PATH", expected_path)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home-secret"))
 
-    with pytest.raises(
-        FileNotFoundError,
-        match=r"provider config file not found.*\.cambium/providers\.json",
-    ):
+    with pytest.raises(FileNotFoundError) as raised:
         load_providers()
+
+    message = str(raised.value)
+    assert f"provider config file not found: {expected_path}" in message
+    assert f"create {expected_path}" in message
+    assert "home-secret" not in message
 
 
 def test_loopback_http_base_url_is_accepted(tmp_path: Path) -> None:
