@@ -636,7 +636,7 @@ def test_invalid_context_checkpoint_fields_matrix() -> None:
         "generation": 1,
         "epoch": 1,
         "turn": 1,
-        "checkpoint_ref": "t/epoch-001-abc.json",
+        "checkpoint_ref": f"t/epoch-001-{'a' * 16}-{'b' * 16}.json",
         "cache_key": {
             "provider": "p",
             "model": "m",
@@ -644,7 +644,9 @@ def test_invalid_context_checkpoint_fields_matrix() -> None:
             "reasoning_effort": None,
             "system_sha256": digest,
             "tools_sha256": digest,
-            "messages_sha256": digest,
+            "prefix_sha256": digest,
+            "suffix_sha256": digest,
+            "full_sha256": digest,
             "prefix_bytes": 0,
             "message_count": 1,
             "redacted": False,
@@ -663,6 +665,17 @@ def test_invalid_context_checkpoint_fields_matrix() -> None:
         "prefix_neg": {
             **valid,
             "cache_key": {**valid["cache_key"], "prefix_bytes": -1},
+        },
+        "prefix_sha_missing": {
+            **valid,
+            "cache_key": {
+                key: value for key, value in valid["cache_key"].items()
+                if key != "prefix_sha256"
+            },
+        },
+        "suffix_sha_bad": {
+            **valid,
+            "cache_key": {**valid["cache_key"], "suffix_sha256": 12},
         },
         "redacted_str": {
             **valid,
@@ -850,11 +863,11 @@ def _write_suspend_worker(path: Path) -> None:
         "        send({'type': 'exit_message', 'task_id': task_id,\n"
         "              'generation': init.get('generation', 1), 'reason': 'crash'})\n"
         "        return 1\n"
-        "    proposal = proposals[0]\n"
-        "    send({'type': 'propose_child', 'request_id': run_rid,\n"
-        "          'parent_task_id': task_id,\n"
-        "          'child_task_id': proposal['child_task_id'],\n"
-        "          'kind': proposal['kind'], 'spec': proposal['spec']})\n"
+        "    for proposal in proposals:\n"
+        "        send({'type': 'propose_child', 'request_id': run_rid,\n"
+        "              'parent_task_id': task_id,\n"
+        "              'child_task_id': proposal['child_task_id'],\n"
+        "              'kind': proposal['kind'], 'spec': proposal['spec']})\n"
         "    checkpoint_ref = os.environ.get(\n"
         "        'FAKE_CHECKPOINT_REF', task_id + '/epoch-001-"
         + ('a' * 16) + '-' + ('b' * 16) + ".json')\n"
@@ -1077,3 +1090,139 @@ def test_fork_pin_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert child_init["assigned_provider"] == "fake-provider"
     assert child_init["fanout_config"]["model"] == "fake-model"
     assert child_init["context_reuse"] is True
+
+@pytest.mark.slow
+def test_suspend_resume_two_children_concurrency_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Suspend/resume under max_concurrent_tasks=1 must not deadlock.
+
+    The parent releases its admission slot while awaiting children, both
+    children run serialized in that slot, and the parent resumes with both
+    bounded child results on the same worktree and generation.
+    """
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n", "c.txt": "file c\n"})
+
+    suspend_worker = tmp_path / "suspend_worker.py"
+    dump_worker = tmp_path / "dump_worker.py"
+    _write_suspend_worker(suspend_worker)
+    _write_dump_worker(dump_worker)
+
+    context_dump = tmp_path / "parent-inits.jsonl"
+    child_dump = tmp_path / "child-init.json"
+    monkeypatch.setenv("CONTEXT_DUMP_PATH", str(context_dump))
+    monkeypatch.setenv("CHILD_DUMP_PATH", str(child_dump))
+
+    def _child(task_id: str, target: str) -> dict:
+        return _task(
+            session_dir, repo, base, task_id, worktree=f"wt-{task_id}",
+            branch=f"wt-{task_id}", target_file=target,
+            marker=f"// {task_id}-marker", worker_path=str(dump_worker),
+            provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
+        )
+
+    root = _task(
+        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
+        target_file="a.txt", marker="// parent-marker",
+        worker_path=str(suspend_worker),
+        provider_env_keys=[
+            "FAKE_MODE", "CONTEXT_DUMP_PATH", "CHILD_DUMP_PATH",
+            "FAKE_CHECKPOINT_REF", "FAKE_EPOCH_PROVIDER", "FAKE_EPOCH_MODEL",
+            "FAKE_TOOLS_SHA", "FAKE_SYSTEM_SHA", "FAKE_MESSAGES_SHA",
+        ],
+        proposed_children=[
+            _child_proposal(_child("c1", "b.txt")),
+            _child_proposal(_child("c2", "c.txt")),
+        ],
+    )
+
+    result = asyncio.run(
+        run_plan(
+            session_dir, {"tasks": [root]}, context_reuse=True,
+            max_concurrent_tasks=1,
+        )
+    )
+
+    assert result.exit_code == 0, result.results
+    assert {r.task_id for r in result.results} == {"t-root", "c1", "c2"}
+    assert all(r.status == "succeeded" for r in result.results)
+
+    events = read_events(session_dir)
+    resumes = _kinds(events, "context_resume")
+    assert len(resumes) == 1
+    assert resumes[0]["payload"]["child_count"] == 2
+
+    lines = context_dump.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    resume_init = json.loads(lines[1])
+    child_results = resume_init["resume"]["child_results"]
+    assert len(child_results) == 2
+    assert {r["files_changed"][0] for r in child_results if r["files_changed"]} == {
+        "b.txt", "c.txt",
+    }
+    # Same worktree and generation across suspend/resume (no restart).
+    first_init = json.loads(lines[0])
+    assert first_init["generation"] == resume_init["generation"]
+
+
+def test_result_identity_note_matrix() -> None:
+    from cambium.supervisor import _result_identity_note
+
+    assert _result_identity_note(
+        {"task_id": "t", "generation": 1}, "t", 1
+    ) is None
+    assert _result_identity_note(
+        {"task_id": "other", "generation": 1}, "t", 1
+    ) == "result task_id mismatch"
+    assert _result_identity_note(
+        {"generation": 2}, "t", 1
+    ) == "result generation mismatch"
+    assert _result_identity_note(
+        {"generation": True}, "t", 1
+    ) == "result generation mismatch"
+    # Absent identity fields are tolerated (older workers omit them).
+    assert _result_identity_note({}, "t", 1) is None
+
+
+@pytest.mark.slow
+def test_suspended_envelope_without_flag_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without context_reuse a suspended verdict is a failure, not a resume."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
+
+    suspend_worker = tmp_path / "suspend_worker.py"
+    dump_worker = tmp_path / "dump_worker.py"
+    _write_suspend_worker(suspend_worker)
+    _write_dump_worker(dump_worker)
+    monkeypatch.setenv("CONTEXT_DUMP_PATH", str(tmp_path / "parent-inits.jsonl"))
+    monkeypatch.setenv("CHILD_DUMP_PATH", str(tmp_path / "child-init.json"))
+
+    child = _task(
+        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
+        target_file="b.txt", marker="// child-marker", worker_path=str(dump_worker),
+        provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
+    )
+    root = _task(
+        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
+        target_file="a.txt", marker="// parent-marker",
+        worker_path=str(suspend_worker),
+        provider_env_keys=[
+            "FAKE_MODE", "CONTEXT_DUMP_PATH", "CHILD_DUMP_PATH",
+            "FAKE_CHECKPOINT_REF", "FAKE_EPOCH_PROVIDER", "FAKE_EPOCH_MODEL",
+            "FAKE_TOOLS_SHA", "FAKE_SYSTEM_SHA", "FAKE_MESSAGES_SHA",
+        ],
+        proposed_children=[_child_proposal(child)],
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [root]}))
+
+    root_result = next(r for r in result.results if r.task_id == "t-root")
+    assert root_result.status == "failed"
+    events = read_events(session_dir)
+    assert not _kinds(events, "context_resume")
+    assert not _kinds(events, "context_fork")

@@ -140,6 +140,8 @@ from .worker import (
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
     _cap_utf8,
+)
+from .worker import (
     _fork_cache_compatible as _worker_fork_cache_compatible,
 )
 
@@ -230,9 +232,17 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
         value = cache_key.get(field)
         if value is not None and not (isinstance(value, str) and value):
             invalid.append(f"cache_key.{field}")
-    for field in ("system_sha256", "tools_sha256", "messages_sha256"):
+    for field in (
+        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+        "full_sha256", "messages_sha256",
+    ):
         value = cache_key.get(field)
-        if not (isinstance(value, str) and _SHA256_HEX_RE.match(value) is not None):
+        if value is not None and (
+            not isinstance(value, str) or _SHA256_HEX_RE.match(value) is None
+        ):
+            invalid.append(f"cache_key.{field}")
+    for field in ("prefix_sha256", "suffix_sha256", "full_sha256"):
+        if field not in cache_key:
             invalid.append(f"cache_key.{field}")
     if type(cache_key.get("redacted")) is not bool:
         invalid.append("cache_key.redacted")
@@ -248,6 +258,26 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
     if msg.get("type") == "ready":
         return msg.get("proto") != PROTO
     return "proto" in msg and msg["proto"] != PROTO
+
+
+def _result_identity_note(
+    msg: Mapping[str, Any], task_id: str, generation: int
+) -> str | None:
+    """Return why a result envelope fails worker identity, or None."""
+    claimed_task = msg.get("task_id")
+    if claimed_task is not None and claimed_task != task_id:
+        return "result task_id mismatch"
+    claimed_generation = msg.get("generation")
+    if (
+        claimed_generation is not None
+        and (
+            isinstance(claimed_generation, bool)
+            or not isinstance(claimed_generation, int)
+            or claimed_generation != generation
+        )
+    ):
+        return "result generation mismatch"
+    return None
 
 
 _TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
@@ -2193,14 +2223,28 @@ class _Runtime:
         provider = cache_key.get("provider")
         if not isinstance(provider, str):
             return
+        boundary = cache_key.get("provider_boundary")
+        if not isinstance(boundary, dict):
+            await self.emit(
+                "context_fork_skipped",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                epoch=epoch.get("epoch"),
+                reason="epoch provider boundary is missing",
+            )
+            return
         descriptor = {
             "checkpoint_ref": epoch["checkpoint_ref"],
             "provider": provider,
             "model": cache_key["model"],
             "system_sha256": cache_key["system_sha256"],
             "tools_sha256": cache_key["tools_sha256"],
+            "prefix_sha256": cache_key["prefix_sha256"],
+            "suffix_sha256": cache_key["suffix_sha256"],
+            "full_sha256": cache_key["full_sha256"],
             "prefix_bytes": cache_key["prefix_bytes"],
-            "messages_sha256": cache_key["messages_sha256"],
+            "provider_boundary": boundary,
         }
         fanout = child_spec.get("fanout_config")
         if not isinstance(fanout, dict):
@@ -2692,6 +2736,10 @@ class _Runtime:
                         outcome.envelope.get("status")
                         if outcome.envelope is not None else None
                     )
+                    if envelope_status == "suspended" and not self._context_reuse:
+                        # Fail closed: without the flag a suspended verdict is
+                        # an unsupported status, never a resume loop.
+                        envelope_status = None
                     if envelope_status == "suspended":
                         remaining = wall_budget - (time.monotonic() - supervise_started)
                         if remaining <= 0:
@@ -3273,12 +3321,24 @@ class _Runtime:
                         "run_task", task_id=task_id, request_id=run_rid, generation=generation
                     )
                 elif mtype in ("result", "result_envelope"):
-                    envelope = msg
-                    correlated = run_rid is not None and msg.get("request_id") == run_rid
-                    if not correlated:
+                    identity_note = _result_identity_note(msg, task_id, generation)
+                    correlated = (
+                        run_rid is not None and msg.get("request_id") == run_rid
+                    )
+                    if not correlated and identity_note is None:
+                        identity_note = "result request_id mismatch"
+                    if identity_note is not None:
                         await self.emit(
-                            "protocol", task_id=task_id, note="result request_id mismatch",
+                            "protocol", task_id=task_id, note=identity_note,
                             expected=run_rid, got=msg.get("request_id"),
+                        )
+                    if envelope is not None:
+                        # One accepted terminal envelope per run request; a
+                        # stale or duplicate result never triggers lifecycle
+                        # side effects a second time.
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="duplicate result envelope ignored",
                         )
                     result_payload: dict[str, Any] = {"status": msg.get("status")}
                     provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
@@ -3288,12 +3348,15 @@ class _Runtime:
                         "result", task_id=task_id, request_id=msg.get("request_id"),
                         generation=generation, **result_payload,
                     )
+                    accepted = correlated and identity_note is None and envelope is None
+                    if accepted:
+                        envelope = msg
                     # Dynamic child admission: proposals are processed only
                     # now, when the parent's terminal envelope exists (the
                     # child's context is its own spec plus that envelope).
                     pending = self._pending_children.pop(task_id, [])
                     admitted: list[str] = []
-                    if pending or self._admission_port is not None:
+                    if accepted and (pending or self._admission_port is not None):
                         parent_envelope = self._redact_envelope(
                             self._strict_envelope(spec, msg)
                         )
@@ -3314,19 +3377,18 @@ class _Runtime:
                             )
                             await _kill_worker(proc)
                             return _GenOutcome(clean=False, fatal=True, reason=reason)
-                    if spec.get("parent_task_id") is not None:
-                        child_result = self._strict_envelope(spec, msg)
-                        await self.emit(
-                            "child_result", task_id=task_id, generation=generation,
-                            **child_result,
+                    if (
+                        accepted
+                        and spec.get("parent_task_id") is not None
+                        and msg.get("status") in ("succeeded", "failed", "cancelled")
+                    ):
+                        # A suspended child emits no upward child_result until
+                        # its final post-resume result; publication happens
+                        # once in _complete_child under the supervisor verdict.
+                        self._capture_child_result(
+                            spec, msg,
+                            request_id=msg.get("request_id"), generation=generation,
                         )
-                        self._child_envelopes.setdefault(
-                            spec["parent_task_id"], []
-                        ).append(child_result)
-                        self._child_result_by_task[task_id] = child_result
-                        self._admitted_children.setdefault(
-                            spec["parent_task_id"], []
-                        ).append(task_id)
                     if admitted:
                         self._admitted_children.setdefault(task_id, []).extend(admitted)
                         admitted_children.extend(admitted)
