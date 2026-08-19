@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-_DEFAULT_LAYERS = [48, 56, 60, 63]
+_DEFAULT_LAYERS = [29, 41, 57, 61]
 
 
 class JlenError(RuntimeError):
