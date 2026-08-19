@@ -244,6 +244,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="prompt to run against the repository",
     )
     _add_routing_budget_arguments(parser)
+    parser.add_argument(
+        "--context-reuse",
+        action="store_true",
+        help="cache-first context reuse: fork children from parent epoch "
+        "checkpoints and suspend/resume at delegate boundaries (default: off)",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -861,6 +867,7 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
             max_turns=_budget_or_default(
                 getattr(args, "max_turns", None), oneshot.DEFAULT_MAX_TURNS
             ),
+            context_reuse=getattr(args, "context_reuse", False),
         )
     except ValueError as exc:
         print(f"cambium run: {exc}", file=sys.stderr)

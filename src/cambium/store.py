@@ -78,7 +78,8 @@ CRITICAL_KINDS = frozenset({
     "merge_progress", "task_assigned", "merge_committed",
     "merge_staging_quarantined", "merge_staging_cleanup_failed",
     "merge_staging_prune_started", "merge_staging_pruned",
-    "context_checkpoint",
+    "context_checkpoint", "context_fork", "context_fork_skipped",
+    "context_resume", "child_admitted",
 })
 
 _SCHEMA = """CREATE TABLE IF NOT EXISTS events (
