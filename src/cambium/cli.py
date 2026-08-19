@@ -179,6 +179,12 @@ def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
     )
+    parser.add_argument(
+        "--context-reuse",
+        action="store_true",
+        help="cache-first context reuse: fork children from parent epoch "
+        "checkpoints and suspend/resume at delegate boundaries (default: off)",
+    )
 
 
 def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
@@ -508,6 +514,8 @@ def _supervisor_args(args: argparse.Namespace) -> list[str]:
     delegated = ["--session-dir", args.session_dir]
     if getattr(args, "conversations", False):
         delegated.append("--conversations")
+    if getattr(args, "context_reuse", False):
+        delegated.append("--context-reuse")
     return delegated
 
 

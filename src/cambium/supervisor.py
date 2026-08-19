@@ -135,6 +135,13 @@ from .tasktree import (
     ready_tasks,
     topological_order,
 )
+from .worker import (
+    _SHA256_HEX_RE,
+    MAX_ENVELOPE_FIELD_CHARS,
+    MAX_ENVELOPE_ITEMS,
+    _cap_utf8,
+    _fork_cache_compatible,
+)
 
 PROTO = 1
 WORKER_STDIN_LIMIT = MAX_LINE_BYTES
@@ -195,6 +202,43 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
+_CACHE_KEY_INT_FIELDS = ("prefix_bytes", "message_count")
+
+
+def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
+    """Return context_checkpoint fields whose values must not enter the runtime.
+
+    Field names only; values are never echoed back. The checkpoint is the
+    fork/resume trust anchor, so unknown fields and malformed cache-key
+    values fail the whole message instead of being trimmed.
+    """
+    cache_key = msg.get("cache_key")
+    if not isinstance(cache_key, dict):
+        return ["cache_key"]
+    invalid: list[str] = []
+    for field in ("epoch", "turn"):
+        if not (type(msg.get(field)) is int and msg.get(field) > 0):
+            invalid.append(field)
+    checkpoint_ref = msg.get("checkpoint_ref")
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        invalid.append("checkpoint_ref")
+    for field in _CACHE_KEY_INT_FIELDS:
+        value = cache_key.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            invalid.append(f"cache_key.{field}")
+    for field in ("provider", "model", "protocol", "reasoning_effort"):
+        value = cache_key.get(field)
+        if value is not None and not (isinstance(value, str) and value):
+            invalid.append(f"cache_key.{field}")
+    for field in ("system_sha256", "tools_sha256", "messages_sha256"):
+        value = cache_key.get(field)
+        if not (isinstance(value, str) and _SHA256_HEX_RE.match(value) is not None):
+            invalid.append(f"cache_key.{field}")
+    if type(cache_key.get("redacted")) is not bool:
+        invalid.append("cache_key.redacted")
+    return invalid
+
+
 def _wire_str(value: Any) -> str | None:
     """Coerce an unvalidated wire value for a JSON-safe event payload."""
     return value if isinstance(value, str) else None
@@ -222,6 +266,8 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
         "prompt_prefix_bytes",
         "provider_cache_hit",
         "failure_reason",
+        "epoch",
+        "fork_of",
     }
 )
 
@@ -258,9 +304,11 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     if unknown:
         return unknown
     invalid: list[str] = []
-    for field in ("turn", "prompt_prefix_bytes"):
+    for field in ("turn", "prompt_prefix_bytes", "epoch"):
         if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
             invalid.append(field)
+    if "fork_of" in msg and not (type(msg["fork_of"]) is str and msg["fork_of"]):
+        invalid.append("fork_of")
     for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):
         value = msg.get(field)
         if field in msg and not (
@@ -944,6 +992,41 @@ def _envelope_text(envelope: Mapping[str, Any] | None, key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _bounded_resume_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one child-result envelope to the strict parent-envelope caps.
+
+    The worker re-validates each resume child result as a strict parent
+    envelope, so text fields are byte-capped to ``MAX_ENVELOPE_FIELD_CHARS``
+    and list fields to ``MAX_ENVELOPE_ITEMS`` items/fields. Unknown keys are
+    dropped; known fields keep their declared types (numbers stay numbers,
+    booleans stay booleans, null stays null).
+    """
+    text_fields = ("unified_diff", "summary", "status")
+    list_fields = ("files_changed", "commits")
+    bounded: dict[str, Any] = {}
+    for key, value in envelope.items():
+        if key in text_fields:
+            bounded[key] = _cap_utf8(value, MAX_ENVELOPE_FIELD_CHARS) if isinstance(
+                value, str
+            ) else value
+        elif key in list_fields and isinstance(value, list):
+            bounded[key] = [
+                _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
+                for item in value[:MAX_ENVELOPE_ITEMS]
+                if isinstance(item, str)
+            ]
+        elif key == "metric_breakdown" and isinstance(value, dict):
+            bounded[key] = value
+        elif key in ("parent_task_id", "metric_score", "diff_truncated"):
+            bounded[key] = value
+    return {
+        key: bounded.get(key, envelope.get(key))
+        for key in ("parent_task_id", "unified_diff", "diff_truncated", "summary",
+                    "metric_score", "metric_breakdown", "commits", "files_changed",
+                    "status")
+    }
+
+
 class DuplicateTaskIDError(ValueError):
     """The plan cannot be dispatched because a task id is repeated."""
 
@@ -1088,6 +1171,9 @@ class _GenOutcome:
     # Eval-3 ADOPT: true when the worker reported reuse-ready after its
     # terminal envelope and the live process was returned to the session pool.
     reuse_ready: bool = False
+    # Dynamic admission: the child task ids admitted at this generation's
+    # terminal envelope, in deterministic order (Cache-first step 2/§5.3).
+    admitted_children: tuple[str, ...] = ()
 
 
 class _Runtime:
@@ -1112,6 +1198,7 @@ class _Runtime:
         architectus: Any = None,
         conversations: Any = None,
         warm_pool_size: int = 0,
+        context_reuse: bool = False,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1157,6 +1244,15 @@ class _Runtime:
         self._admission_port = self._make_admission_port(architectus)
         self._admission_port_lock = asyncio.Lock()
         self._conversations = conversations
+        # Cache-first context reuse (step 2): session-level flag; per-parent
+        # epoch checkpoints keyed by task id, the admitted child ids per
+        # parent in admission order, and the strict child-result envelope per
+        # child task, captured at the child's terminal result envelope.
+        self._context_reuse = context_reuse
+        self._task_epochs: dict[str, dict[str, Any]] = {}
+        self._child_tasks: dict[str, list[asyncio.Task[dict[str, Any]]]] = {}
+        self._admitted_children: dict[str, list[str]] = {}
+        self._child_result_by_task: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _make_admission_port(architectus: Any) -> Any:
@@ -1621,6 +1717,10 @@ class _Runtime:
             payload["parent_envelope"] = spec["parent_envelope"]
         if spec.get("proposed_children") is not None:
             payload["proposed_children"] = spec["proposed_children"]
+        # Cache-first resume: the payload carries the bounded resume dict so a
+        # restarted (or resumed) parent re-seeds its transcript from the epoch.
+        if spec.get("resume") is not None:
+            payload["resume"] = spec["resume"]
         return payload
 
     # -- dynamic child admission (implementation-plan step 2) ----------------
@@ -1672,8 +1772,13 @@ class _Runtime:
         parent_spec: dict[str, Any],
         proposal: dict[str, Any],
         parent_envelope: dict[str, Any],
-    ) -> None:
+    ) -> list[str]:
         """Validate one child revision, record it durably, then spawn it.
+
+        Returns the admitted child task ids in admission order (one per
+        proposal). A compatible cached-epoch child is pinned to the epoch's
+        (provider, model) and carries the ``context_fork`` descriptor; an
+        incompatible one runs the legacy summary-passing path.
 
         The revision is validated with ``tasktree.build_tree`` over the
         accumulated session tasks plus the proposed child. A duplicate,
@@ -1708,7 +1813,7 @@ class _Runtime:
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
                 reason=exc.__class__.__name__, proposal=proposal,
             )
-            return
+            return []
         try:
             child_spec = _child_spec(
                 self._session_dir, parent_spec, proposal, parent_envelope
@@ -1724,7 +1829,8 @@ class _Runtime:
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
                 reason=exc.__class__.__name__, proposal=proposal,
             )
-            return
+            return []
+        await self._pin_fork_child(parent_spec, child_spec, parent_task_id, child_task_id, kind)
         # Append synchronously before any await so a concurrent proposal
         # validation observes this child (duplicate detection stays exact).
         self._session_tasks.append({
@@ -1752,14 +1858,14 @@ class _Runtime:
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
                 reason="NoActiveTaskGroup", proposal=proposal,
             )
-            return
+            return []
         await self._record_revision_conversation(
             outcome="admitted", parent_task_id=parent_task_id,
             child_task_id=child_task_id, child_kind=kind, request_id=request_id,
             proposal=proposal,
         )
         try:
-            self._task_group.create_task(self.supervise_task(child_spec))
+            child_task = self._task_group.create_task(self.supervise_task(child_spec))
         except RuntimeError as exc:
             # Group closed after the check: roll back the in-memory admission.
             self._session_tasks[:] = [
@@ -1776,12 +1882,139 @@ class _Runtime:
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
                 reason="NoActiveTaskGroup", proposal=proposal,
             )
-            return
+            return []
         await self.emit(
             "child_admitted", task_id=parent_task_id, request_id=request_id,
             parent_task_id=parent_task_id, child_task_id=child_task_id,
             child_kind=kind, branch=child_spec.get("branch"),
         )
+        self._child_tasks.setdefault(parent_task_id, []).append(child_task)
+        return [child_task_id]
+
+    def _child_results_for_resume(
+        self, parent_task_id: str, child_ids: list[str],
+        *, checkpoint_ref: Any, epoch: Any,
+    ) -> dict[str, Any]:
+        """One bounded resume payload: every admitted child's strict envelope.
+
+        Children are ordered by admission (deterministic); a child with no
+        terminal envelope yet synthesizes a bounded failure envelope so the
+        resume never blocks on a missing result. Every envelope is normalized
+        to the strict parent-envelope caps (the worker re-validates each
+        child result as a strict envelope), and the list is capped at
+        ``MAX_ENVELOPE_ITEMS`` with ``child_results_truncated`` set when
+        dropped.
+        """
+        child_results: list[dict[str, Any]] = []
+        truncated = False
+        for child_id in child_ids:
+            envelope = self._child_result_by_task.get(child_id)
+            if envelope is None:
+                result = self._results.get(child_id)
+                summary = (result.reason if result is not None else "child result missing")
+                envelope = {
+                    "parent_task_id": parent_task_id,
+                    "unified_diff": "",
+                    "diff_truncated": False,
+                    "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
+                    "metric_score": None,
+                    "metric_breakdown": {},
+                    "commits": [],
+                    "files_changed": [],
+                    "status": "failed",
+                }
+            if len(child_results) >= MAX_ENVELOPE_ITEMS:
+                truncated = True
+                continue
+            child_results.append(_bounded_resume_envelope(envelope))
+        return {
+            "checkpoint_ref": checkpoint_ref,
+            "epoch": epoch,
+            "child_results": child_results,
+            "child_results_truncated": truncated,
+        }
+
+    async def _await_suspend_children(
+        self, parent_task_id: str, child_ids: list[str], remaining: float
+    ) -> None:
+        """Await the suspended parent's children, bounded by the wall budget.
+
+        Each child is awaited under a shield so a resume-timeout never cancels
+        the child's own supervision; the bounded wait prevents one hung child
+        from consuming the parent's entire remaining budget.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, remaining)
+        pending = {
+            task for task in self._child_tasks.get(parent_task_id, ())
+            if task is not None and not task.done()
+        }
+        for task in pending:
+            timeout = max(0.0, deadline - loop.time())
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except (TimeoutError, asyncio.CancelledError):
+                pass
+
+    async def _pin_fork_child(
+        self,
+        parent_spec: dict[str, Any],
+        child_spec: dict[str, Any],
+        parent_task_id: str,
+        child_task_id: str,
+        kind: str | None,
+    ) -> None:
+        """Pin a cache-compatible child to its parent's last epoch (plan §5.5).
+
+        Runs after ``_validate_plan_task`` on the built child spec. A child
+        whose (model, tool schema) matches the parent's epoch and whose
+        provider is authorized is pinned to the epoch's (provider, model) and
+        carries the ``context_fork`` descriptor; every other child keeps the
+        legacy summary-passing path. The ``context_fork`` event is emitted in
+        both cases so session audits can see the compatibility decision.
+        """
+        if not self._context_reuse:
+            return
+        epoch = self._task_epochs.get(parent_task_id)
+        if epoch is None:
+            return
+        cache_key = epoch.get("cache_key")
+        authorized = frozenset(child_spec.get("authorized_providers") or ())
+        compatible, reason = _fork_cache_compatible(child_spec, epoch, authorized)
+        fork_payload: dict[str, Any] = {
+            "task_id": parent_task_id,
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "child_kind": kind,
+            "epoch": epoch.get("epoch"),
+            "compatible": compatible,
+        }
+        if reason is not None:
+            fork_payload["reason"] = reason
+        await self.emit("context_fork", **fork_payload)
+        if not compatible or not isinstance(cache_key, dict):
+            return
+        provider = cache_key.get("provider")
+        if not isinstance(provider, str):
+            return
+        descriptor = {
+            "checkpoint_ref": epoch["checkpoint_ref"],
+            "provider": provider,
+            "model": cache_key["model"],
+            "system_sha256": cache_key["system_sha256"],
+            "tools_sha256": cache_key["tools_sha256"],
+            "prefix_bytes": cache_key["prefix_bytes"],
+            "messages_sha256": cache_key["messages_sha256"],
+        }
+        fanout = child_spec.get("fanout_config")
+        if not isinstance(fanout, dict):
+            fanout = child_spec["fanout_config"] = {}
+        fanout["model"] = descriptor["model"]
+        child_spec["assigned_provider"] = provider
+        child_spec["context_fork"] = descriptor
+        lane = self._lanes.get(provider)
+        if lane is not None:
+            lane.in_flight += 1
 
     async def _record_revision_conversation(
         self,
@@ -1838,7 +2071,7 @@ class _Runtime:
 
     async def _admit_port_proposals(
         self, parent_spec: dict[str, Any], parent_envelope: dict[str, Any]
-    ) -> None:
+    ) -> list[str]:
         """Feed one admitted parent's envelope to the decision port and admit its proposals.
 
         The port is the only provider-side channel whose response can become a
@@ -1847,7 +2080,7 @@ class _Runtime:
         directly. A malformed or mismatched proposal is durably rejected with
         ``child_rejected`` and spawns nothing. A finished task outside the
         port's decision domain (unknown to its tree) yields no wave: the port
-        has nothing to propose for it.
+        has nothing to propose for it. Returns the admitted child task ids.
         """
         parent_task_id = parent_spec["task_id"]
         malformed: str | None = None
@@ -1856,7 +2089,7 @@ class _Runtime:
             try:
                 self._admission_port.aggregate(parent_task_id, parent_envelope)
             except ValueError:
-                return
+                return []
             try:
                 proposals = await self._admission_port.step([
                     {
@@ -1873,16 +2106,20 @@ class _Runtime:
                 parent_task_id=parent_task_id, child_task_id=None, child_kind=None,
                 reason="MalformedProposal", message=f"decision port error: {malformed}"[:512],
             )
-            return
+            return []
+        admitted: list[str] = []
         for proposal in proposals:
-            await self._admit_port_proposal(parent_spec, parent_envelope, proposal)
+            admitted.extend(
+                await self._admit_port_proposal(parent_spec, parent_envelope, proposal)
+            )
+        return admitted
 
     async def _admit_port_proposal(
         self,
         parent_spec: dict[str, Any],
         parent_envelope: dict[str, Any],
         proposal: Any,
-    ) -> None:
+    ) -> list[str]:
         """Route one decision-port proposal through the revision boundary."""
         parent_task_id = parent_spec["task_id"]
         if not isinstance(proposal, dict):
@@ -1892,7 +2129,7 @@ class _Runtime:
                 reason="MalformedProposal",
                 message="decision port returned a non-object proposal",
             )
-            return
+            return []
         invalid_fields = _invalid_propose_child_fields(proposal)
         if invalid_fields:
             await self.emit(
@@ -1908,7 +2145,7 @@ class _Runtime:
                 parent_task_id, proposal, "MalformedProposal",
                 f"invalid field(s) {invalid_fields}",
             )
-            return
+            return []
         if proposal.get("parent_task_id") != parent_task_id:
             await self.emit(
                 "child_rejected", task_id=parent_task_id,
@@ -1923,8 +2160,8 @@ class _Runtime:
                 parent_task_id, proposal, "ParentTaskIdMismatch",
                 "parent_task_id does not match the finished task",
             )
-            return
-        await self._admit_child(parent_spec, proposal, parent_envelope)
+            return []
+        return await self._admit_child(parent_spec, proposal, parent_envelope)
 
     async def _record_port_rejection(
         self,
@@ -2040,6 +2277,9 @@ class _Runtime:
         wall_budget = _cfg_float(
             spec, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S
         )
+        # Cache-first: the monotonic start anchors the resume budget so each
+        # suspend/resume cycle subtracts its children's wall time exactly.
+        supervise_started = time.monotonic()
         if spec.get("base_commit") is None:
             base = await self._git_stdout(repo, "rev-parse", "refs/heads/main", check=False)
             if not base:
@@ -2144,6 +2384,36 @@ class _Runtime:
                         outcome.envelope.get("status")
                         if outcome.envelope is not None else None
                     )
+                    if envelope_status == "suspended":
+                        remaining = wall_budget - (time.monotonic() - supervise_started)
+                        if remaining <= 0:
+                            reason = "wall budget exhausted before resume"
+                            await self.emit(
+                                "context_resume_failed", task_id=task_id,
+                                generation=generation, reason=reason,
+                            )
+                            self._results[task_id] = TaskResult(
+                                task_id=task_id, status="failed", exit_code=1,
+                                reason=reason, restarts=restarts, summary=worker_summary,
+                            )
+                            return
+                        child_ids = list(outcome.admitted_children)
+                        await self.emit(
+                            "context_resume", task_id=task_id, generation=generation,
+                            epoch=outcome.envelope.get("epoch"),
+                            checkpoint_ref=outcome.envelope.get("checkpoint_ref"),
+                            child_count=len(child_ids),
+                        )
+                        await self._await_suspend_children(task_id, child_ids, remaining)
+                        resume_payload = self._child_results_for_resume(
+                            task_id, child_ids,
+                            checkpoint_ref=outcome.envelope.get("checkpoint_ref"),
+                            epoch=outcome.envelope.get("epoch"),
+                        )
+                        spec["resume"] = resume_payload
+                        spec.pop("context_fork", None)
+                        wall_budget = remaining
+                        continue
                     if envelope_status != "succeeded":
                         failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
                         if failure_reason is None:
@@ -2349,6 +2619,12 @@ class _Runtime:
             # Admission balancing (solution C): the worker presets Diffundo's
             # sticky primary from this value instead of the seeded first pick.
             init_msg["assigned_provider"] = spec["assigned_provider"]
+        if self._context_reuse:
+            init_msg["context_reuse"] = True
+        if isinstance(spec.get("context_fork"), dict):
+            init_msg["context_fork"] = spec["context_fork"]
+        if isinstance(spec.get("resume"), dict):
+            init_msg["resume"] = spec["resume"]
         if encode_message(init_msg) is None:
             await _report_outbound_message_too_long()
             return _GenOutcome(
@@ -2482,6 +2758,9 @@ class _Runtime:
         # waited on and reaped as a terminal worker.
         reuse_ready = False
         keep_alive = False
+        # Cache-first: child task ids admitted at this generation's terminal
+        # envelope, in admission order (deterministic resume ordering).
+        admitted_children: list[str] = []
 
         async def _cancel_and_kill() -> None:
             cancel_msg = {
@@ -2702,15 +2981,20 @@ class _Runtime:
                     # now, when the parent's terminal envelope exists (the
                     # child's context is its own spec plus that envelope).
                     pending = self._pending_children.pop(task_id, [])
+                    admitted: list[str] = []
                     if pending or self._admission_port is not None:
                         parent_envelope = self._redact_envelope(
                             self._strict_envelope(spec, msg)
                         )
                         try:
                             for proposal in pending:
-                                await self._admit_child(spec, proposal, parent_envelope)
+                                admitted.extend(
+                                    await self._admit_child(spec, proposal, parent_envelope)
+                                )
                             if self._admission_port is not None:
-                                await self._admit_port_proposals(spec, parent_envelope)
+                                admitted.extend(
+                                    await self._admit_port_proposals(spec, parent_envelope)
+                                )
                         except ConversationAppendError:
                             reason = "conversation_store_append_failed"
                             await self.emit(
@@ -2728,6 +3012,35 @@ class _Runtime:
                         self._child_envelopes.setdefault(
                             spec["parent_task_id"], []
                         ).append(child_result)
+                        self._child_result_by_task[task_id] = child_result
+                        self._admitted_children.setdefault(
+                            spec["parent_task_id"], []
+                        ).append(task_id)
+                    if admitted:
+                        self._admitted_children.setdefault(task_id, []).extend(admitted)
+                        admitted_children.extend(admitted)
+                elif mtype == "context_checkpoint":
+                    invalid = _invalid_context_checkpoint_fields(msg)
+                    if invalid:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="context_checkpoint rejected: invalid field(s)",
+                            fields=invalid,
+                        )
+                    else:
+                        self._task_epochs[task_id] = dict(msg)
+                        await self.emit(
+                            "context_checkpoint", task_id=task_id, generation=generation,
+                            epoch=msg.get("epoch"), turn=msg.get("turn"),
+                            checkpoint_ref=msg.get("checkpoint_ref"),
+                            cache_key=msg.get("cache_key"),
+                        )
+                elif mtype == "context_fork_skipped":
+                    reason = msg.get("reason")
+                    await self.emit(
+                        "context_fork_skipped", task_id=task_id, generation=generation,
+                        reason=reason,
+                    )
                 elif mtype == "propose_child":
                     invalid_fields = _invalid_propose_child_fields(msg)
                     if invalid_fields:
@@ -2882,7 +3195,8 @@ class _Runtime:
         terminal_verdict = (
             envelope is not None
             and correlated
-            and envelope.get("status") in ("succeeded", "failed", "cancelled")
+            and envelope.get("status")
+            in ("succeeded", "failed", "cancelled", "suspended")
         )
         if reuse_ready and not message_too_long:
             # The worker stays alive and owns no task state; the handle no
@@ -2894,6 +3208,7 @@ class _Runtime:
                 clean=terminal_verdict, fatal=False, reason=None,
                 exit_code=None, exit_reason=None, envelope=envelope,
                 correlated=correlated, reuse_ready=True,
+                admitted_children=tuple(admitted_children),
             )
         exit_code = proc.returncode
         handle.exit_code = exit_code
@@ -2925,7 +3240,7 @@ class _Runtime:
             fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",
             reason=protocol_failure or protocol_reason or reason, timeout_phase=timeout_phase,
             exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
-            correlated=correlated,
+            correlated=correlated, admitted_children=tuple(admitted_children),
         )
 
     # -- publish eligibility --------------------------------------------------
@@ -3842,6 +4157,7 @@ async def run_plan(
     architectus: Any = None,
     conversations: bool | None = None,
     warm_pool_size: int = 0,
+    context_reuse: bool = False,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3958,6 +4274,7 @@ async def run_plan(
             architectus=architectus,
             conversations=conversations_store,
             warm_pool_size=warm_pool_size,
+            context_reuse=context_reuse,
         )
         await runtime.start()
         if routing_state_load_error is not None:
@@ -4078,6 +4395,7 @@ async def _amain_plan(
     *,
     conversations: bool = False,
     warm_pool_size: int = 0,
+    context_reuse: bool = False,
 ) -> int:
     loop = asyncio.get_running_loop()
 
@@ -4091,6 +4409,7 @@ async def _amain_plan(
             on_event=print_event,
             conversations=conversations,
             warm_pool_size=warm_pool_size,
+            context_reuse=context_reuse,
         )
     )
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -4147,6 +4466,12 @@ def main(argv: list[str] | None = None) -> int:
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
     )
+    parser.add_argument(
+        "--context-reuse",
+        action="store_true",
+        help="cache-first context reuse: fork children from parent epoch "
+        "checkpoints and suspend/resume at delegate boundaries (default: off)",
+    )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)
     if args.warm_pool_size < 0:
@@ -4175,6 +4500,7 @@ def main(argv: list[str] | None = None) -> int:
                     plan,
                     conversations=args.conversations,
                     warm_pool_size=args.warm_pool_size,
+                    context_reuse=args.context_reuse,
                 )
             )
         except KeyboardInterrupt:
