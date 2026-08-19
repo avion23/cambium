@@ -1,6 +1,7 @@
 # Cache-first context reuse — implementation plan for immutable cache epochs
 
-**Status: DRAFT — future work, non-normative.** Snapshot base `main@a446345`
+**Status: DRAFT — Phase 1 implemented; Phase 2 measurement tooling implemented;
+live provider evidence remains opt-in.** Snapshot base `main@a446345`
 (`feat(jlens): calibrated layers from falsification (29,41,57,61)`), written
 2026-08-19, worktree `/tmp/opencode/cambium-cache-first`, branch
 `docs/cache-first-context-reuse`. This commit adds this file and one index
@@ -406,7 +407,7 @@ No LLM calls anywhere in the new tests. No compaction, no
 `ConversationStore` writes. Byte-for-byte current behavior when the flags
 are absent.
 
-### Phase 2 — real cache measurement (no behavior change beyond pinning)
+### Phase 2 — real cache measurement (tooling implemented; live evidence pending)
 
 Extend usage events with `epoch` / `fork_of`; add
 `scripts/context_cache_evidence.py`; run one live paired session per chat
@@ -592,6 +593,6 @@ Acceptance metrics:
 ## 15. This commit
 
 Adds this file and the `README.md` index line. Touches no runtime code, no
-tests, no other research notes. Nothing described here is implemented by
-this commit; no claim in this note asserts current runtime behavior beyond
-the cited source.
+tests, no other research notes. This historical docs commit did not implement
+the runtime; later implementation commits now cover Phase 1 and the
+measurement-only Phase 2 evidence tool.
