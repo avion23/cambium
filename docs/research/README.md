@@ -89,6 +89,7 @@ file's own header.
 - [`python-3.14.md`](python-3.14.md) — verified Python 3.14 capabilities for Cambium (historical run).
 - [`replay-restart-design.md`](replay-restart-design.md) — crash-recovery event-log replay and supervisor restart semantics.
 - [`repo-structure-plan.md`](repo-structure-plan.md) — historical repo-structure audit and final layout plan.
+- [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) — future-work research: rolling delta compaction and parent/child context reuse; docs-only, non-normative, supersedes nothing.
 - [`sandbox-options.md`](sandbox-options.md) — superseded sandboxing-options research; runtime has no per-worker containment.
 - [`security-audit.md`](security-audit.md) — read-only security audit of merged implementation vs the threat model.
 - [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — empirical validation of SQLite WAL event-log durability.
