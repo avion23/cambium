@@ -229,9 +229,9 @@ def test_build_agent_prompt_head_passes_d8c_lint() -> None:
 
 
 def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
-    """Design C: a child's system prompt carries the parent's summary, changed
-    files, and commits as a compact block after the Task line, never the
-    parent's raw transcript."""
+    """Design C: a child receives the parent's summary, changed files, and
+    commits as a delimited user-role data block after the transcript, never
+    inside the system message and never the parent's raw transcript."""
     tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
     envelope = {
         "parent_task_id": "parent-1",
@@ -243,13 +243,18 @@ def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
     prompt = worker._build_agent_prompt(
         "continue the work", tools, [], parent_envelope=envelope
     )
-    content = prompt["messages"][0]["content"]
-    head, _, tail = content.rpartition("Task: ")
-    assert tail.startswith("continue the work\nParent task context:")
-    assert "parent summary: added the token budget" in content
-    assert "parent files changed: src/a.py, src/b.py" in content
-    assert "parent commits: abc123" in content
-    assert "parent status: succeeded" in content
+    system_content = prompt["messages"][0]["content"]
+    head, _, tail = system_content.rpartition("Task: ")
+    assert tail.startswith("continue the work")
+    assert "Parent task context:" not in system_content
+    block = prompt["messages"][-1]
+    assert block["role"] == "user"
+    assert block["content"].startswith("<cambium-parent-context>\nParent task context:")
+    assert block["content"].endswith("</cambium-parent-context>")
+    assert "parent summary: added the token budget" in block["content"]
+    assert "parent files changed: src/a.py, src/b.py" in block["content"]
+    assert "parent commits: abc123" in block["content"]
+    assert "parent status: succeeded" in block["content"]
 
 
 def test_parent_envelope_rejects_oversized_and_incomplete_fields() -> None:
@@ -325,7 +330,9 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     assert "tool read_batch ok=True" in observation
     assert "alpha-content" in observation
     assert "beta-content" in observation
-    assert transcript[-1]["content"].startswith('{"type":"finish"')
+    final_action = json.loads(transcript[-1]["content"])
+    assert final_action["type"] == "finish"
+    assert "thought" not in final_action
 
     tool_names = [schema["name"] for schema in worker._exposed_tool_schemas(config)]
     assert "read_batch" in tool_names

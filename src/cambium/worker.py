@@ -297,7 +297,7 @@ _RESUME_KEYS = frozenset({
 })
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PROVIDER_BOUNDARY_KEYS = frozenset({
-    "provider", "endpoint", "auth", "api_key_env", "provider_env_keys",
+    "provider", "endpoint", "authmode", "api_key_env", "provider_env_keys",
     "authorized_providers", "authorized_providers_explicit", "protocol", "model",
     "tier", "reasoning_effort", "provider_config_path",
 })
@@ -315,11 +315,12 @@ def _validate_provider_boundary(value: Any) -> dict[str, Any]:
             details.append(f"missing keys: {missing}")
         if unknown:
             details.append(f"unknown keys: {unknown}")
+        suffix = f" ({'; '.join(details)})" if details else ""
         raise ContextForkError(
-            "provider_boundary has an invalid key set" + (f" ({'; '.join(details)})" if details else "")
+            "provider_boundary has an invalid key set" + suffix
         )
     required_strings = (
-        "provider", "endpoint", "auth", "protocol", "model", "tier",
+        "provider", "endpoint", "authmode", "protocol", "model", "tier",
         "provider_config_path",
     )
     for key in required_strings:
@@ -359,7 +360,7 @@ def _validate_provider_boundary(value: Any) -> dict[str, Any]:
     return {
         "provider": value["provider"],
         "endpoint": value["endpoint"],
-        "auth": value["auth"],
+        "authmode": value["authmode"],
         "api_key_env": api_key_env,
         "provider_env_keys": list(env_keys),
         "authorized_providers": None if authorized is None else list(authorized),
@@ -630,7 +631,7 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
         if len(field) > MAX_ENVELOPE_ITEMS:
             raise ParentEnvelopeError(f"parent_envelope {key!r} exceeds the item cap")
         for item in field:
-        if type(item) is not str:
+            if type(item) is not str:
                 raise ParentEnvelopeError(
                     f"parent_envelope {key!r} must contain only strings"
                 )
@@ -869,8 +870,10 @@ def _provider_router(
     debt: Mapping[str, Any] | None = None,
 ) -> tuple[Diffundo, ProviderTier, str, str]:
     providers = load_providers(_provider_path())
-    if authorized_providers_explicit and not authorized_providers:
-        raise ValueError("authorized_providers is explicitly empty")
+    # An explicitly empty authorized list is the historical "unrestricted"
+    # wire value (the supervisor always sends the key): restriction applies
+    # only to a non-empty list. `authorized_providers_explicit` records the
+    # distinction for the provider-boundary descriptor, nothing more.
     if authorized_providers:
         authorized = frozenset(authorized_providers)
         providers = [provider for provider in providers if provider.name in authorized]
@@ -2162,7 +2165,7 @@ def _default_provider_boundary(
     return {
         "provider": provider or "unknown-provider",
         "endpoint": "unknown-endpoint",
-        "auth": "unknown-auth",
+        "authmode": "unknown-auth",
         "api_key_env": "",
         "provider_env_keys": list(config.provider_env_keys),
         "authorized_providers": (
@@ -2199,7 +2202,7 @@ def _provider_boundary(
     boundary = {
         "provider": name,
         "endpoint": endpoint or "codex-profile",
-        "auth": auth_value,
+        "authmode": auth_value,
         "api_key_env": api_key_env or "",
         "provider_env_keys": list(config.provider_env_keys),
         "authorized_providers": (
@@ -2332,6 +2335,7 @@ def _write_epoch_checkpoint(
     code_changed: bool = False,
     verified_after_change: bool = False,
     verification_failed: bool = False,
+    no_progress_actions: int = 0,
     budget_new_tokens: int = 0,
     previous_prompt_tokens: int = 0,
     cumulative_usage: Mapping[str, int] | None = None,
@@ -2369,6 +2373,7 @@ def _write_epoch_checkpoint(
     for name, value in (
         ("budget_new_tokens", budget_new_tokens),
         ("previous_prompt_tokens", previous_prompt_tokens),
+        ("no_progress_actions", no_progress_actions),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ContextForkError(f"checkpoint {name} must be a non-negative integer")
@@ -2425,6 +2430,7 @@ def _write_epoch_checkpoint(
     checkpoint = ContextCheckpoint(
         schema=CHECKPOINT_EPOCH_SCHEMA,
         task_id=config.task_id,
+        generation=config.generation,
         epoch=epoch,
         turn=turn,
         created_at=created_at if created_at is not None else time.time(),
@@ -2435,25 +2441,35 @@ def _write_epoch_checkpoint(
         code_changed=code_changed,
         verified_after_change=verified_after_change,
         verification_failed=verification_failed,
+        no_progress_actions=no_progress_actions,
         budget_new_tokens=budget_new_tokens,
         previous_prompt_tokens=previous_prompt_tokens,
         cumulative_usage=dict(cumulative_usage),
         wall_deadline=float(wall_deadline),
     )
     raw = asdict(checkpoint)
-    raw_json = json.dumps(raw, sort_keys=True)
-    address = _sha256_hex(raw_json.encode("utf-8"))[:16]
+    address_pre = _checkpoint_address(raw)
     safe_task = _safe_task_id(config.task_id)
-    checkpoint = replace(checkpoint, checkpoint_ref=f"{safe_task}/epoch-{epoch:03d}-{address}.json")
-    directory = config.checkpoint_root / safe_task
-    path = directory / f"epoch-{epoch:03d}-{address}.json"
+    prefix = f"epoch-{epoch:03d}-{address_pre}"
+    placeholder_ref = f"{safe_task}/{prefix}-{'0' * 16}.json"
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
-    payload = redactor.redact_mapping(asdict(checkpoint))
-    redacted = json.dumps(payload, sort_keys=True) != json.dumps(asdict(checkpoint), sort_keys=True)
+    payload = redactor.redact_mapping(asdict(replace(
+        checkpoint, checkpoint_ref=placeholder_ref,
+    )))
+    redacted = payload != asdict(replace(checkpoint, checkpoint_ref=placeholder_ref))
     if redacted:
         payload["cache_key"]["redacted"] = True
+    address_persisted = _checkpoint_address(payload)
+    checkpoint_ref = f"{safe_task}/{prefix}-{address_persisted}.json"
+    payload["checkpoint_ref"] = checkpoint_ref
+    directory = config.checkpoint_root / safe_task
+    path = directory / f"{prefix}-{address_persisted}.json"
     _create_epoch_checkpoint(path, json.dumps(payload, sort_keys=True, indent=2))
-    return replace(checkpoint, cache_key=replace(checkpoint.cache_key, redacted=redacted))
+    return replace(
+        checkpoint,
+        checkpoint_ref=checkpoint_ref,
+        cache_key=replace(checkpoint.cache_key, redacted=redacted),
+    )
 
 
 async def _emit_context_checkpoint(
@@ -2506,14 +2522,12 @@ def _load_epoch_checkpoint(
     root = root.resolve()
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
         raise ContextForkError("invalid checkpoint_ref")
-    relative = Path(checkpoint_ref)
-    if (
-        relative.is_absolute()
-        or len(relative.parts) != 2
-        or relative.parts[0] != _safe_task_id(config.task_id)
-        or not re.fullmatch(r"epoch-[0-9]{3,}-[0-9a-f]{16}\.json", relative.parts[1])
-    ):
+    task_component, ref_epoch, _address_pre, address_persisted = (
+        _validate_checkpoint_ref_shape(checkpoint_ref)
+    )
+    if expect_task_id and task_component != _safe_task_id(config.task_id):
         raise ContextForkError("invalid checkpoint_ref path")
+    relative = Path(checkpoint_ref)
     current = root
     for part in relative.parts:
         current = current / part
@@ -2540,12 +2554,16 @@ def _load_epoch_checkpoint(
         ) from exc
     if not isinstance(data, dict):
         raise ContextForkError("checkpoint is not an object")
+    if _checkpoint_address(data) != address_persisted:
+        raise ContextForkError("checkpoint persisted-address mismatch")
+    if data.get("epoch") != ref_epoch:
+        raise ContextForkError("checkpoint epoch does not match its filename")
     expected_keys = frozenset({
-        "schema", "task_id", "epoch", "turn", "created_at", "cache_key",
-        "provider_messages", "continuation_suffix", "checkpoint_ref",
+        "schema", "task_id", "generation", "epoch", "turn", "created_at",
+        "cache_key", "provider_messages", "continuation_suffix", "checkpoint_ref",
         "code_changed", "verified_after_change", "verification_failed",
-        "budget_new_tokens", "previous_prompt_tokens", "cumulative_usage",
-        "wall_deadline",
+        "no_progress_actions", "budget_new_tokens", "previous_prompt_tokens",
+        "cumulative_usage", "wall_deadline",
     })
     if set(data) != expected_keys:
         raise ContextForkError("checkpoint has an invalid key set")
@@ -2557,6 +2575,11 @@ def _load_epoch_checkpoint(
         raise ContextForkError("checkpoint task_id mismatch")
     if data.get("checkpoint_ref") != checkpoint_ref:
         raise ContextForkError("checkpoint_ref mismatch")
+    generation = data.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise ContextForkError("checkpoint generation invalid")
+    if expect_task_id and generation != config.generation:
+        raise ContextForkError("checkpoint generation mismatch")
     epoch = data.get("epoch")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
         raise ContextForkError("checkpoint epoch invalid")
@@ -2645,7 +2668,9 @@ def _load_epoch_checkpoint(
     for key in ("code_changed", "verified_after_change", "verification_failed"):
         if type(data.get(key)) is not bool:
             raise ContextForkError(f"checkpoint {key} invalid")
-    for key in ("budget_new_tokens", "previous_prompt_tokens"):
+    for key in (
+        "budget_new_tokens", "previous_prompt_tokens", "no_progress_actions"
+    ):
         value = data.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ContextForkError(f"checkpoint {key} invalid")
@@ -2673,6 +2698,7 @@ def _load_epoch_checkpoint(
     return ContextCheckpoint(
         schema=CHECKPOINT_EPOCH_SCHEMA,
         task_id=data["task_id"],
+        generation=generation,
         epoch=epoch,
         turn=turn,
         created_at=float(created_at),
@@ -2683,6 +2709,7 @@ def _load_epoch_checkpoint(
         code_changed=data["code_changed"],
         verified_after_change=data["verified_after_change"],
         verification_failed=data["verification_failed"],
+        no_progress_actions=data["no_progress_actions"],
         budget_new_tokens=data["budget_new_tokens"],
         previous_prompt_tokens=data["previous_prompt_tokens"],
         cumulative_usage=dict(usage),
@@ -3344,6 +3371,7 @@ async def _run_agent_loop(
                     code_changed=code_changed,
                     verified_after_change=verified_after_change,
                     verification_failed=verification_failed,
+                    no_progress_actions=no_progress_actions,
                     budget_new_tokens=budget_new_tokens,
                     previous_prompt_tokens=previous_prompt_tokens,
                     cumulative_usage=cumulative_usage,

@@ -207,10 +207,30 @@ def _write_epoch(
             json.dumps(worker._exposed_tool_schemas(config), sort_keys=True).encode("utf-8")
         ),
         provider_compat={provider: ("loopback", None)},
-        last_prompt_tokens=7,
     )
     assert checkpoint is not None
     return checkpoint
+
+
+_DIGEST = "a" * 64
+_REF = f"epoch-agent/epoch-001-{'a' * 16}-{'b' * 16}.json"
+
+
+def _provider_boundary(provider: str = "p1", model: str = "m1") -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "endpoint": "https://api.example",
+        "authmode": "api_key",
+        "api_key_env": "PROVIDER_KEY",
+        "provider_env_keys": ["PROVIDER_KEY"],
+        "authorized_providers": [provider],
+        "authorized_providers_explicit": True,
+        "protocol": "openai",
+        "model": model,
+        "tier": "fast",
+        "reasoning_effort": None,
+        "provider_config_path": "/opt/cambium/providers.json",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +238,18 @@ def _write_epoch(
 # ---------------------------------------------------------------------------
 
 def test_validate_context_fork_strict_keys() -> None:
-    digest = "a" * 64
+    digest = _DIGEST
     valid = {
-        "checkpoint_ref": "epoch-agent/epoch-001-abc.json",
+        "checkpoint_ref": _REF,
         "provider": "p1",
         "model": "m1",
         "system_sha256": digest,
         "tools_sha256": digest,
+        "prefix_sha256": digest,
+        "suffix_sha256": digest,
+        "full_sha256": digest,
         "prefix_bytes": 123,
-        "messages_sha256": digest,
+        "provider_boundary": _provider_boundary(),
     }
     assert worker._validate_context_fork(valid) == valid
     assert worker._validate_context_fork(None) is None
@@ -235,19 +258,23 @@ def test_validate_context_fork_strict_keys() -> None:
         worker._validate_context_fork({**valid, "sneaky": 1})
     with pytest.raises(ContextForkError, match="checkpoint_ref"):
         worker._validate_context_fork({**valid, "checkpoint_ref": ""})
+    with pytest.raises(ContextForkError, match="checkpoint_ref"):
+        worker._validate_context_fork({**valid, "checkpoint_ref": "epoch-agent/../evil.json"})
     with pytest.raises(ContextForkError, match="model"):
         worker._validate_context_fork({**valid, "model": ""})
     with pytest.raises(ContextForkError, match="sha256"):
         worker._validate_context_fork({**valid, "system_sha256": "not-hex"})
     with pytest.raises(ContextForkError, match="prefix_bytes"):
         worker._validate_context_fork({**valid, "prefix_bytes": -1})
+    with pytest.raises(ContextForkError, match="provider_boundary"):
+        worker._validate_context_fork({**valid, "provider_boundary": {"provider": "p1"}})
     with pytest.raises(ContextForkError, match="object"):
         worker._validate_context_fork("bogus")  # type: ignore[arg-type]
 
 
 def test_validate_resume_strict() -> None:
     payload = {
-        "checkpoint_ref": "epoch-agent/epoch-001-abc.json",
+        "checkpoint_ref": _REF,
         "epoch": 1,
         "child_results": [_strict_child_envelope()],
         "child_results_truncated": False,
@@ -282,24 +309,36 @@ def test_epoch_checkpoint_roundtrip_and_tamper(tmp_path: Path) -> None:
     assert loaded.cache_key == checkpoint.cache_key
     assert loaded.checkpoint_ref == checkpoint.checkpoint_ref
 
-    with pytest.raises(ContextForkError, match="task_id mismatch"):
+    with pytest.raises(ContextForkError, match="task_id mismatch|invalid checkpoint_ref path"):
         worker._load_epoch_checkpoint(
             _agent_config(tmp_path / "wt", task_id="other", checkpoint_root=tmp_path / "ckpts"),
             checkpoint.checkpoint_ref, expect_task_id=True,
         )
 
+    with pytest.raises(ContextForkError, match="generation mismatch"):
+        worker._load_epoch_checkpoint(
+            _agent_config(
+                tmp_path / "wt", checkpoint_root=tmp_path / "ckpts",
+                generation=2,
+            ),
+            checkpoint.checkpoint_ref, expect_task_id=True,
+        )
+
     path = tmp_path / "ckpts" / checkpoint.checkpoint_ref
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["transcript"] = [{"role": "user", "content": "tampered"}]
+    data["provider_messages"][1]["content"] = "tampered"
     path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-    with pytest.raises(ContextForkError, match="messages_sha256 mismatch"):
+    with pytest.raises(
+        ContextForkError, match="persisted-address mismatch|prefix_sha256 mismatch"
+    ):
         worker._load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
 
     with pytest.raises(ContextForkError, match="unreadable"):
         worker._load_epoch_checkpoint(
-            config, "epoch-agent/missing.json", expect_task_id=True
+            config, f"epoch-agent/epoch-001-{'c' * 16}-{'d' * 16}.json",
+            expect_task_id=True,
         )
-    with pytest.raises(ContextForkError, match="escapes"):
+    with pytest.raises(ContextForkError, match="invalid checkpoint_ref path"):
         worker._load_epoch_checkpoint(config, "../evil.json", expect_task_id=True)
 
 
@@ -328,12 +367,15 @@ def test_fork_cache_compatible_matrix() -> None:
     tools_sha = worker._provider_task_tools_hash()
     epoch = {
         "epoch": 1,
-        "checkpoint_ref": "r/epoch-001.json",
+        "checkpoint_ref": _REF,
         "cache_key": {
             "provider": "fake-provider",
             "model": "fake-model",
+            "protocol": "loopback",
+            "reasoning_effort": None,
             "tools_sha256": tools_sha,
             "redacted": False,
+            "provider_boundary": _provider_boundary("fake-provider", "fake-model"),
         },
     }
     child = {
@@ -361,6 +403,18 @@ def test_fork_cache_compatible_matrix() -> None:
         epoch, frozenset({"fake-provider"}),
     )
     assert not incompatible and "model differs" in (reason or "")
+
+    incompatible, reason = worker._fork_cache_compatible(
+        {**child, "fanout_config": {"model": "fake-model", "protocol": "other"}},
+        epoch, frozenset({"fake-provider"}),
+    )
+    assert not incompatible and "protocol differs" in (reason or "")
+
+    incompatible, reason = worker._fork_cache_compatible(
+        {**child, "fanout_config": {"model": "fake-model", "reasoning_effort": "high"}},
+        epoch, frozenset({"fake-provider"}),
+    )
+    assert not incompatible and "reasoning" in (reason or "")
 
     incompatible, reason = worker._fork_cache_compatible(
         child, {**epoch, "cache_key": {**epoch["cache_key"], "redacted": True}},
@@ -511,18 +565,24 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
             "model": cache_key.model,
             "system_sha256": cache_key.system_sha256,
             "tools_sha256": cache_key.tools_sha256,
+            "prefix_sha256": cache_key.prefix_sha256,
+            "suffix_sha256": cache_key.suffix_sha256,
+            "full_sha256": cache_key.full_sha256,
             "prefix_bytes": cache_key.prefix_bytes,
-            "messages_sha256": cache_key.messages_sha256,
+            "provider_boundary": cache_key.provider_boundary,
         },
     )
     writer = _FakeWriter()
     router = _ScriptedRouter(['{"type":"finish","summary":"forked and done"}'])
 
-    outcome = asyncio.run(_drive_loop(fork_config, worktree, router, writer))
+    outcome = asyncio.run(
+        _drive_loop(fork_config, worktree, router, writer)
+    )
 
     assert outcome["status"] == "succeeded"
     first = router.prompts[0]["messages"]
     assert first[0] == checkpoint.system_message
+    assert first[: len(checkpoint.full_messages)] == checkpoint.full_messages
     assert first[1:] == [*checkpoint.transcript, {
         "role": "user", "content": "Child task: read the files and finish",
     }]
@@ -533,17 +593,21 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
 
 
 def test_fork_fallback_reports_skip(tmp_path: Path) -> None:
+    missing_ref = f"epoch-agent/epoch-001-{'c' * 16}-{'d' * 16}.json"
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
         worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
         context_fork={
-            "checkpoint_ref": "epoch-agent/epoch-001-missing.json",
+            "checkpoint_ref": missing_ref,
             "provider": "loopback-provider",
             "model": "loopback-model",
-            "system_sha256": "a" * 64,
-            "tools_sha256": "b" * 64,
+            "system_sha256": _DIGEST,
+            "tools_sha256": _DIGEST,
+            "prefix_sha256": _DIGEST,
+            "suffix_sha256": _DIGEST,
+            "full_sha256": _DIGEST,
             "prefix_bytes": 0,
-            "messages_sha256": "c" * 64,
+            "provider_boundary": _provider_boundary("loopback-provider", "loopback-model"),
         },
     )
     writer = _FakeWriter()
@@ -792,7 +856,22 @@ def _write_suspend_worker(path: Path) -> None:
         "          'child_task_id': proposal['child_task_id'],\n"
         "          'kind': proposal['kind'], 'spec': proposal['spec']})\n"
         "    checkpoint_ref = os.environ.get(\n"
-        "        'FAKE_CHECKPOINT_REF', task_id + '/epoch-001-test.json')\n"
+        "        'FAKE_CHECKPOINT_REF', task_id + '/epoch-001-"
+        + ('a' * 16) + '-' + ('b' * 16) + ".json')\n"
+        "    boundary = {\n"
+        "        'provider': os.environ.get('FAKE_EPOCH_PROVIDER', 'fake-provider'),\n"
+        "        'endpoint': 'https://api.example',\n"
+        "        'authmode': 'api_key',\n"
+        "        'api_key_env': 'FAKE_KEY',\n"
+        "        'provider_env_keys': [],\n"
+        "        'authorized_providers': None,\n"
+        "        'authorized_providers_explicit': False,\n"
+        "        'protocol': 'loopback',\n"
+        "        'model': os.environ.get('FAKE_EPOCH_MODEL', 'fake-model'),\n"
+        "        'tier': 'fast',\n"
+        "        'reasoning_effort': None,\n"
+        "        'provider_config_path': '/opt/cambium/providers.json',\n"
+        "    }\n"
         "    send({'type': 'context_checkpoint', 'task_id': task_id,\n"
         "          'generation': init.get('generation', 1), 'epoch': 1, 'turn': 1,\n"
         "          'checkpoint_ref': checkpoint_ref,\n"
@@ -803,10 +882,14 @@ def _write_suspend_worker(path: Path) -> None:
         "              'reasoning_effort': None,\n"
         "              'system_sha256': os.environ.get('FAKE_SYSTEM_SHA', 'a' * 64),\n"
         "              'tools_sha256': os.environ.get('FAKE_TOOLS_SHA', 'b' * 64),\n"
+        "              'prefix_sha256': 'd' * 64,\n"
+        "              'suffix_sha256': 'e' * 64,\n"
+        "              'full_sha256': 'f' * 64,\n"
         "              'prefix_bytes': 0,\n"
         "              'messages_sha256': os.environ.get('FAKE_MESSAGES_SHA', 'c' * 64),\n"
         "              'message_count': 1,\n"
         "              'redacted': False,\n"
+        "              'provider_boundary': boundary,\n"
         "          }})\n"
         "    send({'type': 'result_envelope', 'request_id': run_rid,\n"
         "          'task_id': task_id, 'generation': init.get('generation', 1),\n"
