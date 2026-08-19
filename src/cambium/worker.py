@@ -106,12 +106,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import math
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -119,7 +121,7 @@ import threading
 import time
 import zlib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any
@@ -133,6 +135,7 @@ from cambium.diffundo import (
     ProviderError,
     ProviderTier,
     prompt_prefix_bytes,
+    validate_prompt_structure,
 )
 from cambium.fencing import is_cache_artifact_path, validate_worker_generation
 from cambium.ipc import (
@@ -168,6 +171,8 @@ MAX_TRANSCRIPT_CHARS = 120_000
 TRANSCRIPT_KEEP_TURNS = 6
 MAX_ENVELOPE_FIELD_CHARS = 2_000
 MAX_ENVELOPE_ITEMS = 16
+MAX_CONTEXT_MESSAGES = 512
+CHECKPOINT_EPOCH_SCHEMA = 4
 
 
 class TaskStatus(StrEnum):
@@ -176,6 +181,7 @@ class TaskStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SUSPENDED = "suspended"
 
 
 class WorkerExitCode(IntEnum):
@@ -183,18 +189,21 @@ class WorkerExitCode(IntEnum):
 
     The worker reports ``status`` as the domain verdict; ``exit_code`` is the
     numeric encoding the supervisor reads off the wire. ``SUCCEEDED`` is 0 and
-    ``FAILED`` is 1; ``CANCELLED`` is 4 (a distinct non-success code so the
-    supervisor never misreads a cancelled task as a plain failure).
+    ``FAILED`` is 1; ``CANCELLED`` is 4 and ``SUSPENDED`` is 3 (distinct
+    non-success codes so the supervisor never misreads a suspended or
+    cancelled task as a plain failure).
     """
 
     SUCCEEDED = 0
     FAILED = 1
+    SUSPENDED = 3
     CANCELLED = 4
 
 
 _EXIT_CODE_BY_STATUS: Mapping[str, int] = {
     TaskStatus.SUCCEEDED.value: WorkerExitCode.SUCCEEDED,
     TaskStatus.FAILED.value: WorkerExitCode.FAILED,
+    TaskStatus.SUSPENDED.value: WorkerExitCode.SUSPENDED,
     TaskStatus.CANCELLED.value: WorkerExitCode.CANCELLED,
 }
 
@@ -203,6 +212,285 @@ def _exit_code_for(status: str) -> int:
     """Resolve one envelope status to its numeric exit code (fail-closed)."""
     code = _EXIT_CODE_BY_STATUS.get(status)
     return code if code is not None else WorkerExitCode.FAILED
+
+
+@dataclass(frozen=True, slots=True)
+class CacheKeyDescriptor:
+    """Compatibility contract for forking one epoch checkpoint (plan §5.2).
+
+    ``provider`` is the served provider of the turn that cut the epoch; the
+    model is the configured slug, never a response slug. ``prefix_sha256``
+    hashes the exact provider-sent message list at the boundary;
+    ``suffix_sha256`` hashes the post-response continuation kept separately;
+    and ``full_sha256`` hashes their concatenation. A fork appends another
+    user message, so its full hash is different from this checkpoint hash.
+    ``redacted`` records whether the session redactor altered any byte of the
+    persisted checkpoint; a redacted checkpoint is forkable for context
+    continuity but never byte-guaranteed for provider-cache reuse.
+    """
+
+    provider: str | None
+    model: str
+    protocol: str
+    reasoning_effort: str | None
+    system_sha256: str
+    tools_sha256: str
+    prefix_sha256: str
+    suffix_sha256: str
+    full_sha256: str
+    prefix_bytes: int
+    message_count: int
+    redacted: bool
+    provider_boundary: dict[str, Any]
+
+@dataclass(frozen=True, slots=True)
+class ContextCheckpoint:
+    """Immutable content-addressed epoch checkpoint (plan §5.2).
+
+    Holds the exact message list the parent sent at a safe provider-turn
+    boundary and a separate post-response continuation suffix. Fork and resume
+    builders append that suffix before their child/result envelope.
+    """
+
+    schema: int
+    task_id: str
+    generation: int
+    epoch: int
+    turn: int
+    created_at: float
+    cache_key: CacheKeyDescriptor
+    provider_messages: list[dict[str, Any]]
+    continuation_suffix: list[dict[str, Any]]
+    checkpoint_ref: str
+    code_changed: bool
+    verified_after_change: bool
+    verification_failed: bool
+    no_progress_actions: int
+    budget_new_tokens: int
+    previous_prompt_tokens: int
+    cumulative_usage: dict[str, int]
+    wall_deadline: float
+
+    @property
+    def system_message(self) -> dict[str, Any]:
+        """First-pass compatibility view of the provider message list."""
+        return self.provider_messages[0]
+
+    @property
+    def transcript(self) -> list[dict[str, Any]]:
+        """First-pass compatibility view without the continuation suffix."""
+        return self.provider_messages[1:]
+
+    @property
+    def full_messages(self) -> list[dict[str, Any]]:
+        """The immutable checkpoint context before a fork/resume envelope."""
+        return [*self.provider_messages, *self.continuation_suffix]
+
+
+_FORK_DESCRIPTOR_KEYS = frozenset({
+    "checkpoint_ref", "provider", "model", "system_sha256", "tools_sha256",
+    "prefix_sha256", "suffix_sha256", "full_sha256", "prefix_bytes",
+    "provider_boundary",
+})
+_RESUME_KEYS = frozenset({
+    "checkpoint_ref", "epoch", "child_results", "child_results_truncated",
+})
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
+_PROVIDER_BOUNDARY_KEYS = frozenset({
+    "provider", "endpoint", "authmode", "api_key_env", "provider_env_keys",
+    "authorized_providers", "authorized_providers_explicit", "protocol", "model",
+    "tier", "reasoning_effort", "provider_config_path",
+})
+
+
+def _validate_provider_boundary(value: Any) -> dict[str, Any]:
+    """Validate the non-secret provider boundary carried by a context fork."""
+    if not isinstance(value, dict):
+        raise ContextForkError("provider_boundary must be an object")
+    if set(value) != _PROVIDER_BOUNDARY_KEYS:
+        missing = sorted(_PROVIDER_BOUNDARY_KEYS - set(value))
+        unknown = sorted(set(value) - _PROVIDER_BOUNDARY_KEYS)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing keys: {missing}")
+        if unknown:
+            details.append(f"unknown keys: {unknown}")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        raise ContextForkError(
+            "provider_boundary has an invalid key set" + suffix
+        )
+    required_strings = (
+        "provider", "endpoint", "authmode", "protocol", "model", "tier",
+        "provider_config_path",
+    )
+    for key in required_strings:
+        item = value.get(key)
+        if not isinstance(item, str) or not item:
+            raise ContextForkError(f"provider_boundary {key!r} must be a non-empty string")
+    api_key_env = value.get("api_key_env")
+    if not isinstance(api_key_env, str):
+        raise ContextForkError("provider_boundary 'api_key_env' must be a string")
+    env_keys = value.get("provider_env_keys")
+    if (
+        not isinstance(env_keys, list)
+        or not all(isinstance(item, str) and item for item in env_keys)
+        or len(set(env_keys)) != len(env_keys)
+    ):
+        raise ContextForkError("provider_boundary 'provider_env_keys' must be unique strings")
+    authorized = value.get("authorized_providers")
+    if authorized is not None and (
+        not isinstance(authorized, list)
+        or not all(isinstance(item, str) and item for item in authorized)
+        or len(set(authorized)) != len(authorized)
+        or len(authorized) > MAX_ENVELOPE_ITEMS
+    ):
+        raise ContextForkError(
+            "provider_boundary 'authorized_providers' must be a string list or null"
+        )
+    explicit = value.get("authorized_providers_explicit")
+    if type(explicit) is not bool:
+        raise ContextForkError(
+            "provider_boundary 'authorized_providers_explicit' must be a boolean"
+        )
+    reasoning = value.get("reasoning_effort")
+    if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
+        raise ContextForkError(
+            "provider_boundary 'reasoning_effort' must be a string or null"
+        )
+    return {
+        "provider": value["provider"],
+        "endpoint": value["endpoint"],
+        "authmode": value["authmode"],
+        "api_key_env": api_key_env,
+        "provider_env_keys": list(env_keys),
+        "authorized_providers": None if authorized is None else list(authorized),
+        "authorized_providers_explicit": explicit,
+        "protocol": value["protocol"],
+        "model": value["model"],
+        "tier": value["tier"],
+        "reasoning_effort": reasoning,
+        "provider_config_path": value["provider_config_path"],
+    }
+
+
+class ContextForkError(ValueError):
+    """A context fork or resume could not be constructed safely."""
+
+
+def _validate_context_fork(value: Any) -> dict[str, Any] | None:
+    """Strictly validate the init ``context_fork`` descriptor, or return None.
+
+    Exactly the context-fork key set is accepted; any unknown key or malformed
+    value is fatal (mirrors ``_validate_parent_envelope`` posture). A child
+    that receives an invalid descriptor must never guess at a prefix.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ContextForkError("context_fork must be an object")
+    if set(value) != _FORK_DESCRIPTOR_KEYS:
+        missing = sorted(_FORK_DESCRIPTOR_KEYS - set(value))
+        unknown = sorted(set(value) - _FORK_DESCRIPTOR_KEYS)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing keys: {missing}")
+        if unknown:
+            details.append(f"unknown keys: {unknown}")
+        raise ContextForkError(
+            "context_fork has an invalid key set"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
+    checkpoint_ref = value.get("checkpoint_ref")
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        raise ContextForkError("context_fork 'checkpoint_ref' must be a non-empty string")
+    _validate_checkpoint_ref_shape(checkpoint_ref)
+    provider = value.get("provider")
+    if provider is not None and not (isinstance(provider, str) and provider):
+        raise ContextForkError("context_fork 'provider' must be a string or null")
+    model = value.get("model")
+    if not isinstance(model, str) or not model:
+        raise ContextForkError("context_fork 'model' must be a non-empty string")
+    for key in (
+        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+        "full_sha256",
+    ):
+        digest = value.get(key)
+        if not isinstance(digest, str) or _SHA256_HEX_RE.match(digest) is None:
+            raise ContextForkError(f"context_fork {key!r} must be a sha256 hex digest")
+    prefix_bytes = value.get("prefix_bytes")
+    if isinstance(prefix_bytes, bool) or not isinstance(prefix_bytes, int) or prefix_bytes < 0:
+        raise ContextForkError("context_fork 'prefix_bytes' must be a non-negative integer")
+    boundary = _validate_provider_boundary(value.get("provider_boundary"))
+    return {
+        "checkpoint_ref": checkpoint_ref,
+        "provider": provider,
+        "model": model,
+        "system_sha256": value["system_sha256"],
+        "tools_sha256": value["tools_sha256"],
+        "prefix_sha256": value["prefix_sha256"],
+        "suffix_sha256": value["suffix_sha256"],
+        "full_sha256": value["full_sha256"],
+        "prefix_bytes": prefix_bytes,
+        "provider_boundary": boundary,
+    }
+
+
+def _validate_resume(value: Any) -> dict[str, Any] | None:
+    """Strictly validate the run_task ``resume`` payload, or return None.
+
+    Exactly the plan §9 key set is accepted. Each child envelope is validated
+    as a strict parent envelope and the list is bounded by
+    ``MAX_ENVELOPE_ITEMS``; anything else is a supervisor/corruption defect
+    and fails closed.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ContextForkError("resume must be an object")
+    if set(value) != _RESUME_KEYS:
+        missing = sorted(_RESUME_KEYS - set(value))
+        unknown = sorted(set(value) - _RESUME_KEYS)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing keys: {missing}")
+        if unknown:
+            details.append(f"unknown keys: {unknown}")
+        raise ContextForkError(
+            "resume has an invalid key set"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
+    checkpoint_ref = value.get("checkpoint_ref")
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        raise ContextForkError("resume 'checkpoint_ref' must be a non-empty string")
+    _validate_checkpoint_ref_shape(checkpoint_ref)
+    epoch = value.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+        raise ContextForkError("resume 'epoch' must be a positive integer")
+    child_results = value.get("child_results")
+    if not isinstance(child_results, list):
+        raise ContextForkError("resume 'child_results' must be a list")
+    if len(child_results) > MAX_ENVELOPE_ITEMS:
+        raise ContextForkError("resume 'child_results' exceeds the item cap")
+    validated_results: list[dict[str, Any]] = []
+    for index, result in enumerate(child_results):
+        try:
+            validated = _validate_parent_envelope(result)
+        except ParentEnvelopeError as exc:
+            raise ContextForkError(
+                f"resume 'child_results[{index}]' is not a strict envelope: {exc}"
+            ) from exc
+        if validated is None:
+            raise ContextForkError(f"resume 'child_results[{index}]' must be a strict envelope")
+        validated_results.append(validated)
+    truncated = value.get("child_results_truncated")
+    if type(truncated) is not bool:
+        raise ContextForkError("resume 'child_results_truncated' must be a boolean")
+    return {
+        "checkpoint_ref": checkpoint_ref,
+        "epoch": epoch,
+        "child_results": validated_results,
+        "child_results_truncated": truncated,
+    }
 
 
 INSPECTION_GIT_OPS = frozenset({"status", "diff", "log"})
@@ -254,6 +542,35 @@ _ENVELOPE_KEYS = frozenset(
 )
 
 
+def _validate_finite_json(value: Any, location: str, *, depth: int = 0) -> None:
+    """Validate bounded JSON data without accepting NaN, infinity, or bool ints."""
+    if depth > 8:
+        raise ParentEnvelopeError(f"{location} is nested too deeply")
+    if value is None or type(value) is bool or type(value) is str:
+        return
+    if type(value) is int:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ParentEnvelopeError(f"{location} must be finite")
+        return
+    if type(value) is list:
+        if len(value) > MAX_ENVELOPE_ITEMS:
+            raise ParentEnvelopeError(f"{location} exceeds the item cap")
+        for index, item in enumerate(value):
+            _validate_finite_json(item, f"{location}[{index}]", depth=depth + 1)
+        return
+    if type(value) is dict:
+        if len(value) > MAX_ENVELOPE_ITEMS:
+            raise ParentEnvelopeError(f"{location} exceeds the item cap")
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ParentEnvelopeError(f"{location} keys must be strings")
+            _validate_finite_json(item, f"{location}.{key}", depth=depth + 1)
+        return
+    raise ParentEnvelopeError(f"{location} contains an unsupported JSON value")
+
+
 def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
     """Validate a strict-key parent envelope, or return None for no parent.
 
@@ -271,13 +588,22 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
         raise ParentEnvelopeError(
             f"parent_envelope must be an object, got {type(value).__name__}"
         )
-    unknown = sorted(set(value) - _ENVELOPE_KEYS)
-    if unknown:
-        raise ParentEnvelopeError(f"parent_envelope has unknown keys: {unknown}")
+    if set(value) != _ENVELOPE_KEYS:
+        missing = sorted(_ENVELOPE_KEYS - set(value))
+        unknown = sorted(set(value) - _ENVELOPE_KEYS)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing keys: {missing}")
+        if unknown:
+            details.append(f"unknown keys: {unknown}")
+        raise ParentEnvelopeError(
+            "parent_envelope has an invalid key set"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
     validated: dict[str, Any] = {}
     parent_task_id = value.get("parent_task_id", _MISSING)
     if parent_task_id is _MISSING or not (
-        parent_task_id is None or isinstance(parent_task_id, str)
+        parent_task_id is None or (type(parent_task_id) is str and bool(parent_task_id))
     ):
         raise ParentEnvelopeError(
             "parent_envelope 'parent_task_id' must be a string or null"
@@ -287,7 +613,7 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
         field = value.get(key, _MISSING)
         if field is _MISSING:
             raise ParentEnvelopeError(f"parent_envelope missing required key {key!r}")
-        if not isinstance(field, str):
+        if type(field) is not str:
             raise ParentEnvelopeError(
                 f"parent_envelope {key!r} must be a string, got {type(field).__name__}"
             )
@@ -305,7 +631,7 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
         if len(field) > MAX_ENVELOPE_ITEMS:
             raise ParentEnvelopeError(f"parent_envelope {key!r} exceeds the item cap")
         for item in field:
-            if not isinstance(item, str):
+            if type(item) is not str:
                 raise ParentEnvelopeError(
                     f"parent_envelope {key!r} must contain only strings"
                 )
@@ -315,22 +641,30 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
                 )
         validated[key] = list(field)
     diff_truncated = value.get("diff_truncated", _MISSING)
-    if not isinstance(diff_truncated, bool):
+    if type(diff_truncated) is not bool:
         raise ParentEnvelopeError("parent_envelope 'diff_truncated' must be a boolean")
     validated["diff_truncated"] = diff_truncated
     metric_score = value.get("metric_score", _MISSING)
-    if metric_score is _MISSING or isinstance(metric_score, bool) or not (
-        metric_score is None or isinstance(metric_score, (int, float))
+    if metric_score is _MISSING or not (
+        metric_score is None
+        or (
+            type(metric_score) in (int, float)
+            and not isinstance(metric_score, bool)
+            and (type(metric_score) is int or math.isfinite(metric_score))
+        )
     ):
         raise ParentEnvelopeError(
             "parent_envelope 'metric_score' must be a number or null"
         )
     validated["metric_score"] = metric_score
     metric_breakdown = value.get("metric_breakdown", _MISSING)
-    if not isinstance(metric_breakdown, dict):
+    if type(metric_breakdown) is not dict:
         raise ParentEnvelopeError("parent_envelope 'metric_breakdown' must be an object")
+    _validate_finite_json(metric_breakdown, "parent_envelope.metric_breakdown")
     try:
-        encoded_breakdown = json.dumps(metric_breakdown, sort_keys=True).encode("utf-8")
+        encoded_breakdown = json.dumps(
+            metric_breakdown, sort_keys=True, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise ParentEnvelopeError(
             "parent_envelope 'metric_breakdown' must contain JSON values"
@@ -445,9 +779,17 @@ def _provider_fanout_config(run: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _provider_env_keys(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
+    if value is None:
         return ()
-    return tuple(key for key in value if isinstance(key, str))
+    if type(value) not in (list, tuple):
+        raise ValueError("provider environment keys must be a list")
+    if len(value) > MAX_ENVELOPE_ITEMS:
+        raise ValueError("provider environment keys exceed the item cap")
+    if not all(type(key) is str and key for key in value):
+        raise ValueError("provider environment keys must contain non-empty strings")
+    if len(set(value)) != len(value):
+        raise ValueError("provider environment keys must be unique")
+    return tuple(value)
 
 
 def _checkpoint_redactor(
@@ -524,9 +866,14 @@ def _model_identity(
 def _provider_router(
     config: dict[str, Any], *, assigned_provider: str | None = None,
     authorized_providers: tuple[str, ...] = (),
+    authorized_providers_explicit: bool = False,
     debt: Mapping[str, Any] | None = None,
 ) -> tuple[Diffundo, ProviderTier, str, str]:
     providers = load_providers(_provider_path())
+    # An explicitly empty authorized list is the historical "unrestricted"
+    # wire value (the supervisor always sends the key): restriction applies
+    # only to a non-empty list. `authorized_providers_explicit` records the
+    # distinction for the provider-boundary descriptor, nothing more.
     if authorized_providers:
         authorized = frozenset(authorized_providers)
         providers = [provider for provider in providers if provider.name in authorized]
@@ -604,10 +951,23 @@ def _positive_int(value: Any, name: str, default: int) -> int:
     return value
 
 
+def _strict_bool(value: Any, name: str) -> bool:
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def _positive_float(value: Any, name: str, default: float) -> float:
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or type(value) not in (int, float)
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
         raise ValueError(f"{name} must be a positive number")
     return float(value)
 
@@ -634,6 +994,7 @@ class AgentConfig:
     # task was assigned at admission; presets Diffundo's sticky primary.
     assigned_provider: str | None = None
     authorized_providers: tuple[str, ...] = ()
+    authorized_providers_explicit: bool = False
     debt: Mapping[str, Any] | None = None
     provider_env_keys: tuple[str, ...] = ()
     redactor: Redactor | None = None
@@ -641,6 +1002,14 @@ class AgentConfig:
     # files_changed, commits, ...) rendered as a bounded prompt block so a
     # child starts from the parent's outcome without inheriting its session.
     parent_envelope: dict[str, Any] | None = None
+    # Cache-first context reuse (plan phase 1): ``context_reuse`` opts the
+    # task into suspending at delegate boundaries; ``context_fork`` (init,
+    # supervisor to child) carries the strict fork descriptor of the epoch a
+    # compatible child reuses; ``resume`` (run_task) carries the checkpoint
+    # ref and bounded child-result envelopes a suspended parent continues from.
+    context_reuse: bool = False
+    context_fork: dict[str, Any] | None = None
+    resume: dict[str, Any] | None = None
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -661,11 +1030,21 @@ class AgentConfig:
         worktree = init.get("worktree")
         base_commit = init.get("base_commit")
         task = init.get("spec")
+        task_id = init.get("task_id", "unknown")
+        if type(task_id) is not str or not task_id:
+            raise ValueError("init task_id must be a non-empty string")
         assigned_provider = init.get("assigned_provider")
-        if assigned_provider is not None and not isinstance(assigned_provider, str):
+        if assigned_provider is not None and (
+            type(assigned_provider) is not str or not assigned_provider
+        ):
             raise ValueError("init assigned_provider must be a string")
         provider_env_keys = _provider_env_keys(init.get("provider_env_keys"))
         authorized_providers = _provider_env_keys(init.get("authorized_providers"))
+        authorized_explicit = init.get("authorized_providers_explicit")
+        if authorized_explicit is None:
+            authorized_explicit = "authorized_providers" in init
+        if type(authorized_explicit) is not bool:
+            raise ValueError("init authorized_providers_explicit must be a boolean")
         debt = init.get("debt")
         if debt is not None and not isinstance(debt, dict):
             raise ValueError("init debt must be a mapping")
@@ -674,7 +1053,7 @@ class AgentConfig:
             Path(session_id).resolve() / ".cambium" / "checkpoints" if session_id else None
         )
         return cls(
-            task_id=str(init.get("task_id", "unknown")),
+            task_id=task_id,
             generation=_positive_int(init.get("generation"), "init generation", 1),
             task=task if isinstance(task, str) else "",
             worktree=Path(worktree) if isinstance(worktree, str) else None,
@@ -682,6 +1061,7 @@ class AgentConfig:
             fanout_config=_provider_fanout_config(init),
             assigned_provider=assigned_provider,
             authorized_providers=authorized_providers,
+            authorized_providers_explicit=authorized_explicit,
             debt=debt or None,
             max_turns=_positive_int(init.get("max_turns"), "init max_turns", DEFAULT_MAX_TURNS),
             max_tokens=_positive_int(
@@ -704,6 +1084,8 @@ class AgentConfig:
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
             parent_envelope=_validate_parent_envelope(init.get("parent_envelope")),
+            context_reuse=_strict_bool(init.get("context_reuse"), "init context_reuse"),
+            context_fork=_validate_context_fork(init.get("context_fork")),
         )
 
 
@@ -735,6 +1117,7 @@ def _merge_task_config(
     parent_envelope = config.parent_envelope or _validate_parent_envelope(
         run.get("parent_envelope")
     )
+    resume = config.resume or _validate_resume(run.get("resume"))
     return AgentConfig(
         task_id=config.task_id,
         generation=config.generation,
@@ -744,6 +1127,7 @@ def _merge_task_config(
         fanout_config=fanout_config,
         assigned_provider=config.assigned_provider,
         authorized_providers=config.authorized_providers,
+        authorized_providers_explicit=config.authorized_providers_explicit,
         debt=config.debt,
         max_turns=max_turns,
         max_tokens=max_tokens,
@@ -756,14 +1140,25 @@ def _merge_task_config(
         provider_env_keys=config.provider_env_keys,
         redactor=config.redactor,
         parent_envelope=parent_envelope,
+        context_reuse=config.context_reuse,
+        context_fork=config.context_fork,
+        resume=resume,
     )
 
 
 def _config_from_run(run: dict[str, Any]) -> AgentConfig:
     """Fallback config when do_work is invoked directly (no init message)."""
     provider_env_keys = _provider_env_keys(run.get("provider_env_keys"))
+    task_id = run.get("task_id", "unknown")
+    if type(task_id) is not str or not task_id:
+        raise ValueError("run_task task_id must be a non-empty string")
+    authorized_explicit = run.get("authorized_providers_explicit")
+    if authorized_explicit is None:
+        authorized_explicit = "authorized_providers" in run
+    if type(authorized_explicit) is not bool:
+        raise ValueError("run_task authorized_providers_explicit must be a boolean")
     return AgentConfig(
-        task_id=str(run.get("task_id", "unknown")),
+        task_id=task_id,
         generation=_positive_int(run.get("generation"), "run_task generation", 1),
         task=str(run.get("task", "")),
         worktree=(
@@ -773,6 +1168,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         fanout_config=_provider_fanout_config(run),
         assigned_provider=None,
         authorized_providers=_provider_env_keys(run.get("authorized_providers")),
+        authorized_providers_explicit=authorized_explicit,
         debt=None,
         max_turns=_positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS),
         max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
@@ -786,6 +1182,9 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
         parent_envelope=_validate_parent_envelope(run.get("parent_envelope")),
+        context_reuse=_strict_bool(run.get("context_reuse"), "run_task context_reuse"),
+        context_fork=_validate_context_fork(run.get("context_fork")),
+        resume=_validate_resume(run.get("resume")),
     )
 
 
@@ -817,6 +1216,53 @@ def _bounded_text(text: str, limit: int) -> str:
 def _safe_task_id(task_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
     return safe or "task"
+
+
+_EPOCH_REF_RE = re.compile(
+    r"epoch-(?P<epoch>[0-9]{3,})-(?P<pre>[0-9a-f]{16})-"
+    r"(?P<persisted>[0-9a-f]{16})\.json\Z"
+)
+
+
+def _validate_checkpoint_ref_shape(checkpoint_ref: str) -> tuple[str, int, str, str]:
+    """Validate the relative two-component epoch reference without resolving it."""
+    if type(checkpoint_ref) is not str or not checkpoint_ref:
+        raise ContextForkError("invalid checkpoint_ref")
+    relative = Path(checkpoint_ref)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ContextForkError("invalid checkpoint_ref path")
+    if len(relative.parts) != 2:
+        raise ContextForkError("invalid checkpoint_ref path")
+    task_component, filename = relative.parts
+    if task_component != _safe_task_id(task_component):
+        raise ContextForkError("invalid checkpoint_ref task path")
+    match = _EPOCH_REF_RE.fullmatch(filename)
+    if match is None:
+        raise ContextForkError("invalid checkpoint_ref filename")
+    return (
+        task_component,
+        int(match.group("epoch")),
+        match.group("pre"),
+        match.group("persisted"),
+    )
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Encode JSON deterministically and reject non-finite values."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _checkpoint_address(payload: Mapping[str, Any]) -> str:
+    """Return the short address for a payload with its ref removed."""
+    normalized = copy.deepcopy(dict(payload))
+    normalized["checkpoint_ref"] = ""
+    return _sha256_hex(_canonical_json_bytes(normalized))[:16]
 
 
 def _atomic_json_write(path: Path, content: str) -> None:
@@ -929,6 +1375,8 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     text = content.strip()
     if not text:
         raise ValueError("empty agent action")
+    if len(text.encode("utf-8")) > MAX_ACTION_CONTENT_BYTES:
+        raise ValueError("agent action exceeds the field cap")
     try:
         parsed, _end = json.JSONDecoder().raw_decode(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
@@ -1189,6 +1637,219 @@ def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _parent_envelope_message(parent_envelope: dict[str, Any]) -> dict[str, str]:
+    """Render legacy parent data as a delimited user-role message.
+
+    Parent results are data. Keeping them outside the system message prevents
+    a child result from gaining system authority while retaining the existing
+    strict nine-key projection.
+    """
+    return {
+        "role": "user",
+        "content": (
+            "<cambium-parent-context>\n"
+            + _parent_envelope_lines(parent_envelope)
+            + "\n</cambium-parent-context>"
+        ),
+    }
+
+
+def _child_task_lines(task: str, parent_envelope: dict[str, Any] | None) -> str:
+    """Render the bounded child task block appended to a forked epoch.
+
+    The child task plus the parent-outcome block become ONE user-role data
+    block (plan §5.4): bounded data, never a system directive. Fields are
+    already validated by ``_validate_parent_envelope``.
+    """
+    lines = [f"Child task: {_bounded_text(task, MAX_ENVELOPE_FIELD_CHARS)}"]
+    if parent_envelope:
+        lines.extend([
+            "<cambium-parent-context>",
+            _parent_envelope_lines(parent_envelope),
+            "</cambium-parent-context>",
+        ])
+    return "\n".join(lines)
+
+
+def _child_result_lines(child_result: dict[str, Any]) -> str:
+    """Render one bounded strict child-result envelope as a user message.
+
+    The child-result envelope carries exactly the strict nine keys with
+    bounded fields, so the rendered block is bounded data under the user
+    role (injection posture, plan §11).
+    """
+    lines = ["Child task result:"]
+    status = child_result.get("status")
+    if isinstance(status, str) and status.strip():
+        lines.append(f"status: {status}")
+    summary = child_result.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"summary: {summary}")
+    files = child_result.get("files_changed")
+    if isinstance(files, list) and files:
+        lines.append("files changed: " + ", ".join(map(str, files)))
+    commits = child_result.get("commits")
+    if isinstance(commits, list) and commits:
+        lines.append("commits: " + ", ".join(map(str, commits)))
+    return "\n".join(lines)
+
+
+def _build_forked_prompt(checkpoint: ContextCheckpoint, child_task_lines: str) -> dict[str, Any]:
+    """Build the fork prompt: checkpoint messages plus one child envelope.
+
+    The child task block is appended as one user-role message so the fork's
+    leading messages are byte-identical to the checkpoint the parent sent
+    (plan §5.4). The checkpoint's last message is the delegate tool
+    observation (user role), so the fork payload never needs a neutral tail.
+    """
+    messages = copy.deepcopy(checkpoint.full_messages)
+    messages.append({"role": "user", "content": child_task_lines})
+    return {"messages": messages}
+
+
+def _fork_prompt(
+    base_messages: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    continuation: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build each forked-session turn from an immutable base message list.
+
+    ``base_messages`` is never mutated. The caller owns the mutable
+    continuation and can therefore prove the checkpoint prefix remains equal
+    on every later turn.
+    """
+    messages = list(copy.deepcopy(base_messages))
+    messages.extend(copy.deepcopy(continuation))
+    if not messages or messages[-1].get("role") != "user":
+        messages.append({"role": "user", "content": "Continue."})
+    return {"messages": messages}
+
+
+def _resolve_fork_prefix(
+    config: AgentConfig, tools: list[dict[str, Any]], model: str
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Resolve the forked prefix messages, or a durable skip reason.
+
+    Build-time assertions (plan §5.4) each fail closed: a corrupt, missing,
+    or incompatible checkpoint returns ``(None, reason)`` so the caller runs
+    the legacy fresh-prompt path with ``parent_envelope`` only and reports
+    ``context_fork_skipped``; a valid one returns the exact prefix message
+    list the child's first prompt starts with.
+    """
+    if config.context_fork is None:
+        return None, None
+    descriptor = config.context_fork
+    try:
+        checkpoint = _load_epoch_checkpoint(
+            config, descriptor["checkpoint_ref"], expect_task_id=False
+        )
+    except ContextForkError as exc:
+        return None, str(exc)
+    if checkpoint.cache_key.redacted:
+        return None, "checkpoint redacted"
+    if checkpoint.cache_key.model != model or descriptor["model"] != model:
+        return None, "model mismatch"
+    tools_sha256 = _sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8"))
+    if descriptor["tools_sha256"] != tools_sha256:
+        return None, "tool schema mismatch"
+    forked = _build_forked_prompt(
+        checkpoint, _child_task_lines(config.task, config.parent_envelope)
+    )
+    try:
+        if prompt_prefix_bytes({"messages": checkpoint.provider_messages}) != (
+            checkpoint.cache_key.prefix_bytes
+        ):
+            return None, "prefix byte mismatch"
+        if _messages_sha256(checkpoint.provider_messages) != checkpoint.cache_key.prefix_sha256:
+            return None, "prefix hash mismatch"
+        if _messages_sha256(checkpoint.continuation_suffix) != checkpoint.cache_key.suffix_sha256:
+            return None, "suffix hash mismatch"
+        if _messages_sha256(checkpoint.full_messages) != checkpoint.cache_key.full_sha256:
+            return None, "full checkpoint hash mismatch"
+        if _messages_sha256(forked["messages"]) == checkpoint.cache_key.full_sha256:
+            return None, "fork full hash unexpectedly equals checkpoint hash"
+        if forked["messages"][: len(checkpoint.full_messages)] != checkpoint.full_messages:
+            return None, "fork base message mismatch"
+        validate_prompt_structure(forked)
+    except Exception as exc:  # noqa: BLE001  PromptStructureError and friends
+        return None, f"fork prompt invalid: {exc.__class__.__name__}"
+    return forked["messages"], None
+
+
+_PROVIDER_TOOLS_CONFIG = AgentConfig(
+    task_id="provider-tools",
+    generation=1,
+    task="",
+    worktree=None,
+    base_commit=None,
+    fanout_config=None,
+    max_turns=1,
+    max_tokens=1,
+    shell_permission=True,
+    network_permission=False,
+    heartbeat_interval_s=1.0,
+    max_wall_s=1.0,
+    checkpoint_root=None,
+)
+
+
+def _provider_task_tools_hash() -> str:
+    """The canonical tools-JSON hash for provider tasks.
+
+    The supervisor sends uniform permissions for provider tasks
+    (``{"shell": True, "network": False}``), so sibling schemas are identical;
+    compatibility asserts this hash, never assumes it (plan §5.5).
+    """
+    return _sha256_hex(
+        json.dumps(_exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG), sort_keys=True).encode(
+            "utf-8"
+        )
+    )
+
+
+def _fork_cache_compatible(
+    child_spec: dict[str, Any],
+    epoch: Mapping[str, Any],
+    authorized_providers: frozenset[str],
+) -> tuple[bool, str | None]:
+    """Cache-key compatibility of one child with one epoch (plan §5.5).
+
+    Returns ``(compatible, reason)``. A compatible child is pinned by the
+    supervisor before admission resolution; an incompatible one runs exactly
+    today's summary-passing path with ``parent_envelope`` only.
+    """
+    cache_key = epoch.get("cache_key")
+    if not isinstance(cache_key, dict):
+        return False, "epoch has no cache_key"
+    if set(cache_key) < {
+        "provider", "model", "protocol", "reasoning_effort", "tools_sha256",
+        "redacted", "provider_boundary",
+    }:
+        return False, "epoch cache_key is incomplete"
+    if cache_key.get("redacted") is True:
+        return False, "checkpoint redacted"
+    provider = cache_key.get("provider")
+    if not isinstance(provider, str) or provider not in authorized_providers:
+        return False, f"provider {provider!r} not authorized"
+    model = cache_key.get("model")
+    fanout = child_spec.get("fanout_config") or {}
+    if not isinstance(model, str) or model != fanout.get("model"):
+        return False, "child model differs from the epoch model"
+    if cache_key.get("tools_sha256") != _provider_task_tools_hash():
+        return False, "child tool schema differs from the epoch"
+    boundary = cache_key.get("provider_boundary")
+    if not isinstance(boundary, dict):
+        return False, "epoch provider boundary is missing"
+    if boundary.get("provider") != provider or boundary.get("model") != model:
+        return False, "provider boundary differs from the epoch"
+    child_protocol = fanout.get("protocol")
+    if child_protocol is not None and child_protocol != cache_key.get("protocol"):
+        return False, "child provider protocol differs from the epoch"
+    child_reasoning = fanout.get("reasoning_effort")
+    if child_reasoning is not None and child_reasoning != cache_key.get("reasoning_effort"):
+        return False, "child reasoning effort differs from the epoch"
+    return True, None
+
+
 def _build_agent_prompt(
     task: str,
     tools: list[dict[str, Any]],
@@ -1233,10 +1894,10 @@ def _build_agent_prompt(
         json.dumps(tools, sort_keys=True),
         f"Task: {task}",
     ])
-    if parent_envelope:
-        system_lines.append(_parent_envelope_lines(parent_envelope))
     messages = [{"role": "system", "content": "\n".join(system_lines)}]
     messages.extend(transcript)
+    if parent_envelope:
+        messages.append(_parent_envelope_message(parent_envelope))
     if not messages or messages[-1].get("role") != "user":
         # Some providers (e.g. ZAI/GLM) reject payloads whose last message is
         # not a user message: a fresh transcript has no non-system message
@@ -1254,6 +1915,44 @@ def _build_agent_prompt(
 def _tool_observation(name: str, result: ToolResult) -> str:
     body = result.output if result.ok else (result.error or result.output or "")
     return _bounded_text(f"tool {name} ok={result.ok}\n{body}", MAX_OBSERVATION_BYTES)
+
+
+def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
+    """Persist only the parsed action, never an optional scratchpad/thought."""
+    return {
+        "role": "assistant",
+        "content": json.dumps(action, sort_keys=True, separators=(",", ":")),
+    }
+
+
+def _context_state_message(
+    *,
+    code_changed: bool,
+    verified_after_change: bool,
+    verification_failed: bool,
+    no_progress_actions: int,
+    budget_new_tokens: int,
+    previous_prompt_tokens: int,
+    turn: int,
+) -> dict[str, str]:
+    """Render bounded loop state as delimited user-role continuation data."""
+    state = {
+        "code_changed": code_changed,
+        "verified_after_change": verified_after_change,
+        "verification_failed": verification_failed,
+        "no_progress_actions": no_progress_actions,
+        "budget_new_tokens": budget_new_tokens,
+        "previous_prompt_tokens": previous_prompt_tokens,
+        "turn": turn,
+    }
+    return {
+        "role": "user",
+        "content": (
+            "<cambium-loop-state>\n"
+            + json.dumps(state, sort_keys=True, separators=(",", ":"))
+            + "\n</cambium-loop-state>"
+        ),
+    }
 
 
 def _safe_cmd(name: str, args: dict[str, Any]) -> str:
@@ -1290,18 +1989,25 @@ def _success_usage_event(result: CallResult, turn: int) -> dict[str, Any]:
     Fields the provider did not report are omitted; a missing field never
     breaks the event or the session (implementation plan step 3).
     """
+    estimated_cost = float(result.estimated_cost_usd)
+    latency = float(result.latency_s)
+    if not math.isfinite(estimated_cost) or not math.isfinite(latency):
+        raise ValueError("provider usage metadata contains a non-finite number")
     event: dict[str, Any] = {
         "turn": turn,
         "provider": result.provider,
         "model": result.model,
-        "estimated_cost_usd": max(0.0, float(result.estimated_cost_usd)),
-        "latency_s": max(0.0, float(result.latency_s)),
+        "estimated_cost_usd": max(0.0, estimated_cost),
+        "latency_s": max(0.0, latency),
     }
     usage = _usage_counts(result.usage)
     if usage:
         event["usage"] = usage
     if result.retry_after_s is not None:
-        event["retry_after_s"] = max(0.0, float(result.retry_after_s))
+        retry_after = float(result.retry_after_s)
+        if not math.isfinite(retry_after):
+            raise ValueError("provider usage metadata contains a non-finite retry delay")
+        event["retry_after_s"] = max(0.0, retry_after)
     if result.request_rate_status is not None:
         event["request_rate_status"] = result.request_rate_status
     if result.account_quota_owner is not None:
@@ -1365,13 +2071,21 @@ async def _emit_usage_event(
     writer: asyncio.StreamWriter,
     config: AgentConfig,
     event: dict[str, Any],
+    *,
+    epoch: int | None = None,
+    fork_of: str | None = None,
 ) -> None:
-    await send(writer, {
+    payload: dict[str, Any] = {
         "type": "usage_event",
         "task_id": config.task_id,
         "generation": config.generation,
         **event,
-    })
+    }
+    if epoch is not None:
+        payload["epoch"] = epoch
+    if fork_of is not None:
+        payload["fork_of"] = fork_of
+    await send(writer, payload)
 
 
 def _write_checkpoint_file(
@@ -1432,8 +2146,579 @@ async def _persist_checkpoint(
         await _emit_checkpoint(writer, config, turn, path, commits_so_far)
 
 
-def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _messages_sha256(messages: list[dict[str, Any]]) -> str:
+    return _sha256_hex(_canonical_json_bytes(messages))
+
+
+def _default_provider_boundary(
+    config: AgentConfig,
+    provider: str | None,
+    model: str,
+    protocol: str,
+    reasoning_effort: str | None,
+) -> dict[str, Any]:
+    """Build a conservative boundary for in-process/test routers."""
     return {
+        "provider": provider or "unknown-provider",
+        "endpoint": "unknown-endpoint",
+        "authmode": "unknown-auth",
+        "api_key_env": "",
+        "provider_env_keys": list(config.provider_env_keys),
+        "authorized_providers": (
+            list(config.authorized_providers)
+            if config.authorized_providers_explicit
+            else None
+        ),
+        "authorized_providers_explicit": config.authorized_providers_explicit,
+        "protocol": protocol or "unknown-protocol",
+        "model": model,
+        "tier": "unknown-tier",
+        "reasoning_effort": reasoning_effort,
+        "provider_config_path": "unknown-provider-config",
+    }
+
+
+def _provider_boundary(
+    config: AgentConfig,
+    provider: Any,
+    *,
+    provider_config_path: Path,
+) -> dict[str, Any]:
+    """Describe the exact provider boundary without carrying credentials."""
+    auth = getattr(provider, "auth", None)
+    protocol = getattr(provider, "protocol", None)
+    tier = getattr(provider, "tier", None)
+    auth_value = getattr(auth, "value", auth)
+    protocol_value = getattr(protocol, "value", protocol)
+    tier_value = getattr(tier, "value", tier)
+    endpoint = getattr(provider, "base_url", None)
+    api_key_env = getattr(provider, "api_key_env", None)
+    model = getattr(provider, "model", None)
+    name = getattr(provider, "name", None)
+    boundary = {
+        "provider": name,
+        "endpoint": endpoint or "codex-profile",
+        "authmode": auth_value,
+        "api_key_env": api_key_env or "",
+        "provider_env_keys": list(config.provider_env_keys),
+        "authorized_providers": (
+            list(config.authorized_providers)
+            if config.authorized_providers_explicit
+            else None
+        ),
+        "authorized_providers_explicit": config.authorized_providers_explicit,
+        "protocol": protocol_value,
+        "model": model,
+        "tier": tier_value,
+        "reasoning_effort": getattr(provider, "reasoning_effort", None),
+        "provider_config_path": str(provider_config_path),
+    }
+    return _validate_provider_boundary(boundary)
+
+
+def _context_message(value: Any, location: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"role", "content"}:
+        raise ContextForkError(f"checkpoint {location} must have exactly role/content")
+    role = value.get("role")
+    content = value.get("content")
+    if role not in {"system", "user", "assistant", "tool"}:
+        raise ContextForkError(f"checkpoint {location}.role is invalid")
+    if not isinstance(content, str):
+        raise ContextForkError(f"checkpoint {location}.content must be a string")
+    if len(content.encode("utf-8")) > MAX_OBSERVATION_BYTES:
+        raise ContextForkError(f"checkpoint {location}.content exceeds the field cap")
+    return {"role": role, "content": content}
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create a directory tree without following a symlink component."""
+    if not path.is_absolute():
+        path = path.absolute()
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                info = current.lstat()
+            else:
+                continue
+        if stat.S_ISLNK(info.st_mode):
+            raise ContextForkError(f"checkpoint directory is a symlink: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ContextForkError(f"checkpoint directory is not a directory: {current}")
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise ContextForkError("checkpoint directory fsync failed") from exc
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise ContextForkError("checkpoint directory fsync failed") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _create_epoch_checkpoint(path: Path, content: str) -> None:
+    """Publish one private checkpoint with an exclusive create operation."""
+    encoded = content.encode("utf-8")
+    _ensure_private_directory(path.parent)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode):
+            raise ContextForkError("checkpoint path is a symlink")
+        if not stat.S_ISREG(info.st_mode):
+            raise ContextForkError("checkpoint path is not a regular file")
+        raise ContextForkError("checkpoint path collision")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise ContextForkError("checkpoint path collision") from exc
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("checkpoint write made no progress")
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise ContextForkError("checkpoint file write failed") from exc
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError("checkpoint contains duplicate JSON fields")
+        values[key] = value
+    return values
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"checkpoint contains non-standard JSON constant {value!r}")
+
+
+def _write_epoch_checkpoint(
+    config: AgentConfig,
+    *,
+    turn: int,
+    epoch: int,
+    messages: list[dict[str, Any]] | None = None,
+    provider_messages: list[dict[str, Any]] | None = None,
+    continuation_suffix: list[dict[str, Any]] | None = None,
+    provider: str | None,
+    model: str,
+    tools_sha256: str,
+    provider_compat: Mapping[str, tuple[str, str | None]] | None = None,
+    provider_boundary: Mapping[str, Any] | None = None,
+    code_changed: bool = False,
+    verified_after_change: bool = False,
+    verification_failed: bool = False,
+    no_progress_actions: int = 0,
+    budget_new_tokens: int = 0,
+    previous_prompt_tokens: int = 0,
+    cumulative_usage: Mapping[str, int] | None = None,
+    wall_deadline: float | None = None,
+    created_at: float | None = None,
+) -> ContextCheckpoint | None:
+    """Write one immutable content-addressed epoch checkpoint (plan §5.2-5.3).
+
+    The checkpoint holds the exact provider-sent messages separately from the
+    response continuation. The content address hashes the canonical
+    pre-redaction serialization, and a retry may only find identical bytes at
+    the same path. Returns ``None`` when no checkpoint root is configured
+    (suspend is then impossible and the loop continues).
+    """
+    if config.checkpoint_root is None:
+        return None
+    if provider_messages is None:
+        provider_messages = messages if messages is not None else []
+    if continuation_suffix is None:
+        continuation_suffix = []
+    provider_messages = [
+        _context_message(message, f"provider_messages[{index}]")
+        for index, message in enumerate(provider_messages)
+    ]
+    continuation_suffix = [
+        _context_message(message, f"continuation_suffix[{index}]")
+        for index, message in enumerate(continuation_suffix)
+    ]
+    if not provider_messages or provider_messages[0]["role"] != "system":
+        raise ContextForkError("checkpoint provider_messages must start with system")
+    if isinstance(turn, bool) or not isinstance(turn, int) or turn <= 0:
+        raise ContextForkError("checkpoint turn must be positive")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+        raise ContextForkError("checkpoint epoch must be positive")
+    for name, value in (
+        ("budget_new_tokens", budget_new_tokens),
+        ("previous_prompt_tokens", previous_prompt_tokens),
+        ("no_progress_actions", no_progress_actions),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ContextForkError(f"checkpoint {name} must be a non-negative integer")
+    if cumulative_usage is None:
+        cumulative_usage = {}
+    if (
+        not isinstance(cumulative_usage, Mapping)
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for key, value in cumulative_usage.items()
+        )
+    ):
+        raise ContextForkError("checkpoint cumulative_usage has invalid counts")
+    if wall_deadline is None:
+        wall_deadline = time.time() + config.max_wall_s
+    if (
+        isinstance(wall_deadline, bool)
+        or not isinstance(wall_deadline, (int, float))
+        or not math.isfinite(float(wall_deadline))
+        or wall_deadline <= 0
+    ):
+        raise ContextForkError("checkpoint wall_deadline must be finite and positive")
+    if provider_compat is None:
+        provider_compat = {}
+    protocol, reasoning_effort = provider_compat.get(provider or "", ("unknown", None))
+    boundary = dict(provider_boundary or _default_provider_boundary(
+        config, provider, model, protocol, reasoning_effort
+    ))
+    boundary = _validate_provider_boundary(boundary)
+    full_messages = [*provider_messages, *continuation_suffix]
+    prefix_sha256 = _messages_sha256(provider_messages)
+    suffix_sha256 = _messages_sha256(continuation_suffix)
+    full_sha256 = _messages_sha256(full_messages)
+    cache_key = CacheKeyDescriptor(
+        provider=provider,
+        model=model,
+        protocol=protocol,
+        reasoning_effort=reasoning_effort,
+        system_sha256=_sha256_hex(
+            str(provider_messages[0].get("content", "")).encode("utf-8")
+        ),
+        tools_sha256=tools_sha256,
+        prefix_sha256=prefix_sha256,
+        suffix_sha256=suffix_sha256,
+        full_sha256=full_sha256,
+        prefix_bytes=prompt_prefix_bytes({"messages": provider_messages}) or 0,
+        message_count=len(provider_messages),
+        redacted=False,
+        provider_boundary=boundary,
+    )
+    checkpoint = ContextCheckpoint(
+        schema=CHECKPOINT_EPOCH_SCHEMA,
+        task_id=config.task_id,
+        generation=config.generation,
+        epoch=epoch,
+        turn=turn,
+        created_at=created_at if created_at is not None else time.time(),
+        cache_key=cache_key,
+        provider_messages=copy.deepcopy(provider_messages),
+        continuation_suffix=copy.deepcopy(continuation_suffix),
+        checkpoint_ref="",
+        code_changed=code_changed,
+        verified_after_change=verified_after_change,
+        verification_failed=verification_failed,
+        no_progress_actions=no_progress_actions,
+        budget_new_tokens=budget_new_tokens,
+        previous_prompt_tokens=previous_prompt_tokens,
+        cumulative_usage=dict(cumulative_usage),
+        wall_deadline=float(wall_deadline),
+    )
+    raw = asdict(checkpoint)
+    address_pre = _checkpoint_address(raw)
+    safe_task = _safe_task_id(config.task_id)
+    prefix = f"epoch-{epoch:03d}-{address_pre}"
+    placeholder_ref = f"{safe_task}/{prefix}-{'0' * 16}.json"
+    redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
+    payload = redactor.redact_mapping(asdict(replace(
+        checkpoint, checkpoint_ref=placeholder_ref,
+    )))
+    redacted = payload != asdict(replace(checkpoint, checkpoint_ref=placeholder_ref))
+    if redacted:
+        payload["cache_key"]["redacted"] = True
+    address_persisted = _checkpoint_address(payload)
+    checkpoint_ref = f"{safe_task}/{prefix}-{address_persisted}.json"
+    payload["checkpoint_ref"] = checkpoint_ref
+    directory = config.checkpoint_root / safe_task
+    path = directory / f"{prefix}-{address_persisted}.json"
+    _create_epoch_checkpoint(path, json.dumps(payload, sort_keys=True, indent=2))
+    return replace(
+        checkpoint,
+        checkpoint_ref=checkpoint_ref,
+        cache_key=replace(checkpoint.cache_key, redacted=redacted),
+    )
+
+
+async def _emit_context_checkpoint(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    checkpoint: ContextCheckpoint,
+    request_id: str | None = None,
+) -> None:
+    cache_key = checkpoint.cache_key
+    await send(writer, {
+        "type": "context_checkpoint",
+        "request_id": request_id,
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "epoch": checkpoint.epoch,
+        "turn": checkpoint.turn,
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "cache_key": {
+            "provider": cache_key.provider,
+            "model": cache_key.model,
+            "protocol": cache_key.protocol,
+            "reasoning_effort": cache_key.reasoning_effort,
+            "system_sha256": cache_key.system_sha256,
+            "tools_sha256": cache_key.tools_sha256,
+            "prefix_sha256": cache_key.prefix_sha256,
+            "suffix_sha256": cache_key.suffix_sha256,
+            "full_sha256": cache_key.full_sha256,
+            "prefix_bytes": cache_key.prefix_bytes,
+            "message_count": cache_key.message_count,
+            "redacted": cache_key.redacted,
+            "provider_boundary": cache_key.provider_boundary,
+        },
+    })
+
+
+def _load_epoch_checkpoint(
+    config: AgentConfig, checkpoint_ref: str, *, expect_task_id: bool
+) -> ContextCheckpoint:
+    """Load and integrity-check one epoch checkpoint, or fail closed.
+
+    A missing, corrupt, escaping, or tampered checkpoint raises
+    :class:`ContextForkError`; the caller then falls back to the legacy
+    fresh-prompt path (fork) or fails the task (resume). The message-list
+    hashes are recomputed and compared so no malformed payload ever seeds a
+    prompt prefix.
+    """
+    root = config.checkpoint_root
+    if root is None:
+        raise ContextForkError("no checkpoint root configured")
+    root = root.resolve()
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        raise ContextForkError("invalid checkpoint_ref")
+    task_component, ref_epoch, _address_pre, address_persisted = (
+        _validate_checkpoint_ref_shape(checkpoint_ref)
+    )
+    if expect_task_id and task_component != _safe_task_id(config.task_id):
+        raise ContextForkError("invalid checkpoint_ref path")
+    relative = Path(checkpoint_ref)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ContextForkError("checkpoint path is a symlink")
+    path = root / relative
+    if not path.is_relative_to(root):
+        raise ContextForkError("checkpoint_ref escapes the checkpoint root")
+    try:
+        if path.stat().st_size > MAX_LINE_BYTES * 4:
+            raise ContextForkError("checkpoint exceeds the size cap")
+    except FileNotFoundError as exc:
+        raise ContextForkError("checkpoint unreadable: FileNotFoundError") from exc
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError) as exc:
+        raise ContextForkError(
+            f"checkpoint unreadable: {exc.__class__.__name__}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ContextForkError("checkpoint is not an object")
+    if _checkpoint_address(data) != address_persisted:
+        raise ContextForkError("checkpoint persisted-address mismatch")
+    if data.get("epoch") != ref_epoch:
+        raise ContextForkError("checkpoint epoch does not match its filename")
+    expected_keys = frozenset({
+        "schema", "task_id", "generation", "epoch", "turn", "created_at",
+        "cache_key", "provider_messages", "continuation_suffix", "checkpoint_ref",
+        "code_changed", "verified_after_change", "verification_failed",
+        "no_progress_actions", "budget_new_tokens", "previous_prompt_tokens",
+        "cumulative_usage", "wall_deadline",
+    })
+    if set(data) != expected_keys:
+        raise ContextForkError("checkpoint has an invalid key set")
+    if data.get("schema") != CHECKPOINT_EPOCH_SCHEMA:
+        raise ContextForkError("checkpoint schema mismatch")
+    if not isinstance(data.get("task_id"), str) or not data["task_id"]:
+        raise ContextForkError("checkpoint task_id invalid")
+    if expect_task_id and data.get("task_id") != config.task_id:
+        raise ContextForkError("checkpoint task_id mismatch")
+    if data.get("checkpoint_ref") != checkpoint_ref:
+        raise ContextForkError("checkpoint_ref mismatch")
+    generation = data.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise ContextForkError("checkpoint generation invalid")
+    if expect_task_id and generation != config.generation:
+        raise ContextForkError("checkpoint generation mismatch")
+    epoch = data.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+        raise ContextForkError("checkpoint epoch invalid")
+    turn = data.get("turn")
+    if isinstance(turn, bool) or not isinstance(turn, int) or turn <= 0:
+        raise ContextForkError("checkpoint turn invalid")
+    provider_messages_raw = data.get("provider_messages")
+    suffix_raw = data.get("continuation_suffix")
+    if not isinstance(provider_messages_raw, list) or not provider_messages_raw:
+        raise ContextForkError("checkpoint provider_messages invalid")
+    if not isinstance(suffix_raw, list):
+        raise ContextForkError("checkpoint continuation_suffix invalid")
+    provider_messages = [
+        _context_message(message, f"provider_messages[{index}]")
+        for index, message in enumerate(provider_messages_raw)
+    ]
+    continuation_suffix = [
+        _context_message(message, f"continuation_suffix[{index}]")
+        for index, message in enumerate(suffix_raw)
+    ]
+    if provider_messages[0]["role"] != "system":
+        raise ContextForkError("checkpoint provider_messages must start with system")
+    messages = [*provider_messages, *continuation_suffix]
+    cache_key = data.get("cache_key")
+    if not isinstance(cache_key, dict):
+        raise ContextForkError("checkpoint cache_key missing")
+    cache_keys = frozenset({
+        "provider", "model", "protocol", "reasoning_effort", "system_sha256",
+        "tools_sha256", "prefix_sha256", "suffix_sha256", "full_sha256",
+        "prefix_bytes", "message_count", "redacted", "provider_boundary",
+    })
+    if set(cache_key) != cache_keys:
+        raise ContextForkError("checkpoint cache_key has an invalid key set")
+    expected = {
+        "system_sha256": _sha256_hex(str(provider_messages[0]["content"]).encode("utf-8")),
+        "prefix_sha256": _messages_sha256(provider_messages),
+        "suffix_sha256": _messages_sha256(continuation_suffix),
+        "full_sha256": _messages_sha256(messages),
+        "message_count": len(provider_messages),
+        "prefix_bytes": prompt_prefix_bytes({"messages": provider_messages}),
+    }
+    for key, value in expected.items():
+        if cache_key.get(key) != value:
+            raise ContextForkError(f"checkpoint {key} mismatch")
+    try:
+        provider = cache_key.get("provider")
+        if provider is not None and (not isinstance(provider, str) or not provider):
+            raise ContextForkError("checkpoint cache_key provider invalid")
+        for key in ("model", "protocol"):
+            if not isinstance(cache_key.get(key), str) or not cache_key[key]:
+                raise ContextForkError(f"checkpoint cache_key {key} invalid")
+        reasoning = cache_key.get("reasoning_effort")
+        if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
+            raise ContextForkError("checkpoint cache_key reasoning_effort invalid")
+        for key in (
+            "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+            "full_sha256",
+        ):
+            digest = cache_key.get(key)
+            if not isinstance(digest, str) or _SHA256_HEX_RE.fullmatch(digest) is None:
+                raise ContextForkError(f"checkpoint cache_key {key} invalid")
+        for key in ("prefix_bytes", "message_count"):
+            item = cache_key.get(key)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ContextForkError(f"checkpoint cache_key {key} invalid")
+        if type(cache_key.get("redacted")) is not bool:
+            raise ContextForkError("checkpoint cache_key redacted invalid")
+        boundary = _validate_provider_boundary(cache_key.get("provider_boundary"))
+        cache_key_descriptor = CacheKeyDescriptor(
+            provider=provider,
+            model=cache_key["model"],
+            protocol=cache_key["protocol"],
+            reasoning_effort=reasoning,
+            system_sha256=cache_key["system_sha256"],
+            tools_sha256=cache_key["tools_sha256"],
+            prefix_sha256=cache_key["prefix_sha256"],
+            suffix_sha256=cache_key["suffix_sha256"],
+            full_sha256=cache_key["full_sha256"],
+            prefix_bytes=cache_key["prefix_bytes"],
+            message_count=cache_key["message_count"],
+            redacted=cache_key["redacted"],
+            provider_boundary=boundary,
+        )
+    except (KeyError, TypeError) as exc:
+        raise ContextForkError(f"checkpoint cache_key invalid: {exc}") from exc
+    for key in ("code_changed", "verified_after_change", "verification_failed"):
+        if type(data.get(key)) is not bool:
+            raise ContextForkError(f"checkpoint {key} invalid")
+    for key in (
+        "budget_new_tokens", "previous_prompt_tokens", "no_progress_actions"
+    ):
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ContextForkError(f"checkpoint {key} invalid")
+    usage = data.get("cumulative_usage")
+    if not isinstance(usage, dict) or any(
+        not isinstance(key, str)
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for key, value in usage.items()
+    ):
+        raise ContextForkError("checkpoint cumulative_usage invalid")
+    created_at = data.get("created_at")
+    wall_deadline = data.get("wall_deadline")
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not math.isfinite(float(created_at))
+        or isinstance(wall_deadline, bool)
+        or not isinstance(wall_deadline, (int, float))
+        or not math.isfinite(float(wall_deadline))
+        or wall_deadline <= 0
+    ):
+        raise ContextForkError("checkpoint time state invalid")
+    return ContextCheckpoint(
+        schema=CHECKPOINT_EPOCH_SCHEMA,
+        task_id=data["task_id"],
+        generation=generation,
+        epoch=epoch,
+        turn=turn,
+        created_at=float(created_at),
+        cache_key=cache_key_descriptor,
+        provider_messages=provider_messages,
+        continuation_suffix=continuation_suffix,
+        checkpoint_ref=checkpoint_ref,
+        code_changed=data["code_changed"],
+        verified_after_change=data["verified_after_change"],
+        verification_failed=data["verification_failed"],
+        no_progress_actions=data["no_progress_actions"],
+        budget_new_tokens=data["budget_new_tokens"],
+        previous_prompt_tokens=data["previous_prompt_tokens"],
+        cumulative_usage=dict(usage),
+        wall_deadline=float(wall_deadline),
+    )
+
+
+def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
+    outcome = {
         "status": loop_outcome.get("status", "failed"),
         "failure_reason": loop_outcome.get("failure_reason"),
         "commits": [],
@@ -1442,6 +2727,10 @@ def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
         "diff_truncated": False,
         "summary": loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
     }
+    if outcome["status"] == TaskStatus.SUSPENDED.value:
+        outcome["epoch"] = loop_outcome.get("epoch")
+        outcome["checkpoint_ref"] = loop_outcome.get("checkpoint_ref")
+    return outcome
 
 
 def _cumulative_provider_metadata(loop_outcome: dict[str, Any]) -> dict[str, Any] | None:
@@ -1450,11 +2739,18 @@ def _cumulative_provider_metadata(loop_outcome: dict[str, Any]) -> dict[str, Any
     usage = loop_outcome.get("usage")
     if not isinstance(provider, str) or not isinstance(model, str) or not isinstance(usage, dict):
         return None
+    latency = loop_outcome.get("latency_s", 0.0)
+    if (
+        isinstance(latency, bool)
+        or type(latency) not in (int, float)
+        or not math.isfinite(float(latency))
+    ):
+        return None
     return {
         "provider": provider,
         "model": model,
         "usage": usage,
-        "latency_s": max(0.0, float(loop_outcome.get("latency_s", 0.0))),
+        "latency_s": max(0.0, float(latency)),
     }
 
 
@@ -1643,7 +2939,12 @@ def _fanout_budget_usd(config: dict[str, Any] | None) -> float | None:
     if not isinstance(config, dict):
         return None
     value = config.get("budget_usd")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if (
+        isinstance(value, bool)
+        or type(value) not in (int, float)
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
         return None
     return float(value)
 
@@ -1677,12 +2978,21 @@ async def _run_agent_loop(
     writer: asyncio.StreamWriter | None,
     stop: threading.Event,
     progress: AgentProgress,
+    provider_compat: Mapping[str, tuple[str, str | None]] | None = None,
+    provider_boundaries: Mapping[str, Mapping[str, Any]] | None = None,
+    run_request_id: str | None = None,
 ) -> dict[str, Any]:
     """Bounded provider-backed tool loop: one router call per turn, strict
     action parsing, permission checks, tool dispatch, tool_event + checkpoint.
 
+    With ``config.context_fork`` the first prompt reuses a checkpointed epoch
+    prefix; with ``config.resume`` the transcript is seeded from a checkpoint
+    plus bounded child-result envelopes. A ``context_reuse`` task suspends at
+    a successful ``delegate`` boundary with a durable epoch checkpoint.
+
     Returns a loop outcome dict: status / failure_reason / summary / turn /
-    cumulative usage / provider / latency_s / bounded transcript.
+    cumulative usage / provider / latency_s / bounded transcript, plus
+    ``epoch``/``checkpoint_ref`` for the suspended status.
     """
     outcome: dict[str, Any] = {
         "status": "failed",
@@ -1696,13 +3006,8 @@ async def _run_agent_loop(
         "transcript": [],
         "commits_so_far": [],
     }
-    wall_deadline = time.monotonic() + config.max_wall_s
+    absolute_wall_deadline = time.time() + config.max_wall_s
     cumulative_usage: dict[str, int] = {}
-    # New-token budget accounting: the full transcript is re-sent every turn,
-    # so counting each turn's whole prompt against the budget is O(turns^2).
-    # Only the prompt delta versus the previous turn plus the completion are
-    # new work; the first turn counts its whole prompt. This is a separate
-    # accumulator so the durable cumulative_usage snapshot is unchanged.
     budget_new_tokens = 0
     previous_prompt_tokens = 0
     transcript: list[dict[str, Any]] = []
@@ -1713,8 +3018,85 @@ async def _run_agent_loop(
     verified_after_change = False
     verification_failed = False
     code_changed = False
+    base_messages: tuple[dict[str, Any], ...] | None = None
+    context_continuation: list[dict[str, Any]] = []
+    epoch_count = 0
+    usage_epoch: int | None = None
+    usage_fork_of: str | None = None
+    first_turn = 1
+    provider_compat = provider_compat or {}
+    provider_boundaries = provider_boundaries or {}
+
+    def _sync_context_transcript() -> None:
+        nonlocal transcript
+        if base_messages is not None:
+            transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
+
+    resume = config.resume
+    if resume is not None:
+        try:
+            resume_checkpoint = _load_epoch_checkpoint(
+                config, resume["checkpoint_ref"], expect_task_id=True
+            )
+            if resume["epoch"] != resume_checkpoint.epoch:
+                raise ContextForkError("resume epoch does not match checkpoint")
+        except ContextForkError as exc:
+            return _loop_result(
+                outcome, "failed", f"context_resume_failed: {exc}", 0,
+                cumulative_usage, transcript,
+            )
+        base_messages = tuple(copy.deepcopy(resume_checkpoint.full_messages))
+        context_continuation = [
+            {"role": "user", "content": _child_result_lines(child_result)}
+            for child_result in resume["child_results"]
+        ]
+        if resume["child_results_truncated"]:
+            context_continuation.append({
+                "role": "user",
+                "content": "[note: some child results were truncated and omitted]",
+            })
+        code_changed = resume_checkpoint.code_changed
+        verified_after_change = resume_checkpoint.verified_after_change
+        verification_failed = resume_checkpoint.verification_failed
+        no_progress_actions = resume_checkpoint.no_progress_actions
+        budget_new_tokens = resume_checkpoint.budget_new_tokens
+        previous_prompt_tokens = resume_checkpoint.previous_prompt_tokens
+        cumulative_usage = dict(resume_checkpoint.cumulative_usage)
+        absolute_wall_deadline = resume_checkpoint.wall_deadline
+        first_turn = resume_checkpoint.turn + 1
+        epoch_count = resume_checkpoint.epoch
+        usage_epoch = resume_checkpoint.epoch
+        _sync_context_transcript()
+    elif config.context_fork is not None:
+        fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
+        if fork_messages is not None:
+            try:
+                fork_checkpoint = _load_epoch_checkpoint(
+                    config, config.context_fork["checkpoint_ref"], expect_task_id=False
+                )
+            except ContextForkError as exc:  # pragma: no cover - already validated
+                fork_skip = str(exc)
+            else:
+                base_messages = tuple(copy.deepcopy(fork_checkpoint.full_messages))
+                context_continuation = [copy.deepcopy(fork_messages[-1])]
+                epoch_count = fork_checkpoint.epoch
+                usage_epoch = fork_checkpoint.epoch
+                usage_fork_of = fork_checkpoint.checkpoint_ref
+                _sync_context_transcript()
+        if fork_skip is not None and writer is not None:
+            await send(writer, {
+                "type": "context_fork_skipped",
+                "request_id": run_request_id,
+                "task_id": config.task_id,
+                "generation": config.generation,
+                "reason": fork_skip,
+            })
+
+    wall_deadline = time.monotonic() + max(
+        0.0, absolute_wall_deadline - time.time()
+    )
     try:
-        for turn in range(1, config.max_turns + 1):
+        for turn in range(first_turn, config.max_turns + 1):
             progress.turn = turn
             progress.status = "working"
             if stop.is_set():
@@ -1727,25 +3109,32 @@ async def _run_agent_loop(
                     cumulative_usage, transcript,
                 )
             _require_generation(worktree, config.generation)
-            transcript = _summarize_transcript(transcript, config.max_transcript_chars)
-            prompt = _build_agent_prompt(
-                config.task, tools, transcript, model_identity,
-                parent_envelope=config.parent_envelope,
-            )
+            if base_messages is None:
+                transcript = _summarize_transcript(transcript, config.max_transcript_chars)
+                prompt = _build_agent_prompt(
+                    config.task, tools, transcript, model_identity,
+                    parent_envelope=config.parent_envelope,
+                )
+            else:
+                # The tuple is immutable and every message is deep-copied at
+                # the prompt boundary. No later turn can rewrite the epoch
+                # prefix in place.
+                prompt = _fork_prompt(base_messages, context_continuation)
+            # Keep the object handed to the router immutable for checkpointing.
+            # A provider adapter is allowed to normalize its local request, but
+            # the epoch must describe the exact object Cambium submitted.
+            sent_prompt = copy.deepcopy(prompt)
             try:
                 result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
             except Exception as exc:
-                # Provider errors may contain response text or request details.
-                # Only the exception class is safe to carry into the envelope.
-                # The usage event carries the redacted failure evidence; the
-                # envelope failure reason stays class-name only.
                 if writer is not None:
                     await _emit_usage_event(
                         writer,
                         config,
                         _failure_usage_event(
-                            exc, turn=turn, model=model, router=router, prompt=prompt
+                            exc, turn=turn, model=model, router=router, prompt=sent_prompt
                         ),
+                        epoch=usage_epoch, fork_of=usage_fork_of,
                     )
                 return _loop_result(
                     outcome, "failed", f"provider call failed: {exc.__class__.__name__}",
@@ -1753,20 +3142,16 @@ async def _run_agent_loop(
                 )
             if time.monotonic() >= wall_deadline:
                 return _loop_result(
-                    outcome, "failed", "wall budget exceeded",
-                    turn, cumulative_usage, transcript,
+                    outcome, "failed", "wall budget exceeded", turn,
+                    cumulative_usage, transcript,
                 )
             if result.model != model:
-                # An untrusted response model never enters durable artifacts;
-                # no usage event is emitted for it.
                 return _loop_result(
                     outcome, "failed", "provider response model mismatch",
                     turn - 1, cumulative_usage, transcript,
                 )
             invalid_usage_fields = _invalid_usage_fields(result.usage)
             if invalid_usage_fields:
-                # Strict choice: reject the attempt rather than omit a bad
-                # provider count and continue with a misleading budget/debt.
                 return _loop_result(
                     outcome, "failed", "provider usage contains invalid token counts",
                     turn - 1, cumulative_usage, transcript,
@@ -1778,37 +3163,43 @@ async def _run_agent_loop(
                     turn - 1, cumulative_usage, transcript,
                 )
             if writer is not None:
-                await _emit_usage_event(writer, config, _success_usage_event(result, turn))
+                await _emit_usage_event(
+                    writer, config, _success_usage_event(result, turn),
+                    epoch=usage_epoch, fork_of=usage_fork_of,
+                )
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
             prompt_tokens = _usage_prompt_tokens(result.usage)
             completion_tokens = _usage_completion_tokens(result.usage)
             if prompt_tokens is None:
-                # Provider reports no prompt/completion split (e.g. only an
-                # explicit total): count the whole total as new work so the
-                # budget still binds (fail-conservative, matches pre-change
-                # behavior).
                 budget_new_tokens += total
                 previous_prompt_tokens = 0
             else:
                 budget_new_tokens += max(0, prompt_tokens - previous_prompt_tokens)
                 previous_prompt_tokens = prompt_tokens
-                if completion_tokens is not None:
-                    budget_new_tokens += completion_tokens
-                else:
-                    # Completion missing but a total is present: the remainder
-                    # is output-side work.
-                    budget_new_tokens += max(0, total - prompt_tokens)
+                budget_new_tokens += (
+                    completion_tokens
+                    if completion_tokens is not None
+                    else max(0, total - prompt_tokens)
+                )
             if budget_new_tokens > config.max_tokens:
                 return _loop_result(
                     outcome, "failed", "token budget exceeded",
                     turn, cumulative_usage, transcript,
                 )
-            action_content = _bounded_text(result.content, MAX_ACTION_CONTENT_BYTES)
             try:
                 action = _parse_agent_action(result.content)
             except ValueError as exc:
-                transcript.append({"role": "assistant", "content": action_content})
-                transcript.append({"role": "user", "content": f"invalid action: {exc}"})
+                invalid_messages = [
+                    {"role": "assistant", "content": "[invalid action omitted]"},
+                    {"role": "user", "content": _bounded_text(
+                        f"invalid action: {exc}", MAX_OBSERVATION_BYTES
+                    )},
+                ]
+                if base_messages is None:
+                    transcript.extend(invalid_messages)
+                else:
+                    context_continuation.extend(invalid_messages)
+                    _sync_context_transcript()
                 no_progress_actions += 1
                 if no_progress_actions > MAX_CONSECUTIVE_PLANS:
                     return _loop_result(
@@ -1819,6 +3210,7 @@ async def _run_agent_loop(
                     )
                 continue
             trailing = _action_trailing(result.content)
+            action_message = _canonical_action_message(action)
             if action["type"] == "plan":
                 no_progress_actions += 1
                 if no_progress_actions > MAX_CONSECUTIVE_PLANS:
@@ -1828,14 +3220,27 @@ async def _run_agent_loop(
                         "actions without a tool call",
                         turn, cumulative_usage, transcript,
                     )
-                transcript.append({"role": "assistant", "content": action_content})
-                if trailing:
-                    transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
+                if base_messages is None:
+                    transcript.append(action_message)
+                    if trailing:
+                        transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
+                else:
+                    context_continuation.append(action_message)
+                    if trailing:
+                        context_continuation.append({
+                            "role": "user", "content": _TRAILING_ACTION_NOTE
+                        })
+                    context_continuation.append({"role": "user", "content": "Continue."})
+                    _sync_context_transcript()
                 progress.tool = "plan"
                 continue
             no_progress_actions = 0
             if action["type"] == "finish":
-                transcript.append({"role": "assistant", "content": action_content})
+                if base_messages is None:
+                    transcript.append(action_message)
+                else:
+                    context_continuation.append(action_message)
+                    _sync_context_transcript()
                 if code_changed and not verified_after_change:
                     reason = (
                         "finish rejected: you changed code but did not run a "
@@ -1848,10 +3253,11 @@ async def _run_agent_loop(
                             "finishing"
                         )
                     )
-                    transcript.append({
-                        "role": "user",
-                        "content": reason,
-                    })
+                    if base_messages is None:
+                        transcript.append({"role": "user", "content": reason})
+                    else:
+                        context_continuation.append({"role": "user", "content": reason})
+                        _sync_context_transcript()
                     progress.tool = "finish"
                     continue
                 return {
@@ -1867,8 +3273,15 @@ async def _run_agent_loop(
             name, arguments = action["name"], action["arguments"]
             denial = _permission_denied(name, arguments, config)
             if denial is not None:
-                transcript.append({"role": "assistant", "content": action_content})
-                transcript.append({"role": "user", "content": f"action rejected: {denial}"})
+                denied_messages = [
+                    action_message,
+                    {"role": "user", "content": f"action rejected: {denial}"},
+                ]
+                if base_messages is None:
+                    transcript.extend(denied_messages)
+                else:
+                    context_continuation.extend(denied_messages)
+                    _sync_context_transcript()
                 progress.tool = name
                 continue
             if stop.is_set():
@@ -1879,10 +3292,9 @@ async def _run_agent_loop(
             with ToolContext(worktree, lint=lint_diag) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)
             if name == "delegate" and tool_result.ok and writer is not None:
-                # Model-triggered child proposal: emit now; the supervisor
-                # validates and admits at this task's terminal envelope
-                # (implementation-plan step 2's dynamic admission).
-                await _emit_delegated_child(writer, config, arguments)
+                await _emit_delegated_child(
+                    writer, config, arguments, request_id=run_request_id
+                )
             if tool_result.ok:
                 if name in ("write_file", "edit_file"):
                     code_changed = True
@@ -1894,13 +3306,93 @@ async def _run_agent_loop(
             elif name == "run_shell":
                 verification_failed = True
                 verified_after_change = False
-            transcript.append({"role": "assistant", "content": action_content})
-            if trailing:
-                transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
-            transcript.append({"role": "user", "content": _tool_observation(name, tool_result)})
+            observation = {"role": "user", "content": _tool_observation(name, tool_result)}
+            if base_messages is None:
+                transcript.append(action_message)
+                if trailing:
+                    transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
+                transcript.append(observation)
+            else:
+                continuation_suffix = [action_message]
+                if trailing:
+                    continuation_suffix.append({
+                        "role": "user", "content": _TRAILING_ACTION_NOTE
+                    })
+                continuation_suffix.append(observation)
+                state_message = _context_state_message(
+                    code_changed=code_changed,
+                    verified_after_change=verified_after_change,
+                    verification_failed=verification_failed,
+                    no_progress_actions=no_progress_actions,
+                    budget_new_tokens=budget_new_tokens,
+                    previous_prompt_tokens=previous_prompt_tokens,
+                    turn=turn,
+                )
+                continuation_suffix.append(state_message)
+                context_continuation.extend(copy.deepcopy(continuation_suffix))
+                _sync_context_transcript()
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
                 await _persist_checkpoint(writer, config, turn, transcript, cumulative_usage, [])
+            if config.context_reuse and name == "delegate" and tool_result.ok:
+                epoch_count += 1
+                if base_messages is None:
+                    continuation_suffix = [
+                        _canonical_action_message(action),
+                        *(
+                            [{"role": "user", "content": _TRAILING_ACTION_NOTE}]
+                            if trailing else []
+                        ),
+                        observation,
+                        _context_state_message(
+                            code_changed=code_changed,
+                            verified_after_change=verified_after_change,
+                            verification_failed=verification_failed,
+                            no_progress_actions=no_progress_actions,
+                            budget_new_tokens=budget_new_tokens,
+                            previous_prompt_tokens=previous_prompt_tokens,
+                            turn=turn,
+                        ),
+                    ]
+                checkpoint = await asyncio.to_thread(
+                    _write_epoch_checkpoint,
+                    config,
+                    turn=turn,
+                    epoch=epoch_count,
+                    provider_messages=copy.deepcopy(sent_prompt["messages"]),
+                    continuation_suffix=continuation_suffix,
+                    provider=result.provider,
+                    model=model,
+                    tools_sha256=_sha256_hex(
+                        json.dumps(tools, sort_keys=True).encode("utf-8")
+                    ),
+                    provider_compat=provider_compat,
+                    provider_boundary=provider_boundaries.get(result.provider),
+                    code_changed=code_changed,
+                    verified_after_change=verified_after_change,
+                    verification_failed=verification_failed,
+                    no_progress_actions=no_progress_actions,
+                    budget_new_tokens=budget_new_tokens,
+                    previous_prompt_tokens=previous_prompt_tokens,
+                    cumulative_usage=cumulative_usage,
+                    wall_deadline=absolute_wall_deadline,
+                )
+                if checkpoint is not None:
+                    if writer is not None:
+                        await _emit_context_checkpoint(
+                            writer, config, checkpoint, request_id=run_request_id
+                        )
+                    return {
+                        **outcome,
+                        "status": TaskStatus.SUSPENDED.value,
+                        "turn": turn,
+                        "usage": cumulative_usage,
+                        "provider": result.provider,
+                        "latency_s": max(0.0, float(result.latency_s)),
+                        "transcript": transcript,
+                        "epoch": checkpoint.epoch,
+                        "checkpoint_ref": checkpoint.checkpoint_ref,
+                    }
         return _loop_result(
             outcome, "failed", f"max turns exceeded ({config.max_turns})",
             config.max_turns, cumulative_usage, transcript,
@@ -1936,6 +3428,7 @@ async def _do_provider_work(
             config.fanout_config,
             assigned_provider=config.assigned_provider,
             authorized_providers=config.authorized_providers,
+            authorized_providers_explicit=config.authorized_providers_explicit,
             debt=config.debt,
         )
     except Exception as exc:
@@ -1943,6 +3436,22 @@ async def _do_provider_work(
             "status": "failed",
             "failure_reason": f"provider routing failed: {exc.__class__.__name__}",
         })
+    try:
+        provider_path = _provider_path()
+        configured_providers = load_providers(provider_path)
+        provider_compat = {
+            p.name: (p.protocol.value, p.reasoning_effort)
+            for p in configured_providers
+        }
+        provider_boundaries = {
+            p.name: _provider_boundary(
+                config, p, provider_config_path=provider_path
+            )
+            for p in configured_providers
+        }
+    except Exception:
+        provider_compat = {}
+        provider_boundaries = {}
     worker_identity = secrets.token_hex(16)
     loop_outcome = await _run_agent_loop(
         config=config,
@@ -1954,6 +3463,9 @@ async def _do_provider_work(
         writer=writer,
         stop=stop,
         progress=progress,
+        provider_compat=provider_compat,
+        provider_boundaries=provider_boundaries,
+        run_request_id=run.get("request_id"),
     )
     if loop_outcome["status"] != "succeeded":
         return _loop_failure_outcome(loop_outcome)
@@ -2248,7 +3760,11 @@ async def _emit_proposed_children(
 
 
 async def _emit_delegated_child(
-    writer: asyncio.StreamWriter, config: AgentConfig, arguments: dict[str, Any]
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    arguments: dict[str, Any],
+    *,
+    request_id: str | None = None,
 ) -> None:
     """Emit the ``propose_child`` wire message for one model ``delegate`` call.
 
@@ -2260,7 +3776,7 @@ async def _emit_delegated_child(
     """
     await send(writer, {
         "type": "propose_child",
-        "request_id": make_request_id("propose"),
+        "request_id": request_id or make_request_id("propose"),
         "parent_task_id": config.task_id,
         "child_task_id": arguments["child_task_id"],
         "kind": arguments["kind"],
@@ -2314,8 +3830,12 @@ async def _run_task(
 
 
 def _exit_reason(status: str) -> str:
-    return {"succeeded": "done", "failed": "failed", "cancelled": "cancelled"}.get(
-        status, "failed")
+    return {
+        "succeeded": "done",
+        "failed": "failed",
+        "cancelled": "cancelled",
+        TaskStatus.SUSPENDED.value: "suspended",
+    }.get(status, "failed")
 
 
 async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
@@ -2336,6 +3856,13 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),
     }
+    if status == TaskStatus.SUSPENDED.value:
+        epoch = outcome.get("epoch")
+        checkpoint_ref = outcome.get("checkpoint_ref")
+        if epoch is not None:
+            envelope["epoch"] = epoch
+        if checkpoint_ref is not None:
+            envelope["checkpoint_ref"] = checkpoint_ref
     provider_metadata = outcome.get("provider_metadata")
     if isinstance(provider_metadata, dict):
         envelope["provider_metadata"] = provider_metadata

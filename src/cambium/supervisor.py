@@ -135,6 +135,15 @@ from .tasktree import (
     ready_tasks,
     topological_order,
 )
+from .worker import (
+    _SHA256_HEX_RE,
+    MAX_ENVELOPE_FIELD_CHARS,
+    MAX_ENVELOPE_ITEMS,
+    _cap_utf8,
+)
+from .worker import (
+    _fork_cache_compatible as _worker_fork_cache_compatible,
+)
 
 PROTO = 1
 WORKER_STDIN_LIMIT = MAX_LINE_BYTES
@@ -195,6 +204,51 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
+_CACHE_KEY_INT_FIELDS = ("prefix_bytes", "message_count")
+
+
+def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
+    """Return context_checkpoint fields whose values must not enter the runtime.
+
+    Field names only; values are never echoed back. The checkpoint is the
+    fork/resume trust anchor, so unknown fields and malformed cache-key
+    values fail the whole message instead of being trimmed.
+    """
+    cache_key = msg.get("cache_key")
+    if not isinstance(cache_key, dict):
+        return ["cache_key"]
+    invalid: list[str] = []
+    for field in ("epoch", "turn"):
+        if not (type(msg.get(field)) is int and msg.get(field) > 0):
+            invalid.append(field)
+    checkpoint_ref = msg.get("checkpoint_ref")
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        invalid.append("checkpoint_ref")
+    for field in _CACHE_KEY_INT_FIELDS:
+        value = cache_key.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            invalid.append(f"cache_key.{field}")
+    for field in ("provider", "model", "protocol", "reasoning_effort"):
+        value = cache_key.get(field)
+        if value is not None and not (isinstance(value, str) and value):
+            invalid.append(f"cache_key.{field}")
+    for field in (
+        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+        "full_sha256", "messages_sha256",
+    ):
+        value = cache_key.get(field)
+        if value is not None and (
+            not isinstance(value, str) or _SHA256_HEX_RE.match(value) is None
+        ):
+            invalid.append(f"cache_key.{field}")
+    for field in ("prefix_sha256", "suffix_sha256", "full_sha256"):
+        if field not in cache_key:
+            invalid.append(f"cache_key.{field}")
+    if type(cache_key.get("redacted")) is not bool:
+        invalid.append("cache_key.redacted")
+    return invalid
+
+
 def _wire_str(value: Any) -> str | None:
     """Coerce an unvalidated wire value for a JSON-safe event payload."""
     return value if isinstance(value, str) else None
@@ -204,6 +258,26 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
     if msg.get("type") == "ready":
         return msg.get("proto") != PROTO
     return "proto" in msg and msg["proto"] != PROTO
+
+
+def _result_identity_note(
+    msg: Mapping[str, Any], task_id: str, generation: int
+) -> str | None:
+    """Return why a result envelope fails worker identity, or None."""
+    claimed_task = msg.get("task_id")
+    if claimed_task is not None and claimed_task != task_id:
+        return "result task_id mismatch"
+    claimed_generation = msg.get("generation")
+    if (
+        claimed_generation is not None
+        and (
+            isinstance(claimed_generation, bool)
+            or not isinstance(claimed_generation, int)
+            or claimed_generation != generation
+        )
+    ):
+        return "result generation mismatch"
+    return None
 
 
 _TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
@@ -222,6 +296,8 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
         "prompt_prefix_bytes",
         "provider_cache_hit",
         "failure_reason",
+        "epoch",
+        "fork_of",
     }
 )
 
@@ -258,9 +334,11 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     if unknown:
         return unknown
     invalid: list[str] = []
-    for field in ("turn", "prompt_prefix_bytes"):
+    for field in ("turn", "prompt_prefix_bytes", "epoch"):
         if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
             invalid.append(field)
+    if "fork_of" in msg and not (type(msg["fork_of"]) is str and msg["fork_of"]):
+        invalid.append("fork_of")
     for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):
         value = msg.get(field)
         if field in msg and not (
@@ -944,6 +1022,161 @@ def _envelope_text(envelope: Mapping[str, Any] | None, key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _finite_metric_score(value: Any) -> int | float | None:
+    """Return a JSON-safe metric score, never a non-finite number."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _bounded_metric_value(value: Any, depth: int = 0) -> tuple[Any, bool]:
+    """Bound one JSON-like metric value without accepting NaN or infinity."""
+    if isinstance(value, str):
+        capped = _cap_utf8(value, MAX_ENVELOPE_FIELD_CHARS)
+        return capped, capped != value
+    if value is None or isinstance(value, bool):
+        return value, False
+    if isinstance(value, int):
+        return value, False
+    if isinstance(value, float):
+        return (value, False) if math.isfinite(value) else (None, True)
+    if depth >= 3:
+        return None, True
+    if isinstance(value, list):
+        bounded: list[Any] = []
+        truncated = len(value) > MAX_ENVELOPE_ITEMS
+        for item in value[:MAX_ENVELOPE_ITEMS]:
+            safe, item_truncated = _bounded_metric_value(item, depth + 1)
+            bounded.append(safe)
+            truncated = truncated or item_truncated
+        return bounded, truncated
+    if isinstance(value, dict):
+        bounded_dict: dict[str, Any] = {}
+        truncated = False
+        for raw_key in sorted(value, key=lambda key: str(key))[:MAX_ENVELOPE_ITEMS]:
+            if not isinstance(raw_key, str):
+                truncated = True
+                continue
+            key = _cap_utf8(raw_key, MAX_ENVELOPE_FIELD_CHARS)
+            safe, item_truncated = _bounded_metric_value(value[raw_key], depth + 1)
+            bounded_dict[key] = safe
+            truncated = truncated or item_truncated or key != raw_key
+        if len(value) > MAX_ENVELOPE_ITEMS:
+            truncated = True
+        return bounded_dict, truncated
+    return None, True
+
+
+def _bounded_metric_breakdown(value: Any) -> dict[str, Any]:
+    """Deterministically cap metric breakdowns to the envelope field budget.
+
+    ``metric_breakdown`` is part of the fixed nine-key envelope, so the
+    truncation marker lives inside the mapping instead of adding a tenth key.
+    Entries are considered in lexical key order and the marker is retained
+    whenever any entry or value was dropped.
+    """
+    if not isinstance(value, dict):
+        return {}
+    bounded: dict[str, Any] = {}
+    truncated = False
+    for raw_key in sorted(value, key=lambda key: str(key)):
+        if len(bounded) >= MAX_ENVELOPE_ITEMS - 1:
+            truncated = True
+            break
+        if not isinstance(raw_key, str):
+            truncated = True
+            continue
+        key = _cap_utf8(raw_key, MAX_ENVELOPE_FIELD_CHARS)
+        safe, item_truncated = _bounded_metric_value(value[raw_key])
+        candidate = {**bounded, key: safe}
+        try:
+            encoded_size = len(
+                json.dumps(
+                    {**candidate, "_truncated": True},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, UnicodeEncodeError):
+            truncated = True
+            continue
+        if encoded_size > MAX_ENVELOPE_FIELD_CHARS:
+            truncated = True
+            continue
+        bounded = candidate
+        truncated = truncated or item_truncated or key != raw_key
+    if not truncated:
+        return bounded
+    bounded["_truncated"] = True
+    while len(bounded) > 1:
+        try:
+            encoded_size = len(
+                json.dumps(
+                    bounded,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, UnicodeEncodeError):
+            encoded_size = MAX_ENVELOPE_FIELD_CHARS + 1
+        if encoded_size <= MAX_ENVELOPE_FIELD_CHARS:
+            break
+        removable = next(
+            (key for key in reversed(list(bounded)) if key != "_truncated"), None
+        )
+        if removable is None:
+            break
+        del bounded[removable]
+    return bounded if len(bounded) > 1 else {"_truncated": True}
+
+
+def _bounded_strict_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Produce the bounded, exact nine-key parent-result envelope."""
+    raw_diff = envelope.get("unified_diff", envelope.get("diff", ""))
+    diff = raw_diff if isinstance(raw_diff, str) else ""
+    bounded_diff = _cap_utf8(diff, MAX_ENVELOPE_FIELD_CHARS)
+    raw_summary = envelope.get("summary", "")
+    summary = raw_summary if isinstance(raw_summary, str) else ""
+    raw_status = envelope.get("status", "failed")
+    status = raw_status if isinstance(raw_status, str) else "failed"
+
+    def bounded_strings(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [
+            _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
+            for item in value[:MAX_ENVELOPE_ITEMS]
+            if isinstance(item, str)
+        ]
+
+    parent_task_id = envelope.get("parent_task_id")
+    if not (parent_task_id is None or isinstance(parent_task_id, str)):
+        parent_task_id = None
+    return {
+        "parent_task_id": parent_task_id,
+        "unified_diff": bounded_diff,
+        "diff_truncated": bool(envelope.get("diff_truncated", False))
+        or bounded_diff != diff,
+        "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
+        "metric_score": _finite_metric_score(envelope.get("metric_score")),
+        "metric_breakdown": _bounded_metric_breakdown(envelope.get("metric_breakdown")),
+        "commits": bounded_strings(envelope.get("commits")),
+        "files_changed": bounded_strings(envelope.get("files_changed")),
+        "status": _cap_utf8(status, MAX_ENVELOPE_FIELD_CHARS),
+    }
+
+
+def _bounded_resume_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one child-result envelope to the strict parent-envelope caps."""
+    return _bounded_strict_envelope(envelope)
+
+
 class DuplicateTaskIDError(ValueError):
     """The plan cannot be dispatched because a task id is repeated."""
 
@@ -1088,6 +1321,9 @@ class _GenOutcome:
     # Eval-3 ADOPT: true when the worker reported reuse-ready after its
     # terminal envelope and the live process was returned to the session pool.
     reuse_ready: bool = False
+    # Dynamic admission: the child task ids admitted at this generation's
+    # terminal envelope, in deterministic order (Cache-first step 2/§5.3).
+    admitted_children: tuple[str, ...] = ()
 
 
 class _Runtime:
@@ -1112,6 +1348,7 @@ class _Runtime:
         architectus: Any = None,
         conversations: Any = None,
         warm_pool_size: int = 0,
+        context_reuse: bool = False,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1157,6 +1394,23 @@ class _Runtime:
         self._admission_port = self._make_admission_port(architectus)
         self._admission_port_lock = asyncio.Lock()
         self._conversations = conversations
+        # Cache-first context reuse (step 2): session-level flag; per-parent
+        # epoch checkpoints keyed by task id, the admitted child ids per
+        # parent in admission order, and the strict child-result envelope per
+        # child task, captured at the child's terminal result envelope.
+        self._context_reuse = context_reuse
+        self._task_epochs: dict[str, dict[str, Any]] = {}
+        # Completion futures are registered before dynamic child tasks are
+        # created.  A suspended parent waits on these futures, not on a
+        # post-spawn task lookup, so a child cannot finish between admission
+        # and registration.
+        self._child_tasks: dict[str, list[asyncio.Future[dict[str, Any]]]] = {}
+        self._child_completion: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._child_parent: dict[str, str] = {}
+        self._admitted_children: dict[str, list[str]] = {}
+        self._child_result_by_task: dict[str, dict[str, Any]] = {}
+        self._child_result_meta: dict[str, tuple[str | None, int | None]] = {}
+        self._child_result_emitted: set[str] = set()
 
     @staticmethod
     def _make_admission_port(architectus: Any) -> Any:
@@ -1621,6 +1875,10 @@ class _Runtime:
             payload["parent_envelope"] = spec["parent_envelope"]
         if spec.get("proposed_children") is not None:
             payload["proposed_children"] = spec["proposed_children"]
+        # Cache-first resume: the payload carries the bounded resume dict so a
+        # restarted (or resumed) parent re-seeds its transcript from the epoch.
+        if spec.get("resume") is not None:
+            payload["resume"] = spec["resume"]
         return payload
 
     # -- dynamic child admission (implementation-plan step 2) ----------------
@@ -1654,17 +1912,17 @@ class _Runtime:
         one. Used both for the parent envelope admitted into a child's
         context and for a dynamic child's own upward result.
         """
-        values = {
+        values = _bounded_strict_envelope({
             "parent_task_id": spec.get("parent_task_id"),
             "unified_diff": msg.get("diff", ""),
-            "diff_truncated": bool(msg.get("diff_truncated", False)),
+            "diff_truncated": msg.get("diff_truncated", False),
             "summary": msg.get("summary", ""),
-            "metric_score": None,
-            "metric_breakdown": {},
+            "metric_score": msg.get("metric_score"),
+            "metric_breakdown": msg.get("metric_breakdown", {}),
             "commits": msg.get("commits", []),
             "files_changed": msg.get("files_changed", []),
-            "status": msg.get("status"),
-        }
+            "status": msg.get("status", "failed"),
+        })
         return {key: values[key] for key in _ENVELOPE_KEYS}
 
     async def _admit_child(
@@ -1672,8 +1930,13 @@ class _Runtime:
         parent_spec: dict[str, Any],
         proposal: dict[str, Any],
         parent_envelope: dict[str, Any],
-    ) -> None:
+    ) -> list[str]:
         """Validate one child revision, record it durably, then spawn it.
+
+        Returns the admitted child task ids in admission order (one per
+        proposal). A compatible cached-epoch child is pinned to the epoch's
+        (provider, model) and carries the ``context_fork`` descriptor; an
+        incompatible one runs the legacy summary-passing path.
 
         The revision is validated with ``tasktree.build_tree`` over the
         accumulated session tasks plus the proposed child. A duplicate,
@@ -1708,7 +1971,7 @@ class _Runtime:
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
                 reason=exc.__class__.__name__, proposal=proposal,
             )
-            return
+            return []
         try:
             child_spec = _child_spec(
                 self._session_dir, parent_spec, proposal, parent_envelope
@@ -1724,64 +1987,275 @@ class _Runtime:
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
                 reason=exc.__class__.__name__, proposal=proposal,
             )
-            return
-        # Append synchronously before any await so a concurrent proposal
-        # validation observes this child (duplicate detection stays exact).
+            return []
+        if self._task_group is None:
+            exc = RuntimeError("no active task group")
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected", parent_task_id=parent_task_id,
+                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                reason="NoActiveTaskGroup", proposal=proposal,
+            )
+            return []
+
+        # Append synchronously before the first await so concurrent proposals
+        # observe this child and duplicate detection stays exact.  Everything
+        # below has a rollback path until the durable admission event and the
+        # task creation both succeed.
         self._session_tasks.append({
             "task_id": child_task_id,
             "kind": kind,
             "depends_on": [parent_task_id],
             "spec": child_spec,
         })
-        if self._task_group is None:
-            exc = RuntimeError("no active task group")
-            # Group already closed/cancelled: roll the tree back so the child
-            # is not left durably admitted but never spawned, and record the
-            # rejection instead.
-            self._session_tasks[:] = [
-                task for task in self._session_tasks
-                if task.get("spec") is not child_spec
-            ]
-            await self.emit(
-                "child_rejected", task_id=parent_task_id, request_id=request_id,
-                parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
-            )
-            await self._record_revision_conversation(
-                outcome="rejected", parent_task_id=parent_task_id,
-                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-                reason="NoActiveTaskGroup", proposal=proposal,
-            )
-            return
-        await self._record_revision_conversation(
-            outcome="admitted", parent_task_id=parent_task_id,
-            child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-            proposal=proposal,
-        )
         try:
-            self._task_group.create_task(self.supervise_task(child_spec))
-        except RuntimeError as exc:
-            # Group closed after the check: roll back the in-memory admission.
-            self._session_tasks[:] = [
-                task for task in self._session_tasks
-                if task.get("spec") is not child_spec
-            ]
-            await self.emit(
-                "child_rejected", task_id=parent_task_id, request_id=request_id,
-                parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
+            await self._pin_fork_child(
+                parent_spec, child_spec, parent_task_id, child_task_id, kind
             )
             await self._record_revision_conversation(
-                outcome="rejected", parent_task_id=parent_task_id,
+                outcome="admitted", parent_task_id=parent_task_id,
                 child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-                reason="NoActiveTaskGroup", proposal=proposal,
+                proposal=proposal,
+            )
+            # This is the durable-before-spawn barrier.  A child is not an
+            # admitted runtime object until this critical event succeeds.
+            await self.emit(
+                "child_admitted", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, branch=child_spec.get("branch"),
+            )
+        except BaseException as admission_error:
+            self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            try:
+                await self.emit(
+                    "child_rejected", task_id=parent_task_id, request_id=request_id,
+                    parent_task_id=parent_task_id, child_task_id=child_task_id,
+                    child_kind=kind, reason="AdmissionPersistenceFailed",
+                    message=str(admission_error)[:512],
+                )
+                await self._record_revision_conversation(
+                    outcome="rejected", parent_task_id=parent_task_id,
+                    child_task_id=child_task_id, child_kind=kind,
+                    request_id=request_id, reason="AdmissionPersistenceFailed",
+                    proposal=proposal,
+                )
+            except BaseException:
+                pass
+            raise
+
+        # Register the completion future synchronously immediately before the
+        # create_task call.  The future is the parent-facing terminality
+        # signal; supervise_task resolves it exactly once in its finally.
+        loop = asyncio.get_running_loop()
+        completion = loop.create_future()
+        self._child_tasks.setdefault(parent_task_id, []).append(completion)
+        self._child_completion[child_task_id] = completion
+        self._child_parent[child_task_id] = parent_task_id
+        child_coroutine = self.supervise_task(child_spec)
+        try:
+            self._task_group.create_task(child_coroutine)
+        except BaseException as create_error:
+            child_coroutine.close()
+            self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            try:
+                await self.emit(
+                    "child_rejected", task_id=parent_task_id, request_id=request_id,
+                    parent_task_id=parent_task_id, child_task_id=child_task_id,
+                    child_kind=kind, reason="ChildSpawnFailed",
+                    message=str(create_error)[:512],
+                )
+                await self._record_revision_conversation(
+                    outcome="rejected", parent_task_id=parent_task_id,
+                    child_task_id=child_task_id, child_kind=kind,
+                    request_id=request_id, reason="ChildSpawnFailed",
+                    proposal=proposal,
+                )
+            except BaseException:
+                pass
+            return []
+        self._admitted_children.setdefault(parent_task_id, []).append(child_task_id)
+        return [child_task_id]
+
+    def _rollback_child_admission(
+        self, parent_task_id: str, child_task_id: str, child_spec: dict[str, Any]
+    ) -> None:
+        """Remove every in-memory child admission artifact before spawn."""
+        self._session_tasks[:] = [
+            task for task in self._session_tasks if task.get("spec") is not child_spec
+        ]
+        admitted = self._admitted_children.get(parent_task_id)
+        if admitted is not None:
+            self._admitted_children[parent_task_id] = [
+                task_id for task_id in admitted if task_id != child_task_id
+            ]
+        completion = self._child_completion.pop(child_task_id, None)
+        self._child_parent.pop(child_task_id, None)
+        if completion is not None and not completion.done():
+            completion.cancel()
+        futures = self._child_tasks.get(parent_task_id)
+        if futures is not None and completion is not None:
+            self._child_tasks[parent_task_id] = [
+                future for future in futures if future is not completion
+            ]
+        _release_lane(self._lanes, child_spec)
+
+    def _child_results_for_resume(
+        self, parent_task_id: str, child_ids: list[str],
+        *, checkpoint_ref: Any, epoch: Any,
+    ) -> dict[str, Any]:
+        """One bounded resume payload: every admitted child's strict envelope.
+
+        Children are ordered by admission (deterministic); a child with no
+        terminal envelope yet synthesizes a bounded failure envelope so the
+        resume never blocks on a missing result. Every envelope is normalized
+        to the strict parent-envelope caps (the worker re-validates each
+        child result as a strict envelope), and the list is capped at
+        ``MAX_ENVELOPE_ITEMS`` with ``child_results_truncated`` set when
+        dropped.
+        """
+        child_results: list[dict[str, Any]] = []
+        truncated = False
+        for child_id in child_ids:
+            envelope = self._child_result_by_task.get(child_id)
+            if envelope is None:
+                result = self._results.get(child_id)
+                summary = (result.reason if result is not None else "child result missing")
+                envelope = {
+                    "parent_task_id": parent_task_id,
+                    "unified_diff": "",
+                    "diff_truncated": False,
+                    "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
+                    "metric_score": None,
+                    "metric_breakdown": {},
+                    "commits": [],
+                    "files_changed": [],
+                    "status": (
+                        "cancelled"
+                        if result is not None and result.reason == "cancelled"
+                        else "failed"
+                    ),
+                }
+            if len(child_results) >= MAX_ENVELOPE_ITEMS:
+                truncated = True
+                continue
+            child_results.append(_bounded_resume_envelope(envelope))
+        return {
+            "checkpoint_ref": checkpoint_ref,
+            "epoch": epoch,
+            "child_results": child_results,
+            "child_results_truncated": truncated,
+        }
+
+    async def _await_suspend_children(
+        self, parent_task_id: str, child_ids: list[str], remaining: float
+    ) -> None:
+        """Await the suspended parent's children, bounded by the wall budget.
+
+        Each child is awaited under a shield so a resume-timeout never cancels
+        the child's own supervision; the bounded wait prevents one hung child
+        from consuming the parent's entire remaining budget.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, remaining)
+        pending = [
+            future for future in self._child_tasks.get(parent_task_id, ())
+            if future is not None and not future.done()
+        ]
+        for future in pending:
+            timeout = max(0.0, deadline - loop.time())
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            except TimeoutError:
+                pass
+
+    async def _pin_fork_child(
+        self,
+        parent_spec: dict[str, Any],
+        child_spec: dict[str, Any],
+        parent_task_id: str,
+        child_task_id: str,
+        kind: str | None,
+    ) -> None:
+        """Pin a cache-compatible child to its parent's last epoch (plan §5.5).
+
+        Runs after ``_validate_plan_task`` on the built child spec. A child
+        whose (model, tool schema) matches the parent's epoch and whose
+        provider is authorized is pinned to the epoch's (provider, model) and
+        carries the ``context_fork`` descriptor; every other child keeps the
+        legacy summary-passing path. The ``context_fork`` event is emitted in
+        both cases so session audits can see the compatibility decision.
+        """
+        if not self._context_reuse:
+            return
+        epoch = self._task_epochs.get(parent_task_id)
+        if epoch is None:
+            return
+        cache_key = epoch.get("cache_key")
+        authorized = frozenset(child_spec.get("authorized_providers") or ())
+        compatible, reason = _fork_cache_compatible_supervisor(
+            child_spec, epoch, authorized
+        )
+        fork_payload: dict[str, Any] = {
+            "task_id": parent_task_id,
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "child_kind": kind,
+            "epoch": epoch.get("epoch"),
+            "compatible": compatible,
+        }
+        if reason is not None:
+            fork_payload["reason"] = reason
+        await self.emit("context_fork", **fork_payload)
+        if not compatible or not isinstance(cache_key, dict):
+            await self.emit(
+                "context_fork_skipped",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                epoch=epoch.get("epoch"),
+                reason=reason or "incompatible epoch",
             )
             return
-        await self.emit(
-            "child_admitted", task_id=parent_task_id, request_id=request_id,
-            parent_task_id=parent_task_id, child_task_id=child_task_id,
-            child_kind=kind, branch=child_spec.get("branch"),
-        )
+        provider = cache_key.get("provider")
+        if not isinstance(provider, str):
+            return
+        boundary = cache_key.get("provider_boundary")
+        if not isinstance(boundary, dict):
+            await self.emit(
+                "context_fork_skipped",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                epoch=epoch.get("epoch"),
+                reason="epoch provider boundary is missing",
+            )
+            return
+        descriptor = {
+            "checkpoint_ref": epoch["checkpoint_ref"],
+            "provider": provider,
+            "model": cache_key["model"],
+            "system_sha256": cache_key["system_sha256"],
+            "tools_sha256": cache_key["tools_sha256"],
+            "prefix_sha256": cache_key["prefix_sha256"],
+            "suffix_sha256": cache_key["suffix_sha256"],
+            "full_sha256": cache_key["full_sha256"],
+            "prefix_bytes": cache_key["prefix_bytes"],
+            "provider_boundary": boundary,
+        }
+        fanout = child_spec.get("fanout_config")
+        if not isinstance(fanout, dict):
+            fanout = child_spec["fanout_config"] = {}
+        fanout["model"] = descriptor["model"]
+        child_spec["assigned_provider"] = provider
+        child_spec["context_fork"] = descriptor
+        lane = self._lanes.get(provider)
+        if lane is not None and not child_spec.get("_lane_reserved", False):
+            lane.in_flight += 1
+            child_spec["_lane_reserved"] = True
 
     async def _record_revision_conversation(
         self,
@@ -1838,7 +2312,7 @@ class _Runtime:
 
     async def _admit_port_proposals(
         self, parent_spec: dict[str, Any], parent_envelope: dict[str, Any]
-    ) -> None:
+    ) -> list[str]:
         """Feed one admitted parent's envelope to the decision port and admit its proposals.
 
         The port is the only provider-side channel whose response can become a
@@ -1847,7 +2321,7 @@ class _Runtime:
         directly. A malformed or mismatched proposal is durably rejected with
         ``child_rejected`` and spawns nothing. A finished task outside the
         port's decision domain (unknown to its tree) yields no wave: the port
-        has nothing to propose for it.
+        has nothing to propose for it. Returns the admitted child task ids.
         """
         parent_task_id = parent_spec["task_id"]
         malformed: str | None = None
@@ -1856,7 +2330,7 @@ class _Runtime:
             try:
                 self._admission_port.aggregate(parent_task_id, parent_envelope)
             except ValueError:
-                return
+                return []
             try:
                 proposals = await self._admission_port.step([
                     {
@@ -1873,16 +2347,20 @@ class _Runtime:
                 parent_task_id=parent_task_id, child_task_id=None, child_kind=None,
                 reason="MalformedProposal", message=f"decision port error: {malformed}"[:512],
             )
-            return
+            return []
+        admitted: list[str] = []
         for proposal in proposals:
-            await self._admit_port_proposal(parent_spec, parent_envelope, proposal)
+            admitted.extend(
+                await self._admit_port_proposal(parent_spec, parent_envelope, proposal)
+            )
+        return admitted
 
     async def _admit_port_proposal(
         self,
         parent_spec: dict[str, Any],
         parent_envelope: dict[str, Any],
         proposal: Any,
-    ) -> None:
+    ) -> list[str]:
         """Route one decision-port proposal through the revision boundary."""
         parent_task_id = parent_spec["task_id"]
         if not isinstance(proposal, dict):
@@ -1892,7 +2370,7 @@ class _Runtime:
                 reason="MalformedProposal",
                 message="decision port returned a non-object proposal",
             )
-            return
+            return []
         invalid_fields = _invalid_propose_child_fields(proposal)
         if invalid_fields:
             await self.emit(
@@ -1908,7 +2386,7 @@ class _Runtime:
                 parent_task_id, proposal, "MalformedProposal",
                 f"invalid field(s) {invalid_fields}",
             )
-            return
+            return []
         if proposal.get("parent_task_id") != parent_task_id:
             await self.emit(
                 "child_rejected", task_id=parent_task_id,
@@ -1923,8 +2401,8 @@ class _Runtime:
                 parent_task_id, proposal, "ParentTaskIdMismatch",
                 "parent_task_id does not match the finished task",
             )
-            return
-        await self._admit_child(parent_spec, proposal, parent_envelope)
+            return []
+        return await self._admit_child(parent_spec, proposal, parent_envelope)
 
     async def _record_port_rejection(
         self,
@@ -1965,61 +2443,158 @@ class _Runtime:
             spec, self._debt_store.as_mapping(), self._lanes
         ):
             self._lanes[spec["assigned_provider"]].in_flight += 1
+            spec["_lane_reserved"] = True
+
+    def _capture_child_result(
+        self, spec: dict[str, Any], msg: Mapping[str, Any],
+        *, request_id: str | None = None, generation: int | None = None,
+    ) -> None:
+        """Capture the first final worker envelope for one admitted child."""
+        task_id = spec["task_id"]
+        parent_task_id = self._child_parent.get(task_id)
+        if parent_task_id is None or task_id in self._child_result_by_task:
+            return
+        envelope = self._strict_envelope(spec, dict(msg))
+        self._child_result_by_task[task_id] = envelope
+        self._child_result_meta[task_id] = (request_id, generation)
+        self._child_envelopes.setdefault(parent_task_id, []).append(envelope)
+
+    def _synthetic_child_result(
+        self, spec: dict[str, Any], *, cancelled: bool = False
+    ) -> dict[str, Any]:
+        """Build a bounded terminal envelope when a child has no wire result."""
+        task_id = spec["task_id"]
+        parent_task_id = self._child_parent.get(task_id, spec.get("parent_task_id"))
+        result = self._results.get(task_id)
+        if cancelled:
+            status = "cancelled"
+            reason = "child cancelled"
+        elif result is None:
+            status = "failed"
+            reason = "child supervision ended without a result"
+        else:
+            status = "failed" if result.status != "succeeded" else "succeeded"
+            reason = result.reason or "child failed"
+        return _bounded_strict_envelope({
+            "parent_task_id": parent_task_id,
+            "unified_diff": "",
+            "diff_truncated": False,
+            "summary": reason,
+            "metric_score": None,
+            "metric_breakdown": {},
+            "commits": [],
+            "files_changed": [],
+            "status": status,
+        })
+
+    async def _publish_child_result(
+        self, task_id: str, envelope: dict[str, Any]
+    ) -> None:
+        """Publish one correlated child result event, first result wins."""
+        if task_id in self._child_result_emitted:
+            return
+        parent_task_id = self._child_parent.get(task_id)
+        if parent_task_id is None:
+            return
+        self._child_result_emitted.add(task_id)
+        request_id, generation = self._child_result_meta.get(task_id, (None, None))
+        await self.emit(
+            "child_result",
+            task_id=task_id,
+            request_id=request_id,
+            generation=generation,
+            **_bounded_resume_envelope(envelope),
+        )
+
+    async def _complete_child(self, spec: dict[str, Any], *, cancelled: bool) -> None:
+        """Resolve an admitted child's completion future exactly once."""
+        task_id = spec["task_id"]
+        if task_id not in self._child_parent:
+            return
+        result = self._results.get(task_id)
+        envelope = self._child_result_by_task.get(task_id)
+        # A worker can report success and then fail supervisor-owned integrity
+        # or merge checks.  The upward result follows the final supervisor
+        # verdict, not the provisional wire status.
+        if envelope is None or (
+            result is not None
+            and result.status != "succeeded"
+            and envelope.get("status") == "succeeded"
+        ):
+            previous = envelope
+            envelope = self._synthetic_child_result(spec, cancelled=cancelled)
+            self._child_result_by_task[task_id] = envelope
+            parent_task_id = self._child_parent[task_id]
+            self._child_envelopes[parent_task_id] = [
+                item for item in self._child_envelopes.get(parent_task_id, ())
+                if item is not previous
+            ]
+            self._child_envelopes[parent_task_id].append(envelope)
+            self._child_result_meta.setdefault(task_id, (None, None))
+        await self._publish_child_result(task_id, envelope)
+        future = self._child_completion.get(task_id)
+        if future is not None and not future.done():
+            future.set_result(envelope)
 
     async def supervise_task(self, spec: dict[str, Any]) -> None:
-        if spec["task_id"] in self._results:
-            # Reconcile may have marked the task finished before its lane was
-            # reserved; release the reservation if one was made.
-            _release_lane(self._lanes, spec)
-            return
+        task_id = spec["task_id"]
+        cancelled = False
         try:
-            await self._supervise(spec)
-        except InvalidBaseCommitError:
-            reason = "invalid_base_commit"
-            await self.emit("worker_failed", task_id=spec["task_id"], reason=reason)
-            self._results[spec["task_id"]] = TaskResult(
-                task_id=spec["task_id"], status="failed", exit_code=1, reason=reason
-            )
-        except WorktreeRecoveryError:
-            reason = "worktree_recovery_failed"
-            await self.emit("worker_failed", task_id=spec["task_id"], reason=reason)
-            self._results[spec["task_id"]] = TaskResult(
-                task_id=spec["task_id"], status="failed", exit_code=1, reason=reason
-            )
-        finally:
-            # Lane release (H1): every task that holds a lane reservation
-            # (batch pre-assignment or admission-time assignment) frees it on
-            # every exit path — success, failure, exception, cancellation.
-            _release_lane(self._lanes, spec)
-            if spec["task_id"] in self._results:
-                await self._prune_worktree(spec)
-            # Proposals buffered but never processed (the parent ended without
-            # a result envelope) are dropped with a durable rejection so they
-            # neither leak nor vanish silently.
-            pending = self._pending_children.pop(spec["task_id"], [])
-            for proposal in pending:
-                await self.emit(
-                    "child_rejected", task_id=spec["task_id"],
-                    request_id=proposal.get("request_id"),
-                    parent_task_id=spec["task_id"],
-                    child_task_id=proposal["child_task_id"],
-                    child_kind=proposal.get("kind"),
-                    reason="ParentTerminatedWithoutResult",
-                    message="parent ended without a result envelope; proposal dropped",
+            if task_id in self._results:
+                return
+            try:
+                await self._supervise(spec)
+            except InvalidBaseCommitError:
+                reason = "invalid_base_commit"
+                await self.emit("worker_failed", task_id=task_id, reason=reason)
+                self._results[task_id] = TaskResult(
+                    task_id=task_id, status="failed", exit_code=1, reason=reason
                 )
-            # A child task that ends failed is otherwise invisible to its
-            # parent: emit one correlated failure event so the parent learns
-            # the child did not succeed. Succeeded/cancelled children stay
-            # quiet here (their envelopes already carry the outcome).
-            parent_task_id = spec.get("parent_task_id")
-            if parent_task_id is not None:
-                child_result = self._results.get(spec["task_id"])
-                if child_result is not None and child_result.status == "failed":
+            except WorktreeRecoveryError:
+                reason = "worktree_recovery_failed"
+                await self.emit("worker_failed", task_id=task_id, reason=reason)
+                self._results[task_id] = TaskResult(
+                    task_id=task_id, status="failed", exit_code=1, reason=reason
+                )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            try:
+                # Lane release (H1): only an explicit ownership token may
+                # decrement a lane.  Provider identity alone is not ownership.
+                _release_lane(self._lanes, spec)
+                if task_id in self._results:
+                    await self._prune_worktree(spec)
+                # Proposals buffered but never processed are durably rejected.
+                pending = self._pending_children.pop(task_id, [])
+                for proposal in pending:
                     await self.emit(
-                        "child_failed", task_id=spec["task_id"],
+                        "child_rejected", task_id=task_id,
+                        request_id=proposal.get("request_id"),
+                        parent_task_id=task_id,
+                        child_task_id=proposal["child_task_id"],
+                        child_kind=proposal.get("kind"),
+                        reason="ParentTerminatedWithoutResult",
+                        message="parent ended without a result envelope; proposal dropped",
+                    )
+                parent_task_id = spec.get("parent_task_id")
+                child_result = self._results.get(task_id)
+                if (
+                    parent_task_id is not None
+                    and child_result is not None
+                    and child_result.status == "failed"
+                ):
+                    await self.emit(
+                        "child_failed", task_id=task_id,
                         parent_task_id=parent_task_id,
                         reason=child_result.reason or "failed",
                     )
+            finally:
+                # This is deliberately the last lifecycle step: parent
+                # suspension can proceed only after the final result (or a
+                # synthesized failure/cancellation envelope) is published.
+                await self._complete_child(spec, cancelled=cancelled)
 
     async def _supervise(self, spec: dict[str, Any]) -> None:
         task_id = spec["task_id"]
@@ -2040,6 +2615,9 @@ class _Runtime:
         wall_budget = _cfg_float(
             spec, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S
         )
+        # Cache-first: the monotonic start anchors the resume budget so each
+        # suspend/resume cycle subtracts its children's wall time exactly.
+        supervise_started = time.monotonic()
         if spec.get("base_commit") is None:
             base = await self._git_stdout(repo, "rev-parse", "refs/heads/main", check=False)
             if not base:
@@ -2086,14 +2664,33 @@ class _Runtime:
                 return
         generation = await self._ensure_worktree(spec)
 
-        # The admission semaphore bounds concurrent worker processes only. It
-        # is held across the generation loop and released before merge, prune,
-        # and observer notification, so a barrier observer waiting on a peer
-        # task's merge can never deadlock against tasks still queued for an
-        # admission slot.
+        # The admission semaphore bounds concurrent worker processes only.  A
+        # suspended parent releases it as soon as its generation exits, waits
+        # for children without a worker slot, then reacquires it for resume.
         semaphore = self._admission_semaphore
-        if semaphore is not None:
-            await semaphore.acquire()
+        semaphore_held = False
+
+        async def drive_with_admission_slot(
+            handle: WorkerHandle, *, allow_pool: bool
+        ) -> _GenOutcome:
+            acquired = False
+            if semaphore is not None:
+                await semaphore.acquire()
+                acquired = True
+            try:
+                return await self._drive_generation(
+                    spec,
+                    handle,
+                    ready_timeout=ready_timeout,
+                    heartbeat_interval=heartbeat_interval,
+                    heartbeat_timeout=heartbeat_timeout,
+                    wall_budget=wall_budget,
+                    allow_pool=allow_pool,
+                )
+            finally:
+                if acquired:
+                    semaphore.release()
+
         try:
             # Admission-time balancing (solution C): resolve (provider, model)
             # for un-pinned ``model_candidates`` tasks only now that the task
@@ -2124,13 +2721,8 @@ class _Runtime:
             while True:
                 handle = WorkerHandle(task_id=task_id, generation=generation)
                 self._handles[task_id] = handle
-                outcome = await self._drive_generation(
-                    spec, handle,
-                    ready_timeout=ready_timeout,
-                    heartbeat_interval=heartbeat_interval,
-                    heartbeat_timeout=heartbeat_timeout,
-                    wall_budget=wall_budget,
-                    allow_pool=first_generation,
+                outcome = await drive_with_admission_slot(
+                    handle, allow_pool=first_generation
                 )
                 first_generation = False
                 sanitized_envelope: dict[str, Any] | None = None
@@ -2144,6 +2736,43 @@ class _Runtime:
                         outcome.envelope.get("status")
                         if outcome.envelope is not None else None
                     )
+                    if envelope_status == "suspended" and not self._context_reuse:
+                        # Fail closed: without the flag a suspended verdict is
+                        # an unsupported status, never a resume loop.
+                        envelope_status = None
+                    if envelope_status == "suspended":
+                        remaining = wall_budget - (time.monotonic() - supervise_started)
+                        if remaining <= 0:
+                            reason = "wall budget exhausted before resume"
+                            await self.emit(
+                                "context_resume_failed", task_id=task_id,
+                                generation=generation, reason=reason,
+                            )
+                            self._results[task_id] = TaskResult(
+                                task_id=task_id, status="failed", exit_code=1,
+                                reason=reason, restarts=restarts, summary=worker_summary,
+                            )
+                            return
+                        child_ids = list(outcome.admitted_children)
+                        await self._await_suspend_children(task_id, child_ids, remaining)
+                        resume_payload = self._child_results_for_resume(
+                            task_id, child_ids,
+                            checkpoint_ref=outcome.envelope.get("checkpoint_ref"),
+                            epoch=outcome.envelope.get("epoch"),
+                        )
+                        # This critical lifecycle event is the last durable
+                        # barrier before the next worker spawn.  A store
+                        # failure raises and the resume is not attempted.
+                        await self.emit(
+                            "context_resume", task_id=task_id, generation=generation,
+                            epoch=outcome.envelope.get("epoch"),
+                            checkpoint_ref=outcome.envelope.get("checkpoint_ref"),
+                            child_count=len(child_ids),
+                        )
+                        spec["resume"] = resume_payload
+                        spec.pop("context_fork", None)
+                        wall_budget = remaining
+                        continue
                     if envelope_status != "succeeded":
                         failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
                         if failure_reason is None:
@@ -2228,7 +2857,7 @@ class _Runtime:
                 await asyncio.sleep(delay)
                 generation = await self._recover_worktree(spec, generation + 1)
         finally:
-            if semaphore is not None:
+            if semaphore is not None and semaphore_held:
                 semaphore.release()
 
 
@@ -2349,6 +2978,12 @@ class _Runtime:
             # Admission balancing (solution C): the worker presets Diffundo's
             # sticky primary from this value instead of the seeded first pick.
             init_msg["assigned_provider"] = spec["assigned_provider"]
+        if self._context_reuse:
+            init_msg["context_reuse"] = True
+        if isinstance(spec.get("context_fork"), dict):
+            init_msg["context_fork"] = spec["context_fork"]
+        if isinstance(spec.get("resume"), dict):
+            init_msg["resume"] = spec["resume"]
         if encode_message(init_msg) is None:
             await _report_outbound_message_too_long()
             return _GenOutcome(
@@ -2482,6 +3117,9 @@ class _Runtime:
         # waited on and reaped as a terminal worker.
         reuse_ready = False
         keep_alive = False
+        # Cache-first: child task ids admitted at this generation's terminal
+        # envelope, in admission order (deterministic resume ordering).
+        admitted_children: list[str] = []
 
         async def _cancel_and_kill() -> None:
             cancel_msg = {
@@ -2683,12 +3321,24 @@ class _Runtime:
                         "run_task", task_id=task_id, request_id=run_rid, generation=generation
                     )
                 elif mtype in ("result", "result_envelope"):
-                    envelope = msg
-                    correlated = run_rid is not None and msg.get("request_id") == run_rid
-                    if not correlated:
+                    identity_note = _result_identity_note(msg, task_id, generation)
+                    correlated = (
+                        run_rid is not None and msg.get("request_id") == run_rid
+                    )
+                    if not correlated and identity_note is None:
+                        identity_note = "result request_id mismatch"
+                    if identity_note is not None:
                         await self.emit(
-                            "protocol", task_id=task_id, note="result request_id mismatch",
+                            "protocol", task_id=task_id, note=identity_note,
                             expected=run_rid, got=msg.get("request_id"),
+                        )
+                    if envelope is not None:
+                        # One accepted terminal envelope per run request; a
+                        # stale or duplicate result never triggers lifecycle
+                        # side effects a second time.
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="duplicate result envelope ignored",
                         )
                     result_payload: dict[str, Any] = {"status": msg.get("status")}
                     provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
@@ -2698,19 +3348,27 @@ class _Runtime:
                         "result", task_id=task_id, request_id=msg.get("request_id"),
                         generation=generation, **result_payload,
                     )
+                    accepted = correlated and identity_note is None and envelope is None
+                    if accepted:
+                        envelope = msg
                     # Dynamic child admission: proposals are processed only
                     # now, when the parent's terminal envelope exists (the
                     # child's context is its own spec plus that envelope).
                     pending = self._pending_children.pop(task_id, [])
-                    if pending or self._admission_port is not None:
+                    admitted: list[str] = []
+                    if accepted and (pending or self._admission_port is not None):
                         parent_envelope = self._redact_envelope(
                             self._strict_envelope(spec, msg)
                         )
                         try:
                             for proposal in pending:
-                                await self._admit_child(spec, proposal, parent_envelope)
+                                admitted.extend(
+                                    await self._admit_child(spec, proposal, parent_envelope)
+                                )
                             if self._admission_port is not None:
-                                await self._admit_port_proposals(spec, parent_envelope)
+                                admitted.extend(
+                                    await self._admit_port_proposals(spec, parent_envelope)
+                                )
                         except ConversationAppendError:
                             reason = "conversation_store_append_failed"
                             await self.emit(
@@ -2719,15 +3377,43 @@ class _Runtime:
                             )
                             await _kill_worker(proc)
                             return _GenOutcome(clean=False, fatal=True, reason=reason)
-                    if spec.get("parent_task_id") is not None:
-                        child_result = self._strict_envelope(spec, msg)
-                        await self.emit(
-                            "child_result", task_id=task_id, generation=generation,
-                            **child_result,
+                    if (
+                        accepted
+                        and spec.get("parent_task_id") is not None
+                        and msg.get("status") in ("succeeded", "failed", "cancelled")
+                    ):
+                        # A suspended child emits no upward child_result until
+                        # its final post-resume result; publication happens
+                        # once in _complete_child under the supervisor verdict.
+                        self._capture_child_result(
+                            spec, msg,
+                            request_id=msg.get("request_id"), generation=generation,
                         )
-                        self._child_envelopes.setdefault(
-                            spec["parent_task_id"], []
-                        ).append(child_result)
+                    if admitted:
+                        self._admitted_children.setdefault(task_id, []).extend(admitted)
+                        admitted_children.extend(admitted)
+                elif mtype == "context_checkpoint":
+                    invalid = _invalid_context_checkpoint_fields(msg)
+                    if invalid:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="context_checkpoint rejected: invalid field(s)",
+                            fields=invalid,
+                        )
+                    else:
+                        self._task_epochs[task_id] = dict(msg)
+                        await self.emit(
+                            "context_checkpoint", task_id=task_id, generation=generation,
+                            epoch=msg.get("epoch"), turn=msg.get("turn"),
+                            checkpoint_ref=msg.get("checkpoint_ref"),
+                            cache_key=msg.get("cache_key"),
+                        )
+                elif mtype == "context_fork_skipped":
+                    reason = msg.get("reason")
+                    await self.emit(
+                        "context_fork_skipped", task_id=task_id, generation=generation,
+                        reason=reason,
+                    )
                 elif mtype == "propose_child":
                     invalid_fields = _invalid_propose_child_fields(msg)
                     if invalid_fields:
@@ -2882,7 +3568,8 @@ class _Runtime:
         terminal_verdict = (
             envelope is not None
             and correlated
-            and envelope.get("status") in ("succeeded", "failed", "cancelled")
+            and envelope.get("status")
+            in ("succeeded", "failed", "cancelled", "suspended")
         )
         if reuse_ready and not message_too_long:
             # The worker stays alive and owns no task state; the handle no
@@ -2894,6 +3581,7 @@ class _Runtime:
                 clean=terminal_verdict, fatal=False, reason=None,
                 exit_code=None, exit_reason=None, envelope=envelope,
                 correlated=correlated, reuse_ready=True,
+                admitted_children=tuple(admitted_children),
             )
         exit_code = proc.returncode
         handle.exit_code = exit_code
@@ -2925,7 +3613,7 @@ class _Runtime:
             fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",
             reason=protocol_failure or protocol_reason or reason, timeout_phase=timeout_phase,
             exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
-            correlated=correlated,
+            correlated=correlated, admitted_children=tuple(admitted_children),
         )
 
     # -- publish eligibility --------------------------------------------------
@@ -3342,6 +4030,10 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         if requirements:
             spec["requirements"] = requirements
     spec.setdefault("base_commit", None)
+    # Internal ownership token.  A provider identity alone does not prove
+    # that this task booked a lane; releases use this flag to stay balanced
+    # for explicit and cache-pinned tasks.
+    spec["_lane_reserved"] = False
     spec.setdefault("write_marker", True)
     if not isinstance(spec["write_marker"], bool):
         raise ValueError(f"task {task_id} write_marker must be a boolean")
@@ -3480,6 +4172,7 @@ def _preassign_lanes(
             continue
         provider_name = spec["assigned_provider"]
         lanes[provider_name].in_flight += 1
+        spec["_lane_reserved"] = True
         entry = batch_debt.get(provider_name)
         if entry is None:
             entry = batch_debt[provider_name] = ProviderDebt()
@@ -3494,12 +4187,94 @@ def _release_lane(lanes: dict[str, LaneState], spec: Mapping[str, Any]) -> None:
     success, failure, exception, and cancellation. Tasks without an
     ``assigned_provider`` never held a reservation.
     """
+    if not spec.get("_lane_reserved", False):
+        return
     assigned = spec.get("assigned_provider")
     if not isinstance(assigned, str):
+        if isinstance(spec, dict):
+            spec["_lane_reserved"] = False
         return
     lane = lanes.get(assigned)
     if lane is not None and lane.in_flight > 0:
         lane.in_flight -= 1
+    if isinstance(spec, dict):
+        spec["_lane_reserved"] = False
+
+
+def _fork_cache_compatible_supervisor(
+    child_spec: dict[str, Any],
+    epoch: Mapping[str, Any],
+    authorized_providers: frozenset[str],
+) -> tuple[bool, str | None]:
+    """Check every supervisor-visible cache identity before pinning a child."""
+    compatible, reason = _worker_fork_cache_compatible(
+        child_spec, epoch, authorized_providers
+    )
+    if not compatible:
+        return False, reason
+    cache_key = epoch.get("cache_key")
+    if not isinstance(cache_key, dict):
+        return False, "epoch has no cache_key"
+    provider = cache_key.get("provider")
+    if not isinstance(provider, str):
+        return False, "epoch provider is invalid"
+
+    fanout = child_spec.get("fanout_config")
+    fanout = fanout if isinstance(fanout, dict) else {}
+    configured_provider = child_spec.get("assigned_provider")
+    if configured_provider is None:
+        for key in ("provider", "primary_provider"):
+            if isinstance(fanout.get(key), str):
+                configured_provider = fanout[key]
+                break
+        if configured_provider is None:
+            providers = fanout.get("providers")
+            names = [
+                entry.get("name")
+                for entry in providers
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+            ] if isinstance(providers, (list, tuple)) else []
+            if len(names) == 1:
+                configured_provider = names[0]
+    if isinstance(configured_provider, str) and configured_provider != provider:
+        return False, "child provider differs from the epoch provider"
+
+    expected_protocol = cache_key.get("protocol")
+    expected_reasoning = cache_key.get("reasoning_effort")
+    actual_protocol = fanout.get("protocol")
+    actual_reasoning = fanout.get("reasoning_effort")
+    if actual_protocol is None:
+        actual_protocol = child_spec.get("protocol")
+    if actual_reasoning is None:
+        actual_reasoning = child_spec.get("reasoning_effort")
+
+    # Provider-backed children normally carry the trusted config path. Read
+    # only that path here; marker/fake workers have no provider config and
+    # retain the first-pass compatibility behavior when no identity is
+    # available to compare.
+    config_path = child_spec.get("provider_config_path")
+    if isinstance(config_path, str) and config_path:
+        try:
+            configured = next(
+                provider_config
+                for provider_config in load_providers(Path(config_path))
+                if provider_config.name == provider
+            )
+        except (OSError, StopIteration, ValueError):
+            return False, "provider configuration is unavailable"
+        actual_protocol = configured.protocol.value
+        actual_reasoning = configured.reasoning_effort
+    if (
+        isinstance(expected_protocol, str)
+        and isinstance(actual_protocol, str)
+        and expected_protocol != actual_protocol
+    ):
+        return False, "provider protocol differs from the epoch"
+    if expected_reasoning != actual_reasoning and (
+        expected_reasoning is not None or actual_reasoning is not None
+    ):
+        return False, "reasoning effort differs from the epoch"
+    return True, None
 
 
 def _child_spec(
@@ -3521,16 +4296,142 @@ def _child_spec(
     raw = proposal.get("spec")
     if not isinstance(raw, dict):
         raise ValueError("child proposal spec must be an object")
-    child_spec = dict(raw)
+    child_spec = copy.deepcopy(raw)
     child_spec["task_id"] = proposal["child_task_id"]
     child_spec["kind"] = proposal["kind"]
     child_spec["parent_task_id"] = parent_spec["task_id"]
-    # Children inherit, never exceed, the parent's environment access: a
-    # worker must not widen provider_env_keys beyond what its parent (or the
-    # plan) already had.
+
+    # Children inherit, never exceed, the parent's environment and provider
+    # authorization.  Reject a widening request instead of silently trimming
+    # it: silent trimming turns a malformed proposal into a different task.
     parent_keys = set(parent_spec.get("provider_env_keys") or ())
-    child_keys = set(child_spec.get("provider_env_keys") or ())
+    raw_keys = child_spec.get("provider_env_keys")
+    if raw_keys is None:
+        child_keys = set(parent_keys)
+    elif isinstance(raw_keys, (list, tuple)):
+        child_keys = set(raw_keys)
+    else:
+        raise ValueError("child provider_env_keys must be a list of names")
+    if not all(isinstance(key, str) for key in child_keys):
+        raise ValueError("child provider_env_keys must contain only names")
+    if not child_keys.issubset(parent_keys):
+        raise ValueError("child provider_env_keys would widen parent authorization")
     child_spec["provider_env_keys"] = sorted(child_keys & parent_keys)
+
+    parent_authorized = set(parent_spec.get("authorized_providers") or ())
+    raw_authorized = child_spec.get("authorized_providers")
+    if raw_authorized is None:
+        requested_authorized = set(parent_authorized)
+    elif isinstance(raw_authorized, (list, tuple)):
+        requested_authorized = set(raw_authorized)
+    else:
+        raise ValueError("child authorized_providers must be a list of names")
+    if not all(isinstance(name, str) and name for name in requested_authorized):
+        raise ValueError("child authorized_providers must contain only names")
+    if parent_authorized and not requested_authorized.issubset(parent_authorized):
+        raise ValueError("child authorized_providers would widen parent authorization")
+    # An empty parent set is the legacy unrestricted carrier.  A child may
+    # narrow that set, but it cannot gain access through a non-empty parent.
+    child_spec["authorized_providers"] = sorted(
+        requested_authorized & parent_authorized
+        if parent_authorized
+        else requested_authorized
+    )
+
+    parent_configured_path = parent_spec.get("provider_config_path")
+    child_configured_path = child_spec.get("provider_config_path")
+    if child_configured_path is not None:
+        if not isinstance(child_configured_path, str) or not child_configured_path:
+            raise ValueError("child provider_config_path must be a non-empty path")
+        if not isinstance(parent_configured_path, str) or not parent_configured_path:
+            raise ValueError("child provider_config_path override is forbidden")
+        if Path(child_configured_path).expanduser().resolve() != Path(
+            parent_configured_path
+        ).expanduser().resolve():
+            raise ValueError("child provider_config_path override is forbidden")
+    if isinstance(parent_configured_path, str) and parent_configured_path:
+        child_spec["provider_config_path"] = parent_configured_path
+
+    parent_fanout = parent_spec.get("fanout_config")
+    parent_fanout = parent_fanout if isinstance(parent_fanout, dict) else {}
+    child_fanout = child_spec.get("fanout_config")
+    if child_fanout is not None and not isinstance(child_fanout, dict):
+        raise ValueError("child fanout_config must be an object")
+    if isinstance(child_fanout, dict):
+        child_fanout = copy.deepcopy(child_fanout)
+        parent_nested_keys = set(parent_fanout.get("provider_env_keys") or ())
+        nested_keys = child_fanout.get("provider_env_keys")
+        if nested_keys is None:
+            nested_keys = parent_nested_keys
+        elif not isinstance(nested_keys, (list, tuple)):
+            raise ValueError("child fanout_config.provider_env_keys must be a list")
+        nested_key_set = set(nested_keys)
+        if not all(isinstance(key, str) for key in nested_key_set):
+            raise ValueError("child fanout_config.provider_env_keys must contain names")
+        if not nested_key_set.issubset(parent_keys | parent_nested_keys):
+            raise ValueError(
+                "child fanout_config.provider_env_keys would widen parent authorization"
+            )
+        child_fanout["provider_env_keys"] = sorted(
+            nested_key_set & (parent_keys | parent_nested_keys)
+        )
+
+        parent_providers = parent_fanout.get("providers")
+        child_providers = child_fanout.get("providers")
+        if isinstance(parent_providers, (list, tuple)):
+            parent_provider_names = {
+                entry.get("name")
+                for entry in parent_providers
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+            }
+            if child_providers is None:
+                child_fanout["providers"] = copy.deepcopy(list(parent_providers))
+            elif not isinstance(child_providers, (list, tuple)):
+                raise ValueError("child fanout_config.providers must be a list")
+            else:
+                child_provider_names = {
+                    entry.get("name")
+                    for entry in child_providers
+                    if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                }
+                if not child_provider_names.issubset(parent_provider_names):
+                    raise ValueError(
+                        "child fanout_config.providers would widen parent identity"
+                    )
+                child_fanout["providers"] = [
+                    copy.deepcopy(entry)
+                    for entry in parent_providers
+                    if isinstance(entry, dict)
+                    and entry.get("name") in child_provider_names
+                ]
+        elif child_providers is not None:
+            if not isinstance(child_providers, (list, tuple)):
+                raise ValueError("child fanout_config.providers must be a list")
+            child_provider_names = {
+                entry.get("name")
+                for entry in child_providers
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+            }
+            allowed_names = parent_authorized | {
+                value for value in (parent_spec.get("assigned_provider"),)
+                if isinstance(value, str)
+            }
+            if not child_provider_names.issubset(allowed_names):
+                raise ValueError("child fanout_config.providers would widen parent identity")
+        child_spec["fanout_config"] = child_fanout
+
+    parent_assigned = parent_spec.get("assigned_provider")
+    child_assigned = child_spec.get("assigned_provider")
+    if child_assigned is not None and not isinstance(child_assigned, str):
+        raise ValueError("child assigned_provider must be a provider name")
+    if isinstance(parent_assigned, str) and child_assigned is None:
+        child_spec["assigned_provider"] = parent_assigned
+    if (
+        isinstance(child_spec.get("assigned_provider"), str)
+        and parent_authorized
+        and child_spec["assigned_provider"] not in parent_authorized
+    ):
+        raise ValueError("child assigned_provider is not authorized by the parent")
     child_spec["parent_envelope"] = parent_envelope
     return _validate_plan_task(session_dir, child_spec)
 
@@ -3842,6 +4743,7 @@ async def run_plan(
     architectus: Any = None,
     conversations: bool | None = None,
     warm_pool_size: int = 0,
+    context_reuse: bool = False,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -3958,6 +4860,7 @@ async def run_plan(
             architectus=architectus,
             conversations=conversations_store,
             warm_pool_size=warm_pool_size,
+            context_reuse=context_reuse,
         )
         await runtime.start()
         if routing_state_load_error is not None:
@@ -4078,6 +4981,7 @@ async def _amain_plan(
     *,
     conversations: bool = False,
     warm_pool_size: int = 0,
+    context_reuse: bool = False,
 ) -> int:
     loop = asyncio.get_running_loop()
 
@@ -4091,6 +4995,7 @@ async def _amain_plan(
             on_event=print_event,
             conversations=conversations,
             warm_pool_size=warm_pool_size,
+            context_reuse=context_reuse,
         )
     )
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -4147,6 +5052,12 @@ def main(argv: list[str] | None = None) -> int:
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
     )
+    parser.add_argument(
+        "--context-reuse",
+        action="store_true",
+        help="cache-first context reuse: fork children from parent epoch "
+        "checkpoints and suspend/resume at delegate boundaries (default: off)",
+    )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)
     if args.warm_pool_size < 0:
@@ -4175,6 +5086,7 @@ def main(argv: list[str] | None = None) -> int:
                     plan,
                     conversations=args.conversations,
                     warm_pool_size=args.warm_pool_size,
+                    context_reuse=args.context_reuse,
                 )
             )
         except KeyboardInterrupt:

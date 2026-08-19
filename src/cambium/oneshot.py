@@ -141,6 +141,10 @@ class OneShotConfig:
     # Deprecated boolean alias for ``routing_mode``; cli.py is migrated in a
     # separate change. ``True`` selects USAGE_BALANCED.
     auto: bool | None = field(default=None)
+    # Cache-first context reuse: fork children from parent epoch checkpoints
+    # and suspend/resume at delegate boundaries. Default off: the historical
+    # behavior is byte-for-byte unchanged.
+    context_reuse: bool = False
 
     def __post_init__(self) -> None:
         if self.auto:
@@ -602,6 +606,7 @@ async def run_oneshot(
             provider_environment=provider_environment,
             routing_state_path=routing_state_path,
             reject_reused_session=reject_reused,
+            context_reuse=resolved.context_reuse,
         )
     return await supervisor.run_plan(
         session_dir,
@@ -609,4 +614,5 @@ async def run_oneshot(
         on_event=on_event,
         routing_state_path=routing_state_path,
         reject_reused_session=reject_reused,
+        context_reuse=resolved.context_reuse,
     )

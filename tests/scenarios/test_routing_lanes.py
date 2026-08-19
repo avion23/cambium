@@ -220,16 +220,25 @@ def test_batch_preassignment_skips_pinned_and_no_fanout_tasks(tmp_path) -> None:
 
 def test_release_lane_returns_in_flight_to_zero_and_noops_without_reservation() -> None:
     lanes = {"a": LaneState(in_flight=1), "b": LaneState()}
-    spec = {"task_id": "t", "assigned_provider": "a", "fanout_config": {"model": "m1"}}
+    spec = {
+        "task_id": "t", "assigned_provider": "a", "fanout_config": {"model": "m1"},
+        "_lane_reserved": True,
+    }
 
     _release_lane(lanes, spec)
     assert lanes["a"].in_flight == 0
+    assert spec["_lane_reserved"] is False
     # a task without an assignment never held a reservation
     _release_lane(lanes, {"task_id": "t2"})
     assert lanes["b"].in_flight == 0
     # after release, admission picks the freed lane again
     providers = [_pc("a", "m1"), _pc("b", "m2")]
     assert select_lane(providers, ["m1", "m2"], {}, lanes) == ("a", "m1")
+    # a pinned task that never booked a lane must not decrement one
+    pinned = {"task_id": "t3", "assigned_provider": "a", "_lane_reserved": False}
+    lanes["a"].in_flight += 1
+    _release_lane(lanes, pinned)
+    assert lanes["a"].in_flight == 1
 
 
 # --------------------------------------------------------------------------- #
