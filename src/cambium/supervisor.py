@@ -600,11 +600,12 @@ def _codex_oauth_provider_names(
 
     Identity is carried by provider name (``authorized_providers``) so OAuth
     providers are never dropped the way env-key filtering dropped them. When a
-    task carries no authorized set (legacy plans) the referenced-provider and
-    fanout fallbacks preserve the prior behavior. A config that cannot be
-    loaded yields no names: the worker's own config load surfaces file errors
-    at its boundary (transport authoritative), so this preflight only adds the
-    oauth-document gate on top of a loadable config.
+    task carries no authorized set (legacy plans), the referenced-provider
+    fallback preserves prior behavior; an explicit model pin limits the
+    unrestricted fanout fallback to matching providers. A config that cannot
+    be loaded yields no names: the worker's own config load surfaces file
+    errors at its boundary (transport authoritative), so this preflight only
+    adds the oauth-document gate on top of a loadable config.
     """
     try:
         providers = load_providers(_provider_config_path(source, spec))
@@ -624,13 +625,19 @@ def _codex_oauth_provider_names(
     referenced = _fanout_provider_names(spec)
     if referenced:
         return codex & referenced
-    # No explicit provider restriction: the worker loads every configured
-    # provider and cascades over the model-matching ones, so any codex
-    # provider may serve this task (e.g. a pinned oneshot run whose
-    # fanout_config carries no providers list). Marker-mode tasks never
-    # build a router and stay empty.
+    # No explicit provider restriction: a pinned model narrows the OAuth
+    # providers to the same model the worker will route to. Without a model
+    # pin, the worker loads every configured provider and may cascade over any
+    # codex provider. Marker-mode tasks never build a router and stay empty.
     fanout_config = spec.get("fanout_config")
     if isinstance(fanout_config, dict) and fanout_config:
+        model = fanout_config.get("model")
+        if isinstance(model, str) and model:
+            return frozenset(
+                provider.name
+                for provider in providers
+                if provider.auth is AuthMode.CODEX_CHATGPT and provider.model == model
+            )
         return codex
     return frozenset()
 
