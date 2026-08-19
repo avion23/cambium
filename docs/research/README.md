@@ -59,6 +59,7 @@ file's own header.
 
 - [`architectus-design.md`](architectus-design.md) — RLM task-tree orchestrator (v2.1 M5), historical draft; nothing merged.
 - [`bench-harness-design.md`](bench-harness-design.md) — proposed Ascensus measurement layer for scenario tests; historical snapshot.
+- [`cache-first-context-reuse-plan.md`](cache-first-context-reuse-plan.md) — implementation plan for immutable cache epochs and parent/child fork/resume; cache reuse primary, compaction later; docs-only, non-normative.
 - [`cascade-design.md`](cascade-design.md) — Diffundo provider-cascade design, docs-only proposal extending architecture §9.
 - [`cloud-code.md`](cloud-code.md) — competitive analysis of Google/Amazon "Cloud Code".
 - [`codex.md`](codex.md) — competitive analysis of the OpenAI Codex CLI.
