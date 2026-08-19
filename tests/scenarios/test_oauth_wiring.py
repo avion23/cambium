@@ -353,6 +353,25 @@ def test_worker_environment_non_codex_task_gets_no_oauth_env(tmp_path: Path) -> 
     assert not any(name.startswith("CAMBIUM_OAUTH_") for name in env)
 
 
+def test_worker_environment_injects_for_matching_unrestricted_model(
+    tmp_path: Path,
+) -> None:
+    config = _codex_config(tmp_path / "providers.json")
+    spec = {
+        "task_id": "codex-model-task",
+        "worktree_path": str(tmp_path / "wt"),
+        "fanout_config": {"tier": "strong", "model": "gpt-5.6-sol"},
+        "provider_config_path": str(config),
+    }
+    store = OAuthStore(_store_path(tmp_path))
+    store.save_provider(_doc())
+
+    env = supervisor._worker_environment(spec, 1, oauth_store=store)
+
+    assert env["CAMBIUM_OAUTH_ACCESS_CODEX"] == ACCESS
+    assert env["CAMBIUM_OAUTH_ACCOUNT_CODEX"] == ACCOUNT
+
+
 def test_worker_environment_injects_for_empty_authorized_set(tmp_path: Path) -> None:
     """An empty authorized_providers list (validator normalization) is no
     restriction: the codex provider referenced through fanout_config still gets
