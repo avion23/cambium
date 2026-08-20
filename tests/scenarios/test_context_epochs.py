@@ -686,6 +686,7 @@ def test_invalid_context_checkpoint_fields_matrix() -> None:
             "prefix_bytes": 0,
             "message_count": 1,
             "redacted": False,
+            "provider_boundary": _provider_boundary("p", "m"),
         },
     }
     assert _invalid_context_checkpoint_fields(valid) == []
@@ -935,7 +936,6 @@ def _write_suspend_worker(path: Path) -> None:
         "              'suffix_sha256': 'e' * 64,\n"
         "              'full_sha256': 'f' * 64,\n"
         "              'prefix_bytes': 0,\n"
-        "              'messages_sha256': os.environ.get('FAKE_MESSAGES_SHA', 'c' * 64),\n"
         "              'message_count': 1,\n"
         "              'redacted': False,\n"
         "              'provider_boundary': boundary,\n"
