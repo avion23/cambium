@@ -896,7 +896,9 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         def observe(event: dict[str, Any]) -> None:
             nonlocal checkpoint_path
             kind = event["kind"]
-            if kind == "context_checkpoint":
+            # Keep the epoch-1 fork target as the byte-comparison fixture;
+            # terminal epoch 2 is a separate immutable checkpoint.
+            if kind == "context_checkpoint" and event["payload"]["epoch"] == 1:
                 checkpoint_ref = event["payload"]["checkpoint_ref"]
                 checkpoint_path = (
                     session_dir / ".cambium" / "checkpoints" / task["task_id"]
@@ -925,7 +927,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             authorizations = list(REQUEST_AUTHORIZATION)
 
         checkpoints = [event for event in events if event["kind"] == "context_checkpoint"]
-        assert len(checkpoints) == 1
+        assert len(checkpoints) == 2
         checkpoint_event = checkpoints[0]["payload"]
         assert checkpoint_event["epoch"] == 1
         checkpoint_ref = checkpoint_event["checkpoint_ref"]
