@@ -140,6 +140,7 @@ from .worker import (
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
     _cap_utf8,
+    _validate_provider_boundary,
 )
 from .worker import (
     _fork_cache_compatible as _worker_fork_cache_compatible,
@@ -204,6 +205,15 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
+_CONTEXT_CHECKPOINT_FIELDS = frozenset({
+    "type", "request_id", "task_id", "generation", "epoch", "turn",
+    "checkpoint_ref", "cache_key",
+})
+_CACHE_KEY_FIELDS = frozenset({
+    "provider", "model", "protocol", "reasoning_effort", "system_sha256",
+    "tools_sha256", "prefix_sha256", "suffix_sha256", "full_sha256",
+    "prefix_bytes", "message_count", "redacted", "provider_boundary",
+})
 _CACHE_KEY_INT_FIELDS = ("prefix_bytes", "message_count")
 
 
@@ -214,10 +224,15 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
     fork/resume trust anchor, so unknown fields and malformed cache-key
     values fail the whole message instead of being trimmed.
     """
+    unknown = sorted(set(msg) - _CONTEXT_CHECKPOINT_FIELDS, key=str)
+    if unknown:
+        return unknown
     cache_key = msg.get("cache_key")
     if not isinstance(cache_key, dict):
         return ["cache_key"]
     invalid: list[str] = []
+    unknown_cache_key = sorted(set(cache_key) - _CACHE_KEY_FIELDS, key=str)
+    invalid.extend(f"cache_key.{field}" for field in unknown_cache_key)
     for field in ("epoch", "turn"):
         if not (type(msg.get(field)) is int and msg.get(field) > 0):
             invalid.append(field)
@@ -229,23 +244,35 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             invalid.append(f"cache_key.{field}")
     for field in ("provider", "model", "protocol", "reasoning_effort"):
-        value = cache_key.get(field)
-        if value is not None and not (isinstance(value, str) and value):
-            invalid.append(f"cache_key.{field}")
-    for field in (
-        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
-        "full_sha256", "messages_sha256",
-    ):
-        value = cache_key.get(field)
-        if value is not None and (
-            not isinstance(value, str) or _SHA256_HEX_RE.match(value) is None
-        ):
-            invalid.append(f"cache_key.{field}")
-    for field in ("prefix_sha256", "suffix_sha256", "full_sha256"):
         if field not in cache_key:
+            invalid.append(f"cache_key.{field}")
+            continue
+        value = cache_key.get(field)
+        if field in ("provider", "reasoning_effort"):
+            valid = value is None or (isinstance(value, str) and bool(value))
+        else:
+            valid = isinstance(value, str) and bool(value)
+        if not valid:
+            invalid.append(f"cache_key.{field}")
+    required_digests = (
+        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+        "full_sha256",
+    )
+    for field in required_digests:
+        value = cache_key.get(field)
+        if field not in cache_key:
+            invalid.append(f"cache_key.{field}")
+        elif not isinstance(value, str) or _SHA256_HEX_RE.match(value) is None:
             invalid.append(f"cache_key.{field}")
     if type(cache_key.get("redacted")) is not bool:
         invalid.append("cache_key.redacted")
+    if "provider_boundary" not in cache_key:
+        invalid.append("cache_key.provider_boundary")
+    else:
+        try:
+            _validate_provider_boundary(cache_key["provider_boundary"])
+        except ValueError:
+            invalid.append("cache_key.provider_boundary")
     return invalid
 
 
@@ -2615,9 +2642,10 @@ class _Runtime:
         wall_budget = _cfg_float(
             spec, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S
         )
-        # Cache-first: the monotonic start anchors the resume budget so each
-        # suspend/resume cycle subtracts its children's wall time exactly.
+        # Cache-first: one absolute deadline accounts for every suspend/resume
+        # cycle and the time spent waiting for children.
         supervise_started = time.monotonic()
+        deadline = supervise_started + wall_budget
         if spec.get("base_commit") is None:
             base = await self._git_stdout(repo, "rev-parse", "refs/heads/main", check=False)
             if not base:
@@ -2741,7 +2769,7 @@ class _Runtime:
                         # an unsupported status, never a resume loop.
                         envelope_status = None
                     if envelope_status == "suspended":
-                        remaining = wall_budget - (time.monotonic() - supervise_started)
+                        remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             reason = "wall budget exhausted before resume"
                             await self.emit(
@@ -2771,12 +2799,16 @@ class _Runtime:
                         )
                         spec["resume"] = resume_payload
                         spec.pop("context_fork", None)
-                        wall_budget = remaining
                         continue
                     if envelope_status != "succeeded":
                         failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
                         if failure_reason is None:
                             failure_reason = "worker_verdict_failed"
+                        if spec.get("resume") is not None:
+                            await self.emit(
+                                "context_resume_failed", task_id=task_id,
+                                generation=generation, reason=failure_reason,
+                            )
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
                             reason=failure_reason, restarts=restarts, summary=worker_summary,
@@ -3399,6 +3431,16 @@ class _Runtime:
                             "protocol", task_id=task_id, generation=generation,
                             note="context_checkpoint rejected: invalid field(s)",
                             fields=invalid,
+                        )
+                    elif (
+                        msg.get("task_id") != task_id
+                        or type(msg.get("generation")) is not int
+                        or msg.get("generation") != generation
+                    ):
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="context_checkpoint rejected: identity mismatch",
+                            expected_task_id=task_id, expected_generation=generation,
                         )
                     else:
                         self._task_epochs[task_id] = dict(msg)
