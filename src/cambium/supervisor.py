@@ -140,6 +140,8 @@ from .worker import (
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
     _cap_utf8,
+    _safe_task_id,
+    _validate_checkpoint_ref_shape,
     _validate_provider_boundary,
 )
 from .worker import (
@@ -215,6 +217,13 @@ _CACHE_KEY_FIELDS = frozenset({
     "prefix_bytes", "message_count", "redacted", "provider_boundary",
 })
 _CACHE_KEY_INT_FIELDS = ("prefix_bytes", "message_count")
+_CONTEXT_EPOCH_ADVANCED_FIELDS = frozenset({
+    "type", "request_id", "task_id", "generation", "epoch", "checkpoint_ref",
+    "folded_from_epoch", "reason",
+})
+_COMPACTION_FAILED_FIELDS = frozenset({
+    "type", "request_id", "task_id", "generation", "epoch", "reason",
+})
 
 
 def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
@@ -274,6 +283,115 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
         except ValueError:
             invalid.append("cache_key.provider_boundary")
     return invalid
+
+
+def _invalid_context_epoch_advanced_fields(msg: dict[str, Any]) -> list[str]:
+    """Return context_epoch_advanced fields whose values are invalid."""
+    unknown = sorted(set(msg) - _CONTEXT_EPOCH_ADVANCED_FIELDS, key=str)
+    if unknown:
+        return unknown
+    invalid: list[str] = []
+    if msg.get("type") != "context_epoch_advanced":
+        invalid.append("type")
+    for field in ("request_id", "task_id", "checkpoint_ref"):
+        value = msg.get(field)
+        if not isinstance(value, str) or not value:
+            invalid.append(field)
+    for field in ("generation", "epoch", "folded_from_epoch"):
+        value = msg.get(field)
+        if type(value) is not int or value <= 0:
+            invalid.append(field)
+    if "reason" not in msg:
+        invalid.append("reason")
+    elif msg["reason"] is not None and not isinstance(msg["reason"], str):
+        invalid.append("reason")
+    return invalid
+
+
+def _invalid_compaction_failed_fields(msg: dict[str, Any]) -> list[str]:
+    """Return compaction_failed fields whose values are invalid."""
+    unknown = sorted(set(msg) - _COMPACTION_FAILED_FIELDS, key=str)
+    if unknown:
+        return unknown
+    invalid: list[str] = []
+    if msg.get("type") != "compaction_failed":
+        invalid.append("type")
+    for field in ("request_id", "task_id"):
+        value = msg.get(field)
+        if not isinstance(value, str) or not value:
+            invalid.append(field)
+    for field in ("generation", "epoch"):
+        value = msg.get(field)
+        if type(value) is not int or value <= 0:
+            invalid.append(field)
+    reason = msg.get("reason")
+    if not isinstance(reason, str) or not reason:
+        invalid.append("reason")
+    return invalid
+
+
+def _epoch_checkpoint_path(
+    session_dir: Path, task_id: str, checkpoint_ref: str
+) -> Path:
+    """Return one session-owned epoch checkpoint path after strict validation."""
+    try:
+        task_component, _epoch, _address_pre, _address_persisted = (
+            _validate_checkpoint_ref_shape(checkpoint_ref)
+        )
+    except ValueError as exc:
+        raise ValueError("invalid checkpoint_ref path") from exc
+    if task_component != _safe_task_id(task_id):
+        raise ValueError("checkpoint_ref task mismatch")
+
+    root = (Path(session_dir).resolve() / ".cambium" / "checkpoints").resolve()
+    relative = Path(checkpoint_ref)
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("checkpoint path is a symlink")
+    path = root / relative
+    if not path.is_relative_to(root):
+        raise ValueError("checkpoint_ref escapes the checkpoint root")
+    return path
+
+
+def _load_epoch_checkpoint_messages(
+    session_dir: Path, task_id: str, checkpoint_ref: str
+) -> dict[str, list[dict[str, str]]]:
+    """Load the raw message lists from one immutable epoch checkpoint."""
+    path = _epoch_checkpoint_path(session_dir, task_id, checkpoint_ref)
+    try:
+        if path.stat().st_size > MAX_LINE_BYTES * 4:
+            raise ValueError("checkpoint exceeds the size cap")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("checkpoint unreadable") from exc
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint is not an object")
+
+    loaded: dict[str, list[dict[str, str]]] = {}
+    for field in ("provider_messages", "continuation_suffix"):
+        raw_messages = data.get(field)
+        if not isinstance(raw_messages, list):
+            raise ValueError(f"checkpoint {field} is invalid")
+        messages: list[dict[str, str]] = []
+        for message in raw_messages:
+            if (
+                not isinstance(message, dict)
+                or set(message) != {"role", "content"}
+                or message.get("role") not in {"system", "user", "assistant", "tool"}
+                or not isinstance(message.get("content"), str)
+            ):
+                raise ValueError(f"checkpoint {field} contains an invalid message")
+            messages.append({
+                "role": message["role"],
+                "content": message["content"],
+            })
+        loaded[field] = messages
+    if not loaded["provider_messages"]:
+        raise ValueError("checkpoint provider_messages is empty")
+    return loaded
 
 
 def _wire_str(value: Any) -> str | None:
@@ -1427,6 +1545,9 @@ class _Runtime:
         # child task, captured at the child's terminal result envelope.
         self._context_reuse = context_reuse
         self._task_epochs: dict[str, dict[str, Any]] = {}
+        # A worker only folds after a later run receives proof that this node's
+        # earlier terminal result was published by the supervisor.
+        self._published_task_ids: set[str] = set()
         # Completion futures are registered before dynamic child tasks are
         # created.  A suspended parent waits on these futures, not on a
         # post-spawn task lookup, so a child cannot finish between admission
@@ -1883,6 +2004,7 @@ class _Runtime:
             "branch": spec["branch"],
             "base_commit": spec["base_commit"],
             "generation": generation,
+            "published": spec["task_id"] in self._published_task_ids,
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
             "max_wall_s": wall_budget,
@@ -1907,6 +2029,10 @@ class _Runtime:
         if spec.get("resume") is not None:
             payload["resume"] = spec["resume"]
         return payload
+
+    def _mark_published(self, task_id: str) -> None:
+        """Record that a terminal success for *task_id* was published."""
+        self._published_task_ids.add(task_id)
 
     # -- dynamic child admission (implementation-plan step 2) ----------------
 
@@ -2472,6 +2598,115 @@ class _Runtime:
             self._lanes[spec["assigned_provider"]].in_flight += 1
             spec["_lane_reserved"] = True
 
+    def _redact_checkpoint_message(self, message: dict[str, str]) -> dict[str, str]:
+        """Redact one provider message before it enters or leaves recovery."""
+        if self._redactor is None:
+            return dict(message)
+        redacted = self._redactor.redact_protocol_record(
+            message, structural_fields=("role",)
+        )
+        return {
+            "role": redacted["role"],
+            "content": redacted["content"],
+        }
+
+    async def _record_context_checkpoint_conversation(
+        self, task_id: str, checkpoint_ref: str, epoch: int
+    ) -> None:
+        """Append one redacted raw row for every message in an epoch checkpoint."""
+        if self._conversations is None:
+            return
+        try:
+            checkpoint = await asyncio.to_thread(
+                _load_epoch_checkpoint_messages,
+                self._session_dir,
+                task_id,
+                checkpoint_ref,
+            )
+        except (OSError, ValueError) as exc:
+            raise ConversationAppendError("conversation checkpoint load failed") from exc
+
+        meta = {"checkpoint_ref": checkpoint_ref, "epoch": epoch}
+        for message in (
+            *checkpoint["provider_messages"],
+            *checkpoint["continuation_suffix"],
+        ):
+            redacted = self._redact_checkpoint_message(message)
+            try:
+                await asyncio.to_thread(
+                    self._conversations.append,
+                    task_id,
+                    redacted["role"],
+                    redacted["content"],
+                    kind="turn",
+                    meta=meta,
+                )
+            except (ConversationStoreError, RuntimeError) as exc:
+                raise ConversationAppendError("conversation store append failed") from exc
+
+    def replay_raw_record(self, task_id: str) -> dict[str, Any]:
+        """Return a read-only recovery bundle from rows and immutable checkpoints.
+
+        Conversation rows remain the append-only raw record.  The checkpoint
+        files are loaded separately as immutable replay anchors, so a caller can
+        verify both sources without changing the active prompt projection.
+        """
+        if self._conversations is None:
+            return {"node_id": task_id, "rows": [], "checkpoint_files": []}
+        rows = self._conversations.history(task_id)
+        checkpoint_refs: dict[str, Any] = {}
+        for row in rows:
+            meta = row.get("meta")
+            checkpoint_ref = meta.get("checkpoint_ref") if isinstance(meta, dict) else None
+            if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+                continue
+            checkpoint_refs.setdefault(checkpoint_ref, meta.get("epoch"))
+
+        checkpoint_dir = (
+            self._session_dir.resolve()
+            / ".cambium"
+            / "checkpoints"
+            / _safe_task_id(task_id)
+        )
+        try:
+            checkpoint_paths = sorted(checkpoint_dir.iterdir(), key=lambda path: path.name)
+        except FileNotFoundError:
+            checkpoint_paths = []
+        for checkpoint_path in checkpoint_paths:
+            if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
+                continue
+            checkpoint_ref = f"{_safe_task_id(task_id)}/{checkpoint_path.name}"
+            try:
+                _task_component, checkpoint_epoch, _pre, _persisted = (
+                    _validate_checkpoint_ref_shape(checkpoint_ref)
+                )
+            except ValueError:
+                continue
+            checkpoint_refs.setdefault(checkpoint_ref, checkpoint_epoch)
+
+        checkpoint_files: list[dict[str, Any]] = []
+        for checkpoint_ref, epoch in checkpoint_refs.items():
+            loaded = _load_epoch_checkpoint_messages(
+                self._session_dir, task_id, checkpoint_ref
+            )
+            checkpoint_files.append({
+                "checkpoint_ref": checkpoint_ref,
+                "epoch": epoch,
+                "provider_messages": [
+                    self._redact_checkpoint_message(message)
+                    for message in loaded["provider_messages"]
+                ],
+                "continuation_suffix": [
+                    self._redact_checkpoint_message(message)
+                    for message in loaded["continuation_suffix"]
+                ],
+            })
+        return {
+            "node_id": task_id,
+            "rows": rows,
+            "checkpoint_files": checkpoint_files,
+        }
+
     def _capture_child_result(
         self, spec: dict[str, Any], msg: Mapping[str, Any],
         *, request_id: str | None = None, generation: int | None = None,
@@ -2833,6 +3068,7 @@ class _Runtime:
                         )
                         return
                     if head == spec["base_commit"]:
+                        self._mark_published(task_id)
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=None, restarts=restarts,
@@ -2841,6 +3077,7 @@ class _Runtime:
                         return
                     merged = await self._merge_task(spec, handle)
                     if merged is not None:
+                        self._mark_published(task_id)
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=merged, restarts=restarts,
@@ -3444,11 +3681,70 @@ class _Runtime:
                         )
                     else:
                         self._task_epochs[task_id] = dict(msg)
+                        await self._record_context_checkpoint_conversation(
+                            task_id,
+                            msg["checkpoint_ref"],
+                            msg["epoch"],
+                        )
                         await self.emit(
                             "context_checkpoint", task_id=task_id, generation=generation,
                             epoch=msg.get("epoch"), turn=msg.get("turn"),
                             checkpoint_ref=msg.get("checkpoint_ref"),
                             cache_key=msg.get("cache_key"),
+                        )
+                elif mtype == "context_epoch_advanced":
+                    invalid = _invalid_context_epoch_advanced_fields(msg)
+                    if invalid:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="context_epoch_advanced rejected: invalid field(s)",
+                            fields=invalid,
+                        )
+                    elif (
+                        msg.get("task_id") != task_id
+                        or msg.get("generation") != generation
+                    ):
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="context_epoch_advanced rejected: identity mismatch",
+                            expected_task_id=task_id, expected_generation=generation,
+                        )
+                    else:
+                        await self.emit(
+                            "context_epoch_advanced",
+                            task_id=task_id,
+                            generation=generation,
+                            request_id=msg["request_id"],
+                            epoch=msg["epoch"],
+                            checkpoint_ref=msg["checkpoint_ref"],
+                            folded_from_epoch=msg["folded_from_epoch"],
+                            reason=msg["reason"],
+                        )
+                elif mtype == "compaction_failed":
+                    invalid = _invalid_compaction_failed_fields(msg)
+                    if invalid:
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="compaction_failed rejected: invalid field(s)",
+                            fields=invalid,
+                        )
+                    elif (
+                        msg.get("task_id") != task_id
+                        or msg.get("generation") != generation
+                    ):
+                        await self.emit(
+                            "protocol", task_id=task_id, generation=generation,
+                            note="compaction_failed rejected: identity mismatch",
+                            expected_task_id=task_id, expected_generation=generation,
+                        )
+                    else:
+                        await self.emit(
+                            "compaction_failed",
+                            task_id=task_id,
+                            generation=generation,
+                            request_id=msg["request_id"],
+                            epoch=msg["epoch"],
+                            reason=msg["reason"],
                         )
                 elif mtype == "context_fork_skipped":
                     reason = msg.get("reason")
@@ -3765,6 +4061,7 @@ class _Runtime:
                 "recovered-ref-advance"
             )
             if (kind == "merge_reconciled" or recovered) and task_id is not None:
+                self._mark_published(task_id)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="succeeded", exit_code=0,
                     reason=None, merge_sha=payload.get("new"),
@@ -3818,6 +4115,7 @@ class _Runtime:
                 None,
             )
             if terminal is not None:
+                self._mark_published(task_id)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="succeeded", exit_code=0,
                     reason=None, merge_sha=current,
@@ -3839,6 +4137,7 @@ class _Runtime:
                     "merge_reconciled", task_id=owner, new=current, repo=str(repo),
                     reason="ref-advanced-before-event",
                 )
+                self._mark_published(owner)
                 self._results[owner] = TaskResult(
                     task_id=owner, status="succeeded", exit_code=0,
                     reason=None, merge_sha=current,
