@@ -507,6 +507,37 @@ def test_suspend_cuts_epoch_at_delegate_boundary(tmp_path: Path) -> None:
     assert usage and "epoch" not in usage[0]  # pre-epoch turns carry no epoch
 
 
+def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(
+        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(['{"type":"finish","summary":"done"}'])
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
+
+    assert outcome["status"] == "succeeded"
+    checkpoints = [
+        message for message in writer.messages()
+        if message["type"] == "context_checkpoint"
+    ]
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["epoch"] == 1
+    checkpoint_ref = checkpoints[0]["checkpoint_ref"]
+    assert isinstance(checkpoint_ref, str) and checkpoint_ref
+    checkpoint = worker._load_epoch_checkpoint(
+        config, checkpoint_ref, expect_task_id=True
+    )
+    assert checkpoint.epoch == 1
+    assert checkpoint.continuation_suffix[-1]["role"] == "assistant"
+    assert checkpoint.continuation_suffix[-1]["content"] == (
+        '{"summary":"done","type":"finish"}'
+    )
+    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
+    assert usage and all("epoch" not in message for message in usage)
+
+
 def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
@@ -562,6 +593,60 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
     usage = [m for m in writer.messages() if m["type"] == "usage_event"]
     assert usage and usage[0]["epoch"] == checkpoint.epoch
     assert "fork_of" not in usage[0]
+
+
+def test_resume_continuation_guard_preserves_checkpoint_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(config)
+    prefix = checkpoint.full_messages
+    original_checkpoint_bytes = (
+        (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
+    )
+    monkeypatch.setattr(worker, "MAX_CONTEXT_MESSAGES", 4)
+    resume_config = _agent_config(
+        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        max_transcript_chars=100_000,
+        resume={
+            "checkpoint_ref": checkpoint.checkpoint_ref,
+            "epoch": checkpoint.epoch,
+            "child_results": [_strict_child_envelope()],
+            "child_results_truncated": False,
+        },
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter([
+        '{"type":"tool_call","name":"read_batch",'
+        '"arguments":{"paths":["alpha.txt"]}}',
+        '{"type":"tool_call","name":"read_batch",'
+        '"arguments":{"paths":["alpha.txt"]}}',
+        '{"type":"finish","summary":"done"}',
+    ])
+
+    outcome = asyncio.run(
+        _drive_loop(resume_config, worktree, router, writer)
+    )
+
+    assert outcome["status"] == "succeeded"
+    assert len(router.prompts) == 3
+    assert all(prompt["messages"][: len(prefix)] == prefix for prompt in router.prompts)
+    assert all(
+        len(prompt["messages"]) - len(prefix) <= worker.MAX_CONTEXT_MESSAGES
+        for prompt in router.prompts
+    )
+    assert (
+        tmp_path / "ckpts" / checkpoint.checkpoint_ref
+    ).read_bytes() == original_checkpoint_bytes
+    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
+    assert usage and all(message["epoch"] == checkpoint.epoch for message in usage)
+    terminal = [
+        message for message in writer.messages()
+        if message["type"] == "context_checkpoint"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0]["epoch"] == checkpoint.epoch + 2
 
 
 def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
@@ -658,6 +743,85 @@ def test_fork_fallback_reports_skip(tmp_path: Path) -> None:
     assert skipped["reason"]
     usage = [m for m in writer.messages() if m["type"] == "usage_event"]
     assert usage and "fork_of" not in usage[0]
+
+
+def test_fork_descriptor_artifact_mismatch_falls_back(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(config)
+    cache_key = checkpoint.cache_key
+    fork_descriptor = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "provider": cache_key.provider,
+        "model": cache_key.model,
+        "system_sha256": "f" * 64,
+        "tools_sha256": cache_key.tools_sha256,
+        "prefix_sha256": cache_key.prefix_sha256,
+        "suffix_sha256": cache_key.suffix_sha256,
+        "full_sha256": cache_key.full_sha256,
+        "prefix_bytes": cache_key.prefix_bytes,
+        "provider_boundary": cache_key.provider_boundary,
+    }
+    fork_config = _agent_config(
+        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        context_fork=fork_descriptor,
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(['{"type":"finish","summary":"legacy path"}'])
+
+    outcome = asyncio.run(
+        _drive_loop(fork_config, worktree, router, writer)
+    )
+
+    assert outcome["status"] == "succeeded"
+    skipped = [
+        message for message in writer.messages()
+        if message["type"] == "context_fork_skipped"
+    ]
+    assert len(skipped) == 1
+    assert "mismatch" in skipped[0]["reason"]
+    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
+    assert usage and "fork_of" not in usage[0]
+
+
+def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        redactor=Redactor(secret_values={"SECRETXYZ"}),
+    )
+    checkpoint = _write_epoch(
+        config,
+        messages=[
+            {"role": "system", "content": "You are the agent SECRETXYZ."},
+            {"role": "user", "content": "observe SECRETXYZ"},
+        ],
+    )
+    resume_config = _agent_config(
+        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        resume={
+            "checkpoint_ref": checkpoint.checkpoint_ref,
+            "epoch": checkpoint.epoch,
+            "child_results": [_strict_child_envelope()],
+            "child_results_truncated": False,
+        },
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter([])
+
+    outcome = asyncio.run(
+        _drive_loop(resume_config, worktree, router, writer)
+    )
+
+    assert outcome["status"] == "failed"
+    assert "context_resume_failed" in (outcome["failure_reason"] or "")
+    assert "redacted" in (outcome["failure_reason"] or "")
+    assert router.prompts == []
+    assert outcome["transcript"] == []
+    assert not any(
+        message["type"] == "context_checkpoint" for message in writer.messages()
+    )
 
 
 # ---------------------------------------------------------------------------

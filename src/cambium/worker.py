@@ -1581,6 +1581,7 @@ def _summarize_transcript(
     transcript: list[dict[str, Any]],
     budget: int,
     keep_turns: int = TRANSCRIPT_KEEP_TURNS,
+    max_messages: int | None = None,
 ) -> list[dict[str, Any]]:
     """Bound the transcript to ``budget`` characters without calling the LLM.
 
@@ -1588,13 +1589,20 @@ def _summarize_transcript(
     does not, keeps the plan message (if any), drops everything older than the
     most recent ``keep_turns`` turns, inserts one synthetic "prior context
     summary" marker, and proportionally truncates the retained observations so
-    the result stays within the budget.
+    the result stays within the budget. ``max_messages`` applies the same
+    retention policy when a message-count guard is also active.
     """
-    if _transcript_chars(transcript) <= budget:
+    if _transcript_chars(transcript) <= budget and (
+        max_messages is None or len(transcript) <= max_messages
+    ):
         return list(transcript)
     tail = transcript[-(keep_turns * 2):] if keep_turns > 0 else []
     plan = _plan_message(transcript)
     tail = [dict(message) for message in tail if message is not plan]
+    if max_messages is not None:
+        reserved = (1 if plan is not None else 0) + 1
+        tail_capacity = max(0, max_messages - reserved)
+        tail = tail[-tail_capacity:] if tail_capacity else []
     dropped = len(transcript) - len(tail) - (1 if plan is not None else 0)
     marker = {
         "role": "user",
@@ -1606,7 +1614,8 @@ def _summarize_transcript(
     kept: list[dict[str, Any]] = []
     if plan is not None:
         kept.append(dict(plan))
-    kept.append(marker)
+    if max_messages is None or len(kept) < max_messages:
+        kept.append(marker)
     kept.extend(tail)
     return _fit_transcript_to_budget(kept, budget)
 
@@ -1746,11 +1755,43 @@ def _resolve_fork_prefix(
         return None, str(exc)
     if checkpoint.cache_key.redacted:
         return None, "checkpoint redacted"
-    if checkpoint.cache_key.model != model or descriptor["model"] != model:
-        return None, "model mismatch"
     tools_sha256 = _sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8"))
+    cache_key = checkpoint.cache_key
+    artifact_fields: dict[str, Any] = {
+        "provider": cache_key.provider,
+        "model": cache_key.model,
+        "protocol": cache_key.protocol,
+        "system_sha256": _sha256_hex(
+            str(checkpoint.provider_messages[0]["content"]).encode("utf-8")
+        ),
+        "tools_sha256": cache_key.tools_sha256,
+        "prefix_sha256": _messages_sha256(checkpoint.provider_messages),
+        "suffix_sha256": _messages_sha256(checkpoint.continuation_suffix),
+        "full_sha256": _messages_sha256(checkpoint.full_messages),
+        "prefix_bytes": prompt_prefix_bytes(
+            {"messages": checkpoint.provider_messages}
+        ) or 0,
+        "provider_boundary": cache_key.provider_boundary,
+    }
+    for field in (
+        "provider", "model", "protocol", "system_sha256", "tools_sha256",
+        "prefix_sha256", "suffix_sha256", "full_sha256", "prefix_bytes",
+        "provider_boundary",
+    ):
+        descriptor_value = descriptor.get(field)
+        if field == "protocol":
+            # The wire descriptor carries protocol in its provider boundary;
+            # accept a future top-level field without weakening today's strict
+            # descriptor validator.
+            descriptor_value = descriptor.get(
+                "protocol", descriptor["provider_boundary"].get("protocol")
+            )
+        if descriptor_value != artifact_fields[field]:
+            return None, f"fork descriptor {field} mismatch"
     if descriptor["tools_sha256"] != tools_sha256:
         return None, "tool schema mismatch"
+    if cache_key.model != model or descriptor["model"] != model:
+        return None, "model mismatch"
     forked = _build_forked_prompt(
         checkpoint, _child_task_lines(config.task, config.parent_envelope)
     )
@@ -3018,6 +3059,7 @@ async def _run_agent_loop(
     provider_compat: Mapping[str, tuple[str, str | None]] | None = None,
     provider_boundaries: Mapping[str, Mapping[str, Any]] | None = None,
     run_request_id: str | None = None,
+    defer_terminal_checkpoint: bool = False,
 ) -> dict[str, Any]:
     """Bounded provider-backed tool loop: one router call per turn, strict
     action parsing, permission checks, tool dispatch, tool_event + checkpoint.
@@ -3069,6 +3111,21 @@ async def _run_agent_loop(
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
 
+    def _bound_context_continuation() -> bool:
+        """Bound only mutable fork/resume messages, never the epoch prefix."""
+        nonlocal context_continuation, epoch_count
+        bounded = _summarize_transcript(
+            context_continuation,
+            config.max_transcript_chars,
+            max_messages=MAX_CONTEXT_MESSAGES,
+        )
+        if bounded == context_continuation:
+            return False
+        context_continuation = bounded
+        epoch_count += 1
+        _sync_context_transcript()
+        return True
+
     resume = config.resume
     if resume is not None:
         try:
@@ -3077,6 +3134,8 @@ async def _run_agent_loop(
             )
             if resume["epoch"] != resume_checkpoint.epoch:
                 raise ContextForkError("resume epoch does not match checkpoint")
+            if resume_checkpoint.cache_key.redacted:
+                raise ContextForkError("checkpoint redacted")
         except ContextForkError as exc:
             return _loop_result(
                 outcome, "failed", f"context_resume_failed: {exc}", 0,
@@ -3156,6 +3215,8 @@ async def _run_agent_loop(
                 # The tuple is immutable and every message is deep-copied at
                 # the prompt boundary. No later turn can rewrite the epoch
                 # prefix in place.
+                if config.context_reuse:
+                    _bound_context_continuation()
                 prompt = _fork_prompt(base_messages, context_continuation)
             # Keep the object handed to the router immutable for checkpointing.
             # A provider adapter is allowed to normalize its local request, but
@@ -3297,6 +3358,42 @@ async def _run_agent_loop(
                         _sync_context_transcript()
                     progress.tool = "finish"
                     continue
+                # A forked child consumes an immutable parent epoch; its
+                # terminal result is not a new parent-resumable boundary.
+                if config.context_reuse and usage_fork_of is None:
+                    epoch_count += 1
+                    terminal_epoch = {
+                        "turn": turn,
+                        "epoch": epoch_count,
+                        "provider_messages": copy.deepcopy(sent_prompt["messages"]),
+                        "continuation_suffix": [copy.deepcopy(action_message)],
+                        "provider": result.provider,
+                        "model": model,
+                        "tools_sha256": _sha256_hex(
+                            json.dumps(tools, sort_keys=True).encode("utf-8")
+                        ),
+                        "provider_compat": provider_compat,
+                        "provider_boundary": provider_boundaries.get(result.provider),
+                        "code_changed": code_changed,
+                        "verified_after_change": verified_after_change,
+                        "verification_failed": verification_failed,
+                        "no_progress_actions": no_progress_actions,
+                        "budget_new_tokens": budget_new_tokens,
+                        "previous_prompt_tokens": previous_prompt_tokens,
+                        "cumulative_usage": cumulative_usage,
+                        "wall_deadline": absolute_wall_deadline,
+                    }
+                    if defer_terminal_checkpoint:
+                        outcome["_terminal_epoch"] = terminal_epoch
+                    else:
+                        terminal_checkpoint = await asyncio.to_thread(
+                            _write_epoch_checkpoint, config, **terminal_epoch
+                        )
+                        if terminal_checkpoint is not None and writer is not None:
+                            await _emit_context_checkpoint(
+                                writer, config, terminal_checkpoint,
+                                request_id=run_request_id,
+                            )
                 return {
                     **outcome,
                     "status": "succeeded",
@@ -3503,6 +3600,7 @@ async def _do_provider_work(
         provider_compat=provider_compat,
         provider_boundaries=provider_boundaries,
         run_request_id=run.get("request_id"),
+        defer_terminal_checkpoint=True,
     )
     if loop_outcome["status"] != "succeeded":
         return _loop_failure_outcome(loop_outcome)
@@ -3517,10 +3615,15 @@ async def _do_provider_work(
         loop_outcome=loop_outcome,
     )
     final_checkpoint = outcome.pop("_checkpoint_path", None)
+    terminal_checkpoint = outcome.pop("_context_checkpoint", None)
     if writer is not None and final_checkpoint is not None:
         await _emit_checkpoint(
             writer, config, loop_outcome.get("turn", 0),
             Path(final_checkpoint), outcome.get("commits", []),
+        )
+    if writer is not None and terminal_checkpoint is not None:
+        await _emit_context_checkpoint(
+            writer, config, terminal_checkpoint, request_id=run.get("request_id")
         )
     return outcome
 
@@ -3539,7 +3642,7 @@ def _finalize_worktree(
     most ONE fenced worker-owned commit with generation + identity trailers.
     A clean worktree succeeds as a no-op only while HEAD still resolves to
     the base commit; such a true no-op receives no empty commit and writes
-    no final checkpoint. Returns the result-envelope shape: model summary +
+    no ordinary final checkpoint. Returns the result-envelope shape: model summary +
     cumulative safe provider metadata.
 
     The commit message, envelope, state paths, and provider metadata are all
@@ -3557,6 +3660,16 @@ def _finalize_worktree(
     provider_metadata = _cumulative_provider_metadata(loop_outcome)
     if provider_metadata is not None:
         outcome["provider_metadata"] = provider_metadata
+
+    def _write_terminal_epoch() -> ContextCheckpoint | None:
+        terminal_epoch = loop_outcome.get("_terminal_epoch")
+        if (
+            not config.context_reuse
+            or not isinstance(terminal_epoch, dict)
+        ):
+            return None
+        return _write_epoch_checkpoint(config, **terminal_epoch)
+
     try:
         if stop.is_set():
             outcome["status"] = "cancelled"
@@ -3639,8 +3752,10 @@ def _finalize_worktree(
             return outcome
         if not changed:
             _require_generation(worktree, generation)
-            # True no-op: no final checkpoint is written. The summary stays in
-            # the envelope.
+            terminal_checkpoint = _write_terminal_epoch()
+            # True no-op: no ordinary final checkpoint is written. The summary
+            # stays in the envelope, while context reuse still records the
+            # terminal provider-turn boundary.
             outcome.update(
                 status="succeeded",
                 failure_reason=None,
@@ -3652,6 +3767,8 @@ def _finalize_worktree(
                     loop_outcome.get("summary") or f"completed {config.task_id}"
                 )[:MAX_SUMMARY_CHARS],
             )
+            if terminal_checkpoint is not None:
+                outcome["_context_checkpoint"] = terminal_checkpoint
             return outcome
         for path in changed:
             _require_generation(worktree, generation)
@@ -3685,6 +3802,7 @@ def _finalize_worktree(
             loop_outcome.get("usage", {}),
             [sha],
         )
+        terminal_checkpoint = _write_terminal_epoch()
         outcome.update(
             status="succeeded",
             failure_reason=None,
@@ -3698,6 +3816,8 @@ def _finalize_worktree(
         )
         if final_checkpoint is not None:
             outcome["_checkpoint_path"] = str(final_checkpoint)
+        if terminal_checkpoint is not None:
+            outcome["_context_checkpoint"] = terminal_checkpoint
         return outcome
     except GenerationFenceError as exc:
         outcome["failure_reason"] = str(exc)
