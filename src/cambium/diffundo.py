@@ -563,6 +563,12 @@ class _RawResponse:
         usage = self.payload.get("usage")
         if not isinstance(usage, dict):
             usage = None
+        else:
+            cached_tokens = _cached_tokens(usage)
+            usage = dict(usage)
+            usage.pop("cached_tokens", None)
+            if cached_tokens is not None:
+                usage["cached_tokens"] = cached_tokens
         return CallResult(
             provider=provider.name,
             model=self.payload.get("model") or provider.model,
@@ -631,25 +637,40 @@ class _CodexRawResponse(_RawResponse):
 def _provider_cache_hit(usage: dict[str, Any] | None) -> bool | None:
     """Provider-reported cache-hit for one completion, or None when unknown.
 
-    True when the usage payload reports cached input tokens (OpenAI
-    ``prompt_tokens_details.cached_tokens``, Anthropic
-    ``cache_read_input_tokens``, or a top-level ``cached_tokens``); False when
-    usage is present without any cache field; None when usage is absent. This
-    records what the provider reports, the router always requests
+    True when the normalized cached-token count is positive; False when usage
+    is present without a positive count; None when usage is absent. This records
+    what the provider reports, the router always requests
     ``cache=False`` and never serves from a local response cache (D1).
     """
     if not isinstance(usage, dict):
         return None
-    details = usage.get("prompt_tokens_details")
-    if isinstance(details, dict):
-        cached = details.get("cached_tokens")
-        if isinstance(cached, (int, float)) and not isinstance(cached, bool) and cached > 0:
-            return True
+    cached_tokens = _cached_tokens(usage)
+    return cached_tokens is not None and cached_tokens > 0
+
+
+def _cached_tokens(usage: dict[str, Any] | None) -> int | None:
+    """Return the first valid cached-token count in provider-shape order."""
+    if not isinstance(usage, dict):
+        return None
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(details_key)
+        if isinstance(details, dict):
+            cached_tokens = details.get("cached_tokens")
+            if (
+                isinstance(cached_tokens, int)
+                and not isinstance(cached_tokens, bool)
+                and cached_tokens >= 0
+            ):
+                return cached_tokens
     for key in ("cache_read_input_tokens", "cached_tokens"):
-        cached = usage.get(key)
-        if isinstance(cached, (int, float)) and not isinstance(cached, bool) and cached > 0:
-            return True
-    return False
+        cached_tokens = usage.get(key)
+        if (
+            isinstance(cached_tokens, int)
+            and not isinstance(cached_tokens, bool)
+            and cached_tokens >= 0
+        ):
+            return cached_tokens
+    return None
 
 
 _ACCOUNT_QUOTA_OWNER_KEYS = ("quota_owner", "account_quota_owner", "account_quota")
@@ -959,12 +980,13 @@ def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
     with ``input_tokens_details``/``output_tokens_details``; the cost estimate
     and cache-hit extraction read the chat shape (``prompt_tokens``/
     ``completion_tokens``, ``prompt_tokens_details.cached_tokens``), so the
-    normalized dict carries both.
+    normalized dict carries both plus top-level ``cached_tokens``.
     """
     response = completed.get("response")
     usage = response.get("usage") if isinstance(response, dict) else completed.get("usage")
     if not isinstance(usage, dict):
         return None
+    cached_tokens = _cached_tokens(usage)
     normalized: dict[str, Any] = {
         "prompt_tokens": usage.get("input_tokens") or 0,
         "completion_tokens": usage.get("output_tokens") or 0,
@@ -972,7 +994,7 @@ def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
     input_details = usage.get("input_tokens_details")
     if isinstance(input_details, dict):
         normalized["prompt_tokens_details"] = {
-            "cached_tokens": input_details.get("cached_tokens") or 0
+            "cached_tokens": cached_tokens if cached_tokens is not None else 0
         }
         normalized["input_tokens_details"] = dict(input_details)
     output_details = usage.get("output_tokens_details")
@@ -980,6 +1002,8 @@ def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
         normalized["output_tokens_details"] = dict(output_details)
     if usage.get("total_tokens") is not None:
         normalized["total_tokens"] = usage["total_tokens"]
+    if cached_tokens is not None:
+        normalized["cached_tokens"] = cached_tokens
     return normalized
 
 

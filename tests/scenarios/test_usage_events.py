@@ -46,7 +46,7 @@ CACHED_USAGE = {
     "prompt_tokens": 17,
     "completion_tokens": 9,
     "total_tokens": 26,
-    "cached_tokens": 3,
+    "prompt_tokens_details": {"cached_tokens": 3},
 }
 
 
