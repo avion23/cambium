@@ -825,6 +825,221 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
 
 
 @pytest.mark.slow
+def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -> None:
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        project = tmp_path / "project"
+        project.mkdir()
+        config_path = _provider_config(project / "providers.json", server.base_url)
+        monkeypatch.chdir(project)
+        _set_provider_env(monkeypatch, config_path)
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        child_task_id = "worker-provider-cache-child"
+        child_spec = {
+            "task": "complete the provider-backed child task",
+            "repo": str(repo),
+            "worktree_path": str(session_dir / "child-wt"),
+            "branch": child_task_id,
+            "worker": WORKER,
+            "target_file": "notes.txt",
+            "marker": "// provider-cache-child",
+            "write_marker": True,
+            "base_commit": base,
+            "provider_env_keys": [PROVIDER_KEY, "NO_PROXY", "no_proxy"],
+            "authorized_providers": ["loopback-provider"],
+            "fanout_config": {
+                "tier": "fast",
+                "model": "loopback-model",
+                "call_budget_s": 5.0,
+                "pause_timeout_s": 0.1,
+            },
+        }
+        delegate_args = {
+            "child_task_id": child_task_id,
+            "kind": "test",
+            "spec": child_spec,
+        }
+        cache_hit_usage = {
+            "prompt_tokens": 17,
+            "completion_tokens": 9,
+            "total_tokens": 26,
+            "prompt_tokens_details": {"cached_tokens": 11},
+        }
+        _enqueue(
+            '{"type":"tool_call","name":"edit_file","arguments":'
+            '{"path":"target.txt","old_string":"not-present",'
+            '"new_string":"fixture\\n// provider-cache-parent\\n"}}'
+        )
+        _enqueue(
+            '{"type":"tool_call","name":"delegate","arguments":'
+            + json.dumps(delegate_args)
+            + "}"
+        )
+        _enqueue(
+            '{"type":"finish","summary":"child provider call completed"}',
+            usage=cache_hit_usage,
+        )
+        _enqueue(
+            '{"type":"finish","summary":"resumed after child completion"}',
+            usage=cache_hit_usage,
+        )
+
+        task = _task(session_dir, repo, base, config_path)
+        task["authorized_providers"] = ["loopback-provider"]
+        checkpoint_snapshots: dict[str, bytes] = {}
+        checkpoint_path: Path | None = None
+
+        def observe(event: dict[str, Any]) -> None:
+            nonlocal checkpoint_path
+            kind = event["kind"]
+            if kind == "context_checkpoint":
+                checkpoint_ref = event["payload"]["checkpoint_ref"]
+                checkpoint_path = (
+                    session_dir / ".cambium" / "checkpoints" / task["task_id"]
+                    / checkpoint_ref.split("/", 1)[1]
+                )
+                checkpoint_snapshots["at_checkpoint"] = checkpoint_path.read_bytes()
+            elif kind == "child_result" and event["task_id"] == child_task_id:
+                assert checkpoint_path is not None
+                checkpoint_snapshots["after_child"] = checkpoint_path.read_bytes()
+            elif kind == "context_resume":
+                assert checkpoint_path is not None
+                checkpoint_snapshots["after_resume"] = checkpoint_path.read_bytes()
+
+        result = asyncio.run(
+            run_plan(
+                session_dir,
+                {"tasks": [task]},
+                on_event=observe,
+                routing_state_path=str(tmp_path / "routing-state.json"),
+                context_reuse=True,
+            )
+        )
+        events = read_events(session_dir)
+        with REQUEST_LOCK:
+            requests = copy.deepcopy(REQUESTS)
+            authorizations = list(REQUEST_AUTHORIZATION)
+
+        checkpoints = [event for event in events if event["kind"] == "context_checkpoint"]
+        assert len(checkpoints) == 1
+        checkpoint_event = checkpoints[0]["payload"]
+        assert checkpoint_event["epoch"] == 1
+        checkpoint_ref = checkpoint_event["checkpoint_ref"]
+        assert isinstance(checkpoint_ref, str) and checkpoint_ref
+        assert checkpoint_ref.startswith(f'{task["task_id"]}/')
+        assert checkpoint_event["cache_key"]["redacted"] is False
+
+        assert checkpoint_path is not None
+        assert checkpoint_path.is_file()
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        assert checkpoint["epoch"] == 1
+        assert checkpoint["task_id"] == task["task_id"]
+        assert checkpoint["checkpoint_ref"] == checkpoint_ref
+        checkpoint_prefix = checkpoint["provider_messages"] + checkpoint["continuation_suffix"]
+        prefix_length = len(checkpoint_prefix)
+
+        assert len(requests) == 4
+        assert all(request["model"] == "loopback-model" for request in requests)
+        assert authorizations == [f"Bearer {PROVIDER_SECRET}"] * 4
+        assert requests[1]["messages"] == checkpoint["provider_messages"]
+        child_messages = requests[2]["messages"]
+        resumed_messages = requests[3]["messages"]
+        assert child_messages[:prefix_length] == checkpoint_prefix
+        assert resumed_messages[:prefix_length] == checkpoint_prefix
+        assert len(child_messages) == prefix_length + 1
+        assert len(resumed_messages) == prefix_length + 1
+        assert set(child_messages[prefix_length]) == {"role", "content"}
+        assert child_messages[prefix_length]["role"] == "user"
+        assert child_messages[prefix_length]["content"].startswith("Child task: ")
+        assert set(resumed_messages[prefix_length]) == {"role", "content"}
+        assert resumed_messages[prefix_length]["role"] == "user"
+        assert resumed_messages[prefix_length]["content"].startswith("Child task result:\n")
+
+        child_prefix_bytes = json.dumps(
+            {"messages": child_messages[:prefix_length], "model": requests[2]["model"]}
+        ).encode("utf-8")
+        resumed_prefix_bytes = json.dumps(
+            {"messages": resumed_messages[:prefix_length], "model": requests[3]["model"]}
+        ).encode("utf-8")
+        assert child_prefix_bytes == resumed_prefix_bytes
+
+        assert set(checkpoint_snapshots) == {"at_checkpoint", "after_child", "after_resume"}
+        checkpoint_bytes = checkpoint_path.read_bytes()
+        assert checkpoint_snapshots["after_child"] == checkpoint_snapshots["at_checkpoint"]
+        assert checkpoint_snapshots["after_resume"] == checkpoint_bytes
+        assert checkpoint_snapshots["after_child"] == checkpoint_snapshots["after_resume"]
+
+        forks = [event for event in events if event["kind"] == "context_fork"]
+        assert len(forks) == 1
+        fork_payload = forks[0]["payload"]
+        assert fork_payload["epoch"] == 1
+        assert fork_payload["compatible"] is True
+        assert fork_payload["parent_task_id"] == task["task_id"]
+        assert fork_payload["child_task_id"] == child_task_id
+
+        resumes = [event for event in events if event["kind"] == "context_resume"]
+        assert len(resumes) == 1
+        resume_payload = resumes[0]["payload"]
+        assert resume_payload["checkpoint_ref"] == checkpoint_ref
+        assert resume_payload["epoch"] == 1
+        assert resume_payload["child_count"] == 1
+
+        usage_events = [event for event in events if event["kind"] == "usage_event"]
+        child_usage = [
+            event["payload"] for event in usage_events if event["task_id"] == child_task_id
+        ]
+        parent_usage = [
+            event["payload"] for event in usage_events if event["task_id"] == task["task_id"]
+        ]
+        assert len(child_usage) == 1
+        assert len(parent_usage) == 3
+        assert child_usage[0]["epoch"] == 1
+        assert child_usage[0]["fork_of"] == checkpoint_ref
+        assert child_usage[0]["provider_cache_hit"] is True
+        assert child_usage[0]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
+        assert parent_usage[-1]["epoch"] == 1
+        assert "fork_of" not in parent_usage[-1]
+        assert parent_usage[-1]["provider_cache_hit"] is True
+        assert parent_usage[-1]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
+        assert all("epoch" not in payload for payload in parent_usage[:2])
+
+        evidence_env = dict(os.environ)
+        evidence_env["PYTHONPATH"] = str(ROOT / "src")
+        evidence = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "context_cache_evidence.py"),
+                "--json",
+                str(session_dir),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=evidence_env,
+        )
+        report = json.loads(evidence.stdout)
+        buckets = report["providers"]["loopback-provider"]["buckets"]
+        assert buckets["baseline"]["calls"] == 2
+        assert buckets["fork_first"]["calls"] == 1
+        assert buckets["resume_first"]["calls"] == 1
+        assert buckets["fork_later"]["calls"] == 0
+        assert buckets["resume_later"]["calls"] == 0
+
+        assert result.exit_code == 0
+        assert {item.task_id for item in result.results} == {
+            task["task_id"], child_task_id
+        }
+        assert all(item.status == "succeeded" for item in result.results)
+        assert PROVIDER_SECRET not in json.dumps(events)
+    finally:
+        server.close()
+
+
+@pytest.mark.slow
 def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
