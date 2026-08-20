@@ -1,6 +1,6 @@
 # Cache-first context reuse — implementation plan for immutable cache epochs
 
-**Status: DRAFT — Phase 1 runtime and Phase 2 measurement tooling implemented; live baseline evidence collected; live fork/resume evidence pending.** Snapshot base `main@a446345`
+**Status: DRAFT — Phase 1 runtime and Phase 2 measurement tooling implemented; live fork/resume evidence collected and the chat-provider acceptance gates PASS on both chat providers.** Snapshot base `main@a446345`
 (`feat(jlens): calibrated layers from falsification (29,41,57,61)`), written
 2026-08-19, worktree `/tmp/opencode/cambium-cache-first`, branch
 `docs/cache-first-context-reuse`. This commit adds this file and one index
@@ -128,8 +128,19 @@ Measured and coded facts that bound the design:
   `src/cambium/supervisor.py:2348-2351`; `_resolve_assignment`,
   `src/cambium/supervisor.py:1950-1967`).
 - **Chat providers hit; codex does not.** Current Phase 2 baseline evidence is
-  codex 0/2, zai 2/3 (66.7%), and opencode-go 1/3 (33.3%); live fork/resume
-  evidence is pending. Chat-provider calls hit the cache on a byte-stable
+  codex 0/2, zai 2/3 (66.7%), and opencode-go 1/3 (33.3%). Live fork/resume
+  evidence was then collected in two paired sessions (2026-08-20): on zai
+  (`/home/ubuntu/cambium-live-zai-20260821c`) the baseline rate was 0.857
+  (6/7) with fork-first 1.0 (1/1, relative 1.167) and resume-first 1.0 (1/1,
+  relative 1.167) at a byte-stable 6072-byte prefix; on opencode-go
+  (`/home/ubuntu/cambium-live-opencode-go-20260821c`) the baseline rate was
+  0.875 (7/8) with fork-first 1.0 (1/1, relative 1.143) and resume-first 1.0
+  (1/1, relative 1.143) at a byte-stable 6134-byte prefix. Both providers met
+  the 80-percent-of-baseline acceptance gate; both runs produced a
+  `context_fork` with `compatible: true` (the child spec must carry
+  `assigned_provider` and `fanout_config.model` matching the epoch), a
+  succeeded child, a `context_resume`, and a terminal epoch. Chat-provider
+  calls hit the cache on a byte-stable
   prefix; the codex responses endpoint remains sparse and non-monotonic and
   rejects `prompt_cache_options` /
   `prompt_cache_breakpoint` with 400s while `prompt_cache_key` reports zero
@@ -427,7 +438,7 @@ No LLM calls anywhere in the new tests. No compaction, no
 `ConversationStore` writes. Byte-for-byte current behavior when the flags
 are absent.
 
-### Phase 2 — real cache measurement (tooling is implemented and baseline live evidence has been collected; the live fork/resume rerun remains pending)
+### Phase 2 — real cache measurement (tooling implemented; live fork/resume evidence collected; both chat-provider acceptance gates PASS)
 
 Extend usage events with `epoch` / `fork_of`; add
 `scripts/context_cache_evidence.py`; run one live paired session per chat
@@ -435,7 +446,10 @@ provider (zai, opencode-go; codex measured, never gated) using the
 opt-in, non-loopback pattern of `scripts/external-provider-smoke.sh`.
 Restarted-call classification must include generation before final acceptance
 measurements.
-Acceptance gates in section 12.
+Acceptance gates in section 12. Both chat-provider gates pass on the
+2026-08-20 live runs (zai fork-first 1.0 / resume-first 1.0 against a 0.857
+baseline; opencode-go fork-first 1.0 / resume-first 1.0 against a 0.875
+baseline).
 
 ### Phase 3 (optional) — durable raw record
 
