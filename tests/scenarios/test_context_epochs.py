@@ -160,6 +160,7 @@ async def _drive_loop(
     worktree: Path,
     router: _ScriptedRouter,
     writer: _FakeWriter,
+    run_request_id: str | None = None,
 ) -> dict[str, Any]:
     return await worker._run_agent_loop(
         config=config,
@@ -170,15 +171,18 @@ async def _drive_loop(
         writer=writer,  # type: ignore[arg-type]  # duck-typed StreamWriter
         stop=threading.Event(),
         progress=worker.AgentProgress(),
+        run_request_id=run_request_id,
     )
 
 
-def _strict_child_envelope(status: str = "succeeded") -> dict[str, Any]:
+def _strict_child_envelope(
+    status: str = "succeeded", summary: str = "child did the work"
+) -> dict[str, Any]:
     return {
         "parent_task_id": "epoch-agent",
         "unified_diff": "diff",
         "diff_truncated": False,
-        "summary": "child did the work",
+        "summary": summary,
         "metric_score": None,
         "metric_breakdown": {},
         "commits": ["c1"],
@@ -667,6 +671,292 @@ def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
 
     assert outcome["status"] == "failed"
     assert "context_resume_failed" in (outcome["failure_reason"] or "")
+
+
+def test_rolling_compact_config_and_published_gate_are_tolerant() -> None:
+    init = {
+        "task_id": "epoch-agent",
+        "context_reuse": True,
+        "rolling_compact": True,
+        "max_transcript_chars": 200,
+        "rolling_compact_threshold_high": 100,
+    }
+    config = worker.AgentConfig.from_init(init)
+    assert config.rolling_compact is True
+    assert config.rolling_compact_threshold_high == 100
+    assert config.rolling_compact_threshold_low == 50
+
+    malformed = worker._merge_task_config(
+        config,
+        init,
+        {"published": "true"},
+    )
+    assert malformed.published is False
+    valid = worker._merge_task_config(config, init, {"published": True})
+    assert valid.published is True
+
+
+def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(base_config)
+    old_bytes = (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
+    resume = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "child_results": [
+            _strict_child_envelope(summary="a" * 140),
+            _strict_child_envelope(summary="b" * 140),
+        ],
+        "child_results_truncated": False,
+    }
+    config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        rolling_compact=True,
+        published=True,
+        rolling_compact_threshold_high=100,
+        rolling_compact_threshold_low=50,
+        resume=resume,
+        max_turns=2,
+    )
+    writer = _FakeWriter()
+    outcome = asyncio.run(
+        _drive_loop(
+            config,
+            worktree,
+            _ScriptedRouter(['{"type":"plan","steps":["continue"]}']),
+            writer,
+            run_request_id="run-compact",
+        )
+    )
+
+    assert outcome["status"] == "failed"
+    advanced = [
+        message for message in writer.messages()
+        if message["type"] == "context_epoch_advanced"
+    ]
+    assert len(advanced) == 1
+    assert advanced[0] == {
+        "type": "context_epoch_advanced",
+        "request_id": "run-compact",
+        "task_id": "epoch-agent",
+        "generation": 1,
+        "epoch": 2,
+        "checkpoint_ref": advanced[0]["checkpoint_ref"],
+        "folded_from_epoch": 1,
+        "reason": None,
+    }
+    folded = worker._load_epoch_checkpoint(
+        config, advanced[0]["checkpoint_ref"], expect_task_id=True
+    )
+    assert folded.epoch == 2
+    assert json.dumps(folded.provider_messages, sort_keys=True) == json.dumps(
+        checkpoint.provider_messages, sort_keys=True
+    )
+    assert len(folded.continuation_suffix) == 1
+    assert folded.continuation_suffix[0]["role"] == "user"
+    assert folded.continuation_suffix[0]["content"]
+    assert (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes() == old_bytes
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
+
+
+def test_rolling_compact_published_false_does_not_fold_or_checkpoint(
+    tmp_path: Path,
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(base_config)
+    resume = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
+        "child_results_truncated": False,
+    }
+    config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        rolling_compact=True,
+        published=False,
+        rolling_compact_threshold_high=100,
+        rolling_compact_threshold_low=50,
+        resume=resume,
+        max_turns=2,
+    )
+    writer = _FakeWriter()
+    asyncio.run(
+        _drive_loop(
+            config,
+            worktree,
+            _ScriptedRouter(['{"type":"plan","steps":["continue"]}']),
+            writer,
+            run_request_id="run-unpublished",
+        )
+    )
+
+    kinds = [message["type"] for message in writer.messages()]
+    assert "context_epoch_advanced" not in kinds
+    assert "compaction_failed" not in kinds
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 1
+
+
+def test_rolling_compact_hysteresis_does_not_refold_below_low(
+    tmp_path: Path,
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(base_config)
+    resume = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "child_results": [
+            _strict_child_envelope(summary="a" * 500),
+            _strict_child_envelope(summary="b" * 500),
+        ],
+        "child_results_truncated": False,
+    }
+    config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        rolling_compact=True,
+        published=True,
+        rolling_compact_threshold_high=1_000,
+        rolling_compact_threshold_low=900,
+        resume=resume,
+        max_turns=3,
+    )
+    writer = _FakeWriter()
+    outcome = asyncio.run(
+        _drive_loop(
+            config,
+            worktree,
+            _ScriptedRouter([
+                '{"type":"plan","steps":["continue"]}',
+                '{"type":"plan","steps":["continue"]}',
+            ]),
+            writer,
+            run_request_id="run-hysteresis",
+        )
+    )
+
+    assert outcome["status"] == "failed"
+    advanced = [
+        message for message in writer.messages()
+        if message["type"] == "context_epoch_advanced"
+    ]
+    assert len(advanced) == 1
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
+
+
+def test_rolling_compact_failure_is_fail_open_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(base_config)
+    old_bytes = (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
+    resume = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
+        "child_results_truncated": False,
+    }
+    config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        rolling_compact=True,
+        published=True,
+        rolling_compact_threshold_high=100,
+        rolling_compact_threshold_low=50,
+        resume=resume,
+        max_turns=2,
+    )
+
+    def fail_checkpoint(*args: Any, **kwargs: Any) -> worker.ContextCheckpoint:
+        raise RuntimeError("checkpoint write failed")
+
+    monkeypatch.setattr(worker, "_write_epoch_checkpoint", fail_checkpoint)
+    writer = _FakeWriter()
+    router = _ScriptedRouter(['{"type":"plan","steps":["continue"]}'])
+    outcome = asyncio.run(
+        _drive_loop(
+            config,
+            worktree,
+            router,
+            writer,
+            run_request_id="run-failure",
+        )
+    )
+
+    assert outcome["status"] == "failed"
+    assert len(router.prompts) == 1
+    failed = [
+        message for message in writer.messages()
+        if message["type"] == "compaction_failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0] == {
+        "type": "compaction_failed",
+        "request_id": "run-failure",
+        "task_id": "epoch-agent",
+        "generation": 1,
+        "epoch": 1,
+        "reason": "checkpoint write failed",
+    }
+    assert router.prompts[0]["messages"][2]["content"].startswith(
+        "Child task result:\n"
+    )
+    assert "<cambium-rolling-context>" not in json.dumps(router.prompts[0])
+    assert (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes() == old_bytes
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 1
+
+
+def test_rolling_compact_flag_absent_keeps_existing_epoch_path(
+    tmp_path: Path,
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(base_config)
+    resume = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
+        "child_results_truncated": False,
+    }
+    config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        resume=resume,
+        max_turns=2,
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(['{"type":"plan","steps":["continue"]}'])
+    asyncio.run(_drive_loop(config, worktree, router, writer, run_request_id="run-legacy"))
+
+    assert router.prompts[0]["messages"] == [
+        *checkpoint.full_messages,
+        {
+            "role": "user",
+            "content": worker._child_result_lines(
+                _strict_child_envelope(summary="x" * 300)
+            ),
+        },
+        {
+            "role": "user",
+            "content": worker._child_result_lines(
+                _strict_child_envelope(summary="x" * 300)
+            ),
+        },
+    ]
+    kinds = [message["type"] for message in writer.messages()]
+    assert "context_epoch_advanced" not in kinds
+    assert "compaction_failed" not in kinds
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 1
 
 
 # ---------------------------------------------------------------------------

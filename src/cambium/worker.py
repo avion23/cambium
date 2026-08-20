@@ -972,6 +972,41 @@ def _positive_float(value: Any, name: str, default: float) -> float:
     return float(value)
 
 
+def _rolling_compact_thresholds(
+    values: Mapping[str, Any],
+    max_transcript_chars: int,
+    source: str,
+) -> tuple[int, int]:
+    """Parse rolling-fold character thresholds with a hysteresis band.
+
+    The high threshold defaults to the existing transcript budget and the low
+    threshold defaults to half of that high threshold.  These are character
+    counts, so the legacy transcript budget and provider token accounting stay
+    unchanged.
+    """
+    threshold_high = _positive_int(
+        values.get("rolling_compact_threshold_high"),
+        f"{source} rolling_compact_threshold_high",
+        max_transcript_chars,
+    )
+    threshold_low = _positive_int(
+        values.get("rolling_compact_threshold_low"),
+        f"{source} rolling_compact_threshold_low",
+        max(1, threshold_high // 2),
+    )
+    if threshold_low > threshold_high:
+        raise ValueError(
+            f"{source} rolling_compact_threshold_low must not exceed "
+            "rolling_compact_threshold_high"
+        )
+    return threshold_high, threshold_low
+
+
+def _tolerant_published(value: Any) -> bool:
+    """Read the supervisor publication gate without rejecting old payloads."""
+    return type(value) is bool and value
+
+
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     """Immutable per-task agent configuration parsed from init (init is authoritative)."""
@@ -1008,8 +1043,30 @@ class AgentConfig:
     # compatible child reuses; ``resume`` (run_task) carries the checkpoint
     # ref and bounded child-result envelopes a suspended parent continues from.
     context_reuse: bool = False
+    # Phase 4 rolling compaction is opt-in and only meaningful with context
+    # reuse. Thresholds are character counts: high defaults to the existing
+    # transcript budget and low defaults to half of high.
+    rolling_compact: bool = False
+    rolling_compact_threshold_high: int = 0
+    rolling_compact_threshold_low: int = 0
+    # The current run's supervisor publication gate. Invalid or absent wire
+    # values are deliberately treated as false for old supervisors.
+    published: bool = False
     context_fork: dict[str, Any] | None = None
     resume: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        """Derive threshold defaults for direct in-process configurations."""
+        threshold_high = self.rolling_compact_threshold_high
+        if threshold_high == 0:
+            threshold_high = self.max_transcript_chars
+        threshold_low = self.rolling_compact_threshold_low
+        if threshold_low == 0:
+            threshold_low = max(1, threshold_high // 2)
+        if threshold_high <= 0 or threshold_low <= 0 or threshold_low > threshold_high:
+            raise ValueError("invalid rolling compaction thresholds")
+        object.__setattr__(self, "rolling_compact_threshold_high", threshold_high)
+        object.__setattr__(self, "rolling_compact_threshold_low", threshold_low)
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -1052,6 +1109,14 @@ class AgentConfig:
         checkpoint_root = (
             Path(session_id).resolve() / ".cambium" / "checkpoints" if session_id else None
         )
+        max_transcript_chars = _positive_int(
+            init.get("max_transcript_chars"),
+            "init max_transcript_chars",
+            MAX_TRANSCRIPT_CHARS,
+        )
+        rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
+            init, max_transcript_chars, "init"
+        )
         return cls(
             task_id=task_id,
             generation=_positive_int(init.get("generation"), "init generation", 1),
@@ -1076,15 +1141,16 @@ class AgentConfig:
                 max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S
             ),
             checkpoint_root=checkpoint_root,
-            max_transcript_chars=_positive_int(
-                init.get("max_transcript_chars"),
-                "init max_transcript_chars",
-                MAX_TRANSCRIPT_CHARS,
-            ),
+            max_transcript_chars=max_transcript_chars,
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
             parent_envelope=_validate_parent_envelope(init.get("parent_envelope")),
             context_reuse=_strict_bool(init.get("context_reuse"), "init context_reuse"),
+            rolling_compact=_strict_bool(
+                init.get("rolling_compact"), "init rolling_compact"
+            ),
+            rolling_compact_threshold_high=rolling_threshold_high,
+            rolling_compact_threshold_low=rolling_threshold_low,
             context_fork=_validate_context_fork(init.get("context_fork")),
         )
 
@@ -1118,6 +1184,26 @@ def _merge_task_config(
         run.get("parent_envelope")
     )
     resume = config.resume or _validate_resume(run.get("resume"))
+    rolling_compact = config.rolling_compact
+    if "rolling_compact" not in init:
+        rolling_compact = _strict_bool(
+            run.get("rolling_compact"), "run_task rolling_compact"
+        )
+    threshold_values: dict[str, Any] = {
+        "rolling_compact_threshold_high": config.rolling_compact_threshold_high,
+        "rolling_compact_threshold_low": config.rolling_compact_threshold_low,
+    }
+    if "rolling_compact_threshold_high" not in init:
+        threshold_values["rolling_compact_threshold_high"] = run.get(
+            "rolling_compact_threshold_high"
+        )
+    if "rolling_compact_threshold_low" not in init:
+        threshold_values["rolling_compact_threshold_low"] = run.get(
+            "rolling_compact_threshold_low"
+        )
+    rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
+        threshold_values, config.max_transcript_chars, "run_task"
+    )
     return AgentConfig(
         task_id=config.task_id,
         generation=config.generation,
@@ -1141,6 +1227,10 @@ def _merge_task_config(
         redactor=config.redactor,
         parent_envelope=parent_envelope,
         context_reuse=config.context_reuse,
+        rolling_compact=rolling_compact,
+        rolling_compact_threshold_high=rolling_threshold_high,
+        rolling_compact_threshold_low=rolling_threshold_low,
+        published=_tolerant_published(run.get("published")),
         context_fork=config.context_fork,
         resume=resume,
     )
@@ -1157,6 +1247,14 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         authorized_explicit = "authorized_providers" in run
     if type(authorized_explicit) is not bool:
         raise ValueError("run_task authorized_providers_explicit must be a boolean")
+    max_transcript_chars = _positive_int(
+        run.get("max_transcript_chars"),
+        "run_task max_transcript_chars",
+        MAX_TRANSCRIPT_CHARS,
+    )
+    rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
+        run, max_transcript_chars, "run_task"
+    )
     return AgentConfig(
         task_id=task_id,
         generation=_positive_int(run.get("generation"), "run_task generation", 1),
@@ -1179,10 +1277,17 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
             run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
         ),
         checkpoint_root=None,
+        max_transcript_chars=max_transcript_chars,
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
         parent_envelope=_validate_parent_envelope(run.get("parent_envelope")),
         context_reuse=_strict_bool(run.get("context_reuse"), "run_task context_reuse"),
+        rolling_compact=_strict_bool(
+            run.get("rolling_compact"), "run_task rolling_compact"
+        ),
+        rolling_compact_threshold_high=rolling_threshold_high,
+        rolling_compact_threshold_low=rolling_threshold_low,
+        published=_tolerant_published(run.get("published")),
         context_fork=_validate_context_fork(run.get("context_fork")),
         resume=_validate_resume(run.get("resume")),
     )
@@ -1618,6 +1723,38 @@ def _summarize_transcript(
         kept.append(marker)
     kept.extend(tail)
     return _fit_transcript_to_budget(kept, budget)
+
+
+def _render_rolling_compaction(
+    continuation: list[dict[str, Any]], budget: int
+) -> list[dict[str, str]]:
+    """Render a deterministic bounded continuation summary as user data.
+
+    ``_summarize_transcript`` supplies the existing retention and truncation
+    semantics.  The resulting message list is then serialized into one
+    delimited user-role message so compacted, untrusted observations never
+    gain system authority.
+    """
+    summarized = _summarize_transcript(
+        copy.deepcopy(continuation),
+        budget,
+        max_messages=MAX_CONTEXT_MESSAGES,
+    )
+    serialized = json.dumps(
+        summarized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    content = (
+        "<cambium-rolling-context>\n"
+        + serialized
+        + "\n</cambium-rolling-context>"
+    )
+    return [{
+        "role": "user",
+        "content": _cap_utf8(content, min(budget, MAX_OBSERVATION_BYTES)),
+    }]
 
 
 def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
@@ -2583,6 +2720,46 @@ async def _emit_context_checkpoint(
     })
 
 
+async def _emit_context_epoch_advanced(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    *,
+    request_id: str,
+    epoch: int,
+    checkpoint_ref: str,
+    folded_from_epoch: int,
+    reason: str | None,
+) -> None:
+    await send(writer, {
+        "type": "context_epoch_advanced",
+        "request_id": request_id,
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "epoch": epoch,
+        "checkpoint_ref": checkpoint_ref,
+        "folded_from_epoch": folded_from_epoch,
+        "reason": reason,
+    })
+
+
+async def _emit_compaction_failed(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    *,
+    request_id: str,
+    epoch: int,
+    reason: str,
+) -> None:
+    await send(writer, {
+        "type": "compaction_failed",
+        "request_id": request_id,
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "epoch": epoch,
+        "reason": _cap_utf8(reason, MAX_ENVELOPE_FIELD_CHARS),
+    })
+
+
 def _load_epoch_checkpoint(
     config: AgentConfig, checkpoint_ref: str, *, expect_task_id: bool
 ) -> ContextCheckpoint:
@@ -3100,6 +3277,8 @@ async def _run_agent_loop(
     base_messages: tuple[dict[str, Any], ...] | None = None
     context_continuation: list[dict[str, Any]] = []
     epoch_count = 0
+    current_epoch_checkpoint: ContextCheckpoint | None = None
+    compaction_armed = True
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
     first_turn = 1
@@ -3111,9 +3290,108 @@ async def _run_agent_loop(
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
 
-    def _bound_context_continuation() -> bool:
-        """Bound only mutable fork/resume messages, never the epoch prefix."""
-        nonlocal context_continuation, epoch_count
+    async def _bound_context_continuation(turn: int) -> bool:
+        """Bound mutable continuation or perform one durable rolling fold."""
+        nonlocal context_continuation, current_epoch_checkpoint, epoch_count
+        nonlocal compaction_armed, usage_epoch
+
+        rolling_gate = config.rolling_compact and config.context_reuse and config.published
+        continuation_size = _transcript_chars(context_continuation)
+        if rolling_gate:
+            if continuation_size <= config.rolling_compact_threshold_low:
+                compaction_armed = True
+            if (
+                compaction_armed
+                and (
+                    continuation_size > config.rolling_compact_threshold_high
+                    or len(context_continuation) > MAX_CONTEXT_MESSAGES
+                )
+            ):
+                request_id = (
+                    run_request_id
+                    if isinstance(run_request_id, str) and run_request_id
+                    else make_request_id("run")
+                )
+                prior_continuation = copy.deepcopy(context_continuation)
+                prior_epoch = epoch_count
+                try:
+                    if base_messages is None or current_epoch_checkpoint is None:
+                        raise ContextForkError("no active epoch checkpoint for rolling fold")
+                    compacted_suffix = _render_rolling_compaction(
+                        prior_continuation,
+                        config.rolling_compact_threshold_low,
+                    )
+                    cache_key = current_epoch_checkpoint.cache_key
+                    provider = cache_key.provider
+                    checkpoint = await asyncio.to_thread(
+                        _write_epoch_checkpoint,
+                        config,
+                        turn=turn,
+                        epoch=prior_epoch + 1,
+                        provider_messages=copy.deepcopy(list(base_messages)),
+                        continuation_suffix=copy.deepcopy(compacted_suffix),
+                        provider=provider,
+                        model=cache_key.model,
+                        tools_sha256=_sha256_hex(
+                            json.dumps(tools, sort_keys=True).encode("utf-8")
+                        ),
+                        provider_compat=(
+                            {provider: (cache_key.protocol, cache_key.reasoning_effort)}
+                            if provider is not None
+                            else {}
+                        ),
+                        provider_boundary=cache_key.provider_boundary,
+                        code_changed=code_changed,
+                        verified_after_change=verified_after_change,
+                        verification_failed=verification_failed,
+                        no_progress_actions=no_progress_actions,
+                        budget_new_tokens=budget_new_tokens,
+                        previous_prompt_tokens=previous_prompt_tokens,
+                        cumulative_usage=cumulative_usage,
+                        wall_deadline=absolute_wall_deadline,
+                    )
+                    if checkpoint is None:
+                        raise ContextForkError("rolling fold has no checkpoint root")
+                except Exception as exc:
+                    if writer is not None:
+                        await _emit_compaction_failed(
+                            writer,
+                            config,
+                            request_id=request_id,
+                            epoch=prior_epoch,
+                            reason=str(exc),
+                        )
+                    return False
+
+                # Commit the in-memory transition only after the immutable
+                # checkpoint has been durably created. The old checkpoint and
+                # the stable base tuple are never mutated.
+                context_continuation = compacted_suffix
+                current_epoch_checkpoint = checkpoint
+                epoch_count = checkpoint.epoch
+                usage_epoch = checkpoint.epoch
+                compaction_armed = (
+                    _transcript_chars(context_continuation)
+                    <= config.rolling_compact_threshold_low
+                )
+                _sync_context_transcript()
+                if writer is not None:
+                    await _emit_context_epoch_advanced(
+                        writer,
+                        config,
+                        request_id=request_id,
+                        epoch=checkpoint.epoch,
+                        checkpoint_ref=checkpoint.checkpoint_ref,
+                        folded_from_epoch=prior_epoch,
+                        reason=None,
+                    )
+                return True
+            # A publication-gated rolling run owns this seam. On a successful
+            # fold, hysteresis keeps the compacted suffix in place until it is
+            # back below the low threshold; on failure, fail-open preserves
+            # the raw continuation and avoids legacy truncation.
+            return False
+
         bounded = _summarize_transcript(
             context_continuation,
             config.max_transcript_chars,
@@ -3141,6 +3419,7 @@ async def _run_agent_loop(
                 outcome, "failed", f"context_resume_failed: {exc}", 0,
                 cumulative_usage, transcript,
             )
+        current_epoch_checkpoint = resume_checkpoint
         base_messages = tuple(copy.deepcopy(resume_checkpoint.full_messages))
         context_continuation = [
             {"role": "user", "content": _child_result_lines(child_result)}
@@ -3173,6 +3452,7 @@ async def _run_agent_loop(
             except ContextForkError as exc:  # pragma: no cover - already validated
                 fork_skip = str(exc)
             else:
+                current_epoch_checkpoint = fork_checkpoint
                 base_messages = tuple(copy.deepcopy(fork_checkpoint.full_messages))
                 context_continuation = [copy.deepcopy(fork_messages[-1])]
                 epoch_count = fork_checkpoint.epoch
@@ -3216,7 +3496,7 @@ async def _run_agent_loop(
                 # the prompt boundary. No later turn can rewrite the epoch
                 # prefix in place.
                 if config.context_reuse:
-                    _bound_context_continuation()
+                    await _bound_context_continuation(turn)
                 prompt = _fork_prompt(base_messages, context_continuation)
             # Keep the object handed to the router immutable for checkpointing.
             # A provider adapter is allowed to normalize its local request, but
