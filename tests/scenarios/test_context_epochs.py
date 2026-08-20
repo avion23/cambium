@@ -14,6 +14,7 @@ import asyncio
 import json
 import subprocess
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ import pytest
 from cambium import worker
 from cambium.diffundo import ProviderTier
 from cambium.fencing import write_generation
+from cambium.redact import Redactor
 from cambium.supervisor import (
     TaskResult,
     _bounded_resume_envelope,
@@ -340,6 +342,40 @@ def test_epoch_checkpoint_roundtrip_and_tamper(tmp_path: Path) -> None:
         )
     with pytest.raises(ContextForkError, match="invalid checkpoint_ref path"):
         worker._load_epoch_checkpoint(config, "../evil.json", expect_task_id=True)
+
+
+def test_redacted_epoch_checkpoint_roundtrip(tmp_path: Path) -> None:
+    config = _agent_config(
+        tmp_path / "wt",
+        checkpoint_root=tmp_path / "ckpts",
+        redactor=Redactor(secret_values={"SECRETXYZ"}),
+    )
+    checkpoint = _write_epoch(
+        config,
+        messages=[
+            {"role": "system", "content": "You are the agent SECRETXYZ."},
+            {"role": "user", "content": "observe SECRETXYZ"},
+        ],
+    )
+
+    loaded = worker._load_epoch_checkpoint(
+        config, checkpoint.checkpoint_ref, expect_task_id=True
+    )
+    assert checkpoint.cache_key.redacted is True
+    assert loaded.cache_key.redacted is True
+    assert loaded.cache_key == checkpoint.cache_key
+    assert all(
+        "SECRETXYZ" not in message["content"]
+        for message in [*loaded.provider_messages, *loaded.continuation_suffix]
+    )
+
+    compatible, reason = worker._fork_cache_compatible(
+        {"fanout_config": {"model": checkpoint.cache_key.model}},
+        {"cache_key": asdict(checkpoint.cache_key)},
+        frozenset({"loopback-provider"}),
+    )
+    assert not compatible
+    assert reason == "checkpoint redacted"
 
 
 def test_child_result_lines_and_fork_prompt() -> None:

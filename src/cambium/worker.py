@@ -2458,7 +2458,44 @@ def _write_epoch_checkpoint(
     )))
     redacted = payload != asdict(replace(checkpoint, checkpoint_ref=placeholder_ref))
     if redacted:
-        payload["cache_key"]["redacted"] = True
+        redacted_provider_messages = payload["provider_messages"]
+        redacted_continuation_suffix = payload["continuation_suffix"]
+        redacted_cache_key = payload["cache_key"]
+        redacted_cache_key.update({
+            "system_sha256": _sha256_hex(
+                str(redacted_provider_messages[0]["content"]).encode("utf-8")
+            ),
+            "prefix_sha256": _messages_sha256(redacted_provider_messages),
+            "suffix_sha256": _messages_sha256(redacted_continuation_suffix),
+            "full_sha256": _messages_sha256([
+                *redacted_provider_messages, *redacted_continuation_suffix,
+            ]),
+            "prefix_bytes": prompt_prefix_bytes(
+                {"messages": redacted_provider_messages}
+            ) or 0,
+            "message_count": len(redacted_provider_messages),
+            "redacted": True,
+        })
+        redacted_cache_key["provider_boundary"] = _validate_provider_boundary(
+            redacted_cache_key["provider_boundary"]
+        )
+        persisted_cache_key = CacheKeyDescriptor(
+            provider=redacted_cache_key["provider"],
+            model=redacted_cache_key["model"],
+            protocol=redacted_cache_key["protocol"],
+            reasoning_effort=redacted_cache_key["reasoning_effort"],
+            system_sha256=redacted_cache_key["system_sha256"],
+            tools_sha256=redacted_cache_key["tools_sha256"],
+            prefix_sha256=redacted_cache_key["prefix_sha256"],
+            suffix_sha256=redacted_cache_key["suffix_sha256"],
+            full_sha256=redacted_cache_key["full_sha256"],
+            prefix_bytes=redacted_cache_key["prefix_bytes"],
+            message_count=redacted_cache_key["message_count"],
+            redacted=redacted_cache_key["redacted"],
+            provider_boundary=redacted_cache_key["provider_boundary"],
+        )
+    else:
+        persisted_cache_key = checkpoint.cache_key
     address_persisted = _checkpoint_address(payload)
     checkpoint_ref = f"{safe_task}/{prefix}-{address_persisted}.json"
     payload["checkpoint_ref"] = checkpoint_ref
@@ -2468,7 +2505,7 @@ def _write_epoch_checkpoint(
     return replace(
         checkpoint,
         checkpoint_ref=checkpoint_ref,
-        cache_key=replace(checkpoint.cache_key, redacted=redacted),
+        cache_key=persisted_cache_key,
     )
 
 
