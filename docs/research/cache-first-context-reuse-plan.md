@@ -1,7 +1,6 @@
 # Cache-first context reuse — implementation plan for immutable cache epochs
 
-**Status: DRAFT — Phase 1 implemented; Phase 2 measurement tooling implemented;
-live provider evidence remains opt-in.** Snapshot base `main@a446345`
+**Status: DRAFT — Phase 1 runtime and Phase 2 measurement tooling implemented; live baseline evidence collected; live fork/resume evidence pending.** Snapshot base `main@a446345`
 (`feat(jlens): calibrated layers from falsification (29,41,57,61)`), written
 2026-08-19, worktree `/tmp/opencode/cambium-cache-first`, branch
 `docs/cache-first-context-reuse`. This commit adds this file and one index
@@ -33,10 +32,9 @@ research files.
    durable and recovery stays independent of compaction. The first
    implementation does not compact at all.
 
-The existing in-loop truncation (`_summarize_transcript`,
-`src/cambium/worker.py:1132-1163`, called at `worker.py:1730`) continues to
-bound the transcript in every phase below. It is a size guard, not the reuse
-mechanism.
+The existing `_summarize_transcript` guard bounds legacy fresh-prompt
+transcripts. Fork and resume continuations currently bypass this guard;
+enforcing `MAX_CONTEXT_MESSAGES` on those paths remains required.
 
 ## 2. How this differs from passing a summary to a fresh subagent
 
@@ -90,11 +88,9 @@ Traced execution path, all citations verified at `main@a446345`:
   (`_child_spec`, `src/cambium/supervisor.py:3505-3535`). The envelope is
   bounded: `MAX_ENVELOPE_FIELD_CHARS = 2_000` and `MAX_ENVELOPE_ITEMS = 16`
   (`src/cambium/worker.py:169-170`).
-- The worker renders that envelope into a freshly built system prompt:
-  `_parent_envelope_lines` (`src/cambium/worker.py:1166-1189`) appends a
-  "Parent task context:" block after the `Task:` line inside
-  `_build_agent_prompt` (`src/cambium/worker.py:1192-1251`,
-  `worker.py:1236-1237`).
+- The legacy worker path appends the envelope as a bounded, delimited user-role
+  message via `_parent_envelope_message`
+  (`src/cambium/worker.py:1640-1654`); it is not part of the system message.
 
 Consequences:
 
@@ -104,9 +100,9 @@ Consequences:
   `src/cambium/diffundo.py:388-404`), so the shared cacheable region is only
   the static head above `Task:`. The parent's accumulated transcript — the
   expensive part — is not reused at all.
-- The parent itself is terminal (exited or pooled) when its children run.
-  There is no suspension and no resume today; "parent continues after child
-  results" does not exist as a mechanism.
+- With `context_reuse` disabled, the parent remains terminal before children run.
+  With it enabled, a successful delegate writes an epoch, suspends the parent,
+  and resumes it after admitted children terminate.
 
 ## 4. Current cache evidence and limits
 
@@ -131,10 +127,11 @@ Measured and coded facts that bound the design:
   (`assigned_provider`, `src/cambium/worker.py:558-564`;
   `src/cambium/supervisor.py:2348-2351`; `_resolve_assignment`,
   `src/cambium/supervisor.py:1950-1967`).
-- **Chat providers hit; codex does not.** zai 48/49 and opencode-go 109/110
-  calls hit the cache on a byte-stable prefix; the codex responses endpoint
-  reported `cached_tokens` on only 7/56 calls (12.5%), sparse and
-  non-monotonic, and rejects `prompt_cache_options` /
+- **Chat providers hit; codex does not.** Current Phase 2 baseline evidence is
+  codex 0/2, zai 2/3 (66.7%), and opencode-go 1/3 (33.3%); live fork/resume
+  evidence is pending. Chat-provider calls hit the cache on a byte-stable
+  prefix; the codex responses endpoint remains sparse and non-monotonic and
+  rejects `prompt_cache_options` /
   `prompt_cache_breakpoint` with 400s while `prompt_cache_key` reports zero
   (`src/cambium/diffundo.py:70-93`). Consequences: never emit cache-control
   fields; never gate the feature on codex hit rates; promise nothing for
@@ -150,11 +147,14 @@ Measured and coded facts that bound the design:
   (`implementation-plan.md:112-117`).
 - **Telemetry surface already exists.** `CallResult` carries
   `prompt_prefix_bytes` and `provider_cache_hit`
-  (`src/cambium/diffundo.py:279-281`); `_provider_cache_hit` extracts
-  `prompt_tokens_details.cached_tokens`, `cache_read_input_tokens`, and
-  top-level `cached_tokens` (`src/cambium/diffundo.py:631-652`); codex usage
-  is normalized by `_codex_usage` (`src/cambium/diffundo.py:955-983`). The
-  worker emits one redacted `usage_event` per router call
+  (`src/cambium/diffundo.py:279-281`); extraction is centralized in
+  `diffundo._cached_tokens`, which validates counts from
+  `prompt_tokens_details.cached_tokens`, `input_tokens_details.cached_tokens`,
+  `cache_read_input_tokens`, or top-level `cached_tokens`
+  (`src/cambium/diffundo.py:651-672`), and normalized usage events persist a
+  top-level `cached_tokens` value. Codex usage is normalized by `_codex_usage`
+  (`src/cambium/diffundo.py:976-1007`). The worker emits one redacted
+  `usage_event` per router call
   (`src/cambium/worker.py:1287-1374`); the supervisor validates and forwards
   an allowlist (`src/cambium/supervisor.py:211-226`, `:249-289`) and folds
   it into the debt ledger (`src/cambium/supervisor.py:2810-2814`;
@@ -173,7 +173,7 @@ Claim measured numbers, not provider marketing.
 
 | Object | Role | Durability |
 |---|---|---|
-| Epoch checkpoint | The exact message list (system head plus transcript projection) the parent last sent, with a cache-key descriptor; content-addressed; immutable once written | file under `<session_dir>/.cambium/checkpoints/<safe-task-id>/epoch-<n>-<sha16>.json`, written with `_atomic_json_write` (`src/cambium/worker.py:822-840`); durable `context_checkpoint` event |
+| Epoch checkpoint | The exact message list (system head plus transcript projection) the parent last sent, with a cache-key descriptor; content-addressed; immutable once written | file under `<session_dir>/.cambium/checkpoints/<safe-task-id>/epoch-<n>-<sha16>.json`; epoch checkpoints store the exact provider-sent `provider_messages` plus a separate `continuation_suffix` and are published through `_create_epoch_checkpoint` using exclusive creation and fsync (`src/cambium/worker.py:2272-2306`); durable `context_checkpoint` event |
 | Cache-key descriptor | Compatibility contract for forking the epoch | embedded in the checkpoint and the event |
 | Fork | A child invocation whose first prompt equals the checkpoint messages plus one child task envelope (user role) | derived; never stored as shared state |
 | Resume | Parent continuation from the same checkpoint plus bounded child-result envelopes | durable `context_resume` event |
@@ -196,40 +196,51 @@ class CacheKeyDescriptor:
     reasoning_effort: str | None
     system_sha256: str            # sha256 of messages[0] content bytes
     tools_sha256: str             # sha256 of the exact tools JSON in the head
+    prefix_sha256: str            # sha256 of canonical provider_messages JSON
+    suffix_sha256: str            # sha256 of canonical continuation_suffix JSON
+    full_sha256: str              # sha256 of canonical full message-list JSON
     prefix_bytes: int             # prompt_prefix_bytes(prompt) at the boundary
-    messages_sha256: str          # sha256 of canonical JSON of the message list
     message_count: int
     redacted: bool                # True when the session redactor altered bytes
+    provider_boundary: dict[str, Any]
 
 @dataclass(frozen=True, slots=True)
 class ContextCheckpoint:
-    schema: int                   # = 2
+    schema: int                   # = 4
     task_id: str
+    generation: int
     epoch: int                    # per-task monotonic
     turn: int
     created_at: float
     cache_key: CacheKeyDescriptor
-    system_message: dict[str, Any]
-    transcript: list[dict[str, Any]]
+    provider_messages: list[dict[str, Any]]
+    continuation_suffix: list[dict[str, Any]]
     checkpoint_ref: str
+    code_changed: bool
+    verified_after_change: bool
+    verification_failed: bool
+    no_progress_actions: int
+    budget_new_tokens: int
+    previous_prompt_tokens: int
+    cumulative_usage: dict[str, int]
+    wall_deadline: float
 ```
 
-If `Redactor.redact_mapping` changes any byte of the serialized checkpoint,
-the writer sets `redacted: true`. A redacted checkpoint may still be forked
-for context continuity, but the descriptor is marked incompatible for the
-byte-guarantee purpose: cache reuse cannot be asserted, and telemetry records
-that fact. Content addressing hashes the canonical pre-redaction
-serialization, so the same logical checkpoint keeps one address.
+When redaction changes persisted bytes, the writer recomputes all message-derived
+hashes, `prefix_bytes`, and `message_count` from the redacted payload and
+validates the redacted `provider_boundary`. The persisted content-address suffix
+is computed from those redacted canonical bytes. A redacted checkpoint is not
+eligible for fork or resume. Fork rejection is implemented; resume must also
+reject a checkpoint whose `cache_key.redacted` is true.
 
 ### 5.3 Where epochs are cut (safe provider-turn boundary)
 
-A checkpoint is cut only between provider turns — after the current tool
+A checkpoint is cut only after a successful `delegate` action, after the tool
 result is appended and the per-turn checkpoint persisted
-(`src/cambium/worker.py:1897-1903`), and only when the action was
-`delegate`; plus one terminal epoch next to the existing final checkpoint
-write in `_finalize_worktree` (`src/cambium/worker.py:2132-2138`). The
-checkpoint holds the prompt object just sent (`worker.py:1731-1734`), so by
-construction `prefix_bytes` and the hashes match what the provider saw.
+(`src/cambium/worker.py:3331-3373`); terminal epoch writing remains
+unimplemented. For unredacted checkpoints, the provider-message hashes and
+`prefix_bytes` match the submitted prompt; redacted checkpoints are ineligible
+for reuse.
 This is the same "Safe Provider-Turn Boundary" lesson recorded in
 [`opencode.md`](opencode.md) (Context Epoch section): keep the baseline
 context immutable during an epoch; admit changes only at the boundary.
@@ -248,7 +259,10 @@ def _build_forked_prompt(checkpoint, child_envelope) -> dict[str, Any]:
 (reuse `_parent_envelope_lines`, `src/cambium/worker.py:1166-1189`) as one
 **user-role data block** — bounded data, never a system directive (injection
 posture, section 11). Build-time assertions, each failing closed to the
-legacy fresh-prompt path with a durable `context_fork_skipped` reason:
+  legacy fresh-prompt path with a durable `context_fork_skipped` reason. The
+  loaded checkpoint is integrity-checked, but the worker does not yet compare
+  every hash in the received fork descriptor with the loaded artifact; that
+  descriptor-to-artifact binding remains required:
 
 - `prompt_prefix_bytes(forked) == checkpoint.cache_key.prefix_bytes`;
 - `sha256(system message) == system_sha256`;
@@ -327,9 +341,11 @@ suspended. On a clean, correlated envelope with `status == "suspended"`:
    (`src/cambium/worker.py:1729`).
 3. The supervisor awaits child terminality (a registry of per-task
    completion futures populated in `supervise_task`'s `finally`; bounded by
-   the parent's remaining wall budget).
+   the parent's remaining wall budget). Current repeated-suspension accounting
+   subtracts elapsed time more than once and must be corrected before claiming
+   an accurate remaining budget.
 4. Strict envelopes come from `_child_envelopes[parent]`
-   (`src/cambium/supervisor.py:2728-2730`) or are synthesized from the
+  (`src/cambium/supervisor.py:2728-2730`) or are synthesized from the
    `child_failed` event for failed children
    (`src/cambium/supervisor.py:2014-2022`).
 5. Emit `context_resume`, then drive a second `_drive_generation` for the
@@ -359,28 +375,32 @@ artifact — the immutable checkpoint file — and nothing writable.
 ## 7. Component work items
 
 Grounded in the traced repo; each item names the file and symbols it touches.
+The Phase 1 runtime, durable events, `--context-reuse`, usage fields, and
+evidence script are implemented. Remaining gaps are terminal epoch writing,
+fork/resume transcript-size enforcement, checkpoint event validation and
+binding, wall-budget accounting, and generation-aware evidence classification.
 
-- `src/cambium/worker.py` — add `CacheKeyDescriptor`, `ContextCheckpoint`,
-  `_write_epoch_checkpoint`, `_build_forked_prompt`, `_child_task_lines`;
-  parse `context_fork` / `resume` in `AgentConfig.from_init`
-  (`worker.py:645-707`) and pass through `_merge_task_config`
-  (`worker.py:710-759`); add the `suspended` status and exit code
-  (`worker.py:173-199`); seed the loop from a checkpoint in
-  `_run_agent_loop` (`worker.py:1669-1911`); emit `context_checkpoint`
+- `src/cambium/worker.py` — implements `CacheKeyDescriptor`,
+  `ContextCheckpoint`, `_write_epoch_checkpoint`, `_build_forked_prompt`,
+  `_child_task_lines`; parses `context_fork` / `resume` in `AgentConfig.from_init`
+  (`worker.py:645-707`) and passes through `_merge_task_config`
+  (`worker.py:710-759`); implements the `suspended` status and exit code
+  (`worker.py:173-199`); seeds the loop from a checkpoint in
+  `_run_agent_loop` (`worker.py:1669-1911`); emits `context_checkpoint`
   next to `_persist_checkpoint` (`worker.py:1420-1432`).
-- `src/cambium/supervisor.py` — suspend handling in `_supervise`
-  (`supervisor.py:2024-2232`); return admitted ids from `_admit_child`
-  (`supervisor.py:1670-1784`); pin compatible children before
-  `_resolve_assignment` (`supervisor.py:1950-1967`); forward the new event
+- `src/cambium/supervisor.py` — implements suspend handling in `_supervise`
+  (`supervisor.py:2024-2232`); returns admitted ids from `_admit_child`
+  (`supervisor.py:1670-1784`); pins compatible children before
+  `_resolve_assignment` (`supervisor.py:1950-1967`); forwards the new event
   kinds in `_drive_generation` next to `checkpoint`
-  (`supervisor.py:2786-2791`); accept and validate `resume` in
-  `_run_payload` (`supervisor.py:1592-1624`); plumb `context_reuse` through
+  (`supervisor.py:2786-2791`); accepts and validates `resume` in
+  `_run_payload` (`supervisor.py:1592-1624`); plumbs `context_reuse` through
   `run_plan` (`supervisor.py:3830-3845`) and `_Runtime`
   (`supervisor.py:1100-1159`), next to `warm_pool_size`/`worker_reuse`
   (`supervisor.py:2340-2344`).
-- `src/cambium/store.py` — add `context_checkpoint` to `CRITICAL_KINDS`
+- `src/cambium/store.py` — includes `context_checkpoint` in `CRITICAL_KINDS`
   (`store.py:76-81`) so the fork substrate is fail-closed durable.
-- `src/cambium/supervisor.py` usage path — extend
+- `src/cambium/supervisor.py` usage path — includes
   `_USAGE_EVENT_FORWARD_FIELDS` (`supervisor.py:211-226`) with optional
   `epoch` and `fork_of` (omitted when absent, the un-reported-field rule).
 - `src/cambium/tasktree.py` — unchanged; `_ENVELOPE_KEYS` and
@@ -391,10 +411,10 @@ Grounded in the traced repo; each item names the file and symbols it touches.
   `conversations.py:48-60`, `:181-230`).
 - `src/cambium/diffundo.py`, `src/cambium/lm.py` — no cache-policy change
   (D1 stands); measurement-only additions if any.
-- `src/cambium/cli.py` / `src/cambium/oneshot.py` — surface
+- `src/cambium/cli.py` / `src/cambium/oneshot.py` — surfaces
   `--context-reuse` next to the `--conversations` flag seam.
-- `scripts/context_cache_evidence.py` — new aggregation script, sibling of
-  `scripts/usage_evidence.py`.
+- `scripts/context_cache_evidence.py` — implemented aggregation script,
+  sibling of `scripts/usage_evidence.py`.
 
 ## 8. Phases
 
@@ -407,12 +427,14 @@ No LLM calls anywhere in the new tests. No compaction, no
 `ConversationStore` writes. Byte-for-byte current behavior when the flags
 are absent.
 
-### Phase 2 — real cache measurement (tooling implemented; live evidence pending)
+### Phase 2 — real cache measurement (tooling is implemented and baseline live evidence has been collected; the live fork/resume rerun remains pending)
 
 Extend usage events with `epoch` / `fork_of`; add
 `scripts/context_cache_evidence.py`; run one live paired session per chat
 provider (zai, opencode-go; codex measured, never gated) using the
 opt-in, non-loopback pattern of `scripts/external-provider-smoke.sh`.
+Restarted-call classification must include generation before final acceptance
+measurements.
 Acceptance gates in section 12.
 
 ### Phase 3 (optional) — durable raw record
@@ -438,21 +460,26 @@ measured.
 ## 9. Data, event, and API changes; migration; flags
 
 - New IPC event (worker to supervisor): `context_checkpoint`
-  `{task_id, generation, epoch, turn, checkpoint_ref, cache_key{...}}`.
+  `{request_id, task_id, generation, epoch, turn, checkpoint_ref, cache_key{...}}`.
+  The event must require the complete cache descriptor, including
+  `system_sha256`, `tools_sha256`, and `provider_boundary`, and must be
+  correlated to the active request, task, and generation before updating
+  `_task_epochs`; the current supervisor validation does not yet enforce these.
 - New init field (supervisor to child): `context_fork`
   `{checkpoint_ref, provider, model, system_sha256, tools_sha256,
-  prefix_bytes, messages_sha256}` — strict-validated in `from_init`; unknown
-  keys are fatal (mirrors `_validate_parent_envelope`,
+  prefix_sha256, suffix_sha256, full_sha256, prefix_bytes,
+  provider_boundary}` — strict-validated in `from_init`; unknown keys are fatal
+  (mirrors `_validate_parent_envelope`,
   `src/cambium/worker.py:248-343`).
 - New run payload field (supervisor to resuming parent): `resume`
   `{checkpoint_ref, epoch, child_results, child_results_truncated}`. The
   list is bounded by `MAX_ENVELOPE_ITEMS` and the field cap; the whole
   message by `MAX_LINE_BYTES = 1 MiB` (`src/cambium/ipc.py:28`). Over
   limit: truncate the list and set the flag; never fail silently.
-- New durable event kinds: `context_checkpoint`, `context_fork`
-  `{parent_task_id, child_task_id, epoch, compatible, reason}`,
-  `context_resume`, later `context_epoch_advanced` and
-  `context_fork_skipped`. `emit` already accepts arbitrary kinds
+- Implemented durable kinds are `context_checkpoint`, `context_fork`,
+  `context_resume`, and `context_fork_skipped`; `context_epoch_advanced` remains
+  deferred. `context_fork` carries
+  `{parent_task_id, child_task_id, epoch, compatible, reason}`. `emit` already accepts arbitrary kinds
   (`src/cambium/supervisor.py:1204-1244`).
 - Usage event: optional `epoch: int`, `fork_of: str | null`.
 - Feature flags: `context_reuse` (init/run_plan parameter, default `False`)
@@ -476,16 +503,17 @@ measured.
 
 | Case | Behavior |
 |---|---|
-| Concurrent children from one epoch | All fork the same immutable checkpoint; identical prefix bytes; independent worktrees and nodes; results appended in completion order; sibling state never merges (I2.4 via `subtree_of`) |
+| Concurrent children from one epoch | All fork the same immutable checkpoint; identical prefix bytes; independent worktrees and nodes; results appended in deterministic admission order, not completion order; sibling state never merges (I2.4 via `subtree_of`) |
 | Child fails, then restarts | The existing crash-restart loop recovers the child worktree per generation (`src/cambium/supervisor.py:2219-2229`); a restart re-forks the same immutable checkpoint in a fresh process (the provider cache may still hold it); restart generations never come from the warm pool (`src/cambium/supervisor.py:2120-2135`) |
 | Child finally fails | Parent resumes with a bounded failure envelope synthesized from `child_failed` (`src/cambium/supervisor.py:2014-2022`); no parent state rolls back |
 | Child cancelled (`cancel`, `src/cambium/worker.py:2648-2651`) | The cancelled strict envelope resumes the parent; the epoch stays valid for further forks |
 | Parent cancelled while suspended | TaskGroup cancellation tears down children with it (existing group semantics); the parent records terminal `cancelled`; prune path unchanged (`src/cambium/supervisor.py:1994-1995`) |
-| Checkpoint missing or corrupt at fork/resume | Fail closed to the legacy fresh-prompt path; durable `context_fork_skipped` / `context_resume_failed`; never fabricate a prefix |
+| Missing or corrupt fork checkpoint | Falls back to the legacy prompt with `context_fork_skipped`; never fabricate a prefix |
+| Missing or corrupt resume checkpoint | Fails the resumed task; durable `context_resume_failed` emission for checkpoint-load failure remains unimplemented |
 | Stale repo/worktree state | Worktree identity and recovery stay exactly the existing paths (`_ensure_worktree`, `_recover_worktree`, generation fence). The checkpoint carries context only, never repo state; the child's `base_commit` resolution is unchanged. A resumed parent re-validates its fence every turn (`src/cambium/worker.py:1729`) |
 | Provider cache miss | Nothing; telemetry records `provider_cache_hit = false`; the run proceeds identically (D1 posture) |
 | Resume payload over the wire cap | Truncate the child-result list; set `child_results_truncated` |
-| Mid-forked-session truncation | `_summarize_transcript` fires as today; that is an epoch transition (a new checkpoint epoch is cut); the old prefix may be lost to the cache — acceptable and recorded |
+| Mid-forked-session truncation | Fork and resume continuations bypass the guard; they must apply the transcript message and size guards before an epoch transition can be claimed. |
 | Warm pool | Pooled processes are never required: transcripts rebuild from durable checkpoints; resume spawns fresh. Pool identity (`_pool_env_key`, `src/cambium/supervisor.py:346-371`) is unchanged |
 
 ## 11. Redaction and prompt-injection controls
@@ -517,25 +545,32 @@ measured.
 New `tests/scenarios/test_context_epochs.py`, plus additions to the
 existing files. All phase-1 tests are deterministic and network-free.
 
-- Prompt equality (fake router): the fork prompt's
-  `prompt_prefix_bytes` equals `epoch.prefix_bytes`; the full message hash
-  equals the checkpoint's; `validate_prompt_structure` passes; exactly one
-  user-role child envelope is appended; no parent scratchpad beyond the
-  strict block.
+- Prompt equality (fake router): the fork begins with the checkpoint's byte-exact
+  full message list and matching checkpoint hash; after the child envelope is
+  appended the fork's full-message hash must differ. `prompt_prefix_bytes`
+  equals `epoch.prefix_bytes`; `validate_prompt_structure` passes; exactly one
+  user-role child envelope is appended; no parent scratchpad beyond the strict
+  block.
 - Suspend/resume (fixture worker, pattern of
   `tests/scenarios/test_dynamic_child_admission.py`): suspend, two
   concurrent children, resume, final merge; `context_checkpoint`,
   `context_fork`, `context_resume` events present and redacted; child
   worktrees disjoint; parent worktree generation unchanged across resume.
+- Merged end-to-end coverage:
+  `test_worker_context_reuse_fork_resume_is_byte_exact` in
+  `tests/scenarios/test_worker_provider.py` proves byte-exact fork/resume
+  prefixes through a real worker and supervisor against a fake OpenAI HTTP
+  server and verifies baseline, fork-first, and resume-first evidence buckets.
 - Negative matrix: incompatible provider pin (child authorized set excludes
   the parent provider) falls back to the legacy prompt with
   `context_fork.compatible = false`; a redacted checkpoint is incompatible;
-  a corrupt or missing checkpoint falls back with a durable skip event; a
-  child crash-then-restart re-forks; a finally-failed child resumes the
-  parent with a failure envelope; a cancelled child resumes the parent; a
-  parent cancelled while suspended cancels the children; an over-cap resume
-  payload truncates with the flag set; unknown `context_fork` init keys are
-  fatal.
+  a corrupt or missing checkpoint falls back with a durable skip event for
+  forks only; resume failure is terminal (a corrupt or missing resume
+  checkpoint fails closed and does not start a fresh parent prompt); a child
+  crash-then-restart re-forks; a finally-failed child resumes the parent with
+  a failure envelope; a cancelled child resumes the parent; a parent cancelled
+  while suspended cancels the children; an over-cap resume payload truncates
+  with the flag set; unknown `context_fork` init keys are fatal.
 - Pool interplay: resume spawns fresh even with `CAMBIUM_WARM_POOL_SIZE > 0`
   (pattern of `tests/scenarios/test_worker_pool.py:357`).
 - Telemetry: `epoch` / `fork_of` forwarding and the omission rule
@@ -576,7 +611,7 @@ Acceptance metrics:
    breaker health machinery.
 8. No background epoch writing in phase 1 (checkpoints are synchronous at
    the boundary, inside the existing checkpoint I/O budget).
-9. No codex hit-rate gates or savings promises ahead of phase-2 measurement.
+9. Codex remains reporting-only; no gates or savings promises.
 10. No change to merge, publication, or verification policy; the supervisor
     verdict stays authoritative over worker `finish` claims.
 
@@ -584,11 +619,11 @@ Acceptance metrics:
 
 | ID | Question | Proposed default |
 |---|---|---|
-| CQ1 | Suspend on `delegate` only, or also a supervisor-issued boundary? | delegate-only in phase 1 (the boundary is already safe); supervisor-issued later if measurement wants it |
-| CQ2 | Resume one generation or N (multiple suspend/resume cycles per task)? | N, but only one level of concurrent children per epoch in phase 1; deeper chains ride existing depth bounds |
+| CQ1 | Suspend on `delegate` only, or also a supervisor-issued boundary? | Resolved by the Phase 1 implementation: suspension is delegate-only |
+| CQ2 | Resume one generation or N (multiple suspend/resume cycles per task)? | Resolved by the Phase 1 implementation: repeated suspend/resume cycles are supported |
 | CQ3 | Should `context_fork_skipped` events be critical? | non-critical first; promote if observers prove lossy |
 | CQ4 | Do chat providers honor identical prefixes across processes within TTL? | open; phase 2 answers it — the design only makes it possible and measurable |
-| CQ5 | Keep the terminal epoch (pre-merge) forkable? | yes, immutable; but children forked from it resolve their own `base_commit` as today |
+| CQ5 | Keep the terminal epoch (pre-merge) forkable? | Unresolved in code because terminal epochs are not currently written |
 
 ## 15. This commit
 
