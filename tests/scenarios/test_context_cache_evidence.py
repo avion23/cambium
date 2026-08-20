@@ -11,13 +11,17 @@ def _event(
     payload: dict[str, Any],
     *,
     seq: int,
+    generation: int | None = None,
 ) -> dict[str, Any]:
-    return {
+    event = {
         "seq": seq,
         "kind": "usage_event",
         "task_id": task_id,
         "payload": payload,
     }
+    if generation is not None:
+        event["generation"] = generation
+    return event
 
 
 def _usage(
@@ -80,6 +84,42 @@ def test_aggregate_classifies_parent_fork_and_resume_calls(
     assert comparison["fork_first"]["meets_threshold"] is True
     assert comparison["resume_first"]["meets_threshold"] is True
     assert report["measurement"]["cache_policy_changed"] is False
+
+
+def test_generation_scopes_fork_first_calls() -> None:
+    events = [
+        _event(
+            "child", _usage("chat", fork_of="parent/epoch"), seq=1, generation=1
+        ),
+        _event(
+            "child", _usage("chat", fork_of="parent/epoch"), seq=2, generation=1
+        ),
+        _event(
+            "child", _usage("chat", fork_of="parent/epoch"), seq=3, generation=2
+        ),
+    ]
+
+    classified = evidence._classify_events(events, "session")
+
+    assert [bucket for bucket, _ in classified] == [
+        "fork_first", "fork_later", "fork_first"
+    ]
+
+
+def test_generation_scopes_resume_first_calls_and_preserves_baseline() -> None:
+    events = [
+        _event("parent", _usage("chat", epoch=1), seq=1, generation=1),
+        _event("parent", _usage("chat", epoch=1), seq=2, generation=1),
+        _event("parent", _usage("chat", epoch=1), seq=3, generation=2),
+        _event("parent", _usage("chat"), seq=4, generation=1),
+        _event("parent", _usage("chat"), seq=5, generation=2),
+    ]
+
+    classified = evidence._classify_events(events, "session")
+
+    assert [bucket for bucket, _ in classified] == [
+        "resume_first", "resume_later", "resume_first", "baseline", "baseline"
+    ]
 
 
 def test_missing_cache_fields_are_not_counted_as_misses(monkeypatch, tmp_path: Path) -> None:

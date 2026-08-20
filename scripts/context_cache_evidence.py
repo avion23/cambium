@@ -50,6 +50,13 @@ def _task_id(event: dict[str, Any], payload: dict[str, Any]) -> str:
     return "<unknown-task>"
 
 
+def _generation(event: dict[str, Any]) -> int | None:
+    generation = event.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        return None
+    return generation if generation > 0 else None
+
+
 def _session_usage_events(session_dir: Path) -> list[dict[str, Any]] | None:
     if not (session_dir / ".cambium" / "events.db").is_file():
         return None
@@ -112,24 +119,25 @@ class _BucketStats:
 def _classify_events(
     usage_events: list[dict[str, Any]], session: str
 ) -> list[tuple[str, dict[str, Any]]]:
-    fork_seen: set[tuple[str, str]] = set()
-    resume_seen: set[tuple[str, int]] = set()
+    fork_seen: set[tuple[str, int | None, str]] = set()
+    resume_seen: set[tuple[str, int | None, int]] = set()
     classified: list[tuple[str, dict[str, Any]]] = []
     for event in usage_events:
         payload = event.get("payload")
         if not isinstance(payload, dict):
             continue
         task_id = _task_id(event, payload)
+        generation = _generation(event)
         fork_of = payload.get("fork_of")
         if isinstance(fork_of, str) and fork_of:
-            key = (task_id, fork_of)
+            key = (task_id, generation, fork_of)
             first = key not in fork_seen
             fork_seen.add(key)
             classified.append(("fork_first" if first else "fork_later", payload))
             continue
         epoch = payload.get("epoch")
         if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0:
-            key = (task_id, epoch)
+            key = (task_id, generation, epoch)
             first = key not in resume_seen
             resume_seen.add(key)
             classified.append(("resume_first" if first else "resume_later", payload))
