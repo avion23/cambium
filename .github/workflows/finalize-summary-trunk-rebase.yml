@@ -1,0 +1,65 @@
+name: finalize-summary-trunk-rebase
+
+on:
+  push:
+    branches:
+      - codex/append-only-summary-trunk
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/append-only-summary-trunk
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python 3.14 and development dependencies
+        run: uv sync --extra dev --python 3.14
+      - name: Update current-main context documentation
+        run: uv run --python 3.14 python scripts/finalize_summary_trunk_rebase.py
+      - name: Focused context tests
+        run: >-
+          uv run --python 3.14 pytest -q
+          tests/scenarios/test_summary_trunk.py
+          tests/scenarios/test_context_epochs.py
+          tests/scenarios/test_context_cache_transitions.py
+      - name: Normalize imports
+        run: uv run --python 3.14 ruff check --fix src tests
+      - name: Ruff
+        run: uv run --python 3.14 ruff check src tests
+      - name: Fast test tier
+        run: uv run --python 3.14 pytest -q -n auto
+      - name: Slow test tier
+        run: uv run --python 3.14 pytest -q -n auto -m slow
+      - name: Compile and whitespace checks
+        run: |
+          uv run --python 3.14 python -m compileall -q src tests
+          git diff --check
+      - name: Commit verified rebased implementation
+        run: |
+          git config user.name "cambium-context-bot"
+          git config user.email "cambium-context-bot@users.noreply.github.com"
+          git add -- \
+            src/cambium/summary_trunk.py \
+            src/cambium/worker.py \
+            src/cambium/supervisor.py \
+            tests/scenarios/test_summary_trunk.py \
+            tests/scenarios/test_context_epochs.py \
+            tests/scenarios/test_context_cache_transitions.py \
+            tests/scenarios/test_worker_provider.py \
+            tests/scenarios/test_routing_balance.py \
+            tests/scenarios/test_routing_scored.py \
+            tests/scenarios/test_hierarchy_waves.py \
+            docs/architecture/context-engine.md \
+            docs/research/README.md \
+            docs/research/cache-first-context-reuse-plan.md \
+            docs/research/rolling-context-and-agent-reuse.md
+          git rm -f -- \
+            scripts/finalize_summary_trunk_rebase.py \
+            .github/workflows/finalize-summary-trunk-rebase.yml
+          git commit -m "docs(context): align append-only trunk with current main"
+          git push origin HEAD

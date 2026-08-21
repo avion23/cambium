@@ -12,6 +12,7 @@ from typing import Any
 from cambium import worker
 from cambium.diffundo import ProviderTier
 from cambium.fencing import write_generation
+from cambium.summary_trunk import summary_entries
 
 
 class _FakeWriter:
@@ -57,6 +58,39 @@ class _ScriptedRouter:
         budget_usd: float | None = None,
     ) -> _FakeCallResult:
         self.prompts.append(prompt)
+        messages = prompt.get("messages")
+        last_content = (
+            messages[-1].get("content")
+            if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
+            else None
+        )
+        if isinstance(last_content, str) and last_content.startswith(
+            "<cambium-summary-control>\n"
+        ):
+            payload = last_content.removeprefix(
+                "<cambium-summary-control>\n"
+            ).removesuffix("\n</cambium-summary-control>")
+            control = json.loads(payload)
+            summary = {
+                "type": "summary_entry",
+                "sequence": control["sequence"],
+                "source_sha256": control["source_sha256"],
+                "source_message_count": control["source_message_count"],
+                "through_turn": control["through_turn"],
+                "objective": "preserve the current coding objective",
+                "outcome": "captured the completed work segment",
+                "decisions_added": [],
+                "decisions_superseded": [],
+                "facts_added": [],
+                "facts_invalidated": [],
+                "files_and_symbols_changed": [],
+                "verification_results": [],
+                "relevant_failed_approaches": [],
+                "open_items": [],
+            }
+            return _FakeCallResult(
+                json.dumps(summary, sort_keys=True, separators=(",", ":"))
+            )
         if not self.responses:
             raise AssertionError("router call with no scripted response")
         return _FakeCallResult(self.responses.pop(0))
@@ -178,15 +212,24 @@ def _messages_bytes(messages: list[dict[str, Any]]) -> bytes:
     return json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _rolling_indices(messages: list[dict[str, Any]]) -> list[int]:
+def _summary_indices(messages: list[dict[str, Any]]) -> list[int]:
     return [
         index
         for index, message in enumerate(messages)
-        if "<cambium-rolling-context>" in str(message.get("content", ""))
+        if str(message.get("content", "")).startswith(
+            "<cambium-summary-entry>\n"
+        )
     ]
 
 
-def test_rolling_fold_keeps_prefix_and_places_marker_at_base_length(
+def _is_summary_prompt(prompt: dict[str, Any]) -> bool:
+    messages = prompt["messages"]
+    return bool(messages) and str(messages[-1].get("content", "")).startswith(
+        "<cambium-summary-control>\n"
+    )
+
+
+def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
     tmp_path: Path,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -199,6 +242,9 @@ def test_rolling_fold_keeps_prefix_and_places_marker_at_base_length(
             {"role": "user", "content": "immutable tool schemas"},
         ],
     )
+    original_checkpoint_bytes = (
+        checkpoint_root / checkpoint.checkpoint_ref
+    ).read_bytes()
     child = _strict_child_envelope("seed")
     seed_chars = len(worker._child_result_lines(child))
     threshold_high = seed_chars + 1
@@ -217,27 +263,54 @@ def test_rolling_fold_keeps_prefix_and_places_marker_at_base_length(
         },
         max_turns=3,
     )
-    router = _ScriptedRouter(['{"type":"plan","steps":["continue"]}'])
+    plan = '{"type":"plan","steps":["continue"]}'
+    router = _ScriptedRouter([plan, plan])
+    writer = _FakeWriter()
 
-    asyncio.run(_drive_loop(config, worktree, router, _FakeWriter()))
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
-    assert len(router.prompts) == 2
-    pre_fold = router.prompts[0]["messages"]
-    post_fold = router.prompts[1]["messages"]
-    immutable_base = checkpoint.full_messages
-    folded_indices = _rolling_indices(post_fold)
-    assert len(folded_indices) == 1
-    folded_index = folded_indices[0]
-    assert folded_index == len(immutable_base)
-    assert pre_fold[:folded_index] == immutable_base
-    assert post_fold[:folded_index] == pre_fold[:folded_index]
-    assert _messages_bytes(post_fold[:folded_index]) == _messages_bytes(
-        pre_fold[:folded_index]
+    assert outcome["status"] == "failed"
+    action_prompts = [prompt for prompt in router.prompts if not _is_summary_prompt(prompt)]
+    summary_prompts = [prompt for prompt in router.prompts if _is_summary_prompt(prompt)]
+    assert len(action_prompts) == 2
+    assert len(summary_prompts) == 1
+
+    immutable_head = checkpoint.full_messages
+    pre_flush = action_prompts[0]["messages"]
+    post_flush = action_prompts[1]["messages"]
+    assert pre_flush[: len(immutable_head)] == immutable_head
+    assert post_flush[: len(immutable_head)] == immutable_head
+    assert _messages_bytes(post_flush[: len(immutable_head)]) == _messages_bytes(
+        pre_flush[: len(immutable_head)]
     )
-    assert post_fold[folded_index]["role"] == "user"
+    assert _summary_indices(post_flush) == [len(immutable_head)]
+    assert len(post_flush) == len(immutable_head) + 1
+    assert post_flush[-1]["role"] == "user"
+    assert not any(
+        "<cambium-rolling-context>" in str(message.get("content", ""))
+        for message in post_flush
+    )
 
+    advanced = [
+        message
+        for message in writer.messages()
+        if message["type"] == "context_epoch_advanced"
+    ]
+    assert [message["turn"] for message in advanced] == [checkpoint.turn + 2]
+    folded = worker._load_epoch_checkpoint(
+        config, advanced[0]["checkpoint_ref"], expect_task_id=True
+    )
+    assert folded.full_messages == post_flush
+    entries = summary_entries(folded.provider_messages)
+    assert len(entries) == 1
+    assert entries[0].sequence == 1
+    assert entries[0].source_message_count == 3
+    assert entries[0].through_turn == checkpoint.turn + 2
+    assert (
+        checkpoint_root / checkpoint.checkpoint_ref
+    ).read_bytes() == original_checkpoint_bytes
 
-def test_rolling_fold_refolds_once_after_full_hysteresis_width(
+def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     tmp_path: Path,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -250,8 +323,8 @@ def test_rolling_fold_refolds_once_after_full_hysteresis_width(
             {"role": "user", "content": "immutable tool schemas"},
         ],
     )
-    threshold_high = 130
-    threshold_low = 80
+    threshold_high = 100
+    threshold_low = 50
     config = _agent_config(
         worktree,
         checkpoint_root=checkpoint_root,
@@ -268,14 +341,19 @@ def test_rolling_fold_refolds_once_after_full_hysteresis_width(
             ],
             "child_results_truncated": False,
         },
-        max_turns=4,
+        max_turns=3,
+    )
+    read_call = (
+        '{"type":"tool_call","name":"read_batch",'
+        '"arguments":{"paths":["alpha.txt"]}}'
     )
     plan = '{"type":"plan","steps":["continue"]}'
-    router = _ScriptedRouter([plan, plan, plan])
+    router = _ScriptedRouter([read_call, plan])
     writer = _FakeWriter()
 
-    asyncio.run(_drive_loop(config, worktree, router, writer))
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
+    assert outcome["status"] == "failed"
     advanced = [
         message
         for message in writer.messages()
@@ -283,41 +361,47 @@ def test_rolling_fold_refolds_once_after_full_hysteresis_width(
     ]
     assert [message["turn"] for message in advanced] == [
         checkpoint.turn + 1,
-        checkpoint.turn + 3,
+        checkpoint.turn + 2,
     ]
-    assert len([message["turn"] for message in advanced]) == len({
-        message["turn"] for message in advanced
-    })
-    assert len(router.prompts) == 3
-    base_length = len(checkpoint.full_messages)
-    prompt_before_growth = router.prompts[0]["messages"]
-    prompt_after_one_growth = router.prompts[1]["messages"]
-    assert all(
-        len(_rolling_indices(prompt["messages"])) == 1 for prompt in router.prompts
+    assert [message["epoch"] for message in advanced] == [2, 3]
+
+    action_prompts = [prompt for prompt in router.prompts if not _is_summary_prompt(prompt)]
+    summary_prompts = [prompt for prompt in router.prompts if _is_summary_prompt(prompt)]
+    assert len(action_prompts) == 2
+    assert len(summary_prompts) == 2
+
+    first_folded = worker._load_epoch_checkpoint(
+        config, advanced[0]["checkpoint_ref"], expect_task_id=True
     )
-    first_suffix = prompt_before_growth[base_length:]
-    grown_suffix = prompt_after_one_growth[base_length:]
-    assert len(first_suffix) == 1
-    assert len(grown_suffix) == 3
-    # The fold reserves wrapper overhead: the closing tag is never cut and
-    # the embedded JSON parses (plan §9.1.1); the payload stays within the
-    # low threshold unless the wrapper alone exceeds it.
-    folded_content = first_suffix[0]["content"]
-    assert folded_content.startswith("<cambium-rolling-context>\n")
-    assert folded_content.endswith("\n</cambium-rolling-context>")
-    inner = folded_content[
-        len("<cambium-rolling-context>\n"): -len("\n</cambium-rolling-context>")
-    ]
-    assert isinstance(json.loads(inner), list)
-    assert len(folded_content) <= threshold_low
-    assert first_suffix[0] == grown_suffix[0]
+    second_folded = worker._load_epoch_checkpoint(
+        config, advanced[1]["checkpoint_ref"], expect_task_id=True
+    )
+    immutable_head = checkpoint.full_messages
+    assert first_folded.provider_messages[: len(immutable_head)] == immutable_head
+    assert second_folded.provider_messages[: len(first_folded.provider_messages)] == (
+        first_folded.provider_messages
+    )
+    assert _messages_bytes(
+        second_folded.provider_messages[: len(first_folded.provider_messages)]
+    ) == _messages_bytes(first_folded.provider_messages)
+    assert first_folded.continuation_suffix == []
+    assert second_folded.continuation_suffix == []
+    assert action_prompts[0]["messages"] == first_folded.full_messages
+    assert action_prompts[1]["messages"] == second_folded.full_messages
+    assert summary_prompts[1]["messages"][: len(first_folded.full_messages)] == (
+        first_folded.full_messages
+    )
 
-    one_plan_growth = _message_chars(grown_suffix) - _message_chars(first_suffix)
-    hysteresis_width = threshold_high - threshold_low
-    assert 0 < one_plan_growth < hysteresis_width
-    assert _message_chars(grown_suffix) <= threshold_high
-    assert _message_chars(first_suffix) + (2 * one_plan_growth) > threshold_high
-
+    first_entries = summary_entries(first_folded.provider_messages)
+    second_entries = summary_entries(second_folded.provider_messages)
+    assert [entry.sequence for entry in first_entries] == [1]
+    assert [entry.sequence for entry in second_entries] == [1, 2]
+    assert second_entries[0] == first_entries[0]
+    assert first_entries[0].source_message_count == 2
+    assert second_entries[1].source_message_count == 3
+    assert first_entries[0].through_turn == checkpoint.turn + 1
+    assert second_entries[1].through_turn == checkpoint.turn + 2
+    assert first_entries[0].source_sha256 != second_entries[1].source_sha256
 
 def test_fork_prompt_appends_continuation_after_immutable_base() -> None:
     base = [

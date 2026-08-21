@@ -277,6 +277,78 @@ def test_supervisor_resolution_without_requirements_uses_select_lane(
 
 from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
 
+_SUMMARY_CONTROL_OPEN = "<cambium-summary-control>\n"
+_SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
+
+
+def _summary_completion(
+    body: dict[str, Any], *, default_model: str
+) -> dict[str, Any] | None:
+    """Return a strict synthetic summary response without consuming actions."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    if not isinstance(content, str) or not content.startswith(_SUMMARY_CONTROL_OPEN):
+        return None
+    try:
+        control = json.loads(
+            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(
+                _SUMMARY_CONTROL_CLOSE
+            )
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    required = {
+        "sequence",
+        "source_sha256",
+        "source_message_count",
+        "through_turn",
+    }
+    if not required <= control.keys():
+        return None
+    summary = {
+        "type": "summary_entry",
+        "sequence": control["sequence"],
+        "source_sha256": control["source_sha256"],
+        "source_message_count": control["source_message_count"],
+        "through_turn": control["through_turn"],
+        "objective": "preserve the current coding objective",
+        "outcome": "captured the completed work segment",
+        "decisions_added": [],
+        "decisions_superseded": [],
+        "facts_added": [],
+        "facts_invalidated": [],
+        "files_and_symbols_changed": [],
+        "verification_results": [],
+        "relevant_failed_approaches": [],
+        "open_items": [],
+    }
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        model = default_model
+    return {
+        "id": "chatcmpl-summary-fixture",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        summary, sort_keys=True, separators=(",", ":")
+                    ),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        # Keep pre-existing action-usage assertions stable. Dedicated summary
+        # tests cover accounting with non-zero usage.
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
 
 class _FakeServer:
     """OpenAI-compatible /chat/completions server on an ephemeral port."""
@@ -286,6 +358,7 @@ class _FakeServer:
 
         self.behaviors = list(behaviors)
         self.calls: list[dict[str, Any]] = []
+        self.summary_calls: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
         cast(Any, self._httpd).fake = self
@@ -324,8 +397,14 @@ class _Handler(BaseHTTPRequestHandler):
         except _json.JSONDecodeError:
             body = {}
         server: _FakeServer = cast(Any, self.server).fake
-        index = server.record(body, {})
-        status, payload, delay = server.behavior_at(index)
+        summary_response = _summary_completion(body, default_model="m1")
+        if summary_response is None:
+            index = server.record(body, {})
+            status, payload, delay = server.behavior_at(index)
+        else:
+            with server._lock:
+                server.summary_calls.append(body)
+            status, payload, delay = 200, summary_response, 0.0
         if delay:
             import time
 

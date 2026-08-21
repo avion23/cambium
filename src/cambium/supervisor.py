@@ -2205,6 +2205,8 @@ class _Runtime:
         # restarted (or resumed) parent re-seeds its transcript from the epoch.
         if spec.get("resume") is not None:
             payload["resume"] = spec["resume"]
+        if isinstance(spec.get("summary_trunk_ref"), str):
+            payload["summary_trunk_ref"] = spec["summary_trunk_ref"]
         return payload
 
     # -- dynamic child admission (implementation-plan step 2) ----------------
@@ -2507,14 +2509,12 @@ class _Runtime:
         child_task_id: str,
         kind: str | None,
     ) -> None:
-        """Pin a cache-compatible child to its parent's last epoch (plan §5.5).
+        """Reuse a parent trunk exactly when legal, otherwise semantically cold.
 
-        Runs after ``_validate_plan_task`` on the built child spec. A child
-        whose (model, tool schema) matches the parent's epoch and whose
-        provider is authorized is pinned to the epoch's (provider, model) and
-        carries the ``context_fork`` descriptor; every other child keeps the
-        legacy summary-passing path. The ``context_fork`` event is emitted in
-        both cases so session audits can see the compatibility decision.
+        Exact provider/model/protocol compatibility pins the child and preserves
+        the provider cache prefix. Any other non-redacted epoch is supplied as
+        ``summary_trunk_ref``: the child builds a fresh provider-specific head
+        and imports only the immutable semantic summary entries.
         """
         if not self._context_reuse:
             return
@@ -2526,17 +2526,26 @@ class _Runtime:
         compatible, reason = _fork_cache_compatible_supervisor(
             child_spec, epoch, authorized
         )
-        fork_payload: dict[str, Any] = {
-            "task_id": parent_task_id,
-            "parent_task_id": parent_task_id,
-            "child_task_id": child_task_id,
-            "child_kind": kind,
-            "epoch": epoch.get("epoch"),
-            "compatible": compatible,
-        }
-        if reason is not None:
-            fork_payload["reason"] = reason
-        await self.emit("context_fork", **fork_payload)
+        semantic_reuse = (
+            not compatible
+            and isinstance(cache_key, dict)
+            and cache_key.get("redacted") is False
+            and isinstance(epoch.get("checkpoint_ref"), str)
+        )
+        await self.emit(
+            "context_fork",
+            task_id=parent_task_id,
+            parent_task_id=parent_task_id,
+            child_task_id=child_task_id,
+            child_kind=kind,
+            epoch=epoch.get("epoch"),
+            compatible=compatible,
+            semantic_reuse=semantic_reuse,
+            **({"reason": reason} if reason is not None else {}),
+        )
+        if semantic_reuse:
+            child_spec["summary_trunk_ref"] = epoch["checkpoint_ref"]
+            return
         if not compatible or not isinstance(cache_key, dict):
             await self.emit(
                 "context_fork_skipped",
@@ -3428,6 +3437,8 @@ class _Runtime:
             init_msg["rolling_compact"] = True
         if isinstance(spec.get("context_fork"), dict):
             init_msg["context_fork"] = spec["context_fork"]
+        if isinstance(spec.get("summary_trunk_ref"), str):
+            init_msg["summary_trunk_ref"] = spec["summary_trunk_ref"]
         if isinstance(spec.get("resume"), dict):
             init_msg["resume"] = spec["resume"]
         if encode_message(init_msg) is None:
@@ -4879,6 +4890,9 @@ def _child_spec(
     if not isinstance(raw, dict):
         raise ValueError("child proposal spec must be an object")
     child_spec = copy.deepcopy(raw)
+    child_spec.pop("context_fork", None)
+    child_spec.pop("summary_trunk_ref", None)
+    child_spec.pop("resume", None)
     child_spec["task_id"] = proposal["child_task_id"]
     child_spec["kind"] = proposal["kind"]
     child_spec["parent_task_id"] = parent_spec["task_id"]
