@@ -158,11 +158,7 @@ candidate, and it must never cross a configured priority boundary.
 2. Deterministic rotation ran after quality sorting and could reverse the
    measured order. Rotation now applies only when the whole priority run lacks
    current quality evidence.
-3. A measured zero-cost provider received infinite expected cost, so a paid
-   provider could outrank it. Zero is now a real zero when at least one request
-   succeeded; no-success remains infinite.
-
-Scenario tests pin all three properties.
+Scenario tests pin both properties.
 
 ### Open correctness gaps
 
@@ -192,6 +188,10 @@ Scenario tests pin all three properties.
    equal-priority run the incumbent currently leads even when its measured
    quality is materially worse. The target is cache-identity-aware hysteresis
    with an explicit switching-cost estimate and expiry.
+10. **Zero cost conflates free with unknown pricing.** Provider price fields and
+    estimated cost default to zero, while quality scoring treats zero as
+    unavailable evidence. Introduce an explicit pricing-known state before
+    ranking a genuinely zero-marginal-cost lane ahead of a priced lane.
 
 The strict-model and rate/concurrency gaps should be corrected before making
 cache locality a stronger routing weight.
@@ -211,7 +211,7 @@ cache locality a stronger routing weight.
 - Priority dominates every soft score.
 - An incumbent never crosses priority or capability boundaries.
 - Rotation never changes a measured quality ordering.
-- Zero marginal cost is not treated as missing/infinite cost.
+- Free, unknown, and unreported price states remain distinguishable.
 - Stale evidence is neutral and cannot silently become current.
 
 ### Capacity properties
