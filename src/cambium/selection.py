@@ -78,11 +78,22 @@ def quality_score(
     slo_miss = int(latency_count > 0 and latency > weights.latency_slo_s)
 
     cost = _number(_field(entry, "cost", 0.0))
-    expected_cost = cost / successes if cost > 0.0 and successes else float("inf")
+    expected_cost = cost / successes if successes else float("inf")
     cache_hits = min(requests, int(_number(_field(entry, "cache_hit_count", 0))))
     cache_fraction = cache_hits / requests
     tie_break = weights.latency_weight * latency_ratio - weights.cache_weight * cache_fraction
     return (failure_probability, slo_miss, expected_cost, tie_break)
+
+
+def _quality_entry(
+    candidate: Candidate,
+    debt: Mapping[str, Any] | None,
+    *,
+    now: float,
+    weights: QualityWeights,
+) -> QualityScore | None:
+    entry = debt.get(candidate.name) if debt else None
+    return quality_score(entry, now=now, weights=weights)
 
 
 def order_candidates[T: Candidate](
@@ -96,10 +107,14 @@ def order_candidates[T: Candidate](
 ) -> list[T]:
     """Order eligible providers without reading state or a clock.
 
-    Quality reorders only adjacent measured providers in an equal-priority
+    Configured priority is the first ordering key and is never crossed.
+    Quality reorders only adjacent measured providers inside an equal-priority
     run. A provider without current evidence is a barrier and therefore keeps
-    its configured position. An eligible incumbent is then hoisted verbatim;
-    otherwise each equal-priority run receives the deterministic rotation.
+    its configured position. An eligible incumbent is moved to the front of
+    its own equal-priority run, expressing cache-locality switching cost without
+    bypassing configured priority. Deterministic rotation is applied only to
+    runs with no current quality evidence, so load spreading cannot undo a
+    measured quality order.
     """
     ordered = sorted(eligible, key=lambda candidate: candidate.priority)
     start = 0
@@ -109,29 +124,42 @@ def order_candidates[T: Candidate](
             end += 1
         measured_start = start
         while measured_start < end:
-            entry = debt.get(ordered[measured_start].name) if debt else None
-            if quality_score(entry, now=now, weights=weights) is None:
+            score = _quality_entry(
+                ordered[measured_start], debt, now=now, weights=weights
+            )
+            if score is None:
                 measured_start += 1
                 continue
             measured_end = measured_start + 1
             while measured_end < end:
-                next_entry = debt.get(ordered[measured_end].name) if debt else None
-                if quality_score(next_entry, now=now, weights=weights) is None:
+                next_score = _quality_entry(
+                    ordered[measured_end], debt, now=now, weights=weights
+                )
+                if next_score is None:
                     break
                 measured_end += 1
             ordered[measured_start:measured_end] = sorted(
                 ordered[measured_start:measured_end],
-                key=lambda candidate: quality_score(
-                    debt[candidate.name], now=now, weights=weights
+                key=lambda candidate: _quality_entry(
+                    candidate, debt, now=now, weights=weights
                 ),
             )
             measured_start = measured_end + 1
         start = end
 
     if incumbent is not None:
-        bound = next((item for item in ordered if item.name == incumbent), None)
-        if bound is not None:
-            return [bound, *(item for item in ordered if item is not bound)]
+        incumbent_index = next(
+            (index for index, item in enumerate(ordered) if item.name == incumbent),
+            None,
+        )
+        if incumbent_index is None:
+            return ordered
+        incumbent_priority = ordered[incumbent_index].priority
+        run_start = incumbent_index
+        while run_start > 0 and ordered[run_start - 1].priority == incumbent_priority:
+            run_start -= 1
+        bound = ordered.pop(incumbent_index)
+        ordered.insert(run_start, bound)
         return ordered
 
     rotated: list[T] = []
@@ -141,7 +169,11 @@ def order_candidates[T: Candidate](
         while end < len(ordered) and ordered[end].priority == ordered[start].priority:
             end += 1
         run = ordered[start:end]
-        if len(run) > 1:
+        has_evidence = any(
+            _quality_entry(candidate, debt, now=now, weights=weights) is not None
+            for candidate in run
+        )
+        if len(run) > 1 and not has_evidence:
             offset = rotation_offset % len(run)
             run = run[offset:] + run[:offset]
         rotated.extend(run)

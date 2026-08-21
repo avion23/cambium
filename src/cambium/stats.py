@@ -75,10 +75,24 @@ def _row_total(usage: Mapping[str, Any]) -> int:
 
 
 def _row_cached(usage: Mapping[str, Any]) -> int:
-    value = usage.get("cached_tokens")
-    if not _is_count(value):
-        return 0
-    return int(value)
+    """Normalize provider cache-read token counters without double counting.
+
+    OpenAI-compatible APIs report the value either directly or below prompt /
+    input token details. Anthropic-style usage reports ``cache_read_input_tokens``.
+    The first valid representation wins because adapters may expose both the
+    raw nested field and a normalized top-level alias for the same tokens.
+    """
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(details_key)
+        if isinstance(details, Mapping):
+            value = details.get("cached_tokens")
+            if _is_count(value):
+                return int(value)
+    for key in ("cache_read_input_tokens", "cached_tokens"):
+        value = usage.get(key)
+        if _is_count(value):
+            return int(value)
+    return 0
 
 
 def _row_cost(payload: Mapping[str, Any]) -> float:
