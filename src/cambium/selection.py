@@ -78,7 +78,7 @@ def quality_score(
     slo_miss = int(latency_count > 0 and latency > weights.latency_slo_s)
 
     cost = _number(_field(entry, "cost", 0.0))
-    expected_cost = cost / successes if successes else float("inf")
+    expected_cost = cost / successes if cost > 0.0 and successes else float("inf")
     cache_hits = min(requests, int(_number(_field(entry, "cache_hit_count", 0))))
     cache_fraction = cache_hits / requests
     tie_break = weights.latency_weight * latency_ratio - weights.cache_weight * cache_fraction
