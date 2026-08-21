@@ -102,6 +102,10 @@ async def run_repl(
                 result = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
                 rendered = render.render_text_result(result)
                 usage = stats.usage_stats_from_events(usage_events)
+                if usage is not None:
+                    # Each one-shot prompt restarts its provider turn counter,
+                    # so a cross-prompt fold cannot name one meaningful last turn.
+                    usage = replace(usage, turns=None)
                 usage_line = render.render_usage_stats_line(usage)
                 if usage_line and usage is not None and usage.provider:
                     usage_line += f" · provider={usage.provider}"
