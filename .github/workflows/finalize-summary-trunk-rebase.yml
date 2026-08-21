@@ -22,7 +22,42 @@ jobs:
       - name: Update current-main context documentation
         run: |
           sed -i 's/"2## C5\. A summary is lossy and non-authoritative/"### C5. A summary is lossy and non-authoritative/' scripts/finalize_summary_trunk_rebase.py
+          sed -i 's/^    patch_research_index()$/    # research index patched below/' scripts/finalize_summary_trunk_rebase.py
           uv run --python 3.14 python scripts/finalize_summary_trunk_rebase.py
+          uv run --python 3.14 python - <<'PY'
+          from pathlib import Path
+
+          path = Path("docs/research/README.md")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one marker, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "  immutable epochs, branching, compaction, and cache accounting.\n",
+              "  immutable epochs, append-only semantic summaries, branching, and cache\n"
+              "  accounting.\n",
+              "context-engine index description",
+          )
+          replace_once(
+              "  corrected hypothesis, provider-cache boundary, measurement protocol, and\n"
+              "  remaining gaps.\n",
+              "  corrected hypothesis, implemented append-only trunk, provider-cache\n"
+              "  boundary, measurement protocol, and remaining gaps.\n",
+              "cache research index description",
+          )
+          replace_once(
+              "  corrected rolling/fork/merge model, bounded recursion, and evaluation plan.\n",
+              "  implemented non-recursive segment lifecycle, corrected fork/merge model,\n"
+              "  bounded recursion, and evaluation plan.\n",
+              "rolling research index description",
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
       - name: Focused context tests
         run: >-
           uv run --python 3.14 pytest -q
