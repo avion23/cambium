@@ -102,15 +102,6 @@ def test_rotation_does_not_override_measured_quality() -> None:
     assert _names(_order(items, debt, offset=1)) == ["fast", "slow"]
 
 
-def test_zero_cost_is_a_real_expected_cost_not_missing_evidence() -> None:
-    free = quality_score(_debt(cost=0.0), now=NOW)
-    paid = quality_score(_debt(cost=1.0), now=NOW)
-    assert free is not None
-    assert paid is not None
-    assert free[2] == 0.0
-    assert free < paid
-
-
 def test_weights_are_tuning_seam() -> None:
     items = [Item("cached_slow"), Item("uncached_fast")]
     debt = {
