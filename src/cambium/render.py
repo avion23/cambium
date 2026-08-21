@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -330,11 +330,160 @@ def render_usage_breakdown(breakdown: Any) -> str:
     return "\n".join(lines)
 
 
-def render_event_line(event: Mapping[str, Any]) -> str:
-    """Render one redacted event record as one deterministic line.
+def _scalar(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return f"{value:g}"
+    if isinstance(value, (list, tuple, dict)):
+        return _dumps(value)
+    return str(value)
 
-    The line is ``seq kind task  payload`` with ``seq`` and ``task`` omitted
-    when absent; the JSON payload is always the last field.
+
+def _pair(payload: Mapping[str, Any], key: str, label: str | None = None) -> str | None:
+    value = payload.get(key)
+    if value is None or value == "":
+        return None
+    return f"{label or key}={_scalar(value)}"
+
+
+def _text(payload: Mapping[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _join(*parts: str | None) -> str:
+    return " ".join(part for part in parts if part)
+
+
+_TOOL_CMD_MAX_CHARS = 60
+
+
+def _format_tool_event(payload: Mapping[str, Any]) -> str:
+    cmd = _text(payload, "cmd") or ""
+    cmd = cmd[:_TOOL_CMD_MAX_CHARS]
+    duration = payload.get("duration_ms")
+    duration_text = (
+        f"{duration}ms"
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool)
+        else "?"
+    )
+    status = "OK" if payload.get("ok") is True else "FAIL"
+    return f"{_text(payload, 'tool') or '?'} {cmd} {status} {duration_text}"
+
+
+def _format_context_checkpoint(payload: Mapping[str, Any]) -> str:
+    return _join(
+        _pair(payload, "epoch"),
+        _pair(payload, "turn"),
+        _text(payload, "checkpoint_ref"),
+    )
+
+
+def _format_context_epoch_advanced(payload: Mapping[str, Any]) -> str:
+    return _join(
+        _format_context_checkpoint(payload),
+        _pair(payload, "reason"),
+        _pair(payload, "folded_from_epoch", label="folded_from"),
+    )
+
+
+def _format_checkpoint(payload: Mapping[str, Any]) -> str:
+    turn = _pair(payload, "turn")
+    return "ckpt" if turn is None else f"ckpt {turn}"
+
+
+def _format_usage_event(payload: Mapping[str, Any]) -> str:
+    failure_reason = _text(payload, "failure_reason")
+    if failure_reason is None:
+        return ""
+    provider = _text(payload, "provider")
+    head = f"provider {provider}" if provider else ""
+    return _join(head, "FAILED", failure_reason)
+
+
+def _format_result(payload: Mapping[str, Any]) -> str:
+    reason = _text(payload, "reason") or _text(payload, "failure_reason")
+    return _join(_pair(payload, "status"), f"reason={reason}" if reason else None)
+
+
+def _format_spawned(payload: Mapping[str, Any]) -> str:
+    worker = (_text(payload, "worker") or "")[:_TOOL_CMD_MAX_CHARS]
+    return f"worker={worker}" if worker else ""
+
+
+def _format_merge_committed(payload: Mapping[str, Any]) -> str:
+    old = _text(payload, "old")
+    new = _text(payload, "new")
+    return _join(
+        _pair(payload, "branch"),
+        f"old={old[:12]}" if old else None,
+        f"new={new[:12]}" if new else None,
+    )
+
+
+_EVENT_FORMATTERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
+    "tool_event": _format_tool_event,
+    "context_checkpoint": _format_context_checkpoint,
+    "context_epoch_advanced": _format_context_epoch_advanced,
+    "checkpoint": _format_checkpoint,
+    "heartbeat": lambda payload: "",
+    "log": lambda payload: "",
+    "ping": lambda payload: "",
+    "pong": lambda payload: "",
+    "usage_event": _format_usage_event,
+    "spawned": _format_spawned,
+    "init": lambda payload: _join(_pair(payload, "request_id")),
+    "run_task": lambda payload: _join(_pair(payload, "request_id")),
+    "ready": lambda payload: _join(_pair(payload, "pid")),
+    "reuse_ready": lambda payload: _join(_pair(payload, "pid")),
+    "exit": lambda payload: _join(_pair(payload, "reason")),
+    "worker_failed": lambda payload: _join(_pair(payload, "reason")),
+    "task_failed": lambda payload: _join(_pair(payload, "reason")),
+    "result": _format_result,
+    "session_ended": lambda payload: _join(_pair(payload, "session_status", "status")),
+    "task_assigned": lambda payload: _join(
+        _pair(payload, "branch"), _pair(payload, "assigned_provider")
+    ),
+    "merge_started": lambda payload: _join(_pair(payload, "branch")),
+    "merge_committed": _format_merge_committed,
+    "worktree_created": lambda payload: _join(_pair(payload, "branch")),
+    "worktree_pruned": lambda payload: _join(_pair(payload, "branch")),
+    "context_fork": lambda payload: _join(
+        _pair(payload, "child_task_id", "child"), _pair(payload, "epoch")
+    ),
+    "context_resume": lambda payload: _join(
+        _pair(payload, "epoch"), _pair(payload, "child_count", "children")
+    ),
+    "child_admitted": lambda payload: _join(
+        _pair(payload, "child_task_id", "child"), _pair(payload, "branch")
+    ),
+    "protocol": lambda payload: _join(
+        _pair(payload, "error_type"), _pair(payload, "note"), _pair(payload, "message", "msg")
+    ),
+    "parse_error": lambda payload: _join(_pair(payload, "message", "msg")),
+    "compaction_failed": lambda payload: _join(
+        _pair(payload, "epoch"), _pair(payload, "reason")
+    ),
+    "context_resume_failed": lambda payload: _join(_pair(payload, "reason")),
+    "child_rejected": lambda payload: _join(
+        _pair(payload, "child_task_id", "child"),
+        _pair(payload, "reason"),
+        _pair(payload, "message", "msg"),
+    ),
+}
+
+
+def render_event_line(event: Mapping[str, Any]) -> str:
+    """Render one redacted event record as one concise human-readable line.
+
+    The line keeps the ``{seq:>6} {kind:>16} {task}  {body}`` prefix shape,
+    with ``seq`` and ``task`` omitted when absent. The body comes from the
+    module-level ``_EVENT_FORMATTERS`` table for known kinds (an empty body
+    prints nothing); unknown kinds fall back to the raw compact-JSON dump so
+    unseen payloads stay visible.
     """
     if not isinstance(event, Mapping):
         raise TypeError("render_event_line requires an event mapping")
@@ -348,6 +497,10 @@ def render_event_line(event: Mapping[str, Any]) -> str:
             for key, value in event.items()
             if key not in _EVENT_ENVELOPE_KEYS
         }
+    formatter = _EVENT_FORMATTERS.get(kind)
+    body = _dumps(payload) if formatter is None else formatter(payload)
+    if not body:
+        return ""
     prefix = f"{kind:>16}"
     seq = event.get("seq")
     if isinstance(seq, int) and not isinstance(seq, bool):
@@ -355,7 +508,7 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     task_id = event.get("task_id")
     if isinstance(task_id, str) and task_id:
         prefix = f"{prefix} {task_id}"
-    return f"{prefix}  {_dumps(payload)}"
+    return f"{prefix}  {body}"
 
 
 def _finite_number(value: Any) -> float | None:
