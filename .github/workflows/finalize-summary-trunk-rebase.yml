@@ -20,7 +20,9 @@ jobs:
       - name: Install Python 3.14 and development dependencies
         run: uv sync --extra dev --python 3.14
       - name: Update current-main context documentation
-        run: uv run --python 3.14 python scripts/finalize_summary_trunk_rebase.py
+        run: |
+          sed -i 's/"2## C5\. A summary is lossy and non-authoritative/"### C5. A summary is lossy and non-authoritative/' scripts/finalize_summary_trunk_rebase.py
+          uv run --python 3.14 python scripts/finalize_summary_trunk_rebase.py
       - name: Focused context tests
         run: >-
           uv run --python 3.14 pytest -q
