@@ -7,11 +7,7 @@ and return a string.  No subprocesses, no network, no I/O.
 
 from __future__ import annotations
 
-from cambium.render import (
-    render_active_workers,
-    render_live_status_line,
-    render_tokens_per_s,
-)
+from cambium.render import render_active_workers, render_tokens_per_s
 
 
 def _usage_event(
@@ -71,26 +67,3 @@ def test_active_workers_reuse_ready_never_negative() -> None:
 def test_active_workers_clamps_a_lone_decrement() -> None:
     assert render_active_workers([_lifecycle("exit")]) == ""
     assert render_active_workers([_lifecycle("reuse_ready")]) == ""
-
-
-def test_live_status_line_combines_rate_and_workers() -> None:
-    events = [
-        _usage_event(1, 5129, 10.0),
-        _lifecycle("spawned"),
-    ]
-
-    assert render_live_status_line(events) == "live: tokens/s=512.9 · subagents=1"
-
-
-def test_live_status_line_empty_without_events() -> None:
-    assert render_live_status_line([]) == ""
-
-
-def test_live_status_line_rate_only() -> None:
-    assert render_live_status_line([_usage_event(1, 1000, 2.0)]) == "live: tokens/s=500.0"
-
-
-def test_live_status_line_workers_only() -> None:
-    events = [_lifecycle("spawned"), _lifecycle("spawned")]
-
-    assert render_live_status_line(events) == "live: subagents=2"
