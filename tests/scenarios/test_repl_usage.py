@@ -63,3 +63,4 @@ def test_repl_prints_current_and_cumulative_token_usage(monkeypatch) -> None:
     assert "cached=75" in text
     assert "model=model-a" in text
     assert "provider=provider-a" in text
+    assert "last_turn=" not in text
