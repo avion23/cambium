@@ -36,6 +36,20 @@ TEST_RESOURCE_THRESHOLDS = {
     "disk_free": 0,
 }
 
+
+def test_plan_manifest_is_idempotent_and_immutable(tmp_path: Path) -> None:
+    plan = {"tasks": [{"task_id": "task"}]}
+    path = supervisor_module._write_plan(tmp_path, plan)
+    original = path.read_bytes()
+    inode = path.stat().st_ino
+
+    assert supervisor_module._write_plan(tmp_path, plan) == path
+    assert path.read_bytes() == original
+    assert path.stat().st_ino == inode
+    with pytest.raises(ValueError, match="does not match"):
+        supervisor_module._write_plan(tmp_path, {"tasks": [{"task_id": "other"}]})
+    assert path.read_bytes() == original
+
 PROBE_ENV = {
     "TEST_API_KEY_DEMO": "sk-demo-value",
     "TEST_DB_PWD_DEMO": "demo-password",

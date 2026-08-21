@@ -579,7 +579,7 @@ class MergeSequencer:
                         "merge_staging_quarantined", dict(quarantine_payload)
                     )
                     durably_recorded = True
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 if not all(self._is_open_child(*link) for link in chain):
                     containment_failure("quarantine path changed during recording", exc)
                 containment_failure("cannot durably record quarantined staging", exc)
@@ -592,7 +592,7 @@ class MergeSequencer:
                     newest_allocated_bytes=allocated,
                     root=anchored_root,
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 if not all(self._is_open_child(*link) for link in chain):
                     containment_failure("quarantine path changed during recording", exc)
                 if isinstance(exc, StagingCleanupError):
@@ -783,7 +783,7 @@ class MergeSequencer:
                     repo, "worktree", "add", "-B", staging_branch, str(worktree_path),
                     worker_tip, check=True,
                 )
-            except Exception:
+            except GitError:
                 self._run_repo(repo, "update-ref", "-d", staging_ref, check=False)
                 raise
 
@@ -1160,7 +1160,7 @@ class MergeSequencer:
                     return
                 self._remove_clean_staging(repo, worktree_path)
             self._drop_staging_refs(repo)
-        except Exception as exc:
+        except (OSError, RuntimeError) as exc:
             if not any(kind == "merge_staging_cleanup_failed" for kind, _ in self._events):
                 staging_sha = "unknown"
                 if worktree_path.exists():

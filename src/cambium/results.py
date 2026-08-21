@@ -634,9 +634,9 @@ class Result:
         return result_to_dict(self)
 
 
-def _timestamp(value: Any, default: float) -> float:
+def _timestamp_or_now(value: Any) -> float:
     if value is _MISSING or value is None:
-        value = default
+        value = time.time()
     return _final_timestamp(value)
 
 
@@ -666,7 +666,6 @@ def _root_from_child(
     session_root = Path(session_dir)
     event_log_ref = f"sqlite:{session_root / '.cambium' / 'events.db'}"
     status = status_from_wire(child)
-    now = time.time()
     unified_diff = child.get("unified_diff", "")
     if not isinstance(unified_diff, str):
         raise TypeError("unified_diff must be a string")
@@ -688,8 +687,8 @@ def _root_from_child(
         parent_task_id=None,
         event_log_ref=event_log_ref,
         session_id=session_id,
-        started_at=_timestamp(started_at, now),
-        ended_at=_timestamp(ended_at, time.time()),
+        started_at=_timestamp_or_now(started_at),
+        ended_at=_timestamp_or_now(ended_at),
         failure_reason=(
             failure_reason
             if failure_reason is not None
@@ -710,7 +709,6 @@ def root_result_from_wire(
     if not isinstance(wire, Mapping):
         raise TypeError("worker result must be a mapping")
     child = wire_to_child_result(wire)
-    now = time.time()
     started = started_at if started_at is not None else _wire_value(wire, "started_at")
     ended = ended_at if ended_at is not None else _wire_value(wire, "ended_at")
     status = child["status"]
@@ -718,8 +716,8 @@ def root_result_from_wire(
         child,
         session_dir=session_dir,
         session_id=session_id,
-        started_at=_timestamp(started, now),
-        ended_at=_timestamp(ended, time.time()),
+        started_at=started,
+        ended_at=ended,
         failure_reason=_failure_reason(wire, status),
     )
 
@@ -736,13 +734,12 @@ def root_result_from_child(
     """Finalize a root result from an already restricted child mapping."""
     if not isinstance(child, Mapping):
         raise TypeError("child result must be a mapping")
-    now = time.time()
     return _root_from_child(
         child,
         session_dir=session_dir,
         session_id=session_id,
-        started_at=_timestamp(started_at, now),
-        ended_at=_timestamp(ended_at, time.time()),
+        started_at=started_at,
+        ended_at=ended_at,
         failure_reason=failure_reason,
     )
 

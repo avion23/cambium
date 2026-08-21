@@ -102,6 +102,7 @@ def test_run_oneshot_delegates_async_at_supervisor_boundary(monkeypatch, tmp_pat
     assert session_dir.parent == repo / ".cambium" / "sessions"
     assert captured["plan"]["tasks"][0]["task"] == "make the change"
     assert "gate" not in captured["plan"]["tasks"][0]
+    assert captured["kwargs"]["context_reuse"] is True
 
 
 def test_default_runs_allocate_distinct_session_leaves(monkeypatch, tmp_path: Path) -> None:
@@ -221,6 +222,7 @@ def test_repl_and_tui_make_a_new_config_per_prompt(monkeypatch, tmp_path: Path) 
 
     assert [config.prompt for config in configs] == ["first", "second"]
     assert all(config.repo == base.repo and config.provider == base.provider for config in configs)
+    assert all(config.context_reuse is True for config in configs)
     assert "plan=tasks:1" in repl_out.getvalue()
     assert "plan=tasks:1" in tui_out.getvalue()
 

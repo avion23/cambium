@@ -141,10 +141,8 @@ class OneShotConfig:
     # Deprecated boolean alias for ``routing_mode``; cli.py is migrated in a
     # separate change. ``True`` selects USAGE_BALANCED.
     auto: bool | None = field(default=None)
-    # Cache-first context reuse: fork children from parent epoch checkpoints
-    # and suspend/resume at delegate boundaries. Default off: the historical
-    # behavior is byte-for-byte unchanged.
-    context_reuse: bool = False
+    # Cache-first context reuse is enabled for operator-facing one-shot runs.
+    context_reuse: bool = True
 
     def __post_init__(self) -> None:
         if self.auto:

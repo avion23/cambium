@@ -71,11 +71,13 @@ Non-critical store records can be dropped under the store overflow policy.
    and then, when the agent changed files, creates one fenced result commit.
    A provider loop that finished cleanly with no non-`.cambium` changes is a
    successful no-op: it owns zero commits and no empty commit is made; the
-   summary is carried in the result and rendered output. The agent is instructed to emit a
-   short `plan` action before any `tool_call`, and the plan is retained in the
-   transcript. The transcript is summarized without an LLM call (dropping old
-   turns plus a synthetic dropped-message marker, keeping the plan) whenever it
-   exceeds a character budget, so it stays bounded within `max_turns`. A
+    summary is carried in the result and rendered output. The agent is instructed to emit a
+    short `plan` action before any `tool_call`, and the plan is retained in the
+    transcript. Context reuse and rolling deterministic compaction are default-on.
+    A fold rewrites only the active continuation projection, persists it as the
+    next immutable content-addressed epoch, and updates supervisor fork metadata;
+    the stable head and older epoch files are not mutated. The transcript remains
+    bounded within `max_turns`. A
    `read_batch` tool reads related files in one bounded call, and lint feedback
    from `write_file` reaches the agent as a tool observation.
 
@@ -117,9 +119,11 @@ existing `_admit_child` revision validation (never the live tree directly);
 every admitted/rejected revision is appended to the conversation store.
 `orchestrator.py` forwards both options from its stabilized public `run`
 surface, and `cambium supervisor --conversations` exposes the flag on the
-CLI. With neither backend configured, `run_plan` keeps the normal execution
-path. A session-scoped warm pool defaults to one idle worker and can be disabled
-with `CAMBIUM_WARM_POOL_SIZE=0`.
+CLI. The unified supervisor accepts the same `--plan`, `--task-spec`, and
+`--demo` inputs as the module entry point. With neither backend configured,
+`run_plan` keeps the normal execution path. The session-scoped warm pool is
+opt-in via `--warm-pool-size` (default 0, disabled); the
+`CAMBIUM_WARM_POOL_SIZE` environment variable is not read.
 
 `doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
 auth coverage, optional event and conversation databases, module datasets, and

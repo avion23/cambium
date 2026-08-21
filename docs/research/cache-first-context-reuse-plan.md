@@ -386,10 +386,11 @@ artifact — the immutable checkpoint file — and nothing writable.
 ## 7. Component work items
 
 Grounded in the traced repo; each item names the file and symbols it touches.
-The Phase 1 runtime, durable events, `--context-reuse`, usage fields, and
-evidence script are implemented. Remaining gaps are terminal epoch writing,
-fork/resume transcript-size enforcement, checkpoint event validation and
-binding, wall-budget accounting, and generation-aware evidence classification.
+The Phase 1 runtime, durable events, internal `context_reuse` plumbing, usage
+fields, and evidence script are implemented. The operator-facing entry points
+now enable context reuse by default; the public `--context-reuse` option was
+removed. Worker wire parsing remains fail-closed when an older caller omits the
+field.
 
 - `src/cambium/worker.py` — implements `CacheKeyDescriptor`,
   `ContextCheckpoint`, `_write_epoch_checkpoint`, `_build_forked_prompt`,
@@ -422,21 +423,24 @@ binding, wall-budget accounting, and generation-aware evidence classification.
   `conversations.py:48-60`, `:181-230`).
 - `src/cambium/diffundo.py`, `src/cambium/lm.py` — no cache-policy change
   (D1 stands); measurement-only additions if any.
-- `src/cambium/cli.py` / `src/cambium/oneshot.py` — surfaces
-  `--context-reuse` next to the `--conversations` flag seam.
+- `src/cambium/cli.py` / `src/cambium/oneshot.py` — operator-facing commands
+  enable context reuse by default. The internal `context_reuse` field and
+  forwarding remain available for targeted false-mode callers; no public
+  `--context-reuse` option remains.
 - `scripts/context_cache_evidence.py` — implemented aggregation script,
   sibling of `scripts/usage_evidence.py`.
 
 ## 8. Phases
 
-### Phase 1 — no-LLM checkpoint/fork/resume slice (fake provider, default-off)
+### Phase 1 — no-LLM checkpoint/fork/resume slice (fake provider; originally default-off)
 
 All of section 7's worker/supervisor/store items, tested with the scripted
 fake router (the `_ScriptedRouter` pattern,
 `tests/scenarios/test_worker_agent_loop.py:55-71`) and fixture workers.
-No LLM calls anywhere in the new tests. No compaction, no
-`ConversationStore` writes. Byte-for-byte current behavior when the flags
-are absent.
+No LLM calls anywhere in the new tests. No compaction, no `ConversationStore`
+writes. The implementation phase was originally default-off; current operator
+entry points are default-on while explicit internal false paths and absent
+legacy wire fields preserve the compatibility behavior.
 
 ### Phase 2 — real cache measurement (tooling implemented; live fork/resume evidence collected; both chat-provider acceptance gates PASS)
 
@@ -457,19 +461,17 @@ Route the worker transcript into `ConversationStore` when enabled; epochs
 reference rows by id; recovery replays from rows plus checkpoints. No
 prompt behavior change.
 
-### Phase 4 (optional) — background compaction as an epoch transition
+### Phase 4 (implemented) — rolling compaction as an epoch transition
 
 Deterministic (no-LLM first) delta fold at the existing
-`worker.py:1730` seam behind a `rolling_compact` init flag, per
+the worker turn boundary under the internal `rolling_compact` policy, per
 [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) §6
 and the canary discipline of [`compaction-design.md`](compaction-design.md)
 §3: the summary render goes into the mutable suffix under the user role; the
 stable head never changes; failure is fail-open with a durable
-`compaction_failed` event; the fold waits on a supervisor `published` signal
-(the worker cannot know merge fate — `_worker_success_integrity` and the
-merge path are supervisor-owned, `src/cambium/supervisor.py:2933-2967`,
-`:3117-3209`). LLM-based folds come only after deterministic folds are
-measured.
+`compaction_failed` event. The current fold changes only derived context state,
+not repository state, so it does not wait for publication. LLM-based folds
+come only after deterministic folds are measured.
 
 ## 9. Data, event, and API changes; migration; flags
 
@@ -491,15 +493,18 @@ measured.
   message by `MAX_LINE_BYTES = 1 MiB` (`src/cambium/ipc.py:28`). Over
   limit: truncate the list and set the flag; never fail silently.
 - Implemented durable kinds are `context_checkpoint`, `context_fork`,
-  `context_resume`, and `context_fork_skipped`; `context_epoch_advanced` remains
-  deferred. `context_fork` carries
+  `context_resume`, `context_fork_skipped`, and `context_epoch_advanced`.
+  Epoch advancement carries the complete new cache descriptor and updates the
+  supervisor's active epoch before later child pinning. `context_fork` carries
   `{parent_task_id, child_task_id, epoch, compatible, reason}`. `emit` already accepts arbitrary kinds
   (`src/cambium/supervisor.py:1204-1244`).
 - Usage event: optional `epoch: int`, `fork_of: str | null`.
-- Feature flags: `context_reuse` (init/run_plan parameter, default `False`)
-  modeled on `worker_reuse` (`src/cambium/worker.py:2470-2474`;
-  `src/cambium/supervisor.py:2340-2344`); later `rolling_compact`. Absence
-  is byte-for-byte today's behavior.
+- Feature flag: `context_reuse` remains an internal init/run_plan parameter.
+  Python entry points default to `True`, explicit `False` remains available
+  for targeted tests and compatibility callers, and absent wire fields still
+  fail closed in old-worker paths. There is no public argparse option. The
+  rolling compaction is the default internal policy and has no separate public
+  flag. Direct worker tests and compatibility callers can explicitly disable it.
 - **No new IPC request type.** The worker dispatch loop
   (`src/cambium/worker.py:2480-2673`) special-cases `init`, `run_task`,
   `cancel`, and EOF; a new request type would need new ordering and

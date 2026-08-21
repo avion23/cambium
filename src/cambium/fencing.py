@@ -8,7 +8,10 @@ must call :func:`write_generation` *after* ``git reset --hard`` and
 from __future__ import annotations
 
 import os
+import posixpath
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -17,10 +20,9 @@ except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None
 
 FENCE_FILE = ".cambium/generation"
+GENERATION_LOCK_FILE = ".cambium/.generation.lock"
 
-# Paths (matched by first component) that are incidental build/cache
-# artifacts of the agent's tool use and are never intentional changes.
-CACHE_ARTIFACT_COMPONENTS = frozenset({
+_CACHE_ARTIFACT_COMPONENTS = frozenset({
     ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", ".tox",
     ".coverage", ".cache", ".venv", ".mise", ".python-version",
 })
@@ -28,14 +30,57 @@ CACHE_ARTIFACT_COMPONENTS = frozenset({
 
 def is_cache_artifact_path(path: str) -> bool:
     """Whether a porcelain status path is an incidental cache/build artifact."""
-    if path.endswith(".pyc"):
-        return True
-    return path.split("/", 1)[0] in CACHE_ARTIFACT_COMPONENTS
+    if not isinstance(path, str):
+        return False
+    normalized = posixpath.normpath(path)
+    if normalized in {"", ".", ".."} or normalized.startswith(("/", "../")):
+        return False
+    components = normalized.split("/")
+    return normalized.endswith(".pyc") or any(
+        component in _CACHE_ARTIFACT_COMPONENTS for component in components
+    )
 
 
-def read_generation(worktree: Path) -> int:
-    """Return the worktree's generation, or ``0`` when the fence is invalid."""
-    path = Path(worktree) / FENCE_FILE
+class GenerationConflictError(RuntimeError):
+    pass
+
+
+def _fence_dir(worktree: Path) -> Path:
+    fence_dir = Path(worktree) / ".cambium"
+    fence_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(fence_dir, 0o700)
+    except OSError:
+        pass
+    return fence_dir
+
+
+@contextmanager
+def _generation_lock(worktree: Path) -> Iterator[Path]:
+    fence_dir = _fence_dir(worktree)
+    lock_path = fence_dir / Path(GENERATION_LOCK_FILE).name
+    fd = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield fence_dir
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _read_generation_path(path: Path) -> int:
     try:
         generation = int(path.read_text(encoding="ascii").strip(), 10)
     except (OSError, UnicodeError, ValueError):
@@ -43,24 +88,7 @@ def read_generation(worktree: Path) -> int:
     return generation if generation >= 0 else 0
 
 
-def write_generation(worktree: Path, generation: int) -> int:
-    """Atomically write and return a non-negative worktree generation.
-
-    The temporary file is created in ``.cambium`` so ``os.replace`` is an
-    atomic same-filesystem rename. The directory is created here because this
-    function is the final step of worktree recovery, after ``git clean -fd``.
-    """
-    if isinstance(generation, bool) or not isinstance(generation, int):
-        raise TypeError("generation must be an integer")
-    if generation < 0:
-        raise ValueError("generation must be non-negative")
-
-    fence_dir = Path(worktree) / ".cambium"
-    fence_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(fence_dir, 0o700)
-    except OSError:
-        pass
+def _write_generation_unlocked(fence_dir: Path, generation: int) -> None:
     fence_path = fence_dir / "generation"
     fd, temporary_name = tempfile.mkstemp(
         prefix=".generation.", suffix=".tmp", dir=fence_dir
@@ -77,7 +105,35 @@ def write_generation(worktree: Path, generation: int) -> int:
             temporary_path.unlink()
         except FileNotFoundError:
             pass
-    return generation
+
+
+def read_generation(worktree: Path) -> int:
+    """Return the worktree's generation, or ``0`` when the fence is invalid."""
+    return _read_generation_path(Path(worktree) / FENCE_FILE)
+
+
+def write_generation(worktree: Path, generation: int) -> int:
+    """Atomically write and return a non-negative worktree generation.
+
+    The temporary file is created in ``.cambium`` so ``os.replace`` is an
+    atomic same-filesystem rename. The directory is created here because this
+    function is the final step of worktree recovery, after ``git clean -fd``.
+    """
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise TypeError("generation must be an integer")
+    if generation < 0:
+        raise ValueError("generation must be non-negative")
+
+    with _generation_lock(worktree) as fence_dir:
+        current = _read_generation_path(fence_dir / "generation")
+        if generation < current:
+            raise GenerationConflictError(
+                f"generation {generation} is older than persisted generation {current}"
+            )
+        if generation == current and generation > 0:
+            return generation
+        _write_generation_unlocked(fence_dir, generation)
+        return generation
 
 
 def next_generation(worktree: Path) -> int:
@@ -90,43 +146,10 @@ def next_generation(worktree: Path) -> int:
     single-recovery-process assumption and does not provide cross-process
     locking.
     """
-    fence_dir = Path(worktree) / ".cambium"
-    fence_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(fence_dir, 0o700)
-    except OSError:
-        pass
-    fence_path = fence_dir / "generation"
-    try:
-        os.chmod(fence_path, 0o600)
-    except FileNotFoundError:
-        fd = os.open(fence_path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600)
-        os.close(fd)
-    except OSError:
-        pass
-
-    with fence_path.open("a+", encoding="ascii", newline="\n") as fence:
-        if fcntl is not None:
-            fcntl.flock(fence.fileno(), fcntl.LOCK_EX)
-        try:
-            fence.seek(0)
-            try:
-                current = int(fence.read().strip(), 10)
-            except (UnicodeError, ValueError):
-                current = 0
-            if current < 0:
-                current = 0
-
-            generation = current + 1
-            fence.seek(0)
-            fence.truncate()
-            fence.write(f"{generation}\n")
-            fence.flush()
-            os.fsync(fence.fileno())
-            return generation
-        finally:
-            if fcntl is not None:
-                fcntl.flock(fence.fileno(), fcntl.LOCK_UN)
+    with _generation_lock(worktree) as fence_dir:
+        generation = _read_generation_path(fence_dir / "generation") + 1
+        _write_generation_unlocked(fence_dir, generation)
+        return generation
 
 
 def validate_worker_generation(worktree: Path, worker_generation: int | None) -> bool:

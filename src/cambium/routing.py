@@ -111,8 +111,11 @@ class ProviderDebt:
     disable_reason: str | None = None
     disable_at: float | None = None
 
-    def record(self, event: Mapping[str, Any]) -> None:
+    def record(
+        self, event: Mapping[str, Any], *, now: float | None = None
+    ) -> None:
         """Fold one usage_event payload into this provider's debt."""
+        timestamp = time.time() if now is None else now
         self.requests += 1
         usage = event.get("usage")
         if isinstance(usage, Mapping):
@@ -140,7 +143,7 @@ class ProviderDebt:
             ) or failure_reason.startswith("auth_error:"):
                 # A quarantine-class failure: record the durable disable reason.
                 self.disable_reason = failure_reason
-                self.disable_at = time.time()
+                self.disable_at = timestamp
         else:
             # A success event clears any durable quarantine record; transient
             # failure classifications leave it untouched.
@@ -160,7 +163,7 @@ class ProviderDebt:
         ):
             self.latency_total_s += float(latency)
             self.latency_count += 1
-        self.last_seen = time.time()
+        self.last_seen = timestamp
 
 
 def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
@@ -627,12 +630,14 @@ def select_lane(
     if not candidates:
         raise ValueError("model_candidates must be a non-empty list of model ids")
     serving: list[tuple[int, Any]] = []
+    matching = False
     for index, provider in enumerate(providers):
         if not getattr(provider, "enabled", True):
             continue
         model = getattr(provider, "model", "")
         if not (isinstance(model, str) and model in candidates):
             continue
+        matching = True
         lane = lanes.get(provider.name)
         if lane is not None:
             current = debt.get(provider.name) if debt is not None else None
@@ -640,6 +645,10 @@ def select_lane(
             if lane.in_flight >= lane.effective_in_flight_cap(retry_after_count):
                 continue
         serving.append((index, provider))
+    if not matching:
+        raise ValueError(
+            f"model_candidates {list(candidates)!r} match no enabled configured provider"
+        )
     if not serving:
         raise LaneCapacityExhausted(
             f"model_candidates {list(candidates)!r} match no enabled configured "
@@ -671,23 +680,24 @@ def validate_requirements(requirements: Mapping[str, Any] | None) -> dict[str, A
         return {}
     if not isinstance(requirements, Mapping):
         raise ValueError("requirements must be a mapping")
-    unknown = sorted(set(requirements) - _REQUIREMENT_KEYS)
+    unknown = [key for key in requirements if key not in _REQUIREMENT_KEYS]
     if unknown:
+        unknown.sort(key=repr)
         raise ValueError(
             "unknown requirement key(s): " + ", ".join(map(repr, unknown))
         )
-    quality = requirements.get("quality")
-    if quality is not None and (
-        not isinstance(quality, str) or quality not in ("high", "normal")
-    ):
-        raise ValueError("requirements.quality must be 'high' or 'normal'")
-    min_context_window = requirements.get("min_context_window")
-    if min_context_window is not None and (
-        isinstance(min_context_window, bool)
-        or not isinstance(min_context_window, int)
-        or min_context_window <= 0
-    ):
-        raise ValueError("requirements.min_context_window must be a positive int")
+    if "quality" in requirements:
+        quality = requirements["quality"]
+        if not isinstance(quality, str) or quality not in ("high", "normal"):
+            raise ValueError("requirements.quality must be 'high' or 'normal'")
+    if "min_context_window" in requirements:
+        min_context_window = requirements["min_context_window"]
+        if (
+            isinstance(min_context_window, bool)
+            or not isinstance(min_context_window, int)
+            or min_context_window <= 0
+        ):
+            raise ValueError("requirements.min_context_window must be a positive int")
     return dict(requirements)
 
 

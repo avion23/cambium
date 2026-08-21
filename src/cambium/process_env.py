@@ -36,6 +36,16 @@ _OVERRIDE_NAMES = frozenset(
     }
 )
 
+_FIXED_NAMES = frozenset(
+    {
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    }
+)
+
+_PROTECTED_NAMES = _OVERRIDE_NAMES | _FIXED_NAMES
+
 
 def _names(names: Iterable[str] | None) -> tuple[str, ...]:
     if names is None:
@@ -97,6 +107,8 @@ def build_subprocess_env(
         env["HOME"] = str(Path(worktree).resolve() / ".cambium" / "home")
 
     for name in names:
+        if name in _PROTECTED_NAMES:
+            continue
         value = source.get(name)
         if value is not None:
             if not isinstance(value, str):

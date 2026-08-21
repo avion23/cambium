@@ -37,7 +37,7 @@ PROVIDER_ID_PATTERN = r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?"
 _PROVIDER_ID_RE = re.compile(PROVIDER_ID_PATTERN + r"\Z")
 _PROVIDER_ENV_RE = re.compile(r"CAMBIUM_PROVIDER_[A-Z0-9]+(?:_[A-Z0-9]+)*_API_KEY\Z")
 _CREDENTIAL_NAME_RE = re.compile(
-    r"(?:api|key|token|secret|password|passwd|credential|authorization)",
+    r"(?:api|key|token|secret|password|passwd|credential|authorization|(?:^|_)auth(?:_|$))",
     re.IGNORECASE,
 )
 _TEMP_NAME_PREFIX = ".auth.json.tmp-"
@@ -210,6 +210,8 @@ def _validate_api_key(provider: str, value: object) -> str:
         raise AuthSchemaError(f"provider {provider!r} api key is not valid UTF-8") from exc
     if not encoded:
         raise AuthSchemaError(f"provider {provider!r} api key is empty")
+    if value.isspace():
+        raise AuthSchemaError(f"provider {provider!r} api key is whitespace")
     if len(encoded) < MIN_API_KEY_BYTES:
         raise AuthSchemaError(f"provider {provider!r} api key is too short")
     if b"\x00" in encoded:

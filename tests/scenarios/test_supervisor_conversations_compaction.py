@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -10,10 +11,13 @@ from typing import Any
 
 import pytest
 
+from cambium import worker
 from cambium.conversations import ConversationStore
+from cambium.diffundo import prompt_prefix_bytes
 from cambium.redact import build_session_redactor
 from cambium.store import CRITICAL_KINDS
 from cambium.supervisor import WorkerHandle, _Runtime
+from cambium.worker import CHECKPOINT_EPOCH_SCHEMA, _provider_task_tools_hash
 
 pytestmark = pytest.mark.slow
 
@@ -168,6 +172,71 @@ def _write_checkpoint_file(session_dir: Path, event: dict[str, Any]) -> None:
     )
 
 
+def _write_advanced_checkpoint(session_dir: Path) -> dict[str, Any]:
+    provider_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "question"},
+    ]
+    continuation_suffix = [{"role": "assistant", "content": "folded"}]
+    cache_key = {
+        "provider": "fake-provider",
+        "model": "fake-model",
+        "protocol": "loopback",
+        "reasoning_effort": None,
+        "system_sha256": hashlib.sha256(b"system").hexdigest(),
+        "tools_sha256": _provider_task_tools_hash(),
+        "prefix_sha256": worker._messages_sha256(provider_messages),
+        "suffix_sha256": worker._messages_sha256(continuation_suffix),
+        "full_sha256": worker._messages_sha256(
+            [*provider_messages, *continuation_suffix]
+        ),
+        "prefix_bytes": prompt_prefix_bytes({"messages": provider_messages}) or 0,
+        "message_count": len(provider_messages),
+        "redacted": False,
+        "provider_boundary": _provider_boundary(),
+    }
+    payload: dict[str, Any] = {
+        "schema": CHECKPOINT_EPOCH_SCHEMA,
+        "task_id": "task",
+        "generation": 1,
+        "epoch": 2,
+        "turn": 2,
+        "created_at": 1.0,
+        "cache_key": cache_key,
+        "provider_messages": provider_messages,
+        "continuation_suffix": continuation_suffix,
+        "checkpoint_ref": "",
+        "code_changed": False,
+        "verified_after_change": False,
+        "verification_failed": False,
+        "no_progress_actions": 0,
+        "budget_new_tokens": 0,
+        "previous_prompt_tokens": 0,
+        "cumulative_usage": {},
+        "wall_deadline": 10.0,
+    }
+    persisted_address = worker._checkpoint_address(payload)
+    checkpoint_ref = (
+        f"task/epoch-002-{'a' * 16}-{persisted_address}.json"
+    )
+    payload["checkpoint_ref"] = checkpoint_ref
+    path = session_dir / ".cambium" / "checkpoints" / checkpoint_ref
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+    return {
+        "type": "context_epoch_advanced",
+        "request_id": "epoch-request",
+        "task_id": "task",
+        "generation": 1,
+        "epoch": 2,
+        "turn": 2,
+        "checkpoint_ref": checkpoint_ref,
+        "cache_key": cache_key,
+        "folded_from_epoch": 1,
+        "reason": None,
+    }
+
+
 def test_context_checkpoint_appends_redacted_raw_rows_and_replays_files(
     tmp_path: Path,
 ) -> None:
@@ -281,7 +350,7 @@ def _write_capture_worker(path: Path) -> None:
     )
 
 
-def test_published_run_field_tracks_prior_clean_success(tmp_path: Path, monkeypatch) -> None:
+def test_run_payload_has_no_publication_gate_field(tmp_path: Path, monkeypatch) -> None:
     repo, worktree, base = _make_repo(tmp_path)
     payload_path = tmp_path / "run-payloads.jsonl"
     worker = tmp_path / "capture_worker.py"
@@ -297,22 +366,17 @@ def test_published_run_field_tracks_prior_clean_success(tmp_path: Path, monkeypa
     asyncio.run(runtime.supervise_task(spec))
 
     payloads = [json.loads(line) for line in payload_path.read_text().splitlines()]
-    assert [payload["published"] for payload in payloads] == [False, True]
-    assert all(type(payload["published"]) is bool for payload in payloads)
+    assert payloads
+    assert all("published" not in payload for payload in payloads)
 
 
 def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) -> None:
     repo, worktree, base = _make_repo(tmp_path)
-    valid_advanced = {
-        "type": "context_epoch_advanced",
-        "request_id": "epoch-request",
-        "task_id": "task",
-        "generation": 1,
-        "epoch": 2,
-        "checkpoint_ref": "task/epoch-002-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb.json",
-        "folded_from_epoch": 1,
-        "reason": None,
-    }
+    checkpoint = _context_checkpoint_message()
+    checkpoint["cache_key"]["tools_sha256"] = _provider_task_tools_hash()
+    session_dir = tmp_path / "session"
+    valid_advanced = _write_advanced_checkpoint(session_dir)
+    advanced_cache_key = valid_advanced["cache_key"]
     valid_failed = {
         "type": "compaction_failed",
         "request_id": "failure-request",
@@ -322,11 +386,29 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "reason": "canary failed",
     }
     malformed_advanced = {**valid_advanced, "folded_from_epoch": 0}
+    invalid_checkpoint = {
+        **valid_advanced,
+        "request_id": "invalid-checkpoint",
+        "epoch": 3,
+        "turn": 3,
+        "checkpoint_ref": "task/epoch-003-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb.json",
+        "folded_from_epoch": 2,
+    }
     malformed_failed = {**valid_failed, "reason": ""}
     worker = tmp_path / "events_worker.py"
-    _write_worker(worker, [valid_advanced, valid_failed, malformed_advanced, malformed_failed])
+    _write_worker(
+        worker,
+        [
+            checkpoint,
+            valid_advanced,
+            valid_failed,
+            invalid_checkpoint,
+            malformed_advanced,
+            malformed_failed,
+        ],
+    )
     event_store = _MemoryStore()
-    runtime = _Runtime(tmp_path / "session", event_store)
+    runtime = _Runtime(session_dir, event_store)
 
     outcome = asyncio.run(
         runtime._drive_generation(
@@ -348,7 +430,9 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
     assert advanced[0]["request_id"] == "epoch-request"
     assert advanced[0]["payload"] == {
         "epoch": 2,
+        "turn": 2,
         "checkpoint_ref": valid_advanced["checkpoint_ref"],
+        "cache_key": advanced_cache_key,
         "folded_from_epoch": 1,
         "reason": None,
     }
@@ -364,5 +448,19 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "context_epoch_advanced rejected: invalid field(s)",
         "compaction_failed rejected: invalid field(s)",
     }
+    assert any(
+        record["payload"].get("note")
+        == "context_epoch_advanced rejected: invalid checkpoint"
+        for record in rejected
+    )
     assert "context_epoch_advanced" in CRITICAL_KINDS
     assert "compaction_failed" in CRITICAL_KINDS
+
+    assert runtime._task_epochs["task"]["checkpoint_ref"] == valid_advanced["checkpoint_ref"]
+    child_spec = {
+        "fanout_config": {"model": "fake-model", "protocol": "loopback"},
+        "authorized_providers": ["fake-provider"],
+    }
+    asyncio.run(runtime._pin_fork_child({}, child_spec, "task", "child", "implementation"))
+    assert child_spec["context_fork"]["checkpoint_ref"] == valid_advanced["checkpoint_ref"]
+    assert child_spec["context_fork"]["suffix_sha256"] == advanced_cache_key["suffix_sha256"]

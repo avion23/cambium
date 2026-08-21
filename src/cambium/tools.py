@@ -45,6 +45,12 @@ OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
 ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolPermissionPolicy:
+    shell: bool = True
+    network: bool = True
+
+
 @dataclass(slots=True)
 class ToolContext:
     """Dependencies needed by one tool invocation."""
@@ -53,6 +59,7 @@ class ToolContext:
     lint: LintDiag | None = None
     init: Mapping[str, Any] | None = None
     emit: ToolEventSink | None = None
+    policy: ToolPermissionPolicy | None = None
     _root: Path = field(init=False, repr=False)
     _root_fd: int | None = field(init=False, default=None, repr=False)
 
@@ -788,6 +795,7 @@ TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "git_op": _git_op,
     "run_shell": _run_shell,
 }
+_TOOL_PERMISSION_REQUIREMENTS = {"run_shell": "shell"}
 
 
 async def _run_read_result(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -949,6 +957,18 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
             duration_ms=_duration_ms(started_ns),
         )
 
+    required_permission = _TOOL_PERMISSION_REQUIREMENTS.get(name)
+    if (
+        required_permission is not None
+        and ctx.policy is not None
+        and not getattr(ctx.policy, required_permission)
+    ):
+        return ToolResult(
+            ok=False,
+            error=f"permission_denied:{required_permission}",
+            duration_ms=_duration_ms(started_ns),
+        )
+
     implementation = TOOL_DISPATCH[name]
     try:
         outcome = await implementation(args, ctx)
@@ -979,6 +999,7 @@ __all__ = [
     "TOOL_DISPATCH",
     "TOOL_SCHEMAS",
     "ToolContext",
+    "ToolPermissionPolicy",
     "ToolResult",
     "run_read_batch",
     "run_tool",

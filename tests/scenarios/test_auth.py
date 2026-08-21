@@ -477,7 +477,7 @@ def test_worker_environment_non_provider_worker_gets_no_provider_path(
 def test_cli_has_only_fixed_auth_run_profile() -> None:
     parser = cli._build_parser()
     args = parser.parse_args(
-        ["auth", "run", "supervisor", "--session-dir", "/tmp/session"]
+        ["auth", "run", "supervisor", "--session-dir", "/tmp/session", "--demo"]
     )
     assert args.profile == "supervisor"
 
@@ -501,7 +501,13 @@ def test_auth_supervisor_exec_is_list_form_and_does_not_include_keys(
 
     monkeypatch.setattr(cli, "AuthStore", FakeStore)
     monkeypatch.setattr(cli.os, "execve", fake_exec)
-    args = argparse.Namespace(session_dir="/tmp/session", plan=None, task_spec=None)
+    args = argparse.Namespace(
+        session_dir="/tmp/session",
+        plan=None,
+        task_spec=None,
+        warm_pool_size=0,
+        conversations=False,
+    )
 
     assert cli._run_auth_supervisor(args) == 0
     assert captured["argv"] == [
@@ -510,6 +516,7 @@ def test_auth_supervisor_exec_is_list_form_and_does_not_include_keys(
         "cambium.supervisor",
         "--session-dir",
         "/tmp/session",
+        "--demo",
     ]
     assert SECRET not in " ".join(captured["argv"])
 

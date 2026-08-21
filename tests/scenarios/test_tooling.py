@@ -113,7 +113,7 @@ def test_doctor_fails_on_corrupt_event_store(tmp_path) -> None:
 
 def test_doctor_fails_on_corrupt_conversation_store(tmp_path) -> None:
     session_dir = tmp_path / "session"
-    db = session_dir / ".cambium" / "sessions" / "conversations.db"
+    db = session_dir / ".cambium" / "conversations.db"
     db.parent.mkdir(parents=True)
     db.write_bytes(b"this is not a sqlite database\ncorrupted\x00payload\n")
 
@@ -181,7 +181,7 @@ def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:
 def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     session_dir = tmp_path / "session"
-    conversations = session_dir / ".cambium" / "sessions" / "conversations.db"
+    conversations = session_dir / ".cambium" / "conversations.db"
     conversations.parent.mkdir(parents=True)
     with sqlite3.connect(conversations) as connection:
         connection.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY)")

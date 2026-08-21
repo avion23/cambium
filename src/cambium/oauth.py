@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import errno
 import fcntl
+import http.client
 import json
 import os
 import secrets
@@ -719,7 +720,7 @@ def _request(
             body = _read_response(exc)
         except OAuthError:
             raise
-        except Exception:
+        except (OSError, ValueError, http.client.HTTPException):
             body = b""
         return exc.code, body
     except urllib.error.URLError as exc:
@@ -762,11 +763,13 @@ def _parse_float(value: object, default: float) -> float:
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
+    if not isinstance(token, str):
+        return None
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
         value = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-    except Exception:
+    except (IndexError, ValueError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -1178,6 +1181,7 @@ class TokenManager:
         refresh_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
         lock_timeout_s: float = DEFAULT_LOCK_TIMEOUT_S,
         refresh: Callable[[str], RefreshedTokens] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._provider = _validate_provider_id(provider)
         self._store = OAuthStore() if store is None else store
@@ -1192,6 +1196,7 @@ class TokenManager:
         self._issuer = validate_issuer(issuer)
         self._refresh_timeout_s = refresh_timeout_s
         self._lock_timeout_s = lock_timeout_s
+        self._clock = time.time if clock is None else clock
         if refresh is not None:
             self._refresh = refresh
         else:
@@ -1292,7 +1297,7 @@ class TokenManager:
         if fast.disabled:
             raise InvalidGrantError(f"provider {self._provider!r} is disabled until re-login")
         if _is_fresh(
-            fast.doc, now=time.time(), margin_s=DEFAULT_REFRESH_MARGIN_S
+            fast.doc, now=self._clock(), margin_s=DEFAULT_REFRESH_MARGIN_S
         ) and (rejected is None or rejected != fast.doc.access_token):
             return fast.doc.access_token, fast.doc.account_id
 
@@ -1308,7 +1313,7 @@ class TokenManager:
             if rejected is not None and current.doc.access_token != rejected:
                 return current.doc.access_token, current.doc.account_id
             if rejected is None and _is_fresh(
-                current.doc, now=time.time(), margin_s=DEFAULT_REFRESH_MARGIN_S
+                current.doc, now=self._clock(), margin_s=DEFAULT_REFRESH_MARGIN_S
             ):
                 return current.doc.access_token, current.doc.account_id
             try:
@@ -1326,7 +1331,7 @@ class TokenManager:
                 provider=self._provider,
                 access_token=refreshed.access_token,
                 refresh_token=refreshed_refresh,
-                expires_at=time.time() + refreshed.expires_in,
+                expires_at=self._clock() + refreshed.expires_in,
                 account_id=account_id,
             )
             self._store.save_provider(updated)

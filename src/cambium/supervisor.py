@@ -100,6 +100,7 @@ from cambium.system_health import can_run_heavy
 from .architectus import ActionKind, ArchitectusCore
 from .auth import MIN_API_KEY_BYTES, oauth_env_suffix, scrub_environment
 from .conversations import ConversationStore, ConversationStoreError
+from .diffundo import prompt_prefix_bytes
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeSequencer
 from .oauth import (
@@ -124,7 +125,7 @@ from .routing import (
     resolve_assignment,
     validate_requirements,
 )
-from .store import CRITICAL_KINDS, EventStore, read_events_file
+from .store import CRITICAL_KINDS, EventStore, StoreError, read_events_file
 from .tasktree import (
     _ENVELOPE_KEYS,
     MAX_WIDTH,
@@ -137,8 +138,10 @@ from .tasktree import (
 )
 from .worker import (
     _SHA256_HEX_RE,
+    CHECKPOINT_EPOCH_SCHEMA,
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
+    MAX_OBSERVATION_BYTES,
     _cap_utf8,
     _safe_task_id,
     _validate_checkpoint_ref_shape,
@@ -218,8 +221,8 @@ _CACHE_KEY_FIELDS = frozenset({
 })
 _CACHE_KEY_INT_FIELDS = ("prefix_bytes", "message_count")
 _CONTEXT_EPOCH_ADVANCED_FIELDS = frozenset({
-    "type", "request_id", "task_id", "generation", "epoch", "checkpoint_ref",
-    "folded_from_epoch", "reason",
+    "type", "request_id", "task_id", "generation", "epoch", "turn",
+    "checkpoint_ref", "cache_key", "folded_from_epoch", "reason",
 })
 _COMPACTION_FAILED_FIELDS = frozenset({
     "type", "request_id", "task_id", "generation", "epoch", "reason",
@@ -290,14 +293,24 @@ def _invalid_context_epoch_advanced_fields(msg: dict[str, Any]) -> list[str]:
     unknown = sorted(set(msg) - _CONTEXT_EPOCH_ADVANCED_FIELDS, key=str)
     if unknown:
         return unknown
-    invalid: list[str] = []
+    checkpoint = {
+        "type": "context_checkpoint",
+        "request_id": msg.get("request_id"),
+        "task_id": msg.get("task_id"),
+        "generation": msg.get("generation"),
+        "epoch": msg.get("epoch"),
+        "turn": msg.get("turn"),
+        "checkpoint_ref": msg.get("checkpoint_ref"),
+        "cache_key": msg.get("cache_key"),
+    }
+    invalid = _invalid_context_checkpoint_fields(checkpoint)
     if msg.get("type") != "context_epoch_advanced":
         invalid.append("type")
     for field in ("request_id", "task_id", "checkpoint_ref"):
         value = msg.get(field)
         if not isinstance(value, str) or not value:
             invalid.append(field)
-    for field in ("generation", "epoch", "folded_from_epoch"):
+    for field in ("generation", "epoch", "turn", "folded_from_epoch"):
         value = msg.get(field)
         if type(value) is not int or value <= 0:
             invalid.append(field)
@@ -392,6 +405,180 @@ def _load_epoch_checkpoint_messages(
     if not loaded["provider_messages"]:
         raise ValueError("checkpoint provider_messages is empty")
     return loaded
+
+
+def _reject_duplicate_checkpoint_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError("checkpoint contains duplicate JSON fields")
+        values[key] = value
+    return values
+
+
+def _reject_checkpoint_json_constant(value: str) -> object:
+    raise ValueError("checkpoint contains non-standard JSON constant")
+
+
+def _load_epoch_checkpoint_data(
+    session_dir: Path, task_id: str, checkpoint_ref: str
+) -> dict[str, Any]:
+    path = _epoch_checkpoint_path(session_dir, task_id, checkpoint_ref)
+    try:
+        if path.stat().st_size > MAX_LINE_BYTES * 4:
+            raise ValueError("checkpoint exceeds the size cap")
+        data = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_checkpoint_pairs,
+            parse_constant=_reject_checkpoint_json_constant,
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError("checkpoint unreadable") from exc
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint is not an object")
+    return data
+
+
+def _checkpoint_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _checkpoint_messages_sha256(messages: list[dict[str, str]]) -> str:
+    return hashlib.sha256(_checkpoint_json_bytes(messages)).hexdigest()
+
+
+def _checkpoint_address(data: dict[str, Any]) -> str:
+    normalized = dict(data)
+    normalized["checkpoint_ref"] = ""
+    return hashlib.sha256(_checkpoint_json_bytes(normalized)).hexdigest()[:16]
+
+
+def _validate_advanced_epoch_checkpoint(
+    session_dir: Path,
+    task_id: str,
+    generation: int,
+    msg: Mapping[str, Any],
+) -> None:
+    checkpoint_ref = msg["checkpoint_ref"]
+    data = _load_epoch_checkpoint_data(session_dir, task_id, checkpoint_ref)
+    expected_keys = frozenset({
+        "schema", "task_id", "generation", "epoch", "turn", "created_at",
+        "cache_key", "provider_messages", "continuation_suffix", "checkpoint_ref",
+        "code_changed", "verified_after_change", "verification_failed",
+        "no_progress_actions", "budget_new_tokens", "previous_prompt_tokens",
+        "cumulative_usage", "wall_deadline",
+    })
+    if set(data) != expected_keys:
+        raise ValueError("checkpoint has an invalid key set")
+    try:
+        _task_component, ref_epoch, _address_pre, address_persisted = (
+            _validate_checkpoint_ref_shape(checkpoint_ref)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint_ref is invalid") from exc
+    if data.get("schema") != CHECKPOINT_EPOCH_SCHEMA:
+        raise ValueError("checkpoint schema mismatch")
+    if data.get("task_id") != task_id or data.get("generation") != generation:
+        raise ValueError("checkpoint identity mismatch")
+    if (
+        data.get("epoch") != msg["epoch"]
+        or data.get("epoch") != ref_epoch
+        or data.get("turn") != msg["turn"]
+        or data.get("checkpoint_ref") != checkpoint_ref
+    ):
+        raise ValueError("checkpoint descriptor mismatch")
+    cache_key = data.get("cache_key")
+    if not isinstance(cache_key, dict) or cache_key != msg["cache_key"]:
+        raise ValueError("checkpoint cache_key mismatch")
+    try:
+        _validate_provider_boundary(cache_key["provider_boundary"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("checkpoint provider boundary is invalid") from exc
+
+    def _messages(field: str) -> list[dict[str, str]]:
+        raw_messages = data.get(field)
+        if not isinstance(raw_messages, list):
+            raise ValueError(f"checkpoint {field} is invalid")
+        messages: list[dict[str, str]] = []
+        for message in raw_messages:
+            if not isinstance(message, dict) or set(message) != {"role", "content"}:
+                raise ValueError(f"checkpoint {field} contains an invalid message")
+            role = message.get("role")
+            content = message.get("content")
+            if (
+                not isinstance(role, str)
+                or role not in {"system", "user", "assistant", "tool"}
+                or not isinstance(content, str)
+                or len(content.encode("utf-8")) > MAX_OBSERVATION_BYTES
+            ):
+                raise ValueError(f"checkpoint {field} contains an invalid message")
+            messages.append({
+                "role": role,
+                "content": content,
+            })
+        return messages
+
+    provider_messages = _messages("provider_messages")
+    continuation_suffix = _messages("continuation_suffix")
+    if not provider_messages or provider_messages[0]["role"] != "system":
+        raise ValueError("checkpoint provider_messages is invalid")
+    full_messages = [*provider_messages, *continuation_suffix]
+    expected_cache_values = {
+        "system_sha256": hashlib.sha256(
+            provider_messages[0]["content"].encode("utf-8")
+        ).hexdigest(),
+        "prefix_sha256": _checkpoint_messages_sha256(provider_messages),
+        "suffix_sha256": _checkpoint_messages_sha256(continuation_suffix),
+        "full_sha256": _checkpoint_messages_sha256(full_messages),
+        "prefix_bytes": prompt_prefix_bytes({"messages": provider_messages}) or 0,
+        "message_count": len(provider_messages),
+    }
+    if any(
+        cache_key.get(field) != expected_value
+        for field, expected_value in expected_cache_values.items()
+    ):
+        raise ValueError("checkpoint cache_key content mismatch")
+
+    for field in ("code_changed", "verified_after_change", "verification_failed"):
+        if type(data.get(field)) is not bool:
+            raise ValueError(f"checkpoint {field} is invalid")
+    for field in ("generation", "epoch", "turn"):
+        value = data.get(field)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"checkpoint {field} is invalid")
+    for field in ("no_progress_actions", "budget_new_tokens", "previous_prompt_tokens"):
+        value = data.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"checkpoint {field} is invalid")
+    usage = data.get("cumulative_usage")
+    if not isinstance(usage, dict) or any(
+        not isinstance(key, str)
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for key, value in usage.items()
+    ):
+        raise ValueError("checkpoint cumulative_usage is invalid")
+    for field, positive in (("created_at", False), ("wall_deadline", True)):
+        value = data.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"checkpoint {field} is invalid")
+        try:
+            finite = math.isfinite(value)
+        except (OverflowError, TypeError):
+            finite = False
+        if not finite or (positive and value <= 0):
+            raise ValueError(f"checkpoint {field} is invalid")
+    if _checkpoint_address(data) != address_persisted:
+        raise ValueError("checkpoint persisted-address mismatch")
 
 
 def _wire_str(value: Any) -> str | None:
@@ -554,18 +741,6 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     return parsed
 
 
-def _warm_pool_size() -> int:
-    """Session warm-pool bound from ``CAMBIUM_WARM_POOL_SIZE`` (0 disables)."""
-    value = os.environ.get("CAMBIUM_WARM_POOL_SIZE")
-    if value is None:
-        return DEFAULT_WARM_POOL_SIZE
-    try:
-        size = int(value)
-    except ValueError:
-        raise ValueError("invalid CAMBIUM_WARM_POOL_SIZE: expected an integer") from None
-    return max(0, size)
-
-
 def _pool_env_key(env: dict[str, str]) -> frozenset[tuple[str, str]]:
     """Env identity for pool matching, ignoring rebindable per-task values.
 
@@ -718,11 +893,6 @@ DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
 RESTART_BASE_DELAY_S = 1.0
 RESTART_MAX_DELAY_S = 30.0
-# Session-scoped warm worker pool (eval-3 ADOPT): idle workers that reported
-# reuse-ready are rebindable to later tasks in the same session, avoiding the
-# spawn-to-ready cold start (interpreter boot + heavy imports) per task.
-# 0 disables the pool entirely (single-init worker behavior, unchanged).
-DEFAULT_WARM_POOL_SIZE = 1
 EOF_GRACE_S = 5.0
 WORKER_EXIT_WAIT_S = 10.0
 TERM_GRACE_S = 5.0
@@ -1493,7 +1663,7 @@ class _Runtime:
         architectus: Any = None,
         conversations: Any = None,
         warm_pool_size: int = 0,
-        context_reuse: bool = False,
+        context_reuse: bool = True,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1545,9 +1715,6 @@ class _Runtime:
         # child task, captured at the child's terminal result envelope.
         self._context_reuse = context_reuse
         self._task_epochs: dict[str, dict[str, Any]] = {}
-        # A worker only folds after a later run receives proof that this node's
-        # earlier terminal result was published by the supervisor.
-        self._published_task_ids: set[str] = set()
         # Completion futures are registered before dynamic child tasks are
         # created.  A suspended parent waits on these futures, not on a
         # post-spawn task lookup, so a child cannot finish between admission
@@ -1625,13 +1792,14 @@ class _Runtime:
             )
             kind = record["kind"]
         durable_record = self._copy_event(record)
-        try:
-            async with self._event_append_lock:
-                await asyncio.to_thread(self._store.append, durable_record)
-        except Exception as exc:
-            if kind in CRITICAL_KINDS:
-                raise
-            print(f"cambium: event store error: {exc}", file=sys.stderr)
+        if self._store is not None:
+            try:
+                async with self._event_append_lock:
+                    await asyncio.to_thread(self._store.append, durable_record)
+            except (OSError, RuntimeError, StoreError, TypeError, ValueError) as exc:
+                if kind in CRITICAL_KINDS:
+                    raise
+                print(f"cambium: event store error: {exc}", file=sys.stderr)
         if self._on_event is None:
             return
         observer_failure_is_fatal = (
@@ -2004,7 +2172,6 @@ class _Runtime:
             "branch": spec["branch"],
             "base_commit": spec["base_commit"],
             "generation": generation,
-            "published": spec["task_id"] in self._published_task_ids,
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
             "max_wall_s": wall_budget,
@@ -2029,10 +2196,6 @@ class _Runtime:
         if spec.get("resume") is not None:
             payload["resume"] = spec["resume"]
         return payload
-
-    def _mark_published(self, task_id: str) -> None:
-        """Record that a terminal success for *task_id* was published."""
-        self._published_task_ids.add(task_id)
 
     # -- dynamic child admission (implementation-plan step 2) ----------------
 
@@ -3068,7 +3231,6 @@ class _Runtime:
                         )
                         return
                     if head == spec["base_commit"]:
-                        self._mark_published(task_id)
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=None, restarts=restarts,
@@ -3077,7 +3239,6 @@ class _Runtime:
                         return
                     merged = await self._merge_task(spec, handle)
                     if merged is not None:
-                        self._mark_published(task_id)
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=merged, restarts=restarts,
@@ -3249,6 +3410,7 @@ class _Runtime:
             init_msg["assigned_provider"] = spec["assigned_provider"]
         if self._context_reuse:
             init_msg["context_reuse"] = True
+            init_msg["rolling_compact"] = True
         if isinstance(spec.get("context_fork"), dict):
             init_msg["context_fork"] = spec["context_fork"]
         if isinstance(spec.get("resume"), dict):
@@ -3403,8 +3565,14 @@ class _Runtime:
                     await _write_json(
                         proc, cancel_msg, deadline=_stdin_deadline(wall_deadline)
                     )
-            except Exception:
-                pass
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                print(f"cambium: cancel message error: {exc}", file=sys.stderr)
             await _kill_worker(proc)
 
         async def _probe_after_eof() -> bool:
@@ -3710,16 +3878,45 @@ class _Runtime:
                             expected_task_id=task_id, expected_generation=generation,
                         )
                     else:
+                        active = self._task_epochs.get(task_id)
+                        if (
+                            active is None
+                            or active.get("epoch") != msg["folded_from_epoch"]
+                            or msg["epoch"] != msg["folded_from_epoch"] + 1
+                        ):
+                            await self.emit(
+                                "protocol", task_id=task_id, generation=generation,
+                                note="context_epoch_advanced rejected: stale transition",
+                            )
+                            continue
+                        try:
+                            await asyncio.to_thread(
+                                _validate_advanced_epoch_checkpoint,
+                                self._session_dir,
+                                task_id,
+                                generation,
+                                msg,
+                            )
+                        except (OSError, TypeError, ValueError):
+                            await self.emit(
+                                "protocol", task_id=task_id, generation=generation,
+                                note="context_epoch_advanced rejected: invalid checkpoint",
+                                fields=["checkpoint_ref"],
+                            )
+                            continue
                         await self.emit(
                             "context_epoch_advanced",
                             task_id=task_id,
                             generation=generation,
                             request_id=msg["request_id"],
                             epoch=msg["epoch"],
+                            turn=msg["turn"],
                             checkpoint_ref=msg["checkpoint_ref"],
+                            cache_key=msg["cache_key"],
                             folded_from_epoch=msg["folded_from_epoch"],
                             reason=msg["reason"],
                         )
+                        self._task_epochs[task_id] = dict(msg)
                 elif mtype == "compaction_failed":
                     invalid = _invalid_compaction_failed_fields(msg)
                     if invalid:
@@ -4061,7 +4258,6 @@ class _Runtime:
                 "recovered-ref-advance"
             )
             if (kind == "merge_reconciled" or recovered) and task_id is not None:
-                self._mark_published(task_id)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="succeeded", exit_code=0,
                     reason=None, merge_sha=payload.get("new"),
@@ -4115,7 +4311,6 @@ class _Runtime:
                 None,
             )
             if terminal is not None:
-                self._mark_published(task_id)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="succeeded", exit_code=0,
                     reason=None, merge_sha=current,
@@ -4137,7 +4332,6 @@ class _Runtime:
                     "merge_reconciled", task_id=owner, new=current, repo=str(repo),
                     reason="ref-advanced-before-event",
                 )
-                self._mark_published(owner)
                 self._results[owner] = TaskResult(
                     task_id=owner, status="succeeded", exit_code=0,
                     reason=None, merge_sha=current,
@@ -4194,7 +4388,7 @@ class _Runtime:
                     _deferred_observers=deferred,
                 )
                 committed_persisted = True
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             merge_failed = True
             error_type = exc.__class__.__name__
             if error_type in ("NonFastForwardError", "MergeConflictError"):
@@ -4213,7 +4407,7 @@ class _Runtime:
                     ref_published and not committed_persisted
                 ):
                     await asyncio.to_thread(seq.cleanup_staging, repo)
-            except Exception as exc:
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 cleanup_failed = True
                 emitted = await self._flush_sequencer_events(
                     seq, deferred_observers=deferred
@@ -4227,7 +4421,13 @@ class _Runtime:
                 await self._flush_sequencer_events(seq, deferred_observers=deferred)
         try:
             await self._notify_deferred_observers(deferred)
-        except Exception as exc:
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            subprocess.SubprocessError,
+        ) as exc:
             await self.emit(
                 "merge_failed", task_id=task_id, merge_error=exc.__class__.__name__,
                 message=str(exc)[:512], generation=handle.generation, internal=True,
@@ -4257,33 +4457,48 @@ def _reject_reused_session(session_dir: str | Path) -> None:
 
 
 def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
-    """Atomically persist the accepted plan as ``<session_dir>/plan.json``.
+    """Persist the accepted plan once as ``<session_dir>/plan.json``.
 
     Mirrors the ``cambium.results.write_result`` JSON conventions:
     ``mkstemp`` in the target directory, compact ``ensure_ascii=False`` /
-    ``allow_nan=False`` JSON with a trailing newline, fsync, then
-    ``os.replace`` plus a directory fsync. The caller holds the session
-    lock, so this is the canonical pre-worker boundary artifact.
+    ``allow_nan=False`` JSON with a trailing newline and fsync. The caller
+    holds the session lock. A resume accepts the byte-identical manifest but
+    never replaces it.
     """
     target = Path(session_dir) / "plan.json"
+    content = json.dumps(
+        plan,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ) + "\n"
+    if target.exists():
+        existing_bytes = target.read_bytes()
+        if existing_bytes == content.encode("utf-8"):
+            return target
+        try:
+            existing_plan = json.loads(existing_bytes)
+            existing_specs = [
+                _validate_plan_task(session_dir, task)
+                for task in _plan_tasks(existing_plan)
+            ]
+        except (TypeError, ValueError):
+            existing_specs = []
+        if plan == {"tasks": existing_specs}:
+            return target
+        raise ValueError("session plan.json does not match the submitted plan")
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=Path(session_dir)
     )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(
-                plan,
-                stream,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            stream.write("\n")
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        os.chmod(target, 0o600)
+        os.chmod(temporary, 0o600)
+        os.link(temporary, target)
+        temporary.unlink()
         directory_fd = os.open(Path(session_dir), os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -5084,7 +5299,7 @@ async def run_plan(
     architectus: Any = None,
     conversations: bool | None = None,
     warm_pool_size: int = 0,
-    context_reuse: bool = False,
+    context_reuse: bool = True,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -5117,8 +5332,8 @@ async def run_plan(
     existing ``_admit_child`` revision validation. ``conversations=True`` opens
     ``ConversationStore`` at ``<session_dir>/.cambium/conversations.db`` for the
     session (closed on shutdown) and appends one row per admitted/rejected
-    revision. Both default off: the historical behavior is byte-for-byte
-    unchanged.
+    revision. Conversations and the warm pool default off; context reuse
+    defaults on and can be disabled by internal callers.
 
     Dispatch shape:
 
@@ -5322,7 +5537,7 @@ async def _amain_plan(
     *,
     conversations: bool = False,
     warm_pool_size: int = 0,
-    context_reuse: bool = False,
+    context_reuse: bool = True,
 ) -> int:
     loop = asyncio.get_running_loop()
 
@@ -5393,12 +5608,6 @@ def main(argv: list[str] | None = None) -> int:
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
     )
-    parser.add_argument(
-        "--context-reuse",
-        action="store_true",
-        help="cache-first context reuse: fork children from parent epoch "
-        "checkpoints and suspend/resume at delegate boundaries (default: off)",
-    )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)
     if args.warm_pool_size < 0:
@@ -5427,7 +5636,6 @@ def main(argv: list[str] | None = None) -> int:
                     plan,
                     conversations=args.conversations,
                     warm_pool_size=args.warm_pool_size,
-                    context_reuse=args.context_reuse,
                 )
             )
         except KeyboardInterrupt:

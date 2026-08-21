@@ -120,7 +120,7 @@ import tempfile
 import threading
 import time
 import zlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -149,7 +149,7 @@ from cambium.lint_diag import LintDiag
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import TOOL_SCHEMAS
-from cambium.tools import ToolContext, ToolResult, run_tool
+from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
@@ -1002,11 +1002,6 @@ def _rolling_compact_thresholds(
     return threshold_high, threshold_low
 
 
-def _tolerant_published(value: Any) -> bool:
-    """Read the supervisor publication gate without rejecting old payloads."""
-    return type(value) is bool and value
-
-
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     """Immutable per-task agent configuration parsed from init (init is authoritative)."""
@@ -1042,16 +1037,13 @@ class AgentConfig:
     # supervisor to child) carries the strict fork descriptor of the epoch a
     # compatible child reuses; ``resume`` (run_task) carries the checkpoint
     # ref and bounded child-result envelopes a suspended parent continues from.
-    context_reuse: bool = False
-    # Phase 4 rolling compaction is opt-in and only meaningful with context
-    # reuse. Thresholds are character counts: high defaults to the existing
-    # transcript budget and low defaults to half of high.
-    rolling_compact: bool = False
+    context_reuse: bool = True
+    # Rolling compaction is the default context-reuse policy. Internal callers
+    # can disable it explicitly. Thresholds are character counts: high defaults
+    # to the transcript budget and low defaults to half of high.
+    rolling_compact: bool = True
     rolling_compact_threshold_high: int = 0
     rolling_compact_threshold_low: int = 0
-    # The current run's supervisor publication gate. Invalid or absent wire
-    # values are deliberately treated as false for old supervisors.
-    published: bool = False
     context_fork: dict[str, Any] | None = None
     resume: dict[str, Any] | None = None
 
@@ -1147,7 +1139,7 @@ class AgentConfig:
             parent_envelope=_validate_parent_envelope(init.get("parent_envelope")),
             context_reuse=_strict_bool(init.get("context_reuse"), "init context_reuse"),
             rolling_compact=_strict_bool(
-                init.get("rolling_compact"), "init rolling_compact"
+                init.get("rolling_compact", True), "init rolling_compact"
             ),
             rolling_compact_threshold_high=rolling_threshold_high,
             rolling_compact_threshold_low=rolling_threshold_low,
@@ -1185,7 +1177,7 @@ def _merge_task_config(
     )
     resume = config.resume or _validate_resume(run.get("resume"))
     rolling_compact = config.rolling_compact
-    if "rolling_compact" not in init:
+    if "rolling_compact" not in init and "rolling_compact" in run:
         rolling_compact = _strict_bool(
             run.get("rolling_compact"), "run_task rolling_compact"
         )
@@ -1230,7 +1222,6 @@ def _merge_task_config(
         rolling_compact=rolling_compact,
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
-        published=_tolerant_published(run.get("published")),
         context_fork=config.context_fork,
         resume=resume,
     )
@@ -1283,11 +1274,10 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         parent_envelope=_validate_parent_envelope(run.get("parent_envelope")),
         context_reuse=_strict_bool(run.get("context_reuse"), "run_task context_reuse"),
         rolling_compact=_strict_bool(
-            run.get("rolling_compact"), "run_task rolling_compact"
+            run.get("rolling_compact", True), "run_task rolling_compact"
         ),
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
-        published=_tolerant_published(run.get("published")),
         context_fork=_validate_context_fork(run.get("context_fork")),
         resume=_validate_resume(run.get("resume")),
     )
@@ -1450,8 +1440,6 @@ def _exposed_tool_schemas(config: AgentConfig) -> list[dict[str, Any]]:
 
 
 def _permission_denied(name: str, args: dict[str, Any], config: AgentConfig) -> str | None:
-    if name == "run_shell" and not config.shell_permission:
-        return "run_shell is not permitted by this worker's permissions"
     if name == "git_op":
         op = args.get("op")
         if op not in INSPECTION_GIT_OPS:
@@ -1654,32 +1642,136 @@ def _plan_message(transcript: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def _fit_transcript_to_budget(
-    messages: list[dict[str, Any]], budget: int
-) -> list[dict[str, Any]]:
-    """Trim retained user observations so ``messages`` fits ``budget`` chars.
+_OBSERVATION_HEADER_RE = re.compile(r"\Atool (?P<name>[a-z_]+) ok=(?P<ok>True|False)\n")
 
-    The plan (if any) and the synthetic marker keep their full content; only
-    the retained tail observations are proportionally truncated (plain cuts,
-    no extra marker) to reach an exact fit.
+
+def _dropped_marker(dropped: int) -> dict[str, str]:
+    """The counted omission marker for dropped whole turns."""
+    return {
+        "role": "user",
+        "content": (
+            f"[prior context: {dropped} earlier message(s) dropped to bound the "
+            "transcript; only the plan and the most recent turns are retained]"
+        ),
+    }
+
+
+def _turn_groups(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group a message tail into whole turns.
+
+    A turn starts at each assistant action and includes the user messages
+    that follow it (observation, notes, loop state). User messages before
+    the first assistant action form one leading group.
     """
-    truncatable = [
-        message for message in messages[2:] if message.get("role") == "user"
-    ]
-    if not truncatable:
-        return messages
-    fixed = _transcript_chars(messages) - _transcript_chars(truncatable)
-    target = max(0, budget - fixed)
-    current = _transcript_chars(truncatable)
-    if current <= target:
-        return messages
-    scale = target / current
-    for message in truncatable:
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        message["content"] = _cap_utf8(content, int(len(content) * scale))
-    return messages
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "assistant" and current:
+            groups.append(current)
+            current = []
+        current.append(message)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _bound_observation(content: str, limit: int) -> str:
+    """Bound one wrapped tool observation to ``limit`` chars.
+
+    Only the observation body is truncated; the ``tool NAME ok=...`` header
+    line stays intact and a counted suffix reports the omitted body chars.
+    Returns ``content`` unchanged when it is not a wrapped observation or
+    the header alone already exceeds ``limit``.
+    """
+    if len(content) <= limit:
+        return content
+    match = _OBSERVATION_HEADER_RE.match(content)
+    if match is None:
+        return content
+    header = match.group(0)
+    if limit <= len(header):
+        return content
+    body = content[len(header):]
+    body_budget = limit - len(header)
+    reservation = f"\n[{len(body)} observation char(s) omitted]"
+    room = body_budget - len(reservation)
+    if room <= 0:
+        return header + _cap_utf8(body, body_budget)
+    truncated = _cap_utf8(body, room)
+    omitted = len(body) - len(truncated)
+    return header + truncated + f"\n[{omitted} observation char(s) omitted]"
+
+
+def _newest_observation(
+    groups: list[list[dict[str, Any]]],
+) -> tuple[int, int, dict[str, Any]] | None:
+    """The newest wrapped tool observation across ``groups``, if any."""
+    for group_index in range(len(groups) - 1, -1, -1):
+        group = groups[group_index]
+        for message_index in range(len(group) - 1, -1, -1):
+            message = group[message_index]
+            content = message.get("content")
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and _OBSERVATION_HEADER_RE.match(content) is not None
+            ):
+                return group_index, message_index, message
+    return None
+
+
+def _fit_turns_to_budget(
+    *,
+    plan: dict[str, Any] | None,
+    tail: list[dict[str, Any]],
+    dropped: int,
+    budget: int,
+    measure: Callable[[list[dict[str, Any]]], int],
+    drop_head: bool = False,
+) -> list[dict[str, Any]]:
+    """Assemble ``plan`` + counted marker + ``tail`` within ``budget``.
+
+    Turn-atomic: the oldest whole turns drop first and the marker counts
+    every dropped message. When the oldest remaining turn carries the newest
+    tool observation, that observation is bounded inside its wrapper instead
+    of dropping the turn. Inputs are never mutated. With ``drop_head`` the
+    plan and marker are also droppable so a degenerate budget still fits.
+    """
+    groups = _turn_groups(tail)
+    head = [plan] if plan is not None else []
+
+    def assemble() -> list[dict[str, Any]]:
+        return [
+            *head,
+            _dropped_marker(dropped),
+            *(message for group in groups for message in group),
+        ]
+
+    while True:
+        assembled = assemble()
+        overflow = measure(assembled) - budget
+        if overflow <= 0:
+            return assembled
+        if not groups:
+            if not drop_head:
+                return assembled
+            if head:
+                dropped += 1
+                head.pop(0)
+                continue
+            return []
+        newest = _newest_observation(groups)
+        if newest is not None and newest[0] == 0:
+            _, _, observation = newest
+            content = str(observation["content"])
+            bounded = _bound_observation(content, max(0, len(content) - overflow))
+            if bounded != content:
+                groups[0] = [
+                    {**message, "content": bounded} if message is observation else message
+                    for message in groups[0]
+                ]
+                continue
+        dropped += len(groups.pop(0))
 
 
 def _summarize_transcript(
@@ -1687,42 +1779,150 @@ def _summarize_transcript(
     budget: int,
     keep_turns: int = TRANSCRIPT_KEEP_TURNS,
     max_messages: int | None = None,
+    *,
+    measure: Callable[[list[dict[str, Any]]], int] = _transcript_chars,
+    drop_head: bool = False,
 ) -> list[dict[str, Any]]:
-    """Bound the transcript to ``budget`` characters without calling the LLM.
+    """Bound the transcript to ``budget`` without calling the LLM.
 
     Returns the transcript unchanged when it fits within the budget. When it
-    does not, keeps the plan message (if any), drops everything older than the
-    most recent ``keep_turns`` turns, inserts one synthetic "prior context
-    summary" marker, and proportionally truncates the retained observations so
-    the result stays within the budget. ``max_messages`` applies the same
-    retention policy when a message-count guard is also active.
+    does not, keeps the plan message (if any), drops whole turns oldest-first
+    under one counted "prior context" marker, and bounds an oversized newest
+    observation inside its wrapper rather than slicing it. ``max_messages``
+    applies the same retention policy when a message-count guard is also
+    active. ``measure`` sizes the assembled list (chars by default; the
+    rolling renderer passes its serialized size); ``drop_head`` lets the
+    plan and marker drop too so a degenerate budget still fits. The input
+    transcript is never mutated.
     """
-    if _transcript_chars(transcript) <= budget and (
+    if measure(transcript) <= budget and (
         max_messages is None or len(transcript) <= max_messages
     ):
         return list(transcript)
     tail = transcript[-(keep_turns * 2):] if keep_turns > 0 else []
     plan = _plan_message(transcript)
-    tail = [dict(message) for message in tail if message is not plan]
+    tail = [message for message in tail if message is not plan]
     if max_messages is not None:
         reserved = (1 if plan is not None else 0) + 1
         tail_capacity = max(0, max_messages - reserved)
         tail = tail[-tail_capacity:] if tail_capacity else []
     dropped = len(transcript) - len(tail) - (1 if plan is not None else 0)
-    marker = {
-        "role": "user",
-        "content": (
-            f"[prior context: {dropped} earlier message(s) dropped to bound the "
-            "transcript; only the plan and the most recent turns are retained]"
-        ),
-    }
-    kept: list[dict[str, Any]] = []
-    if plan is not None:
-        kept.append(dict(plan))
-    if max_messages is None or len(kept) < max_messages:
-        kept.append(marker)
-    kept.extend(tail)
-    return _fit_transcript_to_budget(kept, budget)
+    fitted = _fit_turns_to_budget(
+        plan=plan,
+        tail=tail,
+        dropped=dropped,
+        budget=budget,
+        measure=measure,
+        drop_head=drop_head,
+    )
+    if max_messages is not None and len(fitted) > max_messages:
+        # The plan outranks the marker under an extreme message-count guard.
+        marker_index = next(
+            (
+                index
+                for index, message in enumerate(fitted)
+                if "prior context" in str(message.get("content", ""))
+            ),
+            None,
+        )
+        del fitted[marker_index if marker_index is not None else -1]
+    return fitted
+
+
+_READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
+_EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
+
+
+def _call_paths(name: str, arguments: dict[str, Any]) -> list[str]:
+    """The file paths a tool call reads or writes (identifiers, not bodies)."""
+    if name == "read_batch":
+        paths = arguments.get("paths")
+        if isinstance(paths, list):
+            return [path for path in paths if isinstance(path, str)]
+        return []
+    path = arguments.get("path")
+    return [path] if isinstance(path, str) else []
+
+
+def _strip_for_fold(continuation: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tier-1 deterministic semantic stripping for fold rendering (plan §9.1.7).
+
+    Obsolete read bodies (every path re-read or edited by a later turn)
+    collapse to a one-line on-disk pointer; passing run_shell outputs
+    superseded by a later passing run collapse to a one-line status. Edits,
+    failures, the latest passing verification, identifiers, and the plan
+    survive. Pure (inputs never mutated), whole messages only, idempotent:
+    the markers regenerate byte-identically on a second pass.
+    """
+    calls: list[tuple[int, int, str, dict[str, Any], bool]] = []
+    for index, message in enumerate(continuation):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            action = json.loads(content)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(action, dict) or action.get("type") != "tool_call":
+            continue
+        name = action.get("name")
+        arguments = action.get("arguments")
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            continue
+        obs_index = index + 1
+        while obs_index < len(continuation):
+            candidate = continuation[obs_index]
+            if candidate.get("role") == "assistant":
+                break
+            obs_content = candidate.get("content")
+            if (
+                candidate.get("role") == "user"
+                and isinstance(obs_content, str)
+                and (match := _OBSERVATION_HEADER_RE.match(obs_content)) is not None
+                and match.group("name") == name
+            ):
+                calls.append((index, obs_index, name, arguments, match.group("ok") == "True"))
+                break
+            obs_index += 1
+
+    # suffix_paths[p] = paths read or edited by any call after position p.
+    suffix_paths: list[set[str]] = [set() for _ in range(len(calls) + 1)]
+    for position in range(len(calls) - 1, -1, -1):
+        _, _, name, arguments, _ = calls[position]
+        suffix_paths[position] = set(suffix_paths[position + 1])
+        if name in _READ_TOOL_NAMES or name in _EDIT_TOOL_NAMES:
+            suffix_paths[position].update(_call_paths(name, arguments))
+    last_passing_shell = max(
+        (obs_index for _, obs_index, name, _, ok in calls if name == "run_shell" and ok),
+        default=None,
+    )
+    rewrites: dict[int, str] = {}
+    for position, (_, obs_index, name, arguments, ok) in enumerate(calls):
+        content = str(continuation[obs_index]["content"])
+        header = content[: content.index("\n") + 1]
+        if name in _READ_TOOL_NAMES and ok:
+            paths = _call_paths(name, arguments)
+            if paths and all(path in suffix_paths[position + 1] for path in paths):
+                rewrites[obs_index] = (
+                    f"{header}[{name}: {', '.join(paths)} (omitted - file on disk)]"
+                )
+        elif name == "run_shell" and ok and obs_index != last_passing_shell:
+            rewrites[obs_index] = (
+                f"{header}[run_shell: passed "
+                "(output omitted - superseded by a later run)]"
+            )
+    if not rewrites:
+        return list(continuation)
+    return [
+        {**message, "content": rewrites[index]} if index in rewrites else message
+        for index, message in enumerate(continuation)
+    ]
+
+
+_ROLLING_CONTEXT_OPEN = "<cambium-rolling-context>\n"
+_ROLLING_CONTEXT_CLOSE = "\n</cambium-rolling-context>"
 
 
 def _render_rolling_compaction(
@@ -1730,31 +1930,37 @@ def _render_rolling_compaction(
 ) -> list[dict[str, str]]:
     """Render a deterministic bounded continuation summary as user data.
 
-    ``_summarize_transcript`` supplies the existing retention and truncation
-    semantics.  The resulting message list is then serialized into one
-    delimited user-role message so compacted, untrusted observations never
-    gain system authority.
+    Tier-1 stripping (§9.1.7) drops obsolete read bodies and superseded
+    passing run outputs first; ``_summarize_transcript`` then applies the
+    retention and turn-atomic bounding semantics against the exact
+    serialized size, so the embedded JSON always parses. The wrapper
+    overhead is reserved up front: the ``<cambium-rolling-context>`` closing
+    tag is never cut. Compacted, untrusted observations stay user-role data
+    and never gain system authority.
     """
+    budget = min(budget, MAX_OBSERVATION_BYTES)
+    inner_budget = budget - len(_ROLLING_CONTEXT_OPEN) - len(_ROLLING_CONTEXT_CLOSE)
+
+    def measure(messages: list[dict[str, Any]]) -> int:
+        return len(json.dumps(
+            messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ))
+
     summarized = _summarize_transcript(
-        copy.deepcopy(continuation),
-        budget,
+        _strip_for_fold(continuation),
+        max(0, inner_budget),
         max_messages=MAX_CONTEXT_MESSAGES,
-    )
-    serialized = json.dumps(
-        summarized,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
+        measure=measure,
+        drop_head=True,
     )
     content = (
-        "<cambium-rolling-context>\n"
-        + serialized
-        + "\n</cambium-rolling-context>"
+        _ROLLING_CONTEXT_OPEN
+        + json.dumps(
+            summarized, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        + _ROLLING_CONTEXT_CLOSE
     )
-    return [{
-        "role": "user",
-        "content": _cap_utf8(content, min(budget, MAX_OBSERVATION_BYTES)),
-    }]
+    return [{"role": "user", "content": content}]
 
 
 def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
@@ -2028,6 +2234,19 @@ def _fork_cache_compatible(
     return True, None
 
 
+def _task_message(task: str) -> dict[str, str]:
+    """Render the dynamic task text as delimited user-role data (plan §9.1.6).
+
+    The task is data, not a directive. Keeping it out of the system message
+    makes the system directive plus sorted tool schemas byte-identical
+    across tasks, so provider exact-prefix caches key on a stable head.
+    """
+    return {
+        "role": "user",
+        "content": f"<cambium-task>\nTask: {task}\n</cambium-task>",
+    }
+
+
 def _build_agent_prompt(
     task: str,
     tools: list[dict[str, Any]],
@@ -2070,23 +2289,21 @@ def _build_agent_prompt(
         '  {"type": "finish", "summary": "implemented and verified the change"}',
         "Available tools:",
         json.dumps(tools, sort_keys=True),
-        f"Task: {task}",
     ])
-    messages = [{"role": "system", "content": "\n".join(system_lines)}]
+    messages = [
+        {"role": "system", "content": "\n".join(system_lines)},
+        _task_message(task),
+    ]
     messages.extend(transcript)
     if parent_envelope:
         messages.append(_parent_envelope_message(parent_envelope))
-    if not messages or messages[-1].get("role") != "user":
+    if messages[-1].get("role") != "user":
         # Some providers (e.g. ZAI/GLM) reject payloads whose last message is
-        # not a user message: a fresh transcript has no non-system message
-        # (1214 on turn one), and a plan action leaves the transcript ending
-        # with an assistant message (1214 on the next turn). A neutral user
+        # not a user message: a plan action leaves the transcript ending with
+        # an assistant message (1214 on the next turn). A neutral user
         # message keeps every payload valid without changing the static
         # system prefix (plan step 3 caching).
-        messages.append({
-            "role": "user",
-            "content": "Begin." if len(messages) == 1 else "Continue.",
-        })
+        messages.append({"role": "user", "content": "Continue."})
     return {"messages": messages}
 
 
@@ -2725,8 +2942,7 @@ async def _emit_context_epoch_advanced(
     config: AgentConfig,
     *,
     request_id: str,
-    epoch: int,
-    checkpoint_ref: str,
+    checkpoint: ContextCheckpoint,
     folded_from_epoch: int,
     reason: str | None,
 ) -> None:
@@ -2735,8 +2951,10 @@ async def _emit_context_epoch_advanced(
         "request_id": request_id,
         "task_id": config.task_id,
         "generation": config.generation,
-        "epoch": epoch,
-        "checkpoint_ref": checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "turn": checkpoint.turn,
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "cache_key": asdict(checkpoint.cache_key),
         "folded_from_epoch": folded_from_epoch,
         "reason": reason,
     })
@@ -2750,13 +2968,17 @@ async def _emit_compaction_failed(
     epoch: int,
     reason: str,
 ) -> None:
+    safe_reason = _cap_utf8(reason, MAX_ENVELOPE_FIELD_CHARS)
+    if config.redactor is not None:
+        safe_reason = config.redactor.redact_escaped(safe_reason)
+        safe_reason = _cap_utf8(safe_reason, MAX_ENVELOPE_FIELD_CHARS)
     await send(writer, {
         "type": "compaction_failed",
         "request_id": request_id,
         "task_id": config.task_id,
         "generation": config.generation,
         "epoch": epoch,
-        "reason": _cap_utf8(reason, MAX_ENVELOPE_FIELD_CHARS),
+        "reason": safe_reason,
     })
 
 
@@ -3290,12 +3512,12 @@ async def _run_agent_loop(
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
 
-    async def _bound_context_continuation(turn: int) -> bool:
+    async def _bound_context_continuation(turn: int) -> tuple[bool, str | None]:
         """Bound mutable continuation or perform one durable rolling fold."""
         nonlocal context_continuation, current_epoch_checkpoint, epoch_count
         nonlocal compaction_armed, usage_epoch
 
-        rolling_gate = config.rolling_compact and config.context_reuse and config.published
+        rolling_gate = config.rolling_compact and config.context_reuse
         continuation_size = _transcript_chars(context_continuation)
         if rolling_gate:
             if continuation_size <= config.rolling_compact_threshold_low:
@@ -3352,21 +3574,30 @@ async def _run_agent_loop(
                     )
                     if checkpoint is None:
                         raise ContextForkError("rolling fold has no checkpoint root")
+                    checkpoint = _load_epoch_checkpoint(
+                        config, checkpoint.checkpoint_ref, expect_task_id=True
+                    )
                 except Exception as exc:
+                    failure_reason = str(exc).strip() or exc.__class__.__name__
+                    if config.redactor is not None:
+                        failure_reason = config.redactor.redact_escaped(failure_reason)
+                    failure_reason = _cap_utf8(
+                        failure_reason, MAX_ENVELOPE_FIELD_CHARS
+                    )
                     if writer is not None:
                         await _emit_compaction_failed(
                             writer,
                             config,
                             request_id=request_id,
                             epoch=prior_epoch,
-                            reason=str(exc),
+                            reason=failure_reason,
                         )
-                    return False
+                    return False, failure_reason
 
                 # Commit the in-memory transition only after the immutable
                 # checkpoint has been durably created. The old checkpoint and
                 # the stable base tuple are never mutated.
-                context_continuation = compacted_suffix
+                context_continuation = copy.deepcopy(checkpoint.continuation_suffix)
                 current_epoch_checkpoint = checkpoint
                 epoch_count = checkpoint.epoch
                 usage_epoch = checkpoint.epoch
@@ -3380,17 +3611,12 @@ async def _run_agent_loop(
                         writer,
                         config,
                         request_id=request_id,
-                        epoch=checkpoint.epoch,
-                        checkpoint_ref=checkpoint.checkpoint_ref,
+                        checkpoint=checkpoint,
                         folded_from_epoch=prior_epoch,
                         reason=None,
                     )
-                return True
-            # A publication-gated rolling run owns this seam. On a successful
-            # fold, hysteresis keeps the compacted suffix in place until it is
-            # back below the low threshold; on failure, fail-open preserves
-            # the raw continuation and avoids legacy truncation.
-            return False
+                return True, None
+            return False, None
 
         bounded = _summarize_transcript(
             context_continuation,
@@ -3398,11 +3624,11 @@ async def _run_agent_loop(
             max_messages=MAX_CONTEXT_MESSAGES,
         )
         if bounded == context_continuation:
-            return False
+            return False, None
         context_continuation = bounded
         epoch_count += 1
         _sync_context_transcript()
-        return True
+        return True, None
 
     resume = config.resume
     if resume is not None:
@@ -3496,7 +3722,16 @@ async def _run_agent_loop(
                 # the prompt boundary. No later turn can rewrite the epoch
                 # prefix in place.
                 if config.context_reuse:
-                    await _bound_context_continuation(turn)
+                    _folded, compaction_failure = await _bound_context_continuation(turn)
+                    if compaction_failure is not None:
+                        return _loop_result(
+                            outcome,
+                            "failed",
+                            f"compaction_failed: {compaction_failure}",
+                            turn - 1,
+                            cumulative_usage,
+                            transcript,
+                        )
                 prompt = _fork_prompt(base_messages, context_continuation)
             # Keep the object handed to the router immutable for checkpointing.
             # A provider adapter is allowed to normalize its local request, but
@@ -3703,7 +3938,14 @@ async def _run_agent_loop(
                     outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
                 )
             progress.tool = name
-            with ToolContext(worktree, lint=lint_diag) as ctx:
+            with ToolContext(
+                worktree,
+                lint=lint_diag,
+                policy=ToolPermissionPolicy(
+                    shell=config.shell_permission,
+                    network=config.network_permission,
+                ),
+            ) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)
             if name == "delegate" and tool_result.ok and writer is not None:
                 await _emit_delegated_child(

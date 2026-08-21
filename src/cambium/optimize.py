@@ -22,15 +22,24 @@ import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MethodType
-from typing import Any
+from typing import Any, cast
 
 import dspy
 
 from cambium import module_conformance
-from cambium.diffundo import Diffundo, ProviderTier
+from cambium.diffundo import Diffundo, DiffundoError, ProviderTier
 from cambium.jlens import JlenClient, JlenError, render_messages
 from cambium.lm import CambiumLM
-from cambium.modules.base import Example, load_module_manifest
+from cambium.modules.base import (
+    DatasetError,
+    Example,
+    ModuleContractError,
+    load_module_manifest,
+)
+
+_DSPY_EXCEPTIONS: Any = importlib.import_module("dspy.utils.exceptions")
+AdapterParseError = cast(type[Exception], _DSPY_EXCEPTIONS.__dict__["AdapterParseError"])
+DSPyError = cast(type[Exception], _DSPY_EXCEPTIONS.__dict__["DSPyError"])
 
 MODULES_DIR = module_conformance.MODULES_DIR
 
@@ -50,6 +59,9 @@ class _BudgetExhausted(OptimizeError):
     """Raised before a provider call when the cumulative budget is spent."""
 
 
+_MIN_CALL_BUDGET_USD = 0.01
+
+
 class _CostLedger:
     """Small per-run cost ledger used by the Diffundo adapter."""
 
@@ -62,6 +74,11 @@ class _CostLedger:
         return max(0.0, self.budget_usd - self.spent_usd)
 
     def check_available(self) -> None:
+        if self.budget_usd < _MIN_CALL_BUDGET_USD:
+            raise _BudgetExhausted(
+                f"optimization budget ${self.budget_usd:.6f} is below the "
+                f"${_MIN_CALL_BUDGET_USD:.2f} minimum for one provider call"
+            )
         if self.spent_usd >= self.budget_usd:
             raise _BudgetExhausted(
                 f"optimization budget exhausted: spent ${self.spent_usd:.6f} "
@@ -148,7 +165,7 @@ def load_program_class(manifest) -> type:
     target = target.strip()
     try:
         mod = _import_target(target)
-    except Exception as exc:
+    except ImportError as exc:
         raise OptimizeError(
             f"cannot import DSPy program module {target!r}: {type(exc).__name__}: {exc}"
         ) from exc
@@ -167,10 +184,7 @@ def _read_field(value: object, name: str) -> object:
         return value.get(name, _MISSING)
     getter = getattr(value, "get", None)
     if callable(getter):
-        try:
-            result = getter(name, _MISSING)
-        except Exception:
-            result = _MISSING
+        result = getter(name, _MISSING)
         if result is not _MISSING:
             return result
     try:
@@ -190,7 +204,7 @@ def _domain_module(program: object):
     target = f"{_program_package(program)}.decide"
     try:
         return _import_target(target)
-    except Exception:
+    except ImportError:
         target = _EXAMPLE_DECIDE_TARGET
         return _import_target(target)
 
@@ -203,7 +217,7 @@ def _metric_function(program: object) -> Callable[[Example], float]:
     target = f"{_program_package(program)}.metric"
     try:
         mod = _import_target(target)
-    except Exception:
+    except ImportError:
         target = _EXAMPLE_METRIC_TARGET
         mod = _import_target(target)
     metric = getattr(mod, "should_decompose_metric", None)
@@ -243,10 +257,7 @@ def _task_input(value: object, task_input_type: type) -> object | None:
         context = ""
     if not isinstance(context, str):
         return None
-    try:
-        return task_input_type(task=task, context=context)
-    except Exception:
-        return None
+    return task_input_type(task=task, context=context)
 
 
 def _prediction_output(raw: object, program: object) -> object | None:
@@ -265,7 +276,7 @@ def _prediction_output(raw: object, program: object) -> object | None:
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
-            except (TypeError, ValueError):
+            except json.JSONDecodeError:
                 return None
         if isinstance(raw, list) and len(raw) == 1:
             raw = raw[0]
@@ -289,10 +300,7 @@ def _prediction_output(raw: object, program: object) -> object | None:
         return None
     if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
         return None
-    try:
-        return output_type(decision=decision, reason=reason, confidence=float(confidence))
-    except Exception:
-        return None
+    return output_type(decision=decision, reason=reason, confidence=float(confidence))
 
 
 def _fallback_prediction(program: object) -> object:
@@ -474,7 +482,7 @@ def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callabl
             if jlens_client is not None:
                 score = _fuse_jlens(jlens_client, expected, trace, score, jlens_weight)
             return score
-        except Exception:
+        except (ImportError, KeyError, ValueError):
             return 0.0
 
     return metric
@@ -487,7 +495,7 @@ def _loader_split(loader: object, name: str) -> object:
         try:
             target = module_name
             split_type = getattr(_import_target(target), "Split", None)
-        except Exception:
+        except ImportError:
             split_type = None
     if not isinstance(split_type, type):
         target = _EXAMPLE_DATASET_TARGET
@@ -506,7 +514,7 @@ def _load_split(loader: object, name: str) -> list[Example]:
         return list(load_split(_loader_split(loader, name)))
     except OptimizeError:
         raise
-    except Exception as exc:
+    except (DatasetError, ImportError, OSError, KeyError, json.JSONDecodeError) as exc:
         raise OptimizeError(f"could not load the {name.lower()} split: {exc}") from exc
 
 
@@ -540,7 +548,7 @@ def _load_transcript_candidates(loader: object) -> list[Example]:
     loader_class = type(loader)
     try:
         candidate_loader = loader_class(candidate_path)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         raise OptimizeError(
             f"could not construct the dataset loader for transcript candidates: {exc}"
         ) from exc
@@ -549,7 +557,7 @@ def _load_transcript_candidates(loader: object) -> list[Example]:
         raise OptimizeError("dataset loader does not provide load for transcript candidates")
     try:
         candidates = list(load())
-    except Exception as exc:
+    except (DatasetError, ImportError, OSError, KeyError, json.JSONDecodeError) as exc:
         raise OptimizeError(f"could not load transcript candidates: {exc}") from exc
     if any(getattr(candidate, "canary", False) for candidate in candidates):
         raise OptimizeError("transcript candidate file contains a canary record")
@@ -614,7 +622,7 @@ def build_trainsets(loader, seed=0, val_fraction=0.2) -> tuple[list, list]:
         examples = list(load_split(_loader_split(loader, "TRAIN")))
     except OptimizeError:
         raise
-    except Exception as exc:
+    except (DatasetError, ImportError, OSError, KeyError, json.JSONDecodeError) as exc:
         raise OptimizeError(f"could not load the train split: {exc}") from exc
     if any(getattr(example, "canary", False) for example in examples):
         raise OptimizeError("train split contains a canary record")
@@ -642,7 +650,7 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
             raw_prediction = await program.decide(example.input)
         except _BudgetExhausted:
             raise
-        except Exception as exc:
+        except (AdapterParseError, ValueError) as exc:
             if not _is_parse_failure(exc):
                 raise
             raw_prediction = None
@@ -651,7 +659,7 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
             prediction = _fallback_prediction(program)
         try:
             score = scorer(example.with_prediction(prediction))
-        except Exception:
+        except (KeyError, ValueError):
             score = 0.0
         if isinstance(score, bool) or not isinstance(score, (int, float)):
             score = 0.0
@@ -726,10 +734,7 @@ def _ensure_bootstrap_forward(program: object) -> None:
         with dspy.context(lm=lm):
             return predictor(**kwargs)
 
-    try:
-        program.forward = MethodType(forward, program)
-    except Exception as exc:
-        raise OptimizeError("could not install the DSPy optimizer forward seam") from exc
+    program.forward = MethodType(forward, program)
 
 
 def run_stage_bootstrap(program, train_examples, val_examples, seed=0) -> tuple[object, dict]:
@@ -742,7 +747,7 @@ def run_stage_bootstrap(program, train_examples, val_examples, seed=0) -> tuple[
             max_labeled_demos=8,
             max_rounds=1,
         )
-    except Exception as exc:
+    except (DiffundoError, DSPyError) as exc:
         raise OptimizeError(f"could not create BootstrapFewShot: {exc}") from exc
 
     trainset = [_to_dspy_example(example, program) for example in train_examples]
@@ -753,7 +758,7 @@ def run_stage_bootstrap(program, train_examples, val_examples, seed=0) -> tuple[
             compiled = optimizer.compile(program, trainset=trainset)
         except _BudgetExhausted:
             raise
-        except Exception as exc:
+        except (DiffundoError, DSPyError) as exc:
             raise OptimizeError(f"BootstrapFewShot compilation failed: {exc}") from exc
     finally:
         random.setstate(state)
@@ -846,7 +851,7 @@ def _load_dataset_loader(manifest: object) -> object:
     target = f"{package_target}.dataset"
     try:
         dataset_module = _import_target(target)
-    except Exception as exc:
+    except ImportError as exc:
         raise OptimizeError(f"cannot import dataset module {target!r}: {exc}") from exc
 
     candidates: list[type] = []
@@ -862,7 +867,7 @@ def _load_dataset_loader(manifest: object) -> object:
     )
     try:
         return loader_class(Path(manifest.package_dir) / "datasets")
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         raise OptimizeError(f"could not construct dataset loader: {exc}") from exc
 
 
@@ -871,7 +876,7 @@ def _load_manifest(module_name: str) -> object:
     package_dir = MODULES_DIR / module_name
     try:
         return load_module_manifest(package_dir)
-    except Exception as first_error:
+    except (ModuleContractError, OSError) as first_error:
         if not MODULES_DIR.is_dir():
             raise first_error
         for candidate in sorted(MODULES_DIR.iterdir(), key=lambda path: path.name):
@@ -882,7 +887,7 @@ def _load_manifest(module_name: str) -> object:
                 continue
             try:
                 manifest = load_module_manifest(candidate)
-            except Exception:
+            except (ModuleContractError, OSError):
                 continue
             if manifest.module_name == module_name:
                 return manifest
@@ -933,7 +938,7 @@ def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any
     try:
         providers = load_providers()
         selected = select_provider(providers, tier=tier)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         raise OptimizeError(f"provider selection failed: {exc}") from exc
 
     options: dict[str, Any] = {"primary_provider": selected.name}
@@ -1025,7 +1030,7 @@ def _anti_reward_gap(
     return float(train_gain - canary_gain)
 
 
-def main(argv=None) -> int:
+def _run(argv=None) -> int:
     """Run one optimization plan and return its process exit code."""
     args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     if isinstance(args.budget_usd, bool) or not math.isfinite(args.budget_usd):
@@ -1037,7 +1042,7 @@ def main(argv=None) -> int:
 
     try:
         manifest = _load_manifest(args.module_name)
-    except Exception as exc:
+    except (ModuleContractError, OSError) as exc:
         print(f"cambium optimize: manifest load failed: {exc}", file=sys.stderr)
         return 1
 
@@ -1170,7 +1175,7 @@ def main(argv=None) -> int:
                     report,
                     promote=False,
                 )
-            except Exception as artifact_error:
+            except (OptimizeError, OSError) as artifact_error:
                 print(
                     f"cambium optimize: could not write budget report artifact: {artifact_error}",
                     file=sys.stderr,
@@ -1178,6 +1183,11 @@ def main(argv=None) -> int:
             else:
                 print(f"cambium optimize: wrote {artifact}", file=sys.stderr)
         return 1
+
+
+def main(argv=None) -> int:
+    try:
+        return _run(argv)
     except Exception as exc:
         print(f"cambium optimize: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

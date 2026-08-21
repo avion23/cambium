@@ -17,6 +17,7 @@ has no third-party dependencies.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 from typing import Any
@@ -145,48 +146,117 @@ def health(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     }
 
 
-def can_run_heavy(thresholds: dict | None = None) -> tuple[bool, list[str]]:
-    """Check whether the current host meets the heavy-operation budget.
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def decide_heavy_work(
+    available_frac: float | None,
+    load1: float | None,
+    cpu_count: int | None,
+    disk_free: int | None,
+    thresholds: dict | None = None,
+) -> tuple[bool, list[str]]:
+    """Decide whether readings meet the heavy-operation budget.
 
     Threshold keys are minimum ``mem_available_frac``, maximum
     ``load1_per_cpu`` (the multiplier applied to the logical CPU count), and
     minimum ``disk_free`` bytes.  Defaults are 0.10, 2.0, and 1 GiB.
-    Missing measurements fail closed and add a reason.
+    Minimum thresholds and the maximum load threshold are inclusive. Missing
+    or invalid readings and thresholds fail closed and add a reason.
     """
     configured = {} if thresholds is None else dict(thresholds)
-    minimum_memory = float(configured.get("mem_available_frac", 0.10))
-    maximum_load_per_cpu = float(configured.get("load1_per_cpu", 2.0))
-    minimum_disk_free = int(configured.get("disk_free", 1 << 30))
-    snapshot = health()
     reasons: list[str] = []
 
-    memory = snapshot["mem"]
-    available_frac = memory["available_frac"]
+    try:
+        minimum_memory = float(configured.get("mem_available_frac", 0.10))
+    except (TypeError, ValueError, OverflowError):
+        minimum_memory = None
+    if (
+        minimum_memory is None
+        or not _is_finite_number(minimum_memory)
+        or not 0.0 <= minimum_memory <= 1.0
+    ):
+        reasons.append("mem_available_frac threshold invalid")
+
+    try:
+        maximum_load_per_cpu = float(configured.get("load1_per_cpu", 2.0))
+    except (TypeError, ValueError, OverflowError):
+        maximum_load_per_cpu = None
+    if (
+        maximum_load_per_cpu is None
+        or not _is_finite_number(maximum_load_per_cpu)
+        or maximum_load_per_cpu < 0.0
+    ):
+        reasons.append("load1_per_cpu threshold invalid")
+
+    raw_minimum_disk_free = configured.get("disk_free", 1 << 30)
+    try:
+        minimum_disk_free = int(raw_minimum_disk_free)
+    except (TypeError, ValueError, OverflowError):
+        minimum_disk_free = None
+    if (
+        minimum_disk_free is None
+        or not _is_finite_number(raw_minimum_disk_free)
+        or minimum_disk_free < 0
+        or minimum_disk_free != raw_minimum_disk_free
+    ):
+        reasons.append("disk_free threshold invalid")
+
     if available_frac is None:
         reasons.append("mem_available_frac unavailable")
-    elif available_frac < minimum_memory:
+    elif (
+        not _is_finite_number(available_frac)
+        or not 0.0 <= available_frac <= 1.0
+    ):
+        reasons.append("mem_available_frac invalid")
+    elif minimum_memory is not None and available_frac < minimum_memory:
         reasons.append(
             f"mem_available_frac {available_frac:.3f} < {minimum_memory:.3f}"
         )
 
-    load1 = snapshot["load1"]
-    cpu_count = snapshot["cpu_count"]
     if load1 is None:
         reasons.append("load1 unavailable")
-    elif not isinstance(cpu_count, int) or cpu_count <= 0:
+    elif not _is_finite_number(load1) or load1 < 0.0:
+        reasons.append("load1 invalid")
+    elif (
+        not isinstance(cpu_count, int)
+        or isinstance(cpu_count, bool)
+        or cpu_count <= 0
+        or not _is_finite_number(cpu_count)
+    ):
         reasons.append("cpu_count unavailable")
-    elif load1 > cpu_count * maximum_load_per_cpu:
-        reasons.append(
-            f"load1 {load1:.3f} > {cpu_count * maximum_load_per_cpu:.3f}"
-        )
+    elif maximum_load_per_cpu is not None:
+        cutoff = cpu_count * maximum_load_per_cpu
+        if load1 > cutoff:
+            reasons.append(f"load1 {load1:.3f} > {cutoff:.3f}")
 
-    disk_free = snapshot["disk"]["free"]
     if disk_free is None:
         reasons.append("disk_free unavailable")
-    elif disk_free < minimum_disk_free:
+    elif not _is_finite_number(disk_free) or disk_free < 0:
+        reasons.append("disk_free invalid")
+    elif minimum_disk_free is not None and disk_free < minimum_disk_free:
         reasons.append(f"disk_free {disk_free} < {minimum_disk_free}")
 
     return not reasons, reasons
+
+
+def can_run_heavy(thresholds: dict | None = None) -> tuple[bool, list[str]]:
+    """Check whether the current host meets the heavy-operation budget."""
+    snapshot = health()
+    memory = snapshot["mem"]
+    return decide_heavy_work(
+        memory["available_frac"],
+        snapshot["load1"],
+        snapshot["cpu_count"],
+        snapshot["disk"]["free"],
+        thresholds,
+    )
 
 
 def format_health(snapshot: dict[str, Any]) -> str:

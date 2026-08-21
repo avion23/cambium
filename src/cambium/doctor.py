@@ -61,7 +61,7 @@ from .system_health import format_health, health
 MIN_PYTHON = (3, 14)
 MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
-CONVERSATIONS_DB_REL = ".cambium/sessions/conversations.db"
+CONVERSATIONS_DB_REL = ".cambium/conversations.db"
 MODULES_ROOT = Path(__file__).resolve().parent / "modules"
 OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
 
@@ -786,18 +786,35 @@ def run_checks(
 
 def format_report(checks: list[Check]) -> str:
     lines = ["cambium doctor — Cambium harness diagnostics"]
-    for check in checks:
+    ordered_checks = sorted(checks, key=lambda check: check.number)
+    for check in ordered_checks:
         lines.append(
             f"  {check.number:>2}. {check.name:<22} "
-            f"{check.status.value.upper():<5} {check.detail}"
+            f"{check.status.value.upper():<5} {_redact_report_detail(check.detail)}"
         )
-    counts = Counter(check.status for check in checks)
+    counts = Counter(check.status for check in ordered_checks)
     lines.append(
         f"Summary: {counts[Status.PASS]} pass · {counts[Status.WARN]} warn · "
         f"{counts[Status.SKIP]} skip · {counts[Status.INFO]} info · "
         f"{counts[Status.FAIL]} fail"
     )
     return "\n".join(lines)
+
+
+def _redact_report_detail(detail: str) -> str:
+    environment = dict(os.environ)
+    safe_environment = auth.scrub_environment(environment)
+    secret_values = sorted(
+        {
+            value
+            for name, value in environment.items()
+            if name not in safe_environment and value
+        },
+        key=lambda value: (-len(value), value),
+    )
+    for value in secret_values:
+        detail = detail.replace(value, "***")
+    return detail
 
 
 def exit_code(checks: list[Check]) -> int:

@@ -8,9 +8,9 @@ only:
 - **D1 — no local cache.** ``Diffundo`` is a stateless router; the only state is
   per-provider cooldown timers, circuit-breaker health, and token buckets
   (architecture §8.1, §9.2). There is no response store anywhere in the module.
-- **D8c — prompt prefix layout.** ``validate_prompt_structure`` lints the full
-  leading message for volatile tokens — timestamps
-  and ``request_id`` — that would churn a provider's exact-prefix cache key.
+- **D8c — prompt prefix layout.** ``validate_prompt_structure`` lints the
+  immutable message header for volatile timestamps, epoch stamps, request or
+  trace IDs, and UUIDs that would churn a provider's exact-prefix cache key.
 - **D8f — token bucket + pause-on-exhaustion.** Each provider carries a token
   bucket refilled at ``rpm`` tokens/minute; an empty bucket marks the provider
   ``RATE_LIMITED`` and the cascade skips it. When every provider in a tier is
@@ -106,7 +106,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC
 from email.utils import parsedate_to_datetime
@@ -118,10 +118,26 @@ from . import __version__
 from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
 from .selection import order_candidates
 
-_TIMESTAMP_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
+_TIMESTAMP_PATTERN = (
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}"
+    r"(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
-_VOLATILE_MARKERS = ("request_id", "request-id")
+_EPOCH_PATTERN = r"(?<!\d)(?:\d{10}|\d{13}|\d{16}|\d{19})(?:\.\d+)?(?!\d)"
+_REQUEST_TRACE_ID_PATTERN = r"\b(?:request|trace)[ _-]?id\b"
+_UUID_PATTERN = (
+    r"(?<![0-9a-f])"
+    r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?"
+    r"[0-9a-f]{4}-?[0-9a-f]{12}"
+    r"(?![0-9a-f])"
+)
+_VOLATILE_TOKEN_RE = re.compile(
+    rf"(?P<timestamp>{_TIMESTAMP_PATTERN})"
+    rf"|(?P<epoch>{_EPOCH_PATTERN})"
+    rf"|(?P<request_trace_id>{_REQUEST_TRACE_ID_PATTERN})"
+    rf"|(?P<uuid>{_UUID_PATTERN})",
+    re.IGNORECASE,
+)
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)[^/\s?#@]*@",
     re.IGNORECASE,
@@ -339,7 +355,7 @@ class CostBudgetExceeded(DiffundoError):
 
 
 class PromptStructureError(ValueError):
-    """A volatile token (timestamp / request_id) sits in the static prompt head."""
+    """A volatile token sits in the immutable prompt header."""
 
 
 # --------------------------------------------------------------------------- #
@@ -347,42 +363,57 @@ class PromptStructureError(ValueError):
 # --------------------------------------------------------------------------- #
 
 
-def _prompt_head(prompt: dict[str, Any]) -> str:
-    """Leading static text of an OpenAI-compatible prompt dict."""
+def _prompt_header(prompt: dict[str, Any]) -> Iterator[tuple[int, str]]:
+    """Yield string content in messages before the first user-role tail."""
     messages = prompt.get("messages")
     if isinstance(messages, list) and messages:
-        first = messages[0]
-        if isinstance(first, dict):
-            content = first.get("content")
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "user":
+                return
+            content = message.get("content")
             if isinstance(content, str):
-                return content
-    if isinstance(prompt.get("prompt"), str):
-        return prompt["prompt"]
-    return ""
+                yield index, content
+        return
+    content = prompt.get("prompt")
+    if isinstance(content, str):
+        yield 0, content
 
 
 def validate_prompt_structure(prompt: dict[str, Any]) -> None:
-    """Raise when volatile tokens appear in the leading message (D8c).
+    """Raise when volatile tokens appear in the immutable prompt header (D8c).
 
     Provider-side prefix caches are exact-prefix content-addressed; timestamps
-    and ``request_id`` values at the top churn the prefix key. Static,
-    byte-stable content must sit at the top and dynamic content at the bottom,
-    so the full leading message is linted.
+    and request or trace IDs at the top churn the prefix key. Static, byte-stable
+    content must sit at the top and dynamic user content at the bottom.
     """
-    head = _prompt_head(prompt)
-    for idx, line in enumerate(head.splitlines(), start=1):
-        if _TIMESTAMP_RE.search(line):
-            raise PromptStructureError(
-                f"line {idx}: volatile timestamp token in the static prefix; "
-                "timestamps belong below the first 3 lines (D8c)"
-            )
-        lowered = line.lower()
-        for marker in _VOLATILE_MARKERS:
-            if marker in lowered:
-                raise PromptStructureError(
-                    f"line {idx}: volatile {marker!r} token in the static prefix; "
-                    "request ids belong below the first 3 lines (D8c)"
-                )
+    offending_indexes: list[int] = []
+    first_detail: tuple[int, str] | None = None
+    for message_index, content in _prompt_header(prompt):
+        match = _VOLATILE_TOKEN_RE.search(content)
+        if match is None:
+            continue
+        offending_indexes.append(message_index)
+        if first_detail is None:
+            line = len(_LINE_BREAK_RE.findall(content, 0, match.start())) + 1
+            if match.lastgroup == "timestamp":
+                token_description = "timestamp"
+            elif match.lastgroup == "epoch":
+                token_description = "epoch stamp"
+            elif match.lastgroup == "request_trace_id":
+                token_description = repr(match.group())
+            else:
+                token_description = "UUID"
+            first_detail = line, token_description
+    if first_detail is None:
+        return
+    line, token_description = first_detail
+    raise PromptStructureError(
+        f"message indexes {offending_indexes}; line {line}: volatile "
+        f"{token_description} token in the static prefix; "
+        "dynamic content belongs after the first user message (D8c)"
+    )
 
 
 def prompt_prefix_bytes(prompt: dict[str, Any]) -> int | None:

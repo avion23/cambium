@@ -173,17 +173,29 @@ def _positive_float(value: str) -> float:
 
 def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-dir", required=True, metavar="DIR")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
+        "--plan",
+        metavar="PATH",
+        help="path to plan JSON for multi-worker mode",
+    )
+    inputs.add_argument(
+        "--task-spec",
+        metavar="PATH",
+        help="path to task spec JSON for one-task mode",
+    )
+    inputs.add_argument("--demo", action="store_true", help="run the built-in mutating demo")
+    parser.add_argument(
+        "--warm-pool-size",
+        type=int,
+        default=0,
+        help="maximum reusable idle workers (default: 0)",
+    )
     parser.add_argument(
         "--conversations",
         action="store_true",
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
-    )
-    parser.add_argument(
-        "--context-reuse",
-        action="store_true",
-        help="cache-first context reuse: fork children from parent epoch "
-        "checkpoints and suspend/resume at delegate boundaries (default: off)",
     )
 
 
@@ -244,12 +256,6 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="prompt to run against the repository",
     )
     _add_routing_budget_arguments(parser)
-    parser.add_argument(
-        "--context-reuse",
-        action="store_true",
-        help="cache-first context reuse: fork children from parent epoch "
-        "checkpoints and suspend/resume at delegate boundaries (default: off)",
-    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -307,7 +313,7 @@ def _build_parser() -> argparse.ArgumentParser:
     supervisor = commands.add_parser(
         "supervisor",
         help="run the supervisor",
-        description="Run one session using the supervisor module's built-in plan.",
+        description="Run one session from a plan, task spec, or built-in demo.",
     )
     _add_supervisor_arguments(supervisor)
 
@@ -433,7 +439,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     session = commands.add_parser(
         "session",
-        help="list, latest, or show sessions",
+        help="list, latest, show, status, resume, or usage sessions",
         description="List, latest, or show Cambium sessions.",
     )
     session_commands = session.add_subparsers(
@@ -518,10 +524,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _supervisor_args(args: argparse.Namespace) -> list[str]:
     delegated = ["--session-dir", args.session_dir]
+    if args.plan:
+        delegated.extend(["--plan", args.plan])
+    elif args.task_spec:
+        delegated.extend(["--task-spec", args.task_spec])
+    else:
+        delegated.append("--demo")
+    if args.warm_pool_size:
+        delegated.extend(["--warm-pool-size", str(args.warm_pool_size)])
     if getattr(args, "conversations", False):
         delegated.append("--conversations")
-    if getattr(args, "context_reuse", False):
-        delegated.append("--context-reuse")
     return delegated
 
 
@@ -867,7 +879,7 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
             max_turns=_budget_or_default(
                 getattr(args, "max_turns", None), oneshot.DEFAULT_MAX_TURNS
             ),
-            context_reuse=getattr(args, "context_reuse", False),
+            context_reuse=True,
         )
     except ValueError as exc:
         print(f"cambium run: {exc}", file=sys.stderr)
@@ -1182,17 +1194,17 @@ async def async_main(argv: list[str] | None = None) -> int:
         case "architectus":
             return await _run_architectus(args)
         case "supervisor":
-            return _run_supervisor(args)
+            return await asyncio.to_thread(_run_supervisor, args)
         case "auth":
             return _run_auth(args)
         case "doctor":
             return _run_doctor(args)
         case "bench":
-            return _run_bench(args)
+            return await asyncio.to_thread(_run_bench, args)
         case "module-test":
-            return _run_module_test(args)
+            return await asyncio.to_thread(_run_module_test, args)
         case "session":
-            return _run_session(args)
+            return await asyncio.to_thread(_run_session, args)
         case "version":
             print(__version__)
             return ExitCode.SUCCESS

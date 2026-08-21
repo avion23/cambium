@@ -66,11 +66,63 @@ def test_module_test_rejects_arbitrary_pytest_arguments(capsys) -> None:
 
 
 @pytest.mark.parametrize("option", ["--plan", "--task-spec"])
-def test_unified_supervisor_rejects_module_input_options(option, capsys, tmp_path) -> None:
+def test_unified_supervisor_forwards_module_input_options(
+    option, monkeypatch, tmp_path: Path
+) -> None:
+    from cambium import supervisor
+
+    calls: list[list[str]] = []
+
+    def fake_main(argv=None):
+        calls.append(list(argv or []))
+        return 17
+
+    monkeypatch.setattr(supervisor, "main", fake_main)
+
+    assert cli.main(
+        ["supervisor", "--session-dir", str(tmp_path), option, "input.json"]
+    ) == 17
+    assert calls == [["--session-dir", str(tmp_path), option, "input.json"]]
+
+
+def test_unified_supervisor_forwards_demo_and_warm_pool(monkeypatch, tmp_path: Path) -> None:
+    from cambium import supervisor
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        supervisor,
+        "main",
+        lambda argv=None: calls.append(list(argv or [])) or 0,
+    )
+
+    assert cli.main(
+        [
+            "supervisor",
+            "--session-dir",
+            str(tmp_path),
+            "--demo",
+            "--warm-pool-size",
+            "2",
+            "--conversations",
+        ]
+    ) == 0
+    assert calls == [
+        [
+            "--session-dir",
+            str(tmp_path),
+            "--demo",
+            "--warm-pool-size",
+            "2",
+            "--conversations",
+        ]
+    ]
+
+
+def test_removed_context_reuse_option_is_not_in_run_help(capsys) -> None:
     with pytest.raises(SystemExit) as raised:
-        cli.main(["supervisor", "--session-dir", str(tmp_path), option, "input.json"])
-    assert raised.value.code == 2
-    assert "invalid command arguments" in capsys.readouterr().err
+        cli.main(["run", "--help"])
+    assert raised.value.code == 0
+    assert "--context-reuse" not in capsys.readouterr().out
 
 
 def test_architectus_live_without_provider_config_exits_two(

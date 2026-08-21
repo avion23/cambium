@@ -3,7 +3,13 @@
 Reads durable ``usage_event`` rows and separates calls into parent baseline,
 fork first/later turn, and resume first/later turn buckets. The provider cache
 is treated as an observation only: this script does not add cache-control
-fields, select providers, or require a cache hit.
+fields, select providers, or require a cache hit. It also reports the token
+economics around each durable epoch boundary. Boundary prefix metadata comes
+from ``event["payload"]["cache_key"]["prefix_bytes"]`` and
+``event["payload"]["cache_key"]["prefix_sha256"]`` on
+``context_checkpoint`` and ``context_epoch_advanced`` rows. Usage token
+metadata comes from the nearest same-task, same-generation ``usage_event``
+rows before and after the boundary.
 
 Run:
   PYTHONPATH=src python3.14 scripts/context_cache_evidence.py SESSION_DIR...
@@ -27,6 +33,7 @@ from cambium.supervisor import read_events  # noqa: E402
 
 UNKNOWN_PROVIDER = "<unknown>"
 BUCKETS = ("baseline", "fork_first", "fork_later", "resume_first", "resume_later")
+BOUNDARY_KINDS = ("context_checkpoint", "context_epoch_advanced")
 DEFAULT_THRESHOLD = 0.8
 
 
@@ -57,13 +64,17 @@ def _generation(event: dict[str, Any]) -> int | None:
     return generation if generation > 0 else None
 
 
-def _session_usage_events(session_dir: Path) -> list[dict[str, Any]] | None:
+def _session_events(session_dir: Path) -> list[dict[str, Any]] | None:
     if not (session_dir / ".cambium" / "events.db").is_file():
         return None
-    return [
-        event for event in read_events(session_dir)
-        if event.get("kind") == "usage_event"
-    ]
+    return read_events(session_dir)
+
+
+def _session_usage_events(session_dir: Path) -> list[dict[str, Any]] | None:
+    events = _session_events(session_dir)
+    if events is None:
+        return None
+    return [event for event in events if event.get("kind") == "usage_event"]
 
 
 def _resolve_sessions(sessions: list[str], repos: list[str]) -> list[Path]:
@@ -146,24 +157,220 @@ def _classify_events(
     return classified
 
 
+def _event_sequence(event: dict[str, Any]) -> int | None:
+    sequence = event.get("seq")
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        return None
+    return sequence
+
+
+def _ordered_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return event-log order without making missing synthetic seq values random."""
+    if not all(_event_sequence(event) is not None for event in events):
+        return list(events)
+    return [
+        event
+        for _, event in sorted(
+            enumerate(events),
+            key=lambda item: (_event_sequence(item[1]), item[0]),
+        )
+    ]
+
+
+def _positive_int(source: dict[str, Any], field: str) -> int | None:
+    value = source.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _nonnegative_int(source: dict[str, Any], field: str) -> int | None:
+    value = source.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _nonnegative_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if value >= 0 else None
+
+
+def _usage_mapping(payload: dict[str, Any]) -> dict[str, Any]:
+    usage = payload.get("usage")
+    return usage if isinstance(usage, dict) else {}
+
+
+def _usage_value(
+    usage: dict[str, Any], field: str
+) -> int | float | None:
+    return _nonnegative_number(usage.get(field))
+
+
+def _usage_evidence(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    usage = _usage_mapping(payload)
+    prompt_tokens = _usage_value(usage, "prompt_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = _usage_value(usage, "input_tokens")
+    cached_tokens = _usage_value(usage, "cached_tokens")
+    uncached_tokens: int | float | None = None
+    if prompt_tokens is not None and cached_tokens is not None:
+        remainder = prompt_tokens - cached_tokens
+        if remainder >= 0:
+            uncached_tokens = remainder
+    return {
+        "seq": _event_sequence(event),
+        "turn": _positive_int(payload, "turn"),
+        "prompt_prefix_bytes": _nonnegative_int(payload, "prompt_prefix_bytes"),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "uncached_tokens": uncached_tokens,
+        "completion_tokens": _usage_value(usage, "completion_tokens"),
+        "total_tokens": _usage_value(usage, "total_tokens"),
+        "latency_s": _nonnegative_number(payload.get("latency_s")),
+    }
+
+
+def _boundary_metadata(
+    payload: dict[str, Any],
+) -> tuple[int | None, str | None, list[str]]:
+    """Read the canonical prefix length and hash from a boundary cache key."""
+    cache_key = payload.get("cache_key")
+    if not isinstance(cache_key, dict):
+        return None, None, ["cache_key"]
+    prefix_bytes = _nonnegative_int(cache_key, "prefix_bytes")
+    prefix_sha256 = cache_key.get("prefix_sha256")
+    if not isinstance(prefix_sha256, str) or not prefix_sha256:
+        prefix_sha256 = None
+    missing: list[str] = []
+    if prefix_bytes is None:
+        missing.append("cache_key.prefix_bytes")
+    if prefix_sha256 is None:
+        missing.append("cache_key.prefix_sha256")
+    return prefix_bytes, prefix_sha256, missing
+
+
+def _boundary_turn(payload: dict[str, Any]) -> int | None:
+    return _positive_int(payload, "turn")
+
+
+def _epoch_transitions(
+    events: list[dict[str, Any]], session: str
+) -> list[dict[str, Any]]:
+    """Derive deterministic transition evidence from one replayed event list."""
+    ordered = _ordered_events(events)
+    usage_by_stream: dict[tuple[str, int | None], list[tuple[int, dict[str, Any]]]] = {}
+    for position, event in enumerate(ordered):
+        if event.get("kind") != "usage_event":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        stream = (
+            _task_id(event, payload),
+            _generation(event),
+        )
+        usage_by_stream.setdefault(stream, []).append((position, event))
+
+    prior_epochs: dict[tuple[str, int | None], int] = {}
+    transitions: list[dict[str, Any]] = []
+    for position, event in enumerate(ordered):
+        kind = event.get("kind")
+        if kind not in BOUNDARY_KINDS:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        stream = (
+            _task_id(event, payload),
+            _generation(event),
+        )
+        epoch = _positive_int(payload, "epoch")
+        folded_from_epoch = _positive_int(payload, "folded_from_epoch")
+        from_epoch = folded_from_epoch
+        if from_epoch is None:
+            from_epoch = prior_epochs.get(stream)
+        if from_epoch is None and epoch is not None:
+            from_epoch = epoch - 1
+        prefix_bytes, prefix_sha256, metadata_missing = _boundary_metadata(payload)
+        if epoch is None:
+            metadata_missing = [*metadata_missing, "epoch"]
+        boundary_turn = _boundary_turn(payload)
+        same_stream_usage = usage_by_stream.get(stream, [])
+        before_event = next(
+            (usage for usage_position, usage in reversed(same_stream_usage)
+             if usage_position < position),
+            None,
+        )
+        after_event = next(
+            (usage for usage_position, usage in same_stream_usage
+             if usage_position > position),
+            None,
+        )
+        before = _usage_evidence(before_event) if before_event is not None else None
+        after = _usage_evidence(after_event) if after_event is not None else None
+        record = {
+            "session": session,
+            "task_id": stream[0],
+            "generation": stream[1],
+            "kind": kind,
+            "seq": _event_sequence(event),
+            "from_epoch": from_epoch,
+            "to_epoch": epoch,
+            "epoch": epoch,
+            "folded_from_epoch": folded_from_epoch,
+            "turn": boundary_turn,
+            "prefix_bytes": prefix_bytes,
+            "prefix_sha256": prefix_sha256,
+            "prefix_bytes_before": (
+                before["prompt_prefix_bytes"] if before is not None else None
+            ),
+            "prefix_bytes_after": (
+                after["prompt_prefix_bytes"] if after is not None else None
+            ),
+            "usage_before": before,
+            "usage_after": after,
+            "boundary_metadata_missing": sorted(set(metadata_missing)),
+        }
+        transitions.append(record)
+        if epoch is not None:
+            prior_epochs[stream] = epoch
+    return transitions
+
+
 def _aggregate(
     session_dirs: list[Path],
 ) -> tuple[dict[str, dict[str, _BucketStats]], list[dict[str, Any]], list[str]]:
     providers: dict[str, dict[str, _BucketStats]] = {}
     sessions: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for session_dir in session_dirs:
+    for session_dir in sorted(session_dirs):
         if not session_dir.is_dir():
             warnings.append(f"{session_dir}: not a directory; skipped")
             continue
-        usage_events = _session_usage_events(session_dir)
-        if usage_events is None:
+        all_events = _session_events(session_dir)
+        if all_events is None:
+            # Keep the existing seam used by callers/tests that provide only
+            # usage rows for a session without creating an events.db.
+            all_events = _session_usage_events(session_dir)
+        usage_events = (
+            [event for event in all_events if event.get("kind") == "usage_event"]
+            if all_events is not None else None
+        )
+        if all_events is None or usage_events is None:
             warnings.append(f"{session_dir}: no event DB; skipped")
             sessions.append({
                 "dir": str(session_dir), "usage_events": 0,
                 "usable_events": 0, "skipped": True, "missing_db": True,
             })
             continue
+        transitions = _epoch_transitions(all_events or [], str(session_dir))
         usable = _classify_events(usage_events, str(session_dir))
         for bucket, payload in usable:
             provider = _provider_name(payload)
@@ -171,11 +378,24 @@ def _aggregate(
                 provider, {name: _BucketStats() for name in BUCKETS}
             )
             provider_buckets[bucket].record(payload, str(session_dir))
-        sessions.append({
+        session_record: dict[str, Any] = {
             "dir": str(session_dir), "usage_events": len(usage_events),
             "usable_events": len(usable), "skipped": not bool(usable),
             "missing_db": False,
-        })
+        }
+        if transitions:
+            session_record["epoch_transitions"] = transitions
+            missing = sorted({
+                f"seq={transition['seq']}: {field}"
+                for transition in transitions
+                for field in transition["boundary_metadata_missing"]
+            })
+            if missing:
+                session_record["boundary_metadata_missing"] = missing
+                warnings.append(
+                    f"{session_dir}: boundary metadata missing: {', '.join(missing)}"
+                )
+        sessions.append(session_record)
     return providers, sessions, warnings
 
 
@@ -239,6 +459,23 @@ def _report(
     warnings: list[str],
     threshold: float,
 ) -> dict[str, Any]:
+    transitions = sorted(
+        (
+            transition
+            for session in sessions
+            for transition in session.get("epoch_transitions", [])
+        ),
+        key=lambda transition: (
+            transition["session"],
+            transition["seq"] is None,
+            transition["seq"] if transition["seq"] is not None else 0,
+        ),
+    )
+    sessions_lacking_boundary_metadata = sorted(
+        session["dir"]
+        for session in sessions
+        if session.get("boundary_metadata_missing")
+    )
     return {
         "measurement": {
             "classification": {
@@ -250,6 +487,12 @@ def _report(
             },
             "minimum_relative_rate": threshold,
             "cache_policy_changed": False,
+            "epoch_transition": {
+                "boundary_kinds": list(BOUNDARY_KINDS),
+                "prefix_bytes_source": "payload.cache_key.prefix_bytes",
+                "prefix_sha256_source": "payload.cache_key.prefix_sha256",
+                "usage_source": "usage_event.payload.usage",
+            },
         },
         "providers": {
             provider: {
@@ -261,6 +504,8 @@ def _report(
             }
             for provider, buckets in sorted(providers.items())
         },
+        "epoch_transitions": transitions,
+        "sessions_lacking_boundary_metadata": sessions_lacking_boundary_metadata,
         "sessions": sessions,
         "warnings": warnings,
     }
@@ -298,6 +543,14 @@ def _print_text(report: dict[str, Any]) -> None:
                 f"  {bucket}: {details_bucket['calls']} calls, "
                 f"prefixes={details_bucket['prompt_prefix_bytes']['distinct']}"
             )
+    transitions = report["epoch_transitions"]
+    print(f"epoch transitions: {len(transitions)}")
+    for transition in transitions:
+        print(
+            f"  {transition['session']} {transition['kind']} "
+            f"epoch {transition['from_epoch']}->{transition['to_epoch']} "
+            f"turn={transition['turn']} prefix_bytes={transition['prefix_bytes']}"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

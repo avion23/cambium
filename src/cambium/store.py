@@ -105,10 +105,6 @@ _INSERT = (
     "worker_id, generation, request_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
-_SELECT_AFTER = (
-    "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
-    "generation, request_id FROM events WHERE seq > ? ORDER BY seq"
-)
 _SELECT_NEXT_SEQ = "SELECT next_seq FROM event_store_state WHERE id = 1"
 _INSERT_NEXT_SEQ = "INSERT INTO event_store_state(id, next_seq) VALUES(1, ?)"
 _UPDATE_NEXT_SEQ = (
@@ -130,6 +126,12 @@ _CLOSE_STOP_JOIN_TIMEOUT_S = 0.1
 
 _SENTINEL = object()
 _TIMER = object()
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_SELECT_ALL = (
+    "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
+    "generation, request_id FROM events ORDER BY seq"
+)
+_REQUIRED_EVENT_FIELDS = frozenset({"seq", "kind", "payload"})
 
 
 def read_events_file(db_path: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
@@ -137,13 +139,17 @@ def read_events_file(db_path: Path | str, after_seq: int = 0) -> list[dict[str, 
     path = Path(db_path)
     if not path.is_file():
         return []
-    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     try:
-        conn.execute("PRAGMA busy_timeout=5000")
-        rows = conn.execute(_SELECT_AFTER, (after_seq,)).fetchall()
-    finally:
-        conn.close()
-    return [EventStore._row_to_event(row) for row in rows]
+        with path.open("rb") as handle:
+            header = handle.read(len(_SQLITE_HEADER))
+    except OSError as exc:
+        raise StoreError(f"cannot read event store {path}: {exc}") from exc
+
+    if header == _SQLITE_HEADER:
+        events = _read_sqlite_events(path)
+    else:
+        events = _read_jsonl_events(path)
+    return [event for event in events if event["seq"] > after_seq]
 
 
 def _make_private_dir(path: Path) -> None:
@@ -183,6 +189,120 @@ class _AdmissionCancelled(Exception):
 
 class StoreError(Exception):
     """The event store is dead; pending events were not committed."""
+
+
+def _event_store_error(path: Path, detail: str, line_no: int | None = None) -> StoreError:
+    location = f"{path}:{line_no}" if line_no is not None else str(path)
+    return StoreError(f"corrupt event store {location}: {detail}")
+
+
+def _validate_event_record(record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError("record must be a JSON object")
+    missing = _REQUIRED_EVENT_FIELDS - record.keys()
+    if missing:
+        raise ValueError(f"missing fields: {', '.join(sorted(missing))}")
+
+    seq = record["seq"]
+    if type(seq) is not int or seq <= 0:
+        raise ValueError("seq must be a positive integer")
+    kind = record["kind"]
+    if type(kind) is not str or not kind:
+        raise ValueError("kind must be a non-empty string")
+    if type(record["payload"]) is not dict:
+        raise ValueError("payload must be an object")
+
+    for field in ("task_id", "worker_id", "request_id"):
+        value = record.get(field)
+        if value is not None and type(value) is not str:
+            raise ValueError(f"{field} must be a string or null")
+    for field in ("monotonic_ms", "generation"):
+        value = record.get(field)
+        if value is not None and type(value) is not int:
+            raise ValueError(f"{field} must be an integer or null")
+    ts = record.get("ts")
+    if ts is not None and type(ts) not in (int, float, str):
+        raise ValueError("ts must be a string, number, or null")
+    if "event_id" in record:
+        event_id = record["event_id"]
+        if type(event_id) is not str or not event_id:
+            raise ValueError("event_id must be a non-empty string")
+    if "schema_version" in record:
+        schema_version = record["schema_version"]
+        if type(schema_version) is not int or schema_version <= 0:
+            raise ValueError("schema_version must be a positive integer")
+    return dict(record)
+
+
+def _validate_event_order(events: list[dict[str, Any]], path: Path) -> None:
+    previous_seq = 0
+    event_ids: set[str] = set()
+    for event in events:
+        seq = event["seq"]
+        if seq <= previous_seq:
+            raise _event_store_error(path, f"event sequence is not increasing at seq {seq}")
+        previous_seq = seq
+        event_id = event.get("event_id")
+        if event_id is not None:
+            if event_id in event_ids:
+                raise _event_store_error(path, f"duplicate event_id {event_id!r}")
+            event_ids.add(event_id)
+
+
+def _read_jsonl_events(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    try:
+        with path.open("rb") as handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                if not raw_line.strip():
+                    continue
+                complete_line = raw_line.endswith(b"\n")
+                try:
+                    line = raw_line.decode("utf-8")
+                    value = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    if not complete_line:
+                        continue
+                    raise _event_store_error(path, "invalid JSON", line_no) from exc
+                try:
+                    event = _validate_event_record(value)
+                except (TypeError, ValueError) as exc:
+                    raise _event_store_error(path, str(exc), line_no) from exc
+                events.append(event)
+    except OSError as exc:
+        raise StoreError(f"cannot read event store {path}: {exc}") from exc
+    _validate_event_order(events, path)
+    return events
+
+
+def _read_sqlite_events(path: Path) -> list[dict[str, Any]]:
+    conn = None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.execute("PRAGMA busy_timeout=5000")
+        rows = conn.execute(_SELECT_ALL).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        raise _event_store_error(path, str(exc)) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    return _events_from_rows(rows, path)
+
+
+def _events_from_rows(rows: list[tuple], path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        try:
+            event = EventStore._row_to_event(row)
+        except json.JSONDecodeError as exc:
+            if index == len(rows) - 1:
+                continue
+            raise _event_store_error(path, "invalid JSON payload") from exc
+        except (IndexError, TypeError, ValueError) as exc:
+            raise _event_store_error(path, str(exc)) from exc
+        events.append(event)
+    _validate_event_order(events, path)
+    return events
 
 
 class StoreTimeout(StoreError):
@@ -540,13 +660,18 @@ class EventStore:
         return seq
 
     def events_after(self, seq: int) -> list[dict[str, Any]]:
-        conn = sqlite3.connect(self._path)
+        conn = None
         try:
+            conn = sqlite3.connect(self._path)
             conn.execute("PRAGMA busy_timeout=5000")
-            rows = conn.execute(_SELECT_AFTER, (seq,)).fetchall()
+            rows = conn.execute(_SELECT_ALL).fetchall()
+        except (OSError, sqlite3.Error) as exc:
+            raise _event_store_error(self._path, str(exc)) from exc
         finally:
-            conn.close()
-        return [self._row_to_event(row) for row in rows]
+            if conn is not None:
+                conn.close()
+        events = _events_from_rows(rows, self._path)
+        return [event for event in events if event["seq"] > seq]
 
     def _redact_row(self, row: tuple) -> tuple:
         if self._redactor is None:
@@ -1033,7 +1158,7 @@ class EventStore:
             seq, kind, payload, ts, monotonic_ms,
             task_id, worker_id, generation, request_id,
         ) = row
-        return {
+        return _validate_event_record({
             "seq": seq,
             "kind": kind,
             "payload": json.loads(payload),
@@ -1043,4 +1168,4 @@ class EventStore:
             "worker_id": worker_id,
             "generation": generation,
             "request_id": request_id,
-        }
+        })

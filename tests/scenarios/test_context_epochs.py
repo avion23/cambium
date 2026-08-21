@@ -544,7 +544,9 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(tmp_path: Path) -
 
 def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
-    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    config = _agent_config(
+        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=False
+    )
     writer = _FakeWriter()
     router = _ScriptedRouter([
         _delegate_action("child-1"),
@@ -644,7 +646,12 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
         tmp_path / "ckpts" / checkpoint.checkpoint_ref
     ).read_bytes() == original_checkpoint_bytes
     usage = [message for message in writer.messages() if message["type"] == "usage_event"]
-    assert usage and all(message["epoch"] == checkpoint.epoch for message in usage)
+    assert usage[0]["epoch"] == checkpoint.epoch
+    assert usage[-1]["epoch"] == checkpoint.epoch + 1
+    assert any(
+        message["type"] == "context_epoch_advanced"
+        for message in writer.messages()
+    )
     terminal = [
         message for message in writer.messages()
         if message["type"] == "context_checkpoint"
@@ -673,7 +680,7 @@ def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
     assert "context_resume_failed" in (outcome["failure_reason"] or "")
 
 
-def test_rolling_compact_config_and_published_gate_are_tolerant() -> None:
+def test_rolling_compact_config_defaults_on() -> None:
     init = {
         "task_id": "epoch-agent",
         "context_reuse": True,
@@ -686,14 +693,11 @@ def test_rolling_compact_config_and_published_gate_are_tolerant() -> None:
     assert config.rolling_compact_threshold_high == 100
     assert config.rolling_compact_threshold_low == 50
 
-    malformed = worker._merge_task_config(
-        config,
-        init,
-        {"published": "true"},
-    )
-    assert malformed.published is False
-    valid = worker._merge_task_config(config, init, {"published": True})
-    assert valid.published is True
+    defaulted = worker.AgentConfig.from_init({
+        "task_id": "default-rolling",
+        "context_reuse": True,
+    })
+    assert defaulted.rolling_compact is True
 
 
 def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) -> None:
@@ -715,7 +719,6 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) 
         checkpoint_root=tmp_path / "ckpts",
         context_reuse=True,
         rolling_compact=True,
-        published=True,
         rolling_compact_threshold_high=100,
         rolling_compact_threshold_low=50,
         resume=resume,
@@ -744,7 +747,9 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) 
         "task_id": "epoch-agent",
         "generation": 1,
         "epoch": 2,
+        "turn": 2,
         "checkpoint_ref": advanced[0]["checkpoint_ref"],
+        "cache_key": advanced[0]["cache_key"],
         "folded_from_epoch": 1,
         "reason": None,
     }
@@ -761,8 +766,30 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) 
     assert (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes() == old_bytes
     assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
 
+    resumed = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        rolling_compact=False,
+        resume={
+            "checkpoint_ref": folded.checkpoint_ref,
+            "epoch": folded.epoch,
+            "child_results": [],
+            "child_results_truncated": False,
+        },
+        max_turns=4,
+    )
+    resume_router = _ScriptedRouter(['{"type":"finish","summary":"resumed"}'])
+    resume_outcome = asyncio.run(
+        _drive_loop(resumed, worktree, resume_router, _FakeWriter())
+    )
+    assert resume_outcome["status"] == "succeeded"
+    assert resume_router.prompts[0]["messages"][: len(folded.full_messages)] == (
+        folded.full_messages
+    )
 
-def test_rolling_compact_published_false_does_not_fold_or_checkpoint(
+
+def test_rolling_compact_rewrites_active_context_before_publication(
     tmp_path: Path,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -779,7 +806,6 @@ def test_rolling_compact_published_false_does_not_fold_or_checkpoint(
         checkpoint_root=tmp_path / "ckpts",
         context_reuse=True,
         rolling_compact=True,
-        published=False,
         rolling_compact_threshold_high=100,
         rolling_compact_threshold_low=50,
         resume=resume,
@@ -797,9 +823,9 @@ def test_rolling_compact_published_false_does_not_fold_or_checkpoint(
     )
 
     kinds = [message["type"] for message in writer.messages()]
-    assert "context_epoch_advanced" not in kinds
+    assert "context_epoch_advanced" in kinds
     assert "compaction_failed" not in kinds
-    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 1
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
 
 
 def test_rolling_compact_hysteresis_does_not_refold_below_low(
@@ -822,7 +848,6 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
         checkpoint_root=tmp_path / "ckpts",
         context_reuse=True,
         rolling_compact=True,
-        published=True,
         rolling_compact_threshold_high=1_000,
         rolling_compact_threshold_low=900,
         resume=resume,
@@ -851,13 +876,16 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
     assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
 
 
-def test_rolling_compact_failure_is_fail_open_and_continues(
+def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(base_config)
     old_bytes = (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
+    old_file_count = len(
+        list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))
+    )
     resume = {
         "checkpoint_ref": checkpoint.checkpoint_ref,
         "epoch": checkpoint.epoch,
@@ -869,7 +897,6 @@ def test_rolling_compact_failure_is_fail_open_and_continues(
         checkpoint_root=tmp_path / "ckpts",
         context_reuse=True,
         rolling_compact=True,
-        published=True,
         rolling_compact_threshold_high=100,
         rolling_compact_threshold_low=50,
         resume=resume,
@@ -881,7 +908,7 @@ def test_rolling_compact_failure_is_fail_open_and_continues(
 
     monkeypatch.setattr(worker, "_write_epoch_checkpoint", fail_checkpoint)
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"plan","steps":["continue"]}'])
+    router = _ScriptedRouter([])
     outcome = asyncio.run(
         _drive_loop(
             config,
@@ -893,7 +920,7 @@ def test_rolling_compact_failure_is_fail_open_and_continues(
     )
 
     assert outcome["status"] == "failed"
-    assert len(router.prompts) == 1
+    assert router.prompts == []
     failed = [
         message for message in writer.messages()
         if message["type"] == "compaction_failed"
@@ -907,15 +934,11 @@ def test_rolling_compact_failure_is_fail_open_and_continues(
         "epoch": 1,
         "reason": "checkpoint write failed",
     }
-    assert router.prompts[0]["messages"][2]["content"].startswith(
-        "Child task result:\n"
-    )
-    assert "<cambium-rolling-context>" not in json.dumps(router.prompts[0])
     assert (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes() == old_bytes
-    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 1
+    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == old_file_count
 
 
-def test_rolling_compact_flag_absent_keeps_existing_epoch_path(
+def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
     tmp_path: Path,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -931,6 +954,7 @@ def test_rolling_compact_flag_absent_keeps_existing_epoch_path(
         worktree,
         checkpoint_root=tmp_path / "ckpts",
         context_reuse=True,
+        rolling_compact=False,
         resume=resume,
         max_turns=2,
     )
@@ -1513,7 +1537,9 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     first_init = json.loads(lines[0])
     resume_init = json.loads(lines[1])
     assert "resume" not in first_init
+    assert first_init["rolling_compact"] is True
     assert resume_init["resume"]["epoch"] == 1
+    assert resume_init["rolling_compact"] is True
     assert resume_init["resume"]["checkpoint_ref"]
     assert resume_init["resume"]["child_results"]
     assert resume_init["resume"]["child_results"][0]["status"] == "succeeded"
@@ -1580,6 +1606,7 @@ def test_fork_pin_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert child_init["assigned_provider"] == "fake-provider"
     assert child_init["fanout_config"]["model"] == "fake-model"
     assert child_init["context_reuse"] is True
+    assert child_init["rolling_compact"] is True
 
 @pytest.mark.slow
 def test_suspend_resume_two_children_concurrency_one(
@@ -1709,7 +1736,7 @@ def test_suspended_envelope_without_flag_fails_closed(
         proposed_children=[_child_proposal(child)],
     )
 
-    result = asyncio.run(run_plan(session_dir, {"tasks": [root]}))
+    result = asyncio.run(run_plan(session_dir, {"tasks": [root]}, context_reuse=False))
 
     root_result = next(r for r in result.results if r.task_id == "t-root")
     assert root_result.status == "failed"

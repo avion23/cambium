@@ -16,24 +16,36 @@ The entry point (`src/cambium/cli.py`) dispatches these commands:
   `--max-tokens`, `--max-turns`, `--json`).
 - `repl` — interactive line loop; each input line is one prompt.
 - `tui` — line-oriented front end with a `cambium> ` prompt.
-- `session list | latest | show SESSION` — read completed sessions from their
-  `.cambium/result.json` and `.cambium/events.db` artifacts.
-- `supervisor --session-dir DIR` — run one supervisor session from a plan, a
-  task spec, or the built-in deterministic demo.
-- `architectus [--dry-run|--scripted] [--provider PROVIDER] [--tier TIER]
-  [--waves N] [--task TASK]` — run one live or scripted Architectus decision
-  session: build one fixture TaskTree, run one or more decision waves through
-  the pure core, and print the resulting action intents.
-- `auth set|remove PROVIDER` — manage stored provider credentials; `set` reads
-  the key from stdin with `--stdin`. `auth list` prints configured providers;
-  `auth oauth [PROVIDER]` manages one provider's Codex OAuth session; `auth
-  run supervisor` runs the supervisor with the stored keys. `set` and `remove`
-  take a `PROVIDER` positional; `oauth` takes an optional one.
-- `doctor`, `bench`, `tasktree`, `module-test`, `version` — diagnostics and
-  tooling.
+- `session list | latest | show | status | resume | usage` - read and resume
+  sessions. `list`, `latest`, and `show` read result records; `status` and
+  `usage` read event logs; `resume` requires the leaf's `plan.json`.
+- `supervisor --session-dir DIR (--plan PATH | --task-spec PATH | --demo)` -
+  run one supervisor session from a plan, a task spec, or the built-in
+  deterministic demo. `--warm-pool-size N` (default `0`) and
+  `--conversations` are optional.
+- `architectus [--dry-run|--scripted] [--provider PROVIDER[:MODEL]]
+  [--model [PROVIDER/]MODEL] [--tier TIER] [--waves N] [--task TASK]` - run
+  one live or scripted Architectus decision session: build one fixture
+  TaskTree, run one or more decision waves through the pure core, and print
+  the resulting action intents.
+- `auth set|remove|list|oauth|run` - manage stored provider credentials and
+  launch the authorized supervisor profile. `set` reads the key from stdin
+  with `--stdin`; OAuth operations are `login`, `status`, `logout`, and
+  `import-codex-cli`.
+- `doctor [--session-dir DIR] [--oauth-live]` - run diagnostics.
+- `bench {report,gate,re-anchor,quality}` - run benchmark or quality tooling;
+  each mode also accepts `--full`, `--drift-report`, `--bench-root PATH`,
+  `--bench-metric-delta FLOAT`, and `--bench-wall-ratio FLOAT`.
+- `module-test NAME` - run one module's isolated conformance gate.
+- `version` - print the Cambium version.
 
-A multi-word command line that is not a known command is a prompt:
-`cambium make the change` runs `cambium run "make the change"`.
+Unknown command lines are rejected; use `run PROMPT` for a prompt.
+
+Context reuse and rolling transcript compaction are enabled by default for
+operator-facing `run`, `repl`, `tui`, and supervisor commands. There is no
+second public switch. At a compaction boundary Cambium writes a new immutable,
+content-addressed context epoch and makes it active; it never rewrites the old
+epoch.
 
 Provider-backed `run`, `repl`, and `tui` prompts may complete successfully
 with a conversational/read-only answer and no file change: no commit is made
@@ -42,16 +54,18 @@ rendered output carries the summary. A prompt that changes files commits once
 and merges as before.
 
 See [`docs/architecture/user-cli.md`](docs/architecture/user-cli.md) for the
-exact run, bare-prompt, repl, tui, and session workflows, provider selection
-from the trusted user config (`~/.config/cambium/providers.json`), and how
-stored credentials are handed to workers in memory.
+exact run, repl, tui, session, authentication, diagnostics, and tooling
+workflows; provider selection from the trusted user config
+(`~/.config/cambium/providers.json`) or `CAMBIUM_PROVIDERS`; and how stored
+credentials are handed to workers in memory.
 
 ## Quickstart
 
 ```sh
-PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
-PYTHONPATH=src python3.14 -m cambium.cli session show --session-dir . demo
 PYTHONPATH=src python3.14 -m cambium.cli --help
+PYTHONPATH=src python3.14 -m cambium.cli run "review the repository" --repo .
+PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo --demo
+PYTHONPATH=src python3.14 -m cambium.cli session show --session-dir . demo
 ```
 
 The supervisor demo runs a deterministic worker against a seeded repository

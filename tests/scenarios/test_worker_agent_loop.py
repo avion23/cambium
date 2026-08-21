@@ -9,6 +9,7 @@ The provider-backed loop is driven in-process with a scripted fake router
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import subprocess
 import threading
@@ -168,9 +169,10 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
 
 
 def test_build_agent_prompt_static_head_is_byte_stable_across_tasks() -> None:
-    """D8c: the system-prompt head must be byte-identical across tasks and
-    transcripts; only the trailing ``Task:`` line may vary (provider
-    exact-prefix caching keys on the stable head)."""
+    """§9.1.6: the system message (directive + sorted tool schemas) is
+    byte-identical across tasks and transcripts; the dynamic task text rides
+    as delimited user-role data in the tail (provider exact-prefix caching
+    keys on the stable system head)."""
     tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
     identity = "codex/gpt-5.6-luna"
     task_a = "task alpha"
@@ -179,20 +181,27 @@ def test_build_agent_prompt_static_head_is_byte_stable_across_tasks() -> None:
     prompt_b = worker._build_agent_prompt(task_b, tools, [], model_identity=identity)
     content_a = prompt_a["messages"][0]["content"]
     content_b = prompt_b["messages"][0]["content"]
-    head_a, _, tail_a = content_a.rpartition("Task: ")
-    head_b, _, tail_b = content_b.rpartition("Task: ")
-    assert head_a == head_b
-    assert tail_a == task_a
-    assert tail_b == task_b
-    # The byte-length difference is exactly the task-text byte-length
-    # difference (the 5385-vs-5387 cross-session observation is this, by
-    # design, never a volatile token in the head).
-    bytes_a = len(content_a.encode("utf-8"))
-    bytes_b = len(content_b.encode("utf-8"))
-    assert bytes_b - bytes_a == len(task_b.encode("utf-8")) - len(task_a.encode("utf-8"))
+    assert content_a == content_b
+    assert task_a not in content_a
+    assert task_b not in content_b
+    assert prompt_a["messages"][1] == {
+        "role": "user",
+        "content": "<cambium-task>\nTask: task alpha\n</cambium-task>",
+    }
+    assert prompt_b["messages"][1] == {
+        "role": "user",
+        "content": "<cambium-task>\nTask: task bravo longer\n</cambium-task>",
+    }
     # prompt_prefix_bytes mirrors the system-message byte length exactly.
-    assert prompt_prefix_bytes(prompt_a) == bytes_a
-    assert prompt_prefix_bytes(prompt_b) == bytes_b
+    assert prompt_prefix_bytes(prompt_a) == len(content_a.encode("utf-8"))
+    assert prompt_prefix_bytes(prompt_b) == len(content_b.encode("utf-8"))
+    # A task carrying volatile tokens stays in the user tail: the header
+    # validator does not flag it and the system prefix does not move.
+    volatile = "fix the deploy from 2026-08-20T12:34:56Z (request_id=req-123)"
+    prompt_v = worker._build_agent_prompt(volatile, tools, [], model_identity=identity)
+    assert prompt_v["messages"][0]["content"] == content_a
+    assert volatile in prompt_v["messages"][1]["content"]
+    validate_prompt_structure(prompt_v)
 
 
 def test_build_agent_prompt_head_is_byte_stable_across_transcript_growth() -> None:
@@ -225,7 +234,10 @@ def test_build_agent_prompt_head_passes_d8c_lint() -> None:
     )
     validate_prompt_structure(prompt)  # raises PromptStructureError on churn
     head = prompt["messages"][0]["content"]
-    assert "\nTask: " in head  # dynamic content is the final line, not the head
+    assert "Task:" not in head  # dynamic content is user-role data, not head
+    task_message = prompt["messages"][1]
+    assert task_message["role"] == "user"
+    assert task_message["content"] == "<cambium-task>\nTask: a task\n</cambium-task>"
 
 
 def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
@@ -244,9 +256,12 @@ def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
         "continue the work", tools, [], parent_envelope=envelope
     )
     system_content = prompt["messages"][0]["content"]
-    head, _, tail = system_content.rpartition("Task: ")
-    assert tail.startswith("continue the work")
+    assert "Task:" not in system_content
     assert "Parent task context:" not in system_content
+    assert prompt["messages"][1] == {
+        "role": "user",
+        "content": "<cambium-task>\nTask: continue the work\n</cambium-task>",
+    }
     block = prompt["messages"][-1]
     assert block["role"] == "user"
     assert block["content"].startswith("<cambium-parent-context>\nParent task context:")
@@ -500,11 +515,13 @@ def test_summarize_transcript_large_trimmed_keeps_plan_and_marker(tmp_path: Path
         )
         transcript.append({"role": "user", "content": "x" * 2_000})
     budget = 5_000
+    snapshot = copy.deepcopy(transcript)
 
     result = worker._summarize_transcript(transcript, budget, keep_turns=6)
 
     assert worker._transcript_chars(result) <= budget
     assert result != transcript
+    assert transcript == snapshot  # the input transcript is never mutated
     # the plan survives intact at the front
     assert result[0] == plan_message
     assert json.loads(result[0]["content"])["type"] == "plan"
@@ -515,16 +532,79 @@ def test_summarize_transcript_large_trimmed_keeps_plan_and_marker(tmp_path: Path
     marker = next(
         message for message in result if "prior context" in message.get("content", "")
     )
-    assert "4 earlier message(s) dropped" in marker["content"]
-    # exactly the last 6 turns (12 messages) of tail are retained
+    # turn-atomic dropping: 4 turn pairs fall to the keep_turns window and
+    # 4 more whole turns drop to fit the budget (12 messages total)
+    assert "12 earlier message(s) dropped" in marker["content"]
+    # exactly the newest 2 whole turns (4 messages) survive untruncated
     tail = result[2:]
-    assert len(tail) == 12
-    assert tail[-1]["content"].startswith("x")
-    # every tail turn has an assistant action and a user observation
+    assert len(tail) == 4
     assert [message["role"] for message in tail] == (
-        ["assistant", "user"] * 6
+        ["assistant", "user"] * 2
     )
     assert "f7.py" in tail[-2]["content"]
+    assert tail[-1]["content"] == "x" * 2_000  # whole turns, never sliced
+
+
+def test_summarize_transcript_bounds_oversized_observation_inside_wrapper(
+    tmp_path: Path,
+) -> None:
+    """A single oversized observation keeps its wrapper header; only the body
+    is truncated, with a counted omitted-chars suffix (plan §9.1.1)."""
+    body = "y" * 20_000
+    transcript = [
+        {"role": "assistant", "content": '{"type":"plan","steps":["read"]}'},
+        {
+            "role": "assistant",
+            "content": (
+                '{"type":"tool_call","name":"read_batch",'
+                '"arguments":{"paths":["big.txt"]}}'
+            ),
+        },
+        {"role": "user", "content": f"tool read_batch ok=True\n--- big.txt ---\n{body}"},
+    ]
+    snapshot = copy.deepcopy(transcript)
+    budget = 2_000
+
+    result = worker._summarize_transcript(transcript, budget, keep_turns=6)
+
+    assert transcript == snapshot
+    assert worker._transcript_chars(result) <= budget
+    observation = result[-1]
+    assert observation["content"].startswith("tool read_batch ok=True\n")
+    assert "--- big.txt ---\n" in observation["content"]
+    assert "observation char(s) omitted]" in observation["content"]
+    # the header and wrapper survive; the body carried the cut
+    assert len(observation["content"]) < len(transcript[-1]["content"])
+
+
+def test_render_rolling_compaction_wrapper_always_closed_and_parseable() -> None:
+    """The rolling fold reserves wrapper overhead: the closing tag is never
+    cut and the embedded JSON always parses, even at degenerate budgets."""
+    continuation = [
+        {"role": "user", "content": "child result " + "z" * 500},
+        {"role": "assistant", "content": '{"type":"plan","steps":["go"]}'},
+        {"role": "user", "content": "Continue."},
+    ]
+    snapshot = copy.deepcopy(continuation)
+    for budget in (1, 50, 200, 5_000):
+        rendered = worker._render_rolling_compaction(continuation, budget)
+        assert len(rendered) == 1
+        content = rendered[0]["content"]
+        assert rendered[0]["role"] == "user"
+        assert content.startswith("<cambium-rolling-context>\n")
+        assert content.endswith("\n</cambium-rolling-context>")
+        inner = content[
+            len("<cambium-rolling-context>\n"): -len("\n</cambium-rolling-context>")
+        ]
+        parsed = json.loads(inner)
+        assert isinstance(parsed, list)
+        # Degenerate budgets below the wrapper size still close cleanly.
+        wrapper_floor = (
+            len("<cambium-rolling-context>\n") + 2 + len("\n</cambium-rolling-context>")
+        )
+        if len(content) > wrapper_floor:
+            assert len(content) <= budget
+    assert continuation == snapshot
 
 
 def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path) -> None:
@@ -549,9 +629,109 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
     assert len(router.prompts) == 9
     for prompt in router.prompts:
         transcript = prompt["messages"][1:]
+        # The task text is fixed user-role data added at build time; the
+        # budget bounds the growing transcript, not the static task block.
+        if transcript and transcript[0].get("content", "").startswith("<cambium-task>"):
+            transcript = transcript[1:]
         if transcript and transcript[-1].get("content") in {"Begin.", "Continue."}:
             transcript = transcript[:-1]
         assert worker._transcript_chars(transcript) <= budget
+
+
+def test_strip_for_fold_drops_obsolete_reads_and_superseded_passes() -> None:
+    """Tier-1 stripping (§9.1.7): obsolete read bodies and superseded passing
+    run_shell outputs collapse to one-line markers; edits, failures, the
+    latest verification, identifiers, and the plan survive; idempotent."""
+
+    def call(name: str, args: dict[str, Any]) -> dict[str, str]:
+        return {"role": "assistant", "content": json.dumps({
+            "type": "tool_call", "name": name, "arguments": args,
+        })}
+
+    def obs(name: str, ok: bool, body: str) -> dict[str, str]:
+        return {"role": "user", "content": f"tool {name} ok={ok}\n{body}"}
+
+    continuation = [
+        {"role": "assistant", "content": '{"type":"plan","steps":["work"]}'},
+        call("read_batch", {"paths": ["a.py", "b.py"]}),
+        obs("read_batch", True, "--- a.py ---\nold a\n\n--- b.py ---\nold b"),
+        call("edit_file", {"path": "a.py", "old_string": "old", "new_string": "new"}),
+        obs("edit_file", True, "edited a.py"),
+        call("run_shell", {"cmd": ["pytest", "-q"]}),
+        obs("run_shell", True, "1 passed"),
+        call("read_batch", {"paths": ["a.py"]}),
+        obs("read_batch", True, "--- a.py ---\nnew a"),
+        call("run_shell", {"cmd": ["pytest", "-q"]}),
+        obs("run_shell", False, "2 failed"),
+        call("run_shell", {"cmd": ["pytest", "-q"]}),
+        obs("run_shell", True, "2 passed"),
+    ]
+    snapshot = copy.deepcopy(continuation)
+
+    stripped = worker._strip_for_fold(continuation)
+
+    assert continuation == snapshot  # pure: input never mutated
+    assert len(stripped) == len(continuation)  # whole messages, none dropped
+    # the plan and every identifier survive
+    assert stripped[0] == continuation[0]
+    # the first read is obsolete (a.py edited + re-read, b.py never re-read...
+    # b.py has no later touch, so this read is NOT obsolete and stays whole)
+    assert stripped[2] == continuation[2]
+    # the passing run before the later failure+pass is superseded
+    assert stripped[6]["content"] == (
+        "tool run_shell ok=True\n"
+        "[run_shell: passed (output omitted - superseded by a later run)]"
+    )
+    # the edit, the failure, and the latest passing verification stay whole
+    assert stripped[4] == continuation[4]
+    assert stripped[9] == continuation[9]
+    assert stripped[11] == continuation[11]
+    # idempotent
+    assert worker._strip_for_fold(stripped) == stripped
+
+
+def test_strip_for_fold_drops_fully_superseded_read_body() -> None:
+    """A read whose every path is later edited or re-read collapses to the
+    on-disk pointer with its paths (identifiers) preserved."""
+    continuation = [
+        {
+            "role": "assistant",
+            "content": json.dumps({
+                "type": "tool_call",
+                "name": "read_batch",
+                "arguments": {"paths": ["a.py", "b.py"]},
+            }),
+        },
+        {"role": "user", "content": "tool read_batch ok=True\n--- a.py ---\nx\n\n--- b.py ---\ny"},
+        {
+            "role": "assistant",
+            "content": json.dumps({
+                "type": "tool_call",
+                "name": "edit_file",
+                "arguments": {"path": "a.py", "old_string": "x", "new_string": "z"},
+            }),
+        },
+        {"role": "user", "content": "tool edit_file ok=True\nedited"},
+        {
+            "role": "assistant",
+            "content": json.dumps({
+                "type": "tool_call",
+                "name": "read_batch",
+                "arguments": {"paths": ["b.py"]},
+            }),
+        },
+        {"role": "user", "content": "tool read_batch ok=True\n--- b.py ---\ny"},
+    ]
+
+    stripped = worker._strip_for_fold(continuation)
+
+    assert stripped[1]["content"] == (
+        "tool read_batch ok=True\n"
+        "[read_batch: a.py, b.py (omitted - file on disk)]"
+    )
+    # the re-read of b.py is the latest read of that path: body kept
+    assert stripped[5] == continuation[5]
+    assert worker._strip_for_fold(stripped) == stripped
 
 
 # ---------------------------------------------------------------------------

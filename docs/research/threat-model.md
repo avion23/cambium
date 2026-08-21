@@ -287,3 +287,18 @@ Controls need evidence.
 Historical only.
 
 Historical decision identifier retained: `D7`.
+
+## Addendum — 2026-08-20 security audit
+
+1. **P2 — init permissions:** `permissions.shell` and `permissions.network` were
+   advisory fields with no enforcement point. **Disposition:** shell enforcement
+   landed in `tools.py` `ToolContext` (`ToolPermissionPolicy`, structured
+   `permission_denied:shell` tool errors) wired from worker `AgentConfig`.
+   Network remains unenforced metadata: no current tool performs direct network
+   I/O under policy control, so `permissions.network` stays advisory until a
+   network-touching tool exists to gate. Not a sandbox claim.
+2. **P3 — host isolation:** Host process/worktree isolation remains
+   not-an-OS-sandbox per decision 10. No container/broker reintroduction on this host
+   (unprivileged userns blocked).
+3. **Residual — resource gating:** Argv-classified resource gating was rejected as
+   unsound; runtime hard bounds remain deferred with decision 10.

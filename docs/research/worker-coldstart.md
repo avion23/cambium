@@ -122,22 +122,29 @@ superseded.
 
 ## Conclusion
 
-**Per-task cold-start budget for a 10-worker fan-out:** with the realistic
+**Update (2026-08-20):** The **2.2 s** payload measurement remains valid as an
+`import dspy` measurement, but it does not describe current worker startup.
+Current production worker/supervisor paths never import dspy: it is lazy in
+`src/cambium/lm.py:320-359`; only `python -m cambium.optimize` and module tooling
+import it. The current coldstart path is DSPy-free; the dspy comparison below
+retains its original v2.0 worker assumption.
+
+**Historical per-task cold-start budget (DSPy-importing worker assumption):** with the realistic
 worker payload (cambium + dspy, per architecture v2.0 §2 the Opifex worker runs
 a DSPy ReAct loop), fork-per-task costs **~2.22 s per worker** and
 **~7.0 s wall for the 10-worker fan-out**. A pre-warmed pool forks a worker in
 **5.6 ms** (89 MB parent) and brings up all 10 in **~39 ms**. For the
-deterministic-only path (no dspy) the gap is smaller but still real: **~100 ms
+deterministic-only path (current DSPy-free worker) the gap is smaller but still real: **~100 ms
 per worker / ~178 ms fan-out** vs **~1.8 ms per fork / ~7.2 ms fan-out**.
 
-**Recommendation: persistent pool, not fork-per-task — by ~180x on the
+**Historical recommendation: persistent pool, not fork-per-task — by ~180x on the
 10-worker fan-out with dspy (7.0 s vs 39 ms), ~400x per worker (2.22 s vs
 5.6 ms).** dspy's import dominates everything else in the worker path, so the
 decision hinges on whether that 2.2 s is paid once or per task.
 
 Caveat: supervisor `os.fork` violates v2.0 isolation and fork-after-threads
 invariants. Keep Nuntius stdio IPC and pre-spawn subprocess workers once
-(~2.2 s each), then reuse them so each task pays an IPC round-trip; this is the
+(~2.2 s each when importing dspy), then reuse them so each task pays an IPC round-trip; this is the
 v2.1 persistent-worker-pool direction.
 
 Every figure is a host measurement under concurrent load (`loadavg` 2.6–8.7).

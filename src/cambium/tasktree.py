@@ -274,6 +274,10 @@ def build_tree(
     """
     if not isinstance(plan, dict) or not isinstance(plan.get("tasks"), list):
         raise TaskPlanError("plan must be a dict with a 'tasks' list")
+    if not isinstance(max_depth, int) or isinstance(max_depth, bool):
+        raise TaskPlanError("max_depth must be an integer")
+    if not isinstance(max_width, int) or isinstance(max_width, bool):
+        raise TaskPlanError("max_width must be an integer")
     tasks = plan["tasks"]
 
     order: list[str] = []
@@ -301,7 +305,10 @@ def build_tree(
         if not isinstance(spec, dict):
             raise TaskPlanError(f"task {task_id!r} has a non-dict spec")
         deps[task_id] = list(raw_deps)
-        specs[task_id] = copy.deepcopy(spec)
+        try:
+            specs[task_id] = copy.deepcopy(spec)
+        except RecursionError as exc:
+            raise TaskPlanError(f"task {task_id!r} spec is too deeply nested") from exc
 
     known = set(order)
     for tid, task_deps in deps.items():
@@ -544,11 +551,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         plan = json.loads(payload)
-        order = topological_order(build_tree(plan))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         source = "stdin" if args.plan in (None, "-") else f"plan file {args.plan!r}"
         print(f"tasktree: invalid JSON in {source}: {exc}", file=sys.stderr)
         return 1
+
+    try:
+        order = topological_order(build_tree(plan))
     except TaskTreeError as exc:
         print(f"tasktree: {exc}", file=sys.stderr)
         return 1

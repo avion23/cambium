@@ -1270,10 +1270,11 @@ def test_resource_preflight_is_opt_in_and_skipped_without_thresholds(tmp_path, m
     assert _show(repo, "main", "a.txt") == "file a\n// optin\n"
     assert not _kinds(read_events(session_dir), "resource_denied")
 
+    denied_session = tmp_path / "denied-session"
     denied_task = dict(
         task,
         task_id="t-denied2",
-        worktree_path=str(session_dir / "wt-denied2"),
+        worktree_path=str(denied_session / "wt-denied2"),
         branch="wt-denied2",
     )
     denied_task["resource_thresholds"] = {
@@ -1283,7 +1284,7 @@ def test_resource_preflight_is_opt_in_and_skipped_without_thresholds(tmp_path, m
     }
     denied = asyncio.run(
         run_plan(
-            session_dir,
+            denied_session,
             {"tasks": [denied_task]},
             resource_thresholds=None,
         )

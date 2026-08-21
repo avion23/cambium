@@ -139,7 +139,7 @@ def test_doctor_opens_session_databases_with_special_character_paths(tmp_path) -
     events_db = session_dir / doctor.EVENTS_DB_REL
     conversations_db = session_dir / doctor.CONVERSATIONS_DB_REL
     events_db.parent.mkdir(parents=True)
-    conversations_db.parent.mkdir(parents=True)
+    conversations_db.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(events_db) as connection:
         connection.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")

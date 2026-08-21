@@ -19,11 +19,11 @@ import hashlib
 import os
 import re
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from enum import Enum
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 __all__ = [
     "DEFAULT_PATTERNS",
@@ -58,7 +58,11 @@ EVENT_RECORD_STRUCTURAL_FIELDS = frozenset(
 )
 WORKER_RESULT_STRUCTURAL_FIELDS = frozenset(
     {
+        "checkpoint_ref",
         "child_task_id",
+        "diff_truncated",
+        "epoch",
+        "exit_code",
         "generation",
         "parent_task_id",
         "proto",
@@ -1131,118 +1135,206 @@ def _clone_structured(
     context: _StructuredContext,
     role: _FieldRole,
 ) -> object:
-    cached = _cached(state, node, context, role)
-    if cached is not _MISSING:
-        if isinstance(cached, _TuplePlaceholder):
+    frames: list[
+        tuple[
+            str,
+            object,
+            dict[object, object] | list[object],
+            Iterator[object],
+            _TuplePlaceholder | None,
+            _StructuredContext,
+            _FieldRole,
+        ]
+    ] = []
+
+    def prepare(
+        current: object,
+        current_context: _StructuredContext,
+        current_role: _FieldRole,
+    ) -> object:
+        cached = _cached(state, current, current_context, current_role)
+        if cached is not _MISSING:
             return cached
-        return cached
 
-    if isinstance(node, str):
-        if context is _StructuredContext.COOKIES and role is not _FieldRole.COOKIE_ATTRIBUTE:
-            result_string = redactor.replacement
-        else:
-            result_string = redactor.redact(node)
-        _memoise(state, node, context, role, result_string)
-        return result_string
+        if isinstance(current, str):
+            if (
+                current_context is _StructuredContext.COOKIES
+                and current_role is not _FieldRole.COOKIE_ATTRIBUTE
+            ):
+                result_string = redactor.replacement
+            else:
+                result_string = redactor.redact(current)
+            _memoise(state, current, current_context, current_role, result_string)
+            return result_string
 
-    if isinstance(node, Mapping):
-        result: dict[object, object] = {}
-        _memoise(state, node, context, role, result)
-        for key, value in node.items():
-            key_name = key if isinstance(key, str) else None
-            result_key = _redact_mapping_key(key, redactor)
-            cookie_value = context is _StructuredContext.COOKIES and _cookie_context_value_key(
-                key, value
-            )
-            if cookie_value:
-                result[result_key] = redactor.replacement
+        if isinstance(current, Mapping):
+            result: dict[object, object] = {}
+            _memoise(state, current, current_context, current_role, result)
+            mapping = cast(dict[object, object], result)
+            frames.append((
+                "mapping", current, mapping, iter(current.items()), None,
+                current_context, current_role,
+            ))
+            return result
+
+        if isinstance(current, list):
+            result_list: list[object] = []
+            _memoise(state, current, current_context, current_role, result_list)
+            frames.append((
+                "sequence", current, result_list, iter(current), None,
+                current_context, current_role,
+            ))
+            return result_list
+
+        if isinstance(current, tuple):
+            placeholder = _TuplePlaceholder()
+            items: list[object] = []
+            _memoise(state, current, current_context, current_role, placeholder)
+            frames.append((
+                "tuple", current, items, iter(current), placeholder,
+                current_context, current_role,
+            ))
+            return placeholder
+
+        if isinstance(current, Sequence) and not isinstance(current, (bytes, bytearray)):
+            result_sequence: list[object] = []
+            _memoise(state, current, current_context, current_role, result_sequence)
+            frames.append((
+                "sequence", current, result_sequence, iter(current), None,
+                current_context, current_role,
+            ))
+            return result_sequence
+
+        return current
+
+    copied = prepare(node, context, role)
+    while frames:
+        (
+            frame_kind,
+            source,
+            target,
+            iterator,
+            auxiliary,
+            frame_context,
+            frame_role,
+        ) = frames[-1]
+        try:
+            if frame_kind == "mapping":
+                key, value = cast(tuple[object, object], next(iterator))
+                key_name = key if isinstance(key, str) else None
+                result_key = _redact_mapping_key(key, redactor)
+                cookie_value = (
+                    frame_context is _StructuredContext.COOKIES
+                    and _cookie_context_value_key(key, value)
+                )
+                mapping = cast(dict[object, object], target)
+                if cookie_value or (key_name is not None and is_secret_name(key_name)):
+                    mapping[result_key] = redactor.replacement
+                    continue
+                mapping[result_key] = prepare(
+                    value,
+                    _child_context(key, value, frame_context),
+                    _child_role(key, value, frame_context),
+                )
                 continue
-            if key_name is not None and is_secret_name(key_name):
-                result[result_key] = redactor.replacement
+
+            item = next(iterator)
+            cast(list[object], target).append(prepare(item, frame_context, frame_role))
+        except StopIteration:
+            frames.pop()
+            if frame_kind != "tuple":
                 continue
-            result[result_key] = _clone_structured(
-                value,
-                redactor,
-                state,
-                _child_context(key, value, context),
-                _child_role(key, value, context),
-            )
-        return result
+            result_tuple: tuple[object, ...] = tuple(cast(list[object], target))
+            cast(_TuplePlaceholder, auxiliary).value = result_tuple
+            _memoise(state, source, frame_context, frame_role, result_tuple)
 
-    if isinstance(node, list):
-        result_list: list[object] = []
-        _memoise(state, node, context, role, result_list)
-        result_list.extend(
-            _clone_structured(item, redactor, state, context, role) for item in node
-        )
-        return result_list
-
-    if isinstance(node, tuple):
-        placeholder = _TuplePlaceholder()
-        _memoise(state, node, context, role, placeholder)
-        result_tuple = tuple(
-            _clone_structured(item, redactor, state, context, role) for item in node
-        )
-        placeholder.value = result_tuple
-        _memoise(state, node, context, role, result_tuple)
-        return result_tuple
-
-    if isinstance(node, Sequence) and not isinstance(node, (bytes, bytearray)):
-        # Unknown sequence implementations are copied to a plain list.  This
-        # avoids invoking an arbitrary constructor while still redacting their
-        # elements without using repr().
-        result_sequence: list[object] = []
-        _memoise(state, node, context, role, result_sequence)
-        result_sequence.extend(
-            _clone_structured(item, redactor, state, context, role) for item in node
-        )
-        return result_sequence
-
-    # Non-container values are preserved.  In particular, do not call str(),
-    # repr(), deepcopy(), or a user-defined serialization hook here.
-    return node
+    return copied
 
 
 def _resolve_tuple_placeholders(node: object, seen: set[int]) -> object:
-    if isinstance(node, _TuplePlaceholder):
-        return node.value if node.value is not None else None
+    root: list[object] = [node]
+    tasks: list[
+        tuple[
+            str,
+            object,
+            dict[object, object] | list[object],
+            object,
+            list[object] | None,
+        ]
+    ] = [
+        ("visit", node, root, 0, None)
+    ]
 
-    if isinstance(node, dict):
-        identity = id(node)
-        if identity in seen:
-            return node
-        seen.add(identity)
-        for key, value in tuple(node.items()):
-            resolved = _resolve_tuple_placeholders(value, seen)
-            if resolved is not value:
-                node[key] = resolved
-        return node
+    def assign(
+        parent: dict[object, object] | list[object], slot: object, value: object
+    ) -> None:
+        if isinstance(parent, dict):
+            parent[slot] = value
+        else:
+            parent[cast(int, slot)] = value
 
-    if isinstance(node, list):
-        identity = id(node)
-        if identity in seen:
-            return node
-        seen.add(identity)
-        for index, value in enumerate(node):
-            resolved = _resolve_tuple_placeholders(value, seen)
-            if resolved is not value:
-                node[index] = resolved
-        return node
+    while tasks:
+        task, current, parent, slot, auxiliary = tasks.pop()
+        if task == "tuple_done":
+            original = cast(tuple[object, ...], current)
+            completed_items = cast(list[object], auxiliary)
+            resolved_tuple: tuple[object, ...] = tuple(completed_items)
+            if all(
+                resolved is original_item
+                for resolved, original_item in zip(resolved_tuple, original, strict=True)
+            ):
+                resolved_tuple = original
+            assign(parent, slot, resolved_tuple)
+            continue
 
-    if isinstance(node, tuple):
-        identity = id(node)
-        if identity in seen:
-            return node
-        seen.add(identity)
-        resolved_items = tuple(_resolve_tuple_placeholders(item, seen) for item in node)
-        if all(
-            resolved is original
-            for resolved, original in zip(resolved_items, node, strict=True)
-        ):
-            return node
-        return resolved_items
+        if isinstance(current, _TuplePlaceholder):
+            resolved = current.value if current.value is not None else None
+            assign(parent, slot, resolved)
+            if resolved is not None:
+                tasks.append(("visit", resolved, parent, slot, None))
+            continue
 
-    return node
+        if isinstance(current, dict):
+            mapping = cast(dict[object, object], current)
+            identity = id(mapping)
+            if identity in seen:
+                assign(parent, slot, mapping)
+                continue
+            seen.add(identity)
+            assign(parent, slot, mapping)
+            mapping_items = tuple(mapping.items())
+            for key, value in reversed(mapping_items):
+                tasks.append(("visit", value, mapping, key, None))
+            continue
+
+        if isinstance(current, list):
+            sequence = cast(list[object], current)
+            identity = id(sequence)
+            if identity in seen:
+                assign(parent, slot, sequence)
+                continue
+            seen.add(identity)
+            assign(parent, slot, sequence)
+            for index in range(len(sequence) - 1, -1, -1):
+                tasks.append(("visit", sequence[index], sequence, index, None))
+            continue
+
+        if isinstance(current, tuple):
+            original = cast(tuple[object, ...], current)
+            identity = id(original)
+            if identity in seen:
+                assign(parent, slot, original)
+                continue
+            seen.add(identity)
+            tuple_items: list[object] = list(original)
+            tasks.append(("tuple_done", original, parent, slot, tuple_items))
+            for index in range(len(tuple_items) - 1, -1, -1):
+                tasks.append(("visit", tuple_items[index], tuple_items, index, None))
+            continue
+
+        assign(parent, slot, current)
+
+    return root[0]
 
 
 class Redactor:
@@ -1405,7 +1497,7 @@ class Redactor:
         copied = _clone_structured(
             mapping, self, state, _StructuredContext.NORMAL, _FieldRole.NORMAL
         )
-        return _resolve_tuple_placeholders(copied, set())
+        return cast(dict[object, object], _resolve_tuple_placeholders(copied, set()))
 
     def redact_protocol_record(
         self,
@@ -1446,7 +1538,7 @@ class Redactor:
                 _StructuredContext.NORMAL,
                 _FieldRole.NORMAL,
             )
-        return _resolve_tuple_placeholders(copied, set())
+        return cast(dict[object, object], _resolve_tuple_placeholders(copied, set()))
 
     def is_secret_name(self, name: str) -> bool:
         """Convenience wrapper around :func:`is_secret_name`."""
@@ -1497,7 +1589,7 @@ def sanitize_oauth_document(
     if not isinstance(doc, Mapping):
         raise TypeError("doc must be a mapping")
     effective = redactor if redactor is not None else Redactor()
-    return _sanitize_oauth_node(doc, effective)
+    return cast(dict[object, object], _sanitize_oauth_node(doc, effective))
 
 
 def _sanitize_oauth_node(node: object, redactor: Redactor) -> object:

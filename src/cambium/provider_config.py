@@ -194,11 +194,18 @@ def _require_integer(value: object, location: str) -> int:
 
 def _validate_base_url(value: object, location: str) -> str:
     base_url = _require_string(value, location)
-    parsed = urlparse(base_url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    try:
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname
+        _port = parsed.port
+    except ValueError as exc:
+        raise _error(location, "must be an absolute http(s) URL") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
         raise _error(location, "must be an absolute http(s) URL")
     if parsed.username is not None or parsed.password is not None:
         raise _error(location, "must not contain URL credentials")
+    if parsed.query or parsed.fragment:
+        raise _error(location, "must not contain query parameters or a fragment")
     if parsed.scheme.lower() == "http" and not is_loopback_host(parsed.hostname or ""):
         raise _error(
             location,
@@ -397,6 +404,8 @@ def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
     if unknown:
         raise _error("root", f"unknown field(s): {', '.join(map(repr, unknown))}")
 
+    if "providers" not in raw:
+        raise _error("root", "missing required field(s): providers")
     entries = raw.get("providers")
     if not isinstance(entries, list):
         raise _error("providers", "must be a list")

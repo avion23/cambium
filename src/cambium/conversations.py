@@ -32,7 +32,7 @@ import threading
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 _WRITER_BUSY_TIMEOUT_MS = 5000
 _STARTUP_TIMEOUT_S = 10.0
@@ -44,6 +44,10 @@ _BRANCH_ROLE = "branch"
 _SUMMARY_ROLE = "summary"
 _KIND_ORDER = ("turn", "summary", "system")
 _VALID_KINDS = frozenset(_KIND_ORDER)
+_PENDING_QUEUED = 0
+_PENDING_RUNNING = 1
+_PENDING_CANCELLED = 2
+_PENDING_DONE = 3
 
 _CREATE_TABLE = """CREATE TABLE IF NOT EXISTS conversations (
     id       INTEGER PRIMARY KEY,
@@ -96,12 +100,47 @@ class ConversationStoreInitError(ConversationStoreError):
 class _Pending:
     """Completion state for one queued write."""
 
-    __slots__ = ("event", "result", "exc")
+    __slots__ = ("event", "result", "exc", "_lock", "_state")
 
     def __init__(self) -> None:
         self.event = threading.Event()
         self.result: int | None = None
         self.exc: BaseException | None = None
+        self._lock = threading.Lock()
+        self._state = _PENDING_QUEUED
+
+    def claim(self) -> bool:
+        with self._lock:
+            if self._state != _PENDING_QUEUED:
+                return False
+            self._state = _PENDING_RUNNING
+            return True
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if self._state == _PENDING_DONE:
+                return False
+            self._state = _PENDING_CANCELLED
+            return True
+
+    def commit_if_active(self, conn: sqlite3.Connection, result: int) -> bool:
+        with self._lock:
+            if self._state == _PENDING_CANCELLED:
+                conn.rollback()
+                self.event.set()
+                return False
+            conn.commit()
+            self.result = result
+            self._state = _PENDING_DONE
+            self.event.set()
+            return True
+
+    def fail(self, exc: BaseException) -> None:
+        with self._lock:
+            if self._state != _PENDING_CANCELLED:
+                self.exc = exc
+                self._state = _PENDING_DONE
+            self.event.set()
 
 
 class ConversationStore:
@@ -187,6 +226,8 @@ class ConversationStore:
         covers_to: int,
         tokens_before: int,
         tokens_after: int,
+        state_version: int | None = None,
+        folded_from: int | None = None,
     ) -> int:
         """Append a summary node covering the inclusive ``[from, to]`` range.
 
@@ -202,6 +243,20 @@ class ConversationStore:
             raise ValueError("covers_from must not be greater than covers_to")
         self._validate_tokens(tokens_before, name="tokens_before", allow_none=False)
         self._validate_tokens(tokens_after, name="tokens_after", allow_none=False)
+        if state_version is not None:
+            self._validate_row_id(state_version, "state_version")
+        if folded_from is not None:
+            self._validate_row_id(folded_from, "folded_from")
+        meta: dict[str, Any] = {
+            "covers_from": covers_from,
+            "covers_to": covers_to,
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+        }
+        if state_version is not None:
+            meta["state_version"] = state_version
+        if folded_from is not None:
+            meta["folded_from"] = folded_from
         return self.append(
             node_id,
             _SUMMARY_ROLE,
@@ -209,12 +264,60 @@ class ConversationStore:
             parent_id=covers_to,
             tokens=tokens_after,
             kind="summary",
-            meta={
-                "covers_from": covers_from,
-                "covers_to": covers_to,
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_after,
-            },
+            meta=meta,
+        )
+
+    def fold(
+        self,
+        node_id: str,
+        content: str,
+        *,
+        covers_from: int | None = None,
+        covers_to: int | None = None,
+        tokens_before: int = 0,
+        tokens_after: int = 0,
+        state_version: int | None = None,
+        folded_from: int | None = None,
+    ) -> int | None:
+        self._validate_node_id(node_id)
+        self._validate_content(content)
+        records = self.history(node_id)
+        if not records:
+            return None
+        latest_summary_index = next(
+            (
+                index
+                for index in range(len(records) - 1, -1, -1)
+                if records[index]["kind"] == _SUMMARY_ROLE
+            ),
+            None,
+        )
+        if covers_from is None and covers_to is None and latest_summary_index is not None:
+            latest_summary = records[latest_summary_index]
+            summary_meta = latest_summary["meta"]
+            previous_cursor = (
+                summary_meta.get("covers_to") if isinstance(summary_meta, dict) else None
+            )
+            delta = records[latest_summary_index + 1 :]
+            if not delta:
+                return latest_summary["id"]
+            covers_from = delta[0]["id"]
+            covers_to = delta[-1]["id"]
+            if folded_from is None and isinstance(previous_cursor, int):
+                folded_from = previous_cursor
+        if covers_from is None:
+            covers_from = int(records[0]["id"])
+        if covers_to is None:
+            covers_to = int(records[-1]["id"])
+        return self.add_summary(
+            node_id,
+            content,
+            covers_from=covers_from,
+            covers_to=covers_to,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            state_version=state_version,
+            folded_from=folded_from,
         )
 
     def branch(self, node_id: str, from_id: int) -> int:
@@ -263,6 +366,20 @@ class ConversationStore:
                 raise ValueError(f"node_id has no conversation rows: {node_id!r}")
             return self._chain(conn, int(head[0]), stop_id=to_id)
 
+    def raw_range(self, node_id: str, from_id: int, to_id: int) -> list[dict[str, Any]]:
+        self._validate_node_id(node_id)
+        self._validate_parent_id(from_id)
+        self._validate_parent_id(to_id)
+        if from_id > to_id:
+            raise ValueError("from_id must not be greater than to_id")
+        records = self.history(node_id)
+        indexes = {record["id"]: index for index, record in enumerate(records)}
+        start = indexes.get(from_id)
+        end = indexes.get(to_id)
+        if start is None or end is None or start > end:
+            raise ValueError(f"conversation range is not on node {node_id!r}'s path")
+        return records[start : end + 1]
+
     def token_accounting(self, node_id: str) -> dict[str, Any]:
         """Return token totals and the latest summary's reduction envelope.
 
@@ -300,8 +417,11 @@ class ConversationStore:
                 meta.get("tokens_after"),
             )
             if all(isinstance(value, int) and not isinstance(value, bool) for value in values):
-                covered_range = {"from": values[0], "to": values[1]}
-                reduction = values[2] - values[3]
+                covers_from, covers_to, tokens_before, tokens_after = cast(
+                    tuple[int, int, int, int], values
+                )
+                covered_range = {"from": covers_from, "to": covers_to}
+                reduction = tokens_before - tokens_after
 
         return {
             "tokens_by_kind": tokens_by_kind,
@@ -338,9 +458,10 @@ class ConversationStore:
             self._queue.put_nowait((node_id, role, content, parent_id, tokens, kind, meta, pending))
 
         if not pending.event.wait(_WRITE_TIMEOUT_S):
-            raise ConversationStoreError(
-                f"conversation write did not complete within {_WRITE_TIMEOUT_S}s"
-            )
+            if pending.cancel():
+                raise ConversationStoreError(
+                    f"conversation write did not complete within {_WRITE_TIMEOUT_S}s"
+                )
         if pending.exc is not None:
             if isinstance(pending.exc, ValueError):
                 raise pending.exc
@@ -367,6 +488,7 @@ class ConversationStore:
             conn.execute(_CREATE_TABLE)
             self._migrate_schema(conn)
             conn.execute(_CREATE_NODE_INDEX)
+            self._validate_database(conn)
 
             db_fd = os.open(self._path, os.O_RDWR)
             wal_fd = os.open(
@@ -411,20 +533,31 @@ class ConversationStore:
                     break
 
                 node_id, role, content, parent_id, tokens, kind, meta, pending = item
-                try:
-                    pending.result = self._insert_row(
-                        conn, node_id, role, content, parent_id, tokens, kind, meta
-                    )
-                except ValueError as exc:
-                    pending.exc = exc
+                if not pending.claim():
                     pending.event.set()
                     continue
+                next_seq = self._next_seq
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row_id = self._insert_row(
+                        conn, node_id, role, content, parent_id, tokens, kind, meta
+                    )
+                    if not pending.commit_if_active(conn, row_id):
+                        self._next_seq = next_seq
+                        continue
+                except ValueError as exc:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    self._next_seq = next_seq
+                    pending.fail(exc)
+                    continue
                 except Exception as exc:
-                    pending.exc = exc
-                    pending.event.set()
+                    if conn.in_transaction:
+                        conn.rollback()
+                    self._next_seq = next_seq
+                    pending.fail(exc)
                     raise
 
-                pending.event.set()
                 dirty = True
                 if self._fsync_interval_s == 0 or time.monotonic() >= next_fsync:
                     self._fsync_now()
@@ -460,6 +593,18 @@ class ConversationStore:
         kind: str,
         meta: str | None,
     ) -> int:
+        if kind == _SUMMARY_ROLE:
+            summary_range = self._summary_range(meta)
+            if summary_range is not None:
+                existing = conn.execute(
+                    "SELECT id, meta FROM conversations "
+                    "WHERE node_id = ? AND kind = ? ORDER BY seq, id",
+                    (node_id, _SUMMARY_ROLE),
+                ).fetchall()
+                for existing_id, existing_meta in existing:
+                    if self._summary_range(existing_meta) == summary_range:
+                        return int(existing_id)
+
         if parent_id is None:
             parent = conn.execute(
                 "SELECT id, turn FROM conversations WHERE node_id = ? "
@@ -478,6 +623,10 @@ class ConversationStore:
 
         turn = 1 if parent is None else int(parent[1]) + 1
         ts = datetime.datetime.now(datetime.UTC).isoformat(timespec="microseconds")
+        next_seq = int(
+            conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM conversations").fetchone()[0]
+        )
+        next_seq = max(next_seq, self._next_seq)
         cursor = conn.execute(
             _INSERT_ROW,
             (
@@ -487,7 +636,7 @@ class ConversationStore:
                 role,
                 content,
                 ts,
-                self._next_seq,
+                next_seq,
                 tokens,
                 kind,
                 meta,
@@ -496,42 +645,77 @@ class ConversationStore:
         row_id = cursor.lastrowid
         if row_id is None:
             raise RuntimeError("SQLite did not return the conversation row id")
-        self._next_seq += 1
+        self._next_seq = next_seq + 1
         return int(row_id)
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > _SCHEMA_VERSION:
-            raise RuntimeError(
-                f"unsupported conversation schema version {version}; "
-                f"maximum supported version is {_SCHEMA_VERSION}"
-            )
-
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
-        required = {
-            "tokens": "tokens INTEGER",
-            "kind": "kind TEXT NOT NULL DEFAULT 'turn'",
-            "meta": "meta TEXT",
-        }
-        missing = [
-            (name, definition)
-            for name, definition in required.items()
-            if name not in columns
-        ]
-        if version >= _SCHEMA_VERSION and missing:
-            names = ", ".join(name for name, _ in missing)
-            raise RuntimeError(f"conversation schema v2 is missing columns: {names}")
-
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
         try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version > _SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"unsupported conversation schema version {version}; "
+                    f"maximum supported version is {_SCHEMA_VERSION}"
+                )
+
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+            required = {
+                "tokens": "tokens INTEGER",
+                "kind": "kind TEXT NOT NULL DEFAULT 'turn'",
+                "meta": "meta TEXT",
+            }
+            missing = [
+                (name, definition)
+                for name, definition in required.items()
+                if name not in columns
+            ]
+            if version >= _SCHEMA_VERSION and missing:
+                names = ", ".join(name for name, _ in missing)
+                raise RuntimeError(f"conversation schema v2 is missing columns: {names}")
             for _, definition in missing:
                 conn.execute(f"ALTER TABLE conversations ADD COLUMN {definition}")
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
+
+    @classmethod
+    def _validate_database(cls, conn: sqlite3.Connection) -> None:
+        foreign_key_error = conn.execute("PRAGMA foreign_key_check").fetchone()
+        if foreign_key_error is not None:
+            raise RuntimeError(
+                f"conversation database has invalid foreign key: {foreign_key_error}"
+            )
+
+        rows = conn.execute(
+            "SELECT id, parent_id, kind, meta FROM conversations"
+        ).fetchall()
+        row_ids = {int(row[0]) for row in rows}
+        for row_id, parent_id, kind, meta in rows:
+            if parent_id is not None and int(parent_id) not in row_ids:
+                raise RuntimeError(
+                    f"conversation row {row_id} references missing parent {parent_id}"
+                )
+            if kind != _SUMMARY_ROLE or meta is None:
+                continue
+            decoded = cls._decode_meta(meta)
+            if decoded is None:
+                continue
+            for name in ("covers_from", "covers_to"):
+                value = decoded.get(name)
+                if value is None:
+                    continue
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value not in row_ids
+                ):
+                    raise RuntimeError(
+                        f"conversation summary row {row_id} references missing {name} {value}"
+                    )
 
     def _fail_pending(self, exc: BaseException) -> None:
         while True:
@@ -542,8 +726,7 @@ class ConversationStore:
             if item is _SENTINEL:
                 continue
             pending = item[-1]
-            pending.exc = exc
-            pending.event.set()
+            pending.fail(exc)
 
     def _fsync_now(self) -> None:
         cursor = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -551,6 +734,24 @@ class ConversationStore:
         cursor.close()
         os.fsync(self._wal_fd)
         os.fsync(self._db_fd)
+
+    @staticmethod
+    def _summary_range(meta: Any) -> tuple[int, int] | None:
+        if meta is None:
+            return None
+        decoded = ConversationStore._decode_meta(meta)
+        if decoded is None:
+            return None
+        covers_from = decoded.get("covers_from")
+        covers_to = decoded.get("covers_to")
+        if (
+            isinstance(covers_from, int)
+            and not isinstance(covers_from, bool)
+            and isinstance(covers_to, int)
+            and not isinstance(covers_to, bool)
+        ):
+            return covers_from, covers_to
+        return None
 
     def _reader(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, timeout=_WRITER_BUSY_TIMEOUT_MS / 1000)

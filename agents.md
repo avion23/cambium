@@ -55,15 +55,17 @@ interpreter.
 
 ```sh
 cd /home/ubuntu/cambium
-PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
+PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo --demo
 PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
-The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`, `tasktree`,
+The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`,
 `module-test`, `version`, `run`, `repl`, `tui`, `session`, and `architectus`
-(`session
-list/latest/show` reads completed session results); prefer it over the internal
-supervisor module.
+(`session list/latest/show/status/resume/usage` reads or resumes session
+artifacts); prefer it over the internal supervisor module. Supervisor runs
+require `--plan`, `--task-spec`, or `--demo` alongside `--session-dir`.
+Context reuse is on by default for operator-facing commands and has no public
+disable flag.
 Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
 child imports resolve without an install.
 Root `conftest.py` exports `src` on `PYTHONPATH` so scenario subprocesses
@@ -136,6 +138,13 @@ stdout and to a file under /tmp; the source repo is never written.
   integrity, fencing, expected-old ref publication, session admission,
   worktree confinement, protocol/request correlation, and quarantine).
   Publication is ref-only; it does not refresh a checkout.
+- Operator-facing one-shot and supervisor entry points enable context reuse by
+  default. Internal callers may pass `context_reuse=False` for targeted legacy
+  or compatibility paths; absent wire fields still fail closed in workers.
+- Rolling transcript compaction is the default policy within context reuse.
+  The supervisor forwards the policy on the existing worker init message. A
+  fold creates and activates the next immutable context epoch, updates the
+  supervisor's fork metadata, and leaves every prior epoch byte-exact.
 - Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
   diagnostics use stderr/logging. The supervisor bounds each worker's decoded
   stdout queue and routes emitted records through `EventStore`.
@@ -148,10 +157,11 @@ stdout and to a file under /tmp; the source repo is never written.
   field names (`access_token`, `refresh_token`, `id_token`,
   `authorization_code`, `code_verifier`, `device_auth_id`, `user_code`) are
   structured secret names redacted in JSON-looking text.
-- Warm worker pool (eval-3 ADOPT): the supervisor keeps a bounded
-  session-scoped pool (`CAMBIUM_WARM_POOL_SIZE`, default 1; 0 disables) of
-  idle reuse-ready workers and rebinds them to new worktrees via a full
-  second init instead of spawning a fresh interpreter per task. Only the
+- Warm worker pool (eval-3 ADOPT): the supervisor can keep a bounded
+  session-scoped pool of idle reuse-ready workers and rebind them to new
+  worktrees via a full second init instead of spawning a fresh interpreter
+  per task. The pool is opt-in: `--warm-pool-size N` (default 0, disabled);
+  the `CAMBIUM_WARM_POOL_SIZE` environment variable is not read. Only the
   first generation of a task may pop the pool; restarts always spawn fresh;
   pooled workers are killed at session end. A pooled worker only serves a
   task whose env matches (session, provider config, credentials) and rebuilds

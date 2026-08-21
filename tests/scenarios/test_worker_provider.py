@@ -383,6 +383,7 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
     }
 
     neutral_config = worker.AgentConfig.from_init(init)
+    assert neutral_config.context_reuse is False
     neutral_router, tier, model, _identity = worker._provider_router(
         neutral_config.fanout_config,
         debt=neutral_config.debt,
@@ -601,11 +602,13 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         assert root_result["files_changed"] == []
         assert root_result["unified_diff"] == ""
         assert root_result["summary"] == summary
-        # A true no-op persists no final transcript checkpoint: the raw
-        # transcript may echo credentials back. The summary stays in the
-        # envelope and no empty commit is created.
+        # Default context reuse persists one redacted immutable terminal epoch.
+        # The summary stays in the envelope and no empty commit is created.
         assert not [event for event in events if event["kind"] == "checkpoint"]
-        assert not (session_dir / ".cambium" / "checkpoints").exists()
+        context_events = [event for event in events if event["kind"] == "context_checkpoint"]
+        assert len(context_events) == 1
+        checkpoint_ref = context_events[0]["payload"]["checkpoint_ref"]
+        assert (session_dir / ".cambium" / "checkpoints" / checkpoint_ref).is_file()
     finally:
         server.close()
 
@@ -1110,7 +1113,13 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
             system = REQUESTS[0]["messages"][0]["content"]
             assert system.startswith("You are Cambium's autonomous coding agent.")
             assert "Available tools:" in system
-            assert TASK_TEXT in system
+            # §9.1.6: the task is delimited user-role data, never system text.
+            assert TASK_TEXT not in system
+            task_message = REQUESTS[0]["messages"][1]
+            assert task_message["role"] == "user"
+            assert task_message["content"] == (
+                f"<cambium-task>\nTask: {TASK_TEXT}\n</cambium-task>"
+            )
     finally:
         server.close()
 
@@ -1399,12 +1408,14 @@ def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
         assert not (session_dir / "wt" / "should-not-exist").exists()
         assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
         tool_events = [m for m in messages if m["type"] == "tool_event"]
-        assert tool_events == []
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool"] == "run_shell"
+        assert tool_events[0]["ok"] is False
         with REQUEST_LOCK:
             assert len(REQUESTS) == 2
             assert any(
-                "action rejected: run_shell is not permitted by this worker's permissions"
-                in message.get("content", "")
+                "tool run_shell ok=False" in message.get("content", "")
+                and "permission_denied:shell" in message.get("content", "")
                 for message in REQUESTS[1]["messages"]
             )
     finally:

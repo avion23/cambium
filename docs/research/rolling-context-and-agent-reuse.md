@@ -157,10 +157,10 @@ worktree; `MergeSequencer.publish_merge` (`src/cambium/merge.py:884-...`)
 atomically advances `refs/heads/main` under a strict fast-forward contract;
 `run_plan` (`supervisor.py:3830-4018`) drives the whole session. Consequence:
 a worker's own `finish` claim ("emit finish only when the task is complete
-and verified", `worker.py:1224-1225`) is *advisory*. Folding raw turn data
-into compact state must therefore be gated on the supervisor's published
-result, not on worker success alone. The worker does not know whether its
-branch was merged.
+and verified", `worker.py:1224-1225`) is *advisory*. Repository publication
+therefore remains supervisor-owned. The implemented fold derives only a
+bounded active context and writes a new immutable epoch, so it runs at a safe
+worker turn boundary without a publication gate.
 
 ### 4.4 Per-node context is already the isolation unit
 
@@ -229,7 +229,7 @@ State machine per node:
 
 ```text
   idle --init--> running --turn boundary--> running
-     running --verified published result--> folding
+     running --continuation above threshold--> folding
      folding --fold ok--> idle(compacted)
      folding --canary fail or budget exhausted--> idle(uncompacted, durable error)
      running --failure/cancel--> idle(failed, no fold)
@@ -242,9 +242,9 @@ Invariants:
   checkpoint plus the raw record.
 - **Derived state only.** The compact state is a derived cache; deleting it
   costs a replay, not a loss of truth.
-- **Fold only after verified publication.** The supervisor emits a published
-  event after `publish_merge` (or the no-change success path); only then may
-  the worker fold. Worker-side success alone never triggers a fold.
+- **Publication-independent context derivation.** A fold changes only the
+  active context projection and immutable checkpoint metadata. Publication
+  and merge policy remain unchanged and supervisor-owned.
 - **Per-node state.** Every fold, cursor, and projection is keyed by
   `node_id`. Sibling rows never enter a projection.
 - **Never revert repository or worktree changes.** Compaction touches only
@@ -256,10 +256,10 @@ Invariants:
 
 ### 6.1 Trigger and admission
 
-Initial slice, default-off: an `init` flag such as
-`"rolling_compact": true` (modeled on the existing `worker_reuse` opt-in,
-`supervisor.py:2340-2344`, `worker.py:2470-2474`). When the flag is absent,
-the worker loop is byte-for-byte the current one. Do **not** add a new
+Current implementation: the existing `rolling_compact` init field is an
+internal default-on policy whenever context reuse is enabled. There is no CLI
+flag and no second configuration model. An explicit false remains for direct
+compatibility tests. Do **not** add a new
 `compact` IPC request type first: the worker dispatch loop
 (`worker.py:2480-2610`) special-cases `init`, `run_task`, `cancel`, and EOF,
 and a new request type would require new ordering, out-of-order, and fatal
@@ -268,11 +268,10 @@ six request types). The fold therefore starts as a **worker self-trigger at a
 turn boundary**, exactly like the current `_summarize_transcript` call site
 (`worker.py:1730`), gated on:
 
-1. `rolling_compact` init flag,
-2. the supervisor having reported a verified published result for the node,
-3. a token threshold with hysteresis: enter above `threshold_high`, do not
+1. the internal `rolling_compact` policy,
+2. a character threshold with hysteresis: enter above `threshold_high`, do not
    leave until below `threshold_low` (prevents fold thrash),
-4. a per-fold cost budget (`max_fold_cost_usd`) and wall budget.
+3. the existing wall and token budgets.
 
 ### 6.2 Delta fold algorithm
 
@@ -538,7 +537,9 @@ checkpoint is appended after the summary row in the same writer.
 
 ## 11. Required software changes by component
 
-Docs-only today; each row lists what a future implementation must touch.
+Historical proposal below. The current implementation uses immutable epoch
+files rather than `ConversationStore` summary rows; source and architecture
+docs are authoritative.
 
 - **`src/cambium/conversations.py`** — extend `add_summary`/`meta` with
   `state_version` and a `folded_from` marker; add a `raw_range(node_id, from,
@@ -546,20 +547,12 @@ Docs-only today; each row lists what a future implementation must touch.
   rendering in the worker and add only the range reader). Store remains
   append-only; no schema migration needed for the version field if `meta`
   JSON carries it.
-- **`src/cambium/worker.py`** — replace the in-place `_summarize_transcript`
-  call (`worker.py:1730`) with a gated fold path (`maybe_fold`, §6.2) that
-  renders the compact state into the active projection; add the
-  `rolling_compact` init flag to `AgentConfig` (`worker.py:632` area);
-  emit structured `compaction` events; keep `_summarize_transcript` only as a
-  legacy bounded fallback while the feature is default-off.
-- **`src/cambium/supervisor.py`** — emit a `published` event after the merge
-  path decides a node's fate (`_worker_success_integrity` + `publish_merge`
-  caller, `supervisor.py:2933-3161`); forward the verified state to the
-  worker so the fold gate is supervisor-owned; add a `rolling_compact`
-  option to `run_plan` (next to `conversations`/`warm_pool_size`,
-  `supervisor.py:3842-3844`); for reuse, snapshot parent context checkpoints
-  and spawn children from them (reusing `_admit_child`,
-  `supervisor.py:1670-1727`, and `_child_spec`, `supervisor.py:3509-3534`).
+- **`src/cambium/worker.py`** — implemented at the provider turn boundary:
+  deterministic suffix rendering, immutable next-epoch creation, active
+  projection replacement, and `context_epoch_advanced` emission.
+- **`src/cambium/supervisor.py`** — implemented on the existing init/event
+  path: default policy forwarding, strict epoch-transition validation, active
+  `_task_epochs` replacement, and child pinning from the new descriptor.
 - **`src/cambium/ipc.py` / protocol** — no new request type in phase 1. The
   fold is a self-trigger; reuse uses the existing `init`/`run_task`/
   `result_envelope`/`reuse_ready` surface. A later `context`-style message
@@ -571,8 +564,8 @@ Docs-only today; each row lists what a future implementation must touch.
   checkpoint rendering.
 - **`src/cambium/tasktree.py`** — unchanged; its `_ENVELOPE_KEYS` and
   `upward_result` define the child-result message shape.
-- **`src/cambium/cli.py`** — surface `--rolling-compact` and
-  `--context-reuse` flags next to `--conversations` (`cli.py:177-180`).
+- **`src/cambium/cli.py`** — no rolling-compaction flag. Context reuse and its
+  rolling policy are default-on through the existing operator path.
 - **`docs/research/README.md`** — index line for this note (this task).
 
 ## 12. Phased implementation plan
@@ -585,9 +578,9 @@ Docs-only today; each row lists what a future implementation must touch.
    through `ConversationStore` when a new init flag is set (default off);
    prove replay = rebuild. Keep `_summarize_transcript` untouched. Gate on
    `conversations=True`-style plumbing.
-3. **Phase 2 — rolling fold, self-trigger only.** Implement `maybe_fold` at
-   the existing `worker.py:1730` seam with the supervisor `published` gate,
-   hysteresis thresholds, canary, and durable errors. No new IPC message.
+3. **Phase 2 — rolling fold, self-trigger only (implemented).** The worker
+   folds at a turn boundary with hysteresis and durable errors. It creates a
+   new immutable epoch and uses the existing IPC event path.
 4. **Phase 3 — parent/child reuse.** Add checkpoints, child spawn from a
    checkpoint, and resume-with-envelope; keep child raw traces under child
    node ids. Reuse the existing worktree and permission plumbing.
@@ -605,8 +598,8 @@ New tests:
   `state_version` and no duplicate rows; the cursor is unchanged.
 - Cursor correctness: raw rows before the cursor are only readable via
   `raw_range`; rows after the cursor appear verbatim in the projection.
-- Supervisor gate: a worker "succeeded" without a published merge produces no
-  fold (fail-closed on the gate).
+- Pre-publication fold: an oversized active continuation advances the epoch
+  while leaving repository publication state unchanged.
 - Canary: dropping an open question from the covered range rejects the state;
   exhaustion records `compaction_failed` and leaves the prior state.
 - Redaction: no secret-pattern content from the covered range appears in the
@@ -637,7 +630,7 @@ Acceptance metrics (frozen corpus, pinned model, recorded commit SHA):
 
 | ID | Question | Proposed default |
 |---|---|---|
-| RQ1 | Worker self-trigger vs. supervisor-issued fold | worker self-trigger at turn boundary, supervisor `published` gate, default-off flag (this note) |
+| RQ1 | Worker self-trigger vs. supervisor-issued fold | resolved: worker self-trigger at turn boundary; internal default-on policy |
 | RQ2 | Where the active projection is rendered | worker, from store range + summary (store stays a raw/derived cache, not a prompt builder) |
 | RQ3 | Hysteresis thresholds and per-fold budgets | configurable; per-provider from §8.3 measurements |
 | RQ4 | Canary exhaustion policy | fail-open with durable `compaction_failed`, never silent substitution |
@@ -659,8 +652,8 @@ Acceptance metrics (frozen corpus, pinned model, recorded commit SHA):
 - **No repository/worktree mutation from compaction.**
 - **No single global summary.** Compaction is per-node; sibling state is
   never merged.
-- **No change to publication, merge, or verification policy.** The
-  supervisor keeps those; compaction only consumes a `published` signal.
+- **No change to publication, merge, or verification policy.** The supervisor
+  keeps those; compaction changes only context state.
 
 ## Appendix A — relationship to `compaction-design.md`
 
@@ -674,13 +667,12 @@ records three changes grounded in the current source:
    summarized from `covered_from` to `covered_to`; this note folds only
    `(cursor, head]` into the previous state (§6.2), making folds idempotent
    and proportional to the delta.
-2. **Supervisor `published` gate.** `compaction-design.md` §1 let the worker
-   compact on its own threshold; `worker.py` cannot know whether its branch
-   was published (§4.3), so the fold waits for the supervisor's verified
-   publication signal.
+2. **No publication gate for context-only folds.** The worker compacts on its
+   own threshold because the fold cannot publish or mutate repository state.
 3. **No new `compact` request first.** `compaction-design.md` §2 added a
    seventh request type; the current dispatch loop (`worker.py:2480-2610`)
-   has no generic request handler, so the first slice is a self-trigger at
-   the existing `worker.py:1730` seam, default-off (§6.1).
+   has no generic request handler, so the implementation self-triggers on the
+   existing turn-boundary seam.
 
-Both documents are drafts; neither claims the feature exists.
+The historical design sections remain research context; current context-reuse
+behavior is defined by source and tests.
