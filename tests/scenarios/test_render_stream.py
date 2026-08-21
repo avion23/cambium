@@ -8,10 +8,13 @@ and return a string.  No subprocesses, no network, no I/O.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 
 from cambium.render import (
     render_active_workers,
     render_event_line,
+    render_status_bar,
     render_tokens_per_s,
 )
 
@@ -393,3 +396,81 @@ def test_unknown_kind_json_fallback_stays_escaped_single_line() -> None:
 
     assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
     assert json.loads(line.rsplit("  ", 1)[1])["note"] == payload["note"]
+
+
+def _fixed_columns(monkeypatch: object, columns: int) -> None:
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        shutil, "get_terminal_size", lambda: os.terminal_size((columns, 24))
+    )
+
+
+def _bar_events() -> list[dict[str, object]]:
+    return [
+        {"kind": "spawned", "payload": {}, "task_id": "t1", "monotonic_ms": 0},
+        {"kind": "ready", "payload": {"pid": 7}, "task_id": "t1", "monotonic_ms": 100},
+        {
+            "kind": "usage_event",
+            "payload": {
+                "turn": 1,
+                "latency_s": 10.0,
+                "provider": "p",
+                "model": "m",
+                "estimated_cost_usd": 0.0125,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "total_tokens": 150,
+                },
+            },
+            "task_id": "t1",
+            "monotonic_ms": 200,
+        },
+    ]
+
+
+def test_status_bar_full_golden_at_fixed_columns(monkeypatch: object) -> None:
+    _fixed_columns(monkeypatch, 120)
+    left = "session=sess · elapsed=0s · task=t1"
+    right = "tokens/s=15.0 · in=100 out=50 cached=0 · cost=$0.012500 · subagents=1"
+    expected = f"{left}{' ' * (120 - len(left) - len(right))}{right}"
+
+    line = render_status_bar(_bar_events(), session_label="sess")
+
+    assert line == expected
+    assert len(line) == 120
+
+
+def test_status_bar_narrow_terminal_drops_right_segments_first(
+    monkeypatch: object,
+) -> None:
+    _fixed_columns(monkeypatch, 60)
+
+    line = render_status_bar(_bar_events(), session_label="sess")
+
+    assert len(line) == 60
+    assert line.endswith("tokens/s=15.0")
+    assert "cost=" not in line and "subagents=" not in line
+
+
+def test_status_bar_no_events_is_empty() -> None:
+    assert render_status_bar([], session_label="s") == ""
+    assert render_status_bar(None, session_label="s") == ""
+
+
+def test_status_bar_sanitizes_label_and_task_id(monkeypatch: object) -> None:
+    _fixed_columns(monkeypatch, 100)
+
+    line = render_status_bar(
+        [{"kind": "spawned", "payload": {}, "task_id": "t\x1b[31mi\nx"}],
+        session_label="se\x9b[2ms\ns",
+    )
+
+    assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
+    assert line.startswith("session=se[2ms s · ")
+    assert " task=t[31mi x" in line
+
+
+def test_status_bar_drops_absent_segments() -> None:
+    line = render_status_bar([{"kind": "heartbeat", "payload": {}}], session_label="lab")
+
+    assert line == "session=lab"

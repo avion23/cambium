@@ -21,12 +21,14 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from .results import CHILD_RESULT_KEYS, ROOT_RESULT_KEYS, Result, result_to_dict
+from .stats import usage_stats_from_events
 
 _SUPERVISOR_RESULT_FIELDS = frozenset(
     {
@@ -783,12 +785,70 @@ def render_live_status_line(events: Any) -> str:
     return "live: " + " · ".join(parts)
 
 
+def render_status_bar(events: Any, *, session_label: str) -> str:
+    """Render one live status bar line justified to the terminal width.
+
+    ``events`` is a sequence of already-redacted event records.  LEFT is
+    ``session=<label>``, ``render_elapsed(events)`` and the latest event
+    ``task_id``; RIGHT is ``render_tokens_per_s(events)``, the aggregate
+    ``in``/``out``/``cached`` token counts plus ``cost`` from the same
+    ``cambium.stats`` primitives that back ``render_usage_stats_line``
+    (via ``usage_stats_from_events``), and ``render_active_workers``.
+    Segments whose renderer returns ``""`` are dropped, and ``session_label``
+    and the task id pass through ``_sanitize_field``.  LEFT and RIGHT are
+    joined with spacing so the line spans ``shutil.get_terminal_size()``
+    columns exactly when both sides fit with at least one space between;
+    RIGHT segments are dropped from the end until it fits.  Returns ``""``
+    when there are no events at all.
+    """
+    records = [event for event in (events or ()) if isinstance(event, Mapping)]
+    if not records:
+        return ""
+    left_parts = [f"session={_sanitize_field(session_label)}"]
+    elapsed = render_elapsed(records)
+    if elapsed:
+        left_parts.append(elapsed)
+    task_id = ""
+    for event in reversed(records):
+        candidate = event.get("task_id")
+        if isinstance(candidate, str) and candidate:
+            task_id = _sanitize_field(candidate)
+            break
+    if task_id:
+        left_parts.append(f"task={task_id}")
+    right_parts: list[str] = []
+    rate = render_tokens_per_s(records)
+    if rate:
+        right_parts.append(rate)
+    stats = usage_stats_from_events(records)
+    if stats is not None:
+        right_parts.append(
+            f"in={stats.input_tokens} out={stats.output_tokens} "
+            f"cached={stats.cached_tokens}"
+        )
+        right_parts.append(f"cost=${stats.estimated_cost_usd:.6f}")
+    workers = render_active_workers(records)
+    if workers:
+        right_parts.append(workers)
+    left = " · ".join(left_parts)
+    columns = shutil.get_terminal_size().columns
+    while True:
+        if not right_parts:
+            return left
+        right = " · ".join(right_parts)
+        gap = columns - len(left) - len(right)
+        if gap >= 1:
+            return left + " " * gap + right
+        right_parts.pop()
+
+
 __all__ = [
     "render_active_workers",
     "render_event_line",
     "render_elapsed",
     "render_json_result",
     "render_live_status_line",
+    "render_status_bar",
     "render_subagent_status",
     "render_text_result",
     "render_tokens_per_s",
