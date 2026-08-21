@@ -12,6 +12,7 @@ dist/
 .mypy_cache/
 .coverage
 htmlcov/
+/optimized/
 
 # uv
 .venv/
