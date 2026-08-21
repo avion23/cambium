@@ -95,6 +95,39 @@ class _ScriptedRouter:
         budget_usd: float | None = None,
     ) -> _FakeCallResult:
         self.prompts.append(prompt)
+        messages = prompt.get("messages")
+        last_content = (
+            messages[-1].get("content")
+            if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
+            else None
+        )
+        if isinstance(last_content, str) and last_content.startswith(
+            "<cambium-summary-control>\n"
+        ):
+            payload = last_content.removeprefix(
+                "<cambium-summary-control>\n"
+            ).removesuffix("\n</cambium-summary-control>")
+            control = json.loads(payload)
+            summary = {
+                "type": "summary_entry",
+                "sequence": control["sequence"],
+                "source_sha256": control["source_sha256"],
+                "source_message_count": control["source_message_count"],
+                "through_turn": control["through_turn"],
+                "objective": "preserve the current coding objective",
+                "outcome": "captured the completed work segment",
+                "decisions_added": [],
+                "decisions_superseded": [],
+                "facts_added": [],
+                "facts_invalidated": [],
+                "files_and_symbols_changed": [],
+                "verification_results": [],
+                "relevant_failed_approaches": [],
+                "open_items": [],
+            }
+            return _FakeCallResult(
+                json.dumps(summary, sort_keys=True, separators=(",", ":"))
+            )
         if not self.responses:
             raise AssertionError("router call with no scripted response")
         return _FakeCallResult(self.responses.pop(0))
@@ -511,7 +544,9 @@ def test_suspend_cuts_epoch_at_delegate_boundary(tmp_path: Path) -> None:
     assert usage and "epoch" not in usage[0]  # pre-epoch turns carry no epoch
 
 
-def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(tmp_path: Path) -> None:
+def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
+    tmp_path: Path,
+) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
         worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True
@@ -523,7 +558,8 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(tmp_path: Path) -
 
     assert outcome["status"] == "succeeded"
     checkpoints = [
-        message for message in writer.messages()
+        message
+        for message in writer.messages()
         if message["type"] == "context_checkpoint"
     ]
     assert len(checkpoints) == 1
@@ -534,13 +570,12 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(tmp_path: Path) -
         config, checkpoint_ref, expect_task_id=True
     )
     assert checkpoint.epoch == 1
-    assert checkpoint.continuation_suffix[-1]["role"] == "assistant"
-    assert checkpoint.continuation_suffix[-1]["content"] == (
-        '{"summary":"done","type":"finish"}'
-    )
-    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
+    assert checkpoint.continuation_suffix == []
+    assert "<cambium-summary-entry>" in checkpoint.provider_messages[-1]["content"]
+    usage = [
+        message for message in writer.messages() if message["type"] == "usage_event"
+    ]
     assert usage and all("epoch" not in message for message in usage)
-
 
 def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -609,11 +644,13 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
     checkpoint = _write_epoch(config)
     prefix = checkpoint.full_messages
     original_checkpoint_bytes = (
-        (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
-    )
+        tmp_path / "ckpts" / checkpoint.checkpoint_ref
+    ).read_bytes()
     monkeypatch.setattr(worker, "MAX_CONTEXT_MESSAGES", 4)
     resume_config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         max_transcript_chars=100_000,
         resume={
             "checkpoint_ref": checkpoint.checkpoint_ref,
@@ -623,29 +660,48 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
         },
     )
     writer = _FakeWriter()
-    router = _ScriptedRouter([
-        '{"type":"tool_call","name":"read_batch",'
-        '"arguments":{"paths":["alpha.txt"]}}',
-        '{"type":"tool_call","name":"read_batch",'
-        '"arguments":{"paths":["alpha.txt"]}}',
-        '{"type":"finish","summary":"done"}',
-    ])
-
-    outcome = asyncio.run(
-        _drive_loop(resume_config, worktree, router, writer)
+    router = _ScriptedRouter(
+        [
+            '{"type":"tool_call","name":"read_batch",'
+            '"arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"tool_call","name":"read_batch",'
+            '"arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"done"}',
+        ]
     )
 
+    outcome = asyncio.run(_drive_loop(resume_config, worktree, router, writer))
+
     assert outcome["status"] == "succeeded"
-    assert len(router.prompts) == 3
-    assert all(prompt["messages"][: len(prefix)] == prefix for prompt in router.prompts)
+    action_prompts = [
+        prompt
+        for prompt in router.prompts
+        if not str(prompt["messages"][-1].get("content", "")).startswith(
+            "<cambium-summary-control>"
+        )
+    ]
+    summary_prompts = [
+        prompt
+        for prompt in router.prompts
+        if str(prompt["messages"][-1].get("content", "")).startswith(
+            "<cambium-summary-control>"
+        )
+    ]
+    assert len(action_prompts) == 3
+    assert len(summary_prompts) == 2
+    assert all(
+        prompt["messages"][: len(prefix)] == prefix for prompt in action_prompts
+    )
     assert all(
         len(prompt["messages"]) - len(prefix) <= worker.MAX_CONTEXT_MESSAGES
-        for prompt in router.prompts
+        for prompt in action_prompts
     )
     assert (
         tmp_path / "ckpts" / checkpoint.checkpoint_ref
     ).read_bytes() == original_checkpoint_bytes
-    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
+    usage = [
+        message for message in writer.messages() if message["type"] == "usage_event"
+    ]
     assert usage[0]["epoch"] == checkpoint.epoch
     assert usage[-1]["epoch"] == checkpoint.epoch + 1
     assert any(
@@ -653,12 +709,12 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
         for message in writer.messages()
     )
     terminal = [
-        message for message in writer.messages()
+        message
+        for message in writer.messages()
         if message["type"] == "context_checkpoint"
     ]
     assert len(terminal) == 1
-    assert terminal[0]["epoch"] == checkpoint.epoch + 2
-
+    assert terminal[0]["epoch"] == checkpoint.epoch + 3
 
 def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -700,7 +756,9 @@ def test_rolling_compact_config_defaults_on() -> None:
     assert defaulted.rolling_compact is True
 
 
-def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) -> None:
+def test_rolling_compact_fold_advances_epoch_and_preserves_head(
+    tmp_path: Path,
+) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(base_config)
@@ -737,7 +795,8 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) 
 
     assert outcome["status"] == "failed"
     advanced = [
-        message for message in writer.messages()
+        message
+        for message in writer.messages()
         if message["type"] == "context_epoch_advanced"
     ]
     assert len(advanced) == 1
@@ -757,12 +816,12 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) 
         config, advanced[0]["checkpoint_ref"], expect_task_id=True
     )
     assert folded.epoch == 2
-    assert json.dumps(folded.provider_messages, sort_keys=True) == json.dumps(
-        checkpoint.provider_messages, sort_keys=True
+    assert folded.provider_messages[: len(checkpoint.provider_messages)] == (
+        checkpoint.provider_messages
     )
-    assert len(folded.continuation_suffix) == 1
-    assert folded.continuation_suffix[0]["role"] == "user"
-    assert folded.continuation_suffix[0]["content"]
+    assert len(folded.provider_messages) == len(checkpoint.provider_messages) + 1
+    assert "<cambium-summary-entry>" in folded.provider_messages[-1]["content"]
+    assert folded.continuation_suffix == []
     assert (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes() == old_bytes
     assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
 
@@ -787,7 +846,6 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(tmp_path: Path) 
     assert resume_router.prompts[0]["messages"][: len(folded.full_messages)] == (
         folded.full_messages
     )
-
 
 def test_rolling_compact_rewrites_active_context_before_publication(
     tmp_path: Path,
@@ -920,7 +978,10 @@ def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
     )
 
     assert outcome["status"] == "failed"
-    assert router.prompts == []
+    assert len(router.prompts) == 1
+    assert "<cambium-summary-control>" in (
+        router.prompts[0]["messages"][-1]["content"]
+    )
     failed = [
         message for message in writer.messages()
         if message["type"] == "compaction_failed"
@@ -1113,7 +1174,9 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
         ],
     )
     resume_config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         resume={
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "epoch": checkpoint.epoch,
@@ -1124,9 +1187,7 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
     writer = _FakeWriter()
     router = _ScriptedRouter([])
 
-    outcome = asyncio.run(
-        _drive_loop(resume_config, worktree, router, writer)
-    )
+    outcome = asyncio.run(_drive_loop(resume_config, worktree, router, writer))
 
     assert outcome["status"] == "failed"
     assert "context_resume_failed" in (outcome["failure_reason"] or "")
@@ -1136,11 +1197,6 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
     assert not any(
         message["type"] == "context_checkpoint" for message in writer.messages()
     )
-
-
-# ---------------------------------------------------------------------------
-# Supervisor-side validators and resume building
-# ---------------------------------------------------------------------------
 
 def test_invalid_context_checkpoint_fields_matrix() -> None:
     digest = "a" * 64

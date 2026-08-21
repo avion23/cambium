@@ -5,7 +5,8 @@
 [`../architecture/provider-routing.md`](../architecture/provider-routing.md),
 and [`../architecture/terminal-interface.md`](../architecture/terminal-interface.md).
 
-**Reviewed:** 2026-08-20 against `main@877e4a7`.
+**Reviewed:** 2026-08-21 against current `main` and the verified append-only
+summary-trunk implementation.
 
 ## 1. Answer to the proposed design
 
@@ -78,20 +79,24 @@ merge order and expected-version rules.
 for ambiguous synthesis, but it is not an inherently correct merge protocol.
 It is nondeterministic, costly, and vulnerable to child-context poisoning.
 
-### 2.6 Roll the epoch
+### 2.6 Append one semantic segment
 
-When context pressure or expected future cost justifies it:
+At a configured threshold or a delegation/terminal boundary:
 
-1. freeze a covered range;
-2. deterministically extract decisions, constraints, file/symbol identities,
-   failed checks, open questions, and evidence references;
-3. ask for a schema-constrained synthesis;
-4. validate it and publish one successor epoch with compare-and-swap;
-5. keep a bounded verbatim recent tail;
-6. retain the complete raw history outside the active projection.
+1. freeze only the current raw working tail;
+2. compute its digest, message count, next sequence, and covered turn;
+3. make one additional provider call over the immutable trunk plus that tail;
+4. validate the strict semantic response and canonical entry digest;
+5. append `Sn+1` as one immutable user-role message and clear the covered tail;
+6. durably publish the new epoch, leaving `H + S1..Sn` byte-identical;
+7. retain the complete raw history outside the active projection.
 
-The next turn starts from the successor epoch. It does not append the summary
-behind the entire old epoch.
+The next turn starts from `H + S1..Sn+1 + new raw tail`. A later flush receives
+all earlier segments as context but may summarize only its explicitly supplied
+new raw source. This prevents recursive information decay and preserves exact
+prefix-cache locality. If the flat trunk eventually becomes too large, Cambium
+must introduce a separately typed hierarchical projection rather than silently
+summarizing summaries.
 
 ## 3. Recursion must be typed and bounded
 

@@ -4,8 +4,8 @@
 [`../architecture/context-engine.md`](../architecture/context-engine.md). Source
 and tests establish current behavior.
 
-**Reviewed:** 2026-08-20 against `main@877e4a7` and current provider
-documentation.
+**Reviewed:** 2026-08-21 against current `main` and the verified append-only
+summary-trunk implementation.
 
 ## 1. Research question
 
@@ -29,24 +29,33 @@ append-only history
 
 A cache hit accelerates replay. It does not advance Cambium's logical state.
 
-## 2. What is already implemented
+## 2. What is now implemented
 
-Current source contains substantial pieces of the mechanism:
+The earlier prototype has been replaced by an append-only semantic trunk:
 
-- `ConversationStore` stores an append-only parent-linked conversation graph;
-  branching inserts a marker instead of copying the prefix.
-- Worker/supervisor context descriptors bind epochs, artifacts, generations,
-  forks, resumes, terminal checkpoints, and rolling folds.
-- Structural cache evidence records a stable leading request-prefix byte count
-  and provider-reported cache usage when available.
-- Scenario tests cover epoch creation, fork/resume transitions, terminal
-  checkpoints, evidence transitions, fold publication, and descriptor/artifact
-  validation.
-- Provider affinity keeps a task on the provider that served it when that
-  provider remains eligible.
+- `SummaryEntry` binds every segment to an exact raw source digest, message
+  count, sequence number, covered turn, bounded semantic fields, and canonical
+  entry digest;
+- the active provider request is `stable head + S1..Sn + raw tail`;
+- threshold, delegation, and terminal boundaries make an additional provider
+  summary call, validate it, append one immutable entry, and clear only the
+  covered raw tail;
+- earlier summaries are never summarized again or rewritten; tests assert exact
+  prefix and `S1` byte stability when `S2` is appended;
+- compatible children reuse the exact trunk prefix, while incompatible
+  providers receive the same semantic entries under a fresh provider-specific
+  head;
+- legacy transcript-heavy checkpoints migrate at their next summary boundary;
+- raw events, ordinary turn checkpoints, and immutable epoch artifacts remain
+  the external audit/recovery record;
+- summary calls participate in token, request-debt, latency, cache, cancellation,
+  wall-clock, and cost accounting;
+- invalid summaries, redacted/corrupt checkpoints, and publication failures fail
+  closed without advancing the trunk.
 
-These are real implementation results. They do not prove that a provider cache
-hit occurred, nor do they prove a general cost or quality improvement.
+This establishes the mechanism and cold-path correctness. It does not by itself
+prove provider cache retention, cost savings, or task-quality improvement; those
+remain empirical questions under the verification protocol below.
 
 ## 3. Corrections to the earlier plan
 

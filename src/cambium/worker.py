@@ -149,6 +149,15 @@ from cambium.lint_diag import LintDiag
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import TOOL_SCHEMAS
+from cambium.summary_trunk import (
+    SUMMARY_PROTOCOL_LINES,
+    SummaryTrunkError,
+    append_summary_entry,
+    build_summary_request,
+    parse_summary_response,
+    partition_summary_trunk,
+    semantic_summary_messages,
+)
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
 PROTO = 1
@@ -433,6 +442,16 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
         "prefix_bytes": prefix_bytes,
         "provider_boundary": boundary,
     }
+
+
+def _validate_summary_trunk_ref(value: Any) -> str | None:
+    """Validate a cold-provider semantic summary checkpoint reference."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ContextForkError("summary_trunk_ref must be a non-empty string")
+    _validate_checkpoint_ref_shape(value)
+    return value
 
 
 def _validate_resume(value: Any) -> dict[str, Any] | None:
@@ -1045,6 +1064,8 @@ class AgentConfig:
     rolling_compact_threshold_high: int = 0
     rolling_compact_threshold_low: int = 0
     context_fork: dict[str, Any] | None = None
+    # Provider-neutral summary history used when an exact cache fork is illegal.
+    summary_trunk_ref: str | None = None
     resume: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -1144,6 +1165,9 @@ class AgentConfig:
             rolling_compact_threshold_high=rolling_threshold_high,
             rolling_compact_threshold_low=rolling_threshold_low,
             context_fork=_validate_context_fork(init.get("context_fork")),
+            summary_trunk_ref=_validate_summary_trunk_ref(
+                init.get("summary_trunk_ref")
+            ),
         )
 
 
@@ -1176,6 +1200,9 @@ def _merge_task_config(
         run.get("parent_envelope")
     )
     resume = config.resume or _validate_resume(run.get("resume"))
+    summary_trunk_ref = config.summary_trunk_ref or _validate_summary_trunk_ref(
+        run.get("summary_trunk_ref")
+    )
     rolling_compact = config.rolling_compact
     if "rolling_compact" not in init and "rolling_compact" in run:
         rolling_compact = _strict_bool(
@@ -1223,6 +1250,7 @@ def _merge_task_config(
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
         context_fork=config.context_fork,
+        summary_trunk_ref=summary_trunk_ref,
         resume=resume,
     )
 
@@ -1279,6 +1307,9 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
         context_fork=_validate_context_fork(run.get("context_fork")),
+        summary_trunk_ref=_validate_summary_trunk_ref(
+            run.get("summary_trunk_ref")
+        ),
         resume=_validate_resume(run.get("resume")),
     )
 
@@ -2264,8 +2295,9 @@ def _build_agent_prompt(
             "asked what model or provider you are, answer truthfully from this "
             "identity and never guess."
         )
+    system_lines.extend(SUMMARY_PROTOCOL_LINES)
     system_lines.extend([
-        "Return exactly one JSON object per turn; your reply must be one action:",
+        "In normal mode, return exactly one JSON object; it must be one action:",
         '  plan:      {"type": "plan", "steps": ["...", "..."]}',
         '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
         '  finish:    {"type": "finish", "summary": <non-empty summary>}',
@@ -3514,122 +3546,215 @@ async def _run_agent_loop(
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
 
-    async def _bound_context_continuation(turn: int) -> tuple[bool, str | None]:
-        """Bound mutable continuation or perform one durable rolling fold."""
-        nonlocal context_continuation, current_epoch_checkpoint, epoch_count
-        nonlocal compaction_armed, usage_epoch
+    async def _bound_context_continuation(
+        turn: int, *, force: bool = False
+    ) -> tuple[bool, str | None]:
+        """Flush only the raw tail into one immutable semantic summary entry.
 
-        rolling_gate = config.rolling_compact and config.context_reuse
-        continuation_size = _transcript_chars(context_continuation)
-        if rolling_gate:
-            if continuation_size <= config.rolling_compact_threshold_low:
+        Existing summary entries remain byte-identical and are never model
+        input to the summarized range. Legacy checkpoint transcript material
+        is treated as raw tail once, then replaced by the first summary entry.
+        """
+        nonlocal base_messages, context_continuation, current_epoch_checkpoint
+        nonlocal epoch_count, compaction_armed, usage_epoch, cumulative_usage
+        nonlocal budget_new_tokens, previous_prompt_tokens
+
+        if base_messages is None:
+            return False, None
+        try:
+            trunk_messages, legacy_tail = partition_summary_trunk(base_messages)
+        except SummaryTrunkError as exc:
+            return False, str(exc)
+        raw_tail = [*legacy_tail, *copy.deepcopy(context_continuation)]
+        rolling_gate = (
+            config.rolling_compact
+            and config.context_reuse
+            and config.checkpoint_root is not None
+        )
+        raw_size = _transcript_chars(raw_tail)
+        if not force:
+            if not rolling_gate:
+                bounded = _summarize_transcript(
+                    context_continuation,
+                    config.max_transcript_chars,
+                    max_messages=MAX_CONTEXT_MESSAGES,
+                )
+                if bounded == context_continuation:
+                    return False, None
+                context_continuation = bounded
+                _sync_context_transcript()
+                return True, None
+            if raw_size <= config.rolling_compact_threshold_low:
                 compaction_armed = True
-            if (
+            if not (
                 compaction_armed
                 and (
-                    continuation_size > config.rolling_compact_threshold_high
-                    or len(context_continuation) > MAX_CONTEXT_MESSAGES
+                    raw_size > config.rolling_compact_threshold_high
+                    or len(raw_tail) > MAX_CONTEXT_MESSAGES
                 )
             ):
-                request_id = (
-                    run_request_id
-                    if isinstance(run_request_id, str) and run_request_id
-                    else make_request_id("run")
-                )
-                prior_continuation = copy.deepcopy(context_continuation)
-                prior_epoch = epoch_count
-                try:
-                    if base_messages is None or current_epoch_checkpoint is None:
-                        raise ContextForkError("no active epoch checkpoint for rolling fold")
-                    compacted_suffix = _render_rolling_compaction(
-                        prior_continuation,
-                        config.rolling_compact_threshold_low,
-                    )
-                    cache_key = current_epoch_checkpoint.cache_key
-                    provider = cache_key.provider
-                    checkpoint = await asyncio.to_thread(
-                        _write_epoch_checkpoint,
-                        config,
-                        turn=turn,
-                        epoch=prior_epoch + 1,
-                        provider_messages=copy.deepcopy(list(base_messages)),
-                        continuation_suffix=copy.deepcopy(compacted_suffix),
-                        provider=provider,
-                        model=cache_key.model,
-                        tools_sha256=_sha256_hex(
-                            json.dumps(tools, sort_keys=True).encode("utf-8")
-                        ),
-                        provider_compat=(
-                            {provider: (cache_key.protocol, cache_key.reasoning_effort)}
-                            if provider is not None
-                            else {}
-                        ),
-                        provider_boundary=cache_key.provider_boundary,
-                        code_changed=code_changed,
-                        verified_after_change=verified_after_change,
-                        verification_failed=verification_failed,
-                        no_progress_actions=no_progress_actions,
-                        budget_new_tokens=budget_new_tokens,
-                        previous_prompt_tokens=previous_prompt_tokens,
-                        cumulative_usage=cumulative_usage,
-                        wall_deadline=absolute_wall_deadline,
-                    )
-                    if checkpoint is None:
-                        raise ContextForkError("rolling fold has no checkpoint root")
-                    checkpoint = _load_epoch_checkpoint(
-                        config, checkpoint.checkpoint_ref, expect_task_id=True
-                    )
-                except Exception as exc:
-                    failure_reason = str(exc).strip() or exc.__class__.__name__
-                    if config.redactor is not None:
-                        failure_reason = config.redactor.redact_escaped(failure_reason)
-                    failure_reason = _cap_utf8(
-                        failure_reason, MAX_ENVELOPE_FIELD_CHARS
-                    )
-                    if writer is not None:
-                        await _emit_compaction_failed(
-                            writer,
-                            config,
-                            request_id=request_id,
-                            epoch=prior_epoch,
-                            reason=failure_reason,
-                        )
-                    return False, failure_reason
+                return False, None
+        elif not config.context_reuse or config.checkpoint_root is None:
+            return False, None
+        if not raw_tail:
+            return False, None
 
-                # Commit the in-memory transition only after the immutable
-                # checkpoint has been durably created. The old checkpoint and
-                # the stable base tuple are never mutated.
-                context_continuation = copy.deepcopy(checkpoint.continuation_suffix)
-                current_epoch_checkpoint = checkpoint
-                epoch_count = checkpoint.epoch
-                usage_epoch = checkpoint.epoch
-                compaction_armed = (
-                    _transcript_chars(context_continuation)
-                    <= config.rolling_compact_threshold_low
+        request_id = (
+            run_request_id
+            if isinstance(run_request_id, str) and run_request_id
+            else make_request_id("run")
+        )
+        prior_epoch = epoch_count
+        local_checkpoint = (
+            current_epoch_checkpoint is not None
+            and current_epoch_checkpoint.task_id == config.task_id
+            and current_epoch_checkpoint.generation == config.generation
+        )
+        try:
+            summary_prompt, expectation = build_summary_request(
+                trunk_messages,
+                raw_tail,
+                through_turn=turn,
+            )
+            sent_summary_prompt = copy.deepcopy(summary_prompt)
+            try:
+                summary_result = await router.call(
+                    tier,
+                    summary_prompt,
+                    model=model,
+                    budget_usd=budget_usd,
                 )
-                _sync_context_transcript()
+            except Exception as exc:
                 if writer is not None:
-                    await _emit_context_epoch_advanced(
+                    await _emit_usage_event(
                         writer,
                         config,
-                        request_id=request_id,
-                        checkpoint=checkpoint,
-                        folded_from_epoch=prior_epoch,
-                        reason=None,
+                        _failure_usage_event(
+                            exc,
+                            turn=turn,
+                            model=model,
+                            router=router,
+                            prompt=sent_summary_prompt,
+                        ),
+                        epoch=usage_epoch,
+                        fork_of=usage_fork_of,
                     )
-                return True, None
-            return False, None
+                raise ContextForkError(
+                    f"summary provider call failed: {exc.__class__.__name__}"
+                ) from exc
+            if time.monotonic() >= wall_deadline:
+                raise ContextForkError("wall budget exceeded during summary flush")
+            if summary_result.model != model:
+                raise ContextForkError("summary response model mismatch")
+            invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
+            if invalid_usage_fields:
+                raise ContextForkError("summary usage contains invalid token counts")
+            summary_total = _usage_total(summary_result.usage)
+            if summary_total is None:
+                raise ContextForkError("summary usage missing usable token counts")
+            if writer is not None:
+                await _emit_usage_event(
+                    writer,
+                    config,
+                    _success_usage_event(summary_result, turn),
+                    epoch=usage_epoch,
+                    fork_of=usage_fork_of,
+                )
+            cumulative_usage = _accumulate_usage(
+                cumulative_usage, summary_result.usage
+            )
+            summary_prompt_tokens = _usage_prompt_tokens(summary_result.usage)
+            summary_completion_tokens = _usage_completion_tokens(summary_result.usage)
+            if summary_prompt_tokens is None:
+                budget_new_tokens += summary_total
+                previous_prompt_tokens = 0
+            else:
+                budget_new_tokens += max(
+                    0, summary_prompt_tokens - previous_prompt_tokens
+                )
+                previous_prompt_tokens = summary_prompt_tokens
+                budget_new_tokens += (
+                    summary_completion_tokens
+                    if summary_completion_tokens is not None
+                    else max(0, summary_total - summary_prompt_tokens)
+                )
+            if budget_new_tokens > config.max_tokens:
+                raise ContextForkError("token budget exceeded during summary flush")
+            summary_entry = parse_summary_response(
+                summary_result.content, expectation
+            )
+            new_trunk = append_summary_entry(trunk_messages, summary_entry)
+            checkpoint = await asyncio.to_thread(
+                _write_epoch_checkpoint,
+                config,
+                turn=turn,
+                epoch=prior_epoch + 1,
+                provider_messages=copy.deepcopy(new_trunk),
+                continuation_suffix=[],
+                provider=summary_result.provider,
+                model=model,
+                tools_sha256=_sha256_hex(
+                    json.dumps(tools, sort_keys=True).encode("utf-8")
+                ),
+                provider_compat=provider_compat,
+                provider_boundary=provider_boundaries.get(summary_result.provider),
+                code_changed=code_changed,
+                verified_after_change=verified_after_change,
+                verification_failed=verification_failed,
+                no_progress_actions=no_progress_actions,
+                budget_new_tokens=budget_new_tokens,
+                previous_prompt_tokens=previous_prompt_tokens,
+                cumulative_usage=cumulative_usage,
+                wall_deadline=absolute_wall_deadline,
+            )
+            if checkpoint is None:
+                raise ContextForkError("summary flush has no checkpoint root")
+            checkpoint = _load_epoch_checkpoint(
+                config, checkpoint.checkpoint_ref, expect_task_id=True
+            )
+        except Exception as exc:
+            failure_reason = str(exc).strip() or exc.__class__.__name__
+            if config.redactor is not None:
+                failure_reason = config.redactor.redact_escaped(failure_reason)
+            failure_reason = _cap_utf8(
+                failure_reason, MAX_ENVELOPE_FIELD_CHARS
+            )
+            if writer is not None:
+                await _emit_compaction_failed(
+                    writer,
+                    config,
+                    request_id=request_id,
+                    epoch=max(1, prior_epoch),
+                    reason=failure_reason,
+                )
+            return False, failure_reason
 
-        bounded = _summarize_transcript(
-            context_continuation,
-            config.max_transcript_chars,
-            max_messages=MAX_CONTEXT_MESSAGES,
-        )
-        if bounded == context_continuation:
-            return False, None
-        context_continuation = bounded
-        epoch_count += 1
+        # Publish only after durable checkpoint creation. Prior summary bytes
+        # are shared verbatim; the raw tail disappears from the active prompt.
+        base_messages = tuple(copy.deepcopy(checkpoint.full_messages))
+        context_continuation = []
+        current_epoch_checkpoint = checkpoint
+        epoch_count = checkpoint.epoch
+        usage_epoch = checkpoint.epoch
+        compaction_armed = True
         _sync_context_transcript()
+        if writer is not None:
+            if local_checkpoint:
+                await _emit_context_epoch_advanced(
+                    writer,
+                    config,
+                    request_id=request_id,
+                    checkpoint=checkpoint,
+                    folded_from_epoch=prior_epoch,
+                    reason=None,
+                )
+            else:
+                await _emit_context_checkpoint(
+                    writer,
+                    config,
+                    checkpoint,
+                    request_id=request_id,
+                )
         return True, None
 
     resume = config.resume
@@ -3695,6 +3820,61 @@ async def _run_agent_loop(
                 "generation": config.generation,
                 "reason": fork_skip,
             })
+
+    if base_messages is None and config.summary_trunk_ref is not None:
+        try:
+            semantic_checkpoint = _load_epoch_checkpoint(
+                config, config.summary_trunk_ref, expect_task_id=False
+            )
+            if semantic_checkpoint.cache_key.redacted:
+                raise ContextForkError("checkpoint redacted")
+            summaries = semantic_summary_messages(
+                semantic_checkpoint.full_messages
+            )
+            semantic_prompt = _build_agent_prompt(
+                config.task,
+                tools,
+                summaries,
+                model_identity,
+                parent_envelope=config.parent_envelope,
+            )
+            semantic_trunk, semantic_tail = partition_summary_trunk(
+                semantic_prompt["messages"]
+            )
+            base_messages = tuple(copy.deepcopy(semantic_trunk))
+            context_continuation = copy.deepcopy(semantic_tail)
+            usage_fork_of = config.summary_trunk_ref
+            _sync_context_transcript()
+        except (ContextForkError, SummaryTrunkError) as exc:
+            if writer is not None:
+                await send(writer, {
+                    "type": "context_fork_skipped",
+                    "request_id": run_request_id,
+                    "task_id": config.task_id,
+                    "generation": config.generation,
+                    "reason": f"semantic summary reuse failed: {exc}",
+                })
+
+    # The main agent starts in trunk mode too. The stable head is frozen once;
+    # later summaries extend it and the raw working tail remains separate.
+    if (
+        base_messages is None
+        and config.context_reuse
+        and config.checkpoint_root is not None
+    ):
+        initial_prompt = _build_agent_prompt(
+            config.task,
+            tools,
+            [],
+            model_identity,
+            parent_envelope=config.parent_envelope,
+        )
+        initial_trunk, initial_tail = partition_summary_trunk(
+            initial_prompt["messages"]
+        )
+        base_messages = tuple(copy.deepcopy(initial_trunk))
+        context_continuation = copy.deepcopy(initial_tail)
+        _sync_context_transcript()
 
     wall_deadline = time.monotonic() + max(
         0.0, absolute_wall_deadline - time.time()
@@ -3875,22 +4055,81 @@ async def _run_agent_loop(
                         _sync_context_transcript()
                     progress.tool = "finish"
                     continue
-                # A forked child consumes an immutable parent epoch; its
-                # terminal result is not a new parent-resumable boundary.
-                if config.context_reuse and usage_fork_of is None:
+
+                # The root/parent performs one additional summary call at the
+                # terminal boundary. Forked children return their strict result
+                # envelope instead of publishing a competing parent trunk.
+                terminal_summary_flushed = False
+                terminal_had_local_checkpoint = (
+                    current_epoch_checkpoint is not None
+                    and current_epoch_checkpoint.task_id == config.task_id
+                    and current_epoch_checkpoint.generation == config.generation
+                )
+                if (
+                    config.context_reuse
+                    and usage_fork_of is None
+                    and base_messages is not None
+                    and config.checkpoint_root is not None
+                ):
+                    _folded, compaction_failure = await _bound_context_continuation(
+                        turn, force=True
+                    )
+                    if compaction_failure is not None:
+                        return _loop_result(
+                            outcome,
+                            "failed",
+                            f"compaction_failed: {compaction_failure}",
+                            turn,
+                            cumulative_usage,
+                            transcript,
+                        )
+                    terminal_summary_flushed = _folded
+                terminal_checkpoint_already_emitted = (
+                    terminal_summary_flushed and not terminal_had_local_checkpoint
+                )
+
+                # A fresh root flush emits its terminal context checkpoint
+                # directly. A resumed local trunk emits context_epoch_advanced,
+                # so retain the historical terminal checkpoint after that flush.
+                terminal_provider = result.provider
+                terminal_boundary = provider_boundaries.get(result.provider)
+                terminal_compat = provider_compat
+                terminal_messages = copy.deepcopy(sent_prompt["messages"])
+                terminal_suffix = [copy.deepcopy(action_message)]
+                if base_messages is not None and current_epoch_checkpoint is not None:
+                    terminal_key = current_epoch_checkpoint.cache_key
+                    terminal_provider = terminal_key.provider or result.provider
+                    terminal_boundary = terminal_key.provider_boundary
+                    terminal_compat = (
+                        {
+                            terminal_provider: (
+                                terminal_key.protocol,
+                                terminal_key.reasoning_effort,
+                            )
+                        }
+                        if terminal_provider is not None
+                        else {}
+                    )
+                    terminal_messages = copy.deepcopy(list(base_messages))
+                    terminal_suffix = []
+                if (
+                    config.context_reuse
+                    and usage_fork_of is None
+                    and not terminal_checkpoint_already_emitted
+                ):
                     epoch_count += 1
                     terminal_epoch = {
                         "turn": turn,
                         "epoch": epoch_count,
-                        "provider_messages": copy.deepcopy(sent_prompt["messages"]),
-                        "continuation_suffix": [copy.deepcopy(action_message)],
-                        "provider": result.provider,
+                        "provider_messages": terminal_messages,
+                        "continuation_suffix": terminal_suffix,
+                        "provider": terminal_provider,
                         "model": model,
                         "tools_sha256": _sha256_hex(
                             json.dumps(tools, sort_keys=True).encode("utf-8")
                         ),
-                        "provider_compat": provider_compat,
-                        "provider_boundary": provider_boundaries.get(result.provider),
+                        "provider_compat": terminal_compat,
+                        "provider_boundary": terminal_boundary,
                         "code_changed": code_changed,
                         "verified_after_change": verified_after_change,
                         "verification_failed": verification_failed,
@@ -3908,7 +4147,9 @@ async def _run_agent_loop(
                         )
                         if terminal_checkpoint is not None and writer is not None:
                             await _emit_context_checkpoint(
-                                writer, config, terminal_checkpoint,
+                                writer,
+                                config,
+                                terminal_checkpoint,
                                 request_id=run_request_id,
                             )
                 return {
@@ -3917,7 +4158,7 @@ async def _run_agent_loop(
                     "summary": action["summary"],
                     "turn": turn,
                     "usage": cumulative_usage,
-                    "provider": result.provider,
+                    "provider": terminal_provider,
                     "latency_s": max(0.0, float(result.latency_s)),
                     "transcript": transcript,
                 }
@@ -3993,50 +4234,71 @@ async def _run_agent_loop(
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
                 await _persist_checkpoint(writer, config, turn, transcript, cumulative_usage, [])
             if config.context_reuse and name == "delegate" and tool_result.ok:
-                epoch_count += 1
-                if base_messages is None:
-                    continuation_suffix = [
-                        _canonical_action_message(action),
-                        *(
-                            [{"role": "user", "content": _TRAILING_ACTION_NOTE}]
-                            if trailing else []
+                checkpoint: ContextCheckpoint | None = None
+                checkpoint_was_emitted = False
+                if (
+                    base_messages is not None
+                    and config.checkpoint_root is not None
+                ):
+                    _folded, compaction_failure = await _bound_context_continuation(
+                        turn, force=True
+                    )
+                    if compaction_failure is not None:
+                        return _loop_result(
+                            outcome,
+                            "failed",
+                            f"compaction_failed: {compaction_failure}",
+                            turn,
+                            cumulative_usage,
+                            transcript,
+                        )
+                    checkpoint = current_epoch_checkpoint
+                    checkpoint_was_emitted = checkpoint is not None
+                if checkpoint is None:
+                    epoch_count += 1
+                    if base_messages is None:
+                        continuation_suffix = [
+                            _canonical_action_message(action),
+                            *(
+                                [{"role": "user", "content": _TRAILING_ACTION_NOTE}]
+                                if trailing else []
+                            ),
+                            observation,
+                            _context_state_message(
+                                code_changed=code_changed,
+                                verified_after_change=verified_after_change,
+                                verification_failed=verification_failed,
+                                no_progress_actions=no_progress_actions,
+                                budget_new_tokens=budget_new_tokens,
+                                previous_prompt_tokens=previous_prompt_tokens,
+                                turn=turn,
+                            ),
+                        ]
+                    checkpoint = await asyncio.to_thread(
+                        _write_epoch_checkpoint,
+                        config,
+                        turn=turn,
+                        epoch=epoch_count,
+                        provider_messages=copy.deepcopy(sent_prompt["messages"]),
+                        continuation_suffix=continuation_suffix,
+                        provider=result.provider,
+                        model=model,
+                        tools_sha256=_sha256_hex(
+                            json.dumps(tools, sort_keys=True).encode("utf-8")
                         ),
-                        observation,
-                        _context_state_message(
-                            code_changed=code_changed,
-                            verified_after_change=verified_after_change,
-                            verification_failed=verification_failed,
-                            no_progress_actions=no_progress_actions,
-                            budget_new_tokens=budget_new_tokens,
-                            previous_prompt_tokens=previous_prompt_tokens,
-                            turn=turn,
-                        ),
-                    ]
-                checkpoint = await asyncio.to_thread(
-                    _write_epoch_checkpoint,
-                    config,
-                    turn=turn,
-                    epoch=epoch_count,
-                    provider_messages=copy.deepcopy(sent_prompt["messages"]),
-                    continuation_suffix=continuation_suffix,
-                    provider=result.provider,
-                    model=model,
-                    tools_sha256=_sha256_hex(
-                        json.dumps(tools, sort_keys=True).encode("utf-8")
-                    ),
-                    provider_compat=provider_compat,
-                    provider_boundary=provider_boundaries.get(result.provider),
-                    code_changed=code_changed,
-                    verified_after_change=verified_after_change,
-                    verification_failed=verification_failed,
-                    no_progress_actions=no_progress_actions,
-                    budget_new_tokens=budget_new_tokens,
-                    previous_prompt_tokens=previous_prompt_tokens,
-                    cumulative_usage=cumulative_usage,
-                    wall_deadline=absolute_wall_deadline,
-                )
+                        provider_compat=provider_compat,
+                        provider_boundary=provider_boundaries.get(result.provider),
+                        code_changed=code_changed,
+                        verified_after_change=verified_after_change,
+                        verification_failed=verification_failed,
+                        no_progress_actions=no_progress_actions,
+                        budget_new_tokens=budget_new_tokens,
+                        previous_prompt_tokens=previous_prompt_tokens,
+                        cumulative_usage=cumulative_usage,
+                        wall_deadline=absolute_wall_deadline,
+                    )
                 if checkpoint is not None:
-                    if writer is not None:
+                    if writer is not None and not checkpoint_was_emitted:
                         await _emit_context_checkpoint(
                             writer, config, checkpoint, request_id=run_request_id
                         )
@@ -4045,7 +4307,7 @@ async def _run_agent_loop(
                         "status": TaskStatus.SUSPENDED.value,
                         "turn": turn,
                         "usage": cumulative_usage,
-                        "provider": result.provider,
+                        "provider": checkpoint.cache_key.provider or result.provider,
                         "latency_s": max(0.0, float(result.latency_s)),
                         "transcript": transcript,
                         "epoch": checkpoint.epoch,

@@ -21,7 +21,8 @@ Follow entry points, imports, callers, and tests.
 - [`../architecture/architecture.md`](../architecture/architecture.md) —
   current-versus-target system contract.
 - [`../architecture/context-engine.md`](../architecture/context-engine.md) —
-  immutable epochs, branching, compaction, and cache accounting.
+  immutable epochs, append-only semantic summaries, branching, and cache
+  accounting.
 - [`../architecture/provider-routing.md`](../architecture/provider-routing.md) —
   hard routing constraints, measured soft objectives, capacity, and cache
   affinity.
@@ -53,10 +54,11 @@ Follow entry points, imports, callers, and tests.
 ## Cache and recursive-context research
 
 - [`cache-first-context-reuse-plan.md`](cache-first-context-reuse-plan.md) —
-  corrected hypothesis, provider-cache boundary, measurement protocol, and
-  remaining gaps.
+  corrected hypothesis, implemented append-only trunk, provider-cache
+  boundary, measurement protocol, and remaining gaps.
 - [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) —
-  corrected rolling/fork/merge model, bounded recursion, and evaluation plan.
+  implemented non-recursive segment lifecycle, corrected fork/merge model,
+  bounded recursion, and evaluation plan.
 
 The two files are research records. They deliberately defer normative choices
 to the active context, routing, terminal, and security contracts above.

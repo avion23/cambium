@@ -408,10 +408,11 @@ def test_flat_plan_ignores_max_width_and_preserves_canary(tmp_path: Path) -> Non
     spawned_seq = sorted(seq for seq, kind, _ in events if kind == "spawned")
     result_seq = sorted(seq for seq, kind, _ in events if kind == "result")
     assert spawned_seq and result_seq
-    # ``max_width=1`` is ignored on the flat path: at least three workers are
+    # ``max_width=1`` is ignored on the flat path: multiple workers are
     # spawned before the first result arrives (a width=1 wave would allow one).
+    # Requiring two proves the contract without depending on runner scheduling.
     before_first_result = sum(1 for seq in spawned_seq if seq < result_seq[0])
-    assert before_first_result >= 3
+    assert before_first_result >= 2
 
 
 def _event_kinds_by_task_full(session_dir: Path) -> list[tuple[int, str, str]]:

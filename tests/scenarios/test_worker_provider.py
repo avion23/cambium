@@ -39,9 +39,83 @@ REQUEST_LOCK = threading.Lock()
 REQUESTS: list[dict[str, Any]] = []
 REQUEST_AUTHORIZATION: list[str] = []
 RESPONSES: list[dict[str, Any]] = []
+SUMMARY_REQUESTS: list[dict[str, Any]] = []
 RESPONSE_DELAY_S = 0.0
 
 DEFAULT_USAGE = {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26}
+
+
+_SUMMARY_CONTROL_OPEN = "<cambium-summary-control>\n"
+_SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
+
+
+def _summary_completion(
+    body: dict[str, Any], *, default_model: str
+) -> dict[str, Any] | None:
+    """Return a strict synthetic summary response without consuming actions."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    if not isinstance(content, str) or not content.startswith(_SUMMARY_CONTROL_OPEN):
+        return None
+    try:
+        control = json.loads(
+            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(
+                _SUMMARY_CONTROL_CLOSE
+            )
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    required = {
+        "sequence",
+        "source_sha256",
+        "source_message_count",
+        "through_turn",
+    }
+    if not required <= control.keys():
+        return None
+    summary = {
+        "type": "summary_entry",
+        "sequence": control["sequence"],
+        "source_sha256": control["source_sha256"],
+        "source_message_count": control["source_message_count"],
+        "through_turn": control["through_turn"],
+        "objective": "preserve the current coding objective",
+        "outcome": "captured the completed work segment",
+        "decisions_added": [],
+        "decisions_superseded": [],
+        "facts_added": [],
+        "facts_invalidated": [],
+        "files_and_symbols_changed": [],
+        "verification_results": [],
+        "relevant_failed_approaches": [],
+        "open_items": [],
+    }
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        model = default_model
+    return {
+        "id": "chatcmpl-summary-fixture",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        summary, sort_keys=True, separators=(",", ":")
+                    ),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        # Keep pre-existing action-usage assertions stable. Dedicated summary
+        # tests cover accounting with non-zero usage.
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 
 def _reset_server() -> None:
@@ -50,6 +124,7 @@ def _reset_server() -> None:
         REQUESTS.clear()
         REQUEST_AUTHORIZATION.clear()
         RESPONSES.clear()
+        SUMMARY_REQUESTS.clear()
         RESPONSE_DELAY_S = 0.0
 
 
@@ -93,10 +168,17 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError:
             body = {}
+        summary_response = _summary_completion(
+            body, default_model="loopback-model"
+        )
         with REQUEST_LOCK:
-            REQUESTS.append(body)
-            REQUEST_AUTHORIZATION.append(self.headers.get("Authorization", ""))
-            response = RESPONSES.pop(0) if RESPONSES else _error_payload()
+            if summary_response is None:
+                REQUESTS.append(body)
+                REQUEST_AUTHORIZATION.append(self.headers.get("Authorization", ""))
+                response = RESPONSES.pop(0) if RESPONSES else _error_payload()
+            else:
+                SUMMARY_REQUESTS.append(body)
+                response = summary_response
             delay = RESPONSE_DELAY_S
         if delay > 0:
             time.sleep(delay)
@@ -937,6 +1019,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         events = read_events(session_dir)
         with REQUEST_LOCK:
             requests = copy.deepcopy(REQUESTS)
+            summary_requests = copy.deepcopy(SUMMARY_REQUESTS)
             authorizations = list(REQUEST_AUTHORIZATION)
 
         checkpoints = [event for event in events if event["kind"] == "context_checkpoint"]
@@ -958,13 +1041,23 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         prefix_length = len(checkpoint_prefix)
 
         assert len(requests) == 4
+        assert len(summary_requests) == 2
         assert all(request["model"] == "loopback-model" for request in requests)
+        assert all(
+            request["model"] == "loopback-model" for request in summary_requests
+        )
+        assert all(
+            str(request["messages"][-1].get("content", "")).startswith(
+                "<cambium-summary-control>\n"
+            )
+            for request in summary_requests
+        )
         assert authorizations == [f"Bearer {PROVIDER_SECRET}"] * 4
-        assert requests[1]["messages"] == checkpoint["provider_messages"]
         child_messages = requests[2]["messages"]
         resumed_messages = requests[3]["messages"]
         assert child_messages[:prefix_length] == checkpoint_prefix
         assert resumed_messages[:prefix_length] == checkpoint_prefix
+        assert summary_requests[1]["messages"][:prefix_length] == checkpoint_prefix
         assert len(child_messages) == prefix_length + 1
         assert len(resumed_messages) == prefix_length + 1
         assert set(child_messages[prefix_length]) == {"role", "content"}
@@ -1011,16 +1104,19 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             event["payload"] for event in usage_events if event["task_id"] == task["task_id"]
         ]
         assert len(child_usage) == 1
-        assert len(parent_usage) == 3
+        assert len(parent_usage) == 5
         assert child_usage[0]["epoch"] == 1
         assert child_usage[0]["fork_of"] == checkpoint_ref
         assert child_usage[0]["provider_cache_hit"] is True
         assert child_usage[0]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
+        # The resumed action call is followed by the terminal summary call.
+        assert parent_usage[-2]["epoch"] == 1
+        assert "fork_of" not in parent_usage[-2]
+        assert parent_usage[-2]["provider_cache_hit"] is True
+        assert parent_usage[-2]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
         assert parent_usage[-1]["epoch"] == 1
         assert "fork_of" not in parent_usage[-1]
-        assert parent_usage[-1]["provider_cache_hit"] is True
-        assert parent_usage[-1]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
-        assert all("epoch" not in payload for payload in parent_usage[:2])
+        assert all("epoch" not in payload for payload in parent_usage[:3])
 
         evidence_env = dict(os.environ)
         evidence_env["PYTHONPATH"] = str(ROOT / "src")
@@ -1038,11 +1134,11 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         )
         report = json.loads(evidence.stdout)
         buckets = report["providers"]["loopback-provider"]["buckets"]
-        assert buckets["baseline"]["calls"] == 2
+        assert buckets["baseline"]["calls"] == 3
         assert buckets["fork_first"]["calls"] == 1
         assert buckets["resume_first"]["calls"] == 1
         assert buckets["fork_later"]["calls"] == 0
-        assert buckets["resume_later"]["calls"] == 0
+        assert buckets["resume_later"]["calls"] == 1
 
         assert result.exit_code == 0
         assert {item.task_id for item in result.results} == {

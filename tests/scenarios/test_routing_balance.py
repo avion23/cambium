@@ -61,6 +61,79 @@ TASK_TEXT = "Append a single marker line starting with '// balance-' to target.t
 DEFAULT_USAGE = {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26}
 
 
+_SUMMARY_CONTROL_OPEN = "<cambium-summary-control>\n"
+_SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
+
+
+def _summary_completion(
+    body: dict[str, Any], *, default_model: str
+) -> dict[str, Any] | None:
+    """Return a strict synthetic summary response without consuming actions."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
+    if not isinstance(content, str) or not content.startswith(_SUMMARY_CONTROL_OPEN):
+        return None
+    try:
+        control = json.loads(
+            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(
+                _SUMMARY_CONTROL_CLOSE
+            )
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    required = {
+        "sequence",
+        "source_sha256",
+        "source_message_count",
+        "through_turn",
+    }
+    if not required <= control.keys():
+        return None
+    summary = {
+        "type": "summary_entry",
+        "sequence": control["sequence"],
+        "source_sha256": control["source_sha256"],
+        "source_message_count": control["source_message_count"],
+        "through_turn": control["through_turn"],
+        "objective": "preserve the current coding objective",
+        "outcome": "captured the completed work segment",
+        "decisions_added": [],
+        "decisions_superseded": [],
+        "facts_added": [],
+        "facts_invalidated": [],
+        "files_and_symbols_changed": [],
+        "verification_results": [],
+        "relevant_failed_approaches": [],
+        "open_items": [],
+    }
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        model = default_model
+    return {
+        "id": "chatcmpl-summary-fixture",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        summary, sort_keys=True, separators=(",", ":")
+                    ),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        # Keep pre-existing action-usage assertions stable. Dedicated summary
+        # tests cover accounting with non-zero usage.
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Fake provider server (http.server in a thread — no network)
 # --------------------------------------------------------------------------- #
@@ -84,6 +157,7 @@ class FakeServer:
     ) -> None:
         self.behaviors = list(behaviors)
         self.calls: list[dict[str, Any]] = []
+        self.summary_calls: list[dict[str, Any]] = []
         self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer((host, 0), _Handler)
@@ -129,14 +203,20 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
         server: FakeServer = cast(Any, self.server).fake
-        index = server.record(
-            body,
-            {
-                "User-Agent": self.headers.get("User-Agent"),
-                "Authorization": self.headers.get("Authorization"),
-            },
-        )
-        status, payload, delay, extra_headers = server.behavior_at(index)
+        summary_response = _summary_completion(body, default_model="test-model")
+        if summary_response is None:
+            index = server.record(
+                body,
+                {
+                    "User-Agent": self.headers.get("User-Agent"),
+                    "Authorization": self.headers.get("Authorization"),
+                },
+            )
+            status, payload, delay, extra_headers = server.behavior_at(index)
+        else:
+            with server._lock:
+                server.summary_calls.append(body)
+            status, payload, delay, extra_headers = 200, summary_response, 0.0, {}
         if delay:
             time.sleep(delay)
         encoded = json.dumps(payload).encode("utf-8")
@@ -588,18 +668,21 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
         ]
         assert {payload["model"] for payload in assigned} == {"m1"}
 
-        # both workers call the assigned provider with the assigned model
+        # Both action calls use the assigned provider/model. Each task also
+        # makes one terminal summary call without consuming the action script.
         assert len(server_a.calls) == 2
+        assert len(server_a.summary_calls) == 2
         assert len(server_b.calls) == 0
+        assert len(server_b.summary_calls) == 0
         assert all(call["model"] == "m1" for call in server_a.calls)
 
-        # usage fed the durable ledger: A folded both tasks' 2M tokens; B kept
-        # its seeded 1M untouched
+        # Usage fed the durable ledger: A folded both tasks' 2M action tokens
+        # and counted the two zero-token summary requests; B kept its seed.
         ledger = DebtStore(state_path)
         ledger.load()
         debts = ledger.as_mapping()
         assert debts["provider-a"].tokens == 4_000_000
-        assert debts["provider-a"].requests == 2
+        assert debts["provider-a"].requests == 4
         assert debts["provider-b"].tokens == 1_000_000
         assert debts["provider-b"].requests == 10
     finally:
