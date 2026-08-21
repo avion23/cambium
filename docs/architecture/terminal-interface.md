@@ -39,8 +39,15 @@ to inspect a session.
   prompt. `tui.py` follows the same one-prompt execution boundary. The operator
   sees a loop, but the context engine sees separate jobs rather than one
   durable branch.
-- The TUI clears and redraws the screen on each event, so terminal scrollback is
-  not the canonical transcript.
+- The TUI repaints per event: known event kinds render as concise human lines
+  (`render_event_line` formatter table); unknown kinds keep the raw-JSON
+  fallback. On TTY streams both frontends draw a bottom status bar
+  (`render_status_bar`: session/elapsed/task left, tok/s · in/out/cached ·
+  cost · subagents right), refreshed per event while live and frozen after
+  terminal events; non-TTY output stays byte-identical line-oriented NDJSON.
+- Model summaries render as markdown on TTY streams via `render_markdown_if_tty`
+  (honors `NO_COLOR`, `TERM=dumb`, injected-stream `isatty`); interpolated event
+  fields are control-char sanitized before display.
 - The REPL previously discarded aggregate token usage after rendering a prompt;
   this change set adds a line after every result with cumulative calls, input,
   output, cached, and total tokens for the REPL process.
