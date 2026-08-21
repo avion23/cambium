@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from cambium.render_markdown import render_markdown_if_tty
+
 _PROMPT = "cambium> "
 _ANSI_CLEAR = "\033[2J\033[H"
 
@@ -119,6 +121,18 @@ async def run_tui(
             out.write(text)
             if not text.endswith("\n"):
                 out.write("\n")
+            summaries = [
+                entry.summary
+                for entry in getattr(response, "results", ())
+                if getattr(entry, "summary", None)
+            ]
+            if summaries:
+                rendered_summaries = render_markdown_if_tty(
+                    "\n\n".join(summaries), out
+                )
+                out.write(rendered_summaries)
+                if not rendered_summaries.endswith("\n"):
+                    out.write("\n")
             try:
                 worktree = (
                     str(prompt_config.worktree_path)

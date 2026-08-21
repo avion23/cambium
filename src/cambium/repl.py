@@ -12,6 +12,7 @@ from . import oneshot, render, stats
 from .auth import AuthError
 from .cli import ExitCode
 from .oneshot import OneShotConfig
+from .render_markdown import render_markdown_if_tty
 from .supervisor import SessionAlreadyRunningError
 
 
@@ -134,6 +135,18 @@ async def run_repl(
                 output_stream.write(rendered)
                 if not rendered.endswith("\n"):
                     output_stream.write("\n")
+                summaries = [
+                    entry.summary
+                    for entry in getattr(result, "results", ())
+                    if getattr(entry, "summary", None)
+                ]
+                if summaries:
+                    rendered_summaries = render_markdown_if_tty(
+                        "\n\n".join(summaries), output_stream
+                    )
+                    output_stream.write(rendered_summaries)
+                    if not rendered_summaries.endswith("\n"):
+                        output_stream.write("\n")
                 if usage_line:
                     output_stream.write(usage_line + "\n")
                 output_stream.flush()

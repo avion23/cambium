@@ -40,6 +40,7 @@ from .oauth import (
     OAuthStore,
     import_codex_cli_session,
 )
+from .render_markdown import render_markdown_if_tty
 
 
 class ExitCode(IntEnum):
@@ -932,6 +933,13 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
         print(render.render_json_result(result))
     else:
         print(render.render_text_result(result))
+        summaries = [
+            entry.summary
+            for entry in getattr(result, "results", ())
+            if getattr(entry, "summary", None)
+        ]
+        if summaries:
+            print(render_markdown_if_tty("\n\n".join(summaries), sys.stdout))
     exit_code = getattr(result, "exit_code", 1)
     return exit_code if type(exit_code) is int else 1
 
