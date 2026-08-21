@@ -72,6 +72,7 @@ class LLM(Protocol):
         self, tree_state: dict[str, Any], events: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Return the next action intents for one scheduling wave."""
+        ...
 
 
 LLMCallable = Callable[
@@ -624,13 +625,15 @@ class ArchitectusCore:
 
         actions: list[dict[str, Any]] = []
         for raw_index, _raw_action in enumerate(proposed_actions):
-            task_id = spawn_assignments.get(raw_index)
-            if task_id is not None:
+            spawn_task_id = spawn_assignments.get(raw_index)
+            if spawn_task_id is not None:
                 if (
-                    task_id not in aborted_descendant_spawn_ids
-                    and task_id not in suppressed_spawn_ids
+                    spawn_task_id not in aborted_descendant_spawn_ids
+                    and spawn_task_id not in suppressed_spawn_ids
                 ):
-                    actions.append({"action": ActionKind.SPAWN.value, "task_id": task_id})
+                    actions.append(
+                        {"action": ActionKind.SPAWN.value, "task_id": spawn_task_id}
+                    )
                 continue
             for index, action in non_spawn:
                 if index == raw_index:

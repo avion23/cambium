@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 
@@ -91,7 +92,7 @@ def test_zero_readings_are_valid_at_zero_thresholds() -> None:
     ],
 )
 def test_unavailable_or_zero_cpu_readings_fail_closed(
-    kwargs: dict[str, object], reason: str
+    kwargs: dict[str, Any], reason: str
 ) -> None:
     result, reasons = _decision(**kwargs)
 
@@ -132,7 +133,7 @@ def test_missing_memory_sources_fail_closed(monkeypatch: pytest.MonkeyPatch) -> 
     ],
 )
 def test_negative_or_absurd_readings_fail_closed(
-    kwargs: dict[str, object], reason: str
+    kwargs: dict[str, Any], reason: str
 ) -> None:
     result, reasons = _decision(**kwargs)
 

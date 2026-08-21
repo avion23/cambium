@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import cast
 
 import pytest
 
@@ -287,7 +288,7 @@ def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
 
         blocker.rollback()
         blocker.close()
-        blocker = None
+        blocker = cast(sqlite3.Connection, None)
         assert store.events_after(0) == []
         with pytest.raises(StoreError):
             store.close()
@@ -385,10 +386,10 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
         assert 0.3 <= elapsed < 5.0  # bounded by the hard deadline, no hang
         # store stays alive: a non-critical append is unaffected while the
         # writer is stalled, and a later critical append succeeds on recovery.
-        assert store.append({"kind": "log", "payload": {}}) > 0
+        assert cast(int, store.append({"kind": "log", "payload": {}})) > 0
         release.set()
         seq = store.append({"kind": "result", "payload": {"ok": True}})
-        assert seq > 0
+        assert cast(int, seq) > 0
     finally:
         release.set()
         store.close()
@@ -563,6 +564,7 @@ def test_restart_after_evicted_event_writer_death_does_not_reuse_sequence(
     release = threading.Event()
     eviction_seen = threading.Event()
     append_errors: list[tuple[str, BaseException]] = []
+    critical: threading.Thread | None = None
 
     def fail_fsync(self) -> None:
         fsync_started.set()
@@ -622,7 +624,7 @@ def test_restart_after_evicted_event_writer_death_does_not_reuse_sequence(
     finally:
         release.set()
         first.join(2.0)
-        if "critical" in locals():
+        if critical is not None:
             critical.join(2.0)
         if store._thread.is_alive():
             store._stop_requested.set()
@@ -718,7 +720,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
     starter = threading.Thread(
         target=lambda: first_result.append(
-            store.append({"kind": "result", "payload": {"i": 0}})
+            cast(int, store.append({"kind": "result", "payload": {"i": 0}}))
         )
     )
     try:
@@ -941,7 +943,7 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
         time.sleep(0.3)  # let the blocked eviction reservation reach its deadline
         blocker.rollback()
         blocker.close()
-        blocker = None
+        blocker = cast(sqlite3.Connection, None)
 
         closer.join(2.0)
         critical.join(2.0)
@@ -1131,7 +1133,7 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
             if full:
                 break
             time.sleep(0.001)
-        assert full
+        assert full  # pyright: ignore[reportPossiblyUnboundVariable]
         third.start()
         assert third_started.wait(1.0)
         time.sleep(0.01)

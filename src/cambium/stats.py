@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import quote
 
 _USAGE_EVENT_KIND = "usage_event"
@@ -31,7 +31,7 @@ class UsageStats:
     estimated_cost_usd: float = 0.0
 
 
-def _is_count(value: Any) -> bool:
+def _is_count(value: Any) -> TypeGuard[int | float]:
     """Return whether a usage value is a finite, non-negative number, not a bool.
 
     Negative values are not valid usage counts: a corrupt or mis-encoded row
@@ -202,7 +202,7 @@ def _read_usage_rows(
             ).fetchall()
     finally:
         connection.close()
-    events: list[dict[str, Any]] = []
+    events: list[Mapping[str, Any]] = []
     for row in rows:
         kind = row[0]
         raw_payload = row[-1]

@@ -8,12 +8,18 @@ import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
-import dspy
+import dspy  # type: ignore[import-untyped]
 import pytest
 
 from cambium import optimize
 from cambium.modules.base import Example
+
+if TYPE_CHECKING:
+    from cambium.modules.example.dataset import Split as SplitType
+    from cambium.modules.example.decide import DecomposeOutput as DecomposeOutputType
+    from cambium.modules.example.decide import TaskInput as TaskInputType
 
 _example_target = ".".join(("cambium", "modules", "example"))
 _example = importlib.import_module(_example_target)
@@ -32,7 +38,7 @@ class OfflineLM(dspy.LM):
         self.decision = decision
         self.calls = 0
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> list[dict[str, Any] | str]:
         del args, kwargs
         self.calls += 1
         return [
@@ -76,7 +82,7 @@ class OfflineProgram(dspy.Module):
         with dspy.context(lm=self._lm):
             return self.predict(task=task, context=context)
 
-    async def decide(self, input: TaskInput) -> DecomposeOutput:
+    async def decide(self, input: TaskInputType) -> DecomposeOutputType:
         prediction = self.forward(input.task, input.context)
         decision = Decision.DO_NOT_DECOMPOSE
         try:
@@ -101,7 +107,7 @@ class MemoryLoader:
             Split.CANARIES: list(canaries or []),
         }
 
-    def load_split(self, split: Split) -> list[Example]:
+    def load_split(self, split: SplitType) -> list[Example]:
         return list(self._splits[split])
 
 
@@ -188,7 +194,9 @@ def test_run_stage_bootstrap_returns_working_compiled_program() -> None:
 
     assert compiled is not None
     assert set(report) == {"eval_mean", "train_mean"}
-    output = asyncio.run(compiled.decide(TaskInput(task="new task", context="")))
+    output = asyncio.run(
+        cast(OfflineProgram, compiled).decide(TaskInput(task="new task", context=""))
+    )
     assert isinstance(output, DecomposeOutput)
     assert output.decision is Decision.DO_NOT_DECOMPOSE
 
@@ -393,7 +401,7 @@ def test_load_dataset_loader_uses_module_datasets_directory() -> None:
     package_dir = Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example"
     manifest = optimize.load_module_manifest(package_dir)
 
-    loader = optimize._load_dataset_loader(manifest)
+    loader = cast(Any, optimize._load_dataset_loader(manifest))
 
     assert loader.path == package_dir / "datasets"
     assert loader.load_split(Split.TRAIN)

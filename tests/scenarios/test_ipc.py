@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -152,6 +153,22 @@ class WorkerSupervisor:
         self._env = env
         self._generation = 1
 
+    @property
+    def process(self) -> asyncio.subprocess.Process:
+        return cast(asyncio.subprocess.Process, self.proc)
+
+    @property
+    def stdin(self) -> asyncio.StreamWriter:
+        return cast(asyncio.StreamWriter, self.process.stdin)
+
+    @property
+    def stdout(self) -> asyncio.StreamReader:
+        return cast(asyncio.StreamReader, self.process.stdout)
+
+    @property
+    def stderr(self) -> asyncio.StreamReader:
+        return cast(asyncio.StreamReader, self.process.stderr)
+
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", "-m", "cambium.worker",
@@ -166,7 +183,7 @@ class WorkerSupervisor:
     async def _drain_stderr(self) -> None:
         assert self.proc is not None
         while True:
-            raw = await self.proc.stderr.readline()
+            raw = await self.stderr.readline()
             if not raw:
                 break
             self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
@@ -192,14 +209,15 @@ class WorkerSupervisor:
                 )
             if read_generation(worktree) < self._generation:
                 write_generation(worktree, self._generation)
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        self.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await self.stdin.drain()
 
-    async def recv(self, timeout: float = 30.0) -> dict | None:
+    async def recv(self, timeout: float = 30.0) -> dict[str, Any]:
         assert self.proc is not None
-        return await asyncio.wait_for(
-            read_message(self.proc.stdout, limit=MAX_LINE_BYTES), timeout
+        message = await asyncio.wait_for(
+            read_message(self.stdout, limit=MAX_LINE_BYTES), timeout
         )
+        return cast(dict[str, Any], message)
 
     async def recv_result(self, timeout: float = 30.0) -> tuple[dict, list[dict]]:
         """Read until result_envelope; assert intervening messages are heartbeats."""
@@ -211,7 +229,7 @@ class WorkerSupervisor:
             if remaining <= 0:
                 raise AssertionError("timed out waiting for result_envelope")
             msg = await asyncio.wait_for(
-                read_message(self.proc.stdout, limit=MAX_LINE_BYTES), remaining
+                read_message(self.stdout, limit=MAX_LINE_BYTES), remaining
             )
             if msg is None:
                 raise AssertionError(f"EOF while waiting for result_envelope; "
@@ -285,7 +303,7 @@ async def _happy_handshake(session_dir: Path) -> None:
         assert exit_msg["reason"] == "done"
         assert exit_msg["task_id"] == "ipc-001"
 
-        rc = await w.proc.wait()
+        rc = await w.process.wait()
         assert rc == 0
     finally:
         await w.stop()
@@ -368,7 +386,7 @@ def test_worker_happy_path_8x_no_corrupted_lines(tmp_path) -> None:
 
                 lines: list[dict] = []
                 while True:
-                    raw = await asyncio.wait_for(w.proc.stdout.readline(), 15.0)
+                    raw = await asyncio.wait_for(w.stdout.readline(), 15.0)
                     if not raw:
                         break
                     msg = json.loads(raw.decode("utf-8"))  # must parse cleanly
@@ -382,7 +400,7 @@ def test_worker_happy_path_8x_no_corrupted_lines(tmp_path) -> None:
                 assert result["request_id"] == run_rid
                 exit_msg = next(m for m in lines if m["type"] == "exit_message")
                 assert "request_id" not in exit_msg
-                rc = await w.proc.wait()
+                rc = await w.process.wait()
                 assert rc == 0
             finally:
                 await w.stop()
@@ -415,7 +433,7 @@ def test_worker_invalid_input_fatal_error(tmp_path) -> None:
             assert exit_msg["type"] == "exit_message"
             assert exit_msg["reason"] == "fatal"
 
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc != 0
         finally:
             await w.stop()
@@ -466,7 +484,7 @@ def test_worker_cancel_acks_ok_then_aborts(tmp_path) -> None:
             assert exit_msg["type"] == "exit_message"
             assert exit_msg["reason"] == "cancelled"
 
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0  # cancelled verdict delivered; outcome lives in the envelope
         finally:
             await w.stop()
@@ -506,7 +524,7 @@ def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
 
             exit_msg = await w.recv()
             assert exit_msg["reason"] == "done"
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0
         finally:
             await w.stop()
@@ -544,7 +562,7 @@ def test_worker_steer_action_cancel_aborts(tmp_path) -> None:
 
             exit_msg = await w.recv()
             assert exit_msg["reason"] == "cancelled"
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0  # cancelled verdict delivered; outcome lives in the envelope
         finally:
             await w.stop()
@@ -594,7 +612,7 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
             assert result["status"] == "succeeded"
             exit_msg = await w.recv()
             assert exit_msg["reason"] == "done"
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0
         finally:
             await w.stop()
@@ -626,7 +644,7 @@ def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
             await w.send({"type": "shutdown", "request_id": "shutdown-ping"})
             assert (await w.recv())["type"] == "ok"
             assert (await w.recv())["reason"] == "shutdown"
-            assert await w.proc.wait() == 0
+            assert await w.process.wait() == 0
         finally:
             await w.stop()
 
@@ -656,7 +674,7 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
             assert result["status"] == "failed"
             assert "generation mismatch" in result["failure_reason"]
             assert "// cambium-ipc" not in (worktree / "hello.txt").read_text()
-            assert await w.proc.wait() == 0  # failed verdict delivered cleanly
+            assert await w.process.wait() == 0  # failed verdict delivered cleanly
         finally:
             await w.stop()
 
@@ -696,7 +714,7 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
             result, _ = await w.recv_result()
             assert result["status"] == "failed"
             assert "generation mismatch" in result["failure_reason"]
-            assert await w.proc.wait() == 0  # failed verdict delivered cleanly
+            assert await w.process.wait() == 0  # failed verdict delivered cleanly
         finally:
             hook_release.touch()
             await w.stop()
@@ -740,7 +758,7 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
             ))
             result, _ = await w.recv_result()
             assert result["status"] == "succeeded"
-            assert await w.proc.wait() == 0
+            assert await w.process.wait() == 0
         finally:
             await w.stop()
 
@@ -947,7 +965,7 @@ def test_worker_shutdown_graceful_exit(tmp_path) -> None:
             assert exit_msg["type"] == "exit_message"
             assert exit_msg["reason"] == "shutdown"
 
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0
         finally:
             await w.stop()
@@ -971,7 +989,7 @@ def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
             exit_msg = await w.recv(timeout=8.0)
             assert exit_msg["type"] == "exit_message"
             assert exit_msg["reason"] == "fatal"
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc != 0
         finally:
             await w.stop()
@@ -997,7 +1015,7 @@ def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
             exit_msg = await w.recv(timeout=8.0)
             assert exit_msg["type"] == "exit_message"
             assert exit_msg["reason"] == "idle"
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0
         finally:
             await w.stop()
@@ -1034,7 +1052,7 @@ def test_worker_diff_cap_bytes_and_truncation_flag(tmp_path) -> None:
 
             exit_msg = await w.recv()
             assert exit_msg["reason"] == "done"
-            rc = await w.proc.wait()
+            rc = await w.process.wait()
             assert rc == 0
         finally:
             await w.stop()

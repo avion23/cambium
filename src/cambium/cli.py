@@ -18,10 +18,10 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn, TypeVar, cast, overload
 
 from . import __version__
 from .auth import (
@@ -50,15 +50,46 @@ class ExitCode(IntEnum):
     INTERRUPTED = 130
 
 
+_NamespaceT = TypeVar("_NamespaceT")
+
+
 class _SafeArgumentParser(argparse.ArgumentParser):
     """Do not echo arbitrary rejected tokens, which may be credentials."""
 
-    def parse_known_args(self, args=None, namespace=None):
+    @overload
+    def parse_known_args(
+        self,
+        args: Iterable[str] | None = None,
+        namespace: None = None,
+    ) -> tuple[argparse.Namespace, list[str]]: ...
+
+    @overload
+    def parse_known_args(
+        self,
+        args: Iterable[str] | None,
+        namespace: _NamespaceT,
+    ) -> tuple[_NamespaceT, list[str]]: ...
+
+    @overload
+    def parse_known_args(
+        self,
+        *,
+        namespace: _NamespaceT,
+    ) -> tuple[_NamespaceT, list[str]]: ...
+
+    def parse_known_args(
+        self,
+        args: Iterable[str] | None = None,
+        namespace: _NamespaceT | None = None,
+    ) -> tuple[argparse.Namespace | _NamespaceT, list[str]]:
         if args is not None and "--" in args and self.prog.endswith(" run"):
             self.error("invalid command arguments")
-        return super().parse_known_args(args, namespace)
+        return cast(
+            tuple[argparse.Namespace | _NamespaceT, list[str]],
+            super().parse_known_args(args, namespace),
+        )
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         if "unrecognized arguments" in message or "invalid choice" in message:
             message = "invalid command arguments"
         super().error(message)
@@ -569,7 +600,7 @@ def _run_auth_set(args: argparse.Namespace) -> int:
     except EOFError:
         print("cambium auth: credential input ended before a key was read", file=sys.stderr)
         return ExitCode.FAILURE
-    except (ProviderSelectionError, ValueError) as exc:
+    except (ProviderSelectionError, cast(type[Exception], ValueError)) as exc:
         print(f"cambium auth: provider configuration is invalid: {exc}", file=sys.stderr)
         return ExitCode.USAGE
     except AuthSchemaError as exc:
@@ -923,8 +954,12 @@ async def _run_repl(args: argparse.Namespace) -> int:
         model=model,
         auto=args.auto,
         max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
-        max_tokens=_budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS),
-        max_turns=_budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS),
+        max_tokens=cast(
+            int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)
+        ),
+        max_turns=cast(
+            int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)
+        ),
     )
     return await repl.run_repl(config)
 
@@ -947,8 +982,12 @@ async def _run_tui(args: argparse.Namespace) -> int:
         model=model,
         auto=args.auto,
         max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
-        max_tokens=_budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS),
-        max_turns=_budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS),
+        max_tokens=cast(
+            int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)
+        ),
+        max_turns=cast(
+            int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)
+        ),
     )
     return await tui.run_tui(config, quiet=getattr(args, "quiet", False))
 

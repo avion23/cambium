@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import threading
+from typing import cast
 
 import pytest
 
@@ -75,7 +76,9 @@ def test_mapping_keys_are_redacted_for_all_secret_shapes() -> None:
         "OPENAI_API_KEY",
     )
 
-    output = R.redact_mapping({key: "safe" for key in secret_keys})
+    output = cast(
+        dict[object, object], R.redact_mapping({key: "safe" for key in secret_keys})
+    )
 
     serialized = repr(output)
     for secret in secret_keys:
@@ -269,9 +272,10 @@ def test_benign_metrics_signatures_and_author_fields_survive() -> None:
     assert R.redact(text) == (
         "token_count: 17 token_usage=42 signature=deadbeef author=Ada author_email=***"
     )
-    output = R.redact_mapping(payload)
+    output = cast(dict[object, object], R.redact_mapping(payload))
+    token_metrics = cast(dict[object, object], output["token_metrics"])
     assert output["token_count"] == 17
-    assert output["token_metrics"] == {"prompt_tokens": 4, "completion_tokens": 7}
+    assert token_metrics == {"prompt_tokens": 4, "completion_tokens": 7}
     assert output["signature"] == "deadbeef"
     assert output["author"] == "Ada"
     assert output["author_email"] == "***"
@@ -299,14 +303,17 @@ def test_contextual_short_values_do_not_require_secret_punctuation() -> None:
         "nested": [{"refresh_token": "r?"}, ("plain", "not-a-secret")],
     }
 
-    output = R.redact_mapping(payload)
+    output = cast(dict[object, object], R.redact_mapping(payload))
+    headers = cast(dict[object, object], output["headers"])
+    cookies = cast(dict[object, object], output["cookies"])
+    nested = cast(list[object], output["nested"])
 
-    assert output["headers"]["***"] == "***"
-    assert output["headers"]["Content-Type"] == "application/json"
-    assert output["cookies"]["***"] == "***"
-    assert output["cookies"]["theme"] == "***"
-    assert output["nested"][0]["***"] == "***"
-    assert output["nested"][1] == ("plain", "not-a-secret")
+    assert headers["***"] == "***"
+    assert headers["Content-Type"] == "application/json"
+    assert cookies["***"] == "***"
+    assert cookies["theme"] == "***"
+    assert cast(dict[object, object], nested[0])["***"] == "***"
+    assert nested[1] == ("plain", "not-a-secret")
 
 
 def test_context_delimiters_do_not_leak_or_corrupt_prose() -> None:
@@ -511,6 +518,9 @@ def test_sanitize_oauth_document_redacts_tokens_and_fingerprints_account() -> No
     }
 
     output = sanitize_oauth_document(doc, redactor=redactor)
+    nested = cast(dict[object, object], output["nested"])
+    account_id = cast(str, output["account_id"])
+    error = cast(str, output["error"])
 
     serialized = repr(output)
     for raw in (
@@ -536,14 +546,14 @@ def test_sanitize_oauth_document_redacts_tokens_and_fingerprints_account() -> No
         "user_code",
     ):
         assert output[name] == "<redacted>"
-    assert output["nested"]["access_token"] == "<redacted>"
-    assert output["nested"]["refresh_token"] == "<redacted>"
+    assert nested["access_token"] == "<redacted>"
+    assert nested["refresh_token"] == "<redacted>"
     assert output["account_id"] == hashlib.sha256(b"acc-12345").hexdigest()[:8]
-    assert len(output["account_id"]) == 8
+    assert len(account_id) == 8
     assert output["token_type"] == "Bearer"
     assert output["expires_in"] == 3600
     assert output["scope"] == "openid profile"
-    assert "opaque-rotated" not in output["error"]
+    assert "opaque-rotated" not in error
     assert doc["access_token"] == "raw-access-token"  # input untouched
 
     default = sanitize_oauth_document(doc)

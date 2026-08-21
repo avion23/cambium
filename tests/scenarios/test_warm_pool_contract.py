@@ -6,7 +6,10 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from asyncio.subprocess import Process
 
 import pytest
 
@@ -97,7 +100,7 @@ def test_cli_supervisor_forwards_explicit_warm_pool_size(
     monkeypatch.setattr(
         supervisor,
         "main",
-        lambda argv=None: calls.append(list(argv or [])) or 0,
+        lambda argv=None: cast(Any, calls.append(list(argv or []))) or 0,
     )
 
     assert cli.main(
@@ -151,7 +154,7 @@ def test_positive_pool_bound_rebinds_and_zero_bound_does_not() -> None:
     enabled._warm_pool_size = 1
     enabled._pool = []
     process = _FakeProcess()
-    asyncio.run(enabled._pool_return(process, command, environment))
+    asyncio.run(enabled._pool_return(cast(Any, process), command, environment))
 
     assert enabled._pool_pop(command, environment) is process
 
@@ -160,12 +163,12 @@ def test_positive_pool_bound_rebinds_and_zero_bound_does_not() -> None:
     disabled._pool = []
     killed: list[_FakeProcess] = []
 
-    async def record_kill(proc: _FakeProcess) -> None:
-        killed.append(proc)
+    async def record_kill(proc: Process) -> None:
+        killed.append(cast(_FakeProcess, proc))
 
-    disabled._kill_pooled = record_kill
+    cast(Any, disabled)._kill_pooled = record_kill
     process = _FakeProcess()
-    asyncio.run(disabled._pool_return(process, command, environment))
+    asyncio.run(disabled._pool_return(cast(Any, process), command, environment))
 
     assert killed == [process]
     assert disabled._pool == []
@@ -187,7 +190,7 @@ def test_warm_pool_environment_is_ignored_by_current_entry_points(
     monkeypatch.setattr(
         supervisor,
         "main",
-        lambda argv=None: delegated.append(list(argv or [])) or 0,
+        lambda argv=None: cast(Any, delegated.append(list(argv or []))) or 0,
     )
     session = tmp_path / "cli"
     assert cli.main(["supervisor", "--session-dir", str(session), "--demo"]) == 0

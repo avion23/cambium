@@ -8,6 +8,7 @@ import os
 import stat
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -287,7 +288,7 @@ def test_directory_swap_during_validation_does_not_write_outside(
     swapped = False
 
     def swap_after_final_directory_open(
-        file: os.PathLike[str] | str, *args: object, **kwargs: object
+        file: os.PathLike[str] | str, *args: Any, **kwargs: Any
     ) -> int:
         nonlocal swapped
         fd = real_open(file, *args, **kwargs)
@@ -518,7 +519,7 @@ def test_auth_supervisor_exec_is_list_form_and_does_not_include_keys(
         "/tmp/session",
         "--demo",
     ]
-    assert SECRET not in " ".join(captured["argv"])
+    assert SECRET not in " ".join(cast("list[str]", captured["argv"]))
 
 
 def test_doctor_auth_checks_have_metadata_schema_and_coverage(

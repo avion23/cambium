@@ -16,6 +16,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -210,7 +211,7 @@ class _FakeIssuerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str = "", *args: object) -> None:
         pass
 
 
@@ -238,7 +239,7 @@ class _FakeIssuer:
 
 
 @pytest.fixture
-def fake_issuer() -> _FakeIssuer:
+def fake_issuer() -> Generator[_FakeIssuer]:
     server = _FakeIssuer()
     try:
         yield server

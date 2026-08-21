@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -109,7 +109,7 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -284,22 +284,28 @@ class _WorkerRunner:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:
-        assert self.proc is not None
+        proc = self.proc
+        assert proc is not None
+        stderr = cast(asyncio.StreamReader, proc.stderr)
         while True:
-            raw = await self.proc.stderr.readline()
+            raw = await stderr.readline()
             if not raw:
                 break
             self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
 
     async def send(self, msg: dict[str, Any]) -> None:
-        assert self.proc is not None
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        proc = self.proc
+        assert proc is not None
+        stdin = cast(asyncio.StreamWriter, proc.stdin)
+        stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await stdin.drain()
 
     async def recv(self, timeout: float = 30.0) -> dict[str, Any] | None:
-        assert self.proc is not None
+        proc = self.proc
+        assert proc is not None
+        stdout = cast(asyncio.StreamReader, proc.stdout)
         return await asyncio.wait_for(
-            read_message(self.proc.stdout, limit=MAX_LINE_BYTES), timeout
+            read_message(stdout, limit=MAX_LINE_BYTES), timeout
         )
 
     async def stop(self) -> None:
@@ -357,7 +363,8 @@ async def _drive_worker(
             messages.append(msg)
             if msg["type"] == "exit_message":
                 break
-        rc = await runner.proc.wait()
+        proc = cast(asyncio.subprocess.Process, runner.proc)
+        rc = await proc.wait()
         result = next(m for m in messages if m["type"] == "result_envelope")
         return result, messages, rc, runner.stderr_lines
     finally:
@@ -385,7 +392,7 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
     neutral_config = worker.AgentConfig.from_init(init)
     assert neutral_config.context_reuse is False
     neutral_router, tier, model, _identity = worker._provider_router(
-        neutral_config.fanout_config,
+        cast(dict[str, Any], neutral_config.fanout_config),
         debt=neutral_config.debt,
     )
     assert [provider.name for provider in neutral_router._candidates(tier, model)] == [
@@ -413,7 +420,7 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
         }
     )
     weighted_router, tier, model, _identity = worker._provider_router(
-        weighted_config.fanout_config,
+        cast(dict[str, Any], weighted_config.fanout_config),
         debt=weighted_config.debt,
     )
     assert [provider.name for provider in weighted_router._candidates(tier, model)] == [
@@ -647,7 +654,8 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(
 
         assert result.exit_code != 0
         assert result.results[0].status == "failed"
-        assert "advanced beyond base_commit" in result.results[0].reason
+        reason = cast(str, result.results[0].reason)
+        assert "advanced beyond base_commit" in reason
         assert result.results[0].merge_sha is None
         assert subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
@@ -713,8 +721,9 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
 
         assert result.exit_code != 0
         assert result.results[0].status == "failed"
-        assert "advanced beyond base_commit" in result.results[0].reason
-        assert "refusing to publish unverified changes" in result.results[0].reason
+        reason = cast(str, result.results[0].reason)
+        assert "advanced beyond base_commit" in reason
+        assert "refusing to publish unverified changes" in reason
         assert result.results[0].merge_sha is None
         assert subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
@@ -902,12 +911,13 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             # Keep the epoch-1 fork target as the byte-comparison fixture;
             # terminal epoch 2 is a separate immutable checkpoint.
             if kind == "context_checkpoint" and event["payload"]["epoch"] == 1:
-                checkpoint_ref = event["payload"]["checkpoint_ref"]
-                checkpoint_path = (
+                checkpoint_ref = cast(str, event["payload"]["checkpoint_ref"])
+                checkpoint_file: Path = (
                     session_dir / ".cambium" / "checkpoints" / task["task_id"]
                     / checkpoint_ref.split("/", 1)[1]
                 )
-                checkpoint_snapshots["at_checkpoint"] = checkpoint_path.read_bytes()
+                checkpoint_path = checkpoint_file
+                checkpoint_snapshots["at_checkpoint"] = checkpoint_file.read_bytes()
             elif kind == "child_result" and event["task_id"] == child_task_id:
                 assert checkpoint_path is not None
                 checkpoint_snapshots["after_child"] = checkpoint_path.read_bytes()

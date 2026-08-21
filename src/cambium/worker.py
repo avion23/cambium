@@ -124,7 +124,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard, cast
 
 from cambium.auth import oauth_env_suffix, scrub_environment
 from cambium.diffundo import (
@@ -1365,13 +1365,13 @@ def _atomic_json_write(path: Path, content: str) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
-    temporary_path = Path(temporary_name)
+    temporary_path: Path | None = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        os.replace(cast(Path, temporary_path), path)
         temporary_path = None
     finally:
         if temporary_path is not None:
@@ -1381,7 +1381,7 @@ def _atomic_json_write(path: Path, content: str) -> None:
                 pass
 
 
-def _valid_usage_count(value: Any) -> bool:
+def _valid_usage_count(value: Any) -> TypeGuard[int | float]:
     """Return whether a provider token count is finite and non-negative."""
     if isinstance(value, bool):
         return False
@@ -2494,7 +2494,7 @@ def _write_checkpoint_file(
         return None
     directory = config.checkpoint_root / _safe_task_id(config.task_id)
     path = directory / f"turn-{turn:03d}.json"
-    payload = {
+    payload: dict[str, Any] = {
         "schema": CHECKPOINT_SCHEMA,
         "task": config.task,
         "generation": config.generation,
@@ -2504,7 +2504,7 @@ def _write_checkpoint_file(
         "commits_so_far": commits_so_far,
     }
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
-    payload = redactor.redact_mapping(payload)
+    payload = cast(dict[str, Any], redactor.redact_mapping(payload))
     _atomic_json_write(path, json.dumps(payload, sort_keys=True, indent=2))
     return path
 
@@ -2848,9 +2848,12 @@ def _write_epoch_checkpoint(
     prefix = f"epoch-{epoch:03d}-{address_pre}"
     placeholder_ref = f"{safe_task}/{prefix}-{'0' * 16}.json"
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
-    payload = redactor.redact_mapping(asdict(replace(
-        checkpoint, checkpoint_ref=placeholder_ref,
-    )))
+    payload = cast(
+        dict[str, Any],
+        redactor.redact_mapping(asdict(replace(
+            checkpoint, checkpoint_ref=placeholder_ref,
+        ))),
+    )
     redacted = payload != asdict(replace(checkpoint, checkpoint_ref=placeholder_ref))
     if redacted:
         redacted_provider_messages = payload["provider_messages"]
@@ -3416,14 +3419,12 @@ def _fanout_budget_usd(config: dict[str, Any] | None) -> float | None:
     if not isinstance(config, dict):
         return None
     value = config.get("budget_usd")
-    if (
-        isinstance(value, bool)
-        or type(value) not in (int, float)
-        or not math.isfinite(float(value))
-        or value < 0
-    ):
+    if isinstance(value, bool) or type(value) not in (int, float):
         return None
-    return float(value)
+    numeric_value = cast(int | float, value)
+    if not math.isfinite(float(numeric_value)) or numeric_value < 0:
+        return None
+    return float(numeric_value)
 
 
 def _loop_result(
@@ -3498,6 +3499,7 @@ async def _run_agent_loop(
     code_changed = False
     base_messages: tuple[dict[str, Any], ...] | None = None
     context_continuation: list[dict[str, Any]] = []
+    continuation_suffix: list[dict[str, Any]] = []
     epoch_count = 0
     current_epoch_checkpoint: ContextCheckpoint | None = None
     compaction_armed = True
@@ -4080,8 +4082,9 @@ async def _do_provider_work(
             "failure_reason": f"worker worktree is missing: {worktree}",
         })
     try:
+        fanout_config = cast(dict[str, Any], config.fanout_config)
         router, tier, model, model_identity = _provider_router(
-            config.fanout_config,
+            fanout_config,
             assigned_provider=config.assigned_provider,
             authorized_providers=config.authorized_providers,
             authorized_providers_explicit=config.authorized_providers_explicit,
@@ -4891,7 +4894,7 @@ class _WriterProtocol(asyncio.streams.FlowControlMixin):
         super().__init__()
         self._closed = asyncio.get_running_loop().create_future()
 
-    def connection_lost(self, exc: BaseException | None) -> None:
+    def connection_lost(self, exc: Exception | None) -> None:
         if not self._closed.done():
             self._closed.set_result(exc)
         super().connection_lost(exc)

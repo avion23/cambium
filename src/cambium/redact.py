@@ -652,6 +652,7 @@ def _marker_positions(text: str, marker: str) -> Iterable[int]:
 def _literal_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for index, (markers, pattern) in enumerate(_LITERAL_MARKERS):
+        positions: Iterable[int]
         if markers:
             positions = (
                 position

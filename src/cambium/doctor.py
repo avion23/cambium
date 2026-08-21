@@ -259,6 +259,7 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
     """
 
     path, explicit = _provider_config_path(cwd)
+    configured: Sequence[Any]
     if path.exists():
         if not path.is_file():
             return Status.FAIL, f"{path}: provider config path is not a file"
@@ -375,6 +376,7 @@ def check_auth_schema(path: Path | None = None) -> tuple[Status, str]:
 
 def _doctor_provider_specs(cwd: Path) -> tuple[str, tuple[_DoctorProvider, ...]]:
     path, explicit = _provider_config_path(cwd)
+    configured: Sequence[Any]
     if path.exists():
         if not path.is_file():
             raise ValueError("provider config path is not a file")

@@ -22,11 +22,11 @@ import json
 import math
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import urlparse
 
 from .auth import effective_home, validate_derived_env_name, validate_provider_id
@@ -111,6 +111,27 @@ _DEFAULTS: dict[str, object] = {
     # provider declares no capacity, so min_context_window tasks exclude it.
     "context_window": 0,
 }
+
+
+class _ProviderMapping(TypedDict):
+    name: str
+    tier: str
+    base_url: str
+    api_key_env: str
+    required: bool
+    timeout_s: float
+    max_retries: int
+    rpm: int
+    enabled: bool
+    model: str
+    priority: int
+    cooldown_s: float
+    price: float
+    token_window_allowance: float
+    auth: AuthMode
+    protocol: Protocol
+    context_window: int
+    reasoning_effort: str | None
 
 
 DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
@@ -266,7 +287,7 @@ def _parse_protocol(raw: dict[str, object], location: str) -> Protocol:
         ) from exc
 
 
-def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
+def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     location = f"providers[{index}]"
     if not isinstance(raw, dict):
         raise _error(location, "must be an object")
@@ -396,7 +417,7 @@ def _validate_provider_mapping(raw: object, index: int) -> dict[str, object]:
     }
 
 
-def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
+def _validated_provider_mappings(raw: object) -> list[_ProviderMapping]:
     if not isinstance(raw, dict):
         raise _error("root", "must be an object with a 'providers' field")
 
@@ -410,7 +431,7 @@ def _validated_provider_mappings(raw: object) -> list[dict[str, object]]:
     if not isinstance(entries, list):
         raise _error("providers", "must be a list")
 
-    mappings: list[dict[str, object]] = []
+    mappings: list[_ProviderMapping] = []
     names: set[str] = set()
     env_names: dict[str, str] = {}
     for index, entry in enumerate(entries):
@@ -451,8 +472,8 @@ def validate_provider_specs(raw: object) -> tuple[ProviderEnvSpec, ...]:
     )
 
 
-def _provider_from_values(values: dict[str, object], index: int) -> ProviderConfig:
-    ProviderConfig, ProviderTier = _diffundo_types()
+def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfig:
+    ProviderConfigType, ProviderTier = _diffundo_types()
     location = f"providers[{index}]"
     tier_value = values["tier"]
     try:
@@ -482,7 +503,7 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
         "reasoning_effort": values["reasoning_effort"],
     }
     price = values["price"]
-    provider_fields = {field.name for field in fields(ProviderConfig)}
+    provider_fields = {field.name for field in fields(ProviderConfigType)}
     if "price" in provider_fields:
         config_values["price"] = price
     elif {"price_per_1m_in", "price_per_1m_out"} <= provider_fields:
@@ -491,7 +512,8 @@ def _provider_from_values(values: dict[str, object], index: int) -> ProviderConf
     else:
         raise RuntimeError("ProviderConfig has no supported price field")
 
-    return ProviderConfig(**config_values)
+    provider_constructor = cast(Callable[..., "ProviderConfig"], ProviderConfigType)
+    return provider_constructor(**config_values)
 
 
 def _read_config(source: str | Path | None) -> object:
@@ -610,8 +632,7 @@ def select_provider(
 
 
 def env_report(
-    providers: list[ProviderConfig | ProviderEnvSpec]
-    | tuple[ProviderConfig | ProviderEnvSpec, ...]
+    providers: Sequence[ProviderConfig | ProviderEnvSpec],
 ) -> dict[str, bool]:
     """Return whether each provider's key environment variable is usable.
 

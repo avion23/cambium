@@ -25,7 +25,7 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -36,6 +36,7 @@ from cambium.diffundo import (
     HealthState,
     PromptStructureError,
     ProviderConfig,
+    ProviderError,
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
@@ -71,7 +72,7 @@ class FakeServer:
         self.calls: list[dict[str, Any]] = []
         self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
-        self._httpd = HTTPServer((host, 0), _Handler)
+        self._httpd = cast(_FakeHTTPServer, HTTPServer((host, 0), _Handler))
         self._httpd.fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
@@ -103,6 +104,10 @@ class FakeServer:
         self._thread.join()
 
 
+class _FakeHTTPServer(HTTPServer):
+    fake: FakeServer
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -113,7 +118,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             body = {}
-        server: FakeServer = self.server.fake  # type: ignore[attr-defined]
+        server = cast(_FakeHTTPServer, self.server).fake
         index = server.record(
             body,
             {
@@ -154,7 +159,7 @@ class _Handler(BaseHTTPRequestHandler):
         # POST so redirect-leak canaries observe a stray contact at the target.
         self.do_POST()
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -213,7 +218,7 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
+    base: dict[str, Any] = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
     base.update(overrides)
     return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
 
@@ -453,8 +458,10 @@ def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> 
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert len(server.calls) == 1
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.retry_after_s == 60.0
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        last_error = cast(ProviderError, failure.last_error)
+        assert last_error.retry_after_s == 60.0
     finally:
         server.close()
 
@@ -507,8 +514,10 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        error = exc.value.last_error
+        failure = cast(AllProvidersFailed, exc.value)
+        error = failure.last_error
         assert error is not None
+        error = cast(ProviderError, error)
         assert error.outcome is ProviderOutcome.AUTH_ERROR
         assert "HTTP 401" in error.message
         assert "test_error" in error.message
@@ -537,10 +546,12 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(retry_router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.retry_after_s == 1.0
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.retry_after_s == 1.0
         assert retry_key not in str(exc.value)
-        assert retry_key not in exc.value.last_error.message
+        assert retry_key not in error.message
     finally:
         retry_server.close()
 
@@ -562,8 +573,10 @@ def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
         assert router.health("p_blocked") is HealthState.COOLDOWN
         assert router.status("p_blocked") is ProviderStatus.COOLDOWN
         assert "sk-test-K_BLOCKED" not in str(exc.value)
@@ -649,9 +662,11 @@ def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypa
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
-        assert "tool call without a function name" in exc.value.last_error.message
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "tool call without a function name" in error.message
         assert router.health("p_mal") is HealthState.COOLDOWN
     finally:
         malformed.close()
@@ -664,9 +679,11 @@ def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypa
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(empty_router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
-        assert "tool call without a function name" in exc.value.last_error.message
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "tool call without a function name" in error.message
         assert empty_router.health("p_empty") is HealthState.COOLDOWN
     finally:
         empty.close()
@@ -697,9 +714,11 @@ def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypat
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
-        assert "arguments" in exc.value.last_error.message
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "arguments" in error.message
         assert router.health("p_malargs") is HealthState.COOLDOWN
     finally:
         malformed.close()
@@ -778,8 +797,10 @@ def test_all_providers_refuse_raises_refusal_outcome(tmp_path, monkeypatch) -> N
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.REFUSAL
+        failure = cast(AllProvidersFailed, exc.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.outcome is ProviderOutcome.REFUSAL
         assert router.health("p_a") is HealthState.UNKNOWN
         assert router.health("p_b") is HealthState.UNKNOWN
     finally:
@@ -960,9 +981,11 @@ def test_remote_http_provider_without_config_validation_is_rejected_at_call(
 
     with pytest.raises(AllProvidersFailed) as exc:
         asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-    assert exc.value.last_error is not None
-    assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
-    assert "http transport is allowed only for loopback hosts" in exc.value.last_error.message
+    failure = cast(AllProvidersFailed, exc.value)
+    assert failure.last_error is not None
+    error = cast(ProviderError, failure.last_error)
+    assert error.outcome is ProviderOutcome.AUTH_ERROR
+    assert "http transport is allowed only for loopback hosts" in error.message
     assert "sk-test-K_INSECURE" not in str(exc.value)
     assert router.health("p_insecure") is HealthState.DISABLED
 
@@ -997,8 +1020,10 @@ def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
         assert len(redirector.calls) == 1
         assert target.calls == []  # the redirect target was never contacted
         assert target.request_headers == []  # ... so it never saw the key either
-        error = exc.value.last_error
+        failure = cast(AllProvidersFailed, exc.value)
+        error = failure.last_error
         assert error is not None
+        error = cast(ProviderError, error)
         assert error.outcome is ProviderOutcome.AUTH_ERROR
         assert "redirect" in error.message
         assert "sk-test-K_REDIRECT" not in str(exc.value)
@@ -1117,8 +1142,10 @@ def test_429_quota_owner_reaches_failure_error(monkeypatch) -> None:
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        error = exc.value.last_error
+        failure = cast(AllProvidersFailed, exc.value)
+        error = failure.last_error
         assert error is not None
+        error = cast(ProviderError, error)
         assert error.outcome is ProviderOutcome.QUOTA
         assert error.retry_after_s == 1.0
         assert error.account_quota_owner == "org-xyz"
@@ -1189,7 +1216,9 @@ def test_chat_response_larger_than_provider_cap_is_rejected(monkeypatch) -> None
     try:
         with pytest.raises(AllProvidersFailed) as raised:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert raised.value.last_error is not None
-        assert "response exceeds" in raised.value.last_error.message
+        failure = cast(AllProvidersFailed, raised.value)
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert "response exceeds" in error.message
     finally:
         server.close()

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 from cambium.redact import (
     EVENT_RECORD_STRUCTURAL_FIELDS,
@@ -80,7 +81,7 @@ def _worker_result() -> dict[str, object]:
             "nested": [{"refresh_token": "opaque-secret-value"}],
         },
     }
-    asyncio.run(_emit_result_envelope(writer, outcome))
+    asyncio.run(_emit_result_envelope(cast(asyncio.StreamWriter, writer), outcome))
     return json.loads(writer.frames[0])
 
 
@@ -145,7 +146,8 @@ def test_emitted_protocol_shapes_preserve_structure_and_redact_payloads() -> Non
     }
     assert secret not in repr(redacted_event)
     assert event_redactor.redact_protocol_record(
-        redacted_event, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
+        cast(dict[str, Any], redacted_event),
+        structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS,
     ) == redacted_event
 
     raw_worker = _worker_result()
@@ -198,7 +200,8 @@ def test_emitted_protocol_shapes_preserve_structure_and_redact_payloads() -> Non
         "nested": [{"***": "***"}],
     }
     assert worker_redactor.redact_protocol_record(
-        redacted_worker, structural_fields=WORKER_RESULT_STRUCTURAL_FIELDS
+        cast(dict[str, Any], redacted_worker),
+        structural_fields=WORKER_RESULT_STRUCTURAL_FIELDS,
     ) == redacted_worker
 
 
@@ -259,16 +262,17 @@ def test_session_redactor_handles_lists_keys_and_recursion_limit() -> None:
     cursor["value"] = secret
 
     redactor = build_session_redactor([secret])
-    redacted = redactor.redact_mapping(payload)
+    redacted = cast(dict[object, object], redactor.redact_mapping(payload))
 
     assert redacted[13] == "***"
     assert redacted["items"] == [
         {"***": "***"},
         {"note": "prefix-***"},
     ]
-    output_cursor = redacted
+    output_cursor: dict[object, object] = redacted
     for _ in range(depth):
-        output_cursor = output_cursor["child"]
+        output_cursor = cast(dict[object, object], output_cursor["child"])
     assert output_cursor["value"] == "***"
     assert payload[13] == secret
-    assert payload["items"][0]["password"] == secret
+    items = cast(list[dict[object, object]], payload["items"])
+    assert items[0]["password"] == secret

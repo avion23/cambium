@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 
 AUTH_VERSION = 1
 MAX_API_KEY_BYTES = 16 * 1024
@@ -257,7 +257,7 @@ def _validate_raw_document(raw: object) -> AuthDocument:
         _check_duplicate_object(raw_entry, f"provider {provider!r}")
         if set(raw_entry) != {"api_key"}:
             raise AuthSchemaError(f"provider {provider!r} entry must contain only api_key")
-        credentials.append(ProviderCredential(provider, raw_entry.get("api_key")))
+        credentials.append(ProviderCredential(provider, cast(str, raw_entry.get("api_key"))))
 
     credentials.sort(key=lambda credential: credential.provider)
     return AuthDocument(version=version, providers=tuple(credentials))

@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO, cast
 
 from . import oneshot, render
 from .auth import AuthError
@@ -14,10 +14,22 @@ from .cli import ExitCode
 from .oneshot import OneShotConfig
 from .supervisor import SessionAlreadyRunningError
 
+
+class _Readline(Protocol):
+    def read_history_file(self, filename: str | os.PathLike[str]) -> None: ...
+
+    def write_history_file(self, filename: str | os.PathLike[str]) -> None: ...
+
+    def add_history(self, line: str) -> None: ...
+
+
+readline: _Readline | None
 try:
-    import readline
+    import readline as _readline
 except ImportError:  # non-interactive fallback: no history
     readline = None
+else:
+    readline = cast(_Readline, _readline)
 
 
 def _config_for_prompt(config: OneShotConfig, prompt: str) -> OneShotConfig:
@@ -39,7 +51,7 @@ def _load_history(path: Path) -> None:
     if not path.is_file():
         return
     try:
-        readline.read_history_file(path)
+        cast(_Readline, readline).read_history_file(path)
     except (OSError, ValueError):
         pass
 
@@ -48,7 +60,7 @@ def _save_history(path: Path) -> None:
     """Persist readline history under a private file, creating the directory."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        readline.write_history_file(path)
+        cast(_Readline, readline).write_history_file(path)
         os.chmod(path, 0o600)
     except OSError:
         pass
@@ -62,9 +74,9 @@ async def run_repl(
     error_stream: TextIO | None = None,
 ) -> int:
     """Run prompts with one fresh immutable config per prompt."""
-    input_stream = sys.stdin if input_stream is None else input_stream
-    output_stream = sys.stdout if output_stream is None else output_stream
-    error_stream = sys.stderr if error_stream is None else error_stream
+    input_stream = cast(TextIO, sys.stdin if input_stream is None else input_stream)
+    output_stream = cast(TextIO, sys.stdout if output_stream is None else output_stream)
+    error_stream = cast(TextIO, sys.stderr if error_stream is None else error_stream)
 
     history_path = None
     if readline is not None and getattr(input_stream, "isatty", lambda: False)():
@@ -80,7 +92,7 @@ async def run_repl(
             if not prompt.strip():
                 continue
             if history_path is not None:
-                readline.add_history(prompt)
+                cast(_Readline, readline).add_history(prompt)
             try:
                 prompt_config = _config_for_prompt(config, prompt)
                 events: list[dict[str, Any]] = []

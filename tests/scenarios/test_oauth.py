@@ -20,7 +20,7 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -34,6 +34,7 @@ from cambium.oauth import (
     OAuthDoc,
     OAuthError,
     OAuthMissingError,
+    OAuthRecord,
     OAuthStore,
     OAuthStoreError,
     RefreshUnavailableError,
@@ -199,7 +200,7 @@ class _FakeIssuerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str = "", *args: object) -> None:
         pass
 
 
@@ -261,7 +262,8 @@ def test_store_round_trip_permissions_and_remove(tmp_path: Path) -> None:
 
     store.save_provider(_doc(provider="other", access="a2", refresh="r2", account_id=None))
     assert set(store.providers()) == {"codex", "other"}
-    assert store.read().by_provider("other").doc.account_id is None
+    other = cast(OAuthRecord, store.read().by_provider("other"))
+    assert other.doc.account_id is None
 
     assert store.remove_provider("codex") is True
     assert store.read_provider("codex") is None
@@ -274,9 +276,11 @@ def test_store_disabled_round_trip(tmp_path: Path) -> None:
     path = _store_path(tmp_path)
     store = OAuthStore(path)
     store.save_provider(_doc(), disabled=True)
-    assert store.read_provider("codex").disabled is True
+    record = cast(OAuthRecord, store.read_provider("codex"))
+    assert record.disabled is True
     store.save_provider(_doc(), disabled=False)
-    assert store.read_provider("codex").disabled is False
+    record = cast(OAuthRecord, store.read_provider("codex"))
+    assert record.disabled is False
 
 
 def test_store_corrupt_file_fails_closed_and_repair(tmp_path: Path) -> None:
@@ -315,7 +319,8 @@ def test_store_repair_is_noop_on_valid_and_missing(tmp_path: Path) -> None:
     store.repair()  # missing file -> empty store, no-op
     store.save_provider(_doc())
     store.repair()
-    assert store.read_provider("codex").doc.access_token == "access-1"
+    record = cast(OAuthRecord, store.read_provider("codex"))
+    assert record.doc.access_token == "access-1"
     assert not list(path.parent.glob("oauth.json.corrupt-*"))
 
 
@@ -616,7 +621,7 @@ def test_refresh_preserves_old_refresh_when_response_omits_it(tmp_path: Path) ->
         access, _ = manager.ensure_fresh()
 
         assert access == "new-access-1"
-        record = store.read_provider("codex")
+        record = cast(OAuthRecord, store.read_provider("codex"))
         assert record.doc.access_token == "new-access-1"
         assert record.doc.refresh_token == STALE_REFRESH  # preserved
 
@@ -733,7 +738,8 @@ def test_refresh_timeout_keeps_last_good(tmp_path: Path) -> None:
             manager.ensure_fresh()
 
         assert path.read_bytes() == before
-        assert store.read_provider("codex").doc.access_token == STALE_ACCESS
+        record = cast(OAuthRecord, store.read_provider("codex"))
+        assert record.doc.access_token == STALE_ACCESS
 
 
 def test_refresh_invalid_grant_disables_provider(tmp_path: Path) -> None:
@@ -745,7 +751,8 @@ def test_refresh_invalid_grant_disables_provider(tmp_path: Path) -> None:
         manager = TokenManager("codex", store, client_id=FAKE_CLIENT_ID, issuer=server.issuer)
         with pytest.raises(InvalidGrantError):
             manager.ensure_fresh()
-        assert store.read_provider("codex").disabled is True
+        record = cast(OAuthRecord, store.read_provider("codex"))
+        assert record.disabled is True
 
         # Disabled until re-login: no further network attempts.
         with pytest.raises(InvalidGrantError):
@@ -760,7 +767,8 @@ def test_mark_invalid_grant_disables_until_relogin(tmp_path: Path) -> None:
 
         manager = TokenManager("codex", store, client_id=FAKE_CLIENT_ID, issuer=server.issuer)
         manager.mark_invalid_grant()
-        assert store.read_provider("codex").disabled is True
+        record = cast(OAuthRecord, store.read_provider("codex"))
+        assert record.disabled is True
 
         with pytest.raises(InvalidGrantError):
             manager.ensure_fresh()
@@ -847,7 +855,7 @@ def test_oauth_response_larger_than_cap_is_rejected() -> None:
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-        def log_message(self, *args: object) -> None:
+        def log_message(self, format: str = "", *args: object) -> None:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), OversizedHandler)

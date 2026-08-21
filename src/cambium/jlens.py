@@ -28,7 +28,7 @@ def render_messages(predictor: Any, inputs: dict[str, Any]) -> list[dict[str, An
     signature, the demos currently attached to the predictor, and the inputs
     into the message list that the LM call consumed.
     """
-    import dspy
+    import dspy  # type: ignore[import-untyped]
 
     adapter = dspy.settings.adapter or dspy.ChatAdapter()
     demos = getattr(predictor, "demos", None) or []

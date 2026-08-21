@@ -26,7 +26,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -66,7 +66,7 @@ class FakeServer:
         self.calls: list[dict[str, Any]] = []
         self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
-        self._httpd = HTTPServer((host, 0), _Handler)
+        self._httpd = cast(_FakeHTTPServer, HTTPServer((host, 0), _Handler))
         self._httpd.fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
@@ -98,6 +98,10 @@ class FakeServer:
         self._thread.join()
 
 
+class _FakeHTTPServer(HTTPServer):
+    fake: FakeServer
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -108,7 +112,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             body = {}
-        server: FakeServer = self.server.fake  # type: ignore[attr-defined]
+        server = cast(_FakeHTTPServer, self.server).fake
         index = server.record(
             body,
             {
@@ -131,7 +135,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass  # the client timed out (budget-capped attempt) and closed first
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -166,7 +170,7 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
+    base: dict[str, Any] = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
     base.update(overrides)
     return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
 

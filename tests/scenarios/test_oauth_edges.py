@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from cambium.oauth import (
     DEFAULT_REFRESH_MARGIN_S,
     OAuthDoc,
+    OAuthRecord,
     OAuthStore,
     RefreshedTokens,
     TokenManager,
@@ -112,7 +114,8 @@ def test_token_manager_uses_injected_clock_after_backward_step(tmp_path: Path) -
     )
 
     assert manager.ensure_fresh() == ("refreshed-access", None)
-    assert store.read_provider("codex").doc.expires_at == 4600.0
+    record = cast(OAuthRecord, store.read_provider("codex"))
+    assert record.doc.expires_at == 4600.0
 
     clock.value = 900.0
 

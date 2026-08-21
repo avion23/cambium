@@ -13,11 +13,12 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows
-    fcntl = None
+    fcntl = cast(Any, None)
 
 FENCE_FILE = ".cambium/generation"
 GENERATION_LOCK_FILE = ".cambium/.generation.lock"

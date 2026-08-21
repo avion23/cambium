@@ -78,10 +78,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from cambium.fencing import (
     is_cache_artifact_path,
@@ -160,7 +160,7 @@ STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
 DURABLE_EVENT_TIMEOUT_S = 5.0
 
-EventSink = Callable[[dict[str, Any]], None]
+EventSink = Callable[[dict[str, Any]], None | Awaitable[None]]
 
 # Session-tree kind for plan tasks that do not declare one. ``build_tree``
 # requires a kind per node; flat run_plan specs are code-editing tasks, so
@@ -246,7 +246,10 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
     unknown_cache_key = sorted(set(cache_key) - _CACHE_KEY_FIELDS, key=str)
     invalid.extend(f"cache_key.{field}" for field in unknown_cache_key)
     for field in ("epoch", "turn"):
-        if not (type(msg.get(field)) is int and msg.get(field) > 0):
+        if not (
+            type(msg.get(field)) is int
+            and cast(int, msg.get(field)) > 0
+        ):
             invalid.append(field)
     checkpoint_ref = msg.get("checkpoint_ref")
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
@@ -648,7 +651,9 @@ def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
     for field in _TOOL_EVENT_DURATION_FIELDS:
         value = msg.get(field)
         if field in msg and not (
-            type(value) in (int, float) and value >= 0 and math.isfinite(value)
+            type(value) in (int, float)
+            and cast(int | float, value) >= 0
+            and math.isfinite(cast(int | float, value))
         ):
             invalid.append(field)
     return invalid
@@ -674,7 +679,9 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):
         value = msg.get(field)
         if field in msg and not (
-            type(value) in (int, float) and value >= 0 and math.isfinite(value)
+            type(value) in (int, float)
+            and cast(int | float, value) >= 0
+            and math.isfinite(cast(int | float, value))
         ):
             invalid.append(field)
     if "provider_cache_hit" in msg and type(msg["provider_cache_hit"]) is not bool:
@@ -1762,7 +1769,7 @@ class _Runtime:
         redacted = self._redactor.redact_protocol_record(
             envelope, structural_fields=WORKER_RESULT_STRUCTURAL_FIELDS
         )
-        return dict(redacted)
+        return cast(dict[str, Any], redacted)
 
     # -- event path ---------------------------------------------------------
 
@@ -1776,7 +1783,7 @@ class _Runtime:
         _deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
         **payload: Any,
     ) -> None:
-        record = {
+        record: dict[str, Any] = {
             "kind": kind,
             "task_id": task_id,
             "worker_id": f"{task_id}:{generation}" if generation is not None else task_id,
@@ -1787,10 +1794,11 @@ class _Runtime:
             "payload": dict(payload),
         }
         if self._redactor is not None:
-            record = self._redactor.redact_protocol_record(
+            redacted_record = self._redactor.redact_protocol_record(
                 record, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
             )
-            kind = record["kind"]
+            record = cast(dict[str, Any], redacted_record)
+            kind = cast(str, record["kind"])
         durable_record = self._copy_event(record)
         if self._store is not None:
             try:
@@ -2143,7 +2151,9 @@ class _Runtime:
             return [sys.executable, "-u", "-m", "cambium.worker"]
         return [sys.executable, "-u", str(worker)]
 
-    def _worker_env(self, spec: dict[str, Any], generation: int) -> dict[str, str]:
+    def _worker_env(
+        self: _Runtime | None, spec: dict[str, Any], generation: int
+    ) -> dict[str, str]:
         session_dir = self._session_dir if self is not None else None
         provider_environment = (
             self._provider_environment if self is not None else None
@@ -2305,11 +2315,12 @@ class _Runtime:
             )
             return []
         if self._task_group is None:
-            exc = RuntimeError("no active task group")
+            no_task_group_error = RuntimeError("no active task group")
             await self.emit(
                 "child_rejected", task_id=parent_task_id, request_id=request_id,
                 parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, reason="NoActiveTaskGroup", message=str(exc)[:512],
+                child_kind=kind, reason="NoActiveTaskGroup",
+                message=str(no_task_group_error)[:512],
             )
             await self._record_revision_conversation(
                 outcome="rejected", parent_task_id=parent_task_id,
@@ -2444,7 +2455,7 @@ class _Runtime:
                     "parent_task_id": parent_task_id,
                     "unified_diff": "",
                     "diff_truncated": False,
-                    "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
+                    "summary": _cap_utf8(cast(str, summary), MAX_ENVELOPE_FIELD_CHARS),
                     "metric_score": None,
                     "metric_breakdown": {},
                     "commits": [],
@@ -2624,7 +2635,7 @@ class _Runtime:
             proposal,
             structural_fields=("request_id", "parent_task_id", "child_task_id", "kind"),
         )
-        return dict(redacted)
+        return cast(dict[str, Any], redacted)
 
     async def _admit_port_proposals(
         self, parent_spec: dict[str, Any], parent_envelope: dict[str, Any]
@@ -2769,8 +2780,8 @@ class _Runtime:
             message, structural_fields=("role",)
         )
         return {
-            "role": redacted["role"],
-            "content": redacted["content"],
+            "role": cast(str, redacted["role"]),
+            "content": cast(str, redacted["content"]),
         }
 
     async def _record_context_checkpoint_conversation(
@@ -3114,7 +3125,7 @@ class _Runtime:
                     allow_pool=allow_pool,
                 )
             finally:
-                if acquired:
+                if acquired and semaphore is not None:
                     semaphore.release()
 
         try:
@@ -3183,16 +3194,20 @@ class _Runtime:
                         await self._await_suspend_children(task_id, child_ids, remaining)
                         resume_payload = self._child_results_for_resume(
                             task_id, child_ids,
-                            checkpoint_ref=outcome.envelope.get("checkpoint_ref"),
-                            epoch=outcome.envelope.get("epoch"),
+                            checkpoint_ref=cast(dict[str, Any], outcome.envelope).get(
+                                "checkpoint_ref"
+                            ),
+                            epoch=cast(dict[str, Any], outcome.envelope).get("epoch"),
                         )
                         # This critical lifecycle event is the last durable
                         # barrier before the next worker spawn.  A store
                         # failure raises and the resume is not attempted.
                         await self.emit(
                             "context_resume", task_id=task_id, generation=generation,
-                            epoch=outcome.envelope.get("epoch"),
-                            checkpoint_ref=outcome.envelope.get("checkpoint_ref"),
+                            epoch=cast(dict[str, Any], outcome.envelope).get("epoch"),
+                            checkpoint_ref=cast(dict[str, Any], outcome.envelope).get(
+                                "checkpoint_ref"
+                            ),
                             child_count=len(child_ids),
                         )
                         spec["resume"] = resume_payload
@@ -3459,10 +3474,13 @@ class _Runtime:
         parse_errors = 0
         message_too_long = False
 
+        stdout = cast(asyncio.StreamReader, proc.stdout)
+        stderr = cast(asyncio.StreamReader, proc.stderr)
+
         async def _read_stdout() -> None:
             nonlocal parse_errors, message_too_long
             try:
-                async for raw in proc.stdout:
+                async for raw in stdout:
                     line = raw.decode("utf-8", "replace").rstrip("\n")
                     if not line.strip():
                         continue
@@ -3511,7 +3529,7 @@ class _Runtime:
                     await messages.put(None)
 
         async def _read_stderr() -> None:
-            async for raw in proc.stderr:
+            async for raw in stderr:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 if line.strip():
                     if self._redactor is not None:
@@ -3807,13 +3825,17 @@ class _Runtime:
                                     await self._admit_port_proposals(spec, parent_envelope)
                                 )
                         except ConversationAppendError:
-                            reason = "conversation_store_append_failed"
+                            conversation_failure_reason = "conversation_store_append_failed"
                             await self.emit(
                                 "worker_failed", task_id=task_id,
-                                generation=generation, reason=reason,
+                                generation=generation, reason=conversation_failure_reason,
                             )
                             await _kill_worker(proc)
-                            return _GenOutcome(clean=False, fatal=True, reason=reason)
+                            return _GenOutcome(
+                                clean=False,
+                                fatal=True,
+                                reason=conversation_failure_reason,
+                            )
                     if (
                         accepted
                         and spec.get("parent_task_id") is not None
@@ -3944,10 +3966,10 @@ class _Runtime:
                             reason=msg["reason"],
                         )
                 elif mtype == "context_fork_skipped":
-                    reason = msg.get("reason")
+                    fork_skip_reason = msg.get("reason")
                     await self.emit(
                         "context_fork_skipped", task_id=task_id, generation=generation,
-                        reason=reason,
+                        reason=fork_skip_reason,
                     )
                 elif mtype == "propose_child":
                     invalid_fields = _invalid_propose_child_fields(msg)
@@ -4124,13 +4146,17 @@ class _Runtime:
         clean = (
             exit_reason is not None
             and terminal_verdict
-            and (exit_code == 0 or envelope.get("status") != "succeeded")
+            and (
+                exit_code == 0
+                or cast(dict[str, Any], envelope).get("status") != "succeeded"
+            )
         )
+        reason: str | None
         if message_too_long:
             clean = False
-            reason: str | None = "message_too_long"
+            reason = "message_too_long"
         elif clean:
-            reason: str | None = None
+            reason = None
         elif timeout_phase is not None:
             reason = timeout_phase
         elif protocol_reason is not None:
@@ -4532,8 +4558,8 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     task_id = spec.get("task_id")
     if not isinstance(task_id, str) or not task_id:
         raise ValueError("plan task requires 'task_id'")
-    task = spec.get("task")
-    if not isinstance(task, str) or not task.strip():
+    task_text = spec.get("task")
+    if not isinstance(task_text, str) or not task_text.strip():
         raise ValueError(f"task {task_id} requires a non-empty 'task'")
     if "repo" not in spec:
         raise ValueError(f"task {task_id} requires 'repo'")
@@ -5044,6 +5070,7 @@ def _build_session_result(
     session_dir = Path(session_dir)
     results = list(runtime.plan_result().results)
     ended_at = time.time()
+    failure_reason: str | None
     if cancelled:
         status = "cancelled"
         failure_reason = "cancelled"
@@ -5187,7 +5214,7 @@ def _strict_parent_envelope(
 
 
 async def _run_wave_bounded(
-    runtime: _Runtime, specs: list[dict[str, Any]], width_limit: int
+    runtime: _Runtime, specs: list[dict[str, Any]], width_limit: int | None
 ) -> None:
     """Dispatch one wave's specs under a wave-local width bound.
 
@@ -5364,7 +5391,10 @@ async def run_plan(
     ):
         raise ValueError("max_concurrent_tasks must be a non-negative int or None")
     if max_concurrent_tasks is None:
-        max_concurrent_tasks = max(1, os.process_cpu_count() or os.cpu_count() or 1)
+        max_concurrent_tasks = max(
+            1,
+            cast(Any, os).process_cpu_count() or os.cpu_count() or 1,
+        )
     if type(warm_pool_size) is not int or warm_pool_size < 0:
         raise ValueError("warm_pool_size must be a non-negative int")
 

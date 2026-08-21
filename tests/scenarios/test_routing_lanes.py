@@ -34,7 +34,7 @@ from cambium.supervisor import _preassign_lanes, _release_lane
 
 
 def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
-    base = dict(
+    base: dict[str, Any] = dict(
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",

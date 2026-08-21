@@ -29,7 +29,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -64,7 +64,7 @@ class FakeServer:
         self.calls: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
-        self._httpd.fake = self
+        cast(Any, self._httpd).fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             kwargs={"poll_interval": 0.001},
@@ -98,7 +98,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             body = {}
-        server: FakeServer = self.server.fake  # type: ignore[attr-defined]
+        server = cast(FakeServer, cast(Any, self.server).fake)
         index = server.record(body)
         status, payload, delay = server.behavior_at(index)
         if delay:
@@ -113,7 +113,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass  # the client timed out (budget-capped attempt) and closed first
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -148,7 +148,7 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
+    base: dict[str, Any] = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
     base.update(overrides)
     return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
 
@@ -212,7 +212,10 @@ def _three_servers() -> tuple[FakeServer, FakeServer, FakeServer]:
 def test_quality_score_ranks_measured_data_and_neutral_defaults() -> None:
     now = time.time()
     debt = _measured_debt()
-    scores = {name: quality_score(entry, now=now) for name, entry in debt.items()}
+    scores: dict[str, tuple[float, int, float, float]] = {
+        name: cast(tuple[float, int, float, float], quality_score(entry, now=now))
+        for name, entry in debt.items()
+    }
     # codex sorts below opencode-go and zai when measured data exists
     assert scores["opencode-go"] < scores["zai"] < scores["codex"]
 
@@ -266,7 +269,8 @@ def test_config_priority_order_preserved_without_debt(monkeypatch) -> None:
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     _set_keys(monkeypatch, "K_1", "K_2")
     try:
-        for debt in (None, {}):
+        debt_options: tuple[dict[str, ProviderDebt] | None, ...] = (None, {})
+        for debt in debt_options:
             router = Diffundo(
                 (
                     _config("p_second", second, "K_2", priority=5),

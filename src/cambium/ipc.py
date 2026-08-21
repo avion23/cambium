@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, Protocol, cast
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,14 @@ class MessageTooLong(ValueError):
     def __init__(self, length: int) -> None:
         super().__init__(f"line exceeds the message length cap ({length} bytes)")
         self.length = length
+
+
+class _FrameWriter(Protocol):
+    def write(self, frame: bytes, /) -> None: ...
+
+
+class _ReaderWithLimit(Protocol):
+    _limit: int
 
 
 def make_request_id(prefix: str = "req") -> str:
@@ -58,12 +66,12 @@ def encode_message(msg: dict[str, Any]) -> bytes | None:
     return content + b"\n"
 
 
-def write_frame(writer: asyncio.StreamWriter, frame: bytes) -> None:
+def write_frame(writer: _FrameWriter, frame: bytes) -> None:
     """Queue one pre-encoded newline-terminated wire frame on ``writer``."""
     writer.write(frame)
 
 
-def write_message(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
+def write_message(writer: _FrameWriter, msg: dict[str, Any]) -> None:
     """Encode ``msg`` as one newline-terminated JSON line and queue it.
 
     The caller is responsible for draining the writer (``await
@@ -103,8 +111,9 @@ async def _read_line(reader: asyncio.StreamReader, limit: int) -> bytes | None:
     The temporary reader limit preserves the public ``limit`` argument even
     for in-memory readers created with asyncio's smaller default.
     """
-    original_limit = reader._limit
-    reader._limit = limit
+    reader_with_limit = cast(_ReaderWithLimit, reader)
+    original_limit = reader_with_limit._limit
+    reader_with_limit._limit = limit
     try:
         try:
             return await reader.readuntil(b"\n")
@@ -115,7 +124,7 @@ async def _read_line(reader: asyncio.StreamReader, limit: int) -> bytes | None:
             await _discard_to_newline(reader)
             raise MessageTooLong(exc.consumed) from exc
     finally:
-        reader._limit = original_limit
+        reader_with_limit._limit = original_limit
 
 
 async def read_message(

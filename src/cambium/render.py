@@ -23,7 +23,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .results import CHILD_RESULT_KEYS, ROOT_RESULT_KEYS, Result, result_to_dict
 
@@ -438,7 +438,10 @@ def render_subagent_status(events: Any) -> str:
     total_cost = 0.0
     for event in event_records:
         kind = event.get("kind")
-        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        payload = cast(
+            Mapping[str, Any],
+            event.get("payload") if isinstance(event.get("payload"), Mapping) else {},
+        )
         usage_tokens = 0
         usage_cost = 0.0
         if kind == "usage_event":

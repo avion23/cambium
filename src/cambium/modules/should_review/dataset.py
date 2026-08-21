@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -258,7 +259,7 @@ class ExampleDatasetLoader(DatasetLoader):
             raise DatasetError(f"{path}:{line_no}: version drift: {', '.join(mismatches)}")
 
     def _check_no_cross_split_collisions(
-        self, splits: list[tuple[str, list[Example]]]
+        self, splits: list[tuple[str, Sequence[Example]]]
     ) -> None:
         seen: dict[str, tuple[str, str]] = {}
         for split_name, examples in splits:

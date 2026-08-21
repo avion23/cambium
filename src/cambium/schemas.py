@@ -38,10 +38,10 @@ def _type_schema(annotation: Any) -> dict[str, Any]:
 
     if origin is Literal:
         values = list(get_args(annotation))
-        schema: dict[str, Any] = {"enum": values}
+        literal_schema: dict[str, Any] = {"enum": values}
         if values and all(type(value) is type(values[0]) for value in values):
-            schema.update(_type_schema(type(values[0])))
-        return schema
+            literal_schema.update(_type_schema(type(values[0])))
+        return literal_schema
 
     if annotation in (Any, object):
         return {}

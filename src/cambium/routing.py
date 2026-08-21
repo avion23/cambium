@@ -60,9 +60,10 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 try:
+    fcntl: Any
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None
@@ -437,7 +438,7 @@ class DebtStore:
                 descriptor, temporary_name = tempfile.mkstemp(
                     prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent
                 )
-                temporary_path = Path(temporary_name)
+                temporary_path: Path | None = Path(temporary_name)
                 try:
                     with os.fdopen(
                         descriptor, "w", encoding="utf-8", newline="\n"
@@ -445,7 +446,7 @@ class DebtStore:
                         handle.write(content)
                         handle.flush()
                         os.fsync(handle.fileno())
-                    os.replace(temporary_path, self._path)
+                    os.replace(cast(Path, temporary_path), self._path)
                     temporary_path = None
                 finally:
                     if temporary_path is not None:

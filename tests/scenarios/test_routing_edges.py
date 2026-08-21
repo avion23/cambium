@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -8,6 +8,7 @@ from cambium.diffundo import ProviderConfig, ProviderTier
 from cambium.routing import (
     LaneCapacityExhausted,
     LaneState,
+    ProviderAssignment,
     ProviderDebt,
     resolve_assignment,
     select_lane,
@@ -72,11 +73,15 @@ def test_select_lane_does_not_call_a_non_matching_pool_exhausted() -> None:
 def test_resolve_assignment_handles_empty_single_and_zero_lane_pools() -> None:
     provider = _provider("a", "m1")
 
-    assignment = resolve_assignment([provider], ["m1"], {}, {})
+    assignment = cast(
+        ProviderAssignment, resolve_assignment([provider], ["m1"], {}, {})
+    )
     assert assignment.provider == "a"
     assert assignment.model == "m1"
     assert assignment.tier == "fast"
-    assert resolve_assignment([provider], ["m1"], {}, None).provider == "a"
+    assert cast(
+        ProviderAssignment, resolve_assignment([provider], ["m1"], {}, None)
+    ).provider == "a"
 
     with pytest.raises(ValueError, match="match no enabled configured provider"):
         resolve_assignment([], ["m1"], {}, {})
@@ -103,12 +108,15 @@ def test_resolve_assignment_breaks_equal_cost_ties_by_config_order() -> None:
     lanes = {"a": LaneState(), "b": LaneState()}
 
     assignments = [
-        resolve_assignment(
-            providers,
-            ["m1", "m2"],
-            debt,
-            lanes,
-            requirements={"quality": "normal"},
+        cast(
+            ProviderAssignment,
+            resolve_assignment(
+                providers,
+                ["m1", "m2"],
+                debt,
+                lanes,
+                requirements={"quality": "normal"},
+            ),
         )
         for _ in range(3)
     ]

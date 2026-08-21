@@ -19,12 +19,12 @@ import statistics
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from types import MethodType
 from typing import Any, cast
 
-import dspy
+import dspy  # type: ignore[import-untyped]
 
 from cambium import module_conformance
 from cambium.diffundo import Diffundo, DiffundoError, ProviderTier
@@ -34,6 +34,7 @@ from cambium.modules.base import (
     DatasetError,
     Example,
     ModuleContractError,
+    ModuleManifest,
     load_module_manifest,
 )
 
@@ -212,7 +213,7 @@ def _domain_module(program: object):
 def _metric_function(program: object) -> Callable[[Example], float]:
     metric = getattr(program, "metric", None)
     if callable(metric):
-        return metric
+        return cast(Callable[[Example], float], metric)
 
     target = f"{_program_package(program)}.metric"
     try:
@@ -223,11 +224,11 @@ def _metric_function(program: object) -> Callable[[Example], float]:
     metric = getattr(mod, "should_decompose_metric", None)
     if not callable(metric):
         raise OptimizeError(f"metric module {target!r} has no usable metric")
-    return metric
+    return cast(Callable[[Example], float], metric)
 
 
 def _parse_decision(raw: object, decision_type: type) -> object | None:
-    members = tuple(decision_type)
+    members = tuple(cast(Iterable[object], decision_type))
     if isinstance(raw, decision_type):
         return raw
     if isinstance(raw, bool):
@@ -354,7 +355,7 @@ def _jlens_client_from_env() -> JlenClient | None:
     layers = None
     raw_layers = os.environ.get("CAMBIUM_JLENS_LAYERS", "").strip()
     if raw_layers:
-        parsed = []
+        parsed: list[int] = []
         for part in raw_layers.split(","):
             part = part.strip()
             if not part.isdigit():
@@ -510,6 +511,7 @@ def _load_split(loader: object, name: str) -> list[Example]:
     load_split = getattr(loader, "load_split", None)
     if not callable(load_split):
         raise OptimizeError("dataset loader does not provide load_split")
+    load_split = cast(Callable[[object], Iterable[Example]], load_split)
     try:
         return list(load_split(_loader_split(loader, name)))
     except OptimizeError:
@@ -523,7 +525,7 @@ def _loader_datasets_dir(loader: object) -> Path:
     datasets_dir = getattr(loader, "datasets_dir", _MISSING)
     if datasets_dir is not _MISSING:
         try:
-            return Path(datasets_dir)
+            return Path(cast(str | os.PathLike[str], datasets_dir))
         except TypeError as exc:
             raise OptimizeError("dataset loader has an invalid datasets_dir") from exc
 
@@ -531,7 +533,7 @@ def _loader_datasets_dir(loader: object) -> Path:
     if path is _MISSING:
         raise OptimizeError("dataset loader does not expose a dataset path")
     try:
-        dataset_path = Path(path)
+        dataset_path = Path(cast(str | os.PathLike[str], path))
     except TypeError as exc:
         raise OptimizeError("dataset loader has an invalid dataset path") from exc
     return dataset_path if dataset_path.is_dir() else dataset_path.parent
@@ -545,7 +547,7 @@ def _load_transcript_candidates(loader: object) -> list[Example]:
             f"transcript candidate file is missing for this module: {candidate_path}"
         )
 
-    loader_class = type(loader)
+    loader_class = cast(Callable[[Path], object], type(loader))
     try:
         candidate_loader = loader_class(candidate_path)
     except (OSError, ValueError) as exc:
@@ -555,6 +557,7 @@ def _load_transcript_candidates(loader: object) -> list[Example]:
     load = getattr(candidate_loader, "load", None)
     if not callable(load):
         raise OptimizeError("dataset loader does not provide load for transcript candidates")
+    load = cast(Callable[[], Iterable[Example]], load)
     try:
         candidates = list(load())
     except (DatasetError, ImportError, OSError, KeyError, json.JSONDecodeError) as exc:
@@ -618,6 +621,7 @@ def build_trainsets(loader, seed=0, val_fraction=0.2) -> tuple[list, list]:
     load_split = getattr(loader, "load_split", None)
     if not callable(load_split):
         raise OptimizeError("dataset loader does not provide load_split")
+    load_split = cast(Callable[[object], Iterable[Example]], load_split)
     try:
         examples = list(load_split(_loader_split(loader, "TRAIN")))
     except OptimizeError:
@@ -647,7 +651,9 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
     scores: list[float] = []
     for example in examples:
         try:
-            raw_prediction = await program.decide(example.input)
+            raw_prediction = await cast(
+                Callable[[Any], Any], cast(Any, program).decide
+            )(example.input)
         except _BudgetExhausted:
             raise
         except (AdapterParseError, ValueError) as exc:
@@ -711,7 +717,7 @@ def _to_dspy_example(example: Example, program: object) -> dspy.Example:
     return dspy.Example(
         task=task,
         context=context,
-        decision=decision.value,
+        decision=cast(Any, decision).value,
         reason=reason,
     ).with_inputs("task", "context")
 
@@ -734,7 +740,7 @@ def _ensure_bootstrap_forward(program: object) -> None:
         with dspy.context(lm=lm):
             return predictor(**kwargs)
 
-    program.forward = MethodType(forward, program)
+    cast(Any, program).forward = MethodType(forward, program)
 
 
 def run_stage_bootstrap(program, train_examples, val_examples, seed=0) -> tuple[object, dict]:
@@ -866,7 +872,7 @@ def _load_dataset_loader(manifest: object) -> object:
         candidates[0],
     )
     try:
-        return loader_class(Path(manifest.package_dir) / "datasets")
+        return loader_class(Path(cast(ModuleManifest, manifest).package_dir) / "datasets")
     except (OSError, ValueError) as exc:
         raise OptimizeError(f"could not construct dataset loader: {exc}") from exc
 
@@ -895,7 +901,12 @@ def _load_manifest(module_name: str) -> object:
 
 
 def _baseline_means(manifest: object) -> dict[str, float]:
-    path = Path(manifest.package_dir) / "tests" / "baselines" / "baseline.json"
+    path = (
+        Path(cast(ModuleManifest, manifest).package_dir)
+        / "tests"
+        / "baselines"
+        / "baseline.json"
+    )
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1061,6 +1072,8 @@ def _run(argv=None) -> int:
         return 0
 
     program: object | None = None
+    loader: object = _MISSING
+    lm: object = _MISSING
     ledger = _CostLedger(args.budget_usd)
     baseline_means: dict[str, float] | None = None
     stage_zero: dict | None = None
@@ -1133,8 +1146,8 @@ def _run(argv=None) -> int:
             baseline_means,
         )
         artifact = write_artifact(
-            manifest.module_name,
-            _next_version(manifest.module_name),
+            cast(ModuleManifest, manifest).module_name,
+            _next_version(cast(ModuleManifest, manifest).module_name),
             program,
             lm,
             report,
@@ -1168,8 +1181,8 @@ def _run(argv=None) -> int:
             )
             try:
                 artifact = write_artifact(
-                    manifest.module_name,
-                    _next_version(manifest.module_name),
+                    cast(ModuleManifest, manifest).module_name,
+                    _next_version(cast(ModuleManifest, manifest).module_name),
                     program,
                     lm,
                     report,

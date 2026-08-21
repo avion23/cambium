@@ -35,7 +35,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode, urlparse
 
 from .auth import (
@@ -342,11 +342,14 @@ def _validate_raw_document(raw: object) -> OAuthDocument:
                 f"provider {provider!r} entry must contain exactly access_token, "
                 "refresh_token, expires_at, account_id, and disabled"
             )
+        access_token = cast(str, raw_entry.get("access_token"))
+        refresh_token = cast(str, raw_entry.get("refresh_token"))
+        expires_at = cast(float, raw_entry.get("expires_at"))
         doc = OAuthDoc(
             provider=provider,
-            access_token=raw_entry.get("access_token"),
-            refresh_token=raw_entry.get("refresh_token"),
-            expires_at=raw_entry.get("expires_at"),
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=expires_at,
             account_id=raw_entry.get("account_id"),
         )
         disabled = raw_entry.get("disabled")
@@ -839,14 +842,14 @@ def refresh_access_token(
             raise RefreshUnavailableError(f"refresh unavailable: HTTP {status}")
         payload = _parse_json_object(body)
         access_token = payload.get("access_token")
-        _validate_token(access_token, "access token")
+        access_token = _validate_token(access_token, "access token")
         account_id = _account_id_from_id_token(payload.get("id_token"))
         if account_id is None:
             value = payload.get("account_id")
             account_id = value if isinstance(value, str) and value else None
         refresh_token_out = payload.get("refresh_token")
         if refresh_token_out is not None:
-            _validate_token(refresh_token_out, "refresh token")
+            refresh_token_out = _validate_token(refresh_token_out, "refresh token")
         return RefreshedTokens(
             access_token=access_token,
             expires_in=_parse_float(payload.get("expires_in"), DEFAULT_EXPIRES_IN_S),
@@ -896,8 +899,8 @@ def request_user_code(
         payload = _parse_json_object(body)
         device_auth_id = payload.get("device_auth_id")
         user_code = payload.get("user_code")
-        _validate_token(device_auth_id, "device auth id")
-        _validate_token(user_code, "user code")
+        device_auth_id = _validate_token(device_auth_id, "device auth id")
+        user_code = _validate_token(user_code, "user code")
         interval = _parse_float(payload.get("interval"), 5.0)
     except DeviceFlowError:
         raise
@@ -930,8 +933,8 @@ def poll_device_token(
             payload = _parse_json_object(body)
             code = payload.get("authorization_code")
             code_verifier = payload.get("code_verifier")
-            _validate_token(code, "authorization code")
-            _validate_token(code_verifier, "code verifier")
+            code = _validate_token(code, "authorization code")
+            code_verifier = _validate_token(code_verifier, "code verifier")
             return AuthorizationCode(code=code, code_verifier=code_verifier)
         if status in (403, 404):
             return None
@@ -969,8 +972,8 @@ def exchange_code_for_tokens(
         payload = _parse_json_object(body)
         access_token = payload.get("access_token")
         refresh_token = payload.get("refresh_token")
-        _validate_token(access_token, "access token")
-        _validate_token(refresh_token, "refresh token")
+        access_token = _validate_token(access_token, "access token")
+        refresh_token = _validate_token(refresh_token, "refresh token")
         account_id = _account_id_from_id_token(payload.get("id_token"))
         if account_id is None:
             value = payload.get("account_id")
@@ -1109,15 +1112,13 @@ def import_codex_cli_session(path: str | Path | None = None) -> OAuthDoc:
     tokens = raw.get("tokens")
     if not isinstance(tokens, Mapping):
         raise OAuthError("codex cli session has no tokens")
-    access_token = tokens.get("access_token")
-    refresh_token = tokens.get("refresh_token")
-    _validate_token(access_token, "access token")
-    _validate_token(refresh_token, "refresh token")
-    account_id = tokens.get("account_id")
+    access_token = _validate_token(tokens.get("access_token"), "access token")
+    refresh_token = _validate_token(tokens.get("refresh_token"), "refresh token")
+    account_id = cast(str | None, tokens.get("account_id"))
     if account_id is not None:
         if not isinstance(account_id, str) or not account_id:
             raise OAuthError("codex cli session account_id is invalid")
-        _validate_token(account_id, "account id")
+        account_id = _validate_token(account_id, "account id")
     def _usable_exp(token: Any) -> float:
         """Return a valid ``exp`` epoch-seconds claim from a JWT, else 0.0."""
         if not isinstance(token, str) or not token:

@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 if sysconfig.get_config_var("Py_GIL_DISABLED") or os.environ.get("Py_GIL_DISABLED") == "1":
@@ -136,6 +136,30 @@ _JSON_BYTES_MARKER = 1
 _JSON_TUPLE_MARKER = 2
 
 
+if TYPE_CHECKING:
+    class _DspyLMType:
+        callbacks: Any
+        cache: bool
+        history: list[Any]
+        kwargs: dict[str, Any]
+        launch_kwargs: dict[str, Any]
+        model: str
+        num_retries: int
+        train_kwargs: dict[str, Any]
+
+        def __init__(self, /, *args: Any, **kwargs: Any) -> None: ...
+
+        def __call__(self, /, *args: Any, **kwargs: Any) -> Any: ...
+
+        async def acall(self, /, *args: Any, **kwargs: Any) -> Any: ...
+
+        def copy(self, /, *args: Any, **kwargs: Any) -> Any: ...
+
+        def dump_state(self) -> dict[str, Any]: ...
+else:
+    _DspyLMType = object
+
+
 def _reject_string_subclass_key(key: Any) -> Any:
     if isinstance(key, str) and type(key) is not str:
         raise TypeError("CambiumLM string keys must use exact builtin strings")
@@ -178,18 +202,18 @@ class _ImmutableCallbacks(list[Any]):
         del args, kwargs
         raise TypeError("CambiumLM callbacks are immutable")
 
-    __delitem__ = _reject_mutation
-    __iadd__ = _reject_mutation
-    __imul__ = _reject_mutation
-    __setitem__ = _reject_mutation
-    append = _reject_mutation
-    clear = _reject_mutation
-    extend = _reject_mutation
-    insert = _reject_mutation
-    pop = _reject_mutation
-    remove = _reject_mutation
-    reverse = _reject_mutation
-    sort = _reject_mutation
+    __delitem__ = cast(Any, _reject_mutation)
+    __iadd__ = cast(Any, _reject_mutation)
+    __imul__ = cast(Any, _reject_mutation)
+    __setitem__ = cast(Any, _reject_mutation)
+    append = cast(Any, _reject_mutation)
+    clear = cast(Any, _reject_mutation)
+    extend = cast(Any, _reject_mutation)
+    insert = cast(Any, _reject_mutation)
+    pop = cast(Any, _reject_mutation)
+    remove = cast(Any, _reject_mutation)
+    reverse = cast(Any, _reject_mutation)
+    sort = cast(Any, _reject_mutation)
 
 
 def _freeze(
@@ -201,6 +225,7 @@ def _freeze(
     """Take a recursive isolated snapshot of JSON-shaped configuration."""
     if memo is None:
         memo = {}
+    snapshot: Any
     if isinstance(value, Mapping):
         if id(value) in memo:
             raise ValueError("CambiumLM kwargs must not contain reference cycles")
@@ -347,7 +372,7 @@ def _load_dspy() -> Any:
         os.environ.setdefault("DSPY_CACHEDIR", cache_dir)
         try:
             try:
-                import dspy
+                import dspy  # type: ignore[import-untyped]
             except ImportError as exc:
                 raise RuntimeError("CambiumLM requires the optional 'dspy' extra") from exc
         finally:
@@ -359,8 +384,15 @@ def _load_dspy() -> Any:
         return _DSPY
 
 
-class CambiumLM:
+class CambiumLM(_DspyLMType):
     """Lazily construct a concrete subclass of ``dspy.LM``."""
+
+    if TYPE_CHECKING:
+        _budget_usd: int | float | None
+        _diffundo: Any
+        _diffundo_reference: str
+        _provider_model: str | None
+        _tier: ProviderTier
 
     def __new__(cls, /, *args: Any, **kwargs: Any) -> CambiumLM:
         _require_exact_keyword_keys(kwargs)
@@ -370,7 +402,7 @@ class CambiumLM:
         return object.__new__(_implementation_class())
 
 
-class _CambiumLMMixin:
+class _CambiumLMMixin(_DspyLMType):
     """DSPy LM implementation whose only provider edge is Diffundo.call."""
 
     forward_contract = "typed_lm"
@@ -510,6 +542,7 @@ class _CambiumLMMixin:
             self._validate_model(adapter_overrides["model"])
         if "budget_usd" in adapter_overrides:
             self._validate_budget(adapter_overrides["budget_usd"])
+        diffundo: Any = None
         if "diffundo" in adapter_overrides:
             diffundo = adapter_overrides["diffundo"]
             if not isinstance(diffundo, Diffundo) and not callable(getattr(diffundo, "call", None)):
@@ -709,12 +742,13 @@ class _CambiumLMMixin:
         kwargs: Mapping[str, Any], *, json_safe_snapshot: bool = False
     ) -> dict[str, Any]:
         _require_exact_keyword_keys(kwargs)
+        forbidden: list[str]
         if type(kwargs) is dict and any(key in _FORBIDDEN_FIELDS for key in kwargs):
             forbidden = sorted(key for key in kwargs if key in _FORBIDDEN_FIELDS)
             raise ValueError(f"CambiumLM does not accept {', '.join(forbidden)}")
         frozen_kwargs = _freeze(kwargs, json_safe=json_safe_snapshot)
         safe: dict[Any, Any] = {}
-        forbidden: list[str] = []
+        forbidden = []
         for key, value in frozen_kwargs.items():
             if key in _FORBIDDEN_FIELDS:
                 forbidden.append(key)

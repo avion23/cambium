@@ -16,7 +16,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -798,7 +798,9 @@ def test_run_task_drain_uses_config_heartbeat_interval(tmp_path: Path) -> None:
     stop = threading.Event()
 
     async def _run() -> dict[str, Any]:
-        return await worker._run_task(writer, run, "drain", 1, stop, config)
+        return await worker._run_task(
+            cast(asyncio.StreamWriter, writer), run, "drain", 1, stop, config
+        )
 
     started = time.monotonic()
     outcome = asyncio.run(_run())

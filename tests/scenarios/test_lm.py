@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -18,13 +18,16 @@ from cambium.diffundo import CallResult, ProviderTier
 from cambium.lm import ArchitectusLM, CambiumLM
 from cambium.tasktree import build_tree
 
+if TYPE_CHECKING:
+    dspy: Any
+
 
 def _require_dspy() -> None:
     """Import dspy lazily: every dspy-consuming scenario is slow-tier, so the
     default fast run must not pay the ~2s dspy import at collection."""
     global dspy  # noqa: PLW0603
     try:
-        import dspy  # noqa: PLC0415
+        import dspy  # type: ignore[import-untyped]  # noqa: PLC0415
     except ImportError:
         dspy = None  # type: ignore[assignment]
         pytest.skip("dspy extra is not installed")
@@ -75,7 +78,7 @@ class FakeDiffundo:
         )
 
 
-def _call(lm: CambiumLM, prompt: str = "same prompt") -> list[str]:
+def _call(lm: Any, prompt: str = "same prompt") -> list[str]:
     output = lm(messages=[{"role": "user", "content": prompt}])
     assert isinstance(output, list)
     return output
@@ -373,7 +376,7 @@ def test_predict_json_save_rejects_auth_bearer_credentials(tmp_path: Path) -> No
     state_path = tmp_path / "state.json"
 
     predict.lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
-    predict.lm.kwargs["auth"] = "Bearer SENSITIVE_CANARY"
+    cast(Any, predict.lm).kwargs["auth"] = "Bearer SENSITIVE_CANARY"
 
     with pytest.raises(ValueError, match="provider credentials"):
         predict.save(state_path)
@@ -548,11 +551,12 @@ def test_copy_model_override_routes_through_diffundo() -> None:
 
 def test_post_construction_callback_does_not_observe_prompt() -> None:
     _require_dspy()
-    import dspy
 
     observed: list[dict[str, Any]] = []
 
-    class PromptCallback(dspy.utils.callback.BaseCallback):
+    from dspy.utils.callback import BaseCallback  # type: ignore[import-untyped]  # noqa: PLC0415
+
+    class PromptCallback(BaseCallback):
         def on_lm_start(self, call_id: str, instance: Any, inputs: dict[str, Any]) -> None:
             del call_id, instance
             observed.append(inputs)
@@ -612,7 +616,7 @@ def test_predict_json_save_and_load_round_trip_routes_through_diffundo(tmp_path:
 
     # a budget override survives save/load: the restored LM routes the copied
     # budget through diffundo rather than reverting to the base value
-    copied_budget = predict.lm.copy(budget_usd=2.0)
+    copied_budget = cast(Any, predict.lm).copy(budget_usd=2.0)
     assert _call(copied_budget, "budget round-trip prompt") == ["completion text"]
     assert diffundo.calls[1]["budget_usd"] == 2.0
 
@@ -644,8 +648,8 @@ def test_request_budget_extension_rejects_invalid_values(
     lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST)  # type: ignore[arg-type]
     request = dspy.LMRequest(
         model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"extensions": {"budget_usd": budget}},
+        messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}]),
+        config=cast(Any, {"extensions": {"budget_usd": budget}}),
     )
 
     with pytest.raises(error, match=message):
@@ -660,8 +664,8 @@ def test_request_budget_extension_uses_validated_value() -> None:
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
     request = dspy.LMRequest(
         model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"extensions": {"budget_usd": 10**1000}},
+        messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}]),
+        config=cast(Any, {"extensions": {"budget_usd": 10**1000}}),
     )
 
     lm(request=request)
@@ -678,8 +682,8 @@ def test_explicit_request_response_format_credentials_are_rejected(entry_point: 
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
     request = dspy.LMRequest(
         model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"response_format": {"api_key": "SENSITIVE_CANARY"}},
+        messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}]),
+        config=cast(Any, {"response_format": {"api_key": "SENSITIVE_CANARY"}}),
     )
 
     with pytest.raises(ValueError, match="provider credentials"):
@@ -740,8 +744,8 @@ def test_explicit_request_response_format_mapping_is_frozen_before_dispatch(
     response_format = DelayedCredentialMapping()
     request = dspy.LMRequest(
         model="request-model",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
-        config={"response_format": response_format},
+        messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}]),
+        config=cast(Any, {"response_format": response_format}),
     )
 
     if entry_point == "call":
@@ -895,7 +899,7 @@ def test_reasoning_and_tool_choice_reach_diffundo() -> None:
 def test_tool_call_completion_reaches_dspy_outputs() -> None:
     _require_dspy()
     import dspy
-    from dspy.core.types import LMToolSpec
+    from dspy.core.types import LMToolSpec  # type: ignore[import-untyped]
 
     class ToolCallDiffundo(FakeDiffundo):
         async def call(
@@ -932,7 +936,7 @@ def test_tool_call_completion_reaches_dspy_outputs() -> None:
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
     request = dspy.LMRequest(
         model="cambium/fast",
-        messages=[{"role": "user", "parts": [{"type": "text", "text": "use a tool"}]}],
+        messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "use a tool"}]}]),
         tools=[
             LMToolSpec(
                 name="search",
@@ -989,7 +993,7 @@ def test_tool_call_content_and_tool_calls_are_both_preserved() -> None:
     response = lm(
         request=dspy.LMRequest(
             model="cambium/fast",
-            messages=[{"role": "user", "parts": [{"type": "text", "text": "hi"}]}],
+            messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "hi"}]}]),
         )
     )
 

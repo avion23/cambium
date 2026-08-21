@@ -4,7 +4,7 @@ import ast
 import asyncio
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -87,7 +87,7 @@ def _runtime(
     async def git_stdout(*_args: Any, **_kwargs: Any) -> str:
         return "base"
 
-    runtime._git_stdout = git_stdout
+    cast(Any, runtime)._git_stdout = git_stdout
     return runtime
 
 
@@ -98,7 +98,7 @@ def _set_sequencer(runtime: supervisor_module._Runtime, sequencer: Any) -> None:
     ) -> Any:
         return sequencer
 
-    runtime._make_sequencer = make_sequencer
+    cast(Any, runtime)._make_sequencer = make_sequencer
 
 
 def _target_handlers(function: ast.AST) -> list[ast.ExceptHandler]:

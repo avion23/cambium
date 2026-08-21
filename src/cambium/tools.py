@@ -26,7 +26,7 @@ from inspect import isawaitable
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, current_thread
-from typing import Any
+from typing import Any, cast
 
 from . import ast_tools
 from .auth import scrub_environment
@@ -668,7 +668,7 @@ async def _run_process(
         ) from exc
     return subprocess.CompletedProcess(
         command,
-        process.returncode,
+        cast(int, process.returncode),
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
     )
@@ -904,7 +904,7 @@ async def run_read_batch(
         if errors:
             continue
         try:
-            _confined_path(ctx, raw_path)
+            _confined_path(ctx, cast(str, raw_path))
         except _ToolFailure as exc:
             preflight_errors.append(f"batch_index {batch_index}: {exc}")
     if preflight_errors:
@@ -929,7 +929,7 @@ async def run_read_batch(
         if isinstance(gathered_result, Exception):
             results.append(ToolResult(ok=False, error=f"read_batch failed: {gathered_result}"))
         else:
-            results.append(gathered_result)
+            results.append(cast(ToolResult, gathered_result))
 
     ordered_results = tuple(results)
     for batch_index, result in enumerate(ordered_results):

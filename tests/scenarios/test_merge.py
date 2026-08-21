@@ -27,6 +27,7 @@ import sys
 import time
 from collections import namedtuple
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -930,7 +931,7 @@ def test_operator_removed_tombstone_observer_cancellation_still_spawns(tmp_path)
         ):
             raise asyncio.CancelledError
 
-    result = asyncio.run(run_plan(session, plan, on_event=cancel_on_tombstone))
+    result = asyncio.run(run_plan(session, plan, on_event=cast(Any, cancel_on_tombstone)))
     events = read_events(session)
     tombstones = [
         event for event in events

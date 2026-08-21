@@ -67,7 +67,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .redact import EVENT_RECORD_STRUCTURAL_FIELDS, Redactor
 
@@ -323,6 +323,9 @@ class _Pending:
         self.exc: BaseException | None = None
 
 
+_QueueItem = tuple[int, str, tuple[Any, ...], _Pending]
+
+
 class _BoundedEventQueue:
     """Bounded FIFO of ``(seq, kind, row, pending)`` items.
 
@@ -558,10 +561,13 @@ class EventStore:
         if not isinstance(kind, str) or not kind:
             raise ValueError("event requires a non-empty string 'kind'")
         if self._redactor is not None:
-            event = self._redactor.redact_protocol_record(
-                event, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
+            event = cast(
+                dict[str, Any],
+                self._redactor.redact_protocol_record(
+                    event, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
+                ),
             )
-            kind = event.get("kind")
+            kind = cast(str, event.get("kind"))
         row = (
             json.dumps(event.get("payload", {})),
             str(event["ts"]) if event.get("ts") is not None else None,
@@ -584,7 +590,7 @@ class EventStore:
                 raise RuntimeError("EventStore is closed")
             self._active_admissions += 1
 
-        def admit() -> tuple[int, str, tuple, _Pending]:
+        def admit() -> _QueueItem:
             with self._lock:
                 if self._dead is not None:
                     raise StoreError("event store is dead") from self._dead
@@ -987,8 +993,8 @@ class EventStore:
 
         dirty = False
         next_fsync = time.monotonic() + self._fsync_interval_s
-        cur_item = None
-        cur_pending = None
+        cur_item: _QueueItem | None = None
+        cur_pending: _Pending | None = None
         cur_inserted = False
         dead_exc = None
         try:
@@ -1010,6 +1016,7 @@ class EventStore:
                         dirty = False
                     next_fsync = time.monotonic() + self._fsync_interval_s
                     continue
+                item = cast(_QueueItem, item)
                 seq, kind, row, pending = item
                 cur_item = item
                 cur_pending = pending
@@ -1087,7 +1094,7 @@ class EventStore:
         with self._lock:
             return self._close_error or self._dead or StoreError("event store writer stopped")
 
-    def _account_failed_item(self, item: tuple, *, inserted: bool) -> None:
+    def _account_failed_item(self, item: _QueueItem, *, inserted: bool) -> None:
         if inserted:
             return
         seq, kind, _, _ = item

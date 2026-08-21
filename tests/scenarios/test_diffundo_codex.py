@@ -22,7 +22,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -34,6 +34,7 @@ from cambium.diffundo import (
     HealthState,
     Protocol,
     ProviderConfig,
+    ProviderError,
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
@@ -70,7 +71,7 @@ class CodexServer:
         self.request_paths: list[str] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer((host, 0), _Handler)
-        self._httpd.fake = self
+        cast(Any, self._httpd).fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             kwargs={"poll_interval": 0.001},
@@ -110,7 +111,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             body = {}
-        server: CodexServer = self.server.fake  # type: ignore[attr-defined]
+        server = cast(CodexServer, cast(Any, self.server).fake)
         index = server.record(
             body,
             {
@@ -146,7 +147,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass  # the client timed out and closed first
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -287,6 +288,10 @@ def _router(
     )
 
 
+def _provider_error(failure: AllProvidersFailed) -> ProviderError:
+    return cast(ProviderError, failure.last_error)
+
+
 PROMPT = {"messages": [{"role": "user", "content": "hello"}]}
 
 TOOL_PROMPT = {
@@ -329,7 +334,7 @@ def test_codex_stream_larger_than_provider_cap_is_rejected() -> None:
         with pytest.raises(AllProvidersFailed) as raised:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert raised.value.last_error is not None
-        assert "response exceeds" in raised.value.last_error.message
+        assert "response exceeds" in _provider_error(raised.value).message
     finally:
         server.close()
 
@@ -396,8 +401,8 @@ def test_codex_stream_without_completed_event_is_malformed() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
-        assert "response.completed" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.ERROR
+        assert "response.completed" in _provider_error(exc.value).message
         assert router.health("p_codex") is HealthState.COOLDOWN
     finally:
         server.close()
@@ -431,8 +436,8 @@ def test_codex_stream_service_unavailable_is_retryable_error() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.ERROR
-        assert "overloaded" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.ERROR
+        assert "overloaded" in _provider_error(exc.value).message
         # retryable: the attempt retried once, then the existing cooldown
         # machinery cooled the provider down
         assert len(server.calls) == 2
@@ -461,8 +466,8 @@ def test_codex_stream_model_not_found_quarantines_provider() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.CONFIG_ERROR
-        assert "model_not_found" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.CONFIG_ERROR
+        assert "model_not_found" in _provider_error(exc.value).message
         # non-retryable config error: no retries, provider disabled
         assert len(server.calls) == 1
         assert router.health("p_codex") is HealthState.DISABLED
@@ -478,8 +483,8 @@ def test_codex_completed_stream_with_refusal_text_falls_through() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.REFUSAL
-        assert "refusal" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.REFUSAL
+        assert "refusal" in _provider_error(exc.value).message
         # a refusal never drives a health transition
         assert router.health("p_codex") is HealthState.UNKNOWN
         assert len(server.calls) == 1
@@ -513,8 +518,8 @@ def test_codex_http_400_model_not_found_body_quarantines_not_refusal() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.CONFIG_ERROR
-        assert "HTTP 400" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.CONFIG_ERROR
+        assert "HTTP 400" in _provider_error(exc.value).message
         # non-retryable: quarantined on the first call
         assert len(server.calls) == 1
         assert router.health("p_codex") is HealthState.DISABLED
@@ -543,7 +548,7 @@ def test_codex_http_400_parameter_body_quarantines_not_refusal() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.CONFIG_ERROR
+        assert _provider_error(exc.value).outcome is ProviderOutcome.CONFIG_ERROR
         assert router.health("p_codex") is HealthState.DISABLED
     finally:
         server.close()
@@ -561,8 +566,8 @@ def test_codex_http_400_shape_rejection_stays_content_refusal() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.REFUSAL
-        assert "HTTP 400" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.REFUSAL
+        assert "HTTP 400" in _provider_error(exc.value).message
         assert router.health("p_codex") is HealthState.UNKNOWN
     finally:
         server.close()
@@ -580,8 +585,8 @@ def test_codex_without_credential_source_fails_closed() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
-        assert "credential source" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.AUTH_ERROR
+        assert "credential source" in _provider_error(exc.value).message
         assert router.health("p_codex") is HealthState.DISABLED
         assert server.calls == []  # nothing ever sent without a token
     finally:
@@ -595,8 +600,8 @@ def test_codex_empty_access_token_fails_closed() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
-        assert "empty access token" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.AUTH_ERROR
+        assert "empty access token" in _provider_error(exc.value).message
         assert server.calls == []
     finally:
         server.close()
@@ -612,8 +617,8 @@ def test_codex_non_loopback_http_origin_is_rejected_before_request() -> None:
     with pytest.raises(AllProvidersFailed) as exc:
         asyncio.run(router.call(ProviderTier.FAST, PROMPT))
     assert exc.value.last_error is not None
-    assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
-    assert "http transport is allowed only for loopback hosts" in exc.value.last_error.message
+    assert _provider_error(exc.value).outcome is ProviderOutcome.AUTH_ERROR
+    assert "http transport is allowed only for loopback hosts" in _provider_error(exc.value).message
     assert router.health("p_codex") is HealthState.DISABLED
 
 
@@ -627,8 +632,8 @@ def test_codex_redirect_fails_closed_and_never_contacts_target() -> None:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
-        assert exc.value.last_error.outcome is ProviderOutcome.AUTH_ERROR
-        assert "redirect" in exc.value.last_error.message
+        assert _provider_error(exc.value).outcome is ProviderOutcome.AUTH_ERROR
+        assert "redirect" in _provider_error(exc.value).message
         assert router.health("p_codex") is HealthState.DISABLED
         assert len(redirector.calls) == 1
         assert target.calls == []  # the bearer never followed the redirect

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -21,12 +22,12 @@ from cambium.provider_config import (  # noqa: E402
 )
 
 
-def _provider(name: str = "openai", **overrides: object) -> dict[str, object]:
+def _provider(name: object = "openai", **overrides: object) -> dict[str, object]:
     value: dict[str, object] = {
-        "name": name,
+        "name": cast(str, name),
         "tier": "strong",
         "base_url": "https://api.example.test/v1",
-        "api_key_env": derived_env_name(name),
+        "api_key_env": derived_env_name(cast(str, name)),
         "timeout_s": 30.0,
         "max_retries": 2,
         "rpm": 60,

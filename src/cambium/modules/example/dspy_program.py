@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal, cast
 
 from cambium.modules.base import Example
 
@@ -20,11 +20,11 @@ class ShouldDecomposeModuleDSPy(_LazyDSPyBase):
     name = "should_decompose"
 
     def __init__(self, lm) -> None:
-        import dspy
+        import dspy  # type: ignore[import-untyped]
 
         if _LazyDSPyBase in ShouldDecomposeModuleDSPy.__bases__:
             ShouldDecomposeModuleDSPy.__bases__ = (dspy.Module,)
-        dspy.Module.__init__(self)
+        dspy.Module.__init__(cast(Any, self))
 
         class ShouldDecomposeSignature(dspy.Signature):
             task: str = dspy.InputField()
@@ -37,7 +37,7 @@ class ShouldDecomposeModuleDSPy(_LazyDSPyBase):
 
     async def decide(self, input: TaskInput) -> DecomposeOutput:
         """Run the DSPy predictor and map its output to the domain enum."""
-        import dspy
+        import dspy  # type: ignore[import-untyped]
 
         try:
             with dspy.context(lm=self._lm):

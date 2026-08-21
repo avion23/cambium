@@ -6,6 +6,7 @@ import asyncio
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from cambium.modules.base import Example
 from cambium.modules.example.decide import Decision, DecomposeOutput, TaskInput
@@ -22,16 +23,16 @@ PROGRAM_PATH = (
 
 
 def _fake_lm(response: str):
-    import dspy
+    import dspy  # type: ignore[import-untyped]
 
     class FakeLM(dspy.LM):
         def __init__(self) -> None:
             super().__init__("fake/test", cache=False, num_retries=0)
 
-        def __call__(self, *args, **kwargs):
+        def __call__(self, *args, **kwargs) -> list[dict[str, Any] | str]:
             return [response]
 
-        async def acall(self, *args, **kwargs):
+        async def acall(self, *args, **kwargs) -> list[dict[str, Any] | str]:
             return [response]
 
     return FakeLM()

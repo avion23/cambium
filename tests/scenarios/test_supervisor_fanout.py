@@ -27,6 +27,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1271,7 +1272,7 @@ def test_resource_preflight_is_opt_in_and_skipped_without_thresholds(tmp_path, m
     assert not _kinds(read_events(session_dir), "resource_denied")
 
     denied_session = tmp_path / "denied-session"
-    denied_task = dict(
+    denied_task: dict[str, Any] = dict(
         task,
         task_id="t-denied2",
         worktree_path=str(denied_session / "wt-denied2"),

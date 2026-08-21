@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -36,7 +36,7 @@ from cambium.supervisor import _preassign_lanes, _validate_plan_task
 
 
 def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
-    base = dict(
+    base: dict[str, Any] = dict(
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
@@ -288,7 +288,7 @@ class _FakeServer:
         self.calls: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
-        self._httpd.fake = self
+        cast(Any, self._httpd).fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             kwargs={"poll_interval": 0.001},
@@ -323,7 +323,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = _json.loads(raw.decode("utf-8") or "{}")
         except _json.JSONDecodeError:
             body = {}
-        server: _FakeServer = self.server.fake  # type: ignore[attr-defined]
+        server: _FakeServer = cast(Any, self.server).fake
         index = server.record(body, {})
         status, payload, delay = server.behavior_at(index)
         if delay:
@@ -340,7 +340,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -487,7 +487,7 @@ def test_assignment_writes_tier_and_pinned_tier_constrains(tmp_path, monkeypatch
     lanes = {"weak": LaneState(), "strong": LaneState()}
 
     # no pinned tier: the assignment writes the chosen provider's own tier
-    spec = {
+    spec: dict[str, Any] = {
         "task_id": "t1",
         "fanout_config": {},
         "model_candidates": ["m1", "m2"],
@@ -504,7 +504,7 @@ def test_assignment_writes_tier_and_pinned_tier_constrains(tmp_path, monkeypatch
 
     # pinned tier "fast": only the fast provider may serve, even though
     # "strong" is idle and would otherwise win on utilization.
-    pinned = {
+    pinned: dict[str, Any] = {
         "task_id": "t2",
         "fanout_config": {"tier": "fast"},
         "model_candidates": ["m1", "m2"],

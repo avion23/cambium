@@ -34,7 +34,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fake_worker import do_work, read_msg, send  # noqa: E402
+from fake_worker import (  # type: ignore[import-not-found]  # pyright: ignore[reportMissingImports]  # noqa: E402
+    do_work,
+    read_msg,
+    send,
+)
 
 
 def _trace(line: str) -> None:

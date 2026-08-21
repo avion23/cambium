@@ -16,7 +16,7 @@ import subprocess
 import threading
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -390,13 +390,13 @@ def test_child_result_lines_and_fork_prompt() -> None:
     assert "b.txt" in lines
 
     prompt = worker._fork_prompt(
-        {"role": "system", "content": "sys"},
+        cast(Any, {"role": "system", "content": "sys"}),
         [{"role": "user", "content": "obs"}],
     )
     assert prompt["messages"][-1]["role"] == "user"
     assert prompt["messages"][-1]["content"] != "Continue."
     plan_tail = worker._fork_prompt(
-        {"role": "system", "content": "sys"},
+        cast(Any, {"role": "system", "content": "sys"}),
         [{"role": "user", "content": "obs"},
          {"role": "assistant", "content": '{"type": "plan", "steps": []}'}],
     )
@@ -405,7 +405,7 @@ def test_child_result_lines_and_fork_prompt() -> None:
 
 def test_fork_cache_compatible_matrix() -> None:
     tools_sha = worker._provider_task_tools_hash()
-    epoch = {
+    epoch: dict[str, Any] = {
         "epoch": 1,
         "checkpoint_ref": _REF,
         "cache_key": {
@@ -1144,7 +1144,7 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
 
 def test_invalid_context_checkpoint_fields_matrix() -> None:
     digest = "a" * 64
-    valid = {
+    valid: dict[str, Any] = {
         "type": "context_checkpoint",
         "task_id": "t",
         "generation": 1,

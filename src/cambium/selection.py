@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 
 class Candidate(Protocol):
@@ -121,8 +121,13 @@ def order_candidates[T: Candidate](
                 measured_end += 1
             ordered[measured_start:measured_end] = sorted(
                 ordered[measured_start:measured_end],
-                key=lambda candidate: quality_score(
-                    debt[candidate.name], now=now, weights=weights
+                key=lambda candidate: cast(
+                    QualityScore,
+                    quality_score(
+                        cast(Mapping[str, Any], debt)[candidate.name],
+                        now=now,
+                        weights=weights,
+                    ),
                 ),
             )
             measured_start = measured_end + 1

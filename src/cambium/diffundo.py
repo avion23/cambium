@@ -111,12 +111,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from . import __version__
 from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
-from .selection import order_candidates
+from .selection import Candidate, order_candidates
 
 _TIMESTAMP_PATTERN = (
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}"
@@ -731,7 +731,7 @@ def _account_quota_owner(body: str, api_key: str) -> str | None:
         if isinstance(rate_limit, dict):
             candidates.append(rate_limit)
     for candidate in candidates:
-        keys = _ACCOUNT_QUOTA_OWNER_KEYS
+        keys: tuple[str, ...] = _ACCOUNT_QUOTA_OWNER_KEYS
         if candidate is not error and candidate is not payload:
             keys = (*keys, "scope")
         for key in keys:
@@ -809,9 +809,10 @@ def _redact_error_text(message: str, api_key: str) -> str:
 
 def _parse_retry_after(headers: Any) -> float | None:
     """Parse one provider Retry-After value into a nonnegative delay."""
+    values: Sequence[Any] | None
     get_all = getattr(headers, "get_all", None)
     if callable(get_all):
-        values = get_all("Retry-After")
+        values = cast(Sequence[Any] | None, get_all("Retry-After"))
     elif isinstance(headers, Mapping):
         value = headers.get("Retry-After")
         values = [value] if value is not None else None
@@ -1357,13 +1358,14 @@ class Diffundo:
         return []
 
     def _order_candidates(self, candidates: list[ProviderConfig]) -> list[ProviderConfig]:
-        return order_candidates(
-            candidates,
+        ordered = order_candidates(
+            cast(Sequence[Candidate], candidates),
             debt=dict(self._debt) if self._debt is not None else None,
             incumbent=self._primary_provider,
             rotation_offset=self._rotation,
             now=time.time(),
         )
+        return cast(list[ProviderConfig], ordered)
 
     async def _await_candidates(
         self,
@@ -1640,6 +1642,7 @@ class Diffundo:
         start = time.monotonic()
         http_error: ProviderError | None = None
         http_cause: _SanitizedHTTPError | None = None
+        payload: Any = None
         try:
             with opener.open(request, timeout=timeout_s) as response:
                 response_body = _read_provider_response(response, provider.name)
@@ -1762,6 +1765,7 @@ class Diffundo:
         start = time.monotonic()
         http_error: ProviderError | None = None
         http_cause: _SanitizedHTTPError | None = None
+        stream = ""
         try:
             with opener.open(request, timeout=timeout_s) as response:
                 stream = _read_provider_response(response, provider.name).decode("utf-8")

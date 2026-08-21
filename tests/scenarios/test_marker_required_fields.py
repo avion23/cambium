@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import cast
 
 from cambium.ipc import MAX_LINE_BYTES, read_message
 
@@ -31,11 +32,13 @@ async def _drive_worker(session_dir: Path) -> dict:
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
         start_new_session=True,
     )
+    stderr_reader = cast(asyncio.StreamReader, proc.stderr)
+    stdout_reader = cast(asyncio.StreamReader, proc.stdout)
 
     async def _drain_stderr() -> list[str]:
         lines: list[str] = []
         while True:
-            raw = await proc.stderr.readline()
+            raw = await stderr_reader.readline()
             if not raw:
                 break
             lines.append(raw.decode("utf-8", "replace").rstrip())
@@ -51,7 +54,7 @@ async def _drive_worker(session_dir: Path) -> dict:
         "generation": 1, "proto": 1,
     }) + "\n").encode("utf-8"))
     await proc.stdin.drain()
-    ready = await read_message(proc.stdout, limit=MAX_LINE_BYTES)
+    ready = await read_message(stdout_reader, limit=MAX_LINE_BYTES)
     assert ready is not None and ready["type"] == "ready"
 
     payload = {
@@ -77,12 +80,12 @@ async def _drive_worker(session_dir: Path) -> dict:
 
     envelope = None
     while True:
-        msg = await read_message(proc.stdout, limit=MAX_LINE_BYTES)
+        msg = await read_message(stdout_reader, limit=MAX_LINE_BYTES)
         assert msg is not None, "EOF before result_envelope"
         if msg["type"] == "result_envelope":
             envelope = msg
             break
-    exit_msg = await read_message(proc.stdout, limit=MAX_LINE_BYTES)
+    exit_msg = await read_message(stdout_reader, limit=MAX_LINE_BYTES)
     returncode = await proc.wait()
     stderr = await stderr_task
     return {"envelope": envelope, "exit_msg": exit_msg, "returncode": returncode,

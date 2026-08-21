@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -896,9 +896,9 @@ def _validate_dataset_integrity(
             if isinstance(record.get("expected"), dict)
         ),
     }
-    canary_kinds = sorted(
+    canary_kinds: list[str] = sorted(
         {
-            info.get("kind")
+            cast(str, info.get("kind"))
             for _, record in canary_records
             if isinstance(info := record.get("canary_info"), dict)
             and isinstance(info.get("kind"), str)
@@ -1085,19 +1085,20 @@ def _validate_dataset_integrity(
                 )
             )
         else:
-            for field, expected in (
+            checks: tuple[tuple[str, object], ...] = (
                 ("total", len(canary_records)),
                 ("kinds_present", canary_kinds),
                 ("failed", 0),
-            ):
-                if canaries.get(field) != expected:
+            )
+            for check_field, check_expected in checks:
+                if canaries.get(check_field) != check_expected:
                     findings.append(
                         AuditFinding(
                             "baseline-integrity",
                             baseline_file,
                             0,
-                            f"canaries.{field}",
-                            f"must match current datasets ({expected!r})",
+                            f"canaries.{check_field}",
+                            f"must match current datasets ({check_expected!r})",
                         )
                     )
             coverage = canaries.get("taxonomy_coverage")
@@ -1691,7 +1692,12 @@ def _is_module_test_file(path: Path, spec: ModuleSpec) -> bool:
         return False
 
 
-def _check_import_target(target: str, path: Path, node: ast.AST, spec: ModuleSpec) -> str | None:
+def _check_import_target(
+    target: str,
+    path: Path,
+    node: ast.Import | ast.ImportFrom | ast.Call,
+    spec: ModuleSpec,
+) -> str | None:
     if _is_provider_import(target):
         return f"{path}:{node.lineno}: provider import is forbidden: {target}"
     if _is_sibling_target(target, spec):
@@ -1774,14 +1780,14 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
                 }
             if not is_import_call:
                 continue
-            target = _literal_import_target(node)
-            if target is None:
+            literal_target = _literal_import_target(node)
+            if literal_target is None:
                 issues.append(
                     f"{path}:{node.lineno}: dynamic import with a non-literal target "
                     "is forbidden (fail closed)"
                 )
                 continue
-            issue = _check_import_target(target, path, node, spec)
+            issue = _check_import_target(literal_target, path, node, spec)
             if issue:
                 issues.append(issue)
     return issues
@@ -1979,12 +1985,12 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
             if not is_dynamic_import:
                 continue
             symbol = _reverse_enclosing_symbol(node, parents)
-            relative = path.relative_to(REPO_ROOT)
+            relative_path = path.relative_to(REPO_ROOT)
             if not node.args:
                 findings.append(
                     AuditFinding(
                         "reverse-import",
-                        relative,
+                        relative_path,
                         node.lineno,
                         symbol,
                         "dynamic import with no target is forbidden (fail closed)",
@@ -1993,21 +1999,21 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
                 continue
             resolved = _reverse_importlib_targets(node.args[0], names)
             if resolved:
-                for _, target in resolved:
+                for _, resolved_target in resolved:
                     findings.append(
                         AuditFinding(
                             "reverse-import",
-                            relative,
+                            relative_path,
                             node.lineno,
                             symbol,
-                            f"dynamic import loads decision package {target}",
+                            f"dynamic import loads decision package {resolved_target}",
                         )
                     )
             elif _literal_import_target(node) is None:
                 findings.append(
                     AuditFinding(
                         "reverse-import",
-                        relative,
+                        relative_path,
                         node.lineno,
                         symbol,
                         "dynamic import with a non-literal target may load a "
@@ -2215,7 +2221,7 @@ class ModuleConformancePlugin:
                 self.failures.append(f"all {skipped} collected module tests were skipped")
             else:
                 self.failures.append("no module test passed")
-        siblings_after = _loaded_siblings(self.name)
+        siblings_after = _loaded_siblings(cast(str, self.name))
         if siblings_after:
             self.failures.append(
                 "sibling modules loaded during isolated tests: " + ", ".join(siblings_after)

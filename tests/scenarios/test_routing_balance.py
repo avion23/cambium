@@ -34,7 +34,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -43,6 +43,7 @@ from cambium.diffundo import (
     Diffundo,
     HealthState,
     ProviderConfig,
+    ProviderError,
     ProviderOutcome,
     ProviderTier,
 )
@@ -86,7 +87,7 @@ class FakeServer:
         self.request_headers: list[dict[str, str | None]] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer((host, 0), _Handler)
-        self._httpd.fake = self
+        cast(Any, self._httpd).fake = self
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             kwargs={"poll_interval": 0.001},
@@ -127,7 +128,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             body = {}
-        server: FakeServer = self.server.fake  # type: ignore[attr-defined]
+        server: FakeServer = cast(Any, self.server).fake
         index = server.record(
             body,
             {
@@ -150,7 +151,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass  # the client timed out (budget-capped attempt) and closed first
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
@@ -211,7 +212,9 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
+    base: dict[str, Any] = dict(
+        timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model
+    )
     base.update(overrides)
     return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
 
@@ -227,7 +230,7 @@ def _set_keys(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
 
 
 def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
-    base = dict(
+    base: dict[str, Any] = dict(
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"K_{name.upper()}",
@@ -347,7 +350,7 @@ def test_generic_400_single_provider_raises_refusal_outcome(monkeypatch) -> None
         # REFUSAL; a retryable class would have attempted 3 times first
         with pytest.raises(AllProvidersFailed) as exc_info:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert exc_info.value.last_error.outcome is ProviderOutcome.REFUSAL
+        assert cast(ProviderError, exc_info.value.last_error).outcome is ProviderOutcome.REFUSAL
         assert len(bad.calls) == 1
         assert router.health("p_bad") is HealthState.UNKNOWN
     finally:
@@ -632,20 +635,24 @@ class _WorkerRunner:
     async def _drain_stderr(self) -> None:
         assert self.proc is not None
         while True:
-            raw = await self.proc.stderr.readline()
+            raw = await cast(asyncio.StreamReader, self.proc.stderr).readline()
             if not raw:
                 break
             self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
 
     async def send(self, msg: dict[str, Any]) -> None:
         assert self.proc is not None
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        stdin = cast(asyncio.StreamWriter, self.proc.stdin)
+        stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await stdin.drain()
 
     async def recv(self, timeout: float = 30.0) -> dict[str, Any] | None:
         assert self.proc is not None
         return await asyncio.wait_for(
-            read_message(self.proc.stdout, limit=MAX_LINE_BYTES), timeout
+            read_message(
+                cast(asyncio.StreamReader, self.proc.stdout), limit=MAX_LINE_BYTES
+            ),
+            timeout,
         )
 
     async def stop(self) -> None:
@@ -751,7 +758,7 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
                     messages.append(msg)
                     if msg["type"] == "exit_message":
                         break
-                rc = await runner.proc.wait()
+                rc = await cast(asyncio.subprocess.Process, runner.proc).wait()
                 result = next(m for m in messages if m["type"] == "result_envelope")
                 return result, messages, rc
             finally:

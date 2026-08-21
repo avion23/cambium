@@ -23,23 +23,23 @@ import unicodedata
 from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 try:
-    import tree_sitter_python as _tree_sitter_python
+    import tree_sitter_python as _tree_sitter_python  # type: ignore[import-not-found]  # pyright: ignore[reportMissingImports]
     from tree_sitter import Language as _TreeSitterLanguage
     from tree_sitter import Parser as _TreeSitterParser
 except ImportError:  # Optional dependency: the stdlib backend remains usable.
     _tree_sitter_python = None
-    _TreeSitterLanguage = None
-    _TreeSitterParser = None
+    _TreeSitterLanguage = None  # type: ignore[misc,assignment]
+    _TreeSitterParser = None  # type: ignore[misc,assignment]
 
 
 try:
     if _TreeSitterLanguage is None or _tree_sitter_python is None:
         _TREE_SITTER_LANGUAGE = None
     else:
-        _TREE_SITTER_LANGUAGE = _TreeSitterLanguage(_tree_sitter_python.language())
+        _TREE_SITTER_LANGUAGE = cast(Any, _TreeSitterLanguage)(_tree_sitter_python.language())
 except (AttributeError, TypeError):
     # An incomplete or incompatible optional installation is equivalent to an
     # absent installation.  The stdlib backend must still be importable.
@@ -155,7 +155,7 @@ def _signature_result(index: _SourceIndex, definition: _Definition) -> dict[str,
 def _tree_parser() -> Any:
     if _TREE_SITTER_LANGUAGE is None or _TreeSitterParser is None:
         raise RuntimeError("tree-sitter backend is not available")
-    return _TreeSitterParser(_TREE_SITTER_LANGUAGE)
+    return cast(Any, _TreeSitterParser)(_TREE_SITTER_LANGUAGE)
 
 
 def _tree_root(index: _SourceIndex) -> Any:
@@ -323,8 +323,8 @@ def _find_definitions_stdlib(source: str, path: str = "") -> list[dict[str, Any]
 
 def _attribute_position(index: _SourceIndex, node: _stdlib_ast.Attribute) -> tuple[int, int]:
     """Locate the attribute tail, not the beginning of the whole expression."""
-    end_line = node.end_lineno
-    end_column = node.end_col_offset
+    end_line = cast(int, node.end_lineno)
+    end_column = cast(int, node.end_col_offset)
     if end_line == node.lineno:
         end_byte = index.byte_offset(end_line, end_column)
         name_bytes = node.attr.encode("utf-8")

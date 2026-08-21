@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -67,7 +67,7 @@ class Orchestrator:
         return await run_plan(
             session_dir,
             plan,
-            on_event=self._emit,
+            on_event=cast(Callable[[dict[str, Any]], None], self._emit),
             architectus=self._architectus if architectus is None else architectus,
             conversations=self._conversations if conversations is None else conversations,
         )

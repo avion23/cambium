@@ -10,10 +10,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from cambium import tools
+from cambium.lint_diag import LintDiag
 from cambium.tools import (
     MAX_OUTPUT_BYTES,
     MAX_READ_BYTES,
@@ -255,7 +257,7 @@ def test_write_file_is_atomic_and_returns_lint_feedback(tmp_path: Path) -> None:
     result = _run(
         "write_file",
         {"path": "nested/new.py", "content": "broken(:\n"},
-        ToolContext(tmp_path, lint=_LintFeedback()),
+        ToolContext(tmp_path, lint=cast(LintDiag, _LintFeedback())),
     )
 
     assert result.ok

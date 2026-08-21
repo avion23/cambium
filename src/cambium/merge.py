@@ -46,7 +46,7 @@ import time
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from cambium.process_env import build_subprocess_env
 
@@ -142,7 +142,7 @@ class GitError(RuntimeError):
         cause: str = "",
     ) -> None:
         self.cwd = cwd
-        self.args = args
+        self.args = cast(tuple[Any, ...], args)
         self.returncode: int | None = result.returncode if result is not None else None
         self.stdout = result.stdout if result is not None else ""
         self.stderr = result.stderr if result is not None else ""
@@ -173,7 +173,7 @@ def _parse_conflicts(rebase_output: str) -> list[str]:
         if version:
             paths.append(version.group(1))
     seen: set[str] = set()
-    return [p for p in paths if not (p in seen or seen.add(p))]
+    return [p for p in paths if not (p in seen or cast(bool, seen.add(p)))]
 
 
 class MergeSequencer:
@@ -412,7 +412,7 @@ class MergeSequencer:
             measured[newest_entry] = (
                 measured[newest_entry][0], newest_allocated_bytes
             )
-        newest_bytes = measured.get(newest_entry, (0, 0))[1]
+        newest_bytes = measured.get(cast(Path, newest_entry), (0, 0))[1]
         if newest_entry is not None and newest_bytes > self._quarantine_max_bytes:
             raise StagingCleanupError("newest quarantine artifact exceeds the byte cap")
 
@@ -479,7 +479,7 @@ class MergeSequencer:
         try:
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
             source_parent_fd = os.open(worktree_path.parent, flags)
-            session_fd = os.open(self._session_dir, flags)
+            session_fd = os.open(cast(Path, self._session_dir), flags)
             cambium_fd = self._open_directory(session_fd, ".cambium")
             quarantine_fd = self._open_directory(cambium_fd, "quarantine")
             root_fd = self._open_directory(quarantine_fd, "merge")
@@ -521,6 +521,7 @@ class MergeSequencer:
                 repo, "worktree", "move", str(worktree_path), str(anchored_destination),
                 check=False,
             )
+            allocated: int = 0
             if result.returncode == 0 and not all(
                 self._is_open_child(*link) for link in chain
             ):
@@ -638,7 +639,7 @@ class MergeSequencer:
         check: bool = True,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        trusted_overrides = {
+        trusted_overrides: dict[str, str] = {
             key: env[key]
             for key in ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
             if env is not None and key in env

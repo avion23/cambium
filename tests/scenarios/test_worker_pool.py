@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 from cambium import supervisor as supervisor_module
 from cambium.fencing import write_generation
@@ -161,20 +162,26 @@ class _WorkerDriver:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _drain_stderr(self) -> None:
-        assert self.proc is not None
+        proc = self.proc
+        assert proc is not None
+        stderr = cast(asyncio.StreamReader, proc.stderr)
         while True:
-            raw = await self.proc.stderr.readline()
+            raw = await stderr.readline()
             if not raw:
                 break
             self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
 
     async def send(self, msg: dict[str, object]) -> None:
-        assert self.proc is not None
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        proc = self.proc
+        assert proc is not None
+        stdin = cast(asyncio.StreamWriter, proc.stdin)
+        stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await stdin.drain()
 
     async def recv_until(self, mtype: str, timeout: float = 30.0) -> dict:
-        assert self.proc is not None
+        proc = self.proc
+        assert proc is not None
+        stdout = cast(asyncio.StreamReader, proc.stdout)
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
@@ -183,7 +190,7 @@ class _WorkerDriver:
                     f"timed out waiting for {mtype}; stderr={self.stderr_lines!r}"
                 )
             msg = await asyncio.wait_for(
-                read_message(self.proc.stdout, limit=MAX_LINE_BYTES), remaining
+                read_message(stdout, limit=MAX_LINE_BYTES), remaining
             )
             if msg is None:
                 raise AssertionError(
@@ -290,9 +297,10 @@ def test_worker_rebind_serves_two_worktrees_from_one_process(tmp_path: Path) -> 
             assert reuse2["pid"] == pid
 
             # Clean exit on stdin close.
-            assert driver.proc is not None
-            driver.proc.stdin.close()
-            rc = await asyncio.wait_for(driver.proc.wait(), 30.0)
+            proc = cast(asyncio.subprocess.Process, driver.proc)
+            stdin = cast(asyncio.StreamWriter, proc.stdin)
+            stdin.close()
+            rc = await asyncio.wait_for(proc.wait(), 30.0)
             assert rc == 0
         finally:
             await driver.stop()

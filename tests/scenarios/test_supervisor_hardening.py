@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -267,7 +268,7 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
         try:
             with pytest.raises(SessionAlreadyRunningError):
                 await run_plan(session_dir, [second])
-            assert not Path(second["worktree_path"]).exists()
+            assert not Path(cast(str, second["worktree_path"])).exists()
         finally:
             release.set()
         result = await asyncio.wait_for(first_run, timeout=15)

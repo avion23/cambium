@@ -84,7 +84,7 @@ def test_bare_prompt_is_rejected_regardless_of_token_count(capsys) -> None:
 
 def test_run_oneshot_delegates_async_at_supervisor_boundary(monkeypatch, tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
         captured.update(session_dir=session_dir, plan=plan, on_event=on_event, kwargs=kwargs)
@@ -307,7 +307,7 @@ def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     environment_before = dict(os.environ)
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
         captured.update(plan=plan, kwargs=kwargs)
@@ -653,7 +653,7 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(env_name, raising=False)
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
         captured.update(plan=plan, kwargs=kwargs)
@@ -700,7 +700,7 @@ def test_environment_only_provider_key_is_handed_without_plan_or_artifact_leak(
         raise AssertionError("an environment-only credential must not require AuthStore")
 
     monkeypatch.setattr(oneshot, "AuthStore", unexpected_auth_store)
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
         captured.update(session_dir=Path(session_dir), plan=plan, kwargs=kwargs)

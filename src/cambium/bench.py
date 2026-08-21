@@ -68,7 +68,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -849,7 +849,7 @@ class BenchPlugin:
     """Registered when ``--bench`` is set; collects timings, writes/checks."""
 
     def __init__(self, config: pytest.Config, thresholds: dict[str, Any] | None = None) -> None:
-        self.mode: str = config.getoption("bench")
+        self.mode = cast(str, config.getoption("bench"))
         bench_root = config.getoption("bench_root")
         self.root = Path(bench_root) if bench_root else None
         self.thresholds = dict(DEFAULT_THRESHOLDS)

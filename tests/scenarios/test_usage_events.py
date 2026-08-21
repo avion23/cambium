@@ -24,7 +24,7 @@ import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -123,11 +123,14 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
         with REQUEST_LOCK:
             REQUESTS.append(body)
             REQUEST_AUTHORIZATION.append(self.headers.get("Authorization", ""))
-            response = RESPONSES.pop(0) if RESPONSES else {
-                "status": 500,
-                "payload": _server_error(),
-                "headers": {},
-            }
+            response = cast(
+                dict[str, Any],
+                RESPONSES.pop(0) if RESPONSES else {
+                    "status": 500,
+                    "payload": _server_error(),
+                    "headers": {},
+                },
+            )
         encoded = json.dumps(response["payload"]).encode("utf-8")
         self.send_response(response["status"])
         self.send_header("Content-Type", "application/json")
@@ -138,7 +141,7 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
