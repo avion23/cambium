@@ -1,115 +1,140 @@
 # Research docs index
 
-Research files preserve experiments, evidence, and design history. They do not
-define the runtime by themselves.
+Research files preserve experiments, evidence, competitive snapshots, and
+design history. They do not define runtime behavior by themselves.
 
 ## Authority order
 
 When documents disagree, use:
 
-1. The task request for scope and required behavior.
-2. [`../../agents.md`](../../agents.md) for process and current-truth notes.
-3. `src/cambium/` for implementation and `tests/` plus
-   `src/cambium/modules/example/tests/` for observed behavior.
-4. [`../architecture/architecture.md`](../architecture/architecture.md) for
-   current-versus-target boundaries.
-5. Research files for context or measured evidence.
+1. the task request for scope and required behavior;
+2. [`../../agents.md`](../../agents.md) for the repository operating contract;
+3. `src/cambium/` plus tests for current behavior;
+4. active contracts under `docs/architecture/` and `docs/security/`;
+5. research files for evidence and historical context.
 
-Check imports, callers, and tests. A matching name in a proposal is not proof
-that a module is present or wired.
+A matching name in a proposal is not proof that a module exists or is wired.
+Follow entry points, imports, callers, and tests.
 
-## Live references
+## Active design contracts
 
-- [`v2-1-status.md`](v2-1-status.md) — the detailed capability/gap table.
-- [`python-3.14.md`](python-3.14.md) — runtime assumptions.
-- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — measured store behavior.
+- [`../architecture/architecture.md`](../architecture/architecture.md) —
+  current-versus-target system contract.
+- [`../architecture/context-engine.md`](../architecture/context-engine.md) —
+  immutable epochs, branching, compaction, and cache accounting.
+- [`../architecture/provider-routing.md`](../architecture/provider-routing.md) —
+  hard routing constraints, measured soft objectives, capacity, and cache
+  affinity.
+- [`../architecture/terminal-interface.md`](../architecture/terminal-interface.md)
+  — durable session/event UI target and token/cost presentation.
+- [`../security/threat-model.md`](../security/threat-model.md) — active
+  no-sandbox trust model and residual-risk boundary.
+
+## Live evidence and status references
+
+- [`v2-1-status.md`](v2-1-status.md) — detailed capability/gap table; recheck
+  rapidly changing entries against source.
+- [`python-3.14.md`](python-3.14.md) — runtime assumptions from a recorded run.
+- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — measured store
+  behavior.
 - [`worktree-concurrency.md`](worktree-concurrency.md) — measured Git behavior.
-- [`vertical-slice-report.md`](vertical-slice-report.md) — historical worker/IPC/merge evidence (gate removed by decision).
-- [`test-strategy.md`](test-strategy.md), [`security-audit.md`](security-audit.md),
+- [`worker-coldstart.md`](worker-coldstart.md) — retained raw startup/fan-out
+  measurements and their current-scope correction; relevant to the existing
+  opt-in warm worker pool.
+- [`vertical-slice-report.md`](vertical-slice-report.md) — historical
+  worker/IPC/merge evidence; the old task-command gate was removed.
+- [`test-strategy.md`](test-strategy.md),
   [`conformance-report.md`](conformance-report.md), and
   [`constitution-compliance.md`](constitution-compliance.md) — point-in-time
-  evidence; recheck claims against source.
-- [`coding-constitution.md`](coding-constitution.md) — coding-principles pointer.
+  evidence; not current certification.
+- [`coding-constitution.md`](coding-constitution.md) — coding-principles
+  pointer.
 
-The accepted target shape is defined in the architecture and plan: a
-harness-owned validated tree, static ready-node scheduling before dynamic child
-admission, fresh bounded child contexts, strict upward envelopes, and
-prompt-prefix/cache-hit metrics. These are targets, not current runtime proof.
+## Cache and recursive-context research
 
-## Historical drafts
+- [`cache-first-context-reuse-plan.md`](cache-first-context-reuse-plan.md) —
+  corrected hypothesis, provider-cache boundary, measurement protocol, and
+  remaining gaps.
+- [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) —
+  corrected rolling/fork/merge model, bounded recursion, and evaluation plan.
+
+The two files are research records. They deliberately defer normative choices
+to the active context, routing, terminal, and security contracts above.
+
+## Historical drafts and snapshots
 
 Protocol, event, orchestration, cascade, canonicalization, replay, and
-compaction drafts are retained for provenance. In particular,
+competitive-analysis documents are retained for provenance. In particular,
 [`ipc-protocol-draft.md`](ipc-protocol-draft.md),
 [`event-schema-draft.md`](event-schema-draft.md),
 [`custos-asyncio-design.md`](custos-asyncio-design.md),
 [`architectus-design.md`](architectus-design.md), and
 [`cascade-design.md`](cascade-design.md) do not override current imports and
-callers. Some older drafts name modules that are no longer tracked.
+callers. Some older drafts name modules or decisions that no longer exist.
 
-The benchmark and example-module documents describe offline evaluation, not
-the production supervisor path. Use [`bench-harness-design.md`](bench-harness-design.md)
-with `src/cambium/bench.py` and the example evaluator when reproducing those
-experiments.
+The obsolete sandbox-options paper, old threat-model draft, old security audit,
+pre-implementation compaction proposal, and “no current TUI” research note were
+removed from the working tree. Git history preserves them. Their useful current
+content is represented by active contracts; they must not be used as present
+runtime claims.
+
+Competitive snapshots such as OpenCode and pi remain dated evidence. They are
+not product requirements and should be refreshed before relying on changing
+features.
 
 ## Complete file index
 
-Every `.md` file in this directory, one line each. Status words follow each
-file's own header.
+Every remaining `.md` file in this directory, one line each. Status words follow
+each file's own header.
 
-- [`architectus-design.md`](architectus-design.md) — RLM task-tree orchestrator (v2.1 M5), historical draft; nothing merged.
-- [`bench-harness-design.md`](bench-harness-design.md) — proposed Ascensus measurement layer for scenario tests; historical snapshot.
-- [`cache-first-context-reuse-plan.md`](cache-first-context-reuse-plan.md) — implementation record for immutable cache epochs, parent/child fork/resume, and rolling compaction; chat-provider acceptance gates pass; non-normative.
-- [`cascade-design.md`](cascade-design.md) — Diffundo provider-cascade design, docs-only proposal extending architecture §9.
-- [`cloud-code.md`](cloud-code.md) — competitive analysis of Google/Amazon "Cloud Code".
+- [`architectus-design.md`](architectus-design.md) — RLM task-tree orchestrator design; historical draft.
+- [`bench-harness-design.md`](bench-harness-design.md) — proposed Ascensus scenario measurement layer; historical snapshot.
+- [`cache-first-context-reuse-plan.md`](cache-first-context-reuse-plan.md) — corrected cache-first context research record; non-normative.
+- [`cascade-design.md`](cascade-design.md) — Diffundo provider-cascade design proposal; non-normative.
+- [`cloud-code.md`](cloud-code.md) — competitive analysis of Google/Amazon “Cloud Code”.
 - [`codex.md`](codex.md) — competitive analysis of the OpenAI Codex CLI.
-- [`coding-constitution.md`](coding-constitution.md) — historical Rust/HFT → Python 3.14 translation of coding principles.
-- [`compaction-design.md`](compaction-design.md) — draft context-compaction protocol for workers; docs-only, non-normative.
-- [`conformance-report.md`](conformance-report.md) — read-only audit of merged implementation vs normative specs.
-- [`constitution-compliance.md`](constitution-compliance.md) — read-only audit of merged implementation vs the coding constitution.
-- [`custos-asyncio-design.md`](custos-asyncio-design.md) — historical design spec resolving the proposed M4 asyncio gap.
-- [`design-deltas.md`](design-deltas.md) — historical decision record of design deltas D1..D7.
-- [`dspy-hillclimb-plan.md`](dspy-hillclimb-plan.md) — DSPy hill-climbing spike plan; optimizer implementation and execution remain unverified.
-- [`dspy-python-314.md`](dspy-python-314.md) — historical DSPy-on-Python-3.14.7 compatibility run.
-- [`event-schema-draft.md`](event-schema-draft.md) — research-stage event-log schema proposal, not frozen code.
-- [`example-datasets-v1.md`](example-datasets-v1.md) — historical record of the `should_decompose` datasets v1 generator and checks.
-- [`feedback-2-deltas.md`](feedback-2-deltas.md) — historical assessment of the second external critique plus deltas D8a..D8g.
-- [`feedback-4-assessment.md`](feedback-4-assessment.md) — historical disposition of the fourth critique's 21 claims.
-- [`feedback-5-assessment.md`](feedback-5-assessment.md) — historical disposition of the fifth critique's 19 claims.
-- [`glossary.md`](glossary.md) — naming map bridging Latin architecture names and plain-English names.
-- [`ipc-protocol-draft.md`](ipc-protocol-draft.md) — Nuntius IPC message-catalogue draft, non-normative.
-- [`logging-design.md`](logging-design.md) — design record resolving IMPL-M7; not merged.
-- [`m1-canonicalization-plan.md`](m1-canonicalization-plan.md) — design-only record for one runtime / one store / one sequencer canonicalization.
-- [`metric-design.md`](metric-design.md) — automatic coding metric design (LLM-C5); historical target for Opifex-style tasks.
-- [`omp.md`](omp.md) — competitive analysis of `omp` (Oh My Pi).
-- [`onboarding-checklist-draft.md`](onboarding-checklist-draft.md) — compressed module-onboarding process draft, not a status report.
-- [`opencode.md`](opencode.md) — competitive analysis of OpenCode (anomalyco/opencode).
-- [`pi.md`](pi.md) — competitive analysis of `pi` (@earendil-works/pi-coding-agent).
-- [`prime-agent.md`](prime-agent.md) — competitive analysis of Prime Agent.
-- [`provider-landscape.md`](provider-landscape.md) — local provider-config matrix, input to Diffundo.
-- [`pydev.md`](pydev.md) — web-only competitive analysis of py.dev / JetBrains AI; `py.dev` itself was unreachable.
-- [`python-3.14.md`](python-3.14.md) — verified Python 3.14 capabilities for Cambium (historical run).
-- [`replay-restart-design.md`](replay-restart-design.md) — crash-recovery event-log replay and supervisor restart semantics.
-- [`repo-structure-plan.md`](repo-structure-plan.md) — historical repo-structure audit and final layout plan.
-- [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) — historical design record for implemented immutable-epoch context reuse and rolling compaction; non-normative where it differs from architecture docs.
-- [`sandbox-options.md`](sandbox-options.md) — superseded sandboxing-options research; decision 10 removed in-harness sandboxing; runtime has no per-worker containment.
-- [`security-audit.md`](security-audit.md) — read-only security audit of merged implementation vs the threat model.
-- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — empirical validation of SQLite WAL event-log durability.
-- [`test-strategy.md`](test-strategy.md) — design answering IMPL-M8; test strategy for the harness itself.
-- [`threat-model.md`](threat-model.md) — historical design-level threat model (v0.1.0); decision 10 removed Septum sandboxing; current runtime has no per-worker OS containment.
-- [`treesitter-context.md`](treesitter-context.md) — Tree-sitter AST context-compression experiment (v2.1 M9, proposal 1).
-- [`tui-best-practices.md`](tui-best-practices.md) — future TUI best-practices research (Janus); no current TUI.
-- [`v2-1-review.md`](v2-1-review.md) — v2.1 architecture review and roadmap.
-- [`v2-1-status.md`](v2-1-status.md) — the sole detailed live capability/gap table.
-- [`vertical-slice-report.md`](vertical-slice-report.md) — historical one-worker end-to-end slice record (gate removed by decision).
-- [`worker-coldstart.md`](worker-coldstart.md) — historical worker cold-start benchmark comparing fork-per-task with a persistent pool; corrected conclusion favors pre-spawned persistent workers.
-- [`worktree-concurrency.md`](worktree-concurrency.md) — measured git worktree concurrency semantics.
+- [`coding-constitution.md`](coding-constitution.md) — historical Rust/HFT-to-Python principles translation.
+- [`conformance-report.md`](conformance-report.md) — point-in-time implementation/spec audit.
+- [`constitution-compliance.md`](constitution-compliance.md) — point-in-time coding-constitution audit.
+- [`custos-asyncio-design.md`](custos-asyncio-design.md) — historical design for the proposed asyncio supervisor gap.
+- [`design-deltas.md`](design-deltas.md) — historical design-delta record D1–D7.
+- [`dspy-hillclimb-plan.md`](dspy-hillclimb-plan.md) — DSPy hill-climbing spike plan; execution remains separately verifiable.
+- [`dspy-python-314.md`](dspy-python-314.md) — historical DSPy/Python 3.14.7 compatibility run.
+- [`event-schema-draft.md`](event-schema-draft.md) — research-stage event schema proposal.
+- [`example-datasets-v1.md`](example-datasets-v1.md) — historical `should_decompose` dataset record.
+- [`feedback-2-deltas.md`](feedback-2-deltas.md) — historical second-critique assessment and D8a–D8g.
+- [`feedback-4-assessment.md`](feedback-4-assessment.md) — historical fourth-critique disposition.
+- [`feedback-5-assessment.md`](feedback-5-assessment.md) — historical fifth-critique disposition.
+- [`glossary.md`](glossary.md) — Latin-to-plain-English naming map.
+- [`ipc-protocol-draft.md`](ipc-protocol-draft.md) — Nuntius IPC catalogue draft; non-normative.
+- [`logging-design.md`](logging-design.md) — historical logging design record.
+- [`m1-canonicalization-plan.md`](m1-canonicalization-plan.md) — design-only runtime/store/sequencer canonicalization record.
+- [`metric-design.md`](metric-design.md) — historical automatic coding-metric target.
+- [`omp.md`](omp.md) — competitive analysis of Oh My Pi.
+- [`onboarding-checklist-draft.md`](onboarding-checklist-draft.md) — compressed module-onboarding draft.
+- [`opencode.md`](opencode.md) — dated competitive analysis of OpenCode.
+- [`pi.md`](pi.md) — dated competitive analysis of pi.
+- [`prime-agent.md`](prime-agent.md) — dated competitive analysis of Prime Agent.
+- [`provider-landscape.md`](provider-landscape.md) — local provider-config matrix used as Diffundo research input.
+- [`pydev.md`](pydev.md) — web-only py.dev/JetBrains AI competitive analysis.
+- [`python-3.14.md`](python-3.14.md) — verified Python 3.14 capability record from a historical run.
+- [`replay-restart-design.md`](replay-restart-design.md) — crash-recovery/restart design record.
+- [`repo-structure-plan.md`](repo-structure-plan.md) — historical repository-structure audit and layout plan.
+- [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) — corrected rolling-context and bounded-recursion research record; non-normative.
+- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — empirical SQLite WAL durability study.
+- [`test-strategy.md`](test-strategy.md) — harness test-strategy design.
+- [`treesitter-context.md`](treesitter-context.md) — Tree-sitter context-compression experiment.
+- [`v2-1-review.md`](v2-1-review.md) — architecture review and roadmap snapshot.
+- [`v2-1-status.md`](v2-1-status.md) — detailed live capability/gap table, subject to source verification.
+- [`vertical-slice-report.md`](vertical-slice-report.md) — historical one-worker end-to-end slice record.
+- [`worker-coldstart.md`](worker-coldstart.md) — retained worker-startup benchmark with raw samples and current correction.
+- [`worktree-concurrency.md`](worktree-concurrency.md) — measured Git worktree concurrency semantics.
 
 ## Finding the current surface
 
 ```sh
 git ls-files src/cambium tests | sort
-rg -n "run_plan|do_work|Diffundo|EventStore|ArchitectusCore|evaluate_split" src tests
+rg -n "run_plan|do_work|Diffundo|EventStore|ConversationStore|ContextEpoch" src tests
 ```
 
 Start at the entry point and follow imports and tests. Do not bulk-read the

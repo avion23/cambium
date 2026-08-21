@@ -72,6 +72,15 @@ def test_incumbent_leads_while_eligible() -> None:
     assert _names(_order(items, debt, incumbent="incumbent")) == ["incumbent", "better"]
 
 
+def test_incumbent_never_crosses_a_priority_boundary() -> None:
+    items = [Item("mandatory-first", 0), Item("peer", 5), Item("incumbent", 5)]
+    assert _names(_order(items, incumbent="incumbent")) == [
+        "mandatory-first",
+        "incumbent",
+        "peer",
+    ]
+
+
 def test_filtered_incumbent_reselects_and_new_incumbent_does_not_bounce() -> None:
     debt = {"old": _debt(latency=1), "fallback": _debt(latency=5)}
     eligible = [Item("fallback")]
@@ -85,6 +94,12 @@ def test_rotation_is_deterministic_spreads_and_preserves_priority_runs() -> None
     assert _names(_order(items, offset=1)) == ["b", "c", "a", "y", "x"]
     assert _names(_order(items, offset=1)) == _names(_order(items, offset=1))
     assert {_names(_order(items, offset=i))[0] for i in range(3)} == {"a", "b", "c"}
+
+
+def test_rotation_does_not_override_measured_quality() -> None:
+    items = [Item("slow"), Item("fast")]
+    debt = {"slow": _debt(latency=8), "fast": _debt(latency=1)}
+    assert _names(_order(items, debt, offset=1)) == ["fast", "slow"]
 
 
 def test_weights_are_tuning_seam() -> None:

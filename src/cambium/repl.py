@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol, TextIO, cast
 
-from . import oneshot, render
+from . import oneshot, render, stats
 from .auth import AuthError
 from .cli import ExitCode
 from .oneshot import OneShotConfig
@@ -85,6 +85,7 @@ async def run_repl(
 
     try:
         failed = False
+        usage_events: list[dict[str, Any]] = []
         for line in input_stream:
             prompt = line.rstrip("\r\n")
             if prompt == "/exit":
@@ -102,6 +103,8 @@ async def run_repl(
                     _events: list[dict[str, Any]] = events,
                 ) -> None:
                     _events.append(record)
+                    if record.get("kind") == "usage_event":
+                        usage_events.append(record)
                     output_stream.write(render.render_event_line(record) + "\n")
                     status = render.render_live_status_line(_events)
                     if status:
@@ -110,6 +113,14 @@ async def run_repl(
 
                 result = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
                 rendered = render.render_text_result(result)
+                usage = stats.usage_stats_from_events(usage_events)
+                if usage is not None:
+                    # Each one-shot prompt restarts its provider turn counter,
+                    # so a cross-prompt fold cannot name one meaningful last turn.
+                    usage = replace(usage, turns=None)
+                usage_line = render.render_usage_stats_line(usage)
+                if usage_line and usage is not None and usage.provider:
+                    usage_line += f" · provider={usage.provider}"
                 if result.exit_code != 0:
                     failed = True
             except BrokenPipeError:
@@ -123,6 +134,8 @@ async def run_repl(
                 output_stream.write(rendered)
                 if not rendered.endswith("\n"):
                     output_stream.write("\n")
+                if usage_line:
+                    output_stream.write(usage_line + "\n")
                 output_stream.flush()
             except BrokenPipeError:
                 return ExitCode.SUCCESS
