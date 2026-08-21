@@ -1,8 +1,9 @@
-# Cache-first context engine
+# Cache-first append-only context engine
 
-**Status:** target contract for context reuse, branching, compaction, and cache
-accounting. Source and tests remain authoritative for current behavior. This
-document replaces the design authority previously split across
+**Status:** active contract for the implemented semantic-summary trunk plus
+target contracts for remaining provider-cache, routing, and interactive-session
+work. Source and tests remain authoritative for current behavior. This document
+replaces the design authority previously split across
 `docs/research/cache-first-context-reuse-plan.md`,
 `docs/research/rolling-context-and-agent-reuse.md`, and
 `docs/research/compaction-design.md`.
@@ -15,16 +16,29 @@ not treat an API model as a stateful process. The reusable object is an
 optional acceleration of replaying that projection; it is never correctness
 state.
 
-The source of truth is an append-only event/history log. Each active model
-request is assembled from one materialized context epoch. Child agents fork an
-immutable checkpoint, append a private continuation, and return a typed result
-envelope. Compaction publishes a new epoch containing a validated structured
-checkpoint plus an explicit recent tail. It never deletes the raw history.
+The source of truth is an append-only event/history log. The implemented active
+request projection is:
 
-A concise summary must **replace the covered region in the active projection**.
-Appending a summary after the complete old transcript does not reduce context,
-does not bound attention cost, and usually destroys the intended cache/cost
-benefit.
+```text
+H + S1 + S2 + ... + Sn + small raw working tail
+```
+
+`H` is the stable system/tool head. Every `Si` is an immutable semantic summary
+entry covering one new, disjoint raw message range. A flush makes one additional
+provider call over the existing trunk plus the current raw tail, validates the
+strict result, appends exactly one new summary entry, and removes only that
+covered raw tail from the active prompt. Earlier summary bytes are never edited
+or included in a later summary source.
+
+Raw events, ordinary checkpoints, and immutable epoch files remain the audit and
+recovery authority outside the active prompt. Child agents fork an immutable
+checkpoint and append a private continuation. Cache-compatible children reuse
+the exact trunk prefix; incompatible providers receive the same semantic summary
+entries under a fresh provider-specific head and accept a cold provider cache.
+
+Appending a summary after the complete old transcript is still not compaction.
+The covered raw region must leave the active projection while remaining durable
+in the external history.
 
 ## 2. Distinct mechanisms
 
@@ -68,6 +82,32 @@ Epoch = {
   digest
 }
 ```
+
+The implemented summary segment is:
+
+```text
+SummaryEntry = {
+  sequence,
+  source_sha256,
+  source_message_count,
+  through_turn,
+  objective,
+  outcome,
+  decisions_added,
+  decisions_superseded,
+  facts_added,
+  facts_invalidated,
+  files_and_symbols_changed,
+  verification_results,
+  relevant_failed_approaches,
+  open_items,
+  entry_sha256
+}
+```
+
+Sequence, source digest/count, turn coverage, and the canonical entry digest are
+validated before publication. Semantic arrays are bounded and remain user-role
+data; they do not acquire system authority.
 
 `digest` is over the canonical serialized epoch descriptor and its referenced
 artifacts. The model request has a stricter cache identity:
@@ -120,11 +160,15 @@ fails closed.
 Compaction is a materialized view, not destructive history rewriting. Operators
 and evaluators can recover the exact covered events.
 
-### C5. A summary is lossy and non-authoritative
+### C5. A summary is lossy, append-only, and non-authoritative
 
-An LLM summary is not assumed deterministic, idempotent, associative, or
-commutative. Idempotency applies to publication: the same compaction operation
-ID may publish at most once. Re-running the model may produce different text.
+An LLM summary is not assumed deterministic, associative, or commutative. The
+published entry is immutable: `S1` must remain byte-identical when `S2` is
+appended, and a later flush may summarize only the new raw tail. Publication is
+idempotent and fail-closed through sequence, source digest/count, checkpoint
+identity, and exclusive immutable file creation. Re-running a failed provider
+call may yield different proposed text, but no invalid or duplicate proposal may
+advance the trunk.
 
 ### C6. Bounded active context
 
@@ -217,35 +261,51 @@ base artifacts, and contradictory decisions require an explicit merge or
 re-evaluation. The CALM result is the useful dividing line: coordination-free
 composition is available only for monotonic knowledge.
 
-### 5.5 Compaction
+### 5.5 Append-only semantic-summary flush
 
-Compaction runs only between provider/tool turns:
+A flush runs only between completed provider/tool turns:
 
-1. Freeze the covered event range and expected parent epoch.
-2. Deterministically extract obligations, decisions, file/symbol identities,
-   failed checks, open questions, and evidence references.
-3. Ask the model for a schema-constrained synthesis of those extracted items.
-4. Validate required fields, source references, unresolved items, and size.
-5. Optionally run a held-out continuation/equivalence canary.
-6. Publish a new epoch with the structured checkpoint plus a bounded recent
-   verbatim tail, using compare-and-swap.
-7. Keep the full covered history unchanged and auditable.
+1. Freeze the current raw working tail. Existing summary entries are not part of
+   the source range.
+2. Compute its canonical source digest, message count, next sequence number, and
+   covered turn.
+3. Make one additional provider call containing the immutable trunk, the raw
+   tail, and a delimited summary-control request.
+4. Account for this call exactly like every other provider call: usage, request
+   debt, latency, cache evidence, token budget, cost, cancellation, and wall
+   deadline all apply.
+5. Parse and validate the strict `SummaryEntry`: exact sequence and source
+   metadata, bounded semantic fields, canonical content digest, and no unknown
+   fields.
+6. Append the entry as one user-role trunk message, clear the covered raw tail,
+   write a new immutable checkpoint, and publish the epoch transition only after
+   durable creation succeeds.
+7. Leave every prior summary message byte-stable. The next summary request begins
+   with the complete existing trunk but summarizes only its newly supplied raw
+   source block.
+8. Retain the full raw history externally for replay, audit, recovery, and future
+   re-projection.
 
-The next request uses the new epoch. It does not contain both the entire old
-transcript and its summary.
+Cambium forces a flush at delegation and terminal boundaries and performs a
+threshold flush when the raw tail crosses the configured high-water mark. A
+legacy transcript-heavy checkpoint is migrated by summarizing its unsummarized
+continuation at the next flush; it is not recursively compacted.
 
-Compaction trades a one-time cache rebuild and summarization cost for lower
-recurring input/attention cost. This is an online optimal-stopping/ski-rental
-problem. A policy should compact only when estimated future savings and quality
-benefit exceed rebuild cost:
+If summary generation, validation, redaction, checkpoint creation, or publication
+fails, the active checkpoint and raw tail remain unchanged and the task fails
+closed. No earlier summary is rewritten to recover space. Future hierarchical
+summary tiers, if needed, require a new explicit projection type rather than
+silently summarizing summaries.
+
+The economic decision remains an online optimal-stopping problem:
 
 ```text
 summary_call + expected_cache_rebuild
     < expected_remaining_calls * per_call_context_saving + quality_benefit
 ```
 
-No universal token threshold is correct. Measure the workload's remaining-turn
-distribution and provider cache lifetime.
+Cambium currently uses configured thresholds and semantic boundaries; workload-
+specific adaptive policies remain future work.
 
 ## 6. Provider cache capability contract
 
@@ -303,29 +363,47 @@ agent state.
 
 See [`terminal-interface.md`](terminal-interface.md).
 
-## 9. Current implementation map (2026-08-20)
+## 9. Current implementation map (2026-08-21)
 
-Verified in source/tests at the review base:
+Verified in source and the full Python 3.14 test tiers:
 
-- immutable context epochs and parent/child fork/resume machinery exist;
-- context descriptors bind to artifacts and reject mismatches;
-- terminal checkpoints and rolling transcript compaction exist;
-- provider usage events and token aggregation exist;
-- REPL/TUI operator entry points enable context reuse for each one-shot run.
+- `src/cambium/summary_trunk.py` defines strict immutable `SummaryEntry`
+  parsing, canonical serialization, source binding, sequence validation, and
+  digest verification;
+- provider-backed root agents enter trunk mode immediately when durable epoch
+  storage is available;
+- threshold, delegation, and terminal boundaries perform explicit additional
+  summary calls, and those calls participate in normal usage and request-debt
+  accounting;
+- each raw range is summarized once; tests prove the existing head and `S1`
+  remain byte-stable when later entries are appended;
+- the active request is the immutable head and semantic trunk plus a bounded raw
+  tail, not the old transcript followed by its summary;
+- exact provider/model/protocol/tool-compatible children reuse the byte-identical
+  trunk prefix, while incompatible providers reuse the semantic entries under a
+  fresh head;
+- legacy transcript checkpoints migrate on their next flush rather than being
+  recursively folded;
+- raw events, ordinary checkpoints, and epoch artifacts remain available for
+  audit and replay outside the active prompt;
+- redacted/corrupt/mismatched checkpoints and invalid summary responses fail
+  closed before they can seed or advance a prompt.
 
 Open deltas:
 
 - REPL/TUI prompts still create separate one-shot session leaves instead of
   continuing one durable interactive branch;
-- current rolling folds are deterministic transcript projections, not the
-  structured extraction + model synthesis protocol above;
-- provider cache capability, identity, TTL, and read/write pricing are not
-  modeled as one typed contract;
-- `prompt_prefix_bytes` measures the leading system-message bytes, not the
-  complete provider request prefix;
-- one-sample cache observations are insufficient acceptance evidence;
+- provider cache capability, namespace, TTL, granularity, isolation, and
+  read/write pricing are not modeled as one typed contract;
+- `prompt_prefix_bytes` is not yet a canonical digest/size of the complete
+  provider request identity;
+- repeated real-provider cache and held-out quality canaries are still required
+  before claiming economic or quality gains across workloads;
 - strict model pinning, rate/concurrency modeling, and cache-aware cost routing
-  still have implementation gaps described in `provider-routing.md`.
+  retain gaps described in `provider-routing.md`;
+- the implemented trunk is flat append-only semantic segmentation; any future
+  long-horizon hierarchy must introduce an explicit new projection and preserve
+  the current non-recursive invariant.
 
 ## 10. Verification
 
