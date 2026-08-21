@@ -1484,6 +1484,21 @@ def _action_keys(parsed: dict[str, Any], required: frozenset[str]) -> bool:
     return required <= parsed.keys() and parsed.keys() <= allowed
 
 
+_STRICT_ACTION_DECODER = json.JSONDecoder()
+_LENIENT_ACTION_DECODER = json.JSONDecoder(strict=False)
+
+
+def _decode_action_json(text: str) -> tuple[Any, int]:
+    """Decode one JSON value at the start of ``text``.  When the strict
+    decoder rejects the input only because a string value contains a raw
+    control character, retry with the lenient decoder; every other strictness
+    rule is unchanged."""
+    try:
+        return _STRICT_ACTION_DECODER.raw_decode(text)
+    except json.JSONDecodeError:
+        return _LENIENT_ACTION_DECODER.raw_decode(text)
+
+
 def _parse_agent_action(content: str) -> dict[str, Any]:
     """Strictly parse ONE agent action; a response may carry several
     concatenated JSON actions, in which case the first complete action is
@@ -1502,7 +1517,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     if len(text.encode("utf-8")) > MAX_ACTION_CONTENT_BYTES:
         raise ValueError("agent action exceeds the field cap")
     try:
-        parsed, _end = json.JSONDecoder().raw_decode(text)
+        parsed, _end = _decode_action_json(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError(f"action is not valid JSON: {exc}") from None
     if not isinstance(parsed, dict):
@@ -1553,7 +1568,7 @@ def _action_trailing(content: str) -> str:
     if not text:
         return ""
     try:
-        _obj, end = json.JSONDecoder().raw_decode(text)
+        _obj, end = _decode_action_json(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         return ""
     return text[end:].strip()

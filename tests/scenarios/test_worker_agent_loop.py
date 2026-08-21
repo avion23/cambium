@@ -492,6 +492,24 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
             worker._parse_agent_action(bad)
 
 
+def test_lenient_parse_accepts_raw_control_characters_in_strings() -> None:
+    action = (
+        '{"type":"tool_call","name":"write_file","arguments":'
+        '{"path":"hello.py","content":"print(\'hello world\')\n\t"}}'
+    )
+    assert worker._parse_agent_action(action) == {
+        "type": "tool_call",
+        "name": "write_file",
+        "arguments": {"path": "hello.py", "content": "print('hello world')\n\t"},
+    }
+    assert worker._action_trailing(action) == ""
+    assert worker._action_trailing(
+        action + '{"type":"plan","steps":["a"]}'
+    ).startswith('{"type":"plan"')
+    with pytest.raises(ValueError):
+        worker._parse_agent_action('{"type":"finish","summary":"broken\n-oops}')
+
+
 # ---------------------------------------------------------------------------
 # Transcript summarization (pure function)
 # ---------------------------------------------------------------------------
