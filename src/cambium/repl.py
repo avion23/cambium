@@ -33,6 +33,11 @@ else:
     readline = cast(_Readline, _readline)
 
 
+_BAR_TERMINAL_KINDS = frozenset(
+    {"result", "session_ended", "exit", "worker_failed", "reuse_ready"}
+)
+
+
 def _config_for_prompt(config: OneShotConfig, prompt: str) -> OneShotConfig:
     return replace(config, prompt=prompt)
 
@@ -98,18 +103,41 @@ async def run_repl(
             try:
                 prompt_config = _config_for_prompt(config, prompt)
                 events: list[dict[str, Any]] = []
+                stream_tty = bool(getattr(output_stream, "isatty", lambda: False)())
+                bar_live = stream_tty
+                session_label = (
+                    Path(config.session_root).expanduser().resolve().name
+                    if config.session_root is not None
+                    else oneshot.default_session_root(config.repo).name
+                )
 
                 def _live_sink(
                     record: dict[str, Any],
                     _events: list[dict[str, Any]] = events,
                 ) -> None:
+                    nonlocal bar_live
                     _events.append(record)
                     if record.get("kind") == "usage_event":
                         usage_events.append(record)
-                    output_stream.write(render.render_event_line(record) + "\n")
-                    status = render.render_live_status_line(_events)
-                    if status:
-                        output_stream.write(status + "\n")
+                    if not stream_tty:
+                        output_stream.write(render.render_event_line(record) + "\n")
+                        status = render.render_live_status_line(_events)
+                        if status:
+                            output_stream.write(status + "\n")
+                        output_stream.flush()
+                        return
+                    line = render.render_event_line(record)
+                    if line:
+                        output_stream.write(line + "\n")
+                    if bar_live:
+                        output_stream.write("\r\033[K")
+                        bar = render.render_status_bar(
+                            _events, session_label=session_label
+                        )
+                        if bar:
+                            output_stream.write(bar + "\n")
+                        if record.get("kind") in _BAR_TERMINAL_KINDS:
+                            bar_live = False
                     output_stream.flush()
 
                 result = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)

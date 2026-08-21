@@ -11,7 +11,9 @@ from typing import Any
 from cambium.render_markdown import render_markdown_if_tty
 
 _PROMPT = "cambium> "
-_ANSI_CLEAR = "\033[2J\033[H"
+_BAR_TERMINAL_KINDS = frozenset(
+    {"result", "session_ended", "exit", "worker_failed", "reuse_ready"}
+)
 
 
 def _is_tty(stream: Any) -> bool:
@@ -26,25 +28,6 @@ def _write_line(out: Any, line: str) -> None:
         out.write(line)
         if not line.endswith("\n"):
             out.write("\n")
-
-
-def _dashboard_lines(session_dir: Path, events: list[dict[str, Any]], render, stats) -> list[str]:
-    lines = [f"session: {session_dir}"]
-    elapsed = render.render_elapsed(events)
-    if elapsed:
-        lines[0] += f" · {elapsed}"
-    status = render.render_subagent_status(events)
-    if status:
-        lines.extend(status.splitlines())
-    live = render.render_live_status_line(events)
-    if live:
-        lines.append(live)
-    usage = render.render_usage_stats_line(stats.usage_stats_from_events(events))
-    if usage:
-        lines.append(usage)
-    if events:
-        lines.append(render.render_event_line(events[-1]))
-    return lines
 
 
 async def run_tui(
@@ -90,21 +73,34 @@ async def run_tui(
                 )
                 prompt_config = replace(config, prompt=prompt, session_root=session_dir)
                 events: list[dict[str, Any]] = []
+                bar_live = dashboard
 
                 def _live_sink(
                     record: dict[str, Any],
                     _events: list[dict[str, Any]] = events,
                     _session_dir: Path = session_dir,
                 ) -> None:
+                    nonlocal bar_live
                     _events.append(record)
-                    if dashboard:
-                        out.write(_ANSI_CLEAR)
-                        for line in _dashboard_lines(_session_dir, _events, render, stats):
-                            _write_line(out, line)
-                    elif not quiet:
-                        _write_line(out, render.render_event_line(record))
-                        status = render.render_live_status_line(_events)
-                        _write_line(out, status)
+                    if not dashboard:
+                        if not quiet:
+                            _write_line(out, render.render_event_line(record))
+                            status = render.render_live_status_line(_events)
+                            _write_line(out, status)
+                        out.flush()
+                        return
+                    line = render.render_event_line(record)
+                    if line:
+                        _write_line(out, line)
+                    if bar_live:
+                        out.write("\r\033[K")
+                        bar = render.render_status_bar(
+                            _events, session_label=_session_dir.name
+                        )
+                        if bar:
+                            _write_line(out, bar)
+                        if record.get("kind") in _BAR_TERMINAL_KINDS:
+                            bar_live = False
                     out.flush()
 
                 response = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
