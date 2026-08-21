@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -330,9 +331,25 @@ def render_usage_breakdown(breakdown: Any) -> str:
     return "\n".join(lines)
 
 
+_EVENT_FIELD_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
+_EVENT_FIELD_WHITESPACE = re.compile(r"[\t\n\r]+")
+
+
+def _sanitize_field(text: str) -> str:
+    """Make one interpolated field safe for single-line terminal output.
+
+    Removes ESC (0x1b), the 8-bit C1 CSI introducer (0x9b), DEL, and the
+    remaining C0/C1 controls; collapses tab/newline runs to one space so a
+    model-controlled value can neither emit escape sequences nor break the
+    line.
+    """
+    cleaned = _EVENT_FIELD_CONTROLS.sub("", text)
+    return _EVENT_FIELD_WHITESPACE.sub(" ", cleaned)
+
+
 def _scalar(value: Any) -> str:
     if isinstance(value, str):
-        return value
+        return _sanitize_field(value)
     if isinstance(value, bool):
         return str(value)
     if isinstance(value, float) and math.isfinite(value):
@@ -351,7 +368,9 @@ def _pair(payload: Mapping[str, Any], key: str, label: str | None = None) -> str
 
 def _text(payload: Mapping[str, Any], key: str) -> str | None:
     value = payload.get(key)
-    return value if isinstance(value, str) and value else None
+    if not isinstance(value, str) or not value:
+        return None
+    return _sanitize_field(value)
 
 
 def _join(*parts: str | None) -> str:
@@ -482,8 +501,9 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     The line keeps the ``{seq:>6} {kind:>16} {task}  {body}`` prefix shape,
     with ``seq`` and ``task`` omitted when absent. The body comes from the
     module-level ``_EVENT_FORMATTERS`` table for known kinds (an empty body
-    prints nothing); unknown kinds fall back to the raw compact-JSON dump so
-    unseen payloads stay visible.
+    prints nothing); unknown kinds fall back to a compact-JSON dump with
+    non-ASCII characters escaped so unseen payloads stay visible and
+    single-line.
     """
     if not isinstance(event, Mapping):
         raise TypeError("render_event_line requires an event mapping")
@@ -498,7 +518,11 @@ def render_event_line(event: Mapping[str, Any]) -> str:
             if key not in _EVENT_ENVELOPE_KEYS
         }
     formatter = _EVENT_FORMATTERS.get(kind)
-    body = _dumps(payload) if formatter is None else formatter(payload)
+    body = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if formatter is None
+        else formatter(payload)
+    )
     if not body:
         return ""
     prefix = f"{kind:>16}"

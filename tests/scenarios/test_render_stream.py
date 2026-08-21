@@ -326,3 +326,70 @@ def test_non_mapping_payload_derives_body_from_extra_envelope_keys() -> None:
     line = render_event_line(event)
 
     assert line.endswith("  reason=done")
+
+
+def test_tool_event_cmd_control_characters_are_neutralized() -> None:
+    hostile = "echo \x1b[31mINJECTED\x1b[0m\nrm -rf /"
+    line = _line(
+        "tool_event",
+        {"tool": "run_shell", "cmd": hostile, "ok": True, "duration_ms": 5},
+        seq=1,
+        task_id="t",
+    )
+
+    body = line.rsplit("  ", 1)[1]
+    assert "\x1b" not in line
+    assert "\n" not in line
+    assert "\x9b" not in line
+    assert body == "run_shell echo [31mINJECTED[0m rm -rf / OK 5ms"
+
+
+def test_tool_event_c1_csi_introducer_is_removed() -> None:
+    line = _line(
+        "tool_event",
+        {"tool": "edit", "cmd": "a\x9b31mb", "ok": False},
+        seq=2,
+        task_id="t",
+    )
+
+    assert line.endswith("  edit a31mb FAIL ?")
+    assert "\x9b" not in line
+
+
+def test_truncation_applies_after_sanitization() -> None:
+    cmd = "\x1b" + "x" * 70
+    line = _line("tool_event", {"tool": "t", "cmd": cmd, "ok": True}, seq=3, task_id="t")
+
+    body = line.rsplit("  ", 1)[1]
+    assert "\x1b" not in line
+    assert body == f"t {'x' * 60} OK ?"
+
+
+def test_failure_and_diagnostic_message_fields_are_neutralized() -> None:
+    failure = _line(
+        "usage_event",
+        {"provider": "p", "failure_reason": "boom\x1b[2Jboom\nsecond"},
+        seq=4,
+        task_id="t",
+    )
+
+    assert "\x1b" not in failure and "\n" not in failure
+    assert failure.endswith("  provider p FAILED boom[2Jboom second")
+
+    rejected = _line(
+        "child_rejected",
+        {"child_task_id": "c", "reason": "r\nx", "message": "m\x9bm"},
+        seq=5,
+        task_id="t",
+    )
+
+    assert "\x1b" not in rejected and "\x9b" not in rejected and "\n" not in rejected
+    assert rejected.endswith("  child=c reason=r x msg=mm")
+
+
+def test_unknown_kind_json_fallback_stays_escaped_single_line() -> None:
+    payload = {"note": "raw\nnewline \x1b esc \x9b csi"}
+    line = _line("brand_new_kind", payload)
+
+    assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
+    assert json.loads(line.rsplit("  ", 1)[1])["note"] == payload["note"]
