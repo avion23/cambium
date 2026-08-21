@@ -155,8 +155,8 @@ It loads the program class from the optional `dspy_program` field in
 `module.json`. Stage 0 is zero-shot. Stage 1 is `BootstrapFewShot`. The driver
 enforces the USD budget. A candidate passes the promotion gate only when eval
 is at least `0.85`, eval is at least `baseline - 0.05`, and canaries pass at
-100%. It writes `optimized/<module>/v<N>/program.json`, `lm.json`, and
-`report.json`, with a `current` symlink for the promoted version. The report
+100%. It writes `optimized/<module>/{program.json,lm.json,report.json}`,
+replacing the previous artifact set in place. The report
 includes `train_gain - canary_gain` as an anti-reward-hacking diagnostic. A
 failed gate leaves the rule engine as the deployed path.
 
@@ -280,8 +280,8 @@ developed and run directly from source; no wheel is built or supported.
 
 State optimizer (`zero` or `bootstrap`), train size, max steps, max demos,
 held-out threshold, and 100% canary gate. Human approval is required for
-promotion; retain `optimized/<name>/v<N-1>/` and promote by symlink swap for
-rollback. Optimize against pinned siblings and a single named model at the
+promotion; each run replaces `optimized/<name>/{program.json,lm.json,report.json}`
+in place. Optimize against pinned siblings and a single named model at the
 declared deterministic settings.
 
 The optimizer command is `python3.14 -m cambium.optimize <module_name>
@@ -289,8 +289,8 @@ The optimizer command is `python3.14 -m cambium.optimize <module_name>
 It runs stage 0 zero-shot and stage 1 `BootstrapFewShot`, loads the class named
 by the optional `dspy_program` manifest field, and enforces the USD budget. The
 promotion gate is eval `>= 0.85`, eval `>= baseline - 0.05`, and 100% canaries.
-Artifacts are `optimized/<module>/v<N>/{program.json,lm.json,report.json}`;
-`current` is the promoted-version symlink. Record `train_gain - canary_gain`
+Artifacts are `optimized/<module>/{program.json,lm.json,report.json}`; each
+run replaces the previous set in place. Record `train_gain - canary_gain`
 in the report. The deterministic rule engine remains deployed until a DSPy
 candidate clears this gate and is promoted.
 

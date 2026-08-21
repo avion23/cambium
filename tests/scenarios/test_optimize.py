@@ -201,61 +201,63 @@ def test_run_stage_bootstrap_returns_working_compiled_program() -> None:
     assert output.decision is Decision.DO_NOT_DECOMPOSE
 
 
-def test_write_artifact_writes_state_and_current_link(tmp_path: Path, monkeypatch) -> None:
+def _assert_single_artifact_set(artifact: Path) -> None:
+    assert sorted(path.name for path in artifact.iterdir()) == [
+        "lm.json",
+        "program.json",
+        "report.json",
+    ]
+    assert not (artifact / "current").exists()
+    assert not any(path.name.startswith("v") for path in artifact.parent.iterdir())
+
+
+def test_write_artifact_writes_single_artifact_set(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     program = OfflineProgram(OfflineLM())
     lm = OfflineLM()
 
-    version_dir = optimize.write_artifact(
+    artifact = optimize.write_artifact(
         "should_decompose",
-        1,
         program,
         lm,
         {"gate_passed": True, "eval_mean": 1.0},
-        promote=True,
     )
 
-    assert version_dir == Path("optimized/should_decompose/v1")
-    assert (version_dir / "program.json").is_file()
-    assert (version_dir / "lm.json").is_file()
-    assert (version_dir / "report.json").is_file()
-    assert json.loads((version_dir / "program.json").read_text())
-    current = Path("optimized/should_decompose/current")
-    assert current.is_symlink()
-    assert current.resolve() == version_dir.resolve()
+    assert artifact == Path("optimized/should_decompose")
+    assert (artifact / "program.json").is_file()
+    assert (artifact / "report.json").is_file()
+    assert json.loads((artifact / "program.json").read_text())
+    _assert_single_artifact_set(artifact)
 
 
-def test_rejected_artifact_does_not_replace_current_link(tmp_path: Path, monkeypatch) -> None:
+def test_second_write_replaces_artifact_set_in_place(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    program = OfflineProgram(OfflineLM())
-    lm = OfflineLM()
 
-    approved = optimize.write_artifact(
+    optimize.write_artifact(
         "should_decompose",
-        1,
-        program,
-        lm,
-        {"gate_passed": True},
-        promote=True,
-    )
-    current = Path("optimized/should_decompose/current")
-    assert current.resolve() == approved.resolve()
-
-    rejected = optimize.write_artifact(
-        "should_decompose",
-        2,
         OfflineProgram(OfflineLM()),
         OfflineLM(),
-        {"gate_passed": False},
-        promote=True,
+        {"gate_passed": True},
     )
 
-    assert rejected.is_dir()
-    assert current.is_symlink()
-    assert current.resolve() == approved.resolve()
+    artifact = optimize.write_artifact(
+        "should_decompose",
+        OfflineProgram(OfflineLM()),
+        OfflineLM(),
+        {"gate_passed": False, "eval_mean": 0.5},
+    )
+
+    assert artifact == Path("optimized/should_decompose")
+    assert json.loads((artifact / "report.json").read_text()) == {
+        "gate_passed": False,
+        "eval_mean": 0.5,
+    }
+    _assert_single_artifact_set(artifact)
 
 
-def test_main_rejected_run_keeps_existing_current_link(tmp_path: Path, monkeypatch) -> None:
+def test_main_budget_exhausted_run_writes_report_into_artifact_set(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.chdir(tmp_path)
     manifest = SimpleNamespace(module_name="should_decompose")
     loader = object()
@@ -270,34 +272,24 @@ def test_main_rejected_run_keeps_existing_current_link(tmp_path: Path, monkeypat
     })
     monkeypatch.setattr(optimize, "_construct_lm", lambda *_args: OfflineLM())
     monkeypatch.setattr(optimize, "build_trainsets", lambda _loader, seed: ([], []))
-    monkeypatch.setattr(optimize, "_load_split", lambda _loader, _name: [])
-    monkeypatch.setattr(
-        optimize,
-        "run_stage_zero",
-        lambda program, _train, _validation, seed: (
-            program,
-            {"eval_mean": 0.0, "train_mean": 0.0},
-        ),
-    )
-    monkeypatch.setattr(
-        optimize,
-        "score_split",
-        lambda _program, _examples: {"mean": 0.0, "std": 0.0, "count": 1},
-    )
 
-    approved = optimize.write_artifact(
+    def exhaust_budget(*_args, **_kwargs):
+        raise optimize._BudgetExhausted("offline budget exhausted")
+
+    monkeypatch.setattr(optimize, "run_stage_zero", exhaust_budget)
+
+    artifact = optimize.write_artifact(
         "should_decompose",
-        1,
         OfflineProgram(OfflineLM()),
         OfflineLM(),
         {"gate_passed": True},
-        promote=True,
     )
 
     assert optimize.main(["should_decompose", "--budget-usd", "0"]) == 1
-    current = Path("optimized/should_decompose/current")
-    assert current.resolve() == approved.resolve()
-    assert Path("optimized/should_decompose/v2/report.json").is_file()
+    report = json.loads((artifact / "report.json").read_text())
+    assert report["gate_passed"] is False
+    assert report["budget_exhausted"] is True
+    _assert_single_artifact_set(artifact)
 
 
 def test_missing_transcript_candidates_fail_only_when_opted_in(tmp_path: Path) -> None:

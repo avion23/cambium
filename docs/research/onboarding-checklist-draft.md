@@ -172,8 +172,8 @@ silently re-anchor live records.
 After merge and a frozen dataset, optimization follows pinned siblings in
 `siblings-stub.yaml`, runs SIMBA/GEPA on `train.jsonl`, scores frozen eval, and
 rejects any canary regression. A human reviews promotion. Optimize one named
-model at `temperature=0.0`; retain `optimized/<name>/v<N-1>/` and swap a
-versioned pointer for rollback. Modules are optimized independently.
+model at `temperature=0.0`; write one artifact set at `optimized/<name>/`
+that each run replaces in place. Modules are optimized independently.
 
 ## Definition of done (acceptance gates)
 

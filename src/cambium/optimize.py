@@ -18,7 +18,6 @@ import random
 import statistics
 import sys
 import tempfile
-import uuid
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from types import MethodType
@@ -809,45 +808,20 @@ def _safe_component(value: object, label: str) -> str:
     return text
 
 
-def write_artifact(
-    module_name,
-    version,
-    program,
-    lm,
-    report,
-    *,
-    promote: bool = False,
-) -> Path:
-    """Persist program state and report, optionally promoting the artifact."""
-    if not isinstance(promote, bool):
-        raise OptimizeError("promote must be a boolean")
+def write_artifact(module_name, program, lm, report) -> Path:
+    """Persist the module's single artifact set, replacing any previous set."""
     module_component = _safe_component(module_name, "module_name")
-    version_component = _safe_component(version, "version")
-    module_root = Path("optimized") / module_component
-    version_dir = module_root / f"v{version_component}"
-    version_dir.mkdir(parents=True, exist_ok=True)
+    module_dir = Path("optimized") / module_component
+    module_dir.mkdir(parents=True, exist_ok=True)
 
     program_dump = getattr(program, "dump_state", None)
     lm_dump = getattr(lm, "dump_state", None)
     if not callable(program_dump) or not callable(lm_dump):
         raise OptimizeError("program and LM must provide dump_state()")
-    _atomic_json_write(version_dir / "program.json", program_dump())
-    _atomic_json_write(version_dir / "lm.json", lm_dump())
-    _atomic_json_write(version_dir / "report.json", report)
-
-    approved = promote and isinstance(report, Mapping) and report.get("gate_passed") is True
-    if not approved:
-        return version_dir
-
-    current = module_root / "current"
-    temporary_link = module_root / f".current-{uuid.uuid4().hex}"
-    try:
-        os.symlink(version_dir.name, temporary_link)
-        os.replace(temporary_link, current)
-    except BaseException:
-        temporary_link.unlink(missing_ok=True)
-        raise
-    return version_dir
+    _atomic_json_write(module_dir / "program.json", program_dump())
+    _atomic_json_write(module_dir / "lm.json", lm_dump())
+    _atomic_json_write(module_dir / "report.json", report)
+    return module_dir
 
 
 def _load_dataset_loader(manifest: object) -> object:
@@ -923,19 +897,6 @@ def _baseline_means(manifest: object) -> dict[str, float]:
             raise OptimizeError(f"baseline {path} metric.{split}.mean is outside [0, 1]")
         means[split] = float(value)
     return means
-
-
-def _next_version(module_name: str) -> int:
-    root = Path("optimized") / module_name
-    versions: list[int] = []
-    if root.is_dir():
-        for path in root.iterdir():
-            if path.is_dir() and path.name.startswith("v"):
-                try:
-                    versions.append(int(path.name[1:]))
-                except ValueError:
-                    continue
-    return max(versions, default=0) + 1
 
 
 def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any:
@@ -1147,11 +1108,9 @@ def _run(argv=None) -> int:
         )
         artifact = write_artifact(
             cast(ModuleManifest, manifest).module_name,
-            _next_version(cast(ModuleManifest, manifest).module_name),
             program,
             lm,
             report,
-            promote=gate_passed,
         )
         print(
             f"cambium optimize: wrote {artifact}; gate_passed={gate_passed} "
@@ -1182,11 +1141,9 @@ def _run(argv=None) -> int:
             try:
                 artifact = write_artifact(
                     cast(ModuleManifest, manifest).module_name,
-                    _next_version(cast(ModuleManifest, manifest).module_name),
                     program,
                     lm,
                     report,
-                    promote=False,
                 )
             except (OptimizeError, OSError) as artifact_error:
                 print(

@@ -226,8 +226,9 @@ Tunables live in `src/cambium/modules/<name>/metric_config.yaml`: `weights`,
 `size_bounds`, `red_flags`, `allowed_red_flags`, `canary_floor`,
 `promotion_min_score`, and `promotion_min_confidence`. `config_version` pins
 scores and prompts. A change requires known-good/bad separation, frozen eval,
-and the applicable dataset-version bump. Production prompt promotion is a
-symlink swap under `optimized/<name>/v<N>/` with the previous version retained.
+and the applicable dataset-version bump. Production prompt promotion replaces
+the module's artifact set `optimized/<name>/{program.json,lm.json,report.json}`
+in place.
 
 ## 6. Anti-gaming matrix
 
@@ -408,9 +409,9 @@ extensions. Coding-task kinds use the patch predicates in Appendix B.
 
 Promotion stores model, temperature, metric-config version, dataset version,
 split digests, sibling pins, score/confidence, canary results, and human signoff.
-The optimizer never receives canaries or the metric source. Production uses a
-versioned pointer under `optimized/<name>/v<N>/`; retain the previous pointer
-for rollback. If a candidate fails any floor or canary, keep the deterministic
+The optimizer never receives canaries or the metric source. Production uses
+the single artifact set under `optimized/<name>/`; each run replaces it in
+place. If a candidate fails any floor or canary, keep the deterministic
 baseline and report the exact failing predicate.
 
 ## Appendix E. Anti-gaming matrix and test anchors

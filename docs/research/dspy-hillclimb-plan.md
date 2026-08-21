@@ -131,7 +131,7 @@ implemented):
 | `score_split` | Run one explicit split through the program and exact-match metric, returning its aggregate score and per-record evidence needed by the report. |
 | `run_stage_zero` | Run the uncompiled, zero-shot program and collect scores, calls, and cost. |
 | `run_stage_bootstrap` | Compile a fresh student with the planned BootstrapFewShot limits, then return the compiled program and measurements. |
-| `write_artifact` | Write an immutable version directory containing program state, LM state, and the JSON report; update `current` only after promotion. |
+| `write_artifact` | Write program state, LM state, and the JSON report into the module's single artifact directory, replacing the previous set in place. |
 
 The adapter must keep `cambium.modules.base.Example` and `dspy.Example`
 distinct. It must also read DSPy prediction attributes rather than depending on
@@ -143,11 +143,9 @@ The target layout is:
 
 ```text
 optimized/<module>/
-├── v<N>/
-│   ├── program.json
-│   ├── lm.json
-│   └── report.json
-└── current -> v<N>
+├── program.json
+├── lm.json
+└── report.json
 ```
 
 `program.json` stores the DSPy program state. `lm.json` stores the trusted
@@ -157,9 +155,8 @@ dataset version, split digests, baseline and candidate scores, canary gate
 results, call/cost totals, budget status, promotion decision, and the
 `train_gain - canary_gain` diagnostic. Exact report fields are **UNVERIFIED**.
 
-The version directory is written before the `current` symlink changes. A
-rejected candidate remains auditable, but a failed gate leaves the previous
-`current` target unchanged.
+Each run replaces the artifact set in place. A rejected candidate's report
+remains auditable with its failed-gate verdict.
 
 ## 3. Optimizer ladder
 
@@ -233,7 +230,7 @@ AND canaries == 1.0
 With the current baseline, `baseline_eval == 1.0`, so the drift floor is
 `0.95`. A candidate that ties the rule engine at `1.0` but costs more is a
 regression, not an improvement. The spike may retain its artifact for
-inspection, but it must not promote that costlier tie to `current`.
+inspection, but it must not promote that costlier tie.
 
 Promotion is an artifact-pointer operation only. Runtime module selection is
 outside this spike; no production caller is changed.

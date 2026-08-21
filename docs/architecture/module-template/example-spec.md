@@ -307,11 +307,9 @@ through the optional `dspy_program` manifest field and enforces the USD budget.
 The promotion gate is eval `≥ 0.85`, eval `≥ baseline - 0.05`, and 100%
 canaries. Optimize one named model at `temperature=0.0`, with pinned siblings
 (none today), and keep the rule-engine baseline. Human approval promotes a
-prompt; retain `optimized/should_decompose/v<N-1>/` for rollback via symlink
-swap. Each version writes
-`optimized/should_decompose/v<N>/{program.json,lm.json,report.json}` and the
-promoted version is addressed by the `current` symlink. Report
-`train_gain - canary_gain` as the anti-reward-hacking diagnostic. No separate
+prompt. Each run replaces
+`optimized/should_decompose/{program.json,lm.json,report.json}` in place.
+Report `train_gain - canary_gain` as the anti-reward-hacking diagnostic. No separate
 `eval.py` is claimed; the implemented CLI `operation: evaluate` and split
 metric functions remain the v2 evaluation surfaces.
 
@@ -490,9 +488,8 @@ of the rule-engine baseline, and pass all canaries. Enforce the USD budget.
 Optimize against a single named model at `temperature=0.0`, not a provider
 cascade, to avoid cross-model prompt transfer. Record `train_gain - canary_gain`
 as the reward-hacking diagnostic. A failed gate retains the existing
-deterministic engine. Promotion writes
-`optimized/should_decompose/v<N>/{program.json,lm.json,report.json}` and swaps
-the `current` symlink; the previous pointer remains available for rollback. No
+deterministic engine. Promotion replaces
+`optimized/should_decompose/{program.json,lm.json,report.json}` in place. No
 sibling is currently pinned because this is the first module; later interface
 changes require re-evaluating every module that pins it.
 

@@ -266,8 +266,8 @@ means deleting `src/cambium/modules/should_review/`; shared scenarios remain.
 
 The v2 rule engine is deterministic and needs no state optimizer. A v2.1
 DSPy replacement (state optimizer `dspy.SIMBA` or `dspy.GEPA`, train 40, max
-steps as configured) would require human approval for promotion, retain
-`optimized/<name>/v<N-1>/`, promote by symlink swap for rollback, hold out the
+steps as configured) would require human approval for promotion, replace
+`optimized/<name>/{program.json,lm.json,report.json}` in place, hold out the
 10-record eval set, gate at ≥ 0.95 aggregate, and pass 100% of canaries at
 `temperature=0.0`.
 
