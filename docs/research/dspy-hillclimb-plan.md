@@ -232,8 +232,8 @@ With the current baseline, `baseline_eval == 1.0`, so the drift floor is
 regression, not an improvement. The spike may retain its artifact for
 inspection, but it must not promote that costlier tie.
 
-Promotion is an artifact-pointer operation only. Runtime module selection is
-outside this spike; no production caller is changed.
+Each run replaces the module's artifact set in place. Runtime module selection
+is outside this spike; no production caller is changed.
 
 ## 6. Known pitfalls and compatibility checks
 
