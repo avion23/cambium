@@ -343,9 +343,7 @@ def test_nested_extension_credential_keys_cannot_reach_dump_state(key: str) -> N
 def test_post_construction_nested_mutation_cannot_reach_dump_state() -> None:
     _require_dspy()
     extensions: dict[str, Any] = {"nested": {}}
-    lm = CambiumLM(
-        FakeDiffundo(), ProviderTier.FAST, extensions=extensions
-    )  # type: ignore[arg-type]
+    lm = CambiumLM(FakeDiffundo(), ProviderTier.FAST, extensions=extensions)  # type: ignore[arg-type]
 
     extensions["nested"]["api_key"] = "SENSITIVE_CANARY"
 
@@ -488,9 +486,7 @@ def test_copy_rejects_hostile_private_keys_without_tier_or_provider_corruption()
         ("acall", "request"),
     ],
 )
-def test_hostile_former_parameter_key_cannot_change_provider(
-    entry_point: str, key: str
-) -> None:
+def test_hostile_former_parameter_key_cannot_change_provider(entry_point: str, key: str) -> None:
     _require_dspy()
     import dspy
 
@@ -517,6 +513,7 @@ def test_hostile_former_parameter_key_cannot_change_provider(
         elif entry_point == "call":
             lm(**hostile_kwargs)
         else:
+
             async def invoke() -> None:
                 await lm.acall(**hostile_kwargs)
 
@@ -626,9 +623,7 @@ def test_per_call_max_tokens_reaches_diffundo() -> None:
     diffundo = FakeDiffundo()
     lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
 
-    assert lm(messages=[{"role": "user", "content": "hello"}], max_tokens=1) == [
-        "completion text"
-    ]
+    assert lm(messages=[{"role": "user", "content": "hello"}], max_tokens=1) == ["completion text"]
     assert diffundo.calls[0]["prompt"]["max_tokens"] == 1
 
 

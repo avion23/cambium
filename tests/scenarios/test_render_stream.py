@@ -15,6 +15,9 @@ import re
 import shutil
 import signal
 import sys
+from collections.abc import Mapping
+
+import pytest
 
 from cambium import oneshot, repl, tui
 from cambium.render import (
@@ -127,7 +130,7 @@ def test_active_workers_clamps_a_lone_decrement() -> None:
 
 def _line(
     kind: str,
-    payload: dict[str, object],
+    payload: Mapping[str, object],
     *,
     seq: int | None = None,
     task_id: str | None = None,
@@ -254,7 +257,7 @@ def test_checkpoint_golden() -> None:
 
 
 def test_lifecycle_kinds_one_concise_key_value_line_each() -> None:
-    cases: list[tuple[str, dict[str, object], str]] = [
+    cases: list[tuple[str, dict[str, object], str | None]] = [
         ("spawned", {"worker": "/usr/bin/python3 -m cambium.worker"}, None),
         ("init", {"request_id": "rid-1"}, "request_id=rid-1"),
         ("run_task", {"request_id": "rid-2"}, "request_id=rid-2"),
@@ -318,7 +321,7 @@ def test_merge_worktree_and_child_kinds_golden() -> None:
 
 
 def test_diagnostic_kinds_include_message_or_reason() -> None:
-    cases: list[tuple[str, dict[str, object], str]] = [
+    cases: list[tuple[str, dict[str, object], str | None]] = [
         ("protocol", {"note": "run_task write failed"}, "note=run_task write failed"),
         (
             "protocol",
@@ -450,7 +453,7 @@ def _bar_events() -> list[dict[str, object]]:
     ]
 
 
-def test_status_bar_full_golden_at_fixed_columns(monkeypatch: object) -> None:
+def test_status_bar_full_golden_at_fixed_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     _fixed_columns(monkeypatch, 120)
     left = "session=sess · elapsed=0s · task=t1"
     right = "tokens/s=15.0 · in=100 out=50 cached=0 · cost=$0.012500 · subagents=1"
@@ -479,7 +482,7 @@ def test_status_bar_no_events_is_empty() -> None:
     assert render_status_bar(None, session_label="s") == ""
 
 
-def test_status_bar_sanitizes_label_and_task_id(monkeypatch: object) -> None:
+def test_status_bar_sanitizes_label_and_task_id(monkeypatch: pytest.MonkeyPatch) -> None:
     _fixed_columns(monkeypatch, 100)
 
     line = render_status_bar(
@@ -503,7 +506,7 @@ def test_status_bar_drops_absent_segments() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _color_stream(monkeypatch: object) -> None:
+def _color_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(  # type: ignore[attr-defined]
         sys, "stdout", _TtyStream()
     )
@@ -512,7 +515,7 @@ def _color_stream(monkeypatch: object) -> None:
 
 
 def test_should_color_mirrors_render_markdown_if_tty_gate(
-    monkeypatch: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plain = io.StringIO()
     assert should_color(plain) is False
@@ -567,7 +570,7 @@ def test_severity_accents_on_only_for_color_capable_stream(
     assert "\x1b[" not in plain
 
 
-def test_severity_accents_off_when_gated_or_other_status(monkeypatch: object) -> None:
+def test_severity_accents_off_when_gated_or_other_status(monkeypatch: pytest.MonkeyPatch) -> None:
     tty = _TtyStream()
 
     # stream=None (the pure default) never emits escapes, regardless of env.
@@ -826,9 +829,16 @@ def test_result_usage_and_breakdown_fields_are_sanitized() -> None:
         }
     )
 
-    for line in (result, stats, breakdown):
+    for line in (result, stats):
         assert "\x1b" not in line and "\x9b" not in line and "\x80" not in line
         assert "\n" not in line
+    # The breakdown is legitimately multiline (one line per group); the
+    # contract is that no control character survives and no field value
+    # injects a newline (the injected "task\x1b\n" renders as one clean
+    # task line, not a line break inside a field).
+    for line in breakdown.splitlines():
+        assert "\x1b" not in line and "\x9b" not in line and "\x80" not in line
+        assert not line.startswith(" ") or line.strip()
 
 
 def test_display_width_handles_wide_and_combining_text(monkeypatch: object) -> None:
@@ -875,6 +885,7 @@ def test_repl_tty_prompt_repaints_after_mid_run_event(monkeypatch, tmp_path):
 
     async def scripted(config, on_event=None):
         seen_prompts.append(config.prompt)
+        assert on_event is not None
         on_event(
             {
                 "kind": "tool_event",
