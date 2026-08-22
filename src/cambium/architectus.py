@@ -569,6 +569,7 @@ class ArchitectusCore:
         for raw_index, action in enumerate(proposed_actions):
             kind = ActionKind(action["action"])
             if kind is ActionKind.SPAWN:
+                capacity = max(self._max_width - len(self._in_flight), 0)
                 task_id = self._action_task_id(action)
                 if (
                     task_id not in ready_rank
@@ -610,6 +611,15 @@ class ArchitectusCore:
                     aborted_descendant_spawn_ids.update(subtree - {task_id})
                     spawn_segment += 1
             non_spawn.append((raw_index, action))
+
+        capacity = max(self._max_width - len(self._in_flight), 0)
+        if len(accepted_spawn_ids) > capacity:
+            accepted_spawn_ids = accepted_spawn_ids[:capacity]
+            accepted_spawns = [
+                accepted
+                for accepted in accepted_spawns
+                if accepted[1] in accepted_spawn_ids
+            ]
 
         spawn_assignments: dict[int, str] = {}
         spawn_segments: dict[int, list[tuple[int, str]]] = {}
@@ -723,10 +733,10 @@ class ArchitectusCore:
     def _tree_state(self, ready: Sequence[Any], blocked: set[str]) -> dict[str, Any]:
         nodes: list[dict[str, Any]] = []
         for node in sorted(self._tree.nodes, key=self._node_order_key):
-            if node.task_id in self._finished:
-                status = self._finished[node.task_id]["status"]
-            elif node.task_id in blocked:
+            if node.task_id in blocked or node.task_id in self._failed_subtrees:
                 status = NodeStatus.FAILED.value
+            elif node.task_id in self._finished:
+                status = self._finished[node.task_id]["status"]
             elif node.task_id in self._in_flight:
                 status = NodeStatus.RUNNING.value
             else:

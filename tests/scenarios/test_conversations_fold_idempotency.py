@@ -46,6 +46,78 @@ def test_fold_twice_does_not_change_the_store(tmp_path) -> None:
         store.close()
 
 
+def test_fold_race_keeps_an_append_on_the_active_path(tmp_path, monkeypatch) -> None:
+    store = ConversationStore(tmp_path / "conversations.db", fsync_interval_s=60.0)
+    ready = threading.Event()
+    release = threading.Event()
+    original_history = store.history
+    fold_ids: list[int | None] = []
+    errors: list[BaseException] = []
+
+    def delayed_history(node_id: str, **kwargs):
+        records = original_history(node_id, **kwargs)
+        if node_id == "node" and not ready.is_set():
+            ready.set()
+            release.wait(5.0)
+        return records
+
+    monkeypatch.setattr(store, "history", delayed_history)
+    try:
+        first = store.append("node", "user", "first")
+
+        def fold_one() -> None:
+            try:
+                fold_ids.append(store.fold("node", "folded", tokens_before=1, tokens_after=1))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=fold_one)
+        thread.start()
+        assert ready.wait(5.0)
+        concurrent = store.append("node", "assistant", "concurrent")
+        release.set()
+        thread.join(5.0)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert len(fold_ids) == 1
+        assert fold_ids[0] is not None
+        records = original_history("node")
+        assert [record["id"] for record in records] == [first, concurrent, fold_ids[0]]
+    finally:
+        release.set()
+        store.close()
+
+
+def test_add_summary_requires_active_path_and_current_head(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "conversations.db", fsync_interval_s=60.0)
+    try:
+        outside = store.append("other", "user", "outside")
+        first = store.append("node", "user", "first")
+        head = store.append("node", "assistant", "head")
+
+        with pytest.raises(ValueError, match="covers_from.*active path"):
+            store.add_summary(
+                "node",
+                "bad path",
+                covers_from=outside,
+                covers_to=head,
+                tokens_before=2,
+                tokens_after=1,
+            )
+        with pytest.raises(ValueError, match="current head"):
+            store.add_summary(
+                "node",
+                "stale head",
+                covers_from=first,
+                covers_to=first,
+                tokens_before=2,
+                tokens_after=1,
+            )
+    finally:
+        store.close()
+
+
 def test_two_writers_preserve_complete_records_and_one_fold(tmp_path) -> None:
     store = ConversationStore(tmp_path / "conversations.db", fsync_interval_s=60.0)
     barrier = threading.Barrier(2)

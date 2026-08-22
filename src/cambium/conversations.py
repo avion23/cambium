@@ -97,6 +97,10 @@ class ConversationStoreInitError(ConversationStoreError):
     """The conversation store failed to initialize."""
 
 
+class _SummaryHeadChanged(ValueError):
+    """A fold raced an append and must recompute its covered range."""
+
+
 class _Pending:
     """Completion state for one queued write."""
 
@@ -281,44 +285,53 @@ class ConversationStore:
     ) -> int | None:
         self._validate_node_id(node_id)
         self._validate_content(content)
-        records = self.history(node_id)
-        if not records:
-            return None
-        latest_summary_index = next(
-            (
-                index
-                for index in range(len(records) - 1, -1, -1)
-                if records[index]["kind"] == _SUMMARY_ROLE
-            ),
-            None,
-        )
-        if covers_from is None and covers_to is None and latest_summary_index is not None:
-            latest_summary = records[latest_summary_index]
-            summary_meta = latest_summary["meta"]
-            previous_cursor = (
-                summary_meta.get("covers_to") if isinstance(summary_meta, dict) else None
+        automatic_range = covers_from is None and covers_to is None
+        while True:
+            records = self.history(node_id)
+            if not records:
+                return None
+            effective_from = covers_from
+            effective_to = covers_to
+            effective_folded_from = folded_from
+            latest_summary_index = next(
+                (
+                    index
+                    for index in range(len(records) - 1, -1, -1)
+                    if records[index]["kind"] == _SUMMARY_ROLE
+                ),
+                None,
             )
-            delta = records[latest_summary_index + 1 :]
-            if not delta:
-                return latest_summary["id"]
-            covers_from = delta[0]["id"]
-            covers_to = delta[-1]["id"]
-            if folded_from is None and isinstance(previous_cursor, int):
-                folded_from = previous_cursor
-        if covers_from is None:
-            covers_from = int(records[0]["id"])
-        if covers_to is None:
-            covers_to = int(records[-1]["id"])
-        return self.add_summary(
-            node_id,
-            content,
-            covers_from=covers_from,
-            covers_to=covers_to,
-            tokens_before=tokens_before,
-            tokens_after=tokens_after,
-            state_version=state_version,
-            folded_from=folded_from,
-        )
+            if effective_from is None and effective_to is None and latest_summary_index is not None:
+                latest_summary = records[latest_summary_index]
+                summary_meta = latest_summary["meta"]
+                previous_cursor = (
+                    summary_meta.get("covers_to") if isinstance(summary_meta, dict) else None
+                )
+                delta = records[latest_summary_index + 1 :]
+                if not delta:
+                    return latest_summary["id"]
+                effective_from = delta[0]["id"]
+                effective_to = delta[-1]["id"]
+                if effective_folded_from is None and isinstance(previous_cursor, int):
+                    effective_folded_from = previous_cursor
+            if effective_from is None:
+                effective_from = int(records[0]["id"])
+            if effective_to is None:
+                effective_to = int(records[-1]["id"])
+            try:
+                return self.add_summary(
+                    node_id,
+                    content,
+                    covers_from=effective_from,
+                    covers_to=effective_to,
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_after,
+                    state_version=state_version,
+                    folded_from=effective_folded_from,
+                )
+            except _SummaryHeadChanged:
+                if not automatic_range:
+                    raise
 
     def branch(self, node_id: str, from_id: int) -> int:
         """Create a branch marker for ``node_id`` below conversation row ``from_id``.
@@ -604,6 +617,25 @@ class ConversationStore:
                 for existing_id, existing_meta in existing:
                     if self._summary_range(existing_meta) == summary_range:
                         return int(existing_id)
+
+                head = conn.execute(_SELECT_HEAD, (node_id,)).fetchone()
+                if head is None:
+                    raise ValueError(
+                        f"summary range is not on node {node_id!r}'s active path"
+                    )
+                head_id = int(head[0])
+                covers_from, covers_to = summary_range
+                if covers_to != head_id:
+                    raise _SummaryHeadChanged(
+                        f"summary covers_to {covers_to} is not the current head "
+                        f"{head_id} of node {node_id!r}"
+                    )
+                path_ids = {record["id"] for record in self._chain(conn, head_id)}
+                if covers_from not in path_ids:
+                    raise ValueError(
+                        f"summary covers_from {covers_from} is not on node "
+                        f"{node_id!r}'s active path"
+                    )
 
         if parent_id is None:
             parent = conn.execute(
