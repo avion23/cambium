@@ -19,6 +19,7 @@ it inspects.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -178,7 +179,11 @@ def _session_entry(path: Path) -> SessionEntry | None:
 def _timestamp(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return float("-inf")
-    return float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return float("-inf")
+    return number if math.isfinite(number) else float("-inf")
 
 
 def _sort_key(record: dict[str, Any], path: Path) -> tuple[float, float, str]:

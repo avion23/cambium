@@ -251,7 +251,7 @@ def _event_detail(kind: str, payload: Mapping[str, Any]) -> str:
 
 
 def _set_state(agent: _Agent, state: str) -> None:
-    if agent.state in _TERMINAL_STATES and state not in _TERMINAL_STATES:
+    if agent.state in _TERMINAL_STATES:
         return
     if state in _TERMINAL_STATES:
         agent.state = state
@@ -279,24 +279,34 @@ def _checkpoint_path(session_dir: Path, checkpoint_ref: str) -> Path | None:
     relative = Path(checkpoint_ref)
     if relative.is_absolute() or ".." in relative.parts:
         return None
+    session_root = session_dir.resolve()
+    state_root = (session_root / ".cambium").resolve()
+    try:
+        state_root.relative_to(session_root)
+    except ValueError:
+        return None
     roots = (
-        session_dir / ".cambium" / "checkpoints",
-        session_dir / ".cambium" / "context",
-        session_dir / ".cambium" / "epochs",
-        session_dir / ".cambium",
-        session_dir,
+        session_root / ".cambium" / "checkpoints",
+        session_root / ".cambium" / "context",
+        session_root / ".cambium" / "epochs",
+        session_root / ".cambium",
+        session_root,
     )
     for root in roots:
-        candidate = root / relative
+        try:
+            candidate = (root / relative).resolve()
+            candidate.relative_to(session_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
         if candidate.is_file():
             return candidate
-    state_root = session_dir / ".cambium"
     if state_root.is_dir():
         matches = tuple(state_root.rglob(relative.name))
         for candidate in matches:
             try:
+                candidate = candidate.resolve()
                 candidate.relative_to(state_root)
-            except ValueError:
+            except (OSError, RuntimeError, ValueError):
                 continue
             if candidate.is_file():
                 return candidate

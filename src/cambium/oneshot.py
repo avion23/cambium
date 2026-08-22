@@ -433,6 +433,25 @@ def _resolve_provider(
     except (OSError, ProviderSelectionError, ValueError) as exc:
         raise ValueError(f"provider selection failed: {exc}") from exc
 
+    # AUDIT-001: an explicitly selected provider must be authorized before it
+    # can become the assigned primary. Otherwise a credentialed sibling could
+    # be handed to the worker while the selected provider silently fell back.
+    # Codex-oauth providers are the intentional exception to the API-key
+    # check: their credential is an OAuth document, not an api_key_env key.
+    store = auth_store if auth_store is not None else AuthStore()
+    authorized = _authorized_provider_names(providers, store)
+    if not _is_codex_oauth_provider(selected) and not selected.api_key_env:
+        raise ValueError(
+            f"selected provider {selected.name!r} is not authorized: "
+            "no credential key is configured"
+        )
+    if not any(candidate.name == selected.name for candidate in authorized):
+        raise ValueError(
+            f"selected provider {selected.name!r} is not authorized: "
+            "credential is unavailable"
+        )
+    codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
+
     effective_model = config.model if config.model is not None else selected.model
     if not isinstance(effective_model, str) or not effective_model:
         raise ValueError(f"provider {selected.name!r} has no configured model")
@@ -441,17 +460,9 @@ def _resolve_provider(
             f"model {effective_model!r} is not configured for provider {selected.name!r}"
         )
 
-    # AUDIT-001: an explicit provider is pinned as the assigned primary; same-
-    # tier authorized siblings remain as fallback candidates behind it. The
-    # authorized set is every provider with a usable credential so a sibling
-    # cascade never routes to a provider whose credential was never loaded.
-    # The env-key whitelist must match: a sibling without its key in the
-    # worker environment can only fail with AUTH_ERROR. Codex-oauth providers
-    # are excluded — their access token travels via CAMBIUM_OAUTH_* injection,
-    # never an api_key_env.
-    store = auth_store if auth_store is not None else AuthStore()
-    authorized = _authorized_provider_names(providers, store)
-    codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
+    # Same-tier authorized siblings remain as fallback candidates behind the
+    # assigned primary. The env-key whitelist must match: a sibling without
+    # its key in the worker environment can only fail with AUTH_ERROR.
     if len(codex_authorized) > 1:
         raise ValueError(
             "multiple codex_chatgpt providers have stored oauth sessions; "
@@ -476,7 +487,7 @@ def _resolve_provider(
         provider_env_keys=tuple(
             candidate.api_key_env
             for candidate in authorized
-            if not _is_codex_oauth_provider(candidate)
+            if not _is_codex_oauth_provider(candidate) and candidate.api_key_env
         ),
         fanout_config=fanout_config,
     )
@@ -516,6 +527,8 @@ def build_plan(
             else default_session_root(target_repo)
         )
     )
+    if config.session_mode is SessionMode.RESUME:
+        admit_session(config, target_session)
     task_id = config.task_id or "oneshot"
     worktree = (
         Path(config.worktree_path).expanduser().resolve()
@@ -566,9 +579,20 @@ def admit_session(config: OneShotConfig, session_dir: Path) -> None:
     under the admission lock; this function is the single source for the
     policy so run/REPL/TUI/resume cannot diverge.
     """
+    path = Path(session_dir).expanduser().resolve()
     if config.session_mode is SessionMode.RESUME:
+        artifacts = (
+            path / "plan.json",
+            path / ".cambium" / "events.db",
+            path / ".cambium" / "result.json",
+        )
+        if not path.is_dir() or not any(artifact.is_file() for artifact in artifacts):
+            raise ValueError(
+                "one-shot resume requires an existing session with plan.json or "
+                f"run artifacts: {path}"
+            )
         return
-    _reject_reused_session(session_dir)
+    _reject_reused_session(path)
 
 
 async def run_oneshot(
@@ -585,6 +609,10 @@ async def run_oneshot(
     if explicit_session_dir is not None:
         preflight(config, repo, explicit_session_dir)
         admit_session(config, explicit_session_dir)
+    elif config.session_mode is SessionMode.RESUME:
+        raise ValueError(
+            "one-shot resume requires an explicit existing session directory"
+        )
 
     resolved, provider_environment = _resolve_provider(config, repo)
     session_dir = (
