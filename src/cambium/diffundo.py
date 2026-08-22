@@ -600,9 +600,21 @@ class _RawResponse:
             usage.pop("cached_tokens", None)
             if cached_tokens is not None:
                 usage["cached_tokens"] = cached_tokens
+        reported = self.payload.get("model")
+        if (
+            isinstance(reported, str)
+            and reported
+            and provider.model
+            and reported != provider.model
+        ):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                f"untrusted response model {reported!r} does not match configured {provider.model!r}",
+            )
         return CallResult(
             provider=provider.name,
-            model=self.payload.get("model") or provider.model,
+            model=reported if isinstance(reported, str) and reported else provider.model,
             tier=provider.tier,
             content=content,
             latency_s=self.latency_s,
@@ -646,12 +658,23 @@ class _CodexRawResponse(_RawResponse):
             )
         usage = _codex_usage(self.payload)
         response = self.payload.get("response")
-        model = provider.model
-        if isinstance(response, dict) and isinstance(response.get("model"), str):
-            model = response["model"]
+        reported = (
+            response.get("model") if isinstance(response, dict) else None
+        )
+        if (
+            isinstance(reported, str)
+            and reported
+            and provider.model
+            and reported != provider.model
+        ):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                f"untrusted response model {reported!r} does not match configured {provider.model!r}",
+            )
         return CallResult(
             provider=provider.name,
-            model=model,
+            model=reported if isinstance(reported, str) and reported else provider.model,
             tier=provider.tier,
             content=self.text,
             latency_s=self.latency_s,
