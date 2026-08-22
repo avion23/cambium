@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import codecs
 import os
+import signal
 import sys
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol, TextIO, cast
@@ -36,6 +40,74 @@ else:
 _BAR_TERMINAL_KINDS = frozenset(
     {"result", "session_ended", "exit", "worker_failed", "reuse_ready"}
 )
+
+_PROMPT = "cambium> "
+
+
+def _read_stdin_byte() -> bytes:
+    """Read one raw byte from stdin (patch point for tests)."""
+    return os.read(0, 1)
+
+
+class _TtyLineReader:
+    """Byte-at-a-time tty line reader with prompt echo.
+
+    Enter submits the accumulated partial line; DEL/NUL-backspace edits it and
+    repaints the prompt; unhandled CSI/arrow escape sequences are swallowed
+    without submitting; EOF returns ``None``.  Typed characters are not echoed
+    here (the tty driver echoes in canonical mode); only edits and event-driven
+    repaints redraw ``clear-line + prompt + partial``.
+    """
+
+    def __init__(self, output_stream: TextIO, *, echo: bool) -> None:
+        self._out = output_stream
+        self._echo = echo
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.partial = ""
+
+    def write_prompt(self) -> None:
+        if not self._echo:
+            return
+        self._out.write("\r\033[K" + _PROMPT + self.partial)
+        self._out.flush()
+
+    def _skip_csi(self) -> None:
+        data = _read_stdin_byte()
+        if not data or data != b"[":
+            return
+        while True:
+            data = _read_stdin_byte()
+            if not data or 0x40 <= data[0] <= 0x7E:
+                return
+
+    def read_line(self) -> str | None:
+        self.partial = ""
+        self._decoder.reset()
+        self.write_prompt()
+        while True:
+            data = _read_stdin_byte()
+            if not data:
+                return None
+            for ch in self._decoder.decode(data):
+                if ch in ("\r", "\n"):
+                    return self.partial
+                if ch in ("\x7f", "\b"):
+                    if self.partial:
+                        self.partial = self.partial[:-1]
+                        self.write_prompt()
+                elif ch == "\x1b":
+                    self._skip_csi()
+                else:
+                    self.partial += ch
+
+    def __iter__(self) -> Iterator[str]:
+        return self
+
+    def __next__(self) -> str:
+        line = self.read_line()
+        if line is None:
+            raise StopIteration
+        return line
 
 
 def _config_for_prompt(config: OneShotConfig, prompt: str) -> OneShotConfig:
@@ -85,14 +157,42 @@ async def run_repl(
     error_stream = cast(TextIO, sys.stderr if error_stream is None else error_stream)
 
     history_path = None
-    if readline is not None and getattr(input_stream, "isatty", lambda: False)():
+    input_tty = bool(getattr(input_stream, "isatty", lambda: False)())
+    if readline is not None and input_tty:
         history_path = _history_path(config)
         _load_history(history_path)
+
+    loop = asyncio.get_running_loop()
+    turn_task: asyncio.Task[Any] | None = None
+    sigint_fired = False
+
+    def _on_sigint() -> None:
+        nonlocal sigint_fired
+        sigint_fired = True
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
+
+    sigint_installed = False
+    if input_tty:
+        try:
+            loop.add_signal_handler(signal.SIGINT, _on_sigint)
+            sigint_installed = True
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    reader: _TtyLineReader | None = None
+    if input_tty:
+        reader = _TtyLineReader(
+            output_stream,
+            echo=bool(getattr(output_stream, "isatty", lambda: False)()),
+        )
+
+    line_source: Any = reader if reader is not None else input_stream
 
     try:
         failed = False
         usage_events: list[dict[str, Any]] = []
-        for line in input_stream:
+        for line in line_source:
             prompt = line.rstrip("\r\n")
             if prompt == "/exit":
                 break
@@ -121,6 +221,8 @@ async def run_repl(
                     _events.append(record)
                     if record.get("kind") == "usage_event":
                         usage_events.append(record)
+                    if sigint_fired:
+                        return
                     if not _stream_tty:
                         output_stream.write(
                             render.render_event_line(record, stream=output_stream)
@@ -143,9 +245,33 @@ async def run_repl(
                             output_stream.write(bar + "\n")
                         if record.get("kind") in _BAR_TERMINAL_KINDS:
                             bar_live = False
+                    if reader is not None:
+                        reader.write_prompt()
                     output_stream.flush()
 
-                result = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
+                if input_tty:
+                    turn_task = loop.create_task(
+                        oneshot.run_oneshot(prompt_config, on_event=_live_sink)
+                    )
+                    try:
+                        result = await turn_task
+                    except asyncio.CancelledError:
+                        if not sigint_fired:
+                            raise
+                        bar = render.render_status_bar(
+                            events, session_label=session_label
+                        )
+                        if stream_tty:
+                            output_stream.write("\r\033[K")
+                            if bar:
+                                output_stream.write(bar + "\n")
+                            output_stream.write("interrupted\n")
+                            output_stream.flush()
+                        continue
+                    finally:
+                        turn_task = None
+                else:
+                    result = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
                 rendered = render.render_text_result(result)
                 usage = stats.usage_stats_from_events(usage_events)
                 if usage is not None:
@@ -188,6 +314,8 @@ async def run_repl(
     except KeyboardInterrupt:
         return ExitCode.INTERRUPTED
     finally:
+        if sigint_installed:
+            loop.remove_signal_handler(signal.SIGINT)
         if history_path is not None:
             _save_history(history_path)
     return ExitCode.FAILURE if failed else ExitCode.SUCCESS

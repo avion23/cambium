@@ -784,3 +784,107 @@ def test_nested_container_dump_escapes_c1_controls() -> None:
     assert "\x1b" not in line
     _assert_terminal_safe(line)
     assert 'note=["a\\u009bb"]' in line
+# REPL raw-tty input discipline: reads, prompt repaint, per-turn SIGINT
+# ---------------------------------------------------------------------------
+
+import signal
+
+
+def test_repl_raw_tty_reader_backspace_edits_partial(monkeypatch):
+    feed = iter([b"a", b"b", b"\x7f", b"c", b"\n"])
+    monkeypatch.setattr(repl, "_read_stdin_byte", lambda: next(feed))
+    out = io.StringIO()
+
+    reader = repl._TtyLineReader(out, echo=True)
+    assert reader.read_line() == "ac"
+    # backspace repainted clear-line + prompt + surviving partial twice (a, ab)
+    assert out.getvalue().count("\r\033[Kcambium> ") == 2
+
+
+def test_repl_raw_tty_reader_swallows_arrow_csi_without_submit(monkeypatch):
+    feed = iter([b"x", b"\x1b", b"[", b"A", b"y", b"\n"])
+    monkeypatch.setattr(repl, "_read_stdin_byte", lambda: next(feed))
+
+    reader = repl._TtyLineReader(io.StringIO(), echo=False)
+    assert reader.read_line() == "xy"
+
+
+def test_repl_tty_prompt_repaints_after_mid_run_event(monkeypatch, tmp_path):
+    seen_prompts = []
+
+    async def scripted(config, on_event=None):
+        seen_prompts.append(config.prompt)
+        on_event({"kind": "tool_event", "payload": {"tool": "run_shell", "cmd": "df -h", "ok": True, "duration_ms": 5}})
+        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+    monkeypatch.setattr(oneshot, "run_oneshot", scripted)
+    feed = iter([b"h", b"i", b"\n", b""])
+    monkeypatch.setattr(repl, "_read_stdin_byte", lambda: next(feed))
+    out = _TtyStream()
+
+    assert asyncio.run(repl.run_repl(
+        oneshot.OneShotConfig(repo=tmp_path),
+        input_stream=_TtyStream(""),
+        output_stream=out,
+        error_stream=io.StringIO(),
+    )) == 0
+    assert seen_prompts == ["hi"]
+    text = out.getvalue()
+    assert text.startswith("\r\033[Kcambium> ")
+    repaint_after_event = text.index("\r\033[Kcambium> ", text.index("run_shell df -h OK 5ms"))
+    assert repaint_after_event > text.index("session=")
+
+
+def test_repl_sigint_handler_cancels_turn_and_loop_continues(monkeypatch, tmp_path):
+    seen_prompts = []
+
+    async def scripted(config, on_event=None):
+        seen_prompts.append(config.prompt)
+        if config.prompt == "hi":
+            captured["handler"]()
+            await asyncio.sleep(3600)
+        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+    monkeypatch.setattr(oneshot, "run_oneshot", scripted)
+    feed = iter([b"hi\n", b"/exit\n", b""])
+    monkeypatch.setattr(repl, "_read_stdin_byte", lambda: next(feed))
+    out = _TtyStream()
+    captured: dict[str, object] = {}
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        original = loop.add_signal_handler
+
+        def spy(sig, callback, *args):
+            if sig == signal.SIGINT:
+                captured["handler"] = callback
+            return original(sig, callback, *args)
+
+        loop.add_signal_handler = spy
+        return await repl.run_repl(
+            oneshot.OneShotConfig(repo=tmp_path),
+            input_stream=_TtyStream(""),
+            output_stream=out,
+            error_stream=io.StringIO(),
+        )
+
+    assert asyncio.run(scenario()) == 0
+    assert callable(captured["handler"])
+    assert seen_prompts == ["hi"]  # interrupted turn never submitted a second run
+    assert "interrupted" in out.getvalue()
+
+
+def test_repl_non_tty_scripted_prompt_has_no_echo_or_escapes(monkeypatch, tmp_path):
+    monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
+    out = io.StringIO()
+
+    assert asyncio.run(repl.run_repl(
+        oneshot.OneShotConfig(repo=tmp_path),
+        input_stream=io.StringIO("hi\n/exit\n"),
+        output_stream=out,
+        error_stream=io.StringIO(),
+    )) == 0
+    text = out.getvalue()
+    assert "cambium>" not in text
+    assert "\r\033[K" not in text
+    assert "run_shell df -h OK 5ms" in text
