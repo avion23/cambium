@@ -3467,7 +3467,21 @@ class _Runtime:
                 "worker_reused", task_id=task_id, generation=generation, pid=pooled.pid
             )
         if pooled is None:
-            await self.emit("spawned", task_id=task_id, generation=generation, worker=" ".join(cmd))
+            # Record which provider credential NAMES the worker env carries —
+            # never values. A cascade fallback failing with AUTH_ERROR for a
+            # name absent here is a supervisor injection defect, not a
+            # provider outage; without this the delivery hop is unauditable.
+            await self.emit(
+                "spawned",
+                task_id=task_id,
+                generation=generation,
+                worker=" ".join(cmd),
+                provider_env_keys=sorted(
+                    key
+                    for key in env
+                    if key.startswith("CAMBIUM_PROVIDER_") and env[key]
+                ),
+            )
         try:
             if pooled is not None:
                 proc = pooled
