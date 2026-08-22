@@ -1,0 +1,27 @@
+name: export-source
+
+on:
+  push:
+    branches:
+      - codex/production-harness-v2
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Archive exact checkout
+        run: |
+          git rev-parse HEAD > SOURCE_SHA
+          tar --exclude=.git --exclude=.venv -czf cambium-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cambium-source
+          path: cambium-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
