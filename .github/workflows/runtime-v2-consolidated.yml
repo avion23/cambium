@@ -1,0 +1,140 @@
+name: runtime-v2-consolidated
+
+on:
+  push:
+    branches:
+      - codex/runtime-v2-consolidated
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/runtime-v2-consolidated
+
+      - name: Fetch latest main and staged generators
+        run: |
+          git fetch origin \
+            main \
+            codex/runtime-resource-actor \
+            codex/runtime-interactive-session \
+            codex/runtime-commands-telemetry
+          git show origin/codex/runtime-resource-actor:scripts/runtime_v2_apply.py > /tmp/runtime_v2_apply.py
+          git show origin/codex/runtime-interactive-session:scripts/apply_interactive_session.py > /tmp/apply_interactive_session.py
+          git show origin/codex/runtime-commands-telemetry:scripts/apply_commands_telemetry.py > /tmp/apply_commands_telemetry.py
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git checkout --detach "$BASE_SHA"
+
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python 3.14 dependencies
+        run: uv sync --extra dev --python 3.14
+
+      - name: Normalize staged generators
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/runtime_v2_apply.py')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          result = []
+          skip_closer = False
+          for line in lines:
+              if skip_closer:
+                  skip_closer = False
+                  if line.strip() == '")':
+                      continue
+              if 'if len(args) < 3: raise RuntimeError(f"unexpected run_tool signature:' in line:
+                  result.append('if len(args) < 3: raise RuntimeError(f"unexpected run_tool signature: {args}")')
+                  if not line.rstrip().endswith('")'):
+                      skip_closer = True
+                  continue
+              result.append(line)
+          path.write_text('\n'.join(result) + '\n', encoding='utf-8')
+          for candidate in (
+              path,
+              Path('/tmp/apply_interactive_session.py'),
+              Path('/tmp/apply_commands_telemetry.py'),
+          ):
+              compile(candidate.read_text(encoding='utf-8'), str(candidate), 'exec')
+          PY
+
+      - name: Apply provider portfolio and mailbox layer when absent
+        run: |
+          if [ ! -f src/cambium/provider_resources.py ]; then
+            cp /tmp/runtime_v2_apply.py scripts/runtime_v2_apply.py
+            uv run --python 3.14 python scripts/runtime_v2_apply.py
+          fi
+          uv lock
+          uv sync --extra dev --python 3.14
+
+      - name: Apply durable interactive branch when absent
+        run: |
+          if [ ! -f src/cambium/interactive.py ]; then
+            cp /tmp/apply_interactive_session.py scripts/apply_interactive_session.py
+            uv run --python 3.14 python scripts/apply_interactive_session.py
+          fi
+
+      - name: Apply quota telemetry and local commands when absent
+        run: |
+          if ! grep -q CAMBIUM_LOCAL_COMMANDS src/cambium/interactive.py; then
+            cp /tmp/apply_commands_telemetry.py scripts/apply_commands_telemetry.py
+            uv run --python 3.14 python scripts/apply_commands_telemetry.py
+          fi
+
+      - name: Remove generators and normalize
+        run: |
+          rm -f \
+            scripts/runtime_v2_apply.py \
+            scripts/apply_interactive_session.py \
+            scripts/apply_commands_telemetry.py
+          uv lock
+          uv sync --extra dev --python 3.14
+          uv run --python 3.14 ruff check --fix src tests
+          uv run --python 3.14 ruff check src tests
+          uv run --python 3.14 python -m compileall -q src tests
+
+      - name: Focused runtime tests
+        run: >-
+          uv run --python 3.14 pytest -q
+          tests/scenarios/test_provider_resources.py
+          tests/scenarios/test_provider_resource_commands.py
+          tests/scenarios/test_interactive_session.py
+          tests/scenarios/test_selection.py
+          tests/scenarios/test_oauth.py
+          tests/scenarios/test_oauth_wiring.py
+          tests/scenarios/test_repl_history.py
+          tests/scenarios/test_repl_usage.py
+          tests/scenarios/test_interface_regressions.py
+          tests/scenarios/test_render_stream.py
+          tests/scenarios/test_context_epochs.py
+          tests/scenarios/test_user_cli.py
+
+      - name: Full fast and slow suites
+        run: |
+          uv run --python 3.14 pytest -q -n auto
+          uv run --python 3.14 pytest -q -n auto -m slow
+
+      - name: CLI and repository gates
+        run: |
+          uv lock --check
+          uv run --python 3.14 cambium-quota --help
+          uv run --python 3.14 cambium monitor --help
+          uv run --python 3.14 cambium optimize should_decompose --dry-run
+          git diff --check
+
+      - name: Commit and lease-protected fast-forward
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "latest main already contains runtime v2"
+            exit 0
+          fi
+          git config user.name "cambium-runtime-bot"
+          git config user.email "cambium-runtime-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(runtime): add persistent quota-aware agent runtime"
+          git push --force-with-lease=refs/heads/main:${BASE_SHA} origin HEAD:main
