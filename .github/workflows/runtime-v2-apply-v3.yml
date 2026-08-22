@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - codex/runtime-resource-actor
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -68,5 +71,3 @@ jobs:
           git add -A
           git commit -m "feat(runtime): add quota-aware provider portfolio"
           git push --force-with-lease=refs/heads/main:${BASE_SHA} origin HEAD:main
-
-# retriggered for final integration
