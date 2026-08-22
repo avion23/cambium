@@ -3467,7 +3467,21 @@ class _Runtime:
                 "worker_reused", task_id=task_id, generation=generation, pid=pooled.pid
             )
         if pooled is None:
-            await self.emit("spawned", task_id=task_id, generation=generation, worker=" ".join(cmd))
+            # Record which provider credential NAMES the worker env carries —
+            # never values. A cascade fallback failing with AUTH_ERROR for a
+            # name absent here is a supervisor injection defect, not a
+            # provider outage; without this the delivery hop is unauditable.
+            await self.emit(
+                "spawned",
+                task_id=task_id,
+                generation=generation,
+                worker=" ".join(cmd),
+                provider_env_keys=sorted(
+                    key
+                    for key in env
+                    if key.startswith("CAMBIUM_PROVIDER_") and env[key]
+                ),
+            )
         try:
             if pooled is not None:
                 proc = pooled
@@ -5415,9 +5429,10 @@ async def run_plan(
     ):
         raise ValueError("max_concurrent_tasks must be a non-negative int or None")
     if max_concurrent_tasks is None:
+        cpu_count = getattr(os, "process_cpu_count", None)
         max_concurrent_tasks = max(
             1,
-            cast(Any, os).process_cpu_count() or os.cpu_count() or 1,
+            cpu_count() if cpu_count is not None else (os.cpu_count() or 1),
         )
     if type(warm_pool_size) is not int or warm_pool_size < 0:
         raise ValueError("warm_pool_size must be a non-negative int")

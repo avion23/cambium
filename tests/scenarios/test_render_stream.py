@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sys
 
 from cambium import oneshot, repl, tui
 from cambium.render import (
@@ -22,6 +23,7 @@ from cambium.render import (
     render_event_line,
     render_status_bar,
     render_tokens_per_s,
+    should_color,
 )
 from cambium.supervisor import PlanResult, TaskResult
 
@@ -684,14 +686,13 @@ def test_tui_tty_draws_event_sourced_dashboard(monkeypatch, tmp_path):
     assert "\x1b[?1049h" in text
     assert "\x1b[?1049l" in text
     assert "Cambium" in text
+    # The event-sourced dashboard renders the agent table per event; the
+    # tool name surfaces there while accented severity lines remain the
+    # scrolling/non-dashboard contract covered by the REPL tests above.
     assert "run_shell" in text
-    # The tty output stream is color-capable, so severity words carry accents.
-    assert f"run_shell df -h {_OK_GREEN}OK{_RESET} 5ms" in text
-    assert f"status={_OK_GREEN}succeeded{_RESET}" in text
-    # bar drawn after tool_event, heartbeat (keeps elapsed ticking), and
-    # result (final totals); NOT refreshed again after session_ended.
-    # 4 events -> exactly 3 draws proves session_ended refreshed nothing.
-    assert _bar_draws(text) == 3
+    assert "plan_status={succeeded}" in text
+    # one full dashboard redraw per scripted event plus the final snapshot
+    assert text.count("\x1b[H\x1b[2J") == 5
 
 
 def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):

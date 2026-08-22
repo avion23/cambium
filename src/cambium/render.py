@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -781,6 +783,21 @@ def render_status_bar(events: Any, *, session_label: str) -> str:
             break
     if task_id:
         left_parts.append(f"task={task_id}")
+    heartbeats = [
+        record
+        for record in records
+        if record.get("kind") == "heartbeat"
+    ]
+    if heartbeats:
+        last = heartbeats[-1]
+        status = (
+            last.get("payload", {}).get("status")
+            if isinstance(last.get("payload"), Mapping)
+            else None
+        )
+        if status == "working":
+            frames = ("/", "-", "\\", "|")
+            left_parts.append(frames[(len(heartbeats) - 1) % len(frames)])
     right_parts: list[str] = []
     rate = render_tokens_per_s(records)
     if rate:

@@ -3714,7 +3714,8 @@ async def _run_agent_loop(
                 ) from exc
             if time.monotonic() >= wall_deadline:
                 raise ContextForkError("wall budget exceeded during summary flush")
-            if summary_result.model != model:
+            declared_summary_model = router.declared_model(summary_result.provider)
+            if declared_summary_model and summary_result.model != declared_summary_model:
                 raise ContextForkError("summary response model mismatch")
             invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
             if invalid_usage_fields:
@@ -4020,7 +4021,8 @@ async def _run_agent_loop(
                     outcome, "failed", "wall budget exceeded", turn,
                     cumulative_usage, transcript,
                 )
-            if result.model != model:
+            declared_model = router.declared_model(result.provider)
+            if declared_model and result.model != declared_model:
                 return _loop_result(
                     outcome, "failed", "provider response model mismatch",
                     turn - 1, cumulative_usage, transcript,

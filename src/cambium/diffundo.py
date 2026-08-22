@@ -1286,6 +1286,16 @@ class Diffundo:
         """Current circuit-breaker health state for a provider."""
         return self._runtime(name).health
 
+    def declared_model(self, name: str) -> str:
+        """The model id the named provider is configured to serve.
+
+        Trust reference for response validation: a CallResult from this
+        router must report exactly this id for its serving provider. This
+        — not the caller's pinned model — is what sibling fallback must
+        satisfy when providers in one tier declare different models.
+        """
+        return self._runtime(name).provider.model
+
     def status(self, name: str) -> ProviderStatus:
         """Current selection-filter status for a provider."""
         runtime = self._runtime(name)
@@ -1523,6 +1533,13 @@ class Diffundo:
                             ProviderOutcome.CONFIG_ERROR,
                         ):
                             self._record_disable(provider)
+                            break
+                        # A transport timeout means the endpoint (or a CDN in
+                        # front of it) is tarpitting this client; re-POSTing
+                        # into the same black hole at backoff scale burns the
+                        # call budget that sibling candidates still need. The
+                        # cascade IS the retry: fall through immediately.
+                        if exc.outcome is ProviderOutcome.TIMEOUT:
                             break
                         if attempt_no >= provider.max_retries:
                             break
