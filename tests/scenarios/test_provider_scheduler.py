@@ -58,7 +58,9 @@ def test_throughput_refines_only_equal_priority() -> None:
 
 def test_rpm_and_concurrency_have_independent_units() -> None:
     policy = _policy("p", max_concurrency=2)
-    assert rank_policies([policy], RoutingRequest("t", "m"), in_flight={"p": 2}) == []
+    assert rank_policies(
+        [policy], RoutingRequest("t", "m"), in_flight={"p": 2}
+    ) == []
 
 
 def test_quota_ledger_reservation_is_atomic_across_threads(tmp_path: Path) -> None:

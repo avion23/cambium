@@ -81,7 +81,7 @@ def dataclass_to_json_schema(cls: type[Any]) -> dict[str, Any]:
     target = cls if isinstance(cls, type) else type(cls)
     try:
         annotations = get_type_hints(target, include_extras=True)
-    except NameError, TypeError:
+    except (NameError, TypeError):
         annotations = {}
 
     properties: dict[str, Any] = {}
@@ -390,7 +390,10 @@ if not any(
     isinstance(item, dict)
     and (
         item.get("name") == "run_python"
-        or (isinstance(item.get("function"), dict) and item["function"].get("name") == "run_python")
+        or (
+            isinstance(item.get("function"), dict)
+            and item["function"].get("name") == "run_python"
+        )
     )
     for item in TOOL_SCHEMAS
 ):

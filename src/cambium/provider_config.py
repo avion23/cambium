@@ -324,6 +324,7 @@ def _parse_protocol(raw: dict[str, object], location: str) -> Protocol:
         ) from exc
 
 
+
 def _parse_billing_mode(value: object, location: str) -> BillingMode:
     if not isinstance(value, str):
         raise _error(location, "must be a billing-mode string")
@@ -359,7 +360,6 @@ def _require_bool(value: object, location: str) -> bool:
     if type(value) is not bool:
         raise _error(location, "must be a boolean")
     return value
-
 
 def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     location = f"providers[{index}]"
@@ -408,11 +408,15 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         base_url = ""
         api_key_env = ""
     else:
-        missing = sorted(field for field in ("base_url", "api_key_env") if field not in raw)
+        missing = sorted(
+            field for field in ("base_url", "api_key_env") if field not in raw
+        )
         if missing:
             raise _error(location, f"missing required field(s): {', '.join(missing)}")
         base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
-        api_key_env = _validate_api_key_env(raw["api_key_env"], f"{location}.api_key_env", name)
+        api_key_env = _validate_api_key_env(
+            raw["api_key_env"], f"{location}.api_key_env", name
+        )
 
     values = {**_DEFAULTS, **raw}
     timeout_s = _require_number(values["timeout_s"], f"{location}.timeout_s")
@@ -452,14 +456,22 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     if token_window_allowance < 0:
         raise _error(f"{location}.token_window_allowance", "must not be negative")
 
-    context_window = _require_integer(values["context_window"], f"{location}.context_window")
+    context_window = _require_integer(
+        values["context_window"], f"{location}.context_window"
+    )
     if context_window < 0:
         raise _error(f"{location}.context_window", "must not be negative")
-    max_concurrency = _require_integer(values["max_concurrency"], f"{location}.max_concurrency")
+    max_concurrency = _require_integer(
+        values["max_concurrency"], f"{location}.max_concurrency"
+    )
     if max_concurrency <= 0:
         raise _error(f"{location}.max_concurrency", "must be greater than 0")
-    billing_mode = _parse_billing_mode(values["billing_mode"], f"{location}.billing_mode")
-    quota_windows = _parse_quota_windows(raw.get("quota_windows", []), f"{location}.quota_windows")
+    billing_mode = _parse_billing_mode(
+        values["billing_mode"], f"{location}.billing_mode"
+    )
+    quota_windows = _parse_quota_windows(
+        raw.get("quota_windows", []), f"{location}.quota_windows"
+    )
     legacy_price = price
     price_per_1m_in = _require_number(
         raw.get("price_per_1m_in", legacy_price), f"{location}.price_per_1m_in"
@@ -496,7 +508,9 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     throughput_hint_tps = _require_number(
         values["throughput_hint_tps"], f"{location}.throughput_hint_tps"
     )
-    quality_weight = _require_number(values["quality_weight"], f"{location}.quality_weight")
+    quality_weight = _require_number(
+        values["quality_weight"], f"{location}.quality_weight"
+    )
     if throughput_hint_tps < 0 or quality_weight < 0:
         raise _error(location, "throughput_hint_tps and quality_weight must be non-negative")
     supports_native_tools = _require_bool(
@@ -750,7 +764,9 @@ def select_provider(
             if provider.name != name:
                 continue
             if not provider.enabled:
-                raise ProviderSelectionError(f"provider selection: provider {name!r} is disabled")
+                raise ProviderSelectionError(
+                    f"provider selection: provider {name!r} is disabled"
+                )
             return provider
         raise ProviderSelectionError(
             f"provider selection: no provider named {name!r} is configured"
@@ -783,7 +799,10 @@ def env_report(
     ``ProviderOutcome.AUTH_ERROR``. The report contains only provider names and
     booleans. It never returns an environment-variable name or value.
     """
-    return {provider.name: bool(os.environ.get(provider.api_key_env)) for provider in providers}
+    return {
+        provider.name: bool(os.environ.get(provider.api_key_env))
+        for provider in providers
+    }
 
 
 __all__ = [
