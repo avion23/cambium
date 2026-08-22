@@ -13,6 +13,7 @@ def _provider(name: str = "openai", **overrides: object) -> dict[str, object]:
         "tier": "strong",
         "base_url": "https://api.example.test/v1",
         "api_key_env": derived_env_name(name),
+        "model": "example-model",
     }
     value.update(overrides)
     return value
