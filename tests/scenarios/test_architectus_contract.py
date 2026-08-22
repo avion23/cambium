@@ -148,6 +148,60 @@ def test_oversized_spawn_wave_obeys_width_bound() -> None:
     assert core.in_flight == frozenset({"child-a", "child-b"})
 
 
+@pytest.mark.parametrize(
+    "proposed",
+    [
+        [
+            {"action": "reset_retry", "task_id": "child-a"},
+            {"action": "spawn", "task_id": "child-b"},
+        ],
+        [
+            {"action": "spawn", "task_id": "child-b"},
+            {"action": "reset_retry", "task_id": "child-a"},
+        ],
+    ],
+)
+def test_reset_retry_recomputes_width_capacity_for_later_spawns(
+    proposed: list[dict[str, str]],
+) -> None:
+    tree = _tree(
+        children=[
+            {"task_id": "child-a"},
+            {"task_id": "child-b"},
+        ]
+    )
+    core = ArchitectusCore(
+        ScriptedLLM([proposed]),
+        tree=tree,
+        max_width=1,
+    )
+    core.aggregate("root", _envelope())
+    core.aggregate("child-a", _envelope("root"))
+
+    actions = asyncio.run(core.step([{"kind": "decision_tick"}]))
+
+    assert actions == [{"action": "reset_retry", "task_id": "child-a"}]
+    assert core.in_flight == frozenset({"child-a"})
+
+
+def test_blocked_status_overrides_finished_envelope() -> None:
+    llm = ScriptedLLM(
+        [
+            [{"action": "abort_subtree", "task_id": "root"}],
+            [],
+        ]
+    )
+    core = ArchitectusCore(llm, tree=_tree())
+    core.aggregate("root", _envelope())
+
+    assert asyncio.run(core.step([{"kind": "decision_tick"}])) == [
+        {"action": "abort_subtree", "task_id": "root"}
+    ]
+    asyncio.run(core.step([]))
+
+    assert llm.calls[1][0]["nodes"][0]["status"] == "failed"
+
+
 @pytest.mark.parametrize("raw_kind", ["unknown", "SPAWN", "", None, 1])
 def test_invalid_action_kinds_raise_value_error(raw_kind: Any) -> None:
     core = ArchitectusCore(
