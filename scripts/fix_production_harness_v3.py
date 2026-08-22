@@ -135,17 +135,17 @@ def _fix_model_candidate_policy() -> None:
     _replace_in_function(
         path,
         "_candidates",
-        '''    exact = [provider for provider in candidates if provider.model == requested_model]
-    if exact or not any(provider.allow_model_substitution for provider in candidates):
-        candidates = exact
+        '''        exact = [provider for provider in candidates if provider.model == requested_model]
+        if exact or not any(provider.allow_model_substitution for provider in candidates):
+            candidates = exact
 ''',
-        '''    exact = [provider for provider in candidates if provider.model == requested_model]
-    substitutes = [
-        provider
-        for provider in candidates
-        if provider.model != requested_model and provider.allow_model_substitution
-    ]
-    candidates = [*exact, *substitutes]
+        '''        exact = [provider for provider in candidates if provider.model == requested_model]
+        substitutes = [
+            provider
+            for provider in candidates
+            if provider.model != requested_model and provider.allow_model_substitution
+        ]
+        candidates = [*exact, *substitutes]
 ''',
         class_name="Diffundo",
     )
