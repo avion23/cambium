@@ -874,6 +874,14 @@ def _run_bench(args: argparse.Namespace) -> int:
     try:
         bench = importlib.import_module("cambium.bench")
     except ModuleNotFoundError as exc:
+        if exc.name in {"pytest", "tree_sitter", "tree_sitter_python"}:
+            missing = exc.name.replace("_", "-")
+            print(
+                f"cambium bench: {missing} is not installed; "
+                "run `pip install cambium[test]`",
+                file=sys.stderr,
+            )
+            return 1
         if exc.name == "cambium.bench":
             print("cambium bench: cambium.bench is not installed", file=sys.stderr)
             return 1
@@ -892,7 +900,18 @@ def _run_bench(args: argparse.Namespace) -> int:
 
 
 def _run_module_test(args: argparse.Namespace) -> int:
-    from . import module_conformance
+    try:
+        module_conformance = importlib.import_module("cambium.module_conformance")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"pytest", "tree_sitter", "tree_sitter_python"}:
+            missing = exc.name.replace("_", "-")
+            print(
+                f"cambium module-test: {missing} is not installed; "
+                "run `pip install cambium[test]`",
+                file=sys.stderr,
+            )
+            return 1
+        raise
 
     if args.name not in module_conformance.module_names():
         print(f"cambium module-test: unknown module {args.name!r}", file=sys.stderr)
