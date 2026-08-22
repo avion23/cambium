@@ -8,11 +8,12 @@ while a one-shot run is active.  The renderer never mutates supervisor state.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
+import signal
 import sys
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
@@ -260,7 +261,7 @@ def render_dashboard(
         lines.append(_inside("", width))
     lines.append(
         _inside(
-            "Ctrl-C/q: close monitor  •  "
+            "Ctrl-C: close monitor  •  "
             "runtime continues unless its owner cancels it",
             width,
         )
@@ -287,12 +288,52 @@ class AnsiDashboard:
         self.stream = sys.stdout if stream is None else stream
         self.enabled = enabled and _is_tty(self.stream)
         self._entered = False
+        self._previous_sigterm_handler: Any = None
+        self._sigterm_handler_installed = False
+
+    def _install_sigterm_handler(self) -> None:
+        try:
+            self._previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, self._handle_sigterm)
+        except (OSError, ValueError):
+            self._previous_sigterm_handler = None
+        else:
+            self._sigterm_handler_installed = True
+
+    def _restore_sigterm_handler(self) -> None:
+        if not self._sigterm_handler_installed:
+            return
+        previous = self._previous_sigterm_handler
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        finally:
+            self._sigterm_handler_installed = False
+            self._previous_sigterm_handler = None
+
+    def _leave(self) -> None:
+        if self._entered:
+            try:
+                self.stream.write(_ALT_EXIT)
+                self.stream.flush()
+            finally:
+                self._entered = False
+        self._restore_sigterm_handler()
+
+    def _handle_sigterm(self, signum: int, frame: Any) -> None:
+        del frame
+        self._leave()
+        raise SystemExit(128 + signum)
 
     def __enter__(self) -> AnsiDashboard:
         if self.enabled:
-            self.stream.write(_ALT_ENTER)
-            self.stream.flush()
+            self._install_sigterm_handler()
             self._entered = True
+            try:
+                self.stream.write(_ALT_ENTER)
+                self.stream.flush()
+            except BaseException:
+                self._leave()
+                raise
         return self
 
     def draw(self, snapshot: SessionSnapshot) -> None:
@@ -311,21 +352,16 @@ class AnsiDashboard:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         del exc_type, exc, tb
-        if self._entered:
-            self.stream.write(_ALT_EXIT)
-            self.stream.flush()
-            self._entered = False
+        self._leave()
 
 
-def _latest_session(repo: Path) -> Path | None:
+def _latest_session(repo: Path | None) -> Path | None:
     candidates: list[Path] = []
-    direct = repo / ".cambium" / "events.db"
+    root = Path.cwd() if repo is None else repo
+    direct = root / ".cambium" / "events.db"
     if direct.is_file():
-        candidates.append(repo)
-    roots = (
-        repo / ".cambium" / "sessions",
-        Path.cwd() / ".cambium" / "sessions",
-    )
+        candidates.append(root)
+    roots = (root / ".cambium" / "sessions",)
     for root in roots:
         if not root.is_dir():
             continue
@@ -342,7 +378,7 @@ def _latest_session(repo: Path) -> Path | None:
     )
 
 
-def resolve_session(value: str | Path | None, *, repo: str | Path = ".") -> Path:
+def resolve_session(value: str | Path | None, *, repo: str | Path | None = None) -> Path:
     if value is not None:
         session = Path(value).expanduser().resolve()
     else:
@@ -350,7 +386,9 @@ def resolve_session(value: str | Path | None, *, repo: str | Path = ".") -> Path
         if env_value:
             session = Path(env_value).expanduser().resolve()
         else:
-            latest = _latest_session(Path(repo).expanduser().resolve())
+            latest = _latest_session(
+                None if repo is None else Path(repo).expanduser().resolve()
+            )
             if latest is None:
                 raise ValueError("no Cambium session with an event log was found")
             session = latest.resolve()
@@ -360,7 +398,7 @@ def resolve_session(value: str | Path | None, *, repo: str | Path = ".") -> Path
     return session
 
 
-def monitor_session(
+async def monitor_session_async(
     session_dir: str | Path,
     *,
     interval_s: float = 0.25,
@@ -385,24 +423,48 @@ def monitor_session(
                     out.write(snapshot_json(snapshot) + "\n")
                     out.flush()
                     return 0
-                if once or not dashboard.enabled:
-                    out.write("\n".join(render_dashboard(snapshot, session_dir=session)) + "\n")
+                frame = "\n".join(render_dashboard(snapshot, session_dir=session)) + "\n"
+                if once:
+                    out.write(frame)
                     out.flush()
                     return 0
-                dashboard.draw(snapshot)
+                if dashboard.enabled:
+                    dashboard.draw(snapshot)
+                else:
+                    out.write(frame)
+                    out.flush()
                 if (
                     snapshot.session_status in {"ended", "cancelled", "failed"}
                     and snapshot.active_agents == 0
                     and snapshot.queued_agents == 0
                 ):
-                    time.sleep(min(interval_s, 0.25))
+                    await asyncio.sleep(min(interval_s, 0.25))
                     return 0
-                time.sleep(interval_s)
-    except KeyboardInterrupt:
+                await asyncio.sleep(interval_s)
+    except (asyncio.CancelledError, KeyboardInterrupt):
         return 130
     except (OSError, StoreError, ValueError) as exc:
         print(f"cambium monitor: {exc}", file=sys.stderr)
         return 1
+
+
+def monitor_session(
+    session_dir: str | Path,
+    *,
+    interval_s: float = 0.25,
+    once: bool = False,
+    json_output: bool = False,
+    output_stream: TextIO | None = None,
+) -> int:
+    return asyncio.run(
+        monitor_session_async(
+            session_dir,
+            interval_s=interval_s,
+            once=once,
+            json_output=json_output,
+            output_stream=output_stream,
+        )
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -411,7 +473,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Attach an OpenCode-style dashboard to a durable Cambium session.",
     )
     parser.add_argument("session", nargs="?", help="session directory; defaults to the newest")
-    parser.add_argument("--repo", default=".", help="repository used for session discovery")
+    parser.add_argument("--repo", default=None, help="repository used for session discovery")
     parser.add_argument("--interval", type=float, default=0.25, metavar="SECONDS")
     parser.add_argument("--once", action="store_true", help="render one frame and exit")
     parser.add_argument("--json", action="store_true", help="emit one JSON snapshot and exit")
@@ -452,6 +514,7 @@ __all__ = [
     "AnsiDashboard",
     "main",
     "monitor_session",
+    "monitor_session_async",
     "render_agent_lines",
     "render_dashboard",
     "resolve_session",

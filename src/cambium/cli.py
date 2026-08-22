@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import importlib
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -199,7 +200,7 @@ def _positive_float(value: str) -> float:
         parsed = float(value)
     except ValueError:
         parsed = None
-    if parsed is None or parsed <= 0:
+    if parsed is None or not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive number")
     return parsed
 
@@ -338,7 +339,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,module-test,version,run,repl,tui,monitor,optimize,session,architectus}",
+        metavar="{auth,supervisor,doctor,bench,module-test,version,run,repl,tui,monitor,quota,optimize,session,architectus}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -478,10 +479,35 @@ def _build_parser() -> argparse.ArgumentParser:
         "throughput, and context-trunk size from durable events.",
     )
     monitor.add_argument("session", nargs="?", metavar="SESSION")
-    monitor.add_argument("--repo", default=".", metavar="PATH")
+    monitor.add_argument("--repo", default=None, metavar="PATH")
     monitor.add_argument("--interval", type=float, default=0.25, metavar="SECONDS")
     monitor.add_argument("--once", action="store_true")
     monitor.add_argument("--json", action="store_true")
+
+    quota = commands.add_parser(
+        "quota",
+        help="inspect or update provider quota windows",
+        description="Inspect or update content-free provider quota windows.",
+    )
+    quota.add_argument("--db", type=Path, help=argparse.SUPPRESS)
+    quota_commands = quota.add_subparsers(dest="quota_command", required=True)
+    quota_status = quota_commands.add_parser(
+        "status", help="show known provider quota windows"
+    )
+    quota_status.add_argument("--provider")
+    quota_status.add_argument("--json", action="store_true")
+    quota_observe = quota_commands.add_parser(
+        "observe",
+        help="record a provider/dashboard/header quota observation",
+    )
+    quota_observe.add_argument("provider")
+    quota_observe.add_argument("window")
+    quota_observe.add_argument("--reset-in-s", type=float, required=True)
+    quota_observe.add_argument("--allowance-tokens", type=int, default=0)
+    quota_observe.add_argument("--remaining-tokens", type=int)
+    quota_observe.add_argument("--allowance-requests", type=int, default=0)
+    quota_observe.add_argument("--remaining-requests", type=int)
+    quota_observe.add_argument("--reserve-fraction", type=float, default=0.0)
 
     optimize_command = commands.add_parser(
         "optimize",
@@ -964,7 +990,7 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
         return ExitCode.TEMPORARY_FAILURE
     except (AuthError, OSError, ValueError) as exc:
         print(f"cambium run: {exc}", file=sys.stderr)
-        return 2
+        return ExitCode.FAILURE
     if args.json:
         print(render.render_json_result(result))
     else:
@@ -1036,7 +1062,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
     return await tui.run_tui(config, quiet=getattr(args, "quiet", False))
 
 
-def _run_monitor(args: argparse.Namespace) -> int:
+async def _run_monitor(args: argparse.Namespace) -> int:
     from . import monitor
 
     if not monitor.math_is_positive(args.interval):
@@ -1050,12 +1076,22 @@ def _run_monitor(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"cambium monitor: {exc}", file=sys.stderr)
         return 1
-    return monitor.monitor_session(
+    return await monitor.monitor_session_async(
         session,
         interval_s=args.interval,
         once=args.once,
         json_output=args.json,
     )
+
+
+def _run_quota(args: argparse.Namespace) -> int:
+    from . import quota_cli
+
+    try:
+        return quota_cli.run_namespace(args)
+    except (OSError, ValueError) as exc:
+        print(f"cambium quota: {exc}", file=sys.stderr)
+        return ExitCode.USAGE
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
@@ -1332,7 +1368,9 @@ async def async_main(argv: list[str] | None = None) -> int:
         case "tui":
             return await _run_tui(args)
         case "monitor":
-            return await asyncio.to_thread(_run_monitor, args)
+            return await _run_monitor(args)
+        case "quota":
+            return _run_quota(args)
         case "optimize":
             return await asyncio.to_thread(_run_optimize, args)
         case "architectus":
