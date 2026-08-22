@@ -856,6 +856,44 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+def _kill_worktree_process_groups(worktree: Path) -> None:
+    """Kill process groups whose cwd is inside a tree before removing it.
+
+    Workers put their own process group in the tree, while fenced git helpers
+    may create descendant sessions of their own. The latter cannot be found
+    from the worker handle alone; on Linux, ``/proc/*/cwd`` gives us a bounded
+    best-effort sweep without adding a process-management dependency.
+    """
+    if os.name != "posix":
+        return
+    root = Path(worktree).resolve()
+    own_group = os.getpgrp()
+    groups: set[int] = set()
+    proc_root = Path("/proc")
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+            cwd = Path(os.readlink(entry / "cwd")).resolve()
+            if not (cwd == root or cwd.is_relative_to(root)):
+                continue
+            pgid = os.getpgid(pid)
+        except (FileNotFoundError, PermissionError, OSError, ValueError):
+            continue
+        if pgid != own_group:
+            groups.add(pgid)
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 async def run_session(
     session_dir: str | Path,
     task_spec: dict[str, Any],
@@ -1054,11 +1092,18 @@ def _codex_oauth_provider_names(
         if provider.auth is AuthMode.CODEX_CHATGPT
     )
     authorized_raw = spec.get("authorized_providers")
-    if isinstance(authorized_raw, (list, tuple)) and authorized_raw:
+    authorized_explicit = spec.get(
+        "authorized_providers_explicit", "authorized_providers" in spec
+    )
+    if isinstance(authorized_raw, (list, tuple)):
         authorized = frozenset(
             name for name in authorized_raw if isinstance(name, str) and name
         )
-        return codex & authorized
+        # An explicit empty authorization is a deliberate deny-all set.  Only
+        # plans from before provider identities were carried use the legacy
+        # unrestricted fallback below.
+        if authorized_explicit or authorized:
+            return codex & authorized
     referenced = _fanout_provider_names(spec)
     if referenced:
         return codex & referenced
@@ -1763,6 +1808,9 @@ class _Runtime:
         self._admitted_children: dict[str, list[str]] = {}
         self._child_result_by_task: dict[str, dict[str, Any]] = {}
         self._child_result_meta: dict[str, tuple[str | None, int | None]] = {}
+        self._child_result_by_generation: dict[
+            str, dict[int, tuple[dict[str, Any], tuple[str | None, int | None]]]
+        ] = {}
         self._child_result_emitted: set[str] = set()
 
     @staticmethod
@@ -1898,19 +1946,23 @@ class _Runtime:
         # session; a pooled process that already died is dropped silently.
         alive += [entry.proc for entry in self._pool if entry.proc.returncode is None]
         self._pool.clear()
-        for proc in alive:
+        unique_alive = list({id(proc): proc for proc in alive}.values())
+        for proc in unique_alive:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        if alive:
+        if unique_alive:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*(proc.wait() for proc in alive), return_exceptions=True),
+                    asyncio.gather(
+                        *(proc.wait() for proc in unique_alive),
+                        return_exceptions=True,
+                    ),
                     TERM_GRACE_S,
                 )
             except TimeoutError:
-                for proc in alive:
+                for proc in unique_alive:
                     if proc.returncode is not None:
                         continue
                     try:
@@ -1921,7 +1973,43 @@ class _Runtime:
                         proc.kill()
                     except ProcessLookupError:
                         pass
-                await asyncio.gather(*(proc.wait() for proc in alive), return_exceptions=True)
+                await asyncio.gather(
+                    *(proc.wait() for proc in unique_alive), return_exceptions=True
+                )
+
+        # A task can be cancelled before its coroutine gets a chance to enter
+        # supervise_task (especially a dynamically admitted child). Account for
+        # every admitted spec before publishing the session terminal event.
+        task_specs = {
+            spec["task_id"]: spec
+            for entry in self._session_tasks
+            if isinstance((spec := entry.get("spec")), dict)
+        }
+        for task_id, spec in task_specs.items():
+            if task_id in self._results:
+                continue
+            status = "cancelled" if session_status == "cancelled" else "failed"
+            self._results[task_id] = TaskResult(
+                task_id=task_id,
+                status=status,
+                exit_code=1,
+                reason="cancelled" if status == "cancelled" else "supervision ended",
+            )
+
+        # Cleanup is normally attempted by each task's finally block. Repeat it
+        # here so children cancelled before their coroutine starts cannot leak a
+        # registered worktree or branch. Cancellation is the explicit force
+        # cleanup path because partial edits are no longer useful evidence.
+        for spec in task_specs.values():
+            force = session_status == "cancelled" or (
+                self._results.get(spec["task_id"], TaskResult(
+                    task_id=spec["task_id"], status="failed", exit_code=1
+                )).status == "cancelled"
+            )
+            try:
+                await self._prune_worktree(spec, force=force)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
         try:
             await self.emit(
                 "session_ended", task_id=None, session_status=session_status,
@@ -2055,13 +2143,14 @@ class _Runtime:
         )
         return new_generation
 
-    async def _prune_worktree(self, spec: dict[str, Any]) -> None:
-        """Remove a terminal task's clean worker worktree and branch.
+    async def _prune_worktree(
+        self, spec: dict[str, Any], *, force: bool = False
+    ) -> None:
+        """Remove a terminal task's worker worktree and branch.
 
-        A worker tree may contain edits from a crash or an uncommitted result.
-        Without the staging/quarantine contract, those trees are retained and
-        reported instead of being force-removed. This preserves the evidence
-        for the integration point owned by the staging-quarantine work.
+        Ordinary failures retain dirty trees as evidence. Cancellation is the
+        explicit force path: no caller can safely consume partial edits after
+        the worker has lost ownership of its generation.
         """
         task_id = spec["task_id"]
         repo = Path(spec["repo"]).resolve()
@@ -2109,6 +2198,14 @@ class _Runtime:
                             )
                             return
 
+                handle = self._handles.get(task_id)
+                if handle is not None and handle.proc is not None:
+                    await _kill_worker(handle.proc)
+                    try:
+                        await asyncio.wait_for(handle.proc.wait(), WORKER_EXIT_WAIT_S)
+                    except (TimeoutError, ProcessLookupError):
+                        pass
+                await asyncio.to_thread(_kill_worktree_process_groups, worktree)
                 status = await self._git(
                     worktree,
                     "status",
@@ -2123,7 +2220,7 @@ class _Runtime:
                         _deferred_observers=deferred,
                     )
                     return
-                if any(
+                if not force and any(
                     not _status_line_is_fence(line)
                     for line in status.stdout.splitlines()
                 ):
@@ -2133,10 +2230,26 @@ class _Runtime:
                     )
                     return
 
+                try:
+                    # Invalidate the durable token while the tree is still
+                    # registered, then remove the fence and worktree. A stale
+                    # worker that survived the process-group sweep can no
+                    # longer pass its next fenced write check.
+                    await asyncio.to_thread(next_generation, worktree)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    await self.emit(
+                        "worktree_cleanup_deferred", task_id=task_id,
+                        reason="generation_invalidation_failed",
+                        _deferred_observers=deferred,
+                    )
+                    return
                 fence_dir = worktree / ".cambium"
                 if fence_dir.is_dir():
                     shutil.rmtree(fence_dir, ignore_errors=True)
-                removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
+                remove_args = ("worktree", "remove", "--force", str(worktree)) if force else (
+                    "worktree", "remove", str(worktree)
+                )
+                removed = await self._git(repo, *remove_args, check=False)
                 if removed.returncode != 0:
                     await self.emit(
                         "worktree_cleanup_deferred", task_id=task_id, reason="remove_failed",
@@ -2336,6 +2449,22 @@ class _Runtime:
                 self._session_dir, parent_spec, proposal, parent_envelope
             )
         except ValueError as exc:
+            await self.emit(
+                "child_rejected", task_id=parent_task_id, request_id=request_id,
+                parent_task_id=parent_task_id, child_task_id=child_task_id,
+                child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected", parent_task_id=parent_task_id,
+                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                reason=exc.__class__.__name__, proposal=proposal,
+            )
+            return []
+        try:
+            _reject_duplicate_task_ownership(
+                [*(task["spec"] for task in self._session_tasks), child_spec]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
             await self.emit(
                 "child_rejected", task_id=parent_task_id, request_id=request_id,
                 parent_task_id=parent_task_id, child_task_id=child_task_id,
@@ -3169,6 +3298,7 @@ class _Runtime:
                     heartbeat_interval=heartbeat_interval,
                     heartbeat_timeout=heartbeat_timeout,
                     wall_budget=wall_budget,
+                    wall_deadline=deadline,
                     allow_pool=allow_pool,
                 )
             finally:
@@ -3203,6 +3333,17 @@ class _Runtime:
             # worker must never reuse a pooled process).
             first_generation = True
             while True:
+                if deadline - time.monotonic() <= 0:
+                    reason = "wall budget exhausted"
+                    await self.emit(
+                        "timeout", task_id=task_id, generation=generation,
+                        phase="wall",
+                    )
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason=reason, restarts=restarts, summary=worker_summary,
+                    )
+                    return
                 handle = WorkerHandle(task_id=task_id, generation=generation)
                 self._handles[task_id] = handle
                 outcome = await drive_with_admission_slot(
@@ -3346,7 +3487,22 @@ class _Runtime:
                     restart_count=restarts, max_restarts=max_restarts,
                     delay_s=round(delay, 3), reason=reason,
                 )
-                await asyncio.sleep(delay)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason="wall budget exhausted", restarts=restarts,
+                        summary=worker_summary,
+                    )
+                    return
+                await asyncio.sleep(min(delay, remaining))
+                if deadline - time.monotonic() <= 0:
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id, status="failed", exit_code=1,
+                        reason="wall budget exhausted", restarts=restarts,
+                        summary=worker_summary,
+                    )
+                    return
                 generation = await self._recover_worktree(spec, generation + 1)
         finally:
             if semaphore is not None and semaphore_held:
@@ -3412,11 +3568,22 @@ class _Runtime:
     async def _drive_generation(
         self, spec: dict[str, Any], handle: WorkerHandle, *,
         ready_timeout: float, heartbeat_interval: float, heartbeat_timeout: float,
-        wall_budget: float, allow_pool: bool = True,
+        wall_budget: float, wall_deadline: float | None = None,
+        allow_pool: bool = True,
     ) -> _GenOutcome:
         task_id = spec["task_id"]
         worktree = Path(spec["worktree_path"])
         generation = handle.generation
+        loop = asyncio.get_running_loop()
+        absolute_wall_deadline = (
+            loop.time() + wall_budget if wall_deadline is None else wall_deadline
+        )
+        remaining_wall_budget = absolute_wall_deadline - loop.time()
+        if remaining_wall_budget <= 0:
+            return _GenOutcome(
+                clean=False, fatal=True, reason="wall budget exhausted",
+                timeout_phase="wall",
+            )
         cmd = self._worker_command(spec)
         env = self._worker_env(spec, generation)
         # A new generation is a fresh worker process: proposals buffered by a
@@ -3440,7 +3607,10 @@ class _Runtime:
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
             "heartbeat": {"interval_s": heartbeat_interval, "timeout_s": heartbeat_timeout},
-            "budget": {"max_wall_s": wall_budget, "max_restarts": DEFAULT_MAX_RESTARTS},
+            "budget": {
+                "max_wall_s": max(0.0, remaining_wall_budget),
+                "max_restarts": DEFAULT_MAX_RESTARTS,
+            },
             "permissions": {"shell": True, "network": False},
             "provider_env_keys": list(spec.get("provider_env_keys", ())),
             "authorized_providers": list(spec.get("authorized_providers", ())),
@@ -3604,8 +3774,7 @@ class _Runtime:
 
         stdout_task = asyncio.create_task(_read_stdout())
         stderr_task = asyncio.create_task(_read_stderr())
-        loop = asyncio.get_running_loop()
-        wall_deadline = loop.time() + wall_budget
+        wall_deadline = absolute_wall_deadline
 
         await self.emit("init", task_id=task_id, request_id=init_rid, generation=generation)
         init_written = await _write_json(
@@ -3817,7 +3986,9 @@ class _Runtime:
                         generation=generation, pid=msg.get("pid"), proto=msg.get("proto"),
                     )
                     run_rid = self._next_rid()
-                    payload = self._run_payload(spec, run_rid, wall_budget, generation)
+                    payload = self._run_payload(
+                        spec, run_rid, max(0.0, wall_deadline - loop.time()), generation
+                    )
                     run_msg = {
                         "type": "run_task", "request_id": run_rid,
                         "task_id": task_id, **payload,
@@ -4630,6 +4801,8 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         raise ValueError(f"task {task_id} requires 'worktree_path'")
     if "branch" not in spec:
         raise ValueError(f"task {task_id} requires 'branch'")
+    if not isinstance(spec["branch"], str) or not spec["branch"]:
+        raise ValueError(f"task {task_id} branch must be a non-empty name")
     worktree = Path(spec["worktree_path"]).resolve()
     if not worktree.is_relative_to(session_root):
         raise ValueError(
@@ -4657,6 +4830,9 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
             f"task {task_id} authorized_providers must be a list of names"
         )
     spec["authorized_providers"] = list(authorized_providers)
+    spec["authorized_providers_explicit"] = bool(
+        spec.get("authorized_providers_explicit", "authorized_providers" in task)
+    )
     model_candidates = spec.get("model_candidates")
     if model_candidates is not None:
         if not isinstance(model_candidates, (list, tuple)) or not model_candidates or not all(
@@ -4683,6 +4859,32 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     if not isinstance(spec["write_marker"], bool):
         raise ValueError(f"task {task_id} write_marker must be a boolean")
     return spec
+
+
+def _reject_duplicate_task_ownership(specs: Sequence[Mapping[str, Any]]) -> None:
+    """Reject worktree and branch aliases before any task can reset a tree."""
+    worktrees: dict[Path, str] = {}
+    branches: dict[tuple[Path, str], str] = {}
+    for spec in specs:
+        task_id = str(spec.get("task_id", "<unknown>"))
+        worktree = Path(spec["worktree_path"]).resolve()
+        previous = worktrees.get(worktree)
+        if previous is not None:
+            raise ValueError(
+                f"duplicate worktree_path {str(worktree)!r} for tasks "
+                f"{previous!r} and {task_id!r}"
+            )
+        worktrees[worktree] = task_id
+        repo = Path(spec["repo"]).resolve()
+        branch = spec["branch"]
+        branch_key = (repo, branch)
+        previous = branches.get(branch_key)
+        if previous is not None:
+            raise ValueError(
+                f"duplicate branch {branch!r} in repository {str(repo)!r} for "
+                f"tasks {previous!r} and {task_id!r}"
+            )
+        branches[branch_key] = task_id
 
 
 def _validate_task_repositories(specs: Sequence[Mapping[str, Any]]) -> None:
@@ -4742,9 +4944,13 @@ def _resolve_model_candidates(
         return False
     providers = load_providers(_provider_config_path(os.environ, spec))
     authorized_raw = spec.get("authorized_providers")
+    authorized_explicit = spec.get(
+        "authorized_providers_explicit", "authorized_providers" in spec
+    )
     authorized = (
         frozenset(name for name in authorized_raw if isinstance(name, str) and name)
-        if isinstance(authorized_raw, (list, tuple)) and authorized_raw
+        if isinstance(authorized_raw, (list, tuple))
+        and (authorized_explicit or authorized_raw)
         else None
     )
     if authorized is None:
@@ -4967,24 +5173,35 @@ def _child_spec(
     child_spec["provider_env_keys"] = sorted(child_keys & parent_keys)
 
     parent_authorized = set(parent_spec.get("authorized_providers") or ())
+    parent_authorized_explicit = bool(
+        parent_spec.get(
+            "authorized_providers_explicit", "authorized_providers" in parent_spec
+        )
+    )
     raw_authorized = child_spec.get("authorized_providers")
     if raw_authorized is None:
         requested_authorized = set(parent_authorized)
+        child_authorized_explicit = parent_authorized_explicit
     elif isinstance(raw_authorized, (list, tuple)):
         requested_authorized = set(raw_authorized)
+        child_authorized_explicit = True
     else:
         raise ValueError("child authorized_providers must be a list of names")
     if not all(isinstance(name, str) and name for name in requested_authorized):
         raise ValueError("child authorized_providers must contain only names")
+    if parent_authorized_explicit and not requested_authorized.issubset(parent_authorized):
+        raise ValueError("child authorized_providers would widen parent authorization")
     if parent_authorized and not requested_authorized.issubset(parent_authorized):
         raise ValueError("child authorized_providers would widen parent authorization")
-    # An empty parent set is the legacy unrestricted carrier.  A child may
-    # narrow that set, but it cannot gain access through a non-empty parent.
+    # An empty parent set is unrestricted only for legacy plans.  Preserve an
+    # explicit empty child set as a deny-all narrowing rather than falling back
+    # to every provider visible in the worker's config.
     child_spec["authorized_providers"] = sorted(
         requested_authorized & parent_authorized
         if parent_authorized
         else requested_authorized
     )
+    child_spec["authorized_providers_explicit"] = child_authorized_explicit
 
     parent_configured_path = parent_spec.get("provider_config_path")
     child_configured_path = child_spec.get("provider_config_path")
@@ -5062,7 +5279,7 @@ def _child_spec(
             }
             allowed_names = parent_authorized | {
                 value for value in (parent_spec.get("assigned_provider"),)
-                if isinstance(value, str)
+                if isinstance(value, str) and not parent_authorized_explicit
             }
             if not child_provider_names.issubset(allowed_names):
                 raise ValueError("child fanout_config.providers would widen parent identity")
@@ -5081,7 +5298,16 @@ def _child_spec(
     ):
         raise ValueError("child assigned_provider is not authorized by the parent")
     child_spec["parent_envelope"] = parent_envelope
-    return _validate_plan_task(session_dir, child_spec)
+    validated = _validate_plan_task(session_dir, child_spec)
+    parent_worktree = Path(parent_spec["worktree_path"]).resolve()
+    if Path(validated["worktree_path"]).resolve() == parent_worktree:
+        raise ValueError("child worktree_path duplicates the parent's worktree")
+    if (
+        Path(validated["repo"]).resolve() == Path(parent_spec["repo"]).resolve()
+        and validated["branch"] == parent_spec["branch"]
+    ):
+        raise ValueError("child branch duplicates the parent's branch")
+    return validated
 
 
 def _reject_duplicate_task_ids(tasks: list[dict[str, Any]]) -> None:
@@ -5452,6 +5678,7 @@ async def run_plan(
     specs = [_validate_plan_task(session_dir, t) for t in tasks]
     if not specs:
         raise ValueError("plan contains no tasks")
+    _reject_duplicate_task_ownership(specs)
     if max_concurrent_tasks is not None and (
         type(max_concurrent_tasks) is not int or max_concurrent_tasks < 0
     ):
@@ -5725,6 +5952,7 @@ def main(argv: list[str] | None = None) -> int:
         if not tasks:
             raise ValueError("plan contains no tasks")
         specs = [_validate_plan_task(session_dir, task) for task in tasks]
+        _reject_duplicate_task_ownership(specs)
         _validate_task_repositories(specs)
         try:
             return asyncio.run(
