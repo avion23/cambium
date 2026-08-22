@@ -856,13 +856,19 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-def _kill_worktree_process_groups(worktree: Path) -> None:
+def _kill_worktree_process_groups(
+    worktree: Path, skip_groups: frozenset[int] = frozenset()
+) -> None:
     """Kill process groups whose cwd is inside a tree before removing it.
 
     Workers put their own process group in the tree, while fenced git helpers
     may create descendant sessions of their own. The latter cannot be found
     from the worker handle alone; on Linux, ``/proc/*/cwd`` gives us a bounded
     best-effort sweep without adding a process-management dependency.
+
+    ``skip_groups`` excludes groups owned by the supervisor's warm pool: an
+    idle pooled worker keeps its cwd inside its finished task's worktree, but
+    it must survive pruning so a later task can rebind it (Eval-3 ADOPT).
     """
     if os.name != "posix":
         return
@@ -885,7 +891,7 @@ def _kill_worktree_process_groups(worktree: Path) -> None:
             pgid = os.getpgid(pid)
         except (FileNotFoundError, PermissionError, OSError, ValueError):
             continue
-        if pgid != own_group:
+        if pgid != own_group and pgid not in skip_groups:
             groups.add(pgid)
     for pgid in groups:
         try:
@@ -1999,7 +2005,7 @@ class _Runtime:
             for entry in self._session_tasks
             if isinstance((spec := entry.get("spec")), dict)
         }
-        for task_id, spec in task_specs.items():
+        for task_id in task_specs:
             if task_id in self._results:
                 continue
             status = "cancelled" if session_status == "cancelled" else "failed"
@@ -2242,7 +2248,17 @@ class _Runtime:
                         await asyncio.wait_for(handle.proc.wait(), WORKER_EXIT_WAIT_S)
                     except (TimeoutError, ProcessLookupError):
                         pass
-                await asyncio.to_thread(_kill_worktree_process_groups, worktree)
+                # Pooled workers keep their cwd inside their finished
+                # worktree; killing them here would silently disable reuse
+                # for every later task in the session.
+                pooled_pgids = frozenset(
+                    entry.proc.pid
+                    for entry in self._pool
+                    if entry.proc.returncode is None
+                )
+                await asyncio.to_thread(
+                    _kill_worktree_process_groups, worktree, pooled_pgids
+                )
                 status = await self._git(
                     worktree,
                     "status",
@@ -2731,16 +2747,20 @@ class _Runtime:
             and cache_key.get("redacted") is False
             and isinstance(epoch.get("checkpoint_ref"), str)
         )
+        fork_payload: dict[str, Any] = {
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "child_kind": kind,
+            "epoch": epoch.get("epoch"),
+            "compatible": compatible,
+            "semantic_reuse": semantic_reuse,
+        }
+        if reason is not None:
+            fork_payload["reason"] = reason
         await self.emit(
             "context_fork",
             task_id=parent_task_id,
-            parent_task_id=parent_task_id,
-            child_task_id=child_task_id,
-            child_kind=kind,
-            epoch=epoch.get("epoch"),
-            compatible=compatible,
-            semantic_reuse=semantic_reuse,
-            **({"reason": reason} if reason is not None else {}),
+            **fork_payload,
         )
         if semantic_reuse:
             # Cold semantic children choose an independent provider lane. Only
@@ -3392,9 +3412,12 @@ class _Runtime:
             spec, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S
         )
         # Cache-first: one absolute deadline accounts for every suspend/resume
-        # cycle and the time spent waiting for children.
-        supervise_started = time.monotonic()
-        deadline = supervise_started + wall_budget
+        # cycle and the time spent waiting for children. The window STARTS
+        # when the first generation actually runs (the task may wait through
+        # earlier dependency waves first). An explicit restart (crash/failure
+        # recovery, bounded by ``max_restarts``) grants a fresh window — see
+        # the restart block below.
+        deadline: float | None = None
         if spec.get("base_commit") is None:
             base = await self._git_stdout(repo, "rev-parse", "refs/heads/main", check=False)
             if not base:
@@ -3497,6 +3520,8 @@ class _Runtime:
             # worker must never reuse a pooled process).
             first_generation = True
             while True:
+                if deadline is None:
+                    deadline = time.monotonic() + wall_budget
                 if deadline - time.monotonic() <= 0:
                     reason = "wall budget exhausted"
                     await self.emit(
@@ -3733,34 +3758,17 @@ class _Runtime:
                     restart_count=restarts, max_restarts=max_restarts,
                     delay_s=round(delay, 3), reason=reason,
                 )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    await self._reject_child_proposals(
-                        task_id,
-                        outcome.proposals,
-                        reason="ParentResultRejected",
-                        message="parent wall budget was exhausted before restart",
-                    )
-                    self._results[task_id] = TaskResult(
-                        task_id=task_id, status="failed", exit_code=1,
-                        reason="wall budget exhausted", restarts=restarts,
-                        summary=worker_summary,
-                    )
-                    return
-                await asyncio.sleep(min(delay, remaining))
-                if deadline - time.monotonic() <= 0:
-                    await self._reject_child_proposals(
-                        task_id,
-                        outcome.proposals,
-                        reason="ParentResultRejected",
-                        message="parent wall budget was exhausted during restart backoff",
-                    )
-                    self._results[task_id] = TaskResult(
-                        task_id=task_id, status="failed", exit_code=1,
-                        reason="wall budget exhausted", restarts=restarts,
-                        summary=worker_summary,
-                    )
-                    return
+                # Backoff is bounded by RESTART_MAX_DELAY_S and is not charged
+                # to the restarted attempt's fresh wall window.
+                await asyncio.sleep(delay)
+                # A restart is a fresh attempt, not a continuation: grant a
+                # new wall window so a tight budget cannot make
+                # ``max_restarts`` unreachable (suspensions never get this
+                # reset; they stay on the original deadline). ``None`` makes
+                # the window start lazily when the restarted generation
+                # actually runs — worktree recovery above all else must not
+                # consume it.
+                deadline = None
                 generation = await self._recover_worktree(spec, generation + 1)
         finally:
             if semaphore is not None and semaphore_held:
@@ -4442,7 +4450,9 @@ class _Runtime:
                         # arrives; admission then validates the revision
                         # against the session tree (build_tree over the
                         # accumulated tasks list).
-                        self._pending_children.setdefault(task_id, []).append(msg)
+                        self._pending_children.setdefault(task_id, []).append(
+                            (generation, msg)
+                        )
                 elif mtype == "reuse_ready":
                     # Eval-3 ADOPT: the worker delivered its terminal result
                     # and waits for a rebind init; keep the live process for
