@@ -214,6 +214,7 @@ async def run_repl(
                 break
             if not prompt.strip():
                 continue
+            sigint_fired = False
             if history_path is not None:
                 cast(_Readline, readline).add_history(prompt)
             try:

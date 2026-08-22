@@ -9,9 +9,11 @@ language-specific queries; these primitives remain the fast portable fallback.
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import re
+import tokenize
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -230,9 +232,56 @@ def search_symbols(
             accepted = location.name == needle if exact else folded in location.name.casefold()
             if accepted:
                 matches.append(location)
-                if len(matches) >= max_results:
-                    return matches
-    return matches
+    if not exact:
+        matches.sort(
+            key=lambda location: (
+                0
+                if location.name.casefold() == folded
+                else 1
+                if location.name.casefold().startswith(folded)
+                else 2
+            )
+        )
+    return matches[:max_results]
+
+
+def _python_reference_positions(text: str, symbol: str) -> list[tuple[int, int]]:
+    positions: list[tuple[int, int]] = []
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            if token.type == tokenize.NAME and token.string == symbol:
+                positions.append((token.start[0], token.start[1] + 1))
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        # Tokenize yields useful tokens before reporting an incomplete source
+        # construct; retaining those is preferable to treating comments and
+        # strings as references in the fallback below.
+        pass
+    return positions
+
+
+_GENERIC_STRING = re.compile(
+    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)'''
+)
+_GENERIC_COMMENT = re.compile(r"(?:#|//|/\\*|--).*$")
+
+
+def _generic_reference_positions(text: str, symbol: str) -> list[tuple[int, int]]:
+    """Find identifiers after masking common quoted and comment regions."""
+
+    pattern = re.compile(rf"\b{re.escape(symbol)}\b")
+    positions: list[tuple[int, int]] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        code = _GENERIC_STRING.sub("", line)
+        code = _GENERIC_COMMENT.sub("", code)
+        positions.extend((line_no, match.start() + 1) for match in pattern.finditer(code))
+    return positions
+
+
+def _reference_positions(path: Path, text: str, symbol: str) -> list[tuple[int, int]]:
+    if path.suffix.lower() in {".py", ".pyi"}:
+        return _python_reference_positions(text, symbol)
+    return _generic_reference_positions(text, symbol)
 
 
 def find_references(
@@ -247,27 +296,27 @@ def find_references(
         raise ValueError("symbol must be one identifier")
     if max_results <= 0 or max_results > 1000:
         raise ValueError("max_results must be in [1, 1000]")
-    pattern = re.compile(rf"\b{re.escape(symbol)}\b")
     resolved = Path(root).resolve()
     matches: list[SourceLocation] = []
     for path in _walk_source_files(resolved):
         text = _read(path)
         if text is None:
             continue
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            for match in pattern.finditer(line):
-                matches.append(
-                    SourceLocation(
-                        str(path.relative_to(resolved)),
-                        line_no,
-                        match.start() + 1,
-                        "reference",
-                        symbol,
-                        _preview(line),
-                    )
+        lines = text.splitlines()
+        for line_no, column in _reference_positions(path, text, symbol):
+            line = lines[line_no - 1] if line_no <= len(lines) else ""
+            matches.append(
+                SourceLocation(
+                    str(path.relative_to(resolved)),
+                    line_no,
+                    column,
+                    "reference",
+                    symbol,
+                    _preview(line),
                 )
-                if len(matches) >= max_results:
-                    return matches
+            )
+            if len(matches) >= max_results:
+                return matches
     return matches
 
 
