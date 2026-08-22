@@ -57,6 +57,7 @@ redactor.
 from __future__ import annotations
 
 import collections
+import fcntl
 import json
 import logging
 import os
@@ -234,6 +235,16 @@ def _validate_event_record(record: Any) -> dict[str, Any]:
     return dict(record)
 
 
+def _validate_append_record(record: Any) -> dict[str, Any]:
+    """Validate the envelope fields that will be reconstructed on replay."""
+    if not isinstance(record, dict):
+        raise ValueError("event must be a JSON object")
+    candidate = dict(record)
+    candidate.setdefault("seq", 1)
+    candidate.setdefault("payload", {})
+    return _validate_event_record(candidate)
+
+
 def _validate_event_order(events: list[dict[str, Any]], path: Path) -> None:
     previous_seq = 0
     event_ids: set[str] = set()
@@ -311,6 +322,39 @@ class StoreTimeout(StoreError):
 
 class StoreInitError(StoreError):
     """The event store failed to start."""
+
+
+def _acquire_writer_lock(path: Path) -> int:
+    lock_path = Path(f"{path}.lock")
+    fd = -1
+    try:
+        fd = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        if fd >= 0:
+            os.close(fd)
+        raise StoreInitError(f"event store is already owned: {path}") from exc
+    except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
+        raise StoreInitError(f"could not lock event store: {path}") from exc
+    return fd
+
+
+def _release_writer_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 class _Pending:
@@ -557,9 +601,7 @@ class EventStore:
             return self._dropped
 
     def append(self, event: dict[str, Any]) -> int | None:
-        kind = event.get("kind")
-        if not isinstance(kind, str) or not kind:
-            raise ValueError("event requires a non-empty string 'kind'")
+        event = _validate_append_record(event)
         if self._redactor is not None:
             event = cast(
                 dict[str, Any],
@@ -567,9 +609,14 @@ class EventStore:
                     event, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
                 ),
             )
-            kind = cast(str, event.get("kind"))
+            event = _validate_append_record(event)
+        kind = cast(str, event["kind"])
+        try:
+            payload = json.dumps(event["payload"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("event payload must be JSON serializable") from exc
         row = (
-            json.dumps(event.get("payload", {})),
+            payload,
             str(event["ts"]) if event.get("ts") is not None else None,
             event.get("monotonic_ms"),
             event.get("task_id"),
@@ -953,7 +1000,9 @@ class EventStore:
         conn = None
         db_fd = None
         wal_fd = None
+        lock_fd = -1
         try:
+            lock_fd = _acquire_writer_lock(self._path)
             conn = sqlite3.connect(self._path, isolation_level=None)
             conn.execute(f"PRAGMA busy_timeout={_WRITER_BUSY_TIMEOUT_MS}").fetchall()
             conn.execute("PRAGMA journal_mode=WAL").fetchall()
@@ -989,6 +1038,8 @@ class EventStore:
                 os.close(db_fd)
             if conn is not None:
                 conn.close()
+            if lock_fd >= 0:
+                _release_writer_lock(lock_fd)
             return
 
         dirty = False
@@ -1081,6 +1132,8 @@ class EventStore:
                 os.close(db_fd)
             if conn is not None:
                 conn.close()
+            if lock_fd >= 0:
+                _release_writer_lock(lock_fd)
 
     def _record_writer_failure(self, exc: BaseException, *, close_error: bool = False) -> None:
         with self._lock:
