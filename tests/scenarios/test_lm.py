@@ -953,14 +953,14 @@ def test_tool_call_completion_reaches_dspy_outputs() -> None:
     assert response.tool_calls[0].id == "call_1"
     assert response.text is None
     assert len(diffundo.calls) == 1
+    # The LM passes internal bare descriptors; the real transport performs
+    # the chat-completions wrapping itself (double-wrapped tools were
+    # silently dropped — see the lm.py tool-descriptor fix).
     assert diffundo.calls[0]["prompt"]["tools"] == [
         {
-            "type": "function",
-            "function": {
-                "name": "search",
-                "description": "search the web",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
-            },
+            "name": "search",
+            "description": "search the web",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
         }
     ]
 
