@@ -116,6 +116,35 @@ def _normalize_scheduler_source() -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _normalize_tool_dispatch() -> None:
+    path = ROOT / "src" / "cambium" / "tools.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_tool"
+        ),
+        None,
+    )
+    if function is None or function.end_lineno is None:
+        raise RuntimeError("generated async run_tool wrapper not found")
+    lines = text.splitlines(keepends=True)
+    start = function.lineno - 1
+    end = function.end_lineno
+    segment = "".join(lines[start:end])
+    marker = "return _run_tool_without_python("
+    count = segment.count(marker)
+    if count != 2:
+        raise RuntimeError(
+            f"generated run_tool fallback count mismatch: expected 2, found {count}"
+        )
+    segment = segment.replace(marker, "return await _run_tool_without_python(")
+    lines[start:end] = [segment]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
 def _normalize_render_tests() -> None:
     path = ROOT / "tests" / "scenarios" / "test_render_stream.py"
     text = path.read_text(encoding="utf-8")
@@ -164,6 +193,7 @@ def main() -> None:
     fixer._fix_generated_line_lengths = lambda: None
     fixer.main()
     _normalize_scheduler_source()
+    _normalize_tool_dispatch()
     _normalize_render_tests()
     _normalize_repl_tests()
 
