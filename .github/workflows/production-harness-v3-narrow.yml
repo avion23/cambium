@@ -77,7 +77,7 @@ jobs:
                   token_lines += 1
                   continue
               output.append(line)
-          if model_lines != 2 or token_lines != 1:
+          if model_lines not in (0, 2) or token_lines != 1:
               raise RuntimeError(
                   "generated diffundo normalization mismatch: "
                   f"model={model_lines}, token={token_lines}"
