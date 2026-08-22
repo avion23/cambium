@@ -502,7 +502,7 @@ def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) ->
 
     def fail_final_fsync(self) -> None:
         fsync_started.set()
-        release.wait(1.0)
+        release.wait(30.0)
         raise OSError(28, "No space left on device")
 
     def close_store(name: str, done: threading.Event | None = None) -> None:
@@ -563,7 +563,7 @@ def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monke
         fsync_started.set()
         # Stall longer than the close join budget (1.0s here) so the
         # force-stop verdict is pinned even with headroom.
-        release.wait(3.0)
+        release.wait(30.0)
         real_fsync(self)
 
     def append_critical() -> None:
@@ -700,7 +700,7 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(1.0)
+        release.wait(30.0)
         real_fsync(self)
 
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
@@ -761,7 +761,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(1.0)
+        release.wait(30.0)
         real_fsync(self)
 
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
@@ -1154,7 +1154,7 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(1.0)
+        release.wait(30.0)
         real_fsync(self)
 
     def append_result(value: int, started: threading.Event) -> None:
