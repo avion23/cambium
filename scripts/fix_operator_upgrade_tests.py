@@ -85,6 +85,12 @@ def main() -> None:
         "and source/tests.\n",
         "test-strategy active authority reference",
     )
+    replace_once(
+        "tests/scenarios/test_cli_operator_smoke.py",
+        '    "tui",\n    "session",\n',
+        '    "tui",\n    "monitor",\n    "optimize",\n    "session",\n',
+        "canonical unified command list",
+    )
 
 
 if __name__ == "__main__":
