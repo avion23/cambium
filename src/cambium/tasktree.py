@@ -492,15 +492,31 @@ def upward_result(node: TaskNode) -> dict[str, Any]:
     (:data:`_ENVELOPE_KEYS` drives the returned dict).
     """
     spec = node.spec
+    unified_diff = spec.get("unified_diff", "")
+    if not isinstance(unified_diff, str):
+        raise TaskTreeError("upward result unified_diff must be a string")
+    summary = spec.get("summary", "")
+    if not isinstance(summary, str):
+        raise TaskTreeError("upward result summary must be a string")
+    commits = spec.get("commits", [])
+    if not isinstance(commits, list) or not all(
+        isinstance(commit, str) for commit in commits
+    ):
+        raise TaskTreeError("upward result commits must be a list of strings")
+    files_changed = spec.get("files_changed", [])
+    if not isinstance(files_changed, list) or not all(
+        isinstance(path, str) for path in files_changed
+    ):
+        raise TaskTreeError("upward result files_changed must be a list of strings")
     values = {
         "parent_task_id": node.parent_task_id,
-        "unified_diff": spec.get("unified_diff", ""),
+        "unified_diff": unified_diff,
         "diff_truncated": spec.get("diff_truncated", False),
-        "summary": spec.get("summary", ""),
+        "summary": summary,
         "metric_score": spec.get("metric_score", None),
         "metric_breakdown": spec.get("metric_breakdown", {}),
-        "commits": spec.get("commits", []),
-        "files_changed": spec.get("files_changed", []),
+        "commits": commits,
+        "files_changed": files_changed,
         "status": node.status,
     }
     return {key: copy.deepcopy(values[key]) for key in _ENVELOPE_KEYS}

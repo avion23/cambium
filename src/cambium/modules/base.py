@@ -207,7 +207,7 @@ def load_module_manifest(
         data = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise ModuleContractError(f"module {name!r}: cannot read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         raise ModuleContractError(f"module {name!r}: invalid {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ModuleContractError(f"module {name!r}: {path} must contain a JSON object")
@@ -467,6 +467,19 @@ class DatasetLoader(ABC):
         """Load and validate all examples in the dataset."""
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        record[key] = value
+    return record
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {value!r}")
+
+
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     """Read a JSONL file into a list of records, ignoring blank lines.
 
@@ -484,8 +497,12 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
+            record = json.loads(
+                line,
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
             raise DatasetError(f"{dataset_path}:{line_no}: invalid JSON: {exc}") from exc
         if not isinstance(record, dict):
             raise DatasetError(f"{dataset_path}:{line_no}: record must be a JSON object")
