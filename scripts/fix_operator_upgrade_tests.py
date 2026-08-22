@@ -57,6 +57,12 @@ def main() -> None:
         "worker IPC active architecture reference",
     )
     replace_once(
+        "src/cambium/worker.py",
+        "MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)\n",
+        "MAX_DIFF_BYTES = 64 * 1024  # 64 KiB bounded upward diff envelope.\n",
+        "worker diff-cap active invariant",
+    )
+    replace_once(
         "src/cambium/doctor.py",
         '            "(provider-landscape.md §6)"\n',
         '            "(credential safety invariant)"\n',
