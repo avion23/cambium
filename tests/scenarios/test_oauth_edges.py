@@ -8,7 +8,9 @@ import pytest
 
 from cambium.oauth import (
     DEFAULT_REFRESH_MARGIN_S,
+    InvalidGrantError,
     OAuthDoc,
+    OAuthMissingError,
     OAuthRecord,
     OAuthStore,
     RefreshedTokens,
@@ -123,6 +125,19 @@ def test_token_manager_uses_injected_clock_after_backward_step(tmp_path: Path) -
     assert refreshes == ["stored-refresh"]
 
 
+def test_refreshed_tokens_repr_hides_all_token_values() -> None:
+    refreshed = RefreshedTokens(
+        "fresh-access-secret", 3600.0, "fresh-refresh-secret", "account-secret"
+    )
+
+    output = repr(refreshed)
+
+    assert "fresh-access-secret" not in output
+    assert "fresh-refresh-secret" not in output
+    assert "account-secret" not in output
+    assert output == "RefreshedTokens(expires_in=3600.0, refresh_token=True, account_id=True)"
+
+
 def test_refresh_callback_failure_preserves_store_bytes(tmp_path: Path) -> None:
     store = OAuthStore(_path(tmp_path))
     store.save_provider(_doc(0.0))
@@ -145,6 +160,137 @@ def test_refresh_callback_failure_preserves_store_bytes(tmp_path: Path) -> None:
 
     assert store.path.read_bytes() == before
     assert not list(store.path.parent.glob(".oauth.json.tmp-*"))
+
+
+def test_refresh_does_not_overwrite_a_concurrent_login(tmp_path: Path) -> None:
+    store_path = _path(tmp_path)
+    store = OAuthStore(store_path)
+    store.save_provider(_doc(0.0))
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    result: list[tuple[str, str | None]] = []
+    errors: list[BaseException] = []
+
+    def refresh(_refresh_token: str) -> RefreshedTokens:
+        refresh_started.set()
+        assert release_refresh.wait(5.0)
+        return RefreshedTokens("stale-refresh-access", 3600.0, "stale-refresh-token")
+
+    manager = TokenManager(
+        "codex",
+        store,
+        client_id="client",
+        issuer="http://127.0.0.1:1",
+        refresh=refresh,
+        clock=lambda: 1000.0,
+    )
+
+    def run() -> None:
+        try:
+            result.append(manager.ensure_fresh())
+        except BaseException as exc:  # pragma: no cover - failure diagnostics
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert refresh_started.wait(5.0)
+    login = OAuthDoc("codex", "login-access", "login-refresh", 5000.0, None)
+    store.save_provider(login)
+    release_refresh.set()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert result == [("login-access", None)]
+    record = store.read_provider("codex")
+    assert record is not None
+    assert record.doc == login
+
+
+def test_refresh_does_not_restore_a_logged_out_provider(tmp_path: Path) -> None:
+    store_path = _path(tmp_path)
+    store = OAuthStore(store_path)
+    store.save_provider(_doc(0.0))
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    errors: list[BaseException] = []
+
+    def refresh(_refresh_token: str) -> RefreshedTokens:
+        refresh_started.set()
+        assert release_refresh.wait(5.0)
+        return RefreshedTokens("stale-refresh-access", 3600.0, "stale-refresh-token")
+
+    manager = TokenManager(
+        "codex",
+        store,
+        client_id="client",
+        issuer="http://127.0.0.1:1",
+        refresh=refresh,
+        clock=lambda: 1000.0,
+    )
+
+    def run() -> None:
+        try:
+            manager.ensure_fresh()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert refresh_started.wait(5.0)
+    assert store.remove_provider("codex") is True
+    release_refresh.set()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], OAuthMissingError)
+    assert store.read_provider("codex") is None
+
+
+def test_invalid_grant_does_not_disable_a_concurrent_login(tmp_path: Path) -> None:
+    store_path = _path(tmp_path)
+    store = OAuthStore(store_path)
+    store.save_provider(_doc(0.0))
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    result: list[tuple[str, str | None]] = []
+    errors: list[BaseException] = []
+
+    def refresh(_refresh_token: str) -> RefreshedTokens:
+        refresh_started.set()
+        assert release_refresh.wait(5.0)
+        raise InvalidGrantError("old grant")
+
+    manager = TokenManager(
+        "codex",
+        store,
+        client_id="client",
+        issuer="http://127.0.0.1:1",
+        refresh=refresh,
+        clock=lambda: 1000.0,
+    )
+
+    def run() -> None:
+        try:
+            result.append(manager.ensure_fresh())
+        except BaseException as exc:  # pragma: no cover - failure diagnostics
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert refresh_started.wait(5.0)
+    login = OAuthDoc("codex", "login-access", "login-refresh", 5000.0, None)
+    store.save_provider(login)
+    release_refresh.set()
+    thread.join(5.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert result == [("login-access", None)]
+    record = store.read_provider("codex")
+    assert record is not None and not record.disabled
+    assert record.doc == login
 
 
 def test_two_managers_share_one_refresh_transaction(tmp_path: Path) -> None:

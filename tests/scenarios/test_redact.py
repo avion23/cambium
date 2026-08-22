@@ -473,6 +473,17 @@ def _unicode_escape(text: str) -> str:
     return "".join(f"\\u{ord(character):04x}" for character in text)
 
 
+def test_escaped_provider_shapes_are_redacted() -> None:
+    token = "sk-proj-" + "S" * 40
+    wire = "".join(f"\\u{ord(character):04x}" for character in token)
+
+    output = R.redact_escaped(f"provider={wire}")
+
+    assert token not in output
+    assert wire not in output
+    assert output == "provider=***"
+
+
 def test_old_and_rotated_opaque_tokens_redacted_in_all_wire_forms() -> None:
     old = "opaque-old-token-" + "A" * 20
     rotated = "opaque-rotated-token-" + "B" * 20

@@ -44,7 +44,6 @@ from .auth import (
     _JSONObject,
     _open_directory,
     _open_secure_file,
-    _read_fd,
     _validate_file_stat,
     _verify_directory_path,
     _write_all,
@@ -229,7 +228,7 @@ class AuthorizationCode:
         return "AuthorizationCode(approved=True)"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class RefreshedTokens:
     """Validated refresh response; ``refresh_token``/``account_id`` may be absent."""
 
@@ -237,6 +236,12 @@ class RefreshedTokens:
     expires_in: float
     refresh_token: str | None = None
     account_id: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"RefreshedTokens(expires_in={self.expires_in!r}, "
+            f"refresh_token={bool(self.refresh_token)}, account_id={bool(self.account_id)})"
+        )
 
 
 def oauth_store_path() -> Path:
@@ -392,6 +397,24 @@ def parse_document(data: bytes) -> OAuthDocument:
     return _validate_raw_document(raw)
 
 
+def _read_fd(fd: int) -> bytes:
+    """Read at most one byte beyond the oauth document size cap."""
+    chunks: list[bytes] = []
+    remaining = MAX_OAUTH_DOC_BYTES + 1
+    while remaining:
+        try:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+        except OSError as exc:
+            raise OAuthStoreError("could not read the oauth store file") from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        if remaining == 0:
+            raise OAuthSchemaError("oauth store exceeds the maximum document size")
+    return b"".join(chunks)
+
+
 def _new_temp_file(dir_fd: int) -> tuple[int, str]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     for _ in range(10):
@@ -409,6 +432,8 @@ def _new_temp_file(dir_fd: int) -> tuple[int, str]:
 
 
 def _atomic_write(dir_fd: int, name: str, data: bytes) -> None:
+    if len(data) > MAX_OAUTH_DOC_BYTES:
+        raise OAuthSchemaError("oauth store exceeds the maximum document size")
     fd: int | None = None
     temp_name: str | None = None
     try:
@@ -559,6 +584,63 @@ class OAuthStore:
             records = {record.doc.provider: record for record in current.records}
             records[doc.provider] = OAuthRecord(doc=doc, disabled=disabled)
             self._save_records(directory_fd, records)
+        finally:
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(directory_fd)
+
+    def _save_provider_if_current(
+        self,
+        doc: OAuthDoc,
+        expected: OAuthRecord,
+        *,
+        disabled: bool = False,
+    ) -> bool:
+        """Save ``doc`` only when ``expected`` is still the stored record."""
+        if not isinstance(doc, OAuthDoc):
+            raise OAuthSchemaError("oauth store document is invalid")
+        if not isinstance(expected, OAuthRecord) or expected.doc.provider != doc.provider:
+            raise OAuthSchemaError("oauth store compare-and-swap record is invalid")
+        if not isinstance(disabled, bool):
+            raise OAuthSchemaError("oauth store disabled flag is invalid")
+        if not self._path.parent.is_dir():
+            return False
+        directory_fd = self._open_directory_locked(create=False)
+        try:
+            current = self._read_locked_directory(directory_fd)
+            if current.by_provider(doc.provider) != expected:
+                return False
+            records = {record.doc.provider: record for record in current.records}
+            records[doc.provider] = OAuthRecord(doc=doc, disabled=disabled)
+            self._save_records(directory_fd, records)
+            return True
+        finally:
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(directory_fd)
+
+    def _mark_disabled_if_current(self, expected: OAuthRecord) -> bool:
+        """Disable ``expected`` only while it remains the stored record."""
+        if not isinstance(expected, OAuthRecord):
+            raise OAuthSchemaError("oauth store compare-and-swap record is invalid")
+        provider = expected.doc.provider
+        if not self._path.parent.is_dir():
+            return False
+        directory_fd = self._open_directory_locked(create=False)
+        try:
+            current = self._read_locked_directory(directory_fd)
+            if current.by_provider(provider) != expected:
+                return False
+            if expected.disabled:
+                return True
+            records = {record.doc.provider: record for record in current.records}
+            records[provider] = OAuthRecord(doc=expected.doc, disabled=True)
+            self._save_records(directory_fd, records)
+            return True
         finally:
             try:
                 fcntl.flock(directory_fd, fcntl.LOCK_UN)
@@ -1036,9 +1118,11 @@ class DeviceFlow:
             approved = poll_device_token(
                 self._issuer, code.device_auth_id, code.user_code, self._http_timeout_s
             )
-            if approved is not None:
-                return approved
             remaining = deadline - time.monotonic()
+            if approved is not None:
+                if remaining <= 0:
+                    raise DeviceFlowExpired("device code expired before approval")
+                return approved
             if remaining <= 0:
                 raise DeviceFlowExpired("device code expired before approval")
             time.sleep(min(code.interval, remaining))
@@ -1327,8 +1411,18 @@ class TokenManager:
             try:
                 refreshed = self._refresh(current.doc.refresh_token)
             except InvalidGrantError:
-                self._store.mark_disabled(self._provider)
-                raise
+                if self._store._mark_disabled_if_current(current):
+                    raise
+                latest = self._store.read_provider(self._provider)
+                if latest is None:
+                    raise OAuthMissingError(
+                        f"provider {self._provider!r} has no oauth credentials"
+                    )
+                if latest.disabled:
+                    raise InvalidGrantError(
+                        f"provider {self._provider!r} is disabled until re-login"
+                    )
+                return latest.doc.access_token, latest.doc.account_id
             refreshed_refresh = refreshed.refresh_token or current.doc.refresh_token
             account_id = (
                 refreshed.account_id
@@ -1342,8 +1436,18 @@ class TokenManager:
                 expires_at=self._clock() + refreshed.expires_in,
                 account_id=account_id,
             )
-            self._store.save_provider(updated)
-            return updated.access_token, updated.account_id
+            if self._store._save_provider_if_current(updated, current):
+                return updated.access_token, updated.account_id
+            latest = self._store.read_provider(self._provider)
+            if latest is None:
+                raise OAuthMissingError(
+                    f"provider {self._provider!r} has no oauth credentials"
+                )
+            if latest.disabled:
+                raise InvalidGrantError(
+                    f"provider {self._provider!r} is disabled until re-login"
+                )
+            return latest.doc.access_token, latest.doc.account_id
         finally:
             self._release_lock(lock_fd)
 
@@ -1356,7 +1460,7 @@ class TokenManager:
                 raise OAuthMissingError(
                     f"provider {self._provider!r} has no oauth credentials"
                 )
-            self._store.mark_disabled(self._provider)
+            self._store._mark_disabled_if_current(current)
         finally:
             self._release_lock(lock_fd)
 
