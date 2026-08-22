@@ -82,6 +82,10 @@ class _FakeCallResult:
 
 
 class _ScriptedRouter:
+
+    def declared_model(self, name: str) -> str:
+        return ""
+
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
         self.prompts: list[dict[str, Any]] = []

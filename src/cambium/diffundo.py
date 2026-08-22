@@ -600,21 +600,9 @@ class _RawResponse:
             usage.pop("cached_tokens", None)
             if cached_tokens is not None:
                 usage["cached_tokens"] = cached_tokens
-        reported = self.payload.get("model")
-        if (
-            isinstance(reported, str)
-            and reported
-            and provider.model
-            and reported != provider.model
-        ):
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.ERROR,
-                f"untrusted response model {reported!r} does not match configured {provider.model!r}",
-            )
         return CallResult(
             provider=provider.name,
-            model=reported if isinstance(reported, str) and reported else provider.model,
+            model=self.payload.get("model") or provider.model,
             tier=provider.tier,
             content=content,
             latency_s=self.latency_s,
@@ -658,23 +646,12 @@ class _CodexRawResponse(_RawResponse):
             )
         usage = _codex_usage(self.payload)
         response = self.payload.get("response")
-        reported = (
-            response.get("model") if isinstance(response, dict) else None
-        )
-        if (
-            isinstance(reported, str)
-            and reported
-            and provider.model
-            and reported != provider.model
-        ):
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.ERROR,
-                f"untrusted response model {reported!r} does not match configured {provider.model!r}",
-            )
+        model = provider.model
+        if isinstance(response, dict) and isinstance(response.get("model"), str):
+            model = response["model"]
         return CallResult(
             provider=provider.name,
-            model=reported if isinstance(reported, str) and reported else provider.model,
+            model=model,
             tier=provider.tier,
             content=self.text,
             latency_s=self.latency_s,
@@ -1308,6 +1285,16 @@ class Diffundo:
     def health(self, name: str) -> HealthState:
         """Current circuit-breaker health state for a provider."""
         return self._runtime(name).health
+
+    def declared_model(self, name: str) -> str:
+        """The model id the named provider is configured to serve.
+
+        Trust reference for response validation: a CallResult from this
+        router must report exactly this id for its serving provider. This
+        — not the caller's pinned model — is what sibling fallback must
+        satisfy when providers in one tier declare different models.
+        """
+        return self._runtime(name).provider.model
 
     def status(self, name: str) -> ProviderStatus:
         """Current selection-filter status for a provider."""
