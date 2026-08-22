@@ -1,0 +1,76 @@
+name: runtime-v2-input-introspection
+
+on:
+  push:
+    branches:
+      - codex/runtime-v2-input-introspection
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/runtime-v2-input-introspection
+      - run: cp scripts/apply_input_introspection.py /tmp/apply_input_introspection.py
+
+      - name: Wait for final scheduler corrections
+        run: |
+          for attempt in $(seq 1 160); do
+            git fetch origin main
+            BASE_SHA=$(git rev-parse origin/main)
+            if git cat-file -e "$BASE_SHA:tests/scenarios/test_provider_portfolio_e2e.py" 2>/dev/null; then
+              echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+              git checkout --detach "$BASE_SHA"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "final runtime corrections did not arrive on main" >&2
+          exit 1
+
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev --python 3.14
+
+      - name: Apply multiline input and local introspection
+        run: |
+          cp /tmp/apply_input_introspection.py scripts/apply_input_introspection.py
+          uv run --python 3.14 python scripts/apply_input_introspection.py
+          uv lock
+          uv sync --extra dev --python 3.14
+          uv run --python 3.14 ruff check --fix src tests
+          uv run --python 3.14 ruff check src tests
+          uv run --python 3.14 python -m compileall -q src tests
+
+      - name: Focused UI/session tests
+        run: >-
+          uv run --python 3.14 pytest -q
+          tests/scenarios/test_input_protocol.py
+          tests/scenarios/test_interactive_introspection.py
+          tests/scenarios/test_interactive_session.py
+          tests/scenarios/test_repl_history.py
+          tests/scenarios/test_repl_usage.py
+          tests/scenarios/test_interface_regressions.py
+          tests/scenarios/test_render_stream.py
+          tests/scenarios/test_user_cli.py
+          tests/scenarios/test_context_epochs.py
+
+      - name: Complete gates
+        run: |
+          uv run --python 3.14 pytest -q -n auto
+          uv run --python 3.14 pytest -q -n auto -m slow
+          uv lock --check
+          git diff --check
+
+      - name: Commit and lease-protected fast-forward
+        run: |
+          rm -f scripts/apply_input_introspection.py
+          git config user.name "cambium-ui-bot"
+          git config user.email "cambium-ui-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(ui): add multiline prompts and local introspection"
+          git push --force-with-lease=refs/heads/main:${BASE_SHA} origin HEAD:main
