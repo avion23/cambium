@@ -14,10 +14,15 @@ import pytest
 from cambium.tasktree import (
     CycleError,
     MultiParentError,
+    NodeStatus,
+    TaskKind,
+    TaskNode,
     TaskPlanError,
+    TaskTreeError,
     build_tree,
     ready_tasks,
     topological_order,
+    upward_result,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -244,3 +249,24 @@ def test_module_cli_output_remains_byte_stable() -> None:
     assert result.returncode == 0
     assert result.stdout == '"root"\n"child"\n'
     assert result.stderr == ""
+
+
+def test_upward_result_rejects_unvalidated_text_and_lists() -> None:
+    fields = [
+        ({"summary": 1}, "summary.*string"),
+        ({"unified_diff": 1}, "unified_diff.*string"),
+        ({"commits": ["ok", 1]}, "commits.*list of strings"),
+        ({"files_changed": ["ok", 1]}, "files_changed.*list of strings"),
+    ]
+    for spec, message in fields:
+        node = TaskNode(
+            "child",
+            TaskKind.TEST,
+            "root",
+            spec,
+            1,
+            0,
+            NodeStatus.DONE,
+        )
+        with pytest.raises(TaskTreeError, match=message):
+            upward_result(node)

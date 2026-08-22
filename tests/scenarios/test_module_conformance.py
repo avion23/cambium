@@ -20,6 +20,12 @@ from pathlib import Path
 import pytest
 
 from cambium import module_conformance
+from cambium.modules.base import (
+    DatasetError,
+    ModuleContractError,
+    load_jsonl,
+    load_module_manifest,
+)
 
 EXPECTED_SPLIT_DIGESTS = {
     "train": "e41f1f4ca9e1905122e1faa0955cd2833bf032635ea721d33d36d1b3b7caf136",
@@ -33,6 +39,31 @@ def _one_discovered_module() -> str:
     if not names:
         pytest.skip("no decision modules are installed")
     return names[0]
+
+
+def test_jsonl_loader_rejects_duplicate_keys_and_nonstandard_constants(
+    tmp_path: Path,
+) -> None:
+    duplicate = tmp_path / "duplicate.jsonl"
+    duplicate.write_text('{"id": 1, "id": 2}\n', encoding="utf-8")
+    with pytest.raises(DatasetError, match="duplicate"):
+        load_jsonl(duplicate)
+
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        path = tmp_path / f"{constant.replace('-', 'negative')}.jsonl"
+        path.write_text(f'{{"value": {constant}}}\n', encoding="utf-8")
+        with pytest.raises(DatasetError, match="non-standard"):
+            load_jsonl(path)
+
+
+def test_manifest_loader_wraps_malformed_utf8(tmp_path: Path) -> None:
+    module_dir = tmp_path / "example"
+    module_dir.mkdir()
+    manifest = module_dir / "module.json"
+    manifest.write_bytes(b"{\xff")
+
+    with pytest.raises(ModuleContractError, match="invalid"):
+        load_module_manifest(module_dir)
 
 
 def test_split_digests_anchor_metadata_baseline_and_content() -> None:
