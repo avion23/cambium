@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 import json
 import math
@@ -79,10 +80,10 @@ class _CostLedger:
                 f"optimization budget ${self.budget_usd:.6f} is below the "
                 f"${_MIN_CALL_BUDGET_USD:.2f} minimum for one provider call"
             )
-        if self.spent_usd >= self.budget_usd:
+        if self.remaining_usd < _MIN_CALL_BUDGET_USD:
             raise _BudgetExhausted(
                 f"optimization budget exhausted: spent ${self.spent_usd:.6f} "
-                f"of ${self.budget_usd:.6f}"
+                f"of ${self.budget_usd:.6f}; only ${self.remaining_usd:.6f} remains"
             )
 
     def record(self, value: object) -> None:
@@ -129,13 +130,21 @@ class _TrackingDiffundo(Diffundo):
         budget_usd: float | None = None,
     ) -> Any:
         self._ledger.check_available()
+        call_budget = self._ledger.remaining_usd
+        if budget_usd is not None:
+            call_budget = min(call_budget, budget_usd)
         result = await self._delegate.call(
             tier,
             prompt,
             model=model,
-            budget_usd=budget_usd,
+            budget_usd=call_budget,
         )
         self._ledger.record(getattr(result, "estimated_cost_usd", 0.0))
+        if self._ledger.spent_usd > self._ledger.budget_usd:
+            raise _BudgetExhausted(
+                f"optimization budget exceeded: spent ${self._ledger.spent_usd:.6f} "
+                f"of ${self._ledger.budget_usd:.6f}"
+            )
         return result
 
 
@@ -902,7 +911,13 @@ def _safe_component(value: object, label: str) -> str:
 
 
 def write_artifact(module_name, program, lm, report) -> Path:
-    """Persist the module's single artifact set, replacing any previous set."""
+    """Persist the module's single artifact set, replacing any previous set.
+
+    Each member is atomically replaced, but the directory is not transactional.
+    ``program.json`` and ``lm.json`` are written before ``report.json``; the
+    report is the commit marker that readers should require before consuming
+    the other two files after an interrupted write.
+    """
     module_component = _safe_component(module_name, "module_name")
     module_dir = Path("optimized") / module_component
     module_dir.mkdir(parents=True, exist_ok=True)
@@ -913,6 +928,7 @@ def write_artifact(module_name, program, lm, report) -> Path:
         raise OptimizeError("program and LM must provide dump_state()")
     _atomic_json_write(module_dir / "program.json", program_dump())
     _atomic_json_write(module_dir / "lm.json", lm_dump())
+    # Keep report last: it commits the preceding pair for readers.
     _atomic_json_write(module_dir / "report.json", report)
     return module_dir
 
@@ -968,16 +984,83 @@ def _load_manifest(module_name: str) -> object:
 
 
 def _baseline_means(manifest: object) -> dict[str, float]:
-    path = (
-        Path(cast(ModuleManifest, manifest).package_dir)
-        / "tests"
-        / "baselines"
-        / "baseline.json"
-    )
+    package_dir = Path(cast(ModuleManifest, manifest).package_dir)
+    path = package_dir / "tests" / "baselines" / "baseline.json"
+    datasets_dir = package_dir / "datasets"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise OptimizeError(f"cannot read baseline {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise OptimizeError(f"baseline {path} must contain an object")
+    schema_version = data.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
+        raise OptimizeError(f"baseline {path} has unsupported schema_version")
+    module_name = getattr(manifest, "module_name", None)
+    if not isinstance(data.get("module"), str):
+        raise OptimizeError(f"baseline {path} has no module name")
+    if module_name is not None and data["module"] != module_name:
+        raise OptimizeError(
+            f"baseline {path} module {data['module']!r} does not match {module_name!r}"
+        )
+
+    meta_path = datasets_dir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OptimizeError(f"cannot read dataset metadata {meta_path}: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise OptimizeError(f"dataset metadata {meta_path} must contain an object")
+    expected_schema = getattr(manifest, "dataset_schema_version", None)
+    current_schema = meta.get("schema_version")
+    if expected_schema is not None:
+        if isinstance(expected_schema, bool) or not isinstance(expected_schema, int):
+            raise OptimizeError("manifest dataset_schema_version is not an integer")
+        if isinstance(current_schema, bool) or not isinstance(current_schema, int):
+            raise OptimizeError(
+                f"dataset metadata {meta_path} schema_version is not an integer"
+            )
+        if current_schema != expected_schema:
+            raise OptimizeError(
+                f"dataset metadata {meta_path} schema_version {current_schema!r} "
+                f"does not match manifest {expected_schema!r}"
+            )
+    dataset_version = meta.get("dataset_version")
+    if not isinstance(dataset_version, str) or not dataset_version:
+        raise OptimizeError(f"dataset metadata {meta_path} has no dataset_version")
+    if data.get("dataset_version") != dataset_version:
+        raise OptimizeError(
+            f"baseline {path} dataset_version {data.get('dataset_version')!r} "
+            f"does not match current dataset {dataset_version!r}"
+        )
+
+    baseline_digests = data.get("split_digests")
+    meta_digests = meta.get("split_digests")
+    if not isinstance(baseline_digests, Mapping) or not isinstance(meta_digests, Mapping):
+        raise OptimizeError(f"baseline {path} has no complete split_digests")
+    for split in ("train", "eval", "canaries"):
+        baseline_digest = baseline_digests.get(split)
+        meta_digest = meta_digests.get(split)
+        if not isinstance(baseline_digest, str) or not isinstance(meta_digest, str):
+            raise OptimizeError(f"baseline {path} has no split_digests.{split}")
+        if baseline_digest != meta_digest:
+            raise OptimizeError(
+                f"baseline {path} split_digests.{split} does not match dataset metadata"
+            )
+        split_path = datasets_dir / f"{split}.jsonl"
+        try:
+            actual_digest = hashlib.sha256(split_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise OptimizeError(f"cannot read dataset split {split_path}: {exc}") from exc
+        if baseline_digest != actual_digest:
+            raise OptimizeError(
+                f"baseline {path} split_digests.{split} does not match current dataset"
+            )
+
     means: dict[str, float] = {}
     for split in ("train", "eval", "canaries"):
         try:
@@ -1194,7 +1277,8 @@ def _run(argv=None) -> int:
             final = stage_bootstrap
         canaries = score_split(program, _load_split(loader, "CANARIES"))
         gate_passed = (
-            final["eval_mean"] >= 0.85
+            ledger.spent_usd <= ledger.budget_usd
+            and final["eval_mean"] >= 0.85
             and final["eval_mean"] >= baseline_means["eval"] - 0.05
             and canaries["count"] > 0
             and canaries["mean"] == 1.0

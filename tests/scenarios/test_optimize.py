@@ -414,6 +414,45 @@ def test_baseline_means_reads_all_three_splits() -> None:
     assert all(0.0 <= value <= 1.0 for value in means.values())
 
 
+def test_baseline_means_rejects_dataset_digest_drift(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example"
+    package_dir = tmp_path / "example"
+    shutil.copytree(source, package_dir)
+    (package_dir / "datasets" / "train.jsonl").write_text(
+        (package_dir / "datasets" / "train.jsonl").read_text(encoding="utf-8")
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = SimpleNamespace(
+        package_dir=package_dir,
+        module_name="should_decompose",
+        dataset_schema_version=1,
+    )
+
+    with pytest.raises(optimize.OptimizeError, match="split_digests.train"):
+        optimize._baseline_means(manifest)
+
+
+def test_tracking_diffundo_uses_remaining_budget() -> None:
+    class Delegate:
+        def __init__(self) -> None:
+            self.budgets: list[float] = []
+
+        async def call(self, *_args, **kwargs):
+            self.budgets.append(kwargs["budget_usd"])
+            return SimpleNamespace(estimated_cost_usd=0.4)
+
+    delegate = Delegate()
+    ledger = optimize._CostLedger(1.0)
+    tracked = optimize._TrackingDiffundo(delegate, ledger)
+
+    asyncio.run(tracked.call(optimize.ProviderTier.FAST, {}, budget_usd=1.0))
+    asyncio.run(tracked.call(optimize.ProviderTier.FAST, {}, budget_usd=1.0))
+
+    assert delegate.budgets == [1.0, 0.6]
+    assert ledger.spent_usd == 0.8
+
+
 def test_load_dataset_loader_uses_module_datasets_directory() -> None:
     package_dir = Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example"
     manifest = optimize.load_module_manifest(package_dir)
