@@ -17,7 +17,9 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _function_segment(text: str, name: str, class_name: str | None = None) -> tuple[int, int, str]:
+def _function_segment(
+    text: str, name: str, class_name: str | None = None
+) -> tuple[int, int, str]:
     tree = ast.parse(text)
     scope = tree.body
     if class_name is not None:
@@ -68,6 +70,22 @@ def _replace_in_function(
     lines = text.splitlines(keepends=True)
     lines[start:end] = [replacement]
     _write(path, "".join(lines))
+
+
+def _replace_exact(
+    path: Path,
+    old: str,
+    new: str,
+    *,
+    expected: int = 1,
+) -> None:
+    text = _read(path)
+    if new in text and old not in text:
+        return
+    count = text.count(old)
+    if count != expected:
+        raise RuntimeError(f"{path.name}: expected {expected} matches, found {count}")
+    _write(path, text.replace(old, new))
 
 
 def _move_quota_initialization() -> None:
@@ -169,10 +187,124 @@ def _ensure_oauth_regex_import() -> None:
     _write(path, text.replace(marker, marker + "import re\n", 1))
 
 
+def _fix_generated_line_lengths() -> None:
+    diffundo = ROOT / "src" / "cambium" / "diffundo.py"
+    _replace_exact(
+        diffundo,
+        '                f"untrusted response model {reported!r} does not match configured {provider.model!r}",\n',
+        '''                (
+                    f"untrusted response model {reported!r} does not match "
+                    f"configured {provider.model!r}"
+                ),
+''',
+        expected=2,
+    )
+    _replace_exact(
+        diffundo,
+        '''                sum(len(str(message.get("content", "")).encode("utf-8")) for message in messages) // 4
+''',
+        '''                sum(
+                    len(str(message.get("content", "")).encode("utf-8"))
+                    for message in messages
+                )
+                // 4
+''',
+    )
+
+    scheduler = ROOT / "src" / "cambium" / "provider_scheduler.py"
+    _replace_exact(
+        scheduler,
+        '                    "used_tokens=excluded.used_tokens, allowance_requests=excluded.allowance_requests, "\n',
+        '''                    "used_tokens=excluded.used_tokens, "
+                    "allowance_requests=excluded.allowance_requests, "
+''',
+    )
+    _replace_exact(
+        scheduler,
+        '                    "used_requests=excluded.used_requests, reserve_fraction=excluded.reserve_fraction, "\n',
+        '''                    "used_requests=excluded.used_requests, "
+                    "reserve_fraction=excluded.reserve_fraction, "
+''',
+    )
+    _replace_exact(
+        scheduler,
+        '''        used_requests = 0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)
+''',
+        '''        used_requests = (
+            0
+            if remaining_requests is None
+            else max(0, allowance_requests - remaining_requests)
+        )
+''',
+    )
+    _replace_exact(
+        scheduler,
+        '''                    windows = () if self._ledger is None else await asyncio.to_thread(self._ledger.snapshots)
+''',
+        '''                    windows = (
+                        ()
+                        if self._ledger is None
+                        else await asyncio.to_thread(self._ledger.snapshots)
+                    )
+''',
+    )
+
+    render_tests = ROOT / "tests" / "scenarios" / "test_render_stream.py"
+    text = _read(render_tests)
+    signal_count = text.count("\nimport signal\n")
+    if signal_count == 1:
+        text = text.replace("\nimport signal\n", "\n", 1)
+    elif signal_count != 0:
+        raise RuntimeError(f"test_render_stream signal imports: found {signal_count}")
+    if "\nimport signal\n" not in text[:1000]:
+        marker = "import shutil\n"
+        if text.count(marker) != 1:
+            raise RuntimeError("test_render_stream import marker mismatch")
+        text = text.replace(marker, marker + "import signal\n", 1)
+    long_event = '''        on_event({"kind": "tool_event", "payload": {"tool": "run_shell", "cmd": "df -h", "ok": True, "duration_ms": 5}})
+'''
+    if long_event in text:
+        text = text.replace(
+            long_event,
+            '''        on_event(
+            {
+                "kind": "tool_event",
+                "payload": {
+                    "tool": "run_shell",
+                    "cmd": "df -h",
+                    "ok": True,
+                    "duration_ms": 5,
+                },
+            }
+        )
+''',
+            1,
+        )
+    _write(render_tests, text)
+
+    repl_tests = ROOT / "tests" / "scenarios" / "test_repl_usage.py"
+    text = _read(repl_tests)
+    long_patch = '''    monkeypatch.setattr(repl.render, "render_event_line", lambda _record, stream=None: "usage event")
+'''
+    if long_patch in text:
+        text = text.replace(
+            long_patch,
+            '''    monkeypatch.setattr(
+        repl.render,
+        "render_event_line",
+        lambda _record, stream=None: "usage event",
+    )
+''',
+            1,
+        )
+        _write(repl_tests, text)
+
+
 def main() -> None:
     _move_quota_initialization()
     _fix_native_tool_prompt_wiring()
     _ensure_oauth_regex_import()
+    _fix_generated_line_lengths()
 
 
 if __name__ == "__main__":
