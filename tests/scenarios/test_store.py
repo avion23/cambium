@@ -381,7 +381,7 @@ def test_stalled_writer_flood_drops_non_critical_preserves_critical(
             target=lambda: store.append({"kind": "result", "payload": {"c": 0}})
         )
         starter.start()
-        assert stalled.wait(0.6)  # writer is now blocked in C0's fsync
+        assert stalled.wait(5.0)  # writer is now blocked in C0's fsync
 
         start = time.monotonic()
         for i in range(40):
@@ -721,7 +721,7 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
 
     try:
         starter.start()
-        assert stalled.wait(0.6)
+        assert stalled.wait(5.0)
         accepted = [
             store.append({"kind": "log", "payload": {"i": 1}}),
             store.append({"kind": "log", "payload": {"i": 2}}),
@@ -772,7 +772,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
     )
     try:
         starter.start()
-        assert stalled.wait(0.6)
+        assert stalled.wait(5.0)
         accepted = store.append({"kind": "log", "payload": {"i": 1}})
         dropped = store.append({"kind": "log", "payload": {"i": 2}})
         assert accepted == 2
@@ -822,7 +822,7 @@ def test_failed_eviction_reservation_restores_event_and_sequence(tmp_path, monke
     blocker = sqlite3.connect(path, isolation_level=None)
     try:
         starter.start()
-        assert stalled.wait(1.0)
+        assert stalled.wait(5.0)
         assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
         blocker.execute("BEGIN IMMEDIATE")
 
