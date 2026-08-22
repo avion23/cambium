@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the production-harness corrections with a source-derived candidate patch."""
+"""Run the production-harness corrections with source-derived patches."""
 
 from __future__ import annotations
 
@@ -84,12 +84,88 @@ def _load_fixer() -> ModuleType:
     return module
 
 
+def _normalize_scheduler_source() -> None:
+    path = ROOT / "src" / "cambium" / "provider_scheduler.py"
+    text = path.read_text(encoding="utf-8")
+    replacements = {
+        '                    "used_tokens=excluded.used_tokens, allowance_requests=excluded.allowance_requests, "\n': (
+            '                    "used_tokens=excluded.used_tokens, "\n'
+            '                    "allowance_requests=excluded.allowance_requests, "\n'
+        ),
+        '                    "used_requests=excluded.used_requests, reserve_fraction=excluded.reserve_fraction, "\n': (
+            '                    "used_requests=excluded.used_requests, "\n'
+            '                    "reserve_fraction=excluded.reserve_fraction, "\n'
+        ),
+        '        used_requests = 0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)\n': (
+            '        used_requests = (\n'
+            '            0\n'
+            '            if remaining_requests is None\n'
+            '            else max(0, allowance_requests - remaining_requests)\n'
+            '        )\n'
+        ),
+        '                    windows = () if self._ledger is None else await asyncio.to_thread(self._ledger.snapshots)\n': (
+            '                    windows = (\n'
+            '                        ()\n'
+            '                        if self._ledger is None\n'
+            '                        else await asyncio.to_thread(self._ledger.snapshots)\n'
+            '                    )\n'
+        ),
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    path.write_text(text, encoding="utf-8")
+
+
+def _normalize_render_tests() -> None:
+    path = ROOT / "tests" / "scenarios" / "test_render_stream.py"
+    text = path.read_text(encoding="utf-8")
+    text = text.replace("\nimport signal\n", "\n")
+    import_marker = "import shutil\n"
+    if import_marker not in text:
+        raise RuntimeError("test_render_stream import marker missing")
+    text = text.replace(import_marker, import_marker + "import signal\n", 1)
+    text = text.replace(
+        '        on_event({"kind": "tool_event", "payload": {"tool": "run_shell", "cmd": "df -h", "ok": True, "duration_ms": 5}})\n',
+        '''        on_event(
+            {
+                "kind": "tool_event",
+                "payload": {
+                    "tool": "run_shell",
+                    "cmd": "df -h",
+                    "ok": True,
+                    "duration_ms": 5,
+                },
+            }
+        )
+''',
+    )
+    path.write_text(text, encoding="utf-8")
+
+
+def _normalize_repl_tests() -> None:
+    path = ROOT / "tests" / "scenarios" / "test_repl_usage.py"
+    text = path.read_text(encoding="utf-8")
+    text = text.replace(
+        '    monkeypatch.setattr(repl.render, "render_event_line", lambda _record, stream=None: "usage event")\n',
+        '''    monkeypatch.setattr(
+        repl.render,
+        "render_event_line",
+        lambda _record, stream=None: "usage event",
+    )
+''',
+    )
+    path.write_text(text, encoding="utf-8")
+
+
 def main() -> None:
     _patch_candidate_policy()
     fixer = _load_fixer()
     fixer._fix_model_candidate_policy = lambda: None
     fixer._fix_generated_line_lengths = lambda: None
     fixer.main()
+    _normalize_scheduler_source()
+    _normalize_render_tests()
+    _normalize_repl_tests()
 
 
 if __name__ == "__main__":
