@@ -27,11 +27,14 @@ def main() -> None:
 ''',
         '''    for agent in snapshot.agents:
         parent = agent.parent_task_id or "-"
-        state = "running" if agent.state == "active" else agent.state
+        state = {
+            "active": "running",
+            "succeeded": "done",
+        }.get(agent.state, agent.state)
         lines.append(
             f"{agent.task_id:<24} {state:<9} role={agent.role} "
 ''',
-        "preserve session-status running label",
+        "preserve established session-status labels",
     )
 
 
