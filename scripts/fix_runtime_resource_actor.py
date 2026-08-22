@@ -2,6 +2,7 @@
 """Normalize and clean the retained runtime-resource materializer.
 
 This file is source-controlled so the CI materialization path remains reviewable.
+The materializer is intentionally applied only to the latest verified main.
 """
 
 from __future__ import annotations
