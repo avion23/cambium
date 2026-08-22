@@ -4,7 +4,7 @@ Transport is JSON-Lines over stdio (one JSON object per ``\\n``-terminated
 line, UTF-8). This module is the framing layer only: it carries bytes and
 never interprets message payloads (architecture §4, §8.2).
 
-Framing rules implemented here (docs/research/ipc-protocol-draft.md §1):
+Framing rules implemented here (docs/architecture/architecture.md §5.1):
 - Partial lines are buffered across reads; a message boundary is the newline.
 - Blank and whitespace-only lines are skipped.
 - Lines that are not a single JSON object are logged and skipped; the stream
@@ -25,7 +25,7 @@ from typing import Any, Protocol, cast
 
 logger = logging.getLogger(__name__)
 
-MAX_LINE_BYTES = 1_048_576  # 1 MiB line cap (ipc-protocol-draft.md §1.4)
+MAX_LINE_BYTES = 1_048_576  # 1 MiB line cap; enforced before admission.
 
 
 class MessageTooLong(ValueError):

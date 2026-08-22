@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 cambium = "cambium.cli:main"
+cambium-monitor = "cambium.monitor:main"
 
 [project.optional-dependencies]
 dspy = ["dspy>=3.3.0,<3.4"]

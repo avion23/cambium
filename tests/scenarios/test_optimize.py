@@ -56,6 +56,7 @@ def test_parser_defaults_to_fast_tier() -> None:
 
     assert args.tier == "fast"
     assert not args.include_transcript_candidates
+    assert args.transcript_candidates is None
 
 
 def test_parser_can_opt_in_to_transcript_candidates() -> None:
@@ -64,6 +65,7 @@ def test_parser_can_opt_in_to_transcript_candidates() -> None:
     )
 
     assert args.include_transcript_candidates
+    assert args.transcript_candidates is None
 
 
 class OfflineProgram(dspy.Module):
@@ -329,20 +331,38 @@ def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
     )
     datasets = tmp_path / "datasets"
     shutil.copytree(source, datasets)
+    candidate_path = datasets / "transcript_candidates.jsonl"
+    approved_records = []
+    for line in candidate_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        record["review_status"] = "approved"
+        record["notes"] = "reviewed; approved_for_training"
+        approved_records.append(record)
     extra = {
         "id": "test-candidate-unique",
-        "input": {"task": "Synthetic candidate only", "context": "candidate context"},
+        "candidate": True,
+        "review_status": "approved",
+        "redacted": True,
+        "input": {
+            "task": "Synthetic candidate only",
+            "context": "candidate context",
+        },
         "expected": {"decompose": False, "reason": "test candidate"},
     }
-    candidate_path = datasets / "transcript_candidates.jsonl"
-    with candidate_path.open("a", encoding="utf-8") as stream:
-        encoded = json.dumps(extra)
-        stream.write(encoded + "\n")
-        stream.write(json.dumps({**extra, "id": "test-candidate-duplicate"}) + "\n")
-
-    loader = optimize._import_target("cambium.modules.example.dataset").ExampleDatasetLoader(
-        datasets
+    approved_records.extend(
+        [
+            extra,
+            {**extra, "id": "test-candidate-duplicate"},
+        ]
     )
+    candidate_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in approved_records),
+        encoding="utf-8",
+    )
+
+    loader = optimize._import_target(
+        "cambium.modules.example.dataset"
+    ).ExampleDatasetLoader(datasets)
     frozen = (
         loader.load_split(Split.TRAIN)
         + loader.load_split(Split.EVAL)
@@ -364,10 +384,16 @@ def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
     frozen_pairs = {(item.input.task, item.input.context) for item in frozen}
     augmented_pairs = {(item.input.task, item.input.context) for item in augmented}
     assert augmented_pairs.isdisjoint(
-        {(item.input.task, item.input.context) for item in loader.load_split(Split.EVAL)}
+        {
+            (item.input.task, item.input.context)
+            for item in loader.load_split(Split.EVAL)
+        }
     )
     assert augmented_pairs.isdisjoint(
-        {(item.input.task, item.input.context) for item in loader.load_split(Split.CANARIES)}
+        {
+            (item.input.task, item.input.context)
+            for item in loader.load_split(Split.CANARIES)
+        }
     )
     assert sum(
         item.input.task == "Synthetic candidate only" for item in augmented
@@ -376,7 +402,6 @@ def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
         (item.input.task, item.input.context) in frozen_pairs
         for item in validation
     )
-
 
 def test_baseline_means_reads_all_three_splits() -> None:
     manifest = SimpleNamespace(

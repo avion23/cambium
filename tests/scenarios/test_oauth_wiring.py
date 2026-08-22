@@ -493,9 +493,25 @@ def test_cli_device_flow_stores_session_and_keeps_code_off_stdout(
     assert "".join(tty_lines) != "" and USER_CODE in "".join(tty_lines)
 
 
-def test_cli_device_flow_requires_client_id(tmp_path: Path) -> None:
-    assert cli._run_auth_oauth_device("codex", "", store=OAuthStore(_store_path(tmp_path))) == 1
+def test_cli_device_flow_defaults_to_pinned_public_client(
+    tmp_path: Path,
+    fake_issuer: _FakeIssuer,
+) -> None:
+    store = OAuthStore(_store_path(tmp_path))
+    lines: list[str] = []
 
+    assert (
+        cli._run_auth_oauth_device(
+            "codex",
+            "",
+            store=store,
+            issuer=fake_issuer.issuer,
+            tty=lines.append,
+        )
+        == 0
+    )
+    assert store.read_provider("codex") is not None
+    assert fake_issuer.fake.exchange_count == 1
 
 def test_cli_oauth_parser_rejects_conflicting_subcommands(capsys) -> None:
     with pytest.raises(SystemExit) as raised:
@@ -572,7 +588,7 @@ def test_doctor_oauth_live_missing_session_warns(
     assert "codex=no-session" in detail
 
 
-def test_doctor_oauth_live_without_client_id_skips_refresh(
+def test_doctor_oauth_live_without_override_uses_public_client(
     tmp_path: Path, fake_issuer: _FakeIssuer
 ) -> None:
     config = _codex_config(tmp_path / "providers.json")
@@ -588,10 +604,9 @@ def test_doctor_oauth_live_without_client_id_skips_refresh(
         timeout_s=5.0,
     )
 
-    assert status is doctor.Status.WARN
-    assert "codex=refresh-skipped(no client id)" in detail
-    assert fake_issuer.fake.refresh_count == 0
-
+    assert status is doctor.Status.PASS
+    assert "codex=refreshable" in detail
+    assert fake_issuer.fake.refresh_count == 1
 
 def test_doctor_oauth_live_skips_without_codex_providers(tmp_path: Path) -> None:
     config = tmp_path / "providers.json"

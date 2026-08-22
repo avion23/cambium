@@ -3,8 +3,8 @@
 **Historical snapshot — 2026-08-10.** This design answers **IMPL-M8** and review
 findings for Custos, Opifex, Nuntius, Surculus, Unio, Diffundo, and the event log. It is
 not a test-count or current-status claim. Current authority is
-[`docs/architecture/architecture.md`](../architecture/architecture.md), source/tests,
-and [`v2-1-status.md`](v2-1-status.md).
+[`docs/architecture/architecture.md`](../architecture/architecture.md)
+and source/tests.
 
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; provider cascade is source-defined and honors

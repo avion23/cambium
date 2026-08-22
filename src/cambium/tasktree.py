@@ -1,8 +1,8 @@
 """TaskTree — deterministic task-DAG builder and supervisor scheduler inputs.
 
 Implements the Task Tree of the current architecture (§3.7, invariants
-I2.1-I2.7; formalized in ``docs/research/design-deltas.md`` D2) as a pure
-JSON-in/JSON-out module (module-template §3, feedback-2 delta D8a):
+I2.1-I2.7) as a pure JSON-in/JSON-out module under the normative module
+template:
 
 - I2.1 single root per session; every non-root node has exactly one parent
   (``parent_task_id``, event-schema-draft §3.1/§3.10, payload-first).

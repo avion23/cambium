@@ -5,8 +5,7 @@ Implements the architecture §7.8 merge terminal step: stage a worker branch
 ``git update-ref`` under the expected-old-SHA single-writer invariant, close
 the ref-advance/event crash gap on recovery, and clean up.
 
-Empirical findings from ``docs/research/worktree-concurrency.md`` are baked
-into the ordering:
+Measured Git worktree and reference behavior is baked into the ordering:
 
 - The staging SHA is captured into ``refs/cambium/staging/<id>`` BEFORE any
   worktree removal (Experiment 4: detached/rewritten commits become dangling

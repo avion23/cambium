@@ -7,16 +7,20 @@ and return a string.  No subprocesses, no network, no I/O.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import os
 import shutil
 
+from cambium import oneshot, repl, tui
 from cambium.render import (
     render_active_workers,
     render_event_line,
     render_status_bar,
     render_tokens_per_s,
 )
+from cambium.supervisor import PlanResult, TaskResult
 
 
 def _usage_event(
@@ -480,13 +484,6 @@ def test_status_bar_drops_absent_segments() -> None:
 # Sink wiring: tty status-bar footer vs legacy non-tty byte behavior
 # ---------------------------------------------------------------------------
 
-import asyncio
-import io
-
-from cambium import oneshot, repl, tui
-from cambium.supervisor import PlanResult, TaskResult
-
-
 class _TtyStream(io.StringIO):
     def isatty(self) -> bool:
         return True
@@ -494,8 +491,24 @@ class _TtyStream(io.StringIO):
 
 async def _scripted_run(config, on_event=None) -> PlanResult:
     assert on_event is not None
-    on_event({"kind": "tool_event", "payload": {"tool": "run_shell", "cmd": "df -h", "ok": True, "duration_ms": 5, "turn": 1}})
-    on_event({"kind": "heartbeat", "payload": {"status": "working", "tool": None, "turn": 1}})
+    on_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "run_shell",
+                "cmd": "df -h",
+                "ok": True,
+                "duration_ms": 5,
+                "turn": 1,
+            },
+        }
+    )
+    on_event(
+        {
+            "kind": "heartbeat",
+            "payload": {"status": "working", "tool": None, "turn": 1},
+        }
+    )
     on_event({"kind": "result", "payload": {"status": "succeeded"}})
     on_event({"kind": "session_ended", "payload": {}})
     return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
@@ -505,21 +518,22 @@ def _bar_draws(out: str) -> int:
     return out.count("\r\033[K")
 
 
-def test_tui_tty_draws_bar_then_suppresses_after_terminal_events(monkeypatch, tmp_path):
+def test_tui_tty_draws_event_sourced_dashboard(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = _TtyStream()
-    assert asyncio.run(tui.run_tui(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n"),
-        output_stream=out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert asyncio.run(
+        tui.run_tui(
+            oneshot.OneShotConfig(repo=tmp_path),
+            input_stream=io.StringIO("hi\n"),
+            output_stream=out,
+            error_stream=io.StringIO(),
+        )
+    ) == 0
     text = out.getvalue()
-    assert "run_shell df -h OK 5ms" in text
-    # bar drawn after tool_event, heartbeat (keeps elapsed ticking), and
-    # result (final totals); NOT refreshed again after session_ended.
-    # 4 events -> exactly 3 draws proves session_ended refreshed nothing.
-    assert _bar_draws(text) == 3
+    assert "\x1b[?1049h" in text
+    assert "\x1b[?1049l" in text
+    assert "Cambium" in text
+    assert "run_shell" in text
 
 
 def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):

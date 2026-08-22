@@ -13,9 +13,9 @@ updates, strict schema/version validation, duplicate-field rejection, and a
 bounded document size. A corrupt store fails closed: reads raise
 ``OAuthStoreError`` and the only recovery path is an explicit ``repair()``.
 
-The ``client_id`` is deliberately never hardcoded: callers pass the codex
-CLI's own client id (``--client-id``) so a third-party client id is not
-baked into Cambium.
+The Codex OAuth public client id is pinned in the trusted provider profile.
+Callers may override it for tests or another compatible public client; it is
+configuration, not a credential.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from .auth import (
     effective_home,
     validate_provider_id,
 )
-from .provider_config import is_loopback_host
+from .provider_config import CODEX_CHATGPT_PROFILE, is_loopback_host
 
 OAUTH_VERSION = 1
 OAUTH_FILE_NAME = "oauth.json"
@@ -72,6 +72,16 @@ _LOCK_FILE_SUFFIX = ".lock"
 _REFRESH_ENDPOINT = "/oauth/token"
 _USERCODE_ENDPOINT = "/api/accounts/deviceauth/usercode"
 _DEVICE_TOKEN_ENDPOINT = "/api/accounts/deviceauth/token"
+
+def resolve_codex_client_id(value: str | None = None) -> str:
+    """Return an explicit override or the pinned public Codex OAuth client id."""
+
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    profile_value = CODEX_CHATGPT_PROFILE.get("client_id")
+    if isinstance(profile_value, str) and profile_value:
+        return profile_value
+    raise OAuthError("the trusted Codex OAuth profile has no client id")
 
 
 class OAuthError(Exception):
@@ -997,13 +1007,13 @@ class DeviceFlow:
         self,
         provider: str,
         *,
-        client_id: str,
+        client_id: str | None = None,
         issuer: str = DEFAULT_ISSUER,
         store: OAuthStore | None = None,
         http_timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
     ) -> None:
         self._provider = _validate_provider_id(provider)
-        self._client_id = client_id
+        self._client_id = resolve_codex_client_id(client_id)
         self._issuer = validate_issuer(issuer)
         self._store = OAuthStore() if store is None else store
         self._http_timeout_s = http_timeout_s
@@ -1186,14 +1196,9 @@ class TokenManager:
     ) -> None:
         self._provider = _validate_provider_id(provider)
         self._store = OAuthStore() if store is None else store
-        # The codex_chatgpt profile pins the official shared Codex/ChatGPT
-        # public client; an explicit client_id (env/flag) overrides it.
-        if client_id is None:
-            from cambium.provider_config import CODEX_CHATGPT_PROFILE
-
-            profile_client = CODEX_CHATGPT_PROFILE.get("client_id")
-            client_id = profile_client if isinstance(profile_client, str) and profile_client else ""
-        self._client_id = client_id
+        # Empty environment overrides are absence, not a request to disable
+        # the trusted public client id.
+        self._client_id = resolve_codex_client_id(client_id)
         self._issuer = validate_issuer(issuer)
         self._refresh_timeout_s = refresh_timeout_s
         self._lock_timeout_s = lock_timeout_s
@@ -1391,6 +1396,7 @@ __all__ = [
     "poll_device_token",
     "refresh_access_token",
     "request_user_code",
+    "resolve_codex_client_id",
     "serialize_document",
     "validate_issuer",
 ]

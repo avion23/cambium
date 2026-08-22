@@ -527,7 +527,9 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
     delta = next(line for line in lines if line.startswith("delta"))
     assert "queued" in delta
     totals = next(line for line in lines if line.startswith("totals:"))
-    assert totals == "totals: tokens=0 cost=$0.000000"
+    assert "tokens=0" in totals
+    assert "calls=1" in totals
+    assert "cost=$0.000000" in totals
 
 
 def test_session_status_rejects_missing_event_log(capsys, tmp_path: Path) -> None:

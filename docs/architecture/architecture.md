@@ -2,15 +2,15 @@
 
 **Status:** current-versus-target contract. Source and tests establish current
 behavior. This document names targets but does not turn them into features.
-See [`agents.md`](../../agents.md) for the operating contract and
-[`docs/research/v2-1-status.md`](../research/v2-1-status.md) for the detailed
-live gap table.
+See [`agents.md`](../../agents.md) for the operating contract and the focused
+architecture documents beside this file for subsystem contracts.
 
 ## 1. Current runtime
 
 Cambium runs directly from source; no wheel is built and no install is
 required or supported. The CLI routes `auth`, `supervisor`, `doctor`, `bench`,
-`module-test`, `version`, `run`, `repl`, `tui`, `session`, and `architectus`.
+`module-test`, `version`, `run`, `repl`, `tui`, `monitor`, `optimize`,
+`session`, and `architectus`.
 The session surface includes `list`, `latest`, `show`, `status`, `resume`, and
 `usage`. Task-tree inspection remains available as `python -m cambium.tasktree`.
 `cambium.__init__` exports only `__version__`; there is no public session API.

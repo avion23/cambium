@@ -538,33 +538,126 @@ def _loader_datasets_dir(loader: object) -> Path:
     return dataset_path if dataset_path.is_dir() else dataset_path.parent
 
 
-def _load_transcript_candidates(loader: object) -> list[Example]:
-    """Load optional transcript candidates with the module's DatasetLoader."""
-    candidate_path = _loader_datasets_dir(loader) / _TRANSCRIPT_CANDIDATES_FILENAME
+def _reviewed_transcript_records(candidate_path: Path) -> list[dict[str, Any]]:
+    """Load only explicitly approved, redacted candidate records.
+
+    Rejected/excluded rows are ignored. Any pending or unknown review status
+    fails closed so an optimizer flag cannot silently promote raw transcripts.
+    """
+
+    approved: list[dict[str, Any]] = []
+    pending = 0
+    try:
+        lines = candidate_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise OptimizeError(
+            f"could not read transcript candidates {candidate_path}: {exc}"
+        ) from exc
+    for line_no, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise OptimizeError(
+                f"transcript candidate {candidate_path}:{line_no} is invalid JSON"
+            ) from exc
+        if not isinstance(record, dict):
+            raise OptimizeError(
+                f"transcript candidate {candidate_path}:{line_no} is not an object"
+            )
+        status = record.get("review_status")
+        if status in {"rejected", "excluded"}:
+            continue
+        if status != "approved":
+            pending += 1
+            continue
+        if record.get("candidate") is not True or record.get("redacted") is not True:
+            raise OptimizeError(
+                f"approved transcript candidate {candidate_path}:{line_no} "
+                "must be candidate=true and redacted=true"
+            )
+        approved.append(record)
+    if pending:
+        raise OptimizeError(
+            f"{pending} transcript candidate(s) still need review; "
+            "approve or reject every record before optimization"
+        )
+    if not approved:
+        raise OptimizeError("no approved transcript candidates are available")
+    return approved
+
+
+def _load_transcript_candidates(
+    loader: object, candidate_path: Path | None = None
+) -> list[Example]:
+    """Load explicitly reviewed transcript candidates with the module loader."""
+
+    if candidate_path is None:
+        candidate_path = (
+            _loader_datasets_dir(loader) / _TRANSCRIPT_CANDIDATES_FILENAME
+        )
+    candidate_path = Path(candidate_path)
     if not candidate_path.is_file():
         raise OptimizeError(
             f"transcript candidate file is missing for this module: {candidate_path}"
         )
+    approved = _reviewed_transcript_records(candidate_path)
 
     loader_class = cast(Callable[[Path], object], type(loader))
+    temporary_path: Path | None = None
     try:
-        candidate_loader = loader_class(candidate_path)
-    except (OSError, ValueError) as exc:
-        raise OptimizeError(
-            f"could not construct the dataset loader for transcript candidates: {exc}"
-        ) from exc
-    load = getattr(candidate_loader, "load", None)
-    if not callable(load):
-        raise OptimizeError("dataset loader does not provide load for transcript candidates")
-    load = cast(Callable[[], Iterable[Example]], load)
-    try:
-        candidates = list(load())
-    except (DatasetError, ImportError, OSError, KeyError, json.JSONDecodeError) as exc:
-        raise OptimizeError(f"could not load transcript candidates: {exc}") from exc
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".approved-transcript-",
+            suffix=".jsonl",
+            dir=candidate_path.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            for record in approved:
+                stream.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+        try:
+            candidate_loader = loader_class(temporary_path)
+        except (OSError, ValueError) as exc:
+            raise OptimizeError(
+                "could not construct the dataset loader for transcript candidates: "
+                f"{exc}"
+            ) from exc
+        load = getattr(candidate_loader, "load", None)
+        if not callable(load):
+            raise OptimizeError(
+                "dataset loader does not provide load for transcript candidates"
+            )
+        load = cast(Callable[[], Iterable[Example]], load)
+        try:
+            candidates = list(load())
+        except (
+            DatasetError,
+            ImportError,
+            OSError,
+            KeyError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise OptimizeError(f"could not load transcript candidates: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
     if any(getattr(candidate, "canary", False) for candidate in candidates):
         raise OptimizeError("transcript candidate file contains a canary record")
     return candidates
-
 
 def _canonical_input_pair(example: object) -> tuple[str, str]:
     """Return the exact canonical ``(task, context)`` pair for one example."""
@@ -915,14 +1008,17 @@ def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any
 
     options: dict[str, Any] = {"primary_provider": selected.name}
     if selected.auth is AuthMode.CODEX_CHATGPT:
-        from cambium.oauth import OAuthStore
+        from cambium.oauth import OAuthError, TokenManager
 
-        document = OAuthStore().read_document(selected.name)
-        if document is None:
-            raise OptimizeError(f"provider {selected.name!r} has no stored OAuth session")
+        try:
+            access_token, account_id = TokenManager(selected.name).ensure_fresh()
+        except OAuthError as exc:
+            raise OptimizeError(
+                f"provider {selected.name!r} OAuth session is unavailable: {exc}"
+            ) from exc
         options["credential_source"] = CredentialSource(
-            access_token=document.access_token,
-            account_id=document.account_id,
+            access_token=access_token,
+            account_id=account_id,
         )
 
     router = Diffundo(providers, **options)
@@ -946,10 +1042,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tier", default="fast")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
+    candidate_source = parser.add_mutually_exclusive_group()
+    candidate_source.add_argument(
         "--include-transcript-candidates",
         action="store_true",
-        help="explicitly add reviewed transcript candidates to the training pool",
+        help="add the module-local approved transcript candidates",
+    )
+    candidate_source.add_argument(
+        "--transcript-candidates",
+        type=Path,
+        metavar="PATH",
+        help="add an explicit approved/redacted transcript-candidate JSONL file",
     )
     return parser
 
@@ -1044,17 +1147,24 @@ def _run(argv=None) -> int:
     transcript_candidates: dict[str, int] | None = None
     try:
         candidate_records: list[Example] | None = None
-        if args.include_transcript_candidates:
+        use_transcript_candidates = (
+            args.include_transcript_candidates
+            or args.transcript_candidates is not None
+        )
+        if use_transcript_candidates:
             loader = _load_dataset_loader(manifest)
-            candidate_records = _load_transcript_candidates(loader)
+            candidate_records = _load_transcript_candidates(
+                loader,
+                args.transcript_candidates,
+            )
         program_class = load_program_class(manifest)
-        if not args.include_transcript_candidates:
+        if not use_transcript_candidates:
             loader = _load_dataset_loader(manifest)
         baseline_means = _baseline_means(manifest)
         lm = _construct_lm(args.tier, args.budget_usd, ledger)
         program = program_class(lm)
         train_examples, val_examples = build_trainsets(loader, seed=args.seed)
-        if args.include_transcript_candidates:
+        if use_transcript_candidates:
             frozen_examples = [
                 *train_examples,
                 *val_examples,

@@ -184,7 +184,11 @@ def test_loader_import_and_data_failures_are_handled_but_type_errors_propagate(
 
 def test_transcript_loader_handles_dataset_error_but_propagates_type_error(tmp_path: Path) -> None:
     candidate_path = tmp_path / optimize._TRANSCRIPT_CANDIDATES_FILENAME
-    candidate_path.write_text("{}\n", encoding="utf-8")
+    candidate_path.write_text(
+        '{"id": "approved", "candidate": true, '
+        '"review_status": "approved", "redacted": true}\n',
+        encoding="utf-8",
+    )
 
     class DatasetFailureLoader:
         def __init__(self, path):

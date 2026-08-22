@@ -39,6 +39,7 @@ from .oauth import (
     OAuthError,
     OAuthStore,
     import_codex_cli_session,
+    resolve_codex_client_id,
 )
 from .render_markdown import render_markdown_if_tty
 
@@ -337,7 +338,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,module-test,version,run,repl,tui,session,architectus}",
+        metavar="{auth,supervisor,doctor,bench,module-test,version,run,repl,tui,monitor,optimize,session,architectus}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -467,6 +468,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "--quiet",
         action="store_true",
         help="suppress live event updates and print only completed results",
+    )
+
+
+    monitor = commands.add_parser(
+        "monitor",
+        help="attach the operator dashboard to a durable session",
+        description="Watch main/sub-agent state, provider/model identity, usage, "
+        "throughput, and context-trunk size from durable events.",
+    )
+    monitor.add_argument("session", nargs="?", metavar="SESSION")
+    monitor.add_argument("--repo", default=".", metavar="PATH")
+    monitor.add_argument("--interval", type=float, default=0.25, metavar="SECONDS")
+    monitor.add_argument("--once", action="store_true")
+    monitor.add_argument("--json", action="store_true")
+
+    optimize_command = commands.add_parser(
+        "optimize",
+        help="run one DSPy decision-module optimization",
+        description="Run the reviewed-data DSPy optimizer and write one artifact set.",
+    )
+    optimize_command.add_argument("module_name", metavar="MODULE")
+    optimize_command.add_argument(
+        "--optimizer", choices=("zero", "bootstrap"), default="zero"
+    )
+    optimize_command.add_argument("--budget-usd", type=float, default=2.0)
+    optimize_command.add_argument("--seed", type=int, default=0)
+    optimize_command.add_argument("--tier", default="fast")
+    optimize_command.add_argument("--dry-run", action="store_true")
+    candidate_source = optimize_command.add_mutually_exclusive_group()
+    candidate_source.add_argument(
+        "--include-transcript-candidates",
+        action="store_true",
+    )
+    candidate_source.add_argument(
+        "--transcript-candidates",
+        type=Path,
+        metavar="PATH",
     )
 
     session = commands.add_parser(
@@ -737,24 +775,23 @@ def _controlling_tty_writer() -> Callable[[str], None]:
 
 def _run_auth_oauth_device(
     provider: str,
-    client_id: str,
+    client_id: str | None,
     *,
     store: OAuthStore | None = None,
     issuer: str | None = None,
     tty: Callable[[str], None] | None = None,
 ) -> int:
     """Run the device flow; the user code reaches only the controlling TTY."""
-    if not client_id:
-        print(
-            "cambium auth: a --client-id is required for the device flow "
-            "(or set CAMBIUM_CODEX_CLIENT_ID)",
-            file=sys.stderr,
-        )
+
+    try:
+        effective_client_id = resolve_codex_client_id(client_id)
+    except OAuthError as exc:
+        print(f"cambium auth: device flow configuration failed: {exc}", file=sys.stderr)
         return 1
     writer = _controlling_tty_writer() if tty is None else tty
     flow = DeviceFlow(
         provider,
-        client_id=client_id,
+        client_id=effective_client_id,
         issuer=DEFAULT_ISSUER if issuer is None else issuer,
         store=store,
     )
@@ -779,7 +816,6 @@ def _run_auth_oauth_device(
     print(f"stored oauth session for provider {provider}")
     return 0
 
-
 def _run_auth_oauth(args: argparse.Namespace) -> int:
     if args.oauth_command == "import-codex-cli":
         return _run_auth_oauth_import(OAuthStore())
@@ -790,7 +826,7 @@ def _run_auth_oauth(args: argparse.Namespace) -> int:
         return _run_auth_oauth_logout(store, args.provider)
     if args.oauth_command != "login":
         raise AssertionError(f"unhandled oauth command: {args.oauth_command!r}")
-    client_id = args.client_id or os.environ.get("CAMBIUM_CODEX_CLIENT_ID", "")
+    client_id = args.client_id or os.environ.get("CAMBIUM_CODEX_CLIENT_ID")
     return _run_auth_oauth_device(args.provider, client_id, store=store)
 
 
@@ -1000,6 +1036,62 @@ async def _run_tui(args: argparse.Namespace) -> int:
     return await tui.run_tui(config, quiet=getattr(args, "quiet", False))
 
 
+def _run_monitor(args: argparse.Namespace) -> int:
+    from . import monitor
+
+    if not monitor.math_is_positive(args.interval):
+        print(
+            "cambium monitor: --interval must be a positive finite number",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        session = monitor.resolve_session(args.session, repo=args.repo)
+    except ValueError as exc:
+        print(f"cambium monitor: {exc}", file=sys.stderr)
+        return 1
+    return monitor.monitor_session(
+        session,
+        interval_s=args.interval,
+        once=args.once,
+        json_output=args.json,
+    )
+
+
+def _run_optimize(args: argparse.Namespace) -> int:
+    try:
+        optimize = importlib.import_module("cambium.optimize")
+    except ModuleNotFoundError as exc:
+        if exc.name == "dspy":
+            print(
+                "cambium optimize: DSPy is not installed; "
+                "run `uv sync --extra dspy --python 3.14`",
+                file=sys.stderr,
+            )
+            return 1
+        raise
+    delegated = [
+        args.module_name,
+        "--optimizer",
+        args.optimizer,
+        "--budget-usd",
+        str(args.budget_usd),
+        "--seed",
+        str(args.seed),
+        "--tier",
+        args.tier,
+    ]
+    if args.dry_run:
+        delegated.append("--dry-run")
+    if args.include_transcript_candidates:
+        delegated.append("--include-transcript-candidates")
+    if args.transcript_candidates is not None:
+        delegated.extend(
+            ["--transcript-candidates", str(args.transcript_candidates)]
+        )
+    return optimize.main(delegated)
+
+
 def _run_session(args: argparse.Namespace) -> int:
     session = _import_or_fail("cambium.session", "session")
     if session is None:
@@ -1117,7 +1209,7 @@ def _live_architectus_llm(
     """
     from .diffundo import CredentialSource, Diffundo, ProviderTier
     from .lm import ArchitectusLM, CambiumLM
-    from .oauth import OAuthStore
+    from .oauth import OAuthError, TokenManager
     from .provider_config import (
         AuthMode,
         ProviderSelectionError,
@@ -1145,14 +1237,15 @@ def _live_architectus_llm(
 
     options: dict[str, Any] = {}
     if selected.auth is AuthMode.CODEX_CHATGPT:
-        doc = OAuthStore().read_document(selected.name)
-        if doc is None:
+        try:
+            access_token, account_id = TokenManager(selected.name).ensure_fresh()
+        except OAuthError as exc:
             raise ValueError(
-                f"provider {selected.name!r} has no stored oauth session; "
-                "run `cambium auth oauth <provider>` first"
-            )
+                f"provider {selected.name!r} oauth session is unavailable: {exc}"
+            ) from exc
         options["credential_source"] = CredentialSource(
-            access_token=doc.access_token, account_id=doc.account_id
+            access_token=access_token,
+            account_id=account_id,
         )
     else:
         env_name = selected.api_key_env
@@ -1238,6 +1331,10 @@ async def async_main(argv: list[str] | None = None) -> int:
             return await _run_repl(args)
         case "tui":
             return await _run_tui(args)
+        case "monitor":
+            return await asyncio.to_thread(_run_monitor, args)
+        case "optimize":
+            return await asyncio.to_thread(_run_optimize, args)
         case "architectus":
             return await _run_architectus(args)
         case "supervisor":
