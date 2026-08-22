@@ -25,6 +25,8 @@ jobs:
         run: uv run --python 3.14 python scripts/apply_operator_upgrade.py
       - name: Preserve latest upstream UI behavior
         run: uv run --python 3.14 python scripts/adapt_operator_upgrade_latest.py finalize
+      - name: Apply focused compatibility corrections
+        run: uv run --python 3.14 python scripts/fix_operator_upgrade_tests.py
       - name: Show generated change surface
         run: git diff --stat && git status --short
       - name: Normalize Python
