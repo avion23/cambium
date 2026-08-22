@@ -1,0 +1,135 @@
+name: production-harness-v3-narrow
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Rebuild from current main
+        run: |
+          git config user.name "cambium-production-bot"
+          git config user.email "cambium-production-bot@users.noreply.github.com"
+          git fetch origin main
+          git merge --no-edit origin/main
+          git checkout origin/main -- README.md docs src tests pyproject.toml uv.lock
+          mkdir -p scripts
+          git show 9fc95f71d77c6ccedb9bddbf10a583122e42189e:scripts/apply_production_harness_v3.py > scripts/apply_production_harness_v3.py
+          git show 9fc95f71d77c6ccedb9bddbf10a583122e42189e:scripts/fix_production_harness_v3.py > scripts/fix_production_harness_v3.py
+          git show 9fc95f71d77c6ccedb9bddbf10a583122e42189e:scripts/run_production_harness_v3_fixes.py > scripts/run_production_harness_v3_fixes.py
+      - name: Install Python 3.14 dependencies
+        run: uv sync --extra dev --python 3.14
+      - name: Materialize narrow implementation
+        run: |
+          uv run --python 3.14 python scripts/apply_production_harness_v3.py
+          uv run --python 3.14 python scripts/run_production_harness_v3_fixes.py
+          uv run --python 3.14 python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/cambium/diffundo.py")
+          lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+          output: list[str] = []
+          model_lines = 0
+          token_lines = 0
+          model_needle = (
+              'f"untrusted response model {reported!r} does not match '
+              'configured {provider.model!r}",'
+          )
+          token_needle = (
+              'sum(len(str(message.get("content", "")).encode("utf-8")) '
+              'for message in messages) // 4'
+          )
+          for line in lines:
+              if model_needle in line:
+                  indent = line[: len(line) - len(line.lstrip())]
+                  output.extend(
+                      [
+                          f"{indent}(\n",
+                          f'{indent}    f"untrusted response model {{reported!r}} does not match "\n',
+                          f'{indent}    f"configured {{provider.model!r}}"\n',
+                          f"{indent}),\n",
+                      ]
+                  )
+                  model_lines += 1
+                  continue
+              if token_needle in line:
+                  indent = line[: len(line) - len(line.lstrip())]
+                  output.extend(
+                      [
+                          f"{indent}sum(\n",
+                          f'{indent}    len(str(message.get("content", "")).encode("utf-8"))\n',
+                          f"{indent}    for message in messages\n",
+                          f"{indent})\n",
+                          f"{indent}// 4\n",
+                      ]
+                  )
+                  token_lines += 1
+                  continue
+              output.append(line)
+          if model_lines != 2 or token_lines != 1:
+              raise RuntimeError(
+                  "generated diffundo normalization mismatch: "
+                  f"model={model_lines}, token={token_lines}"
+              )
+          path.write_text("".join(output), encoding="utf-8")
+          PY
+          mapfile -t python_files < <(
+            git ls-files --modified --others --exclude-standard -- src tests \
+              | grep -E '\.py$'
+          )
+          if ((${#python_files[@]})); then
+            uv run --python 3.14 ruff check --fix "${python_files[@]}"
+          fi
+      - name: Static gates
+        run: |
+          uv run --python 3.14 ruff check src tests
+          uv run --python 3.14 python -m compileall -q src tests
+          uv lock --check
+          git diff --check
+      - name: Focused routing, OAuth, tool, context, and UI gates
+        run: >-
+          uv run --python 3.14 pytest -q
+          tests/scenarios/test_provider_scheduler.py
+          tests/scenarios/test_production_harness_v3.py
+          tests/scenarios/test_provider_config.py
+          tests/scenarios/test_diffundo.py
+          tests/scenarios/test_diffundo_ordering.py
+          tests/scenarios/test_oauth.py
+          tests/scenarios/test_oauth_wiring.py
+          tests/scenarios/test_context_epochs.py
+          tests/scenarios/test_interface_regressions.py
+          tests/scenarios/test_render_stream.py
+      - name: Complete fast tier
+        run: uv run --python 3.14 pytest -q -n auto
+      - name: Complete slow tier
+        run: uv run --python 3.14 pytest -q -n auto -m slow
+      - name: Runtime smoke gates
+        run: |
+          uv run --python 3.14 cambium --help
+          uv run --python 3.14 cambium monitor --help
+          uv run --python 3.14 cambium optimize should_decompose --dry-run
+      - name: Publish narrow verified implementation
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          rm -f \
+            scripts/apply_production_harness_v3.py \
+            scripts/fix_production_harness_v3.py \
+            scripts/run_production_harness_v3_fixes.py
+          git add -- README.md docs src tests pyproject.toml uv.lock
+          git rm -f -- .github/workflows/production-harness-v3-narrow.yml
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "refactor(routing): narrow verified provider runtime diff"
+          git push origin HEAD:"$BRANCH"
