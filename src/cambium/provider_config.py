@@ -408,11 +408,15 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         base_url = ""
         api_key_env = ""
     else:
-        missing = sorted(field for field in ("base_url", "api_key_env") if field not in raw)
+        missing = sorted(
+            field for field in ("base_url", "api_key_env") if field not in raw
+        )
         if missing:
             raise _error(location, f"missing required field(s): {', '.join(missing)}")
         base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
-        api_key_env = _validate_api_key_env(raw["api_key_env"], f"{location}.api_key_env", name)
+        api_key_env = _validate_api_key_env(
+            raw["api_key_env"], f"{location}.api_key_env", name
+        )
 
     values = {**_DEFAULTS, **raw}
     timeout_s = _require_number(values["timeout_s"], f"{location}.timeout_s")
@@ -452,7 +456,9 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     if token_window_allowance < 0:
         raise _error(f"{location}.token_window_allowance", "must not be negative")
 
-    context_window = _require_integer(values["context_window"], f"{location}.context_window")
+    context_window = _require_integer(
+        values["context_window"], f"{location}.context_window"
+    )
     if context_window < 0:
         raise _error(f"{location}.context_window", "must not be negative")
     max_concurrency = _require_integer(
@@ -758,7 +764,9 @@ def select_provider(
             if provider.name != name:
                 continue
             if not provider.enabled:
-                raise ProviderSelectionError(f"provider selection: provider {name!r} is disabled")
+                raise ProviderSelectionError(
+                    f"provider selection: provider {name!r} is disabled"
+                )
             return provider
         raise ProviderSelectionError(
             f"provider selection: no provider named {name!r} is configured"
@@ -791,7 +799,10 @@ def env_report(
     ``ProviderOutcome.AUTH_ERROR``. The report contains only provider names and
     booleans. It never returns an environment-variable name or value.
     """
-    return {provider.name: bool(os.environ.get(provider.api_key_env)) for provider in providers}
+    return {
+        provider.name: bool(os.environ.get(provider.api_key_env))
+        for provider in providers
+    }
 
 
 __all__ = [

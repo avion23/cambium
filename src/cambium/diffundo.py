@@ -737,7 +737,7 @@ def _account_quota_owner(body: str, api_key: str) -> str | None:
     """
     try:
         payload = json.loads(body)
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -803,13 +803,19 @@ def _tool_call_arguments(tool_call: Any) -> dict[str, Any] | None:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"tool call arguments are not valid JSON: {raw[:80]!r}") from exc
+            raise ValueError(
+                f"tool call arguments are not valid JSON: {raw[:80]!r}"
+            ) from exc
     elif isinstance(raw, Mapping):
         parsed = dict(raw)
     else:
-        raise ValueError(f"tool call arguments must be a JSON object, got {type(raw).__name__}")
+        raise ValueError(
+            f"tool call arguments must be a JSON object, got {type(raw).__name__}"
+        )
     if not isinstance(parsed, dict):
-        raise ValueError(f"tool call arguments must be a JSON object, got {type(parsed).__name__}")
+        raise ValueError(
+            f"tool call arguments must be a JSON object, got {type(parsed).__name__}"
+        )
     return parsed
 
 
@@ -848,7 +854,7 @@ def _parse_retry_after(headers: Any) -> float | None:
         return None
     try:
         retry_at = parsedate_to_datetime(value)
-    except IndexError, OverflowError, TypeError, ValueError:
+    except (IndexError, OverflowError, TypeError, ValueError):
         return None
     if retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=UTC)
@@ -1089,7 +1095,7 @@ def _parse_codex_sse(
     for line in stream.splitlines():
         if not line.startswith("data:"):
             continue
-        data = line[len("data:") :].strip()
+        data = line[len("data:"):].strip()
         if not data or data == "[DONE]":
             continue
         try:
@@ -1108,7 +1114,9 @@ def _parse_codex_sse(
         elif event_type == "error":
             error = event.get("error")
             if isinstance(error, dict):
-                stream_error = stream_error or _codex_stream_error(provider, error, access_token)
+                stream_error = stream_error or _codex_stream_error(
+                    provider, error, access_token
+                )
         elif event_type == "response.failed":
             response = event.get("response")
             if isinstance(response, dict):
@@ -1121,14 +1129,10 @@ def _parse_codex_sse(
     if stream_error is not None:
         return {}, text, stream_error
     if completed is None:
-        return (
-            {},
-            text,
-            ProviderError(
-                provider.name,
-                ProviderOutcome.ERROR,
-                "malformed codex stream: no response.completed event",
-            ),
+        return {}, text, ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            "malformed codex stream: no response.completed event",
         )
     return completed, text, None
 
@@ -1147,7 +1151,7 @@ def _codex_config_400(message: str) -> bool:
     """
     try:
         payload = json.loads(message)
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return False
     if not isinstance(payload, dict):
         return False
@@ -1251,7 +1255,9 @@ class Diffundo:
         # within an equal-priority run by measured quality. None/empty keeps
         # the pure config-priority order. Stored as an immutable item tuple so
         # no attribute is a mutable mapping (D1).
-        self._debt: tuple[tuple[str, Any], ...] | None = tuple(debt.items()) if debt else None
+        self._debt: tuple[tuple[str, Any], ...] | None = (
+            tuple(debt.items()) if debt else None
+        )
 
     # -- public API --------------------------------------------------------- #
 
@@ -1289,7 +1295,9 @@ class Diffundo:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
-                    raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
+                    raise CostBudgetExceeded(
+                        result.provider, result.estimated_cost_usd, budget_usd
+                    )
                 # The provider that served owns the task's context from here
                 # on (prompt-prefix caching locality).
                 self._primary_provider = provider.name
@@ -1678,7 +1686,9 @@ class Diffundo:
                         await asyncio.sleep(delay)
                         continue
                     request_rate_status = self._record_success(provider)
-                    return replace(result, request_rate_status=request_rate_status)
+                    return replace(
+                        result, request_rate_status=request_rate_status
+                    )
                 assert last_exc is not None
                 if last_exc.outcome in (
                     ProviderOutcome.REFUSAL,
@@ -1712,7 +1722,7 @@ class Diffundo:
 
     def _retry_delay(self, attempt_no: int) -> float:
         # Full jitter (mirrors arch §7.4): uniform(0, base * backoff ** n).
-        return random.uniform(0.0, self._retry_base_delay_s * (2.0**attempt_no))
+        return random.uniform(0.0, self._retry_base_delay_s * (2.0 ** attempt_no))
 
     @staticmethod
     def _remaining(deadline: float | None) -> float | None:
@@ -1744,7 +1754,8 @@ class Diffundo:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
-                "http transport is allowed only for loopback hosts; remote providers require https",
+                "http transport is allowed only for loopback hosts; "
+                "remote providers require https",
             )
         api_key = os.environ.get(provider.api_key_env)
         if not api_key:
@@ -1794,7 +1805,9 @@ class Diffundo:
             except Exception:
                 error_body = ""
             safe_body = _redact_error_text(error_body, api_key)[:500]
-            http_cause = _SanitizedHTTPError(status, _redact_error_text(str(exc.reason), api_key))
+            http_cause = _SanitizedHTTPError(
+                status, _redact_error_text(str(exc.reason), api_key)
+            )
             http_error = self._classify_http(
                 provider,
                 status,
@@ -1809,7 +1822,9 @@ class Diffundo:
                 outcome = ProviderOutcome.TIMEOUT
             else:
                 outcome = ProviderOutcome.ERROR
-            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
+            raise ProviderError(
+                provider.name, outcome, f"transport error: {reason}", exc
+            ) from exc
         except TimeoutError as exc:
             raise ProviderError(
                 provider.name,
@@ -1858,14 +1873,16 @@ class Diffundo:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
-                "http transport is allowed only for loopback hosts; remote providers require https",
+                "http transport is allowed only for loopback hosts; "
+                "remote providers require https",
             )
         credential = self._credential_source
         if credential is None:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
-                "provider requires auth 'codex_chatgpt' but no credential source is injected",
+                "provider requires auth 'codex_chatgpt' but no credential "
+                "source is injected",
             )
         if not credential.access_token:
             raise ProviderError(
@@ -1927,7 +1944,9 @@ class Diffundo:
                 outcome = ProviderOutcome.TIMEOUT
             else:
                 outcome = ProviderOutcome.ERROR
-            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
+            raise ProviderError(
+                provider.name, outcome, f"transport error: {reason}", exc
+            ) from exc
         except TimeoutError as exc:
             raise ProviderError(
                 provider.name,
@@ -1995,7 +2014,10 @@ class Diffundo:
             # quarantines the provider, NOT a content refusal. The generic
             # all-400 -> REFUSAL rule below is unchanged for chat_completions
             # providers.
-            if provider.protocol is Protocol.CODEX_RESPONSES and _codex_config_400(message):
+            if (
+                provider.protocol is Protocol.CODEX_RESPONSES
+                and _codex_config_400(message)
+            ):
                 return ProviderError(
                     provider.name,
                     ProviderOutcome.CONFIG_ERROR,

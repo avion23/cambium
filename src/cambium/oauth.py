@@ -73,7 +73,6 @@ _REFRESH_ENDPOINT = "/oauth/token"
 _USERCODE_ENDPOINT = "/api/accounts/deviceauth/usercode"
 _DEVICE_TOKEN_ENDPOINT = "/api/accounts/deviceauth/token"
 
-
 def resolve_codex_client_id(value: str | None = None) -> str:
     """Return an explicit override or the pinned public Codex OAuth client id."""
 
@@ -147,7 +146,9 @@ class OAuthDoc:
         _validate_provider_id(self.provider)
         _validate_token(self.access_token, "access token")
         _validate_token(self.refresh_token, "refresh token")
-        if isinstance(self.expires_at, bool) or not isinstance(self.expires_at, (int, float)):
+        if isinstance(self.expires_at, bool) or not isinstance(
+            self.expires_at, (int, float)
+        ):
             raise OAuthSchemaError("oauth expires_at must be an epoch number")
         if not _finite(self.expires_at):
             raise OAuthSchemaError("oauth expires_at must be finite")
@@ -307,10 +308,13 @@ def serialize_document(document: OAuthDocument) -> bytes:
     """Serialize a validated document without changing its schema."""
     raw = {
         "version": OAUTH_VERSION,
-        "providers": {record.doc.provider: _record_mapping(record) for record in document.records},
+        "providers": {
+            record.doc.provider: _record_mapping(record) for record in document.records
+        },
     }
     return (
-        json.dumps(raw, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        json.dumps(raw, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        .encode("utf-8")
         + b"\n"
     )
 
@@ -397,7 +401,9 @@ def _new_temp_file(dir_fd: int) -> tuple[int, str]:
         except FileExistsError:
             continue
         except OSError as exc:
-            raise OAuthStoreError("could not create the oauth store temporary file") from exc
+            raise OAuthStoreError(
+                "could not create the oauth store temporary file"
+            ) from exc
         return fd, name
     raise OAuthStoreError("could not create the oauth store temporary file")
 
@@ -433,7 +439,7 @@ def _atomic_write(dir_fd: int, name: str, data: bytes) -> None:
         if temp_name is not None:
             try:
                 os.unlink(temp_name, dir_fd=dir_fd)
-            except FileNotFoundError, OSError:
+            except (FileNotFoundError, OSError):
                 pass
 
 
@@ -564,7 +570,9 @@ class OAuthStore:
         """Durably disable a provider record; raises when no record exists."""
         provider = _validate_provider_id(provider)
         if not self._path.parent.is_dir():
-            raise OAuthMissingError(f"provider {provider!r} has no oauth credentials to disable")
+            raise OAuthMissingError(
+                f"provider {provider!r} has no oauth credentials to disable"
+            )
         directory_fd = self._open_directory_locked(create=False)
         try:
             current = self._read_locked_directory(directory_fd)
@@ -594,7 +602,9 @@ class OAuthStore:
             current = self._read_locked_directory(directory_fd)
             if current.by_provider(provider) is None:
                 return False
-            records = {r.doc.provider: r for r in current.records if r.doc.provider != provider}
+            records = {
+                r.doc.provider: r for r in current.records if r.doc.provider != provider
+            }
             self._save_records(directory_fd, records)
             return True
         finally:
@@ -625,7 +635,7 @@ class OAuthStore:
                 try:
                     parse_document(_read_fd(fd))
                     valid = True
-                except OAuthSchemaError, AuthStoreError:
+                except (OAuthSchemaError, AuthStoreError):
                     pass
                 finally:
                     os.close(fd)
@@ -641,7 +651,9 @@ class OAuthStore:
                 )
             except OSError as exc:
                 raise OAuthStoreError("could not quarantine the corrupt oauth store") from exc
-            _atomic_write(directory_fd, self._path.name, serialize_document(OAuthDocument.empty()))
+            _atomic_write(
+                directory_fd, self._path.name, serialize_document(OAuthDocument.empty())
+            )
         finally:
             try:
                 fcntl.flock(directory_fd, fcntl.LOCK_UN)
@@ -698,13 +710,19 @@ def _request(
     timeout_s: float,
 ) -> tuple[int, bytes]:
     url = f"{issuer.rstrip('/')}{path}"
-    data = urlencode(payload).encode("utf-8") if form else json.dumps(payload).encode("utf-8")
+    data = (
+        urlencode(payload).encode("utf-8")
+        if form
+        else json.dumps(payload).encode("utf-8")
+    )
     request = urllib.request.Request(
         url,
         data=data,
         method="POST",
         headers={
-            "Content-Type": ("application/x-www-form-urlencoded" if form else "application/json"),
+            "Content-Type": (
+                "application/x-www-form-urlencoded" if form else "application/json"
+            ),
         },
     )
     try:
@@ -715,7 +733,7 @@ def _request(
             body = _read_response(exc)
         except OAuthError:
             raise
-        except OSError, ValueError, http.client.HTTPException:
+        except (OSError, ValueError, http.client.HTTPException):
             body = b""
         return exc.code, body
     except urllib.error.URLError as exc:
@@ -752,7 +770,7 @@ def _parse_float(value: object, default: float) -> float:
         return default
     try:
         parsed = float(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return default
     return parsed if _finite(parsed) and parsed > 0 else default
 
@@ -764,7 +782,7 @@ def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
         value = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-    except IndexError, ValueError:
+    except (IndexError, ValueError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -848,7 +866,7 @@ def refresh_access_token(
             refresh_token=refresh_token_out,
             account_id=account_id,
         )
-    except InvalidGrantError, RefreshUnavailableError:
+    except (InvalidGrantError, RefreshUnavailableError):
         raise
     except OAuthError as exc:
         raise RefreshUnavailableError("refresh unavailable: malformed issuer response") from exc
@@ -1111,7 +1129,6 @@ def import_codex_cli_session(path: str | Path | None = None) -> OAuthDoc:
         if not isinstance(account_id, str) or not account_id:
             raise OAuthError("codex cli session account_id is invalid")
         account_id = _validate_token(account_id, "account id")
-
     def _usable_exp(token: Any) -> float:
         """Return a valid ``exp`` epoch-seconds claim from a JWT, else 0.0."""
         if not isinstance(token, str) or not token:
@@ -1120,7 +1137,11 @@ def import_codex_cli_session(path: str | Path | None = None) -> OAuthDoc:
         if claims is None:
             return 0.0
         exp = claims.get("exp")
-        if isinstance(exp, (int, float)) and not isinstance(exp, bool) and _finite(exp):
+        if (
+            isinstance(exp, (int, float))
+            and not isinstance(exp, bool)
+            and _finite(exp)
+        ):
             return float(exp)
         return 0.0
 
@@ -1211,7 +1232,10 @@ class TokenManager:
         return record is None or record.disabled
 
     def _lock_path(self) -> Path:
-        return self._store.path.parent / f"{_LOCK_FILE_PREFIX}{self._provider}{_LOCK_FILE_SUFFIX}"
+        return (
+            self._store.path.parent
+            / f"{_LOCK_FILE_PREFIX}{self._provider}{_LOCK_FILE_SUFFIX}"
+        )
 
     def _acquire_lock(self) -> int:
         """Open the persistent lock file and flock it exclusively, with a timeout.
@@ -1250,11 +1274,14 @@ class TokenManager:
             except OSError as exc:
                 if exc.errno not in (errno.EAGAIN, errno.EACCES):
                     os.close(lock_fd)
-                    raise OAuthStoreError("could not lock the oauth refresh transaction") from exc
+                    raise OAuthStoreError(
+                        "could not lock the oauth refresh transaction"
+                    ) from exc
                 if time.monotonic() >= deadline:
                     os.close(lock_fd)
                     raise LockTimeoutError(
-                        f"could not acquire the oauth refresh lock for provider {self._provider!r}"
+                        "could not acquire the oauth refresh lock for provider "
+                        f"{self._provider!r}"
                     ) from exc
                 time.sleep(0.05)
 
@@ -1277,16 +1304,18 @@ class TokenManager:
             raise OAuthMissingError(f"provider {self._provider!r} has no oauth credentials")
         if fast.disabled:
             raise InvalidGrantError(f"provider {self._provider!r} is disabled until re-login")
-        if _is_fresh(fast.doc, now=self._clock(), margin_s=DEFAULT_REFRESH_MARGIN_S) and (
-            rejected is None or rejected != fast.doc.access_token
-        ):
+        if _is_fresh(
+            fast.doc, now=self._clock(), margin_s=DEFAULT_REFRESH_MARGIN_S
+        ) and (rejected is None or rejected != fast.doc.access_token):
             return fast.doc.access_token, fast.doc.account_id
 
         lock_fd = self._acquire_lock()
         try:
             current = self._store.read_provider(self._provider)
             if current is None:
-                raise OAuthMissingError(f"provider {self._provider!r} has no oauth credentials")
+                raise OAuthMissingError(
+                    f"provider {self._provider!r} has no oauth credentials"
+                )
             if current.disabled:
                 raise InvalidGrantError(f"provider {self._provider!r} is disabled until re-login")
             if rejected is not None and current.doc.access_token != rejected:
@@ -1302,7 +1331,9 @@ class TokenManager:
                 raise
             refreshed_refresh = refreshed.refresh_token or current.doc.refresh_token
             account_id = (
-                refreshed.account_id if refreshed.account_id is not None else current.doc.account_id
+                refreshed.account_id
+                if refreshed.account_id is not None
+                else current.doc.account_id
             )
             updated = OAuthDoc(
                 provider=self._provider,
@@ -1322,7 +1353,9 @@ class TokenManager:
         try:
             current = self._store.read_provider(self._provider)
             if current is None:
-                raise OAuthMissingError(f"provider {self._provider!r} has no oauth credentials")
+                raise OAuthMissingError(
+                    f"provider {self._provider!r} has no oauth credentials"
+                )
             self._store.mark_disabled(self._provider)
         finally:
             self._release_lock(lock_fd)
