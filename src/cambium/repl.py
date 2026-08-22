@@ -114,12 +114,14 @@ async def run_repl(
                 def _live_sink(
                     record: dict[str, Any],
                     _events: list[dict[str, Any]] = events,
+                    _stream_tty: bool = stream_tty,
+                    _session_label: str = session_label,
                 ) -> None:
                     nonlocal bar_live
                     _events.append(record)
                     if record.get("kind") == "usage_event":
                         usage_events.append(record)
-                    if not stream_tty:
+                    if not _stream_tty:
                         output_stream.write(render.render_event_line(record) + "\n")
                         status = render.render_live_status_line(_events)
                         if status:
@@ -132,7 +134,7 @@ async def run_repl(
                     if bar_live:
                         output_stream.write("\r\033[K")
                         bar = render.render_status_bar(
-                            _events, session_label=session_label
+                            _events, session_label=_session_label
                         )
                         if bar:
                             output_stream.write(bar + "\n")

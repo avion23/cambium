@@ -1,7 +1,7 @@
 """Worker runtime (Opifex seed) — ``python -m cambium.worker``.
 
 Speaks the Nuntius JSON-Lines wire protocol over stdio
-(docs/architecture.md §5, docs/research/ipc-protocol-draft.md). By default
+(`docs/architecture/architecture.md` §5). By default
 one worker executes one task and then exits; when the init carries
 ``worker_reuse: true`` the worker stays alive after the task and waits for a
 rebind init on stdin (eval-3 ADOPT warm pool):
@@ -168,7 +168,7 @@ MAX_SUMMARY_CHARS = 2_000
 # Consecutive non-progress actions (valid plans AND invalid/unparseable
 # actions) before the agent loop fails fast.
 MAX_CONSECUTIVE_PLANS = 2
-MAX_DIFF_BYTES = 64 * 1024  # 64 KiB diff cap (ipc-protocol-draft.md §3)
+MAX_DIFF_BYTES = 64 * 1024  # 64 KiB bounded upward diff envelope.
 DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
 DEFAULT_MAX_WALL_S = 3600.0
@@ -2425,7 +2425,56 @@ async def _emit_tool_event(
     })
 
 
-def _success_usage_event(result: CallResult, turn: int) -> dict[str, Any]:
+def _prompt_context_usage_fields(
+    prompt: Mapping[str, Any], *, call_kind: str
+) -> dict[str, Any]:
+    """Describe the active prompt shape without exposing prompt content.
+
+    Byte counts use the exact canonical request representation Cambium handed
+    to the provider. Token counts remain provider-owned in ``usage``; the UI
+    labels byte-derived token estimates as approximate.
+    """
+
+    messages = prompt.get("messages")
+    if not isinstance(messages, list) or not all(
+        isinstance(message, Mapping) for message in messages
+    ):
+        return {"call_kind": call_kind}
+    active_bytes = prompt_prefix_bytes(dict(prompt))
+    if active_bytes is None:
+        try:
+            active_bytes = len(_canonical_json_bytes(list(messages)))
+        except (TypeError, ValueError):
+            active_bytes = 0
+    try:
+        trunk, _ = partition_summary_trunk(messages)
+    except SummaryTrunkError:
+        trunk = list(messages[:2])
+    trunk_bytes = prompt_prefix_bytes({"messages": trunk})
+    if trunk_bytes is None:
+        try:
+            trunk_bytes = len(_canonical_json_bytes(trunk))
+        except (TypeError, ValueError):
+            trunk_bytes = 0
+    raw_tail_bytes = max(0, active_bytes - trunk_bytes)
+    summary_segments = max(0, len(trunk) - 2)
+    return {
+        "call_kind": call_kind,
+        "active_context_bytes": active_bytes,
+        "active_context_messages": len(messages),
+        "summary_trunk_bytes": trunk_bytes,
+        "summary_segments": summary_segments,
+        "raw_tail_bytes": raw_tail_bytes,
+    }
+
+
+def _success_usage_event(
+    result: CallResult,
+    turn: int,
+    *,
+    prompt: Mapping[str, Any] | None = None,
+    call_kind: str = "agent",
+) -> dict[str, Any]:
     """One redacted durable usage event for a completed router call.
 
     Fields the provider did not report are omitted; a missing field never
@@ -2441,6 +2490,7 @@ def _success_usage_event(result: CallResult, turn: int) -> dict[str, Any]:
         "model": result.model,
         "estimated_cost_usd": max(0.0, estimated_cost),
         "latency_s": max(0.0, latency),
+        **_prompt_context_usage_fields(prompt or {}, call_kind=call_kind),
     }
     usage = _usage_counts(result.usage)
     if usage:
@@ -2468,13 +2518,17 @@ def _failure_usage_event(
     model: str | None,
     router: Diffundo,
     prompt: dict[str, Any],
+    call_kind: str = "agent",
 ) -> dict[str, Any]:
     """One redacted durable usage event for a failed router call.
 
     Carries the terminal failure's provider evidence and the redacted failure
     reason; fields that are unavailable are omitted, never an error.
     """
-    event: dict[str, Any] = {"turn": turn}
+    event: dict[str, Any] = {
+        "turn": turn,
+        **_prompt_context_usage_fields(prompt, call_kind=call_kind),
+    }
     if isinstance(model, str) and model:
         event["model"] = model
     failure_reason = exc.__class__.__name__
@@ -3650,6 +3704,7 @@ async def _run_agent_loop(
                             model=model,
                             router=router,
                             prompt=sent_summary_prompt,
+                            call_kind="summary",
                         ),
                         epoch=usage_epoch,
                         fork_of=usage_fork_of,
@@ -3671,7 +3726,12 @@ async def _run_agent_loop(
                 await _emit_usage_event(
                     writer,
                     config,
-                    _success_usage_event(summary_result, turn),
+                    _success_usage_event(
+                        summary_result,
+                        turn,
+                        prompt=sent_summary_prompt,
+                        call_kind="summary",
+                    ),
                     epoch=usage_epoch,
                     fork_of=usage_fork_of,
                 )
@@ -3942,7 +4002,12 @@ async def _run_agent_loop(
                         writer,
                         config,
                         _failure_usage_event(
-                            exc, turn=turn, model=model, router=router, prompt=sent_prompt
+                            exc,
+                            turn=turn,
+                            model=model,
+                            router=router,
+                            prompt=sent_prompt,
+                            call_kind="agent",
                         ),
                         epoch=usage_epoch, fork_of=usage_fork_of,
                     )
@@ -3974,8 +4039,13 @@ async def _run_agent_loop(
                 )
             if writer is not None:
                 await _emit_usage_event(
-                    writer, config, _success_usage_event(result, turn),
-                    epoch=usage_epoch, fork_of=usage_fork_of,
+                    writer,
+                    config,
+                    _success_usage_event(
+                        result, turn, prompt=sent_prompt, call_kind="agent"
+                    ),
+                    epoch=usage_epoch,
+                    fork_of=usage_fork_of,
                 )
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
             prompt_tokens = _usage_prompt_tokens(result.usage)

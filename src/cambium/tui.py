@@ -1,4 +1,4 @@
-"""Line-oriented terminal front end for Cambium one-shot sessions."""
+"""Interactive terminal frontend with an event-sourced live dashboard."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from typing import Any
 
 from cambium.render_markdown import render_markdown_if_tty
 
+from .monitor import AnsiDashboard
+from .observability import ObservabilityState
+
 _PROMPT = "cambium> "
-_BAR_TERMINAL_KINDS = frozenset(
-    {"result", "session_ended", "exit", "worker_failed", "reuse_ready"}
-)
 
 
 def _is_tty(stream: Any) -> bool:
@@ -33,11 +33,12 @@ def _write_line(out: Any, line: str) -> None:
 async def run_tui(
     config, *, input_stream=None, output_stream=None, error_stream=None, quiet=False
 ) -> int:
-    """Run the line-oriented terminal loop and return an exit code."""
+    """Run prompts and show one OpenCode-style dashboard while each run is active."""
+
     source = sys.stdin if input_stream is None else input_stream
     out = sys.stdout if output_stream is None else output_stream
     err = sys.stderr if error_stream is None else error_stream
-    dashboard = _is_tty(out) and not quiet
+    dashboard_enabled = _is_tty(out) and not quiet
 
     try:
         from cambium import oneshot, render, stats
@@ -72,38 +73,41 @@ async def run_tui(
                     else oneshot.allocate_session_dir(oneshot.resolve_repo(config.repo))
                 )
                 prompt_config = replace(config, prompt=prompt, session_root=session_dir)
-                events: list[dict[str, Any]] = []
-                bar_live = dashboard
+                state = ObservabilityState()
+                dashboard = AnsiDashboard(
+                    session_dir,
+                    stream=out,
+                    enabled=dashboard_enabled,
+                )
 
                 def _live_sink(
                     record: dict[str, Any],
-                    _events: list[dict[str, Any]] = events,
+                    _state: ObservabilityState = state,
+                    _dashboard: AnsiDashboard = dashboard,
                     _session_dir: Path = session_dir,
                 ) -> None:
-                    nonlocal bar_live
-                    _events.append(record)
-                    if not dashboard:
-                        if not quiet:
-                            _write_line(out, render.render_event_line(record))
-                            status = render.render_live_status_line(_events)
-                            _write_line(out, status)
-                        out.flush()
-                        return
-                    line = render.render_event_line(record)
-                    if line:
-                        _write_line(out, line)
-                    if bar_live:
-                        out.write("\r\033[K")
-                        bar = render.render_status_bar(
-                            _events, session_label=_session_dir.name
+                    _state.apply(record)
+                    if _dashboard.enabled:
+                        _dashboard.draw(_state.snapshot(session_dir=_session_dir))
+                    elif not quiet:
+                        _write_line(out, render.render_event_line(record))
+                        snapshot = _state.snapshot()
+                        _write_line(
+                            out,
+                            "live: "
+                            f"out/s={snapshot.output_tokens_per_s:.1f} · "
+                            f"active={snapshot.active_agents} · "
+                            f"tokens={snapshot.total_tokens}",
                         )
-                        if bar:
-                            _write_line(out, bar)
-                        if record.get("kind") in _BAR_TERMINAL_KINDS:
-                            bar_live = False
                     out.flush()
 
-                response = await oneshot.run_oneshot(prompt_config, on_event=_live_sink)
+                with dashboard:
+                    response = await oneshot.run_oneshot(
+                        prompt_config,
+                        on_event=_live_sink,
+                    )
+                    if dashboard.enabled:
+                        dashboard.draw(state.snapshot(session_dir=session_dir))
                 text = render.render_text_result(response)
                 if response.exit_code != 0:
                     failed = True

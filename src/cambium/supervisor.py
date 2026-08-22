@@ -631,6 +631,12 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
         "prompt_prefix_bytes",
         "provider_cache_hit",
         "failure_reason",
+        "call_kind",
+        "active_context_bytes",
+        "active_context_messages",
+        "summary_trunk_bytes",
+        "summary_segments",
+        "raw_tail_bytes",
         "epoch",
         "fork_of",
     }
@@ -671,11 +677,22 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     if unknown:
         return unknown
     invalid: list[str] = []
-    for field in ("turn", "prompt_prefix_bytes", "epoch"):
+    for field in (
+        "turn",
+        "prompt_prefix_bytes",
+        "active_context_bytes",
+        "active_context_messages",
+        "summary_trunk_bytes",
+        "summary_segments",
+        "raw_tail_bytes",
+        "epoch",
+    ):
         if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
             invalid.append(field)
     if "fork_of" in msg and not (type(msg["fork_of"]) is str and msg["fork_of"]):
         invalid.append("fork_of")
+    if "call_kind" in msg and msg["call_kind"] not in {"agent", "summary"}:
+        invalid.append("call_kind")
     for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):
         value = msg.get(field)
         if field in msg and not (
@@ -876,8 +893,7 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
 
 # =====================================================================
 # Multi-worker supervisor runtime
-# (docs/architecture/architecture.md §5.3, §7.1-§7.8;
-#  docs/research/custos-asyncio-design.md)
+# (docs/architecture/architecture.md §5.3, §7.1-§7.8)
 #
 # Drives N worker subprocesses concurrently under an asyncio.TaskGroup.
 # Each worker runs in its own process group (start_new_session) inside a
@@ -1075,7 +1091,7 @@ def _require_oauth_document(provider: str, oauth_store: OAuthStore | None) -> No
             f"task references codex_chatgpt provider {provider!r} whose stored "
             "oauth session is expired and has no usable refresh token"
         )
-    if TokenManager(store=store, provider=provider, client_id="").disabled(provider):
+    if TokenManager(store=store, provider=provider, client_id=None).disabled(provider):
         raise ValueError(
             f"task references codex_chatgpt provider {provider!r} whose oauth "
             "session is disabled (refresh was rejected); re-login is required"
@@ -1144,7 +1160,7 @@ def _oauth_worker_environment(
     if not providers:
         return {}, []
     store = OAuthStore() if oauth_store is None else oauth_store
-    client_id = source.get("CAMBIUM_CODEX_CLIENT_ID") or ""
+    client_id = source.get("CAMBIUM_CODEX_CLIENT_ID") or None
     additions: dict[str, str] = {}
     access_values: list[str] = []
     for provider in sorted(providers):
@@ -1152,15 +1168,9 @@ def _oauth_worker_environment(
         try:
             access_token, account_id = manager.ensure_fresh()
         except OAuthError as exc:
-            hint = (
-                " (set CAMBIUM_CODEX_CLIENT_ID to the codex client id "
-                "so an expired access token can be refreshed)"
-                if not client_id
-                else ""
-            )
             raise ValueError(
                 f"task references codex_chatgpt provider {provider!r} but its "
-                f"oauth session could not be ensured fresh: {exc}{hint}"
+                f"oauth session could not be ensured fresh: {exc}"
             ) from None
         additions[f"CAMBIUM_OAUTH_ACCESS_{oauth_env_suffix(provider)}"] = access_token
         access_values.append(access_token)

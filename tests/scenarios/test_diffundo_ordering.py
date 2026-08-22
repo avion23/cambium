@@ -1,10 +1,8 @@
 """Canaries pinning Diffundo's priority-ascending cascade contract.
 
-Review Claim 5 (docs/research/v2-1-review.md §E) proposed weighted
-round-robin/LRU rotation among eligible providers; root REJECTED that change.
-The adopted normative contract is priority ascending: within a tier the lower
-``ProviderConfig.priority`` is tried first (architecture.md §9.1/§9.2 step 2,
-cascade-design.md §1.1), equal-priority providers pick a sticky primary per instance
+The provider-routing contract rejects weighted round-robin/LRU rotation.
+Within a tier the lower ``ProviderConfig.priority`` is tried first; equal-priority
+providers pick a sticky primary per instance
 (diffundo.py:_candidates, fixed offset seeded by the caller — the worker
 seeds it from the task id, and each worker runs one task, so concurrent
 subagents spread across providers at task granularity while a task's context

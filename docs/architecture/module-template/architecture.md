@@ -165,7 +165,7 @@ The program file remains package-local. DSPy program tests live in
 gate excepts these tests from `scan_external_module_files`. `optimize.py` is
 excepted from the reverse-import scan, like `cli.py`, because it is the neutral
 optimizer boundary. Scenario tests use the offline fake-LM pattern recorded in
-`docs/research/dspy-python-314.md`.
+`pyproject.toml` and the optimizer scenario tests.
 
 ### 5.3 LLM and determinism
 

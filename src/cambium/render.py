@@ -25,7 +25,7 @@ import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from .results import CHILD_RESULT_KEYS, ROOT_RESULT_KEYS, Result, result_to_dict
 from .stats import usage_stats_from_events
@@ -593,103 +593,18 @@ _WORKER_ACTIVE_DEC = frozenset({"exit", "reuse_ready", "worker_failed"})
 
 
 def render_subagent_status(events: Any) -> str:
-    """Render the per-subagent live status table for one session event log.
+    """Render one deterministic per-agent status report from durable events."""
 
-    ``events`` is a sequence of already-redacted event records (mappings with
-    at least ``kind``, ``task_id``, ``generation`` and ``payload`` keys) in
-    durable order.  For every distinct ``task_id`` the latest lifecycle event
-    decides the state: ``spawned``/``ready``/``run_task``/``heartbeat``/
-    ``tool_event``/``checkpoint`` make it ``running``; a terminal ``result``,
-    ``worker_failed`` or ``exit`` settles ``done``/``failed``/``exited``;
-    ``task_assigned`` with no spawn yet is ``queued``.  The turn counter comes
-    from the newest ``heartbeat``/``usage_event``/``tool_event`` payload and the
-    active_provider from the newest ``usage_event``. Token and cost columns sum
-    the task's ``usage_event`` rows. A final totals line includes all task
-    usage and elapsed time. Returns one line per sub-agent in first-appearance
-    order, or ``""`` when there are no sub-agents.
-    """
     if events is None:
         return ""
-    event_records = [event for event in events if isinstance(event, Mapping)]
-    states: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    total_tokens = 0
-    total_cost = 0.0
-    for event in event_records:
-        kind = event.get("kind")
-        payload = cast(
-            Mapping[str, Any],
-            event.get("payload") if isinstance(event.get("payload"), Mapping) else {},
-        )
-        usage_tokens = 0
-        usage_cost = 0.0
-        if kind == "usage_event":
-            usage = payload.get("usage")
-            if isinstance(usage, Mapping):
-                tokens = _finite_number(usage.get("total_tokens"))
-                if tokens is not None:
-                    usage_tokens = int(tokens)
-                    total_tokens += usage_tokens
-            cost = _finite_number(payload.get("estimated_cost_usd"))
-            if cost is not None and cost >= 0:
-                usage_cost = cost
-                total_cost += cost
-        task_id = event.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
-            continue
-        record = states.get(task_id)
-        if record is None:
-            record = {
-                "state": "queued",
-                "generation": 0,
-                "turn": 0,
-                "provider": "",
-                "tokens": 0,
-                "cost": 0.0,
-            }
-            states[task_id] = record
-            order.append(task_id)
-        generation = event.get("generation")
-        if isinstance(generation, int) and not isinstance(generation, bool):
-            record["generation"] = max(record["generation"], generation)
-        if kind in ("spawned", "ready", "run_task", "heartbeat", "tool_event", "checkpoint"):
-            record["state"] = "running"
-        elif kind == "result":
-            status = payload.get("status")
-            record["state"] = "done" if status == "succeeded" else "failed"
-        elif kind == "worker_failed":
-            record["state"] = "failed"
-        elif kind == "exit":
-            record["state"] = "exited"
-        elif kind == "reuse_ready":
-            if record["state"] not in ("done", "failed", "exited"):
-                record["state"] = "done"
-        for event_kind in ("heartbeat", "usage_event", "tool_event"):
-            if kind == event_kind:
-                turn = payload.get("turn")
-                if isinstance(turn, int) and not isinstance(turn, bool):
-                    record["turn"] = max(record["turn"], turn)
-        if kind == "usage_event":
-            provider = payload.get("provider")
-            if isinstance(provider, str) and provider:
-                record["provider"] = provider
-            record["tokens"] += usage_tokens
-            record["cost"] += usage_cost
-    if not order:
-        return ""
-    lines = [
-        f"{task_id:<24} {record['state']:<9} gen={record['generation']} "
-        f"turn={record['turn']} provider={record['provider']} "
-        f"tokens={record['tokens']} cost=${record['cost']:.6f}"
-        for task_id, record in ((tid, states[tid]) for tid in order)
-    ]
-    elapsed = render_elapsed(event_records)
-    totals = f"totals: tokens={total_tokens} cost=${total_cost:.6f}"
-    if elapsed:
-        totals += f" {elapsed}"
-    lines.append(totals)
-    return "\n".join(lines)
+    records = [event for event in events if isinstance(event, Mapping)]
+    from .monitor import render_agent_lines
+    from .observability import snapshot_from_events
 
+    snapshot = snapshot_from_events(records)
+    if not snapshot.agents:
+        return ""
+    return "\n".join(render_agent_lines(snapshot))
 
 def render_tokens_per_s(events: Any) -> str:
     """Render generation throughput in tokens per second from the latest

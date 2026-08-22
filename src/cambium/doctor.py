@@ -1,6 +1,6 @@
 """``cambium doctor`` — harness diagnostics command (architecture.md §13).
 
-A health check modeled on ``codex doctor`` (see ``docs/research/codex.md``).
+A health check modeled on established coding-harness doctor commands.
 It exists to surface early the drift failure mode Codex's local install
 exhibits: state rows pointing at missing or unusable files. The Cambium
 analogue checked here: worktree entries whose directory is gone, an event
@@ -47,6 +47,7 @@ from .oauth import (
     OAuthStore,
     RefreshUnavailableError,
     refresh_access_token,
+    resolve_codex_client_id,
 )
 from .provider_config import (
     DEFAULT_SAMPLE,
@@ -664,7 +665,7 @@ def check_secrets() -> tuple[Status, str]:
     if _git_tracked(models.parent, models.name):
         return Status.WARN, (
             f"{models} is git-tracked — plaintext API keys "
-            "(provider-landscape.md §6)"
+            "(credential safety invariant)"
         )
     return Status.PASS, f"{models} present but not git-tracked"
 
@@ -711,8 +712,10 @@ def check_oauth_live(
 
     store = OAuthStore() if oauth_store is None else oauth_store
     effective_issuer = DEFAULT_ISSUER if issuer is None else issuer
-    effective_client_id = (
-        client_id if client_id is not None else os.environ.get("CAMBIUM_CODEX_CLIENT_ID", "")
+    effective_client_id = resolve_codex_client_id(
+        client_id
+        if client_id is not None
+        else os.environ.get("CAMBIUM_CODEX_CLIENT_ID")
     )
     reachable, reachability = _issuer_reachable(effective_issuer, timeout_s)
 
@@ -728,9 +731,6 @@ def check_oauth_live(
         except OAuthError:
             details.append(f"{name}=invalid-store")
             failed = True
-            continue
-        if not effective_client_id:
-            details.append(f"{name}=refresh-skipped(no client id)")
             continue
         try:
             refresh_access_token(

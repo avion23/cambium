@@ -23,6 +23,8 @@ UNIFIED_COMMANDS = (
     "run",
     "repl",
     "tui",
+    "monitor",
+    "optimize",
     "session",
     "architectus",
 )
@@ -146,6 +148,8 @@ HELP_SURFACES = (
     ("run", "--help"),
     ("repl", "--help"),
     ("tui", "--help"),
+    ("monitor", "--help"),
+    ("optimize", "--help"),
     ("session", "--help"),
     ("session", "list", "--help"),
     ("session", "latest", "--help"),
