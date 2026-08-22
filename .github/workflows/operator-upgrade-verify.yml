@@ -1,0 +1,41 @@
+name: operator-upgrade-verify
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python 3.14 and development dependencies
+        run: uv sync --extra dev --python 3.14
+      - name: Apply implementation against latest main
+        run: uv run --python 3.14 python scripts/apply_operator_upgrade.py
+      - name: Show generated change surface
+        run: git diff --stat && git status --short
+      - name: Normalize Python
+        run: uv run --python 3.14 ruff check --fix src tests
+      - name: Compile
+        run: uv run --python 3.14 python -m compileall -q src tests
+      - name: Focused tests
+        run: >-
+          uv run --python 3.14 pytest -q
+          tests/scenarios/test_observability.py
+          tests/scenarios/test_operator_upgrade.py
+          tests/scenarios/test_interface_regressions.py
+          tests/scenarios/test_user_cli.py
+          tests/scenarios/test_oauth_wiring.py
+          tests/scenarios/test_optimize.py
+          tests/scenarios/test_context_epochs.py
+      - name: Whitespace
+        run: git diff --check
