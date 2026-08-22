@@ -14,7 +14,9 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from cambium import doctor, routing
 from cambium.routing import DebtStore
@@ -134,6 +136,58 @@ def test_doctor_ignores_corrupt_routing_ledger(tmp_path, monkeypatch) -> None:
     assert "(disabled:" not in detail
 
 
+def test_oauth_session_presence_matches_runtime_usability() -> None:
+    now = time.time()
+
+    class Store:
+        def __init__(self, record: object) -> None:
+            self.record = record
+
+        def read_provider(self, name: str) -> object:
+            return self.record
+
+    cases = [
+        (now + 3600, "refresh", False, True),
+        (now - 1, "refresh", False, True),
+        (now - 1, "", False, False),
+        (now + 3600, "refresh", True, False),
+    ]
+    for expires_at, refresh_token, disabled, expected in cases:
+        record = SimpleNamespace(
+            doc=SimpleNamespace(expires_at=expires_at, refresh_token=refresh_token),
+            disabled=disabled,
+        )
+        assert doctor._oauth_session_present(Store(record), "codex") is expected
+
+
+def test_check_secrets_uses_effective_home_not_home_env(tmp_path, monkeypatch) -> None:
+    effective_home = tmp_path / "effective-home"
+    spoofed_home = tmp_path / "spoofed-home"
+    models = effective_home / ".omp" / "agent" / "models.yml"
+    models.parent.mkdir(parents=True)
+    models.write_text("models: []", encoding="utf-8")
+    monkeypatch.setattr(doctor.auth, "effective_home", lambda: effective_home)
+    monkeypatch.setenv("HOME", str(spoofed_home))
+
+    status, detail = doctor.check_secrets()
+
+    assert status is doctor.Status.PASS
+    assert str(models) in detail
+    assert str(spoofed_home) not in detail
+
+
+def test_doctor_fails_when_conversation_schema_is_missing(tmp_path) -> None:
+    db = tmp_path / "session" / doctor.CONVERSATIONS_DB_REL
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db):
+        pass
+
+    status, detail = doctor.check_conversation_store(tmp_path / "session")
+
+    assert status is doctor.Status.FAIL
+    assert "missing conversations table" in detail
+
+
 def test_doctor_opens_session_databases_with_special_character_paths(tmp_path) -> None:
     session_dir = tmp_path / "session?query#fragment"
     events_db = session_dir / doctor.EVENTS_DB_REL
@@ -143,8 +197,22 @@ def test_doctor_opens_session_databases_with_special_character_paths(tmp_path) -
 
     with sqlite3.connect(events_db) as connection:
         connection.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")
-    with sqlite3.connect(conversations_db):
-        pass
+    with sqlite3.connect(conversations_db) as connection:
+        connection.execute(
+            """CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                parent_id INTEGER NULL,
+                turn INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                tokens INTEGER NULL,
+                kind TEXT NOT NULL DEFAULT 'turn',
+                meta TEXT NULL
+            )"""
+        )
 
     event_status, event_detail = doctor.check_event_store(session_dir)
     conversation_status, conversation_detail = doctor.check_conversation_store(session_dir)

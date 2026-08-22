@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
@@ -190,11 +191,13 @@ def _has_marker(value: Any, markers: Sequence[str]) -> bool:
 
 
 def _signal_failed(value: Any) -> bool:
-    """Return whether a merge verdict explicitly failed."""
+    """Return whether a merge verdict failed or is not understood."""
+    if value is _MISSING or value is None:
+        return False
     if isinstance(value, Mapping):
         value = _first_wire_value(value, ("status", "verdict", "ok", "passed", "exit_code"))
         if value is _MISSING:
-            return False
+            return True
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value != 0
     flag = _flag(value)
@@ -202,12 +205,14 @@ def _signal_failed(value: Any) -> bool:
         return not flag
     token = _token(value)
     if token is None:
-        return False
-    return token in _FAIL_TOKENS or _has_marker(token, ("fail", "error", "reject", "timeout"))
+        return True
+    return True
 
 
 def _signal_rejected(value: Any) -> bool:
-    """Return whether an evaluator verdict explicitly rejects."""
+    """Return whether an evaluator verdict rejects or is not understood."""
+    if value is _MISSING or value is None:
+        return False
     if isinstance(value, Mapping):
         verdict = _first_wire_value(value, ("status", "verdict"))
         if verdict is not _MISSING:
@@ -215,17 +220,22 @@ def _signal_rejected(value: Any) -> bool:
         else:
             rejected = _first_wire_value(value, ("rejected",))
             if rejected is not _MISSING:
-                return _flag(rejected) is True
+                flag = _flag(rejected)
+                return True if flag is None else flag is True
             ok = _first_wire_value(value, ("ok", "passed"))
             if ok is _MISSING:
-                return False
-            return _flag(ok) is False
+                return True
+            flag = _flag(ok)
+            return True if flag is None else flag is False
+    flag = _flag(value)
+    if flag is not None:
+        return not flag
     token = _token(value)
     if token in _REJECT_TOKENS or _has_marker(
         token, ("evaluator_reject", "review_reject")
     ):
         return True
-    return isinstance(value, bool) and not value
+    return True
 
 
 def _status_mapping(value: Mapping[str, Any] | str) -> Mapping[str, Any]:
@@ -260,6 +270,7 @@ def status_from_wire(
     wire_type = _wire_value(wire, "type")
 
     evaluator_value = evaluator_status
+    evaluator_explicit = evaluator_value is not None
     if evaluator_value is None:
         evaluator_value = _first_wire_value(
             wire,
@@ -273,12 +284,32 @@ def status_from_wire(
                 "review",
             ),
         )
+        evaluator_explicit = evaluator_value is not _MISSING
     if evaluator_value is _MISSING:
         evaluator_value = _first_wire_value(wire, ("failure_reason", "reason"))
+    evaluator_rejected_value = _first_wire_value(
+        wire, ("evaluator_rejected", "evaluation_rejected")
+    )
     rejected = evaluator_rejected
     if rejected is None:
-        rejected = _flag(_first_wire_value(wire, ("evaluator_rejected", "evaluation_rejected")))
-    if rejected is True or _signal_rejected(evaluator_value):
+        rejected = _flag(evaluator_rejected_value)
+    fallback_rejection = (
+        not evaluator_explicit
+        and (
+            _token(evaluator_value) in _REJECT_TOKENS
+            or _has_marker(evaluator_value, ("evaluator_reject", "review_reject"))
+        )
+    )
+    unknown_rejection_flag = (
+        evaluator_rejected_value is not _MISSING
+        and _flag(evaluator_rejected_value) is None
+    )
+    if (
+        rejected is True
+        or unknown_rejection_flag
+        or evaluator_explicit and _signal_rejected(evaluator_value)
+        or fallback_rejection
+    ):
         return "rejected"
     if raw_token in _REJECT_TOKENS or _token(wire_type) in _REJECT_TOKENS or _has_marker(
         raw_status, ("evaluator_reject", "evaluator_rejection", "review_reject")
@@ -366,7 +397,9 @@ def status_from_wire(
                 "merge",
             ),
         )
-    merge_failed = merge_ok is False or _signal_failed(merge_value)
+    merge_failed = (
+        merge_ok is not None and merge_ok is not True
+    ) or _signal_failed(merge_value)
     if merge_failed:
         return "failed"
 
@@ -590,6 +623,8 @@ class Result:
             raise TypeError("summary must be a string")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise TypeError("failure_reason must be a string or None")
+        if status == "done" and self.failure_reason is not None:
+            raise ValueError("done results must not have a failure_reason")
         if not isinstance(self.diff_truncated, bool):
             raise TypeError("diff_truncated must be a boolean")
         started_at = _final_timestamp(self.started_at)
@@ -663,7 +698,7 @@ def _root_from_child(
         raise TypeError("child result must be a mapping")
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("session_id must be an explicit non-empty string")
-    session_root = Path(session_dir)
+    session_root = Path(session_dir).resolve()
     event_log_ref = f"sqlite:{session_root / '.cambium' / 'events.db'}"
     status = status_from_wire(child)
     unified_diff = child.get("unified_diff", "")
@@ -764,6 +799,17 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+def _reject_symlink(path: Path, description: str) -> None:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError(f"cannot inspect {description}") from exc
+    if stat.S_ISLNK(mode):
+        raise ValueError(f"{description} must not be a symlink")
+
+
 def _validate_event_log_ref(event_log_ref: str, session_dir: Path | str) -> None:
     prefix = "sqlite:"
     if not event_log_ref.startswith(prefix):
@@ -771,8 +817,11 @@ def _validate_event_log_ref(event_log_ref: str, session_dir: Path | str) -> None
     referenced_path = event_log_ref.removeprefix(prefix)
     if not referenced_path:
         raise ValueError("event_log_ref must identify the session events.db")
-    expected_path = (Path(session_dir) / ".cambium" / "events.db").resolve()
-    if Path(referenced_path).resolve() != expected_path:
+    state_dir = Path(session_dir) / ".cambium"
+    _reject_symlink(state_dir, "the session .cambium directory")
+    _reject_symlink(Path(referenced_path), "the event log")
+    expected_path = (state_dir / "events.db").absolute()
+    if Path(referenced_path).absolute() != expected_path:
         raise ValueError("result event_log_ref does not match the session events.db")
 
 
@@ -797,11 +846,16 @@ def write_result(
     _validate_event_log_ref(result.event_log_ref, session_dir)
 
     state_dir = Path(session_dir) / ".cambium"
+    _reject_symlink(state_dir, "the session .cambium directory")
     state_dir.mkdir(parents=True, exist_ok=True)
+    _reject_symlink(state_dir, "the session .cambium directory")
+    os.chmod(state_dir, 0o700)
     try:
-        os.chmod(state_dir, 0o700)
+        mode = os.lstat(state_dir).st_mode
     except OSError:
-        pass
+        raise
+    if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+        raise PermissionError("the session .cambium directory could not be made private")
     target = state_dir / "result.json"
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=state_dir

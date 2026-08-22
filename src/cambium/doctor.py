@@ -26,6 +26,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -41,6 +42,7 @@ from . import auth
 from .auth import AuthError, AuthStore
 from .oauth import (
     DEFAULT_ISSUER,
+    DEFAULT_REFRESH_MARGIN_S,
     InvalidGrantError,
     OAuthError,
     OAuthMissingError,
@@ -64,7 +66,11 @@ MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
 CONVERSATIONS_DB_REL = ".cambium/conversations.db"
 MODULES_ROOT = Path(__file__).resolve().parent / "modules"
-OMP_MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
+
+
+def _omp_models_yml() -> Path:
+    """Return the OMP model path under the effective user's home."""
+    return auth.effective_home() / ".omp" / "agent" / "models.yml"
 
 
 def _sqlite_read_only_uri(db: Path) -> str:
@@ -227,12 +233,14 @@ class _DoctorProvider:
 
 
 def _oauth_session_present(store: OAuthStore, name: str) -> bool:
-    """Return whether the OAuth store holds a session for ``name``."""
-    try:
-        store.validate(name)
-    except OAuthMissingError:
+    """Return whether the OAuth store holds a usable session for ``name``."""
+    record = store.read_provider(name)
+    if record is None or record.disabled:
         return False
-    return True
+    return (
+        record.doc.expires_at - time.time() > DEFAULT_REFRESH_MARGIN_S
+        or bool(record.doc.refresh_token)
+    )
 
 
 def _doctor_providers(
@@ -528,6 +536,42 @@ def _sqlite_integrity(db: Path) -> list[str]:
         conn.close()
 
 
+_CONVERSATION_REQUIRED_COLUMNS = frozenset(
+    {
+        "id",
+        "node_id",
+        "parent_id",
+        "turn",
+        "role",
+        "content",
+        "ts",
+        "seq",
+        "tokens",
+        "kind",
+        "meta",
+    }
+)
+
+
+def _conversation_schema_problems(db: Path) -> list[str]:
+    conn = sqlite3.connect(_sqlite_read_only_uri(db), uri=True)
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
+        ).fetchone()
+        if table is None:
+            return ["missing conversations table"]
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(conversations)")
+        }
+    finally:
+        conn.close()
+    missing = sorted(_CONVERSATION_REQUIRED_COLUMNS - columns)
+    if missing:
+        return [f"missing conversations column(s): {', '.join(missing)}"]
+    return []
+
+
 def check_conversation_store(session_dir: Path | None) -> tuple[Status, str]:
     if session_dir is None:
         return Status.SKIP, "no --session-dir given"
@@ -536,10 +580,11 @@ def check_conversation_store(session_dir: Path | None) -> tuple[Status, str]:
         return Status.SKIP, f"{db} does not exist"
     try:
         problems = _sqlite_integrity(db)
+        problems.extend(_conversation_schema_problems(db))
     except sqlite3.Error as exc:
         return Status.FAIL, f"{db}: {exc}"
     if problems:
-        return Status.FAIL, f"{db}: integrity_check: {problems[:3]}"
+        return Status.FAIL, f"{db}: integrity/schema check: {problems[:3]}"
     return Status.PASS, f"{db}: integrity ok"
 
 
@@ -659,7 +704,7 @@ def _git_tracked(repo: Path, relative: str) -> bool:
 
 def check_secrets() -> tuple[Status, str]:
     """WARN (never FAIL) when ~/.omp/agent/models.yml is git-tracked."""
-    models = OMP_MODELS_YML
+    models = _omp_models_yml()
     if not models.is_file():
         return Status.PASS, f"{models} not present"
     if _git_tracked(models.parent, models.name):

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from cambium import results as results_module
 from cambium.results import (
     CHILD_RESULT_KEYS,
     EXIT_CODES,
@@ -201,6 +202,14 @@ def test_merge_failure_keeps_failed_exit_code() -> None:
     assert EXIT_CODES[status] == 1
 
 
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [("merge_status", "failed"), ("evaluator_status", "rejected")],
+)
+def test_unknown_auxiliary_verdict_fails_closed(field: str, expected: str) -> None:
+    assert status_from_wire({"status": "succeeded", field: "unrecognized"}) == expected
+
+
 def test_successful_evaluator_verdict_maps_to_done() -> None:
     status = status_from_wire({"status": "succeeded", "evaluator": {"ok": True}})
 
@@ -269,6 +278,12 @@ def test_result_exit_codes_are_canonical(tmp_path: Path) -> None:
     ):
         result = _root(tmp_path, status=status)
         assert result.exit_code == exit_code
+
+
+def test_result_rejects_failure_reason_for_done_result(tmp_path: Path) -> None:
+    result = _root(tmp_path, status="succeeded")
+    with pytest.raises(ValueError, match="failure_reason"):
+        replace(result, failure_reason="unexpected failure")
 
 
 def test_result_rejects_unknown_status_and_mismatched_exit_code(tmp_path: Path) -> None:
@@ -382,6 +397,56 @@ def test_writer_requires_session_scoped_event_log_ref(tmp_path: Path) -> None:
 
     path = write_result(result, tmp_path, session_id="session-1")
     assert path == tmp_path / ".cambium" / "result.json"
+
+
+def test_root_result_event_log_ref_is_absolute_for_relative_session_dir() -> None:
+    result = root_result_from_wire(
+        {"status": "succeeded"},
+        Path("relative-session"),
+        session_id="session-1",
+        started_at=10.0,
+        ended_at=11.0,
+    )
+    assert Path(result.event_log_ref.removeprefix("sqlite:")).is_absolute()
+
+
+def test_writer_rejects_symlinked_state_dir(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    external = tmp_path / "external"
+    session.mkdir()
+    external.mkdir()
+    (session / ".cambium").symlink_to(external, target_is_directory=True)
+
+    result = _root(session)
+    with pytest.raises(ValueError, match="symlink"):
+        write_result(result, session, session_id="session-1")
+    assert not (external / "result.json").exists()
+
+
+def test_writer_fails_closed_when_state_dir_privacy_cannot_be_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _root(tmp_path)
+
+    def fail_chmod(*args: object, **kwargs: object) -> None:
+        raise OSError("chmod unavailable")
+
+    monkeypatch.setattr(results_module.os, "chmod", fail_chmod)
+    with pytest.raises(OSError, match="chmod unavailable"):
+        write_result(result, tmp_path, session_id="session-1")
+    assert not (tmp_path / ".cambium" / "result.json").exists()
+
+
+def test_writer_rejects_symlinked_event_log(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".cambium"
+    external = tmp_path / "external-events.db"
+    state_dir.mkdir()
+    external.touch()
+    (state_dir / "events.db").symlink_to(external)
+
+    result = _root(tmp_path)
+    with pytest.raises(ValueError, match="symlink"):
+        write_result(result, tmp_path, session_id="session-1")
 
 
 def test_result_and_cambium_dir_are_private_under_permissive_umask(tmp_path: Path) -> None:
