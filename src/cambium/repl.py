@@ -49,6 +49,9 @@ def _read_stdin_byte() -> bytes:
     return os.read(0, 1)
 
 
+_ORIGINAL_READ_BYTE = _read_stdin_byte
+
+
 class _TtyLineReader:
     """Byte-at-a-time tty line reader with prompt echo.
 
@@ -59,9 +62,10 @@ class _TtyLineReader:
     repaints redraw ``clear-line + prompt + partial``.
     """
 
-    def __init__(self, output_stream: TextIO, *, echo: bool) -> None:
+    def __init__(self, output_stream: TextIO, *, echo: bool, read_fn=None) -> None:
         self._out = output_stream
         self._echo = echo
+        self._read_fn = read_fn or _read_stdin_byte
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.partial = ""
 
@@ -72,11 +76,11 @@ class _TtyLineReader:
         self._out.flush()
 
     def _skip_csi(self) -> None:
-        data = _read_stdin_byte()
+        data = self._read_fn()
         if not data or data != b"[":
             return
         while True:
-            data = _read_stdin_byte()
+            data = self._read_fn()
             if not data or 0x40 <= data[0] <= 0x7E:
                 return
 
@@ -85,7 +89,7 @@ class _TtyLineReader:
         self._decoder.reset()
         self.write_prompt()
         while True:
-            data = _read_stdin_byte()
+            data = self._read_fn()
             if not data:
                 return None
             for ch in self._decoder.decode(data):
@@ -182,9 +186,21 @@ async def run_repl(
 
     reader: _TtyLineReader | None = None
     if input_tty:
+        # Byte source precedence: a patched module hook (tests) wins over the
+        # injected stream, which otherwise serves bytes for real tty sessions.
+        if _read_stdin_byte is not _ORIGINAL_READ_BYTE:
+            byte_source = _read_stdin_byte
+        else:
+            def byte_source() -> bytes:
+                data = input_stream.read(1)
+                if isinstance(data, str):
+                    return data.encode("utf-8")
+                return data or b""
+
         reader = _TtyLineReader(
             output_stream,
             echo=bool(getattr(output_stream, "isatty", lambda: False)()),
+            read_fn=byte_source,
         )
 
     line_source: Any = reader if reader is not None else input_stream
