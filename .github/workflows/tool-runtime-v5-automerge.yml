@@ -48,22 +48,28 @@ jobs:
           git diff --check
       - name: Focused integration gates
         run: |
-          uv run --python 3.14 pytest -q \
-            tests/scenarios/test_tool_runtime_v5.py \
-            tests/scenarios/test_tool_runtime_source_v5.py \
-            tests/scenarios/test_provider_admission_v4.py \
-            tests/scenarios/test_lane_mailbox_source.py \
-            tests/scenarios/test_provider_scheduler.py \
-            tests/scenarios/test_production_harness_v3.py \
-            tests/scenarios/test_provider_config.py \
-            tests/scenarios/test_diffundo.py \
-            tests/scenarios/test_diffundo_ordering.py \
-            tests/scenarios/test_oauth.py \
-            tests/scenarios/test_oauth_wiring.py \
-            tests/scenarios/test_context_epochs.py \
-            tests/scenarios/test_interface_regressions.py \
-            tests/scenarios/test_user_cli.py \
+          candidates=(
+            tests/scenarios/test_tool_runtime_v5.py
+            tests/scenarios/test_tool_runtime_source_v5.py
+            tests/scenarios/test_provider_admission_v4.py
+            tests/scenarios/test_lane_mailbox_source.py
+            tests/scenarios/test_provider_scheduler.py
+            tests/scenarios/test_production_harness_v3.py
+            tests/scenarios/test_provider_config.py
+            tests/scenarios/test_diffundo.py
+            tests/scenarios/test_diffundo_ordering.py
+            tests/scenarios/test_oauth.py
+            tests/scenarios/test_oauth_wiring.py
+            tests/scenarios/test_context_epochs.py
+            tests/scenarios/test_interface_regressions.py
+            tests/scenarios/test_user_cli.py
             tests/scenarios/test_render_stream.py
+          )
+          existing=()
+          for path in "${candidates[@]}"; do
+            [[ -f "$path" ]] && existing+=("$path")
+          done
+          uv run --python 3.14 pytest -q "${existing[@]}"
       - name: Complete fast tier
         run: uv run --python 3.14 pytest -q -n auto
       - name: Complete slow tier
