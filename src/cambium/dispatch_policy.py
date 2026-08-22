@@ -13,7 +13,6 @@ from .provider_scheduler import (
     ProviderPolicy,
     QuotaWindowSnapshot,
     RoutingRequest,
-    quota_pressure,
     rank_policies,
 )
 
@@ -24,7 +23,6 @@ def policy_from_config(provider: Any) -> ProviderPolicy:
     billing = getattr(provider, "billing_mode", BillingMode.METERED)
     if not isinstance(billing, BillingMode):
         billing = BillingMode(str(billing))
-    task_classes = getattr(provider, "task_classes", frozenset(TaskClass))
     return ProviderPolicy(
         name=str(provider.name),
         model=str(provider.model),
@@ -44,8 +42,6 @@ def policy_from_config(provider: Any) -> ProviderPolicy:
         supports_native_tools=bool(getattr(provider, "supports_native_tools", True)),
         supports_python_tool=bool(getattr(provider, "supports_python_tool", True)),
         enabled=bool(getattr(provider, "enabled", True)),
-        task_classes=frozenset(task_classes),
-        quality_score=float(getattr(provider, "quality_score", 1.0)),
     )
 
 
@@ -60,6 +56,77 @@ def estimate_prompt_tokens(prompt: Mapping[str, Any]) -> int:
         if isinstance(message, Mapping):
             total_bytes += len(str(message.get("content", "")).encode("utf-8"))
     return max(1, total_bytes // 4) if total_bytes else 0
+
+
+def _supports_task_class(provider: Any, task_class: TaskClass) -> bool:
+    values = getattr(provider, "task_classes", None)
+    if values is None:
+        return True
+    if isinstance(values, (str, bytes)):
+        return False
+    try:
+        parsed = {
+            value if isinstance(value, TaskClass) else TaskClass(str(value))
+            for value in values
+        }
+    except (TypeError, ValueError):
+        return False
+    return task_class in parsed
+
+
+def _quality_meets_threshold(provider: Any, minimum: float) -> bool:
+    value = getattr(provider, "quality_score", 1.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return float(value) >= minimum
+
+
+def _quota_pressure(
+    policy: ProviderPolicy,
+    snapshots: Sequence[QuotaWindowSnapshot],
+    *,
+    expected_tokens: int,
+    expected_requests: int = 1,
+) -> float:
+    """Return projected pressure from scheduler quota snapshots.
+
+    ``QuotaWindowSpec`` carries token and request caps while snapshots carry
+    both counters.  The scheduler's ranking API does not accept a pressure
+    mapping, so the adapter applies this small hard-feasibility check before
+    delegating the remaining ordering to ``rank_policies``.
+    """
+
+    by_name = {
+        snapshot.name: snapshot
+        for snapshot in snapshots
+        if snapshot.provider == policy.name
+    }
+    dominant = 0.0
+    for window in policy.quota_windows:
+        snapshot = by_name.get(window.name)
+        if snapshot is None:
+            continue
+        if window.token_allowance:
+            capacity = window.token_allowance * (1.0 - window.reserve_fraction)
+            pressure = (
+                (snapshot.used_tokens + expected_tokens) / capacity
+                if capacity > 0
+                else float("inf")
+            )
+            dominant = max(dominant, pressure)
+            if pressure > 1.0:
+                return pressure
+        if window.request_allowance:
+            capacity = window.request_allowance * (1.0 - window.reserve_fraction)
+            pressure = (
+                (snapshot.used_requests + expected_requests) / capacity
+                if capacity > 0
+                else float("inf")
+            )
+            dominant = max(dominant, pressure)
+            if pressure > 1.0:
+                return pressure
+    return dominant
 
 
 def order_provider_configs(
@@ -82,17 +149,36 @@ def order_provider_configs(
     semantic_class = (
         task_class if isinstance(task_class, TaskClass) else TaskClass(str(task_class))
     )
-    policies = [policy_from_config(provider) for provider in candidates]
-    pressures = {
-        policy.name: quota_pressure(policy, quota_snapshots) for policy in policies
-    }
-    model = requested_model or policies[0].model
+    eligible_candidates = [
+        provider
+        for provider in candidates
+        if _supports_task_class(provider, semantic_class)
+        and _quality_meets_threshold(provider, min_quality_score)
+    ]
+    if not eligible_candidates:
+        return []
+    policies = [policy_from_config(provider) for provider in eligible_candidates]
+    expected_input_tokens = estimate_prompt_tokens(prompt)
+    expected_output = max(0, int(expected_output_tokens))
+    quota_feasible = [
+        policy
+        for policy in policies
+        if _quota_pressure(
+            policy,
+            quota_snapshots,
+            expected_tokens=expected_input_tokens + expected_output,
+        )
+        <= 1.0
+    ]
+    if not quota_feasible:
+        return []
+    model = requested_model or quota_feasible[0].model
     request = RoutingRequest(
         task_id=task_id,
         model=model,
-        expected_input_tokens=estimate_prompt_tokens(prompt),
-        expected_output_tokens=max(0, int(expected_output_tokens)),
-        required_context_tokens=estimate_prompt_tokens(prompt),
+        expected_input_tokens=expected_input_tokens,
+        expected_output_tokens=expected_output,
+        required_context_tokens=expected_input_tokens,
         needs_native_tools=bool(prompt.get("tools")),
         needs_python_tool=False,
         allow_model_substitution=any(
@@ -101,16 +187,13 @@ def order_provider_configs(
         ),
         incumbent_provider=None if lease is None else lease.provider,
         lease=lease,
-        task_class=semantic_class,
-        min_quality_score=min_quality_score,
     )
     ranked = rank_policies(
-        policies,
+        quota_feasible,
         request,
         evidence=evidence,
-        quota_pressure_by_provider=pressures,
     )
-    by_name = {str(provider.name): provider for provider in candidates}
+    by_name = {str(provider.name): provider for provider in eligible_candidates}
     return [by_name[policy.name] for policy in ranked if policy.name in by_name]
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -62,9 +63,13 @@ def quality_score(
     if not isinstance(requests, int) or isinstance(requests, bool) or requests <= 0:
         return None
     last_seen = _field(entry, "last_seen", None)
-    if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
-        if now - float(last_seen) > weights.stale_after_s:
-            return None
+    if (
+        isinstance(last_seen, bool)
+        or not isinstance(last_seen, (int, float))
+        or not math.isfinite(float(last_seen))
+        or now - float(last_seen) > weights.stale_after_s
+    ):
+        return None
 
     failures = min(requests, int(_number(_field(entry, "failed_requests", 0))))
     successes = requests - failures
