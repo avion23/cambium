@@ -1093,7 +1093,7 @@ def _codex_oauth_provider_names(
     )
     authorized_raw = spec.get("authorized_providers")
     authorized_explicit = spec.get(
-        "authorized_providers_explicit", "authorized_providers" in spec
+        "authorized_providers_explicit", bool(authorized_raw)
     )
     if isinstance(authorized_raw, (list, tuple)):
         authorized = frozenset(
@@ -1820,6 +1820,11 @@ class _Runtime:
             str, dict[int, tuple[dict[str, Any], tuple[str | None, int | None]]]
         ] = {}
         self._cancelled_tasks: set[str] = set()
+        # A task's normal finally block owns its first cleanup attempt.  The
+        # shutdown pass only retries cancellation cleanup for admitted child
+        # coroutines that never reached that block; otherwise ordinary deferred
+        # cleanup would be reported twice.
+        self._cleanup_attempted: set[str] = set()
         self._child_result_emitted: set[str] = set()
 
     @staticmethod
@@ -2007,19 +2012,23 @@ class _Runtime:
                 reason="cancelled" if status == "cancelled" else "supervision ended",
             )
 
-        # Cleanup is normally attempted by each task's finally block. Repeat it
-        # here so children cancelled before their coroutine starts cannot leak a
-        # registered worktree or branch. Cancellation is the explicit force
-        # cleanup path because partial edits are no longer useful evidence.
+        # Cleanup is normally attempted by each task's finally block.  Only
+        # retry cancellation cleanup for an admitted task whose coroutine never
+        # reached that block; re-running ordinary terminal cleanup would emit a
+        # second deferred record for retained evidence trees.
         for spec in task_specs.values():
-            result = self._results.get(spec["task_id"])
-            force = (
-                session_status == "cancelled"
-                or spec["task_id"] in self._cancelled_tasks
+            task_id = spec["task_id"]
+            result = self._results.get(task_id)
+            if not (
+                task_id in self._cancelled_tasks
                 or (result is not None and result.status == "cancelled")
-            )
+            ):
+                continue
+            if task_id in self._cleanup_attempted:
+                continue
             try:
-                await self._prune_worktree(spec, force=force)
+                await self._prune_worktree(spec, force=True)
+                self._cleanup_attempted.add(task_id)
             except (OSError, RuntimeError, TypeError, ValueError):
                 pass
         try:
@@ -3324,6 +3333,7 @@ class _Runtime:
                             or task_id in self._cancelled_tasks
                             or result.status == "cancelled",
                         )
+                        self._cleanup_attempted.add(task_id)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -4474,28 +4484,41 @@ class _Runtime:
                         commits_so_far=msg.get("commits_so_far"),
                     )
                 elif mtype == "usage_event":
-                    invalid_fields = _invalid_usage_event_fields(msg)
-                    if invalid_fields:
+                    identity_valid = (
+                        msg.get("task_id") == task_id
+                        and type(msg.get("generation")) is int
+                        and msg.get("generation") == generation
+                    )
+                    if not identity_valid:
                         await self.emit(
                             "protocol", task_id=task_id, generation=generation,
-                            note="usage_event rejected: invalid field(s)",
-                            fields=invalid_fields,
+                            note="usage_event rejected: identity mismatch",
+                            expected_task_id=task_id,
+                            expected_generation=generation,
                         )
                     else:
-                        forwarded = {
-                            field: msg[field]
-                            for field in _USAGE_EVENT_FORWARD_FIELDS
-                            if field in msg
-                        }
-                        await self.emit(
-                            "usage_event", task_id=task_id, generation=generation,
-                            **forwarded,
-                        )
-                        # Admission balancing (solution C): fold the redacted
-                        # usage event into the session debt ledger so later
-                        # admissions in this session see updated utilization.
-                        if self._debt_store is not None:
-                            self._debt_store.record(msg)
+                        invalid_fields = _invalid_usage_event_fields(msg)
+                        if invalid_fields:
+                            await self.emit(
+                                "protocol", task_id=task_id, generation=generation,
+                                note="usage_event rejected: invalid field(s)",
+                                fields=invalid_fields,
+                            )
+                        else:
+                            forwarded = {
+                                field: msg[field]
+                                for field in _USAGE_EVENT_FORWARD_FIELDS
+                                if field in msg
+                            }
+                            await self.emit(
+                                "usage_event", task_id=task_id, generation=generation,
+                                **forwarded,
+                            )
+                            # Admission balancing (solution C): fold the redacted
+                            # usage event into the session debt ledger so later
+                            # admissions in this session see updated utilization.
+                            if self._debt_store is not None:
+                                self._debt_store.record(msg)
                 elif mtype in ("tool_event", "pong"):
                     forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
                     if mtype == "tool_event":
