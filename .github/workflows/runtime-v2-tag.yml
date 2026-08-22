@@ -1,0 +1,33 @@
+name: runtime-v2-tag
+
+on:
+  push:
+    branches:
+      - codex/runtime-v2-release-final
+
+permissions:
+  contents: write
+
+jobs:
+  tag-verified-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Wait for final verified main
+        run: |
+          for attempt in $(seq 1 80); do
+            git fetch origin main
+            SHA=$(git rev-parse origin/main)
+            if git cat-file -e "$SHA:tests/scenarios/test_provider_portfolio_e2e.py" 2>/dev/null \
+              && git cat-file -e "$SHA:tests/scenarios/test_oauth_refresh_singleflight.py" 2>/dev/null \
+              && git cat-file -e "$SHA:docs/operator-runtime.md" 2>/dev/null; then
+              git tag -f runtime-v2-verified "$SHA"
+              git push --force origin refs/tags/runtime-v2-verified
+              echo "verified runtime tag -> $SHA"
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
