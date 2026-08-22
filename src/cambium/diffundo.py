@@ -566,73 +566,82 @@ class _RawResponse:
         try:
             choices = self.payload["choices"]
             message = choices[0]["message"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, "malformed response: no choices"
-            ) from exc
-        if message.get("refusal"):
-            raise ProviderError(
-                provider.name, ProviderOutcome.REFUSAL, "model refusal marker in response"
-            )
-        content = message.get("content")
-        raw_tool_calls = message.get("tool_calls")
-        tool_calls: tuple[dict[str, Any], ...] | None = None
-        if isinstance(raw_tool_calls, list) and raw_tool_calls:
-            for tool_call in raw_tool_calls:
-                if _tool_call_name(tool_call) is None:
-                    raise ProviderError(
-                        provider.name,
-                        ProviderOutcome.ERROR,
-                        "malformed response: tool call without a function name",
-                    )
-                try:
-                    _tool_call_arguments(tool_call)
-                except ValueError as exc:
-                    raise ProviderError(
-                        provider.name,
-                        ProviderOutcome.ERROR,
-                        f"malformed response: {exc}",
-                    ) from exc
-            tool_calls = tuple(raw_tool_calls)
-        if not isinstance(content, str):
-            if tool_calls is None:
+            if not isinstance(message, Mapping):
+                raise TypeError("message must be an object")
+            if message.get("refusal"):
                 raise ProviderError(
-                    provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
+                    provider.name, ProviderOutcome.REFUSAL, "model refusal marker in response"
                 )
-            content = ""
-        if _CONTENT_REFUSAL_RE.search(content):
-            # A 200 completion whose text is a model refusal: fall through to the
-            # next provider (documented heuristic, see module docstring). Like any
-            # refusal it never drives a health transition.
+            content = message.get("content")
+            raw_tool_calls = message.get("tool_calls")
+            tool_calls: tuple[dict[str, Any], ...] | None = None
+            if isinstance(raw_tool_calls, list) and raw_tool_calls:
+                for tool_call in raw_tool_calls:
+                    if _tool_call_name(tool_call) is None:
+                        raise ProviderError(
+                            provider.name,
+                            ProviderOutcome.ERROR,
+                            "malformed response: tool call without a function name",
+                        )
+                    try:
+                        _tool_call_arguments(tool_call)
+                    except ValueError as exc:
+                        raise ProviderError(
+                            provider.name,
+                            ProviderOutcome.ERROR,
+                            f"malformed response: {exc}",
+                        ) from exc
+                tool_calls = tuple(raw_tool_calls)
+            if not isinstance(content, str):
+                if tool_calls is None:
+                    raise ProviderError(
+                        provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
+                    )
+                content = ""
+            if _CONTENT_REFUSAL_RE.search(content):
+                # A 200 completion whose text is a model refusal: fall through to the
+                # next provider (documented heuristic, see module docstring). Like any
+                # refusal it never drives a health transition.
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.REFUSAL,
+                    f"completion content carries refusal markers: {content[:80]!r}",
+                )
+            usage = self.payload.get("usage")
+            if not isinstance(usage, dict):
+                usage = None
+            else:
+                cached_tokens = _cached_tokens(usage)
+                usage = dict(usage)
+                usage.pop("cached_tokens", None)
+                if cached_tokens is not None:
+                    usage["cached_tokens"] = cached_tokens
+            model = self.payload.get("model") or provider.model
+            if not isinstance(model, str):
+                raise TypeError("model must be a string")
+            return CallResult(
+                provider=provider.name,
+                model=model,
+                tier=provider.tier,
+                content=content,
+                latency_s=self.latency_s,
+                usage=usage,
+                estimated_cost_usd=_estimate_cost(provider, usage),
+                tool_calls=tool_calls,
+                retry_after_s=retry_after_s,
+                account_quota_owner=account_quota_owner,
+                prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+                prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
+                provider_cache_hit=_provider_cache_hit(usage),
+            )
+        except ProviderError:
+            raise
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
             raise ProviderError(
                 provider.name,
-                ProviderOutcome.REFUSAL,
-                f"completion content carries refusal markers: {content[:80]!r}",
-            )
-        usage = self.payload.get("usage")
-        if not isinstance(usage, dict):
-            usage = None
-        else:
-            cached_tokens = _cached_tokens(usage)
-            usage = dict(usage)
-            usage.pop("cached_tokens", None)
-            if cached_tokens is not None:
-                usage["cached_tokens"] = cached_tokens
-        return CallResult(
-            provider=provider.name,
-            model=self.payload.get("model") or provider.model,
-            tier=provider.tier,
-            content=content,
-            latency_s=self.latency_s,
-            usage=usage,
-            estimated_cost_usd=_estimate_cost(provider, usage),
-            tool_calls=tool_calls,
-            retry_after_s=retry_after_s,
-            account_quota_owner=account_quota_owner,
-            prompt_prefix_bytes=prompt_prefix_bytes(prompt),
-            prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
-            provider_cache_hit=_provider_cache_hit(usage),
-        )
+                ProviderOutcome.ERROR,
+                "malformed response: invalid response fields",
+            ) from exc
 
 
 class _CodexRawResponse(_RawResponse):
@@ -662,25 +671,34 @@ class _CodexRawResponse(_RawResponse):
                 ProviderOutcome.REFUSAL,
                 f"completion content carries refusal markers: {self.text[:80]!r}",
             )
-        usage = _codex_usage(self.payload)
-        response = self.payload.get("response")
-        model = provider.model
-        if isinstance(response, dict) and isinstance(response.get("model"), str):
-            model = response["model"]
-        return CallResult(
-            provider=provider.name,
-            model=model,
-            tier=provider.tier,
-            content=self.text,
-            latency_s=self.latency_s,
-            usage=usage,
-            estimated_cost_usd=_estimate_cost(provider, usage),
-            retry_after_s=retry_after_s,
-            account_quota_owner=account_quota_owner,
-            prompt_prefix_bytes=prompt_prefix_bytes(prompt),
-            prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
-            provider_cache_hit=_provider_cache_hit(usage),
-        )
+        try:
+            usage = _codex_usage(self.payload)
+            response = self.payload.get("response")
+            model = provider.model
+            if isinstance(response, dict) and isinstance(response.get("model"), str):
+                model = response["model"]
+            return CallResult(
+                provider=provider.name,
+                model=model,
+                tier=provider.tier,
+                content=self.text,
+                latency_s=self.latency_s,
+                usage=usage,
+                estimated_cost_usd=_estimate_cost(provider, usage),
+                retry_after_s=retry_after_s,
+                account_quota_owner=account_quota_owner,
+                prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+                prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
+                provider_cache_hit=_provider_cache_hit(usage),
+            )
+        except ProviderError:
+            raise
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "malformed response: invalid response fields",
+            ) from exc
 
 
 def _provider_cache_hit(usage: dict[str, Any] | None) -> bool | None:
@@ -763,11 +781,19 @@ def _account_quota_owner(body: str, api_key: str) -> str | None:
 def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> float:
     if not usage:
         return 0.0
-    prompt_tokens = float(usage.get("prompt_tokens") or 0)
-    completion_tokens = float(usage.get("completion_tokens") or 0)
+    values: list[float] = []
+    for key in ("prompt_tokens", "completion_tokens"):
+        value = usage.get(key, 0)
+        if value is None:
+            value = 0
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"usage.{key} must be numeric")
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"usage.{key} must be finite and non-negative")
+        values.append(float(value))
     return (
-        prompt_tokens / 1_000_000 * provider.price_per_1m_in
-        + completion_tokens / 1_000_000 * provider.price_per_1m_out
+        values[0] / 1_000_000 * provider.price_per_1m_in
+        + values[1] / 1_000_000 * provider.price_per_1m_out
     )
 
 
@@ -1043,9 +1069,9 @@ def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
     }
     input_details = usage.get("input_tokens_details")
     if isinstance(input_details, dict):
-        normalized["prompt_tokens_details"] = {
-            "cached_tokens": cached_tokens if cached_tokens is not None else 0
-        }
+        normalized["prompt_tokens_details"] = dict(input_details)
+        if cached_tokens is not None:
+            normalized["prompt_tokens_details"]["cached_tokens"] = cached_tokens
         normalized["input_tokens_details"] = dict(input_details)
     output_details = usage.get("output_tokens_details")
     if isinstance(output_details, dict):
