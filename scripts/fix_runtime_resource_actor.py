@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Normalize and clean the retained runtime-resource materializer."""
+"""Normalize and clean the retained runtime-resource materializer.
+
+This file is source-controlled so the CI materialization path remains reviewable.
+"""
 
 from __future__ import annotations
 
