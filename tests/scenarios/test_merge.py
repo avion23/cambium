@@ -367,6 +367,27 @@ def test_reconcile_reads_current_main(tmp_path) -> None:
     assert seq.reconcile(repo) is None
 
 
+def test_publish_resolves_new_tip_before_fast_forward_check(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    tip_a = _worker_commit(repo, "worker-a", tmp_path / "worker-a", {"a.txt": "a\n"}, base)
+    tip_c = _worker_commit(repo, "worker-c", tmp_path / "worker-c", {"c.txt": "c\n"}, base)
+    _run(repo, "update-ref", "refs/heads/moving", tip_a)
+
+    seq = MergeSequencer(task_id="resolve-tip")
+    checked = seq._is_ancestor
+
+    def move_tip_after_check(repo_path: Path, ancestor: str, descendant: str) -> bool:
+        result = checked(repo_path, ancestor, descendant)
+        _run(repo_path, "update-ref", "refs/heads/moving", tip_c)
+        return result
+
+    monkeypatch.setattr(seq, "_is_ancestor", move_tip_after_check)
+    seq.publish_merge(repo, "refs/heads/moving", base)
+
+    assert _rev(repo, "refs/heads/main") == tip_a
+
+
 def test_publish_rejects_empty_and_zero_expected_old(tmp_path) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
@@ -622,6 +643,30 @@ def test_clean_cleanup_removes_worktree_branch_and_ref(tmp_path) -> None:
         repo, "show-ref", "--verify", f"refs/heads/{branch}", check=False
     ).returncode
     assert ref and _run(repo, "show-ref", "--verify", ref, check=False).returncode
+
+
+def test_artifact_measurement_failure_restores_staging(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
+    staging = tmp_path / "staging"
+    seq = MergeSequencer(task_id="measurement-failure", session_dir=tmp_path)
+    seq.prepare_staging(repo, staging, "worker", "main")
+    evidence = staging / "evidence.bin"
+    evidence.write_bytes(b"must not be stranded")
+
+    def fail_measurement(repo_path: Path, path: Path) -> int:
+        raise OSError("measurement failed")
+
+    monkeypatch.setattr(seq, "_artifact_bytes", fail_measurement)
+    with pytest.raises(OSError, match="measurement failed"):
+        seq.cleanup_staging(repo)
+
+    assert evidence.read_bytes() == b"must not be stranded"
+    assert str(staging.resolve()) in _run(repo, "worktree", "list", "--porcelain").stdout
+    events = seq.drain_events()
+    assert not any(kind == "merge_staging_quarantined" for kind, _ in events)
+    assert any(kind == "merge_staging_cleanup_failed" for kind, _ in events)
 
 
 def test_traversal_task_id_stays_below_quarantine_root(tmp_path) -> None:

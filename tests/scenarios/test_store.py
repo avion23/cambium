@@ -41,6 +41,53 @@ def _open(path):
     return EventStore(path, fsync_interval_s=5.0)
 
 
+def test_same_path_event_store_has_one_process_owner(tmp_path) -> None:
+    path = tmp_path / "events.db"
+    store = _open(path)
+    script = (
+        "import sys\n"
+        "from cambium.store import EventStore\n"
+        "EventStore(sys.argv[1])\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script, str(path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert proc.returncode != 0
+        assert "StoreInitError" in proc.stderr
+    finally:
+        store.close()
+
+    reopened = _open(path)
+    try:
+        assert reopened.append({"kind": "log", "payload": {}}) == 1
+    finally:
+        reopened.close()
+
+
+def test_append_rejects_records_replay_would_reject(tmp_path) -> None:
+    store = _open(tmp_path / "events.db")
+    invalid = [
+        {"kind": "log", "payload": []},
+        {"kind": "log", "payload": {}, "task_id": []},
+        {"kind": "log", "payload": {}, "worker_id": 1},
+        {"kind": "log", "payload": {}, "generation": True},
+        {"kind": "log", "payload": {}, "ts": []},
+        {"kind": "log", "payload": {}, "request_id": 1},
+    ]
+    try:
+        for event in invalid:
+            with pytest.raises(ValueError):
+                store.append(event)
+        assert store.append({"kind": "result", "payload": {}}) == 1
+        assert [event["seq"] for event in store.events_after(0)] == [1]
+    finally:
+        store.close()
+
+
 def test_append_read_back_fields_and_monotonic_seq(tmp_path) -> None:
     store = _open(tmp_path / "events.db")
     try:

@@ -521,18 +521,18 @@ class MergeSequencer:
                 check=False,
             )
             allocated: int = 0
-            if result.returncode == 0 and not all(
-                self._is_open_child(*link) for link in chain
-            ):
-                restore_staging()
-                raise StagingCleanupError("quarantine path changed during worktree move")
             if result.returncode == 0:
-                destination_fd = os.open(destination_name, flags, dir_fd=task_fd)
-                opened_destination = Path(f"/proc/{os.getpid()}/fd/{destination_fd}")
-                allocated = self._artifact_bytes(repo, opened_destination)
-                if not all(self._is_open_child(*link) for link in chain):
+                try:
+                    if not all(self._is_open_child(*link) for link in chain):
+                        raise StagingCleanupError("quarantine path changed during worktree move")
+                    destination_fd = os.open(destination_name, flags, dir_fd=task_fd)
+                    opened_destination = Path(f"/proc/{os.getpid()}/fd/{destination_fd}")
+                    allocated = self._artifact_bytes(repo, opened_destination)
+                    if not all(self._is_open_child(*link) for link in chain):
+                        raise StagingCleanupError("quarantine path changed during worktree move")
+                except (OSError, RuntimeError):
                     restore_staging()
-                    raise StagingCleanupError("quarantine path changed during worktree move")
+                    raise
             if result.returncode != 0:
                 self._event(
                     "merge_staging_cleanup_failed", task=self._task_id,
@@ -925,15 +925,19 @@ class MergeSequencer:
                 expected_old=expected_old,
                 detail=f"{MAIN_REF} does not exist; use create_main() for the first publish",
             )
-        if not self._is_ancestor(repo, expected_old, new_tip):
+        new_tip_commit = self._rev_parse(repo, new_tip)
+        if not self._is_ancestor(repo, expected_old, new_tip_commit):
             raise NonFastForwardError(
-                new_tip=new_tip,
+                new_tip=new_tip_commit,
                 expected_old=expected_old,
-                detail=f"{new_tip} is not a descendant of {expected_old} (no fast-forward)",
+                detail=(
+                    f"{new_tip_commit} is not a descendant of {expected_old} "
+                    "(no fast-forward)"
+                ),
             )
 
         result = self._run_repo(
-            repo, "update-ref", MAIN_REF, new_tip, expected_old, check=False
+            repo, "update-ref", MAIN_REF, new_tip_commit, expected_old, check=False
         )
         if result.returncode == 0:
             return
@@ -955,7 +959,10 @@ class MergeSequencer:
             or lock_contention
         ):
             raise NonFastForwardError(
-                new_tip=new_tip, expected_old=expected_old, current=current, detail=detail[:512]
+                new_tip=new_tip_commit,
+                expected_old=expected_old,
+                current=current,
+                detail=detail[:512],
             )
         raise RuntimeError(f"git update-ref {MAIN_REF} failed: {detail[:512]}")
 
