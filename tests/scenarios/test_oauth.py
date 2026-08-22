@@ -354,6 +354,21 @@ def test_store_parse_rejects_oversized_document() -> None:
         oauth.parse_document(b"x" * (oauth.MAX_OAUTH_DOC_BYTES + 1))
 
 
+def test_store_save_rejects_oversized_document_without_replacing_current(
+    tmp_path: Path,
+) -> None:
+    store = OAuthStore(_store_path(tmp_path))
+    token = "t" * oauth.MAX_TOKEN_BYTES
+    store.save_provider(OAuthDoc("codex", token, token, 1.0, None))
+    before = store.path.read_bytes()
+
+    with pytest.raises(OAuthStoreError):
+        store.save_provider(OAuthDoc("other", token, token, 1.0, None))
+
+    assert store.path.read_bytes() == before
+    assert not list(store.path.parent.glob(".oauth.json.tmp-*"))
+
+
 def test_store_rejects_insecure_file_mode(tmp_path: Path) -> None:
     path = _store_path(tmp_path)
     store = OAuthStore(path)
@@ -417,6 +432,17 @@ def test_oauth_doc_representation_hides_tokens() -> None:
     assert STALE_ACCESS not in repr(doc)
     assert "refresh-1" not in repr(doc)
     assert ACCOUNT_ID not in repr(doc)
+
+
+def test_refreshed_tokens_representation_hides_tokens() -> None:
+    refreshed = oauth.RefreshedTokens(
+        "fresh-access-secret", 3600.0, "fresh-refresh-secret", "account-secret"
+    )
+    output = repr(refreshed)
+
+    assert "fresh-access-secret" not in output
+    assert "fresh-refresh-secret" not in output
+    assert "account-secret" not in output
 
 
 def test_issuer_validation_rejects_remote_http_and_credentials() -> None:
@@ -808,6 +834,18 @@ def test_device_flow_poll_expiry_persists_nothing(tmp_path: Path) -> None:
 
         with pytest.raises(DeviceFlowExpired):
             flow.run(max_wait_s=0.2)
+
+        assert store.read().records == ()
+
+
+def test_device_flow_approval_after_deadline_is_rejected(tmp_path: Path) -> None:
+    with _fake_issuer() as server:
+        server.fake.device_token_sleep_s = 0.2
+        store = OAuthStore(_store_path(tmp_path))
+        flow = DeviceFlow("codex", client_id=FAKE_CLIENT_ID, issuer=server.issuer, store=store)
+
+        with pytest.raises(DeviceFlowExpired):
+            flow.run(max_wait_s=0.05)
 
         assert store.read().records == ()
 

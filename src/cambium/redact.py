@@ -88,6 +88,7 @@ REDACT_KEYS = re.compile(
 # The value patterns are intentionally shape-based.  Do not add a generic
 # long-hex/base64 expression: that would turn public git SHAs and metric
 # signatures into ``***``.  Ambiguous values are handled by contextual fields.
+_MAX_PEM_SCAN_CHARS = 1 << 20
 _LITERAL_SOURCES: tuple[str, ...] = (
     # OpenAI, Anthropic, OpenRouter, and compatible ``sk-`` credentials.
     r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])",
@@ -116,7 +117,8 @@ _LITERAL_SOURCES: tuple[str, ...] = (
     r"[A-Za-z0-9_-]{1,}(?![A-Za-z0-9_-])",
     # PEM private keys, including RSA/EC/OPENSSH/PGP and encrypted variants.
     r"-----BEGIN (?:[A-Z0-9][A-Z0-9 ]* )?PRIVATE KEY(?: BLOCK)?-----"
-    r"[\s\S]*?-----END (?:[A-Z0-9][A-Z0-9 ]* )?PRIVATE KEY(?: BLOCK)?-----",
+    rf"(?:(?!-----BEGIN)[\s\S]){{0,{_MAX_PEM_SCAN_CHARS}}}?"
+    r"-----END (?:[A-Z0-9][A-Z0-9 ]* )?PRIVATE KEY(?: BLOCK)?-----",
     # Credentials embedded in an absolute HTTP(S) URL.  The password can be
     # short and punctuation-heavy; the @ delimiter makes this unambiguous.
     r"(?i:\bhttps?://[^\s/@]+:[^\s/@]+@)",
@@ -678,6 +680,19 @@ def _literal_spans(text: str) -> list[tuple[int, int]]:
             match = pattern.match(text, start)
             if match is not None:
                 spans.append((match.start(), match.end()))
+    return spans
+
+
+def _escaped_literal_spans(text: str) -> list[tuple[int, int]]:
+    """Return raw spans matching provider shapes in decoded wire text."""
+    decoded = _decoded_characters(text)
+    if not decoded:
+        return []
+    logical = "".join(character for character, _start, _end in decoded)
+    spans: list[tuple[int, int]] = []
+    for start, end in _literal_spans(logical):
+        if start < end:
+            spans.append((decoded[start][1], decoded[end - 1][2]))
     return spans
 
 
@@ -1477,7 +1492,7 @@ class Redactor:
         for value in self._whole_values:
             if _decodes_to(text, value):
                 return self.replacement
-        spans: list[tuple[int, int]] = []
+        spans = _escaped_literal_spans(text)
         for value in self._secret_values:
             spans.extend(_escaped_value_spans(text, value))
         if spans:
