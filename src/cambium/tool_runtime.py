@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -38,10 +39,12 @@ class ToolDefinition:
     executor: ToolExecutor | None = None
 
     def __post_init__(self) -> None:
+        parameters = deepcopy(dict(self.parameters))
         if not self.name or not self.description:
             raise ValueError("tool definition name/description must be non-empty")
-        if self.parameters.get("type") != "object":
+        if parameters.get("type") != "object":
             raise ValueError("tool parameters must be an object schema")
+        object.__setattr__(self, "parameters", parameters)
 
     def openai_schema(self) -> dict[str, Any]:
         return {
@@ -49,7 +52,7 @@ class ToolDefinition:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": dict(self.parameters),
+                "parameters": deepcopy(self.parameters),
             },
         }
 
@@ -61,29 +64,47 @@ class ToolRegistry:
         ordered: list[ToolDefinition] = []
         by_name: dict[str, ToolDefinition] = {}
         for definition in definitions:
-            if definition.name in by_name:
-                raise ValueError(f"duplicate tool definition {definition.name!r}")
-            by_name[definition.name] = definition
-            ordered.append(definition)
+            owned = ToolDefinition(
+                definition.name,
+                definition.description,
+                definition.parameters,
+                definition.capability,
+                definition.executor,
+            )
+            if owned.name in by_name:
+                raise ValueError(f"duplicate tool definition {owned.name!r}")
+            by_name[owned.name] = owned
+            ordered.append(owned)
         self._ordered = tuple(ordered)
         self._by_name = MappingProxyType(by_name)
 
+    @staticmethod
+    def _copy_definition(definition: ToolDefinition) -> ToolDefinition:
+        return ToolDefinition(
+            definition.name,
+            definition.description,
+            definition.parameters,
+            definition.capability,
+            definition.executor,
+        )
+
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return self._ordered
+        return tuple(self._copy_definition(item) for item in self._ordered)
 
     @property
     def schemas(self) -> tuple[dict[str, Any], ...]:
         return tuple(definition.openai_schema() for definition in self._ordered)
 
     def get(self, name: str) -> ToolDefinition | None:
-        return self._by_name.get(name)
+        definition = self._by_name.get(name)
+        return None if definition is None else self._copy_definition(definition)
 
     def extend(self, definitions: Iterable[ToolDefinition]) -> ToolRegistry:
         return ToolRegistry((*self._ordered, *definitions))
 
     def execute(self, name: str, arguments: Mapping[str, Any], context: Any) -> Any:
-        definition = self.get(name)
+        definition = self._by_name.get(name)
         if definition is None or definition.executor is None:
             raise KeyError(name)
         return definition.executor(arguments, context)

@@ -216,6 +216,7 @@ def query_lsp(
     reader = _Reader(process.stdout.fileno())
     deadline = time.monotonic() + timeout_s
     diagnostics: list[Any] = []
+    published_diagnostics = False
     try:
         root_uri = worktree.as_uri()
         _write_message(
@@ -281,16 +282,11 @@ def query_lsp(
                     value = params_value.get("diagnostics")
                     if isinstance(value, list):
                         diagnostics = value
-                if method == "diagnostics" and diagnostics:
-                    result = {"items": diagnostics}
-                    break
+                        published_diagnostics = True
                 continue
             if message.get("id") != 2:
                 continue
             if "error" in message:
-                if method == "diagnostics" and diagnostics:
-                    result = {"items": diagnostics}
-                    break
                 raise LspQueryError(f"language server query failed: {message['error']!r}")
             result = message.get("result")
             break
@@ -301,6 +297,13 @@ def query_lsp(
             "published_diagnostics": diagnostics,
         }
     except TimeoutError as exc:
+        if method == "diagnostics" and published_diagnostics:
+            return {
+                "method": method,
+                "path": str(target.relative_to(worktree)),
+                "result": {"items": diagnostics},
+                "published_diagnostics": diagnostics,
+            }
         raise LspQueryError("language server query timed out") from exc
     finally:
         try:

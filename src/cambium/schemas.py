@@ -7,6 +7,7 @@ plain dictionaries so they can be passed directly to an LLM client, while
 
 from __future__ import annotations
 
+import re
 import types
 from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
@@ -289,11 +290,115 @@ def _expected_type(schema: dict[str, Any]) -> str:
     return "value"
 
 
+def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]:
+    """Validate one value, including the constraints on nested schemas."""
+
+    options = schema.get("anyOf")
+    if isinstance(options, list):
+        option_errors = [
+            _validate_value(option, value, label)
+            for option in options
+            if isinstance(option, dict)
+        ]
+        if any(not option_error for option_error in option_errors):
+            return []
+        return [f"validation failed: '{label}' must be {_expected_type(schema)}"]
+
+    if not _type_matches(value, schema):
+        return [f"validation failed: '{label}' must be {_expected_type(schema)}"]
+
+    errors: list[str] = []
+    allowed = schema.get("enum")
+    if allowed is not None and not any(
+        type(value) is type(item) and value == item for item in allowed
+    ):
+        errors.append(f"validation failed: '{label}' must be one of {allowed!r}")
+        return errors
+
+    if type(value) is str:
+        min_length = schema.get("minLength")
+        if isinstance(min_length, int) and not isinstance(min_length, bool) and len(value) < min_length:
+            unit = "character" if min_length == 1 else "characters"
+            errors.append(f"validation failed: '{label}' must have at least {min_length} {unit}")
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and not isinstance(max_length, bool) and len(value) > max_length:
+            unit = "character" if max_length == 1 else "characters"
+            errors.append(f"validation failed: '{label}' must have at most {max_length} {unit}")
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str):
+            try:
+                matched = re.search(pattern, value) is not None
+            except re.error:
+                matched = False
+            if not matched:
+                errors.append(f"validation failed: '{label}' must match pattern {pattern!r}")
+
+    if type(value) in (int, float):
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
+            if value < minimum:
+                errors.append(f"validation failed: '{label}' must be >= {minimum}")
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        if isinstance(exclusive_minimum, bool):
+            if exclusive_minimum and isinstance(minimum, (int, float)) and value <= minimum:
+                errors.append(f"validation failed: '{label}' must be > {minimum}")
+        elif isinstance(exclusive_minimum, (int, float)) and not isinstance(exclusive_minimum, bool):
+            if value <= exclusive_minimum:
+                errors.append(f"validation failed: '{label}' must be > {exclusive_minimum}")
+        maximum = schema.get("maximum")
+        if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
+            if value > maximum:
+                errors.append(f"validation failed: '{label}' must be <= {maximum}")
+        exclusive_maximum = schema.get("exclusiveMaximum")
+        if isinstance(exclusive_maximum, bool):
+            if exclusive_maximum and isinstance(maximum, (int, float)) and value >= maximum:
+                errors.append(f"validation failed: '{label}' must be < {maximum}")
+        elif isinstance(exclusive_maximum, (int, float)) and not isinstance(exclusive_maximum, bool):
+            if value >= exclusive_maximum:
+                errors.append(f"validation failed: '{label}' must be < {exclusive_maximum}")
+
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and not isinstance(min_items, bool) and len(value) < min_items:
+            errors.append(f"validation failed: '{label}' must have at least {min_items} items")
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and not isinstance(max_items, bool) and len(value) > max_items:
+            errors.append(f"validation failed: '{label}' must have at most {max_items} items")
+        item_schema = schema.get("items", {})
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(_validate_value(item_schema, item, f"{label}[{index}]"))
+
+    if isinstance(value, dict):
+        min_properties = schema.get("minProperties")
+        if (
+            isinstance(min_properties, int)
+            and not isinstance(min_properties, bool)
+            and len(value) < min_properties
+        ):
+            errors.append(
+                f"validation failed: '{label}' must have at least {min_properties} properties"
+            )
+        max_properties = schema.get("maxProperties")
+        if (
+            isinstance(max_properties, int)
+            and not isinstance(max_properties, bool)
+            and len(value) > max_properties
+        ):
+            errors.append(
+                f"validation failed: '{label}' must have at most {max_properties} properties"
+            )
+        errors.extend(_validate_object(schema, value, label))
+    return errors
+
+
 def _validate_object(
     schema: dict[str, Any], arguments: dict[str, Any], prefix: str = ""
 ) -> list[str]:
     errors: list[str] = []
     properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
     for name in schema.get("required", []):
         if name not in arguments:
             label = f"{prefix}.{name}" if prefix else name
@@ -305,33 +410,14 @@ def _validate_object(
         label = f"{prefix}.{name}" if prefix else name
         property_schema = properties.get(name)
         if property_schema is None:
-            if schema.get("additionalProperties") is False:
+            additional = schema.get("additionalProperties")
+            if additional is False:
                 errors.append(f"validation failed: unknown argument '{label}'")
+            elif isinstance(additional, dict):
+                errors.extend(_validate_value(additional, value, label))
             continue
-        if not _type_matches(value, property_schema):
-            errors.append(f"validation failed: '{label}' must be {_expected_type(property_schema)}")
-            continue
-        min_length = property_schema.get("minLength")
-        if type(value) is str and isinstance(min_length, int) and len(value) < min_length:
-            unit = "character" if min_length == 1 else "characters"
-            errors.append(f"validation failed: '{label}' must have at least {min_length} {unit}")
-            continue
-        allowed = property_schema.get("enum")
-        if allowed is not None and not any(
-            type(value) is type(item) and value == item for item in allowed
-        ):
-            errors.append(f"validation failed: '{label}' must be one of {allowed!r}")
-            continue
-        if property_schema.get("type") == "object" and isinstance(value, dict):
-            errors.extend(_validate_object(property_schema, value, label))
-        if property_schema.get("type") == "array" and isinstance(value, list):
-            item_schema = property_schema.get("items", {})
-            for index, item in enumerate(value):
-                if not _type_matches(item, item_schema):
-                    errors.append(
-                        f"validation failed: '{label}[{index}]' must be "
-                        f"{_expected_type(item_schema)}"
-                    )
+        if isinstance(property_schema, dict):
+            errors.extend(_validate_value(property_schema, value, label))
     return errors
 
 

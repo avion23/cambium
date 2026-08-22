@@ -134,7 +134,34 @@ class LintDiag:
                 "message": f"lint timed out after {self.timeout_s}s",
                 "code": "lint-timeout",
             }]
-        return _parse_diagnostics(path, result.stdout)
+        try:
+            diagnostics = _parse_diagnostics(path, result.stdout)
+        except (TypeError, ValueError, RecursionError) as exc:
+            return [{
+                "path": str(path),
+                "line": None,
+                "col": None,
+                "message": f"lint output was invalid: {exc}",
+                "code": "lint-error",
+            }]
+        if result.returncode != 0:
+            # Ruff uses exit status 1 for ordinary findings, which are already
+            # represented by its JSON list. Other failures (and status 1 with
+            # no findings) must not look like a clean lint run.
+            stderr = result.stderr.strip()
+            if result.returncode != 1 or not diagnostics or stderr:
+                detail = stderr or f"lint command exited with status {result.returncode}"
+                diagnostics.insert(
+                    0,
+                    {
+                        "path": str(path),
+                        "line": None,
+                        "col": None,
+                        "message": detail,
+                        "code": "lint-error",
+                    },
+                )
+        return diagnostics[:50]
 
     def lint_files(self, paths: list[Path]) -> dict[Path, list[dict]]:
         """Return the diagnostics for each requested path."""
