@@ -293,9 +293,9 @@ def _read_text(ctx: ToolContext, path: Path) -> str:
     descriptor: int | None = None
     try:
         descriptor = _open_confined_read_fd(ctx, path)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
-            return handle.read()
+            raw = handle.read(MAX_READ_BYTES + 1)
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {path}") from exc
     except IsADirectoryError as exc:
@@ -307,6 +307,15 @@ def _read_text(ctx: ToolContext, path: Path) -> str:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+    if len(raw) > MAX_READ_BYTES:
+        raise _ToolFailure(
+            f"edit_file source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): {path}"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ToolFailure(f"file is not valid UTF-8: {path}") from exc
 
 
 def _open_confined_parent_fd(ctx: ToolContext, path: Path) -> tuple[int, str]:
@@ -492,6 +501,20 @@ def _search_files(root: Path) -> list[Path]:
     return files
 
 
+def _append_bounded_text(parts: list[str], used: int, text: str) -> tuple[int, bool]:
+    separator = "\n" if parts else ""
+    raw = (separator + text).encode("utf-8")
+    remaining = MAX_OUTPUT_BYTES - used
+    if len(raw) <= remaining:
+        parts.append(separator + text)
+        return used + len(raw), True
+    marker_bytes = OUTPUT_TRUNCATION_MARKER.encode("utf-8")
+    if remaining > len(marker_bytes):
+        parts.append(_truncate_bytes(raw, remaining, OUTPUT_TRUNCATION_MARKER))
+        return MAX_OUTPUT_BYTES, False
+    return used, False
+
+
 def _grep_fallback(pattern: str, root: Path, worktree: Path) -> str:
     try:
         expression = re.compile(pattern)
@@ -499,18 +522,36 @@ def _grep_fallback(pattern: str, root: Path, worktree: Path) -> str:
         raise _ToolFailure(f"invalid regular expression: {exc}") from exc
 
     matches: list[str] = []
+    used = 0
     for path in _search_files(root):
+        display = path.relative_to(worktree).as_posix()
+        file_matches: list[str] = []
+        file_used = 0
+        truncated = False
+        binary = False
         try:
-            text = path.read_text(encoding="utf-8")
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    if "\x00" in raw_line:
+                        binary = True
+                        break
+                    line = raw_line.rstrip("\r\n")
+                    if not truncated and expression.search(line):
+                        file_used, complete = _append_bounded_text(
+                            file_matches,
+                            file_used,
+                            f"{display}:{line_number}:{line}",
+                        )
+                        truncated = not complete
         except (OSError, UnicodeDecodeError):
             continue
-        if "\x00" in text:
+        if binary:
             continue
-        display = path.relative_to(worktree).as_posix()
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            if expression.search(line):
-                matches.append(f"{display}:{line_number}:{line}")
-    return "\n".join(matches)
+        if file_matches:
+            used, complete = _append_bounded_text(matches, used, "".join(file_matches))
+            if not complete:
+                break
+    return "".join(matches)
 
 
 async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
@@ -528,16 +569,7 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     if raw_path is not None:
         command.append(_display_path(ctx, root))
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            command,
-            cwd=ctx.cwd,
-            env=scrub_environment(),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=GREP_TIMEOUT_S,
-        )
+        result = await _run_process(command, Path(ctx.cwd), GREP_TIMEOUT_S)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         output = await asyncio.to_thread(_grep_fallback, args["pattern"], root, Path(ctx.cwd))
         return _Outcome(ok=True, output=output)
@@ -547,7 +579,10 @@ async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     if result.returncode not in (0, 1):
         detail = result.stderr.strip() or f"exit status {result.returncode}"
         raise _ToolFailure(f"ripgrep failed: {detail}")
-    return _Outcome(ok=True, output=result.stdout)
+    return _Outcome(
+        ok=True,
+        output=_truncate_text(result.stdout, MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER),
+    )
 
 
 def _read_and_extract_signature(
@@ -642,6 +677,31 @@ def _process_output(stdout: Any, stderr: Any) -> str:
     return standard_output or standard_error
 
 
+_PROCESS_CAPTURE_BYTES = MAX_OUTPUT_BYTES + 1
+_PROCESS_READ_CHUNK_BYTES = 8192
+_PROCESS_DRAIN_TIMEOUT_S = 0.5
+
+
+async def _read_process_stream(stream: Any, chunks: list[bytes]) -> None:
+    captured = 0
+    while True:
+        chunk = await stream.read(_PROCESS_READ_CHUNK_BYTES)
+        if not chunk:
+            return
+        if captured < _PROCESS_CAPTURE_BYTES:
+            kept = chunk[: _PROCESS_CAPTURE_BYTES - captured]
+            chunks.append(kept)
+            captured += len(kept)
+
+
+async def _bounded_process_drain(completion: asyncio.Future[Any]) -> None:
+    try:
+        await asyncio.wait_for(asyncio.shield(completion), _PROCESS_DRAIN_TIMEOUT_S)
+    except (TimeoutError, asyncio.CancelledError):
+        completion.cancel()
+        await asyncio.gather(completion, return_exceptions=True)
+
+
 async def _run_process(
     command: list[str], cwd: Path, timeout_s: int
 ) -> subprocess.CompletedProcess[str]:
@@ -652,21 +712,35 @@ async def _run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=_PROCESS_CAPTURE_BYTES,
     )
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_task = asyncio.create_task(_read_process_stream(process.stdout, stdout_chunks))
+    stderr_task = asyncio.create_task(_read_process_stream(process.stderr, stderr_chunks))
+    wait_task = asyncio.create_task(process.wait())
+    completion = asyncio.gather(wait_task, stdout_task, stderr_task)
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
+        await asyncio.wait_for(asyncio.shield(completion), timeout_s)
     except (TimeoutError, asyncio.CancelledError) as exc:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        stdout, stderr = await process.communicate()
+        await _bounded_process_drain(completion)
+        stdout = b"".join(stdout_chunks)
+        stderr = b"".join(stderr_chunks)
         if isinstance(exc, asyncio.CancelledError):
             raise
         raise subprocess.TimeoutExpired(
-            command, timeout_s, output=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace")
+            command,
+            timeout_s,
+            output=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
         ) from exc
+
+    stdout = b"".join(stdout_chunks)
+    stderr = b"".join(stderr_chunks)
     return subprocess.CompletedProcess(
         command,
         cast(int, process.returncode),
@@ -940,12 +1014,33 @@ async def run_read_batch(
 
 async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if name == "run_python":
-        payload = args
-        code = payload.get("code") if isinstance(payload, dict) else None
-        if not isinstance(code, str) or not code.strip():
+        started_ns = time.monotonic_ns()
+        schema = next(
+            (schema for schema in TOOL_SCHEMAS if schema.get("name") == "run_python"),
+            None,
+        )
+        if schema is None:
+            return ToolResult(
+                ok=False,
+                error="unknown tool: 'run_python'",
+                duration_ms=_duration_ms(started_ns),
+            )
+        validation_errors = validate_tool_call(schema, args)
+        if validation_errors:
+            return ToolResult(
+                ok=False,
+                error="\n".join(validation_errors),
+                duration_ms=_duration_ms(started_ns),
+            )
+        code = args["code"]
+        if len(code.encode("utf-8")) > 32768:
+            return ToolResult(
+                ok=False,
+                error="validation failed: 'code' exceeds 32768 bytes",
+                duration_ms=_duration_ms(started_ns),
+            )
+        if not code.strip():
             code = "raise SystemExit('run_python requires non-empty code')"
-        elif len(code.encode("utf-8")) > 32768:
-            code = "raise SystemExit('run_python code exceeds 32768 bytes')"
         return await _run_tool_without_python(
             "run_shell",
             {"cmd": [sys.executable, "-I", "-S", "-c", code]},
