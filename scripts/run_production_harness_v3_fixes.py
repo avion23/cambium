@@ -145,6 +145,85 @@ def _normalize_tool_dispatch() -> None:
     path.write_text("".join(lines), encoding="utf-8")
 
 
+def _normalize_oauth_refresh_lock() -> None:
+    path = ROOT / "src" / "cambium" / "oauth.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    helper = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_refresh_lock"
+        ),
+        None,
+    )
+    token_manager = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "TokenManager"
+        ),
+        None,
+    )
+    if helper is None or helper.end_lineno is None or token_manager is None:
+        raise RuntimeError("generated OAuth refresh wrapper was not found")
+    wrapper = next(
+        (
+            node
+            for node in token_manager.body
+            if isinstance(node, ast.FunctionDef) and node.name == "ensure_fresh"
+        ),
+        None,
+    )
+    original = next(
+        (
+            node
+            for node in token_manager.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ensure_fresh_unlocked"
+        ),
+        None,
+    )
+    if (
+        wrapper is None
+        or wrapper.end_lineno is None
+        or original is None
+        or original.end_lineno is None
+        or wrapper.lineno >= original.lineno
+    ):
+        raise RuntimeError("generated TokenManager refresh methods are malformed")
+
+    lines = text.splitlines(keepends=True)
+    original_segment = "".join(lines[original.lineno - 1 : original.end_lineno])
+    marker = "def _ensure_fresh_unlocked("
+    if original_segment.count(marker) != 1:
+        raise RuntimeError("renamed TokenManager.ensure_fresh header was not found")
+    original_segment = original_segment.replace(marker, "def ensure_fresh(", 1)
+    lines[wrapper.lineno - 1 : original.end_lineno] = [original_segment]
+    text = "".join(lines)
+
+    tree = ast.parse(text)
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_refresh_lock"
+    )
+    if helper.end_lineno is None:
+        raise RuntimeError("generated OAuth refresh helper has no end line")
+    decorator_lines = [item.lineno for item in helper.decorator_list]
+    helper_start = min([helper.lineno, *decorator_lines]) - 1
+    lines = text.splitlines(keepends=True)
+    del lines[helper_start : helper.end_lineno]
+    text = "".join(lines)
+    if "contextmanager" in text.replace(
+        "from contextlib import contextmanager\n", "", 1
+    ):
+        raise RuntimeError("contextmanager is still used after OAuth wrapper removal")
+    text = text.replace("from contextlib import contextmanager\n", "", 1)
+    ast.parse(text)
+    path.write_text(text, encoding="utf-8")
+
+
 def _normalize_render_tests() -> None:
     path = ROOT / "tests" / "scenarios" / "test_render_stream.py"
     text = path.read_text(encoding="utf-8")
@@ -194,6 +273,7 @@ def main() -> None:
     fixer.main()
     _normalize_scheduler_source()
     _normalize_tool_dispatch()
+    _normalize_oauth_refresh_lock()
     _normalize_render_tests()
     _normalize_repl_tests()
 
