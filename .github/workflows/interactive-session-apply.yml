@@ -1,0 +1,60 @@
+name: interactive-session-apply
+
+on:
+  push:
+    branches:
+      - codex/runtime-interactive-session
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/runtime-interactive-session
+      - name: Preserve generator
+        run: cp scripts/apply_interactive_session.py /tmp/apply_interactive_session.py
+      - name: Pull latest upstream main after resource-policy phase
+        run: |
+          git fetch origin main
+          BASE_SHA=$(git rev-parse origin/main)
+          git cat-file -e "$BASE_SHA:src/cambium/provider_resources.py"
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git checkout --detach "$BASE_SHA"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev --python 3.14
+      - name: Apply durable branch actor
+        run: |
+          cp /tmp/apply_interactive_session.py scripts/apply_interactive_session.py
+          uv run --python 3.14 python scripts/apply_interactive_session.py
+          uv run --python 3.14 ruff check --fix src tests
+          uv run --python 3.14 ruff check src tests
+          uv run --python 3.14 python -m compileall -q src tests
+      - name: Focused interactive/context/UI tests
+        run: >-
+          uv run --python 3.14 pytest -q
+          tests/scenarios/test_interactive_session.py
+          tests/scenarios/test_repl_history.py
+          tests/scenarios/test_repl_usage.py
+          tests/scenarios/test_interface_regressions.py
+          tests/scenarios/test_render_stream.py
+          tests/scenarios/test_context_epochs.py
+          tests/scenarios/test_user_cli.py
+      - name: Full test tiers
+        run: |
+          uv run --python 3.14 pytest -q -n auto
+          uv run --python 3.14 pytest -q -n auto -m slow
+          uv lock --check
+          git diff --check
+      - name: Commit and lease-protected fast-forward
+        run: |
+          rm -f scripts/apply_interactive_session.py
+          git config user.name "cambium-session-bot"
+          git config user.email "cambium-session-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(session): keep one durable interactive branch"
+          git push --force-with-lease=refs/heads/main:${BASE_SHA} origin HEAD:main
