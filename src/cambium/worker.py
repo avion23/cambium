@@ -157,6 +157,7 @@ from cambium.summary_trunk import (
     parse_summary_response,
     partition_summary_trunk,
     semantic_summary_messages,
+    summary_entries,
 )
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
@@ -3721,10 +3722,17 @@ async def _run_agent_loop(
             and current_epoch_checkpoint.generation == config.generation
         )
         try:
+            summary_through_turn = turn
+            existing_entries = summary_entries(trunk_messages)
+            if existing_entries:
+                summary_through_turn = max(
+                    summary_through_turn,
+                    existing_entries[-1].through_turn + 1,
+                )
             summary_prompt, expectation = build_summary_request(
                 trunk_messages,
                 raw_tail,
-                through_turn=turn,
+                through_turn=summary_through_turn,
             )
             sent_summary_prompt = copy.deepcopy(summary_prompt)
             try:

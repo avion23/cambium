@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -13,10 +14,12 @@ from cambium.summary_trunk import (
     SummaryTrunkError,
     append_summary_entry,
     build_summary_request,
+    entry_mapping,
     parse_summary_message,
     parse_summary_response,
     partition_summary_trunk,
     raw_tail_sha256,
+    render_summary_message,
     semantic_summary_messages,
     summary_entries,
 )
@@ -137,9 +140,13 @@ def test_summary_response_is_strict_and_bounded() -> None:
     _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
     payload = json.loads(_response(expectation, label="one"))
     payload["tool_calls"] = []
-    # Unknown extra fields are ignored; identity fields are not model-owned.
-    entry = parse_summary_response(json.dumps(payload), expectation)
-    assert entry.objective
+    with pytest.raises(SummaryTrunkError, match="unknown"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    payload = json.loads(_response(expectation, label="one"))
+    payload["objective"] = "x" * 2_001
+    with pytest.raises(SummaryTrunkError, match="objective.*byte cap"):
+        parse_summary_response(json.dumps(payload), expectation)
 
     payload = json.loads(_response(expectation, label="one"))
     payload.pop("objective")
@@ -147,8 +154,13 @@ def test_summary_response_is_strict_and_bounded() -> None:
         parse_summary_response(json.dumps(payload), expectation)
 
     payload = json.loads(_response(expectation, label="one"))
+    payload["open_items"] = [" \t"]
+    with pytest.raises(SummaryTrunkError, match=r"open_items\[0\].*non-empty"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    payload = json.loads(_response(expectation, label="one"))
     payload["open_items"] = ["x"] * 33
-    with pytest.raises(SummaryTrunkError, match="item cap|at most"):
+    with pytest.raises(SummaryTrunkError, match="item cap"):
         parse_summary_response(json.dumps(payload), expectation)
 
 
@@ -165,3 +177,41 @@ def test_summary_wrappers_are_validated() -> None:
     message["role"] = "assistant"
     with pytest.raises(SummaryTrunkError, match="user role"):
         parse_summary_message(message)
+
+
+def test_summary_provenance_distinguishes_raw_delimited_json() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    entry = parse_summary_response(_response(expectation, label="one"), expectation)
+    raw = {
+        "role": "user",
+        "content": SUMMARY_ENTRY_OPEN + json.dumps(entry_mapping(entry)) + SUMMARY_ENTRY_CLOSE,
+    }
+
+    assert parse_summary_message(raw) is None
+    trunk, raw_tail = partition_summary_trunk([*HEAD, raw])
+    assert trunk == HEAD
+    assert raw_tail == [raw]
+
+
+def test_summary_entry_cannot_hide_in_stable_head() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    entry = parse_summary_response(_response(expectation, label="one"), expectation)
+
+    with pytest.raises(SummaryTrunkError, match="stable head"):
+        partition_summary_trunk([HEAD[0], render_summary_message(entry)])
+
+
+def test_summary_append_enforces_source_identity_and_progress() -> None:
+    trunk, entry = _append(HEAD, TAIL_1, 2, "one")
+
+    duplicate = replace(entry, sequence=2, through_turn=3)
+    with pytest.raises(SummaryTrunkError, match="source_sha256.*duplicate"):
+        append_summary_entry(trunk, duplicate)
+
+    empty = replace(entry, sequence=2, source_message_count=0, through_turn=3)
+    with pytest.raises(SummaryTrunkError, match="source_message_count.*positive"):
+        append_summary_entry(trunk, empty)
+
+    regressed = replace(entry, sequence=2, source_sha256="0" * 64, through_turn=2)
+    with pytest.raises(SummaryTrunkError, match="through_turn.*monotonically"):
+        append_summary_entry(trunk, regressed)
