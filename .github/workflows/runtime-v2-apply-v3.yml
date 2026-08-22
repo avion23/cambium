@@ -84,7 +84,88 @@ jobs:
           uv lock
           uv sync --extra dev --python 3.14
           uv run --python 3.14 ruff format src tests
-          uv run --python 3.14 ruff check --fix --unsafe-fixes src tests
+          uv run --python 3.14 ruff check --fix --unsafe-fixes --exit-zero src tests
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          window_pattern = re.compile(
+              r'(?m)^(?P<i>\s*)f"\{w\.name\}:\{w\.remaining_tokens if '
+              r'w\.remaining_tokens is not None else \'\?\'\}/'
+              r'\{w\.limit_tokens if w\.limit_tokens is not None else \'\?\'\}"$'
+          )
+
+          def split_window(match: re.Match[str]) -> str:
+              indent = match.group("i")
+              return "\n".join(
+                  (
+                      indent + "(",
+                      indent + '    f"{w.name}:"',
+                      indent
+                      + '    f"{w.remaining_tokens if w.remaining_tokens is not None else \'?\'}"',
+                      indent + '    "/"',
+                      indent
+                      + '    f"{w.limit_tokens if w.limit_tokens is not None else \'?\'}"',
+                      indent + ")",
+                  )
+              )
+
+          display_patterns = (
+              (
+                  re.compile(
+                      r'(?m)^(?P<i>\s*)f"\{profile\.provider\} '
+                      r'\{profile\.billing\.value\} q=\{profile\.quality:\.2f\} '
+                      r'tps=\{profile\.tokens_per_second:\.1f\} quota=\{windows\}"$'
+                  ),
+                  "q",
+              ),
+              (
+                  re.compile(
+                      r'(?m)^(?P<i>\s*)f"\{profile\.provider\} '
+                      r'\{profile\.billing\.value\} quality=\{profile\.quality:\.2f\} '
+                      r'tps=\{profile\.tokens_per_second:\.1f\} quota=\{windows\}"$'
+                  ),
+                  "quality",
+              ),
+          )
+
+          def split_display(match: re.Match[str], label: str) -> str:
+              indent = match.group("i")
+              return "\n".join(
+                  (
+                      indent + "(",
+                      indent
+                      + f'    f"{{profile.provider}} {{profile.billing.value}} {label}='
+                      + '{profile.quality:.2f} "',
+                      indent
+                      + '    f"tps={profile.tokens_per_second:.1f} quota={windows}"',
+                      indent + ")",
+                  )
+              )
+
+          for name in ("monitor.py", "provider_resources.py"):
+              path = Path("src/cambium") / name
+              source = path.read_text(encoding="utf-8")
+              source = window_pattern.sub(split_window, source)
+              for pattern, label in display_patterns:
+                  source = pattern.sub(
+                      lambda match, label=label: split_display(match, label), source
+                  )
+              path.write_text(source, encoding="utf-8")
+
+          schemas = Path("src/cambium/schemas.py")
+          source = schemas.read_text(encoding="utf-8")
+          source = source.replace(
+              '"description": "Run a short Python snippet in an isolated interpreter '
+              'process in the worktree. Same host authority as run_shell; not a sandbox.",',
+              '"description": (\n'
+              '            "Run a short Python snippet in an isolated interpreter process "\n'
+              '            "in the worktree. Same host authority as run_shell; not a sandbox."\n'
+              '        ),',
+              1,
+          )
+          schemas.write_text(source, encoding="utf-8")
+          PY
           uv run --python 3.14 ruff format src tests
           uv run --python 3.14 ruff check src tests
           uv run --python 3.14 python -m compileall -q src tests
