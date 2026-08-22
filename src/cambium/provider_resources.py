@@ -21,7 +21,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from .provider_scheduler import AdmissionGrant, RoutingRequest, quota_db_path
+from .provider_scheduler import AdmissionGrant, RoutingRequest, _state_path
 
 
 class TaskClass(StrEnum):
@@ -131,7 +131,7 @@ class BudgetLedger:
     """Transactional prepaid-balance reservations in the quota database."""
 
     def __init__(self, path: str | Path | None = None) -> None:
-        self.path = quota_db_path() if path is None else Path(path)
+        self.path = _state_path() if path is None else Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.path.parent, 0o700)
@@ -190,13 +190,16 @@ class BudgetLedger:
                 "SELECT reserved_micros FROM provider_balances WHERE provider=?",
                 (provider,),
             ).fetchone()
-            reserved = 0 if row is None else min(int(row[0]), balance)
+            # Reservations are claims on future balance, not an observation of
+            # current balance.  Never clamp them to a temporarily low
+            # observation: doing so would make the claims disappear and could
+            # admit an oversubscribed request when the balance rises again.
+            reserved = 0 if row is None else int(row[0])
             connection.execute(
                 "INSERT INTO provider_balances(provider,balance_micros,reserved_micros,"
                 "floor_micros,updated_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(provider) DO UPDATE SET "
                 "balance_micros=excluded.balance_micros, "
-                "reserved_micros=MIN(provider_balances.reserved_micros,excluded.balance_micros), "
                 "floor_micros=excluded.floor_micros, updated_at=excluded.updated_at",
                 (provider, balance, reserved, floor, timestamp),
             )

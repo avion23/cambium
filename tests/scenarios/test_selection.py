@@ -66,6 +66,13 @@ def test_stale_debt_is_neutral() -> None:
     ]
 
 
+def test_measured_debt_without_timestamp_is_stale() -> None:
+    undated = _debt(latency=1)
+    del undated["last_seen"]
+
+    assert quality_score(undated, now=NOW) is None
+
+
 def test_incumbent_leads_while_eligible() -> None:
     items = [Item("incumbent"), Item("better")]
     debt = {"incumbent": _debt(latency=8), "better": _debt(latency=1)}

@@ -143,15 +143,23 @@ def usage_bucket_from_event(
     if not isinstance(usage, Mapping):
         usage = {}
     input_tokens = 0
+    input_reported = False
     for key in ("input_tokens", "prompt_tokens"):
         if key in usage:
             input_tokens = _count(usage.get(key))
+            input_reported = True
             break
     output_tokens = 0
+    output_reported = False
     for key in ("output_tokens", "completion_tokens"):
         if key in usage:
             output_tokens = _count(usage.get(key))
+            output_reported = True
             break
+    if not input_reported and not output_reported and "total_tokens" in usage:
+        # Some providers expose only the aggregate count.  Keep it in the
+        # bucket rather than silently treating the event as token-free.
+        input_tokens = _count(usage.get("total_tokens"))
     return UsageBucket(
         start_s=start_s,
         input_tokens=input_tokens,
@@ -235,7 +243,12 @@ def window_usage(
         start = reset_at - window.duration_s
     else:
         start = now - window.duration_s
-    selected = (bucket for bucket in buckets if bucket.start_s >= start)
+    selected = (
+        bucket
+        for bucket in buckets
+        if bucket.start_s < now
+        and bucket.start_s + USAGE_BUCKET_SECONDS > start
+    )
     if window.unit is QuotaUnit.TOKENS:
         return float(sum(bucket.tokens for bucket in selected))
     if window.unit is QuotaUnit.REQUESTS:
@@ -254,7 +267,11 @@ def expected_call_cost(provider: Any, request: DispatchRequest) -> float:
     input_price = _non_negative_number(getattr(provider, "price_per_1m_in", 0.0))
     output_price = _non_negative_number(getattr(provider, "price_per_1m_out", 0.0))
     cache_read_price = _non_negative_number(
-        getattr(provider, "price_per_1m_cache_read", input_price)
+        getattr(
+            provider,
+            "price_per_1m_cached_in",
+            getattr(provider, "price_per_1m_cache_read", input_price),
+        )
     )
     return (
         uncached * input_price
@@ -264,22 +281,74 @@ def expected_call_cost(provider: Any, request: DispatchRequest) -> float:
 
 
 def _provider_roles(provider: Any) -> tuple[ProviderRole, ...]:
-    values = getattr(provider, "roles", ALL_PROVIDER_ROLES)
+    missing = object()
+    values = getattr(provider, "roles", missing)
+    if values is missing:
+        return ALL_PROVIDER_ROLES
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        raise ValueError("provider roles must be an iterable of role names")
     roles: list[ProviderRole] = []
-    if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
-        for value in values:
-            try:
-                role = value if isinstance(value, ProviderRole) else ProviderRole(str(value))
-            except ValueError:
-                continue
-            if role not in roles:
-                roles.append(role)
-    return tuple(roles) or ALL_PROVIDER_ROLES
+    for value in values:
+        try:
+            role = value if isinstance(value, ProviderRole) else ProviderRole(str(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid provider role {value!r}") from exc
+        if role not in roles:
+            roles.append(role)
+    return tuple(roles)
 
 
 def _provider_windows(provider: Any) -> tuple[QuotaWindow, ...]:
     values = getattr(provider, "quota_windows", ())
-    return tuple(item for item in values if isinstance(item, QuotaWindow))
+    if values is None:
+        return ()
+    windows: list[QuotaWindow] = []
+    for item in values:
+        if isinstance(item, QuotaWindow):
+            windows.append(item)
+            continue
+        # Provider configuration uses provider_scheduler.QuotaWindowSpec,
+        # which represents token and request allowances separately.  Convert
+        # either allowance into the local unit-oriented representation instead
+        # of dropping the configured window.
+        name = getattr(item, "name", None)
+        duration_s = getattr(item, "duration_s", None)
+        reserve_fraction = getattr(item, "reserve_fraction", 0.0)
+        token_allowance = getattr(item, "token_allowance", None)
+        request_allowance = getattr(item, "request_allowance", None)
+        if (
+            not isinstance(name, str)
+            or isinstance(duration_s, bool)
+            or not isinstance(duration_s, (int, float))
+            or isinstance(reserve_fraction, bool)
+            or not isinstance(reserve_fraction, (int, float))
+            or isinstance(token_allowance, bool)
+            or not isinstance(token_allowance, int)
+            or isinstance(request_allowance, bool)
+            or not isinstance(request_allowance, int)
+        ):
+            continue
+        if token_allowance > 0:
+            windows.append(
+                QuotaWindow(
+                    name=name,
+                    duration_s=float(duration_s),
+                    limit=float(token_allowance),
+                    unit=QuotaUnit.TOKENS,
+                    reserve_fraction=float(reserve_fraction),
+                )
+            )
+        if request_allowance > 0:
+            windows.append(
+                QuotaWindow(
+                    name=f"{name}:requests" if token_allowance > 0 else name,
+                    duration_s=float(duration_s),
+                    limit=float(request_allowance),
+                    unit=QuotaUnit.REQUESTS,
+                    reserve_fraction=float(reserve_fraction),
+                )
+            )
+    return tuple(windows)
 
 
 def _buckets(debt: Any) -> tuple[UsageBucket, ...]:
@@ -374,34 +443,66 @@ def rank_provider(
 ) -> ProviderRank:
     """Compute a role/affinity/quota-aware lower-is-better rank."""
 
+    if not getattr(provider, "enabled", True):
+        return ProviderRank(False, (math.inf,), math.inf, 0.0, 0.0, "provider disabled")
     if request.role not in _provider_roles(provider):
         return ProviderRank(False, (math.inf,), math.inf, 0.0, 0.0, "role unsupported")
     name = str(getattr(provider, "name", ""))
     if request.affinity is AffinityMode.STRICT and request.incumbent:
         if name != request.incumbent:
             return ProviderRank(False, (math.inf,), math.inf, 0.0, 0.0, "strict affinity")
+
+    in_flight = _count(getattr(lane, "in_flight", 0)) if lane is not None else 0
+    capacity: Any = None
+    if lane is not None:
+        capacity = getattr(lane, "capacity", None)
+        if capacity is None:
+            capacity = getattr(lane, "max_concurrency", None)
+        if capacity is None:
+            effective_capacity = getattr(lane, "effective_in_flight_cap", None)
+            if callable(effective_capacity):
+                try:
+                    capacity = effective_capacity(0)
+                except TypeError:
+                    capacity = None
+        if capacity is None:
+            capacity = getattr(lane, "rpm_allowance", None)
+    if capacity is None:
+        capacity = getattr(provider, "max_concurrency", None)
+    if (
+        isinstance(capacity, (int, float))
+        and not isinstance(capacity, bool)
+        and math.isfinite(float(capacity))
+        and in_flight >= float(capacity)
+    ):
+        return ProviderRank(False, (math.inf,), math.inf, 0.0, 0.0, "lane capacity exhausted")
+
     feasible, pressure, reason = quota_pressure(provider, debt, request)
     if not feasible:
         return ProviderRank(False, (math.inf,), pressure, expected_call_cost(provider, request), 0.0, reason)
 
     expected_cost = expected_call_cost(provider, request)
-    if request.budget_usd is not None and expected_cost > request.budget_usd:
-        return ProviderRank(False, (math.inf,), pressure, expected_cost, 0.0, "request budget exceeded")
-    useful_tps = expected_useful_output_tps(provider, debt)
-    requests = _count(getattr(debt, "requests", 0)) if debt is not None else 0
-    failures = min(requests, _count(getattr(debt, "failed_requests", 0)))
-    failure_risk = (failures + 1.0) / (requests + 3.0)
-    in_flight = _count(getattr(lane, "in_flight", 0)) if lane is not None else 0
-    priority = int(getattr(provider, "priority", 0))
-    affinity_penalty = 0
-    if request.affinity is AffinityMode.STICKY and request.incumbent:
-        affinity_penalty = 0 if name == request.incumbent else 1
-
     billing = getattr(provider, "billing_mode", BillingMode.UNKNOWN)
     try:
         billing = billing if isinstance(billing, BillingMode) else BillingMode(str(billing))
     except ValueError:
         billing = BillingMode.UNKNOWN
+    billable_cost = (
+        0.0
+        if billing in {BillingMode.SUBSCRIPTION, BillingMode.FREE, BillingMode.LOCAL}
+        else expected_cost
+    )
+    if request.budget_usd is not None and billable_cost > request.budget_usd:
+        return ProviderRank(False, (math.inf,), pressure, expected_cost, 0.0, "request budget exceeded")
+    useful_tps = expected_useful_output_tps(provider, debt)
+    requests = _count(getattr(debt, "requests", 0)) if debt is not None else 0
+    failures = min(requests, _count(getattr(debt, "failed_requests", 0)))
+    failure_risk = (failures + 1.0) / (requests + 3.0)
+    priority = int(getattr(provider, "priority", 0))
+    affinity_penalty = 0
+    if request.affinity is AffinityMode.STICKY and request.incumbent:
+        affinity_penalty = 0 if name == request.incumbent else 1
+
     if billing in {BillingMode.SUBSCRIPTION, BillingMode.FREE, BillingMode.LOCAL}:
         cash_pressure = 0.0
     elif billing is BillingMode.UNKNOWN and expected_cost == 0.0:

@@ -9,8 +9,10 @@ DSPy dependency lazy: import time never touches dspy.
 from __future__ import annotations
 
 import json
+import math
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from typing import Any
 
 _DEFAULT_LAYERS = [29, 41, 57, 61]
@@ -74,7 +76,10 @@ class JlenClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                result = json.loads(response.read().decode("utf-8"))
+            if not isinstance(result, Mapping):
+                raise JlenError("jlens score service returned a non-object JSON value")
+            return dict(result)
         except urllib.error.HTTPError as exc:
             raise JlenError(f"jlens score service returned HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
@@ -92,8 +97,14 @@ class JlenClient:
         yields 0.0.  Layers that lack a usable rank are ignored; an empty
         result scores 0.0.
         """
+        if not isinstance(result, Mapping):
+            raise JlenError("jlens score service returned a non-object result")
         commitment = result.get("commitment")
-        if isinstance(commitment, (int, float)) and not isinstance(commitment, bool):
+        if (
+            isinstance(commitment, (int, float))
+            and not isinstance(commitment, bool)
+            and math.isfinite(float(commitment))
+        ):
             return max(0.0, min(1.0, float(commitment)))
         layers = result.get("layers")
         if not isinstance(layers, dict) or not layers:
@@ -103,7 +114,11 @@ class JlenClient:
             if not isinstance(info, dict):
                 continue
             rank = info.get("expected_rank")
-            if isinstance(rank, bool) or not isinstance(rank, (int, float)):
+            if (
+                isinstance(rank, bool)
+                or not isinstance(rank, (int, float))
+                or not math.isfinite(float(rank))
+            ):
                 continue
             if rank < 1:
                 continue
