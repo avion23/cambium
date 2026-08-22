@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - codex/runtime-resource-actor
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
