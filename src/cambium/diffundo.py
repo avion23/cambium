@@ -1524,6 +1524,13 @@ class Diffundo:
                         ):
                             self._record_disable(provider)
                             break
+                        # A transport timeout means the endpoint (or a CDN in
+                        # front of it) is tarpitting this client; re-POSTing
+                        # into the same black hole at backoff scale burns the
+                        # call budget that sibling candidates still need. The
+                        # cascade IS the retry: fall through immediately.
+                        if exc.outcome is ProviderOutcome.TIMEOUT:
+                            break
                         if attempt_no >= provider.max_retries:
                             break
                         delay = (
