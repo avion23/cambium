@@ -60,8 +60,7 @@ class FakeServer:
     def __init__(
         self,
         behaviors: list[
-            tuple[int, dict[str, Any], float]
-            | tuple[int, dict[str, Any], float, dict[str, str]]
+            tuple[int, dict[str, Any], float] | tuple[int, dict[str, Any], float, dict[str, str]]
         ],
         *,
         echo_authorization_in_body: bool = False,
@@ -88,9 +87,7 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(
-        self, index: int
-    ) -> tuple[int, dict[str, Any], float, dict[str, str]]:
+    def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior
@@ -137,8 +134,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "error": {
                         **error,
                         "message": (
-                            f"{error.get('message', '')}; "
-                            f"{self.headers.get('Authorization')}"
+                            f"{error.get('message', '')}; {self.headers.get('Authorization')}"
                         ),
                     },
                 }
@@ -289,10 +285,10 @@ def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> No
 
 
 def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
-    fast = FakeServer([(200, _ok_payload("fast"), 0.0)])
-    fast2 = FakeServer([(200, _ok_payload("fast m2"), 0.0)])
-    strong = FakeServer([(200, _ok_payload("strong"), 0.0)])
-    balanced = FakeServer([(200, _ok_payload("balanced"), 0.0)])
+    fast = FakeServer([(200, _ok_payload("fast", model="m1"), 0.0)])
+    fast2 = FakeServer([(200, _ok_payload("fast m2", model="m2"), 0.0)])
+    strong = FakeServer([(200, _ok_payload("strong", model="m-s"), 0.0)])
+    balanced = FakeServer([(200, _ok_payload("balanced", model="m-b"), 0.0)])
     _set_keys(monkeypatch, "K_FAST", "K_FAST2", "K_STRONG", "K_BAL")
     router = Diffundo(
         (
@@ -331,16 +327,21 @@ def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
 def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
     tmp_path, monkeypatch
 ) -> None:
-    """A pinned model's matching provider failing mid-call cascades to a same
-    tier sibling that declares a different model (cascade fix), instead of
-    surfacing AllProvidersFailed."""
+    """An explicitly substitution-enabled sibling may serve after the exact
+    model lane fails; substitution is never an implicit fallback."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
     _set_keys(monkeypatch, "K_M2", "K_OTHER")
     router = Diffundo(
         (
             _config("p_m2", bad, "K_M2", model="m2"),
-            _config("p_other", sibling, "K_OTHER", model="m-other"),
+            _config(
+                "p_other",
+                sibling,
+                "K_OTHER",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
         ),
         pause_timeout_s=0.01,
     )
@@ -357,18 +358,22 @@ def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
         sibling.close()
 
 
-def test_model_pin_unavailable_at_selection_falls_through_to_sibling(
-    tmp_path, monkeypatch
-) -> None:
-    """A pinned model whose only matching provider fails into COOLDOWN cascades
-    to the eligible same-tier sibling on the next selection."""
+def test_model_pin_unavailable_at_selection_falls_through_to_sibling(tmp_path, monkeypatch) -> None:
+    """An explicitly substitution-enabled sibling remains eligible while the
+    exact model lane is in cooldown."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
     _set_keys(monkeypatch, "K_M2", "K_OTHER")
     router = Diffundo(
         (
             _config("p_m2", bad, "K_M2", model="m2", cooldown_s=60),
-            _config("p_other", sibling, "K_OTHER", model="m-other"),
+            _config(
+                "p_other",
+                sibling,
+                "K_OTHER",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
         ),
         pause_timeout_s=0.01,
     )
@@ -498,9 +503,7 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
         [
             (
                 401,
-                _error_payload(
-                    "invalid credential; see https://body-user:body-pass@example.test"
-                ),
+                _error_payload("invalid credential; see https://body-user:body-pass@example.test"),
                 0.0,
             )
         ],
@@ -754,10 +757,7 @@ def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypat
         assert result.content == ""
         assert result.tool_calls is not None
         assert result.tool_calls[0]["function"]["name"] == "read_file"
-        assert (
-            result.tool_calls[0]["function"]["arguments"]
-            == '{"path": "README.md", "offset": 5}'
-        )
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "README.md", "offset": 5}'
         assert router.health("p_read") is HealthState.HEALTHY
     finally:
         server.close()
@@ -1006,9 +1006,7 @@ def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
     # transport allowlist (only localhost/127.0.0.1/::1), so it is a genuine
     # non-loopback http origin for the redirect target.
     target = FakeServer([(200, _ok_payload("must never arrive"), 0.0)], host="127.0.0.2")
-    redirector = FakeServer(
-        [(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})]
-    )
+    redirector = FakeServer([(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})])
     _set_keys(monkeypatch, "K_REDIRECT")
     router = Diffundo(
         (_config("p_redirect", redirector, "K_REDIRECT"),),

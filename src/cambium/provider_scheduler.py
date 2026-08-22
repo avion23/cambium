@@ -328,8 +328,10 @@ class QuotaLedger:
                     "used_tokens,allowance_requests,used_requests,reserve_fraction,updated_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,name) DO UPDATE SET "
                     "reset_at=excluded.reset_at, allowance_tokens=excluded.allowance_tokens, "
-                    "used_tokens=excluded.used_tokens, allowance_requests=excluded.allowance_requests, "
-                    "used_requests=excluded.used_requests, reserve_fraction=excluded.reserve_fraction, "
+                    "used_tokens=excluded.used_tokens, "
+                    "allowance_requests=excluded.allowance_requests, "
+                    "used_requests=excluded.used_requests, "
+                    "reserve_fraction=excluded.reserve_fraction, "
                     "updated_at=excluded.updated_at",
                     (
                         provider,
@@ -414,7 +416,9 @@ class QuotaLedger:
         if reset_at <= timestamp:
             return
         used_tokens = 0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
-        used_requests = 0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)
+        used_requests = (
+            0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)
+        )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -629,7 +633,11 @@ class ProviderScheduler:
                 elif isinstance(message, _Release):
                     await self._handle_release(message)
                 elif isinstance(message, _Snapshot):
-                    windows = () if self._ledger is None else await asyncio.to_thread(self._ledger.snapshots)
+                    windows = (
+                        ()
+                        if self._ledger is None
+                        else await asyncio.to_thread(self._ledger.snapshots)
+                    )
                     message.future.set_result(
                         SchedulerSnapshot(dict(self._in_flight), self._mailbox.qsize(), windows)
                     )

@@ -257,3 +257,27 @@ cache locality a stronger routing weight.
 - Bandits with switching costs: <https://arxiv.org/abs/1310.2997>
 - Highest-random-weight hashing: <https://www.cs.ucsb.edu/sites/default/files/documents/tech_reports/1996-03.pdf>
 - Weighted rendezvous hashing: <https://datatracker.ietf.org/doc/draft-ietf-bess-weighted-hrw/>
+
+
+## Implemented production policy
+
+Cambium treats the root agent's first successful provider/model as a strict
+`ProviderLease`. Every later action and summary call on that recursive trunk is
+filtered to the lease; an unavailable incumbent fails the branch rather than
+silently moving it and destroying cache/context continuity. Exact
+cache-compatible children inherit the lease. Provider-neutral semantic-summary
+children and other cold parallel branches choose independently.
+
+Provider configuration separates `rpm` from `max_concurrency`, supports known
+free, metered, local, and subscription billing modes, and accepts multiple
+independent quota windows. A five-hour, weekly, and monthly allowance are three
+constraints, not one blended budget. `QuotaLedger` reserves and reconciles them
+with SQLite `BEGIN IMMEDIATE`, while `ProviderScheduler` owns in-process lane
+state through an asyncio mailbox.
+
+Selection remains hard-feasibility first. Within a configured priority class it
+uses shrinkage success evidence, measured/hinted output throughput, utilization,
+known marginal price, cache-switch cost, and a deterministic rendezvous tie
+break. Free models are useful for bounded independent work, review, search,
+classification, and redundant verification, but cannot win tasks whose model,
+context, quality, or tool requirements they do not satisfy.

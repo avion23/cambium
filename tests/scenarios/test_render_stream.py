@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 
 from cambium import oneshot, repl, tui
@@ -28,9 +29,7 @@ from cambium.render import (
 from cambium.supervisor import PlanResult, TaskResult
 
 
-def _usage_event(
-    turn: int, usage: dict[str, object], latency_s: int | float
-) -> dict[str, object]:
+def _usage_event(turn: int, usage: dict[str, object], latency_s: int | float) -> dict[str, object]:
     return {
         "kind": "usage_event",
         "payload": {
@@ -66,21 +65,15 @@ def test_tokens_per_s_falls_back_to_total_tokens_when_completion_missing() -> No
 
 
 def test_tokens_per_s_falls_back_when_completion_is_not_numeric() -> None:
-    events = [
-        _usage_event(1, {"completion_tokens": "many", "total_tokens": 300}, 10.0)
-    ]
+    events = [_usage_event(1, {"completion_tokens": "many", "total_tokens": 300}, 10.0)]
 
     assert render_tokens_per_s(events) == "tokens/s=30.0"
 
 
 def test_tokens_per_s_treats_unusable_completion_as_missing() -> None:
     bool_case = _usage_event(1, {"completion_tokens": True, "total_tokens": 300}, 10.0)
-    nan_case = _usage_event(
-        2, {"completion_tokens": float("nan"), "total_tokens": 300}, 10.0
-    )
-    inf_case = _usage_event(
-        3, {"completion_tokens": float("inf"), "total_tokens": 300}, 10.0
-    )
+    nan_case = _usage_event(2, {"completion_tokens": float("nan"), "total_tokens": 300}, 10.0)
+    inf_case = _usage_event(3, {"completion_tokens": float("inf"), "total_tokens": 300}, 10.0)
 
     assert render_tokens_per_s([bool_case]) == "tokens/s=30.0"
     assert render_tokens_per_s([nan_case]) == "tokens/s=30.0"
@@ -180,9 +173,7 @@ def test_usage_event_success_is_silent_failure_names_provider_and_reason() -> No
         "  provider codex FAILED rate_limited: slow down"
     )
     no_provider = {"failure_reason": "boom"}
-    assert _line("usage_event", no_provider, seq=3, task_id="t").endswith(
-        "  FAILED boom"
-    )
+    assert _line("usage_event", no_provider, seq=3, task_id="t").endswith("  FAILED boom")
 
 
 def test_tool_event_ok_line_and_cmd_truncation() -> None:
@@ -230,8 +221,7 @@ def test_context_epoch_advanced_appends_reason_and_folded_from_when_present() ->
     )
 
     assert full.endswith(
-        "  epoch=3 turn=20 ckpt://t/3/20 reason=rolling_transcript_compaction"
-        " folded_from=2"
+        "  epoch=3 turn=20 ckpt://t/3/20 reason=rolling_transcript_compaction folded_from=2"
     )
 
     bare = _line(
@@ -566,9 +556,7 @@ def test_severity_accents_off_when_gated_or_other_status(monkeypatch: object) ->
     assert "\x1b[" not in default_plain
 
     _color_stream(monkeypatch)
-    no_color = _line(
-        "result", {"status": "failed"}, seq=1, task_id="t"
-    )
+    no_color = _line("result", {"status": "failed"}, seq=1, task_id="t")
     monkeypatch.delenv("NO_COLOR", raising=False)  # type: ignore[attr-defined]
     monkeypatch.setenv("TERM", "dumb")  # type: ignore[attr-defined]
     dumb_tty = _line(
@@ -637,6 +625,7 @@ def test_status_bar_spinner_needs_last_heartbeat_working(monkeypatch: object) ->
 # Sink wiring: tty status-bar footer vs legacy non-tty byte behavior
 # ---------------------------------------------------------------------------
 
+
 class _TtyStream(io.StringIO):
     def isatty(self) -> bool:
         return True
@@ -674,14 +663,17 @@ def _bar_draws(out: str) -> int:
 def test_tui_tty_draws_event_sourced_dashboard(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = _TtyStream()
-    assert asyncio.run(
-        tui.run_tui(
-            oneshot.OneShotConfig(repo=tmp_path),
-            input_stream=io.StringIO("hi\n"),
-            output_stream=out,
-            error_stream=io.StringIO(),
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n"),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
         )
-    ) == 0
+        == 0
+    )
     text = out.getvalue()
     assert "\x1b[?1049h" in text
     assert "\x1b[?1049l" in text
@@ -698,12 +690,17 @@ def test_tui_tty_draws_event_sourced_dashboard(monkeypatch, tmp_path):
 def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = io.StringIO()
-    assert asyncio.run(tui.run_tui(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n"),
-        output_stream=out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n"),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     text = out.getvalue()
     assert "\r\033[K" not in text
     assert render_event_line({"kind": "heartbeat", "payload": {}}) == ""
@@ -713,12 +710,17 @@ def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
 def test_repl_tty_draws_bar_and_suppresses_after_terminal_events(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = _TtyStream()
-    assert asyncio.run(repl.run_repl(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n/exit\n"),
-        output_stream=out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n/exit\n"),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     text = out.getvalue()
     assert f"run_shell df -h {_OK_GREEN}OK{_RESET} 5ms" in text
     assert _bar_draws(text) == 3
@@ -727,12 +729,17 @@ def test_repl_tty_draws_bar_and_suppresses_after_terminal_events(monkeypatch, tm
 def test_repl_non_tty_legacy_has_no_bar_escapes(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = io.StringIO()
-    assert asyncio.run(repl.run_repl(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n/exit\n"),
-        output_stream=out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n/exit\n"),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     assert "\r\033[K" not in out.getvalue()
 
 
@@ -786,10 +793,10 @@ def test_nested_container_dump_escapes_c1_controls() -> None:
     assert "\x1b" not in line
     _assert_terminal_safe(line)
     assert 'note=["a\\u009bb"]' in line
+
+
 # REPL raw-tty input discipline: reads, prompt repaint, per-turn SIGINT
 # ---------------------------------------------------------------------------
-
-import signal
 
 
 def test_repl_raw_tty_reader_backspace_edits_partial(monkeypatch):
@@ -816,7 +823,17 @@ def test_repl_tty_prompt_repaints_after_mid_run_event(monkeypatch, tmp_path):
 
     async def scripted(config, on_event=None):
         seen_prompts.append(config.prompt)
-        on_event({"kind": "tool_event", "payload": {"tool": "run_shell", "cmd": "df -h", "ok": True, "duration_ms": 5}})
+        on_event(
+            {
+                "kind": "tool_event",
+                "payload": {
+                    "tool": "run_shell",
+                    "cmd": "df -h",
+                    "ok": True,
+                    "duration_ms": 5,
+                },
+            }
+        )
         return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
     monkeypatch.setattr(oneshot, "run_oneshot", scripted)
@@ -824,12 +841,17 @@ def test_repl_tty_prompt_repaints_after_mid_run_event(monkeypatch, tmp_path):
     monkeypatch.setattr(repl, "_read_stdin_byte", lambda: next(feed))
     out = _TtyStream()
 
-    assert asyncio.run(repl.run_repl(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=_TtyStream(""),
-        output_stream=out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=_TtyStream(""),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     assert seen_prompts == ["hi"]
     text = out.getvalue()
     assert text.startswith("\r\033[Kcambium> ")
@@ -881,12 +903,17 @@ def test_repl_non_tty_scripted_prompt_has_no_echo_or_escapes(monkeypatch, tmp_pa
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = io.StringIO()
 
-    assert asyncio.run(repl.run_repl(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n/exit\n"),
-        output_stream=out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n/exit\n"),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     text = out.getvalue()
     assert "cambium>" not in text
     assert "\r\033[K" not in text

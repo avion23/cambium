@@ -88,3 +88,13 @@ provider-specific head.
   and research evidence.
 
 Source and tests are authoritative when documentation disagrees.
+
+
+## Production routing and tools
+
+A main semantic trunk is provider/model leased after its first successful call.
+Cold subagents may use other providers, including configured free lanes, while
+exact cache-compatible forks retain the parent lease. Provider configuration
+supports independent concurrency and quota windows. Structured tools remain the
+portable default; `run_python` adds Pi-style short Python snippets through the
+same bounded subprocess boundary as `run_shell`.
