@@ -19,7 +19,10 @@ jobs:
         with:
           fetch-depth: 0
           ref: codex/runtime-resource-actor
-      - run: cp scripts/runtime_v2_apply.py /tmp/runtime_v2_apply.py
+      - name: Preserve materializer
+        run: |
+          cp scripts/runtime_v2_apply.py /tmp/runtime_v2_apply.py
+          cp scripts/fix_runtime_resource_actor.py /tmp/fix_runtime_resource_actor.py
       - name: Pull latest upstream main
         run: |
           git fetch origin main
@@ -27,149 +30,33 @@ jobs:
           git checkout --detach origin/main
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --extra dev --python 3.14
-      - name: Normalize generator transport
+      - name: Normalize materializer
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('/tmp/runtime_v2_apply.py')
-          lines=p.read_text().splitlines()
-          result=[]; skip=False
-          for line in lines:
-              if skip:
-                  skip=False
-                  if line.strip() == '")':
-                      continue
-              if 'if len(args) < 3: raise RuntimeError(f"unexpected run_tool signature:' in line:
-                  result.append('if len(args) < 3: raise RuntimeError(f"unexpected run_tool signature: {args}")')
-                  if not line.rstrip().endswith('")'):
-                      skip=True
-                  continue
-              result.append(line)
-          p.write_text('\n'.join(result)+'\n')
-          PY
-          python -m py_compile /tmp/runtime_v2_apply.py
+          python /tmp/fix_runtime_resource_actor.py normalize /tmp/runtime_v2_apply.py
+          python -m py_compile \
+            /tmp/runtime_v2_apply.py \
+            /tmp/fix_runtime_resource_actor.py
       - name: Apply and validate
         run: |
           cp /tmp/runtime_v2_apply.py scripts/runtime_v2_apply.py
           uv run --python 3.14 python scripts/runtime_v2_apply.py
-          python - <<'PY'
-          from pathlib import Path
-
-          test = Path("tests/scenarios/test_provider_resources.py")
-          text = test.read_text(encoding="utf-8")
-          marker = "# ruff: noqa: F403, F405\n"
-          if marker not in text:
-              text = text.replace(
-                  "from __future__ import annotations\n",
-                  "from __future__ import annotations\n\n" + marker,
-                  1,
-              )
-              test.write_text(text, encoding="utf-8")
-
-          replacements = {
-              Path("src/cambium/oauth.py"): (
-                  "import threading as _cambium_threading",
-                  "import threading as _cambium_threading  # noqa: E402",
-              ),
-              Path("src/cambium/schemas.py"): (
-                  "from .extensions import tool_extensions as _cambium_tool_extensions",
-                  "from .extensions import tool_extensions as _cambium_tool_extensions  # noqa: E402",
-              ),
-          }
-          for path, (old, new) in replacements.items():
-              source = path.read_text(encoding="utf-8")
-              if old in source and new not in source:
-                  path.write_text(source.replace(old, new, 1), encoding="utf-8")
-          PY
+          python /tmp/fix_runtime_resource_actor.py pre .
           uv lock
           uv sync --extra dev --python 3.14
           uv run --python 3.14 ruff format src tests
           uv run --python 3.14 ruff check --fix --unsafe-fixes --exit-zero src tests
-          python - <<'PY'
-          from pathlib import Path
-          import re
-
-          window_pattern = re.compile(
-              r'(?m)^(?P<i>\s*)f"\{w\.name\}:\{w\.remaining_tokens if '
-              r'w\.remaining_tokens is not None else \'\?\'\}/'
-              r'\{w\.limit_tokens if w\.limit_tokens is not None else \'\?\'\}"$'
-          )
-
-          def split_window(match: re.Match[str]) -> str:
-              indent = match.group("i")
-              return "\n".join(
-                  (
-                      indent + "(",
-                      indent + '    f"{w.name}:"',
-                      indent
-                      + '    f"{w.remaining_tokens if w.remaining_tokens is not None else \'?\'}"',
-                      indent + '    "/"',
-                      indent
-                      + '    f"{w.limit_tokens if w.limit_tokens is not None else \'?\'}"',
-                      indent + ")",
-                  )
-              )
-
-          display_patterns = (
-              (
-                  re.compile(
-                      r'(?m)^(?P<i>\s*)f"\{profile\.provider\} '
-                      r'\{profile\.billing\.value\} q=\{profile\.quality:\.2f\} '
-                      r'tps=\{profile\.tokens_per_second:\.1f\} quota=\{windows\}"$'
-                  ),
-                  "q",
-              ),
-              (
-                  re.compile(
-                      r'(?m)^(?P<i>\s*)f"\{profile\.provider\} '
-                      r'\{profile\.billing\.value\} quality=\{profile\.quality:\.2f\} '
-                      r'tps=\{profile\.tokens_per_second:\.1f\} quota=\{windows\}"$'
-                  ),
-                  "quality",
-              ),
-          )
-
-          def split_display(match: re.Match[str], label: str) -> str:
-              indent = match.group("i")
-              return "\n".join(
-                  (
-                      indent + "(",
-                      indent
-                      + f'    f"{{profile.provider}} {{profile.billing.value}} {label}='
-                      + '{profile.quality:.2f} "',
-                      indent
-                      + '    f"tps={profile.tokens_per_second:.1f} quota={windows}"',
-                      indent + ")",
-                  )
-              )
-
-          for name in ("monitor.py", "provider_resources.py"):
-              path = Path("src/cambium") / name
-              source = path.read_text(encoding="utf-8")
-              source = window_pattern.sub(split_window, source)
-              for pattern, label in display_patterns:
-                  source = pattern.sub(
-                      lambda match, label=label: split_display(match, label), source
-                  )
-              path.write_text(source, encoding="utf-8")
-
-          schemas = Path("src/cambium/schemas.py")
-          source = schemas.read_text(encoding="utf-8")
-          source = source.replace(
-              '"description": "Run a short Python snippet in an isolated interpreter '
-              'process in the worktree. Same host authority as run_shell; not a sandbox.",',
-              '"description": (\n'
-              '            "Run a short Python snippet in an isolated interpreter process "\n'
-              '            "in the worktree. Same host authority as run_shell; not a sandbox."\n'
-              '        ),',
-              1,
-          )
-          schemas.write_text(source, encoding="utf-8")
-          PY
+          python /tmp/fix_runtime_resource_actor.py post .
           uv run --python 3.14 ruff format src tests
           uv run --python 3.14 ruff check src tests
           uv run --python 3.14 python -m compileall -q src tests
-          uv run --python 3.14 pytest -q tests/scenarios/test_provider_resources.py tests/scenarios/test_selection.py tests/scenarios/test_oauth.py tests/scenarios/test_oauth_wiring.py tests/scenarios/test_interface_regressions.py tests/scenarios/test_render_stream.py tests/scenarios/test_user_cli.py
+          uv run --python 3.14 pytest -q \
+            tests/scenarios/test_provider_resources.py \
+            tests/scenarios/test_selection.py \
+            tests/scenarios/test_oauth.py \
+            tests/scenarios/test_oauth_wiring.py \
+            tests/scenarios/test_interface_regressions.py \
+            tests/scenarios/test_render_stream.py \
+            tests/scenarios/test_user_cli.py
           uv run --python 3.14 pytest -q -n auto
           uv run --python 3.14 pytest -q -n auto -m slow
           uv lock --check
