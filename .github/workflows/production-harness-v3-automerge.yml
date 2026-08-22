@@ -29,7 +29,13 @@ jobs:
         run: |
           uv run --python 3.14 python scripts/apply_production_harness_v3.py
           uv run --python 3.14 python scripts/run_production_harness_v3_fixes.py
-          uv run --python 3.14 ruff check --fix src tests
+          mapfile -t python_files < <(
+            git ls-files --modified --others --exclude-standard -- '*.py'
+          )
+          if ((${#python_files[@]})); then
+            uv run --python 3.14 ruff format "${python_files[@]}"
+            uv run --python 3.14 ruff check --fix "${python_files[@]}"
+          fi
       - name: Static gates
         run: |
           uv run --python 3.14 ruff check src tests
