@@ -210,23 +210,60 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
-_CONTEXT_CHECKPOINT_FIELDS = frozenset({
-    "type", "request_id", "task_id", "generation", "epoch", "turn",
-    "checkpoint_ref", "cache_key",
-})
-_CACHE_KEY_FIELDS = frozenset({
-    "provider", "model", "protocol", "reasoning_effort", "system_sha256",
-    "tools_sha256", "prefix_sha256", "suffix_sha256", "full_sha256",
-    "prefix_bytes", "message_count", "redacted", "provider_boundary",
-})
+_CONTEXT_CHECKPOINT_FIELDS = frozenset(
+    {
+        "type",
+        "request_id",
+        "task_id",
+        "generation",
+        "epoch",
+        "turn",
+        "checkpoint_ref",
+        "cache_key",
+    }
+)
+_CACHE_KEY_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "protocol",
+        "reasoning_effort",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
+        "full_sha256",
+        "prefix_bytes",
+        "message_count",
+        "redacted",
+        "provider_boundary",
+    }
+)
 _CACHE_KEY_INT_FIELDS = ("prefix_bytes", "message_count")
-_CONTEXT_EPOCH_ADVANCED_FIELDS = frozenset({
-    "type", "request_id", "task_id", "generation", "epoch", "turn",
-    "checkpoint_ref", "cache_key", "folded_from_epoch", "reason",
-})
-_COMPACTION_FAILED_FIELDS = frozenset({
-    "type", "request_id", "task_id", "generation", "epoch", "reason",
-})
+_CONTEXT_EPOCH_ADVANCED_FIELDS = frozenset(
+    {
+        "type",
+        "request_id",
+        "task_id",
+        "generation",
+        "epoch",
+        "turn",
+        "checkpoint_ref",
+        "cache_key",
+        "folded_from_epoch",
+        "reason",
+    }
+)
+_COMPACTION_FAILED_FIELDS = frozenset(
+    {
+        "type",
+        "request_id",
+        "task_id",
+        "generation",
+        "epoch",
+        "reason",
+    }
+)
 
 
 def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
@@ -246,10 +283,7 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
     unknown_cache_key = sorted(set(cache_key) - _CACHE_KEY_FIELDS, key=str)
     invalid.extend(f"cache_key.{field}" for field in unknown_cache_key)
     for field in ("epoch", "turn"):
-        if not (
-            type(msg.get(field)) is int
-            and cast(int, msg.get(field)) > 0
-        ):
+        if not (type(msg.get(field)) is int and cast(int, msg.get(field)) > 0):
             invalid.append(field)
     checkpoint_ref = msg.get("checkpoint_ref")
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
@@ -270,7 +304,10 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
         if not valid:
             invalid.append(f"cache_key.{field}")
     required_digests = (
-        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
         "full_sha256",
     )
     for field in required_digests:
@@ -346,13 +383,11 @@ def _invalid_compaction_failed_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
-def _epoch_checkpoint_path(
-    session_dir: Path, task_id: str, checkpoint_ref: str
-) -> Path:
+def _epoch_checkpoint_path(session_dir: Path, task_id: str, checkpoint_ref: str) -> Path:
     """Return one session-owned epoch checkpoint path after strict validation."""
     try:
-        task_component, _epoch, _address_pre, _address_persisted = (
-            _validate_checkpoint_ref_shape(checkpoint_ref)
+        task_component, _epoch, _address_pre, _address_persisted = _validate_checkpoint_ref_shape(
+            checkpoint_ref
         )
     except ValueError as exc:
         raise ValueError("invalid checkpoint_ref path") from exc
@@ -400,10 +435,12 @@ def _load_epoch_checkpoint_messages(
                 or not isinstance(message.get("content"), str)
             ):
                 raise ValueError(f"checkpoint {field} contains an invalid message")
-            messages.append({
-                "role": message["role"],
-                "content": message["content"],
-            })
+            messages.append(
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+            )
         loaded[field] = messages
     if not loaded["provider_messages"]:
         raise ValueError("checkpoint provider_messages is empty")
@@ -472,13 +509,28 @@ def _validate_advanced_epoch_checkpoint(
 ) -> None:
     checkpoint_ref = msg["checkpoint_ref"]
     data = _load_epoch_checkpoint_data(session_dir, task_id, checkpoint_ref)
-    expected_keys = frozenset({
-        "schema", "task_id", "generation", "epoch", "turn", "created_at",
-        "cache_key", "provider_messages", "continuation_suffix", "checkpoint_ref",
-        "code_changed", "verified_after_change", "verification_failed",
-        "no_progress_actions", "budget_new_tokens", "previous_prompt_tokens",
-        "cumulative_usage", "wall_deadline",
-    })
+    expected_keys = frozenset(
+        {
+            "schema",
+            "task_id",
+            "generation",
+            "epoch",
+            "turn",
+            "created_at",
+            "cache_key",
+            "provider_messages",
+            "continuation_suffix",
+            "checkpoint_ref",
+            "code_changed",
+            "verified_after_change",
+            "verification_failed",
+            "no_progress_actions",
+            "budget_new_tokens",
+            "previous_prompt_tokens",
+            "cumulative_usage",
+            "wall_deadline",
+        }
+    )
     if set(data) != expected_keys:
         raise ValueError("checkpoint has an invalid key set")
     try:
@@ -523,10 +575,12 @@ def _validate_advanced_epoch_checkpoint(
                 or len(content.encode("utf-8")) > MAX_OBSERVATION_BYTES
             ):
                 raise ValueError(f"checkpoint {field} contains an invalid message")
-            messages.append({
-                "role": role,
-                "content": content,
-            })
+            messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
         return messages
 
     provider_messages = _messages("provider_messages")
@@ -576,7 +630,7 @@ def _validate_advanced_epoch_checkpoint(
             raise ValueError(f"checkpoint {field} is invalid")
         try:
             finite = math.isfinite(value)
-        except (OverflowError, TypeError):
+        except OverflowError, TypeError:
             finite = False
         if not finite or (positive and value <= 0):
             raise ValueError(f"checkpoint {field} is invalid")
@@ -595,21 +649,16 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
     return "proto" in msg and msg["proto"] != PROTO
 
 
-def _result_identity_note(
-    msg: Mapping[str, Any], task_id: str, generation: int
-) -> str | None:
+def _result_identity_note(msg: Mapping[str, Any], task_id: str, generation: int) -> str | None:
     """Return why a result envelope fails worker identity, or None."""
     claimed_task = msg.get("task_id")
     if claimed_task is not None and claimed_task != task_id:
         return "result task_id mismatch"
     claimed_generation = msg.get("generation")
-    if (
-        claimed_generation is not None
-        and (
-            isinstance(claimed_generation, bool)
-            or not isinstance(claimed_generation, int)
-            or claimed_generation != generation
-        )
+    if claimed_generation is not None and (
+        isinstance(claimed_generation, bool)
+        or not isinstance(claimed_generation, int)
+        or claimed_generation != generation
     ):
         return "result generation mismatch"
     return None
@@ -705,7 +754,11 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     if "provider_cache_hit" in msg and type(msg["provider_cache_hit"]) is not bool:
         invalid.append("provider_cache_hit")
     for field in (
-        "provider", "model", "request_rate_status", "account_quota_owner", "failure_reason"
+        "provider",
+        "model",
+        "request_rate_status",
+        "account_quota_owner",
+        "failure_reason",
     ):
         if field in msg and not (type(msg[field]) is str and msg[field]):
             invalid.append(field)
@@ -733,8 +786,7 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     if "usage" in msg and (
         not isinstance(usage, dict)
         or any(
-            key not in _PROVIDER_METADATA_USAGE_FIELDS
-            or not _valid_usage_count(value)
+            key not in _PROVIDER_METADATA_USAGE_FIELDS or not _valid_usage_count(value)
             for key, value in usage.items()
         )
     ):
@@ -779,7 +831,7 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     value = spec_value if spec_value is not None else os.environ.get(env, default)
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise ValueError(f"invalid {key}: {value!r}") from None
     if not math.isfinite(parsed):
         raise ValueError(f"invalid {key}: value must be finite")
@@ -843,7 +895,7 @@ async def _write_json(
         write_frame(proc.stdin, frame)
         await asyncio.wait_for(proc.stdin.drain(), remaining)
         return True
-    except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
+    except BrokenPipeError, ConnectionResetError, OSError, TimeoutError:
         await _kill_worker(proc)
         return False
 
@@ -852,7 +904,7 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
     """SIGKILL the worker's process group (worker is its own session/group leader)."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    except ProcessLookupError, PermissionError, OSError:
         pass
 
 
@@ -898,9 +950,7 @@ def _task_result_to_slice_result(result: TaskResult) -> SliceResult:
     ``None``. Timeout state is recovered from the canonical failure reason.
     """
     reason = result.reason or ""
-    timeout_phase = next(
-        (phase for phase in _TIMEOUT_PHASES if phase in reason), None
-    )
+    timeout_phase = next((phase for phase in _TIMEOUT_PHASES if phase in reason), None)
     return SliceResult(
         status=result.status,
         exit_code=result.exit_code,
@@ -980,18 +1030,14 @@ def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
         providers = fanout_config.get("providers")
         if isinstance(providers, (list, tuple)):
             values.extend(
-                provider.get("api_key_env")
-                for provider in providers
-                if isinstance(provider, dict)
+                provider.get("api_key_env") for provider in providers if isinstance(provider, dict)
             )
     return frozenset(
         value for value in values if isinstance(value, str) and _ENV_NAME_RE.fullmatch(value)
     )
 
 
-def _provider_environment_value(
-    key: str, provider_environment: Mapping[str, str] | None
-) -> object:
+def _provider_environment_value(key: str, provider_environment: Mapping[str, str] | None) -> object:
     """Return the value that the worker environment would forward for *key*."""
     if provider_environment is not None:
         override = provider_environment.get(key)
@@ -1046,18 +1092,14 @@ def _codex_oauth_provider_names(
     """
     try:
         providers = load_providers(_provider_config_path(source, spec))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return frozenset()
     codex = frozenset(
-        provider.name
-        for provider in providers
-        if provider.auth is AuthMode.CODEX_CHATGPT
+        provider.name for provider in providers if provider.auth is AuthMode.CODEX_CHATGPT
     )
     authorized_raw = spec.get("authorized_providers")
     if isinstance(authorized_raw, (list, tuple)) and authorized_raw:
-        authorized = frozenset(
-            name for name in authorized_raw if isinstance(name, str) and name
-        )
+        authorized = frozenset(name for name in authorized_raw if isinstance(name, str) and name)
         return codex & authorized
     referenced = _fanout_provider_names(spec)
     if referenced:
@@ -1144,9 +1186,7 @@ def _validate_provider_environment(
             _require_oauth_document(provider, oauth_store)
 
 
-def _provider_config_path(
-    source: Mapping[str, str], spec: Mapping[str, Any] | None = None
-) -> str:
+def _provider_config_path(source: Mapping[str, str], spec: Mapping[str, Any] | None = None) -> str:
     """Resolve the absolute provider-config path a provider-mode worker loads."""
     if spec is not None:
         configured = spec.get("provider_config_path")
@@ -1201,7 +1241,10 @@ def _oauth_worker_environment(
 
 
 def _worker_environment(
-    spec: dict[str, Any], generation: int, *, session_dir: Path | None = None,
+    spec: dict[str, Any],
+    generation: int,
+    *,
+    session_dir: Path | None = None,
     provider_environment: Mapping[str, str] | None = None,
     oauth_store: OAuthStore | None = None,
     redactor: Redactor | None = None,
@@ -1224,9 +1267,7 @@ def _worker_environment(
             value = provider_environment.get(name)
             if value is not None:
                 source[name] = value
-    oauth_environment, oauth_access_values = _oauth_worker_environment(
-        spec, source, oauth_store
-    )
+    oauth_environment, oauth_access_values = _oauth_worker_environment(spec, source, oauth_store)
     for name, value in oauth_environment.items():
         source[name] = value
         allowed_provider_keys.add(name)
@@ -1236,9 +1277,7 @@ def _worker_environment(
     }
     if session_dir is not None:
         overrides["CAMBIUM_SESSION_ID"] = str(session_dir.resolve())
-    worktree = (
-        Path(spec["worktree_path"]).resolve() if "worktree_path" in spec else None
-    )
+    worktree = Path(spec["worktree_path"]).resolve() if "worktree_path" in spec else None
     env = _strip_sensitive_env(
         source,
         allowed_keys=allowed_provider_keys,
@@ -1274,8 +1313,7 @@ def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
     usage_counts = {
         key: count
         for key, count in usage.items()
-        if key in _PROVIDER_METADATA_USAGE_FIELDS
-        and _valid_usage_count(count)
+        if key in _PROVIDER_METADATA_USAGE_FIELDS and _valid_usage_count(count)
     }
     return {
         "provider": provider,
@@ -1283,6 +1321,8 @@ def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
         "usage": usage_counts,
         "latency_s": max(0.0, float(latency)),
     }
+
+
 def _strip_sensitive_env(
     env: dict[str, str],
     *,
@@ -1455,7 +1495,7 @@ def _bounded_metric_breakdown(value: Any) -> dict[str, Any]:
                     allow_nan=False,
                 ).encode("utf-8")
             )
-        except (TypeError, ValueError, UnicodeEncodeError):
+        except TypeError, ValueError, UnicodeEncodeError:
             truncated = True
             continue
         if encoded_size > MAX_ENVELOPE_FIELD_CHARS:
@@ -1476,13 +1516,11 @@ def _bounded_metric_breakdown(value: Any) -> dict[str, Any]:
                     allow_nan=False,
                 ).encode("utf-8")
             )
-        except (TypeError, ValueError, UnicodeEncodeError):
+        except TypeError, ValueError, UnicodeEncodeError:
             encoded_size = MAX_ENVELOPE_FIELD_CHARS + 1
         if encoded_size <= MAX_ENVELOPE_FIELD_CHARS:
             break
-        removable = next(
-            (key for key in reversed(list(bounded)) if key != "_truncated"), None
-        )
+        removable = next((key for key in reversed(list(bounded)) if key != "_truncated"), None)
         if removable is None:
             break
         del bounded[removable]
@@ -1514,8 +1552,7 @@ def _bounded_strict_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "parent_task_id": parent_task_id,
         "unified_diff": bounded_diff,
-        "diff_truncated": bool(envelope.get("diff_truncated", False))
-        or bounded_diff != diff,
+        "diff_truncated": bool(envelope.get("diff_truncated", False)) or bounded_diff != diff,
         "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
         "metric_score": _finite_metric_score(envelope.get("metric_score")),
         "metric_breakdown": _bounded_metric_breakdown(envelope.get("metric_breakdown")),
@@ -1588,13 +1625,15 @@ class ArchitectusAdmissionPort:
                 )
             node = self._nodes[task_id]
             self._seq += 1
-            proposals.append({
-                "request_id": make_request_id(self._seq),
-                "parent_task_id": node.parent_task_id,
-                "child_task_id": task_id,
-                "kind": node.kind.value,
-                "spec": copy.deepcopy(node.spec),
-            })
+            proposals.append(
+                {
+                    "request_id": make_request_id(self._seq),
+                    "parent_task_id": node.parent_task_id,
+                    "child_task_id": task_id,
+                    "kind": node.kind.value,
+                    "spec": copy.deepcopy(node.spec),
+                }
+            )
         return proposals
 
 
@@ -1779,10 +1818,7 @@ class _Runtime:
             return ArchitectusAdmissionPort(architectus)
         if hasattr(architectus, "aggregate") and hasattr(architectus, "step"):
             return architectus
-        raise TypeError(
-            "architectus must be an ArchitectusCore or a port with "
-            "aggregate()/step()"
-        )
+        raise TypeError("architectus must be an ArchitectusCore or a port with aggregate()/step()")
 
     @property
     def last_envelope(self) -> dict[str, Any] | None:
@@ -1809,8 +1845,13 @@ class _Runtime:
         return make_request_id(self._rid)
 
     async def emit(
-        self, kind: str, *, task_id: str | None = None, generation: int | None = None,
-        request_id: str | None = None, _observer_failure_is_fatal: bool | None = None,
+        self,
+        kind: str,
+        *,
+        task_id: str | None = None,
+        generation: int | None = None,
+        request_id: str | None = None,
+        _observer_failure_is_fatal: bool | None = None,
         _deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
         **payload: Any,
     ) -> None:
@@ -1879,9 +1920,7 @@ class _Runtime:
             if observer_failure_is_fatal:
                 raise
 
-    async def _notify_deferred_observers(
-        self, deferred: list[tuple[dict[str, Any], bool]]
-    ) -> None:
+    async def _notify_deferred_observers(self, deferred: list[tuple[dict[str, Any], bool]]) -> None:
         for record, observer_failure_is_fatal in deferred:
             await self._notify_observer(record, observer_failure_is_fatal)
 
@@ -1891,7 +1930,8 @@ class _Runtime:
     async def shutdown(self, session_status: str = "ended") -> None:
         """Steps 2-8 of the custos shutdown sequence (design §4)."""
         alive = [
-            h.proc for h in self._handles.values()
+            h.proc
+            for h in self._handles.values()
             if h.proc is not None and h.proc.returncode is None
         ]
         # Eval-3 ADOPT pool hygiene: idle pooled workers are killed with the
@@ -1901,7 +1941,7 @@ class _Runtime:
         for proc in alive:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
+            except ProcessLookupError, PermissionError, OSError:
                 pass
         if alive:
             try:
@@ -1915,7 +1955,7 @@ class _Runtime:
                         continue
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
+                    except ProcessLookupError, PermissionError, OSError:
                         pass
                     try:
                         proc.kill()
@@ -1924,7 +1964,9 @@ class _Runtime:
                 await asyncio.gather(*(proc.wait() for proc in alive), return_exceptions=True)
         try:
             await self.emit(
-                "session_ended", task_id=None, session_status=session_status,
+                "session_ended",
+                task_id=None,
+                session_status=session_status,
                 results={tid: r.status for tid, r in self._results.items()},
             )
         except BaseException:
@@ -1984,15 +2026,11 @@ class _Runtime:
         repo = Path(spec["repo"]).resolve()
         worktree = Path(spec["worktree_path"]).resolve()
         if worktree == repo:
-            raise WorktreeRecoveryError(
-                f"worktree_path must not be the repo itself: {worktree}"
-            )
+            raise WorktreeRecoveryError(f"worktree_path must not be the repo itself: {worktree}")
         branch = spec["branch"]
         base = spec["base_commit"]
         await self._git(repo, "worktree", "prune", check=False)
-        listing = await self._git_stdout(
-            repo, "worktree", "list", "--porcelain", "-z"
-        ) or ""
+        listing = await self._git_stdout(repo, "worktree", "list", "--porcelain", "-z") or ""
         if worktree in self._registered_worktree_paths(listing):
             return await self._recover_worktree_locked(spec, generation)
         stale_generation = 0
@@ -2024,9 +2062,7 @@ class _Runtime:
         repo = Path(spec["repo"]).resolve()
         worktree = Path(spec["worktree_path"]).resolve()
         if worktree == repo:
-            raise WorktreeRecoveryError(
-                f"worktree_path must not be the repo itself: {worktree}"
-            )
+            raise WorktreeRecoveryError(f"worktree_path must not be the repo itself: {worktree}")
         await self._git(repo, "worktree", "prune", check=False)
         if not worktree.exists():
             return await self._ensure_worktree_locked(spec, generation)
@@ -2050,7 +2086,9 @@ class _Runtime:
                     f"in {worktree}: {detail}"
                 )
         await self.emit(
-            "recover", task_id=spec["task_id"], generation=new_generation,
+            "recover",
+            task_id=spec["task_id"],
+            generation=new_generation,
             base_commit=spec["base_commit"],
         )
         return new_generation
@@ -2075,20 +2113,24 @@ class _Runtime:
                 listing = await self._git(repo, "worktree", "list", "--porcelain", check=False)
                 if listing.returncode != 0:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id, reason="list_failed",
+                        "worktree_cleanup_deferred",
+                        task_id=task_id,
+                        reason="list_failed",
                         _deferred_observers=deferred,
                     )
                     return
                 registered = any(
                     line.startswith("worktree ")
-                    and Path(line[len("worktree "):].strip()).resolve() == worktree
+                    and Path(line[len("worktree ") :].strip()).resolve() == worktree
                     for line in listing.stdout.splitlines()
                 )
                 if not registered:
                     return
                 if worktree == repo:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id, reason="repo_path",
+                        "worktree_cleanup_deferred",
+                        task_id=task_id,
+                        reason="repo_path",
                         _deferred_observers=deferred,
                     )
                     return
@@ -2101,11 +2143,13 @@ class _Runtime:
                         )
                         if path_line is None:
                             continue
-                        registered_path = Path(path_line[len("worktree "):].strip()).resolve()
+                        registered_path = Path(path_line[len("worktree ") :].strip()).resolve()
                         if registered_path != worktree and branch_ref in lines:
                             await self.emit(
-                                "worktree_cleanup_deferred", task_id=task_id,
-                                reason="branch_in_use", _deferred_observers=deferred,
+                                "worktree_cleanup_deferred",
+                                task_id=task_id,
+                                reason="branch_in_use",
+                                _deferred_observers=deferred,
                             )
                             return
 
@@ -2119,16 +2163,17 @@ class _Runtime:
                 )
                 if status.returncode != 0:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id, reason="status_failed",
+                        "worktree_cleanup_deferred",
+                        task_id=task_id,
+                        reason="status_failed",
                         _deferred_observers=deferred,
                     )
                     return
-                if any(
-                    not _status_line_is_fence(line)
-                    for line in status.stdout.splitlines()
-                ):
+                if any(not _status_line_is_fence(line) for line in status.stdout.splitlines()):
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id, reason="dirty",
+                        "worktree_cleanup_deferred",
+                        task_id=task_id,
+                        reason="dirty",
                         _deferred_observers=deferred,
                     )
                     return
@@ -2139,7 +2184,9 @@ class _Runtime:
                 removed = await self._git(repo, "worktree", "remove", str(worktree), check=False)
                 if removed.returncode != 0:
                     await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id, reason="remove_failed",
+                        "worktree_cleanup_deferred",
+                        task_id=task_id,
+                        reason="remove_failed",
                         _deferred_observers=deferred,
                     )
                     return
@@ -2151,18 +2198,27 @@ class _Runtime:
                         )
                         if restored.returncode != 0:
                             restored = await self._git(
-                                repo, "worktree", "add", "--detach", str(worktree), branch,
+                                repo,
+                                "worktree",
+                                "add",
+                                "--detach",
+                                str(worktree),
+                                branch,
                                 check=False,
                             )
                         await self.emit(
-                            "worktree_cleanup_deferred", task_id=task_id,
-                            reason="branch_delete_failed", restored=restored.returncode == 0,
+                            "worktree_cleanup_deferred",
+                            task_id=task_id,
+                            reason="branch_delete_failed",
+                            restored=restored.returncode == 0,
                             _deferred_observers=deferred,
                         )
                         return
                 await self._git(repo, "worktree", "prune", check=False)
                 await self.emit(
-                    "worktree_pruned", task_id=task_id, branch=branch,
+                    "worktree_pruned",
+                    task_id=task_id,
+                    branch=branch,
                     _deferred_observers=deferred,
                 )
         finally:
@@ -2182,13 +2238,9 @@ class _Runtime:
             return [sys.executable, "-u", "-m", "cambium.worker"]
         return [sys.executable, "-u", str(worker)]
 
-    def _worker_env(
-        self: _Runtime | None, spec: dict[str, Any], generation: int
-    ) -> dict[str, str]:
+    def _worker_env(self: _Runtime | None, spec: dict[str, Any], generation: int) -> dict[str, str]:
         session_dir = self._session_dir if self is not None else None
-        provider_environment = (
-            self._provider_environment if self is not None else None
-        )
+        provider_environment = self._provider_environment if self is not None else None
         oauth_store = self._oauth_store if self is not None else None
         redactor = self._redactor if self is not None else None
         return _worker_environment(
@@ -2271,17 +2323,19 @@ class _Runtime:
         one. Used both for the parent envelope admitted into a child's
         context and for a dynamic child's own upward result.
         """
-        values = _bounded_strict_envelope({
-            "parent_task_id": spec.get("parent_task_id"),
-            "unified_diff": msg.get("diff", ""),
-            "diff_truncated": msg.get("diff_truncated", False),
-            "summary": msg.get("summary", ""),
-            "metric_score": msg.get("metric_score"),
-            "metric_breakdown": msg.get("metric_breakdown", {}),
-            "commits": msg.get("commits", []),
-            "files_changed": msg.get("files_changed", []),
-            "status": msg.get("status", "failed"),
-        })
+        values = _bounded_strict_envelope(
+            {
+                "parent_task_id": spec.get("parent_task_id"),
+                "unified_diff": msg.get("diff", ""),
+                "diff_truncated": msg.get("diff_truncated", False),
+                "summary": msg.get("summary", ""),
+                "metric_score": msg.get("metric_score"),
+                "metric_breakdown": msg.get("metric_breakdown", {}),
+                "commits": msg.get("commits", []),
+                "files_changed": msg.get("files_changed", []),
+                "status": msg.get("status", "failed"),
+            }
+        )
         return {key: values[key] for key in _ENVELOPE_KEYS}
 
     async def _admit_child(
@@ -2321,44 +2375,68 @@ class _Runtime:
             build_tree({"tasks": [*self._session_tasks, candidate]})
         except TaskTreeError as exc:
             await self.emit(
-                "child_rejected", task_id=parent_task_id, request_id=request_id,
-                parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                reason=exc.__class__.__name__,
+                message=str(exc)[:512],
             )
             await self._record_revision_conversation(
-                outcome="rejected", parent_task_id=parent_task_id,
-                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-                reason=exc.__class__.__name__, proposal=proposal,
+                outcome="rejected",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
+                reason=exc.__class__.__name__,
+                proposal=proposal,
             )
             return []
         try:
-            child_spec = _child_spec(
-                self._session_dir, parent_spec, proposal, parent_envelope
-            )
+            child_spec = _child_spec(self._session_dir, parent_spec, proposal, parent_envelope)
         except ValueError as exc:
             await self.emit(
-                "child_rejected", task_id=parent_task_id, request_id=request_id,
-                parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, reason=exc.__class__.__name__, message=str(exc)[:512],
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                reason=exc.__class__.__name__,
+                message=str(exc)[:512],
             )
             await self._record_revision_conversation(
-                outcome="rejected", parent_task_id=parent_task_id,
-                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-                reason=exc.__class__.__name__, proposal=proposal,
+                outcome="rejected",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
+                reason=exc.__class__.__name__,
+                proposal=proposal,
             )
             return []
         if self._task_group is None:
             no_task_group_error = RuntimeError("no active task group")
             await self.emit(
-                "child_rejected", task_id=parent_task_id, request_id=request_id,
-                parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, reason="NoActiveTaskGroup",
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                reason="NoActiveTaskGroup",
                 message=str(no_task_group_error)[:512],
             )
             await self._record_revision_conversation(
-                outcome="rejected", parent_task_id=parent_task_id,
-                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
-                reason="NoActiveTaskGroup", proposal=proposal,
+                outcome="rejected",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
+                reason="NoActiveTaskGroup",
+                proposal=proposal,
             )
             return []
 
@@ -2366,41 +2444,55 @@ class _Runtime:
         # observe this child and duplicate detection stays exact.  Everything
         # below has a rollback path until the durable admission event and the
         # task creation both succeed.
-        self._session_tasks.append({
-            "task_id": child_task_id,
-            "kind": kind,
-            "depends_on": [parent_task_id],
-            "spec": child_spec,
-        })
+        self._session_tasks.append(
+            {
+                "task_id": child_task_id,
+                "kind": kind,
+                "depends_on": [parent_task_id],
+                "spec": child_spec,
+            }
+        )
         try:
-            await self._pin_fork_child(
-                parent_spec, child_spec, parent_task_id, child_task_id, kind
-            )
+            await self._pin_fork_child(parent_spec, child_spec, parent_task_id, child_task_id, kind)
             await self._record_revision_conversation(
-                outcome="admitted", parent_task_id=parent_task_id,
-                child_task_id=child_task_id, child_kind=kind, request_id=request_id,
+                outcome="admitted",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
                 proposal=proposal,
             )
             # This is the durable-before-spawn barrier.  A child is not an
             # admitted runtime object until this critical event succeeds.
             await self.emit(
-                "child_admitted", task_id=parent_task_id, request_id=request_id,
-                parent_task_id=parent_task_id, child_task_id=child_task_id,
-                child_kind=kind, branch=child_spec.get("branch"),
+                "child_admitted",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                branch=child_spec.get("branch"),
             )
         except BaseException as admission_error:
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
             try:
                 await self.emit(
-                    "child_rejected", task_id=parent_task_id, request_id=request_id,
-                    parent_task_id=parent_task_id, child_task_id=child_task_id,
-                    child_kind=kind, reason="AdmissionPersistenceFailed",
+                    "child_rejected",
+                    task_id=parent_task_id,
+                    request_id=request_id,
+                    parent_task_id=parent_task_id,
+                    child_task_id=child_task_id,
+                    child_kind=kind,
+                    reason="AdmissionPersistenceFailed",
                     message=str(admission_error)[:512],
                 )
                 await self._record_revision_conversation(
-                    outcome="rejected", parent_task_id=parent_task_id,
-                    child_task_id=child_task_id, child_kind=kind,
-                    request_id=request_id, reason="AdmissionPersistenceFailed",
+                    outcome="rejected",
+                    parent_task_id=parent_task_id,
+                    child_task_id=child_task_id,
+                    child_kind=kind,
+                    request_id=request_id,
+                    reason="AdmissionPersistenceFailed",
                     proposal=proposal,
                 )
             except BaseException:
@@ -2423,15 +2515,22 @@ class _Runtime:
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
             try:
                 await self.emit(
-                    "child_rejected", task_id=parent_task_id, request_id=request_id,
-                    parent_task_id=parent_task_id, child_task_id=child_task_id,
-                    child_kind=kind, reason="ChildSpawnFailed",
+                    "child_rejected",
+                    task_id=parent_task_id,
+                    request_id=request_id,
+                    parent_task_id=parent_task_id,
+                    child_task_id=child_task_id,
+                    child_kind=kind,
+                    reason="ChildSpawnFailed",
                     message=str(create_error)[:512],
                 )
                 await self._record_revision_conversation(
-                    outcome="rejected", parent_task_id=parent_task_id,
-                    child_task_id=child_task_id, child_kind=kind,
-                    request_id=request_id, reason="ChildSpawnFailed",
+                    outcome="rejected",
+                    parent_task_id=parent_task_id,
+                    child_task_id=child_task_id,
+                    child_kind=kind,
+                    request_id=request_id,
+                    reason="ChildSpawnFailed",
                     proposal=proposal,
                 )
             except BaseException:
@@ -2464,8 +2563,12 @@ class _Runtime:
         _release_lane(self._lanes, child_spec)
 
     def _child_results_for_resume(
-        self, parent_task_id: str, child_ids: list[str],
-        *, checkpoint_ref: Any, epoch: Any,
+        self,
+        parent_task_id: str,
+        child_ids: list[str],
+        *,
+        checkpoint_ref: Any,
+        epoch: Any,
     ) -> dict[str, Any]:
         """One bounded resume payload: every admitted child's strict envelope.
 
@@ -2483,7 +2586,7 @@ class _Runtime:
             envelope = self._child_result_by_task.get(child_id)
             if envelope is None:
                 result = self._results.get(child_id)
-                summary = (result.reason if result is not None else "child result missing")
+                summary = result.reason if result is not None else "child result missing"
                 envelope = {
                     "parent_task_id": parent_task_id,
                     "unified_diff": "",
@@ -2522,7 +2625,8 @@ class _Runtime:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, remaining)
         pending = [
-            future for future in self._child_tasks.get(parent_task_id, ())
+            future
+            for future in self._child_tasks.get(parent_task_id, ())
             if future is not None and not future.done()
         ]
         for future in pending:
@@ -2554,9 +2658,7 @@ class _Runtime:
             return
         cache_key = epoch.get("cache_key")
         authorized = frozenset(child_spec.get("authorized_providers") or ())
-        compatible, reason = _fork_cache_compatible_supervisor(
-            child_spec, epoch, authorized
-        )
+        compatible, reason = _fork_cache_compatible_supervisor(child_spec, epoch, authorized)
         semantic_reuse = (
             not compatible
             and isinstance(cache_key, dict)
@@ -2706,27 +2808,31 @@ class _Runtime:
             except ValueError:
                 return []
             try:
-                proposals = await self._admission_port.step([
-                    {
-                        "kind": "child_result",
-                        "task_id": parent_task_id,
-                        "payload": dict(parent_envelope),
-                    }
-                ])
+                proposals = await self._admission_port.step(
+                    [
+                        {
+                            "kind": "child_result",
+                            "task_id": parent_task_id,
+                            "payload": dict(parent_envelope),
+                        }
+                    ]
+                )
             except (TypeError, ValueError) as exc:
                 malformed = repr(exc)
         if malformed is not None:
             await self.emit(
-                "child_rejected", task_id=parent_task_id,
-                parent_task_id=parent_task_id, child_task_id=None, child_kind=None,
-                reason="MalformedProposal", message=f"decision port error: {malformed}"[:512],
+                "child_rejected",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                child_task_id=None,
+                child_kind=None,
+                reason="MalformedProposal",
+                message=f"decision port error: {malformed}"[:512],
             )
             return []
         admitted: list[str] = []
         for proposal in proposals:
-            admitted.extend(
-                await self._admit_port_proposal(parent_spec, parent_envelope, proposal)
-            )
+            admitted.extend(await self._admit_port_proposal(parent_spec, parent_envelope, proposal))
         return admitted
 
     async def _admit_port_proposal(
@@ -2739,8 +2845,11 @@ class _Runtime:
         parent_task_id = parent_spec["task_id"]
         if not isinstance(proposal, dict):
             await self.emit(
-                "child_rejected", task_id=parent_task_id,
-                parent_task_id=parent_task_id, child_task_id=None, child_kind=None,
+                "child_rejected",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                child_task_id=None,
+                child_kind=None,
                 reason="MalformedProposal",
                 message="decision port returned a non-object proposal",
             )
@@ -2748,7 +2857,8 @@ class _Runtime:
         invalid_fields = _invalid_propose_child_fields(proposal)
         if invalid_fields:
             await self.emit(
-                "child_rejected", task_id=parent_task_id,
+                "child_rejected",
+                task_id=parent_task_id,
                 request_id=_wire_str(proposal.get("request_id")),
                 parent_task_id=parent_task_id,
                 child_task_id=_wire_str(proposal.get("child_task_id")),
@@ -2757,13 +2867,16 @@ class _Runtime:
                 message=f"decision port proposal rejected: invalid field(s) {invalid_fields}",
             )
             await self._record_port_rejection(
-                parent_task_id, proposal, "MalformedProposal",
+                parent_task_id,
+                proposal,
+                "MalformedProposal",
                 f"invalid field(s) {invalid_fields}",
             )
             return []
         if proposal.get("parent_task_id") != parent_task_id:
             await self.emit(
-                "child_rejected", task_id=parent_task_id,
+                "child_rejected",
+                task_id=parent_task_id,
                 request_id=_wire_str(proposal.get("request_id")),
                 parent_task_id=parent_task_id,
                 child_task_id=proposal["child_task_id"],
@@ -2772,7 +2885,9 @@ class _Runtime:
                 message="decision port proposal parent_task_id does not match the finished task",
             )
             await self._record_port_rejection(
-                parent_task_id, proposal, "ParentTaskIdMismatch",
+                parent_task_id,
+                proposal,
+                "ParentTaskIdMismatch",
                 "parent_task_id does not match the finished task",
             )
             return []
@@ -2790,11 +2905,13 @@ class _Runtime:
         if not isinstance(child_task_id, str) or not child_task_id:
             return
         await self._record_revision_conversation(
-            outcome="rejected", parent_task_id=parent_task_id,
+            outcome="rejected",
+            parent_task_id=parent_task_id,
             child_task_id=child_task_id,
             child_kind=_wire_str(proposal.get("kind")),
             request_id=_wire_str(proposal.get("request_id")),
-            reason=f"{reason}: {message}"[:512], proposal=proposal,
+            reason=f"{reason}: {message}"[:512],
+            proposal=proposal,
         )
 
     # -- per-task supervision ------------------------------------------------
@@ -2813,9 +2930,7 @@ class _Runtime:
         """
         if self._debt_store is None:
             return
-        if _resolve_model_candidates(
-            spec, self._debt_store.as_mapping(), self._lanes
-        ):
+        if _resolve_model_candidates(spec, self._debt_store.as_mapping(), self._lanes):
             self._lanes[spec["assigned_provider"]].in_flight += 1
             spec["_lane_reserved"] = True
 
@@ -2823,9 +2938,7 @@ class _Runtime:
         """Redact one provider message before it enters or leaves recovery."""
         if self._redactor is None:
             return dict(message)
-        redacted = self._redactor.redact_protocol_record(
-            message, structural_fields=("role",)
-        )
+        redacted = self._redactor.redact_protocol_record(message, structural_fields=("role",))
         return {
             "role": cast(str, redacted["role"]),
             "content": cast(str, redacted["content"]),
@@ -2884,10 +2997,7 @@ class _Runtime:
             checkpoint_refs.setdefault(checkpoint_ref, meta.get("epoch"))
 
         checkpoint_dir = (
-            self._session_dir.resolve()
-            / ".cambium"
-            / "checkpoints"
-            / _safe_task_id(task_id)
+            self._session_dir.resolve() / ".cambium" / "checkpoints" / _safe_task_id(task_id)
         )
         try:
             checkpoint_paths = sorted(checkpoint_dir.iterdir(), key=lambda path: path.name)
@@ -2907,21 +3017,21 @@ class _Runtime:
 
         checkpoint_files: list[dict[str, Any]] = []
         for checkpoint_ref, epoch in checkpoint_refs.items():
-            loaded = _load_epoch_checkpoint_messages(
-                self._session_dir, task_id, checkpoint_ref
+            loaded = _load_epoch_checkpoint_messages(self._session_dir, task_id, checkpoint_ref)
+            checkpoint_files.append(
+                {
+                    "checkpoint_ref": checkpoint_ref,
+                    "epoch": epoch,
+                    "provider_messages": [
+                        self._redact_checkpoint_message(message)
+                        for message in loaded["provider_messages"]
+                    ],
+                    "continuation_suffix": [
+                        self._redact_checkpoint_message(message)
+                        for message in loaded["continuation_suffix"]
+                    ],
+                }
             )
-            checkpoint_files.append({
-                "checkpoint_ref": checkpoint_ref,
-                "epoch": epoch,
-                "provider_messages": [
-                    self._redact_checkpoint_message(message)
-                    for message in loaded["provider_messages"]
-                ],
-                "continuation_suffix": [
-                    self._redact_checkpoint_message(message)
-                    for message in loaded["continuation_suffix"]
-                ],
-            })
         return {
             "node_id": task_id,
             "rows": rows,
@@ -2929,8 +3039,12 @@ class _Runtime:
         }
 
     def _capture_child_result(
-        self, spec: dict[str, Any], msg: Mapping[str, Any],
-        *, request_id: str | None = None, generation: int | None = None,
+        self,
+        spec: dict[str, Any],
+        msg: Mapping[str, Any],
+        *,
+        request_id: str | None = None,
+        generation: int | None = None,
     ) -> None:
         """Capture the first final worker envelope for one admitted child."""
         task_id = spec["task_id"]
@@ -2958,21 +3072,21 @@ class _Runtime:
         else:
             status = "failed" if result.status != "succeeded" else "succeeded"
             reason = result.reason or "child failed"
-        return _bounded_strict_envelope({
-            "parent_task_id": parent_task_id,
-            "unified_diff": "",
-            "diff_truncated": False,
-            "summary": reason,
-            "metric_score": None,
-            "metric_breakdown": {},
-            "commits": [],
-            "files_changed": [],
-            "status": status,
-        })
+        return _bounded_strict_envelope(
+            {
+                "parent_task_id": parent_task_id,
+                "unified_diff": "",
+                "diff_truncated": False,
+                "summary": reason,
+                "metric_score": None,
+                "metric_breakdown": {},
+                "commits": [],
+                "files_changed": [],
+                "status": status,
+            }
+        )
 
-    async def _publish_child_result(
-        self, task_id: str, envelope: dict[str, Any]
-    ) -> None:
+    async def _publish_child_result(self, task_id: str, envelope: dict[str, Any]) -> None:
         """Publish one correlated child result event, first result wins."""
         if task_id in self._child_result_emitted:
             return
@@ -3009,7 +3123,8 @@ class _Runtime:
             self._child_result_by_task[task_id] = envelope
             parent_task_id = self._child_parent[task_id]
             self._child_envelopes[parent_task_id] = [
-                item for item in self._child_envelopes.get(parent_task_id, ())
+                item
+                for item in self._child_envelopes.get(parent_task_id, ())
                 if item is not previous
             ]
             self._child_envelopes[parent_task_id].append(envelope)
@@ -3053,7 +3168,8 @@ class _Runtime:
                 pending = self._pending_children.pop(task_id, [])
                 for proposal in pending:
                     await self.emit(
-                        "child_rejected", task_id=task_id,
+                        "child_rejected",
+                        task_id=task_id,
                         request_id=proposal.get("request_id"),
                         parent_task_id=task_id,
                         child_task_id=proposal["child_task_id"],
@@ -3069,7 +3185,8 @@ class _Runtime:
                     and child_result.status == "failed"
                 ):
                     await self.emit(
-                        "child_failed", task_id=task_id,
+                        "child_failed",
+                        task_id=task_id,
                         parent_task_id=parent_task_id,
                         reason=child_result.reason or "failed",
                     )
@@ -3088,16 +3205,18 @@ class _Runtime:
             spec, "ready_timeout_s", "CAMBIUM_READY_TIMEOUT_S", DEFAULT_READY_TIMEOUT_S
         )
         heartbeat_interval = _cfg_float(
-            spec, "heartbeat_interval_s", "CAMBIUM_HEARTBEAT_INTERVAL_S",
+            spec,
+            "heartbeat_interval_s",
+            "CAMBIUM_HEARTBEAT_INTERVAL_S",
             DEFAULT_HEARTBEAT_INTERVAL_S,
         )
         heartbeat_timeout = _cfg_float(
-            spec, "heartbeat_timeout_s", "CAMBIUM_HEARTBEAT_TIMEOUT_S",
+            spec,
+            "heartbeat_timeout_s",
+            "CAMBIUM_HEARTBEAT_TIMEOUT_S",
             DEFAULT_HEARTBEAT_TIMEOUT_S,
         )
-        wall_budget = _cfg_float(
-            spec, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S
-        )
+        wall_budget = _cfg_float(spec, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S)
         # Cache-first: one absolute deadline accounts for every suspend/resume
         # cycle and the time spent waiting for children.
         supervise_started = time.monotonic()
@@ -3183,13 +3302,14 @@ class _Runtime:
             # is idempotent across restarts (a resolved spec carries a model).
             self._resolve_assignment(spec)
             assigned_payload: dict[str, Any] = {
-                "task_id": task_id, "repo": str(repo), "branch": spec["branch"],
-                "base_commit": spec["base_commit"], "task": spec.get("task", ""),
+                "task_id": task_id,
+                "repo": str(repo),
+                "branch": spec["branch"],
+                "base_commit": spec["base_commit"],
+                "task": spec.get("task", ""),
             }
             fanout_config = spec.get("fanout_config")
-            if isinstance(fanout_config, dict) and isinstance(
-                fanout_config.get("model"), str
-            ):
+            if isinstance(fanout_config, dict) and isinstance(fanout_config.get("model"), str):
                 assigned_payload["model"] = fanout_config["model"]
             if isinstance(spec.get("assigned_provider"), str):
                 assigned_payload["assigned_provider"] = spec["assigned_provider"]
@@ -3205,9 +3325,7 @@ class _Runtime:
             while True:
                 handle = WorkerHandle(task_id=task_id, generation=generation)
                 self._handles[task_id] = handle
-                outcome = await drive_with_admission_slot(
-                    handle, allow_pool=first_generation
-                )
+                outcome = await drive_with_admission_slot(handle, allow_pool=first_generation)
                 first_generation = False
                 sanitized_envelope: dict[str, Any] | None = None
                 if outcome.envelope is not None and outcome.correlated:
@@ -3217,8 +3335,7 @@ class _Runtime:
                     worker_summary = _envelope_text(sanitized_envelope, "summary")
                 if outcome.clean:
                     envelope_status = (
-                        outcome.envelope.get("status")
-                        if outcome.envelope is not None else None
+                        outcome.envelope.get("status") if outcome.envelope is not None else None
                     )
                     if envelope_status == "suspended" and not self._context_reuse:
                         # Fail closed: without the flag a suspended verdict is
@@ -3229,18 +3346,25 @@ class _Runtime:
                         if remaining <= 0:
                             reason = "wall budget exhausted before resume"
                             await self.emit(
-                                "context_resume_failed", task_id=task_id,
-                                generation=generation, reason=reason,
+                                "context_resume_failed",
+                                task_id=task_id,
+                                generation=generation,
+                                reason=reason,
                             )
                             self._results[task_id] = TaskResult(
-                                task_id=task_id, status="failed", exit_code=1,
-                                reason=reason, restarts=restarts, summary=worker_summary,
+                                task_id=task_id,
+                                status="failed",
+                                exit_code=1,
+                                reason=reason,
+                                restarts=restarts,
+                                summary=worker_summary,
                             )
                             return
                         child_ids = list(outcome.admitted_children)
                         await self._await_suspend_children(task_id, child_ids, remaining)
                         resume_payload = self._child_results_for_resume(
-                            task_id, child_ids,
+                            task_id,
+                            child_ids,
                             checkpoint_ref=cast(dict[str, Any], outcome.envelope).get(
                                 "checkpoint_ref"
                             ),
@@ -3250,7 +3374,9 @@ class _Runtime:
                         # barrier before the next worker spawn.  A store
                         # failure raises and the resume is not attempted.
                         await self.emit(
-                            "context_resume", task_id=task_id, generation=generation,
+                            "context_resume",
+                            task_id=task_id,
+                            generation=generation,
                             epoch=cast(dict[str, Any], outcome.envelope).get("epoch"),
                             checkpoint_ref=cast(dict[str, Any], outcome.envelope).get(
                                 "checkpoint_ref"
@@ -3266,12 +3392,18 @@ class _Runtime:
                             failure_reason = "worker_verdict_failed"
                         if spec.get("resume") is not None:
                             await self.emit(
-                                "context_resume_failed", task_id=task_id,
-                                generation=generation, reason=failure_reason,
+                                "context_resume_failed",
+                                task_id=task_id,
+                                generation=generation,
+                                reason=failure_reason,
                             )
                         self._results[task_id] = TaskResult(
-                            task_id=task_id, status="failed", exit_code=1,
-                            reason=failure_reason, restarts=restarts, summary=worker_summary,
+                            task_id=task_id,
+                            status="failed",
+                            exit_code=1,
+                            reason=failure_reason,
+                            restarts=restarts,
+                            summary=worker_summary,
                         )
                         return
                     integrity = await self._worker_success_integrity(spec, worktree)
@@ -3284,38 +3416,60 @@ class _Runtime:
                             integrity = "worker_head_failed"
                     if integrity is not None:
                         await self.emit(
-                            "worker_failed", task_id=task_id, generation=generation,
+                            "worker_failed",
+                            task_id=task_id,
+                            generation=generation,
                             reason=integrity,
                         )
                         self._results[task_id] = TaskResult(
-                            task_id=task_id, status="failed", exit_code=1,
-                            reason=integrity, restarts=restarts, summary=worker_summary,
+                            task_id=task_id,
+                            status="failed",
+                            exit_code=1,
+                            reason=integrity,
+                            restarts=restarts,
+                            summary=worker_summary,
                         )
                         return
                     if head == spec["base_commit"]:
                         self._results[task_id] = TaskResult(
-                            task_id=task_id, status="succeeded", exit_code=0,
-                            reason=None, merge_sha=None, restarts=restarts,
+                            task_id=task_id,
+                            status="succeeded",
+                            exit_code=0,
+                            reason=None,
+                            merge_sha=None,
+                            restarts=restarts,
                             summary=worker_summary,
                         )
                         return
                     merged = await self._merge_task(spec, handle)
                     if merged is not None:
                         self._results[task_id] = TaskResult(
-                            task_id=task_id, status="succeeded", exit_code=0,
-                            reason=None, merge_sha=merged, restarts=restarts,
+                            task_id=task_id,
+                            status="succeeded",
+                            exit_code=0,
+                            reason=None,
+                            merge_sha=merged,
+                            restarts=restarts,
                             summary=worker_summary,
                         )
                     else:
                         self._results[task_id] = TaskResult(
-                            task_id=task_id, status="failed", exit_code=1,
-                            reason="merge_failed", restarts=restarts, summary=worker_summary,
+                            task_id=task_id,
+                            status="failed",
+                            exit_code=1,
+                            reason="merge_failed",
+                            restarts=restarts,
+                            summary=worker_summary,
                         )
                     return
                 if outcome.fatal:
                     self._results[task_id] = TaskResult(
-                        task_id=task_id, status="failed", exit_code=1,
-                        reason=outcome.reason, restarts=restarts, summary=worker_summary,
+                        task_id=task_id,
+                        status="failed",
+                        exit_code=1,
+                        reason=outcome.reason,
+                        restarts=restarts,
+                        summary=worker_summary,
                     )
                     return
                 reason = outcome.reason or "crash"
@@ -3328,13 +3482,20 @@ class _Runtime:
                     )
                 if restarts >= max_restarts:
                     await self.emit(
-                        "worker_failed", task_id=task_id, generation=generation,
-                        restarts=restarts, max_restarts=max_restarts, reason=reason,
+                        "worker_failed",
+                        task_id=task_id,
+                        generation=generation,
+                        restarts=restarts,
+                        max_restarts=max_restarts,
+                        reason=reason,
                     )
                     self._results[task_id] = TaskResult(
-                        task_id=task_id, status="failed", exit_code=1,
+                        task_id=task_id,
+                        status="failed",
+                        exit_code=1,
                         reason=f"max_restarts ({max_restarts}): {reason}",
-                        restarts=restarts, summary=worker_summary,
+                        restarts=restarts,
+                        summary=worker_summary,
                     )
                     return
                 restarts += 1
@@ -3342,16 +3503,19 @@ class _Runtime:
                     0.0, min(RESTART_MAX_DELAY_S, RESTART_BASE_DELAY_S * 2**restarts)
                 )
                 await self.emit(
-                    "restart_scheduled", task_id=task_id, generation=generation,
-                    restart_count=restarts, max_restarts=max_restarts,
-                    delay_s=round(delay, 3), reason=reason,
+                    "restart_scheduled",
+                    task_id=task_id,
+                    generation=generation,
+                    restart_count=restarts,
+                    max_restarts=max_restarts,
+                    delay_s=round(delay, 3),
+                    reason=reason,
                 )
                 await asyncio.sleep(delay)
                 generation = await self._recover_worktree(spec, generation + 1)
         finally:
             if semaphore is not None and semaphore_held:
                 semaphore.release()
-
 
     # -- warm worker pool (eval-3 ADOPT) ------------------------------------
 
@@ -3396,9 +3560,7 @@ class _Runtime:
         if len(self._pool) >= self._warm_pool_size:
             await self._kill_pooled(proc)
             return
-        self._pool.append(
-            _PooledWorker(proc=proc, cmd=tuple(cmd), env_key=_pool_env_key(env))
-        )
+        self._pool.append(_PooledWorker(proc=proc, cmd=tuple(cmd), env_key=_pool_env_key(env)))
 
     @staticmethod
     async def _kill_pooled(proc: asyncio.subprocess.Process) -> None:
@@ -3406,13 +3568,19 @@ class _Runtime:
         await _kill_worker(proc)
         try:
             await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError, asyncio.CancelledError:
             pass
 
     async def _drive_generation(
-        self, spec: dict[str, Any], handle: WorkerHandle, *,
-        ready_timeout: float, heartbeat_interval: float, heartbeat_timeout: float,
-        wall_budget: float, allow_pool: bool = True,
+        self,
+        spec: dict[str, Any],
+        handle: WorkerHandle,
+        *,
+        ready_timeout: float,
+        heartbeat_interval: float,
+        heartbeat_timeout: float,
+        wall_budget: float,
+        allow_pool: bool = True,
     ) -> _GenOutcome:
         task_id = spec["task_id"]
         worktree = Path(spec["worktree_path"])
@@ -3426,16 +3594,22 @@ class _Runtime:
 
         async def _report_outbound_message_too_long() -> None:
             await self.emit(
-                "protocol", task_id=task_id, generation=generation,
+                "protocol",
+                task_id=task_id,
+                generation=generation,
                 error_type="OUTBOUND_MESSAGE_TOO_LONG",
                 note="outbound message exceeds MAX_LINE_BYTES",
             )
 
         init_rid = self._next_rid()
         init_msg = {
-            "type": "init", "request_id": init_rid, "task_id": task_id,
-            "proto": PROTO, "generation": generation,
-            "worktree": str(worktree), "base_commit": spec["base_commit"],
+            "type": "init",
+            "request_id": init_rid,
+            "task_id": task_id,
+            "proto": PROTO,
+            "generation": generation,
+            "worktree": str(worktree),
+            "base_commit": spec["base_commit"],
             "spec": spec.get("task", ""),
             "max_turns": int(spec.get("max_turns", DEFAULT_MAX_TURNS)),
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
@@ -3482,7 +3656,9 @@ class _Runtime:
         if encode_message(init_msg) is None:
             await _report_outbound_message_too_long()
             return _GenOutcome(
-                clean=False, fatal=True, reason=OUTBOUND_MESSAGE_TOO_LONG,
+                clean=False,
+                fatal=True,
+                reason=OUTBOUND_MESSAGE_TOO_LONG,
             )
 
         # Eval-3 ADOPT warm pool: the first generation of a task may pop a
@@ -3491,9 +3667,7 @@ class _Runtime:
         # never reuse a pooled process (it may have run the same task).
         pooled = self._pool_pop(cmd, env) if allow_pool else None
         if pooled is not None:
-            await self.emit(
-                "worker_reused", task_id=task_id, generation=generation, pid=pooled.pid
-            )
+            await self.emit("worker_reused", task_id=task_id, generation=generation, pid=pooled.pid)
         if pooled is None:
             # Record which provider credential NAMES the worker env carries —
             # never values. A cascade fallback failing with AUTH_ERROR for a
@@ -3505,9 +3679,7 @@ class _Runtime:
                 generation=generation,
                 worker=" ".join(cmd),
                 provider_env_keys=sorted(
-                    key
-                    for key in env
-                    if key.startswith("CAMBIUM_PROVIDER_") and env[key]
+                    key for key in env if key.startswith("CAMBIUM_PROVIDER_") and env[key]
                 ),
             )
         try:
@@ -3552,13 +3724,15 @@ class _Runtime:
                     except json.JSONDecodeError as exc:
                         parse_errors += 1
                         await self.emit(
-                            "parse_error", task_id=task_id, generation=generation,
+                            "parse_error",
+                            task_id=task_id,
+                            generation=generation,
                             message=str(exc)[:256],
                         )
                         if parse_errors > MAX_PARSE_ERRORS:
                             try:
                                 os.killpg(proc.pid, signal.SIGKILL)
-                            except (ProcessLookupError, PermissionError, OSError):
+                            except ProcessLookupError, PermissionError, OSError:
                                 pass
                         continue
                     if not isinstance(msg, dict):
@@ -3569,21 +3743,26 @@ class _Runtime:
                         # non-object JSON).
                         parse_errors += 1
                         await self.emit(
-                            "parse_error", task_id=task_id, generation=generation,
+                            "parse_error",
+                            task_id=task_id,
+                            generation=generation,
                             message="valid JSON line is not an object",
                         )
                         if parse_errors > MAX_PARSE_ERRORS:
                             try:
                                 os.killpg(proc.pid, signal.SIGKILL)
-                            except (ProcessLookupError, PermissionError, OSError):
+                            except ProcessLookupError, PermissionError, OSError:
                                 pass
                         continue
                     await messages.put(msg)
             except (ValueError, asyncio.LimitOverrunError) as exc:
                 message_too_long = True
                 await self.emit(
-                    "protocol", task_id=task_id, generation=generation,
-                    note="MessageTooLong", message=str(exc)[:256],
+                    "protocol",
+                    task_id=task_id,
+                    generation=generation,
+                    note="MessageTooLong",
+                    message=str(exc)[:256],
                 )
                 await _kill_worker(proc)
             finally:
@@ -3598,7 +3777,10 @@ class _Runtime:
                     if self._redactor is not None:
                         line = self._redactor.redact_escaped(line)
                     await self.emit(
-                        "log", task_id=task_id, generation=generation, stream="stderr",
+                        "log",
+                        task_id=task_id,
+                        generation=generation,
+                        stream="stderr",
                         message=line[:512],
                     )
 
@@ -3643,9 +3825,7 @@ class _Runtime:
                 if encode_message(cancel_msg) is None:
                     await _report_outbound_message_too_long()
                 else:
-                    await _write_json(
-                        proc, cancel_msg, deadline=_stdin_deadline(wall_deadline)
-                    )
+                    await _write_json(proc, cancel_msg, deadline=_stdin_deadline(wall_deadline))
             except (
                 OSError,
                 subprocess.SubprocessError,
@@ -3664,25 +3844,29 @@ class _Runtime:
             pong_rid = self._next_rid()
             pong_deadline = min(wall_deadline, loop.time() + PONG_DEADLINE_S)
             ping_msg = {
-                "type": "ping", "request_id": pong_rid, "task_id": task_id,
+                "type": "ping",
+                "request_id": pong_rid,
+                "task_id": task_id,
                 "generation": generation,
             }
-            await self.emit(
-                "ping", task_id=task_id, generation=generation, request_id=pong_rid
-            )
+            await self.emit("ping", task_id=task_id, generation=generation, request_id=pong_rid)
             if encode_message(ping_msg) is None:
                 protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
                 await _report_outbound_message_too_long()
                 await _kill_worker(proc)
                 return False
             if not await _write_json(
-                proc, ping_msg,
+                proc,
+                ping_msg,
                 deadline=pong_deadline,
             ):
                 timeout_phase = "pong"
                 await self.emit(
-                    "protocol", task_id=task_id, generation=generation,
-                    note="missing correlated pong after EOF", expected=pong_rid,
+                    "protocol",
+                    task_id=task_id,
+                    generation=generation,
+                    note="missing correlated pong after EOF",
+                    expected=pong_rid,
                 )
                 return False
             while loop.time() < pong_deadline:
@@ -3696,33 +3880,42 @@ class _Runtime:
                 if _protocol_version_mismatch(response):
                     protocol_failure = "PROTO_VERSION_MISMATCH"
                     await self.emit(
-                        "protocol", task_id=task_id, generation=generation,
-                        error_type=protocol_failure, expected=PROTO,
+                        "protocol",
+                        task_id=task_id,
+                        generation=generation,
+                        error_type=protocol_failure,
+                        expected=PROTO,
                         got=response.get("proto"),
                     )
                     return False
                 if response.get("type") != "pong":
                     await self.emit(
-                        "protocol", task_id=task_id, generation=generation,
+                        "protocol",
+                        task_id=task_id,
+                        generation=generation,
                         note="unexpected message during EOF pong probe",
                         type=response.get("type"),
                     )
                     continue
                 if response.get("request_id") != pong_rid:
                     await self.emit(
-                        "protocol", task_id=task_id, generation=generation,
+                        "protocol",
+                        task_id=task_id,
+                        generation=generation,
                         note="pong request_id mismatch",
-                        expected=pong_rid, got=response.get("request_id"),
+                        expected=pong_rid,
+                        got=response.get("request_id"),
                     )
                     continue
-                await self.emit(
-                    "pong", task_id=task_id, generation=generation, request_id=pong_rid
-                )
+                await self.emit("pong", task_id=task_id, generation=generation, request_id=pong_rid)
                 return True
             timeout_phase = "pong"
             await self.emit(
-                "protocol", task_id=task_id, generation=generation,
-                note="missing correlated pong after EOF", expected=pong_rid,
+                "protocol",
+                task_id=task_id,
+                generation=generation,
+                note="missing correlated pong after EOF",
+                expected=pong_rid,
             )
             return False
 
@@ -3739,7 +3932,8 @@ class _Runtime:
                     await _cancel_and_kill()
                     break
                 if (
-                    phase == "run" and last_heartbeat is not None
+                    phase == "run"
+                    and last_heartbeat is not None
                     and now - last_heartbeat > heartbeat_timeout
                 ):
                     timeout_phase = "heartbeat"
@@ -3759,12 +3953,12 @@ class _Runtime:
                     # EOF alone is never death (arch §5.3): grace, then an
                     # exact request_id-correlated ping/pong probe.
                     await self.emit(
-                        "log", task_id=task_id, generation=generation,
+                        "log",
+                        task_id=task_id,
+                        generation=generation,
                         message="stdout EOF; grace then poll",
                     )
-                    await asyncio.sleep(
-                        min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time()))
-                    )
+                    await asyncio.sleep(min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time())))
                     if proc.returncode is None:
                         probe_ok = await _probe_after_eof()
                         if probe_ok:
@@ -3775,17 +3969,20 @@ class _Runtime:
                                 )
                             except TimeoutError:
                                 await self.emit(
-                                    "log", task_id=task_id, generation=generation,
+                                    "log",
+                                    task_id=task_id,
+                                    generation=generation,
                                     message="EOF survivor did not exit after correlated pong",
                                 )
                                 await _kill_worker(proc)
                         else:
                             await self.emit(
-                                "log", task_id=task_id, generation=generation,
-                                    message=(
-                                        "EOF survivor has no correlated pong; "
-                                        "killing process group"
-                                    ),
+                                "log",
+                                task_id=task_id,
+                                generation=generation,
+                                message=(
+                                    "EOF survivor has no correlated pong; killing process group"
+                                ),
                             )
                             await _kill_worker(proc)
                     break
@@ -3793,8 +3990,12 @@ class _Runtime:
                 if _protocol_version_mismatch(msg):
                     protocol_failure = "PROTO_VERSION_MISMATCH"
                     await self.emit(
-                        "protocol", task_id=task_id, generation=generation,
-                        error_type=protocol_failure, expected=PROTO, got=msg.get("proto"),
+                        "protocol",
+                        task_id=task_id,
+                        generation=generation,
+                        error_type=protocol_failure,
+                        expected=PROTO,
+                        got=msg.get("proto"),
                     )
                     await _kill_worker(proc)
                     break
@@ -3802,9 +4003,13 @@ class _Runtime:
                     if msg.get("request_id") != init_rid:
                         protocol_reason = "ready_request_id_mismatch"
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
-                            request_id=msg.get("request_id"), code=PROTO_UNKNOWN_REQUEST_ID,
-                            note="ready request_id mismatch", expected=init_rid,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
+                            request_id=msg.get("request_id"),
+                            code=PROTO_UNKNOWN_REQUEST_ID,
+                            note="ready request_id mismatch",
+                            expected=init_rid,
                             got=msg.get("request_id"),
                         )
                         await _kill_worker(proc)
@@ -3813,14 +4018,20 @@ class _Runtime:
                     last_heartbeat = loop.time()
                     handle.state = "RUNNING"
                     await self.emit(
-                        "ready", task_id=task_id, request_id=msg.get("request_id"),
-                        generation=generation, pid=msg.get("pid"), proto=msg.get("proto"),
+                        "ready",
+                        task_id=task_id,
+                        request_id=msg.get("request_id"),
+                        generation=generation,
+                        pid=msg.get("pid"),
+                        proto=msg.get("proto"),
                     )
                     run_rid = self._next_rid()
                     payload = self._run_payload(spec, run_rid, wall_budget, generation)
                     run_msg = {
-                        "type": "run_task", "request_id": run_rid,
-                        "task_id": task_id, **payload,
+                        "type": "run_task",
+                        "request_id": run_rid,
+                        "task_id": task_id,
+                        **payload,
                     }
                     if encode_message(run_msg) is None:
                         protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
@@ -3828,7 +4039,8 @@ class _Runtime:
                         await _kill_worker(proc)
                         break
                     if not await _write_json(
-                        proc, run_msg,
+                        proc,
+                        run_msg,
                         deadline=_stdin_deadline(wall_deadline),
                     ):
                         timeout_phase = "stdin"
@@ -3840,22 +4052,25 @@ class _Runtime:
                     )
                 elif mtype in ("result", "result_envelope"):
                     identity_note = _result_identity_note(msg, task_id, generation)
-                    correlated = (
-                        run_rid is not None and msg.get("request_id") == run_rid
-                    )
+                    correlated = run_rid is not None and msg.get("request_id") == run_rid
                     if not correlated and identity_note is None:
                         identity_note = "result request_id mismatch"
                     if identity_note is not None:
                         await self.emit(
-                            "protocol", task_id=task_id, note=identity_note,
-                            expected=run_rid, got=msg.get("request_id"),
+                            "protocol",
+                            task_id=task_id,
+                            note=identity_note,
+                            expected=run_rid,
+                            got=msg.get("request_id"),
                         )
                     if envelope is not None:
                         # One accepted terminal envelope per run request; a
                         # stale or duplicate result never triggers lifecycle
                         # side effects a second time.
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="duplicate result envelope ignored",
                         )
                     result_payload: dict[str, Any] = {"status": msg.get("status")}
@@ -3863,8 +4078,11 @@ class _Runtime:
                     if provider_metadata is not None:
                         result_payload["provider_metadata"] = provider_metadata
                     await self.emit(
-                        "result", task_id=task_id, request_id=msg.get("request_id"),
-                        generation=generation, **result_payload,
+                        "result",
+                        task_id=task_id,
+                        request_id=msg.get("request_id"),
+                        generation=generation,
+                        **result_payload,
                     )
                     accepted = correlated and identity_note is None and envelope is None
                     if accepted:
@@ -3875,9 +4093,7 @@ class _Runtime:
                     pending = self._pending_children.pop(task_id, [])
                     admitted: list[str] = []
                     if accepted and (pending or self._admission_port is not None):
-                        parent_envelope = self._redact_envelope(
-                            self._strict_envelope(spec, msg)
-                        )
+                        parent_envelope = self._redact_envelope(self._strict_envelope(spec, msg))
                         try:
                             for proposal in pending:
                                 admitted.extend(
@@ -3890,8 +4106,10 @@ class _Runtime:
                         except ConversationAppendError:
                             conversation_failure_reason = "conversation_store_append_failed"
                             await self.emit(
-                                "worker_failed", task_id=task_id,
-                                generation=generation, reason=conversation_failure_reason,
+                                "worker_failed",
+                                task_id=task_id,
+                                generation=generation,
+                                reason=conversation_failure_reason,
                             )
                             await _kill_worker(proc)
                             return _GenOutcome(
@@ -3908,8 +4126,10 @@ class _Runtime:
                         # its final post-resume result; publication happens
                         # once in _complete_child under the supervisor verdict.
                         self._capture_child_result(
-                            spec, msg,
-                            request_id=msg.get("request_id"), generation=generation,
+                            spec,
+                            msg,
+                            request_id=msg.get("request_id"),
+                            generation=generation,
                         )
                     if admitted:
                         self._admitted_children.setdefault(task_id, []).extend(admitted)
@@ -3918,7 +4138,9 @@ class _Runtime:
                     invalid = _invalid_context_checkpoint_fields(msg)
                     if invalid:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="context_checkpoint rejected: invalid field(s)",
                             fields=invalid,
                         )
@@ -3928,9 +4150,12 @@ class _Runtime:
                         or msg.get("generation") != generation
                     ):
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="context_checkpoint rejected: identity mismatch",
-                            expected_task_id=task_id, expected_generation=generation,
+                            expected_task_id=task_id,
+                            expected_generation=generation,
                         )
                     else:
                         self._task_epochs[task_id] = dict(msg)
@@ -3940,8 +4165,11 @@ class _Runtime:
                             msg["epoch"],
                         )
                         await self.emit(
-                            "context_checkpoint", task_id=task_id, generation=generation,
-                            epoch=msg.get("epoch"), turn=msg.get("turn"),
+                            "context_checkpoint",
+                            task_id=task_id,
+                            generation=generation,
+                            epoch=msg.get("epoch"),
+                            turn=msg.get("turn"),
                             checkpoint_ref=msg.get("checkpoint_ref"),
                             cache_key=msg.get("cache_key"),
                         )
@@ -3949,18 +4177,20 @@ class _Runtime:
                     invalid = _invalid_context_epoch_advanced_fields(msg)
                     if invalid:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="context_epoch_advanced rejected: invalid field(s)",
                             fields=invalid,
                         )
-                    elif (
-                        msg.get("task_id") != task_id
-                        or msg.get("generation") != generation
-                    ):
+                    elif msg.get("task_id") != task_id or msg.get("generation") != generation:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="context_epoch_advanced rejected: identity mismatch",
-                            expected_task_id=task_id, expected_generation=generation,
+                            expected_task_id=task_id,
+                            expected_generation=generation,
                         )
                     else:
                         active = self._task_epochs.get(task_id)
@@ -3970,7 +4200,9 @@ class _Runtime:
                             or msg["epoch"] != msg["folded_from_epoch"] + 1
                         ):
                             await self.emit(
-                                "protocol", task_id=task_id, generation=generation,
+                                "protocol",
+                                task_id=task_id,
+                                generation=generation,
                                 note="context_epoch_advanced rejected: stale transition",
                             )
                             continue
@@ -3982,9 +4214,11 @@ class _Runtime:
                                 generation,
                                 msg,
                             )
-                        except (OSError, TypeError, ValueError):
+                        except OSError, TypeError, ValueError:
                             await self.emit(
-                                "protocol", task_id=task_id, generation=generation,
+                                "protocol",
+                                task_id=task_id,
+                                generation=generation,
                                 note="context_epoch_advanced rejected: invalid checkpoint",
                                 fields=["checkpoint_ref"],
                             )
@@ -4006,18 +4240,20 @@ class _Runtime:
                     invalid = _invalid_compaction_failed_fields(msg)
                     if invalid:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="compaction_failed rejected: invalid field(s)",
                             fields=invalid,
                         )
-                    elif (
-                        msg.get("task_id") != task_id
-                        or msg.get("generation") != generation
-                    ):
+                    elif msg.get("task_id") != task_id or msg.get("generation") != generation:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="compaction_failed rejected: identity mismatch",
-                            expected_task_id=task_id, expected_generation=generation,
+                            expected_task_id=task_id,
+                            expected_generation=generation,
                         )
                     else:
                         await self.emit(
@@ -4031,20 +4267,26 @@ class _Runtime:
                 elif mtype == "context_fork_skipped":
                     fork_skip_reason = msg.get("reason")
                     await self.emit(
-                        "context_fork_skipped", task_id=task_id, generation=generation,
+                        "context_fork_skipped",
+                        task_id=task_id,
+                        generation=generation,
                         reason=fork_skip_reason,
                     )
                 elif mtype == "propose_child":
                     invalid_fields = _invalid_propose_child_fields(msg)
                     if invalid_fields:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="propose_child rejected: invalid field(s)",
                             fields=invalid_fields,
                         )
                     elif msg.get("parent_task_id") != task_id:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="propose_child parent_task_id mismatch",
                             parent_task_id=msg.get("parent_task_id"),
                             child_task_id=msg.get("child_task_id"),
@@ -4062,7 +4304,9 @@ class _Runtime:
                     if envelope is None or not correlated:
                         protocol_reason = "reuse_ready_without_result"
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             error_type=protocol_reason,
                             note="reuse_ready before a correlated terminal result",
                         )
@@ -4071,7 +4315,9 @@ class _Runtime:
                     reuse_ready = True
                     keep_alive = True
                     await self.emit(
-                        "reuse_ready", task_id=task_id, generation=generation,
+                        "reuse_ready",
+                        task_id=task_id,
+                        generation=generation,
                         pid=msg.get("pid"),
                     )
                     break
@@ -4086,20 +4332,29 @@ class _Runtime:
                     last_heartbeat = loop.time()
                     handle.last_heartbeat = last_heartbeat
                     await self.emit(
-                        "heartbeat", task_id=task_id, turn=msg.get("turn"),
-                        tool=msg.get("tool"), status=msg.get("status"), generation=generation,
+                        "heartbeat",
+                        task_id=task_id,
+                        turn=msg.get("turn"),
+                        tool=msg.get("tool"),
+                        status=msg.get("status"),
+                        generation=generation,
                     )
                 elif mtype == "checkpoint":
                     await self.emit(
-                        "checkpoint", task_id=task_id, turn=msg.get("turn"),
-                        state_ref=msg.get("state_ref"), generation=generation,
+                        "checkpoint",
+                        task_id=task_id,
+                        turn=msg.get("turn"),
+                        state_ref=msg.get("state_ref"),
+                        generation=generation,
                         commits_so_far=msg.get("commits_so_far"),
                     )
                 elif mtype == "usage_event":
                     invalid_fields = _invalid_usage_event_fields(msg)
                     if invalid_fields:
                         await self.emit(
-                            "protocol", task_id=task_id, generation=generation,
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
                             note="usage_event rejected: invalid field(s)",
                             fields=invalid_fields,
                         )
@@ -4110,7 +4365,9 @@ class _Runtime:
                             if field in msg
                         }
                         await self.emit(
-                            "usage_event", task_id=task_id, generation=generation,
+                            "usage_event",
+                            task_id=task_id,
+                            generation=generation,
                             **forwarded,
                         )
                         # Admission balancing (solution C): fold the redacted
@@ -4124,38 +4381,51 @@ class _Runtime:
                         invalid_fields = _invalid_tool_event_fields(msg)
                         if invalid_fields:
                             await self.emit(
-                                "protocol", task_id=task_id, generation=generation,
+                                "protocol",
+                                task_id=task_id,
+                                generation=generation,
                                 note="tool_event rejected: invalid field(s)",
                                 fields=invalid_fields,
                             )
                         else:
-                            for field in (
-                                "batch_index", "batch_size", "ok", "duration_ms", "turn"
-                            ):
+                            for field in ("batch_index", "batch_size", "ok", "duration_ms", "turn"):
                                 if field in msg:
                                     forwarded[field] = msg[field]
                             await self.emit(
-                                "tool_event", task_id=task_id, generation=generation,
+                                "tool_event",
+                                task_id=task_id,
+                                generation=generation,
                                 **forwarded,
                             )
                     else:
                         await self.emit(
-                            "log", task_id=task_id, generation=generation, **forwarded,
+                            "log",
+                            task_id=task_id,
+                            generation=generation,
+                            **forwarded,
                         )
                 elif mtype == "error":
                     await self.emit(
-                        "log", task_id=task_id, generation=generation, stream="worker-error",
+                        "log",
+                        task_id=task_id,
+                        generation=generation,
+                        stream="worker-error",
                         error_type=msg.get("error_type"),
                         message=str(msg.get("message", ""))[:512],
                     )
                 elif mtype == "log":
                     await self.emit(
-                        "log", task_id=task_id, generation=generation,
+                        "log",
+                        task_id=task_id,
+                        generation=generation,
                         message=str(msg.get("message", ""))[:512],
                     )
                 else:
                     await self.emit(
-                        "protocol", task_id=task_id, type=mtype, note="unhandled message",
+                        "protocol",
+                        task_id=task_id,
+                        type=mtype,
+                        note="unhandled message",
                         generation=generation,
                     )
         except asyncio.CancelledError:
@@ -4188,8 +4458,7 @@ class _Runtime:
         terminal_verdict = (
             envelope is not None
             and correlated
-            and envelope.get("status")
-            in ("succeeded", "failed", "cancelled", "suspended")
+            and envelope.get("status") in ("succeeded", "failed", "cancelled", "suspended")
         )
         if reuse_ready and not message_too_long:
             # The worker stays alive and owns no task state; the handle no
@@ -4198,9 +4467,14 @@ class _Runtime:
             await self._pool_return(proc, cmd, env)
             handle.proc = None
             return _GenOutcome(
-                clean=terminal_verdict, fatal=False, reason=None,
-                exit_code=None, exit_reason=None, envelope=envelope,
-                correlated=correlated, reuse_ready=True,
+                clean=terminal_verdict,
+                fatal=False,
+                reason=None,
+                exit_code=None,
+                exit_reason=None,
+                envelope=envelope,
+                correlated=correlated,
+                reuse_ready=True,
                 admitted_children=tuple(admitted_children),
             )
         exit_code = proc.returncode
@@ -4209,10 +4483,7 @@ class _Runtime:
         clean = (
             exit_reason is not None
             and terminal_verdict
-            and (
-                exit_code == 0
-                or cast(dict[str, Any], envelope).get("status") != "succeeded"
-            )
+            and (exit_code == 0 or cast(dict[str, Any], envelope).get("status") != "succeeded")
         )
         reason: str | None
         if message_too_long:
@@ -4235,16 +4506,18 @@ class _Runtime:
         return _GenOutcome(
             clean=clean,
             fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",
-            reason=protocol_failure or protocol_reason or reason, timeout_phase=timeout_phase,
-            exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
-            correlated=correlated, admitted_children=tuple(admitted_children),
+            reason=protocol_failure or protocol_reason or reason,
+            timeout_phase=timeout_phase,
+            exit_code=exit_code,
+            exit_reason=exit_reason,
+            envelope=envelope,
+            correlated=correlated,
+            admitted_children=tuple(admitted_children),
         )
 
     # -- publish eligibility --------------------------------------------------
 
-    async def _worker_success_integrity(
-        self, spec: dict[str, Any], worktree: Path
-    ) -> str | None:
+    async def _worker_success_integrity(self, spec: dict[str, Any], worktree: Path) -> str | None:
         """Reject an unpublishable worker verdict before merging.
 
         Returns a failure reason when the worker's success claim is not
@@ -4254,9 +4527,7 @@ class _Runtime:
         supervisor-owned ``.cambium`` fence directory is exempt.
         """
         worktree = Path(worktree)
-        symbolic = await self._git_stdout(
-            worktree, "symbolic-ref", "--quiet", "HEAD", check=False
-        )
+        symbolic = await self._git_stdout(worktree, "symbolic-ref", "--quiet", "HEAD", check=False)
         if not symbolic:
             return "worker_detached_head"
         if symbolic != f"refs/heads/{spec['branch']}":
@@ -4271,10 +4542,7 @@ class _Runtime:
         )
         if status.returncode != 0:
             return "worker_status_failed"
-        if any(
-            not _status_line_is_fence(line)
-            for line in status.stdout.splitlines()
-        ):
+        if any(not _status_line_is_fence(line) for line in status.stdout.splitlines()):
             return "worker_tree_dirty"
         return None
 
@@ -4292,7 +4560,9 @@ class _Runtime:
             event_task_id = event_payload.pop("task", task_id)
             future = asyncio.run_coroutine_threadsafe(
                 self.emit(
-                    kind, task_id=event_task_id, _observer_failure_is_fatal=False,
+                    kind,
+                    task_id=event_task_id,
+                    _observer_failure_is_fatal=False,
                     _deferred_observers=deferred_observers,
                     **event_payload,
                 ),
@@ -4307,8 +4577,7 @@ class _Runtime:
                 # circularly deadlock every merge thread. Fail the merge
                 # closed rather than silently dropping the terminal event.
                 raise RuntimeError(
-                    f"durable terminal event {kind!r} not persisted within "
-                    f"{timeout_s}s"
+                    f"durable terminal event {kind!r} not persisted within {timeout_s}s"
                 ) from exc
 
         return MergeSequencer(
@@ -4348,8 +4617,11 @@ class _Runtime:
             )
             if (kind == "merge_reconciled" or recovered) and task_id is not None:
                 self._results[task_id] = TaskResult(
-                    task_id=task_id, status="succeeded", exit_code=0,
-                    reason=None, merge_sha=payload.get("new"),
+                    task_id=task_id,
+                    status="succeeded",
+                    exit_code=0,
+                    reason=None,
+                    merge_sha=payload.get("new"),
                 )
             emitted.add(kind)
         return emitted
@@ -4378,7 +4650,9 @@ class _Runtime:
             throwaway = self._session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
             seq = self._make_sequencer(task_id)
             current = await asyncio.to_thread(
-                seq.reconcile, repo, throwaway,
+                seq.reconcile,
+                repo,
+                throwaway,
                 scan_quarantine=repo not in scanned_repos,
                 quarantine_events=durable_quarantines,
             )
@@ -4392,7 +4666,8 @@ class _Runtime:
             events = await asyncio.to_thread(self._store.events_after, 0)
             terminal = next(
                 (
-                    event for event in reversed(events)
+                    event
+                    for event in reversed(events)
                     if event["kind"] in ("merge_committed", "merge_reconciled")
                     and event["payload"].get("new") == current
                     and event.get("task_id") == task_id
@@ -4401,14 +4676,23 @@ class _Runtime:
             )
             if terminal is not None:
                 self._results[task_id] = TaskResult(
-                    task_id=task_id, status="succeeded", exit_code=0,
-                    reason=None, merge_sha=current,
+                    task_id=task_id,
+                    status="succeeded",
+                    exit_code=0,
+                    reason=None,
+                    merge_sha=current,
                 )
                 continue
-            refs = await self._git_stdout(
-                repo, "for-each-ref", "--format=%(refname:strip=3) %(objectname)",
-                "refs/cambium/staging", check=False,
-            ) or ""
+            refs = (
+                await self._git_stdout(
+                    repo,
+                    "for-each-ref",
+                    "--format=%(refname:strip=3) %(objectname)",
+                    "refs/cambium/staging",
+                    check=False,
+                )
+                or ""
+            )
             owner: str | None = None
             for line in refs.splitlines():
                 suffix, _, tip = line.partition(" ")
@@ -4418,12 +4702,18 @@ class _Runtime:
                     break
             if owner is not None:
                 await self.emit(
-                    "merge_reconciled", task_id=owner, new=current, repo=str(repo),
+                    "merge_reconciled",
+                    task_id=owner,
+                    new=current,
+                    repo=str(repo),
                     reason="ref-advanced-before-event",
                 )
                 self._results[owner] = TaskResult(
-                    task_id=owner, status="succeeded", exit_code=0,
-                    reason=None, merge_sha=current,
+                    task_id=owner,
+                    status="succeeded",
+                    exit_code=0,
+                    reason=None,
+                    merge_sha=current,
                 )
 
     async def _merge_task(self, spec: dict[str, Any], handle: WorkerHandle) -> str | None:
@@ -4472,8 +4762,13 @@ class _Runtime:
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
                 ref_published = True
                 await self.emit(
-                    "merge_committed", task_id=task_id, old=current_main, new=staging_tip,
-                    repo=str(repo), branch=branch, generation=handle.generation,
+                    "merge_committed",
+                    task_id=task_id,
+                    old=current_main,
+                    new=staging_tip,
+                    repo=str(repo),
+                    branch=branch,
+                    generation=handle.generation,
                     _deferred_observers=deferred,
                 )
                 committed_persisted = True
@@ -4482,13 +4777,20 @@ class _Runtime:
             error_type = exc.__class__.__name__
             if error_type in ("NonFastForwardError", "MergeConflictError"):
                 await self.emit(
-                    "merge_failed", task_id=task_id, merge_error=error_type,
-                    message=str(exc)[:512], generation=handle.generation,
+                    "merge_failed",
+                    task_id=task_id,
+                    merge_error=error_type,
+                    message=str(exc)[:512],
+                    generation=handle.generation,
                 )
             else:
                 await self.emit(
-                    "merge_failed", task_id=task_id, merge_error=error_type,
-                    message=str(exc)[:512], generation=handle.generation, internal=True,
+                    "merge_failed",
+                    task_id=task_id,
+                    merge_error=error_type,
+                    message=str(exc)[:512],
+                    generation=handle.generation,
+                    internal=True,
                 )
         finally:
             try:
@@ -4498,13 +4800,13 @@ class _Runtime:
                     await asyncio.to_thread(seq.cleanup_staging, repo)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 cleanup_failed = True
-                emitted = await self._flush_sequencer_events(
-                    seq, deferred_observers=deferred
-                )
+                emitted = await self._flush_sequencer_events(seq, deferred_observers=deferred)
                 if committed_persisted and "merge_staging_cleanup_failed" not in emitted:
                     await self.emit(
-                        "merge_staging_cleanup_failed", task_id=task_id,
-                        staging_sha=staging_tip, reason=exc.__class__.__name__,
+                        "merge_staging_cleanup_failed",
+                        task_id=task_id,
+                        staging_sha=staging_tip,
+                        reason=exc.__class__.__name__,
                     )
             else:
                 await self._flush_sequencer_events(seq, deferred_observers=deferred)
@@ -4518,8 +4820,12 @@ class _Runtime:
             subprocess.SubprocessError,
         ) as exc:
             await self.emit(
-                "merge_failed", task_id=task_id, merge_error=exc.__class__.__name__,
-                message=str(exc)[:512], generation=handle.generation, internal=True,
+                "merge_failed",
+                task_id=task_id,
+                merge_error=exc.__class__.__name__,
+                message=str(exc)[:512],
+                generation=handle.generation,
+                internal=True,
             )
             return None
         if merge_failed or cleanup_failed:
@@ -4555,12 +4861,15 @@ def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
     never replaces it.
     """
     target = Path(session_dir) / "plan.json"
-    content = json.dumps(
-        plan,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    ) + "\n"
+    content = (
+        json.dumps(
+            plan,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     if target.exists():
         existing_bytes = target.read_bytes()
         if existing_bytes == content.encode("utf-8"):
@@ -4568,10 +4877,9 @@ def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
         try:
             existing_plan = json.loads(existing_bytes)
             existing_specs = [
-                _validate_plan_task(session_dir, task)
-                for task in _plan_tasks(existing_plan)
+                _validate_plan_task(session_dir, task) for task in _plan_tasks(existing_plan)
             ]
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             existing_specs = []
         if plan == {"tasks": existing_specs}:
             return target
@@ -4632,15 +4940,11 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         raise ValueError(f"task {task_id} requires 'branch'")
     worktree = Path(spec["worktree_path"]).resolve()
     if not worktree.is_relative_to(session_root):
-        raise ValueError(
-            f"worktree_path {worktree} is outside the session dir {session_root}"
-        )
+        raise ValueError(f"worktree_path {worktree} is outside the session dir {session_root}")
     spec["repo"] = str(Path(spec["repo"]).resolve())
     spec["worktree_path"] = str(worktree)
     if Path(spec["repo"]).resolve() == worktree:
-        raise ValueError(
-            f"task {task_id}: worktree_path must not be the repo itself ({worktree})"
-        )
+        raise ValueError(f"task {task_id}: worktree_path must not be the repo itself ({worktree})")
     provider_env_keys = spec.get("provider_env_keys", ())
     if isinstance(provider_env_keys, (str, bytes)):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
@@ -4653,14 +4957,14 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
         or not isinstance(authorized_providers, (list, tuple))
         or not all(isinstance(name, str) and name for name in authorized_providers)
     ):
-        raise ValueError(
-            f"task {task_id} authorized_providers must be a list of names"
-        )
+        raise ValueError(f"task {task_id} authorized_providers must be a list of names")
     spec["authorized_providers"] = list(authorized_providers)
     model_candidates = spec.get("model_candidates")
     if model_candidates is not None:
-        if not isinstance(model_candidates, (list, tuple)) or not model_candidates or not all(
-            isinstance(model, str) and bool(model.strip()) for model in model_candidates
+        if (
+            not isinstance(model_candidates, (list, tuple))
+            or not model_candidates
+            or not all(isinstance(model, str) and bool(model.strip()) for model in model_candidates)
         ):
             raise ValueError(
                 f"task {task_id} model_candidates must be a non-empty list of model ids"
@@ -4852,9 +5156,7 @@ def _fork_cache_compatible_supervisor(
     authorized_providers: frozenset[str],
 ) -> tuple[bool, str | None]:
     """Check every supervisor-visible cache identity before pinning a child."""
-    compatible, reason = _worker_fork_cache_compatible(
-        child_spec, epoch, authorized_providers
-    )
+    compatible, reason = _worker_fork_cache_compatible(child_spec, epoch, authorized_providers)
     if not compatible:
         return False, reason
     cache_key = epoch.get("cache_key")
@@ -4874,11 +5176,15 @@ def _fork_cache_compatible_supervisor(
                 break
         if configured_provider is None:
             providers = fanout.get("providers")
-            names = [
-                entry.get("name")
-                for entry in providers
-                if isinstance(entry, dict) and isinstance(entry.get("name"), str)
-            ] if isinstance(providers, (list, tuple)) else []
+            names = (
+                [
+                    entry.get("name")
+                    for entry in providers
+                    if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                ]
+                if isinstance(providers, (list, tuple))
+                else []
+            )
             if len(names) == 1:
                 configured_provider = names[0]
     if isinstance(configured_provider, str) and configured_provider != provider:
@@ -4905,7 +5211,7 @@ def _fork_cache_compatible_supervisor(
                 for provider_config in load_providers(Path(config_path))
                 if provider_config.name == provider
             )
-        except (OSError, StopIteration, ValueError):
+        except OSError, StopIteration, ValueError:
             return False, "provider configuration is unavailable"
         actual_protocol = configured.protocol.value
         actual_reasoning = configured.reasoning_effort
@@ -4981,9 +5287,7 @@ def _child_spec(
     # An empty parent set is the legacy unrestricted carrier.  A child may
     # narrow that set, but it cannot gain access through a non-empty parent.
     child_spec["authorized_providers"] = sorted(
-        requested_authorized & parent_authorized
-        if parent_authorized
-        else requested_authorized
+        requested_authorized & parent_authorized if parent_authorized else requested_authorized
     )
 
     parent_configured_path = parent_spec.get("provider_config_path")
@@ -4993,9 +5297,10 @@ def _child_spec(
             raise ValueError("child provider_config_path must be a non-empty path")
         if not isinstance(parent_configured_path, str) or not parent_configured_path:
             raise ValueError("child provider_config_path override is forbidden")
-        if Path(child_configured_path).expanduser().resolve() != Path(
-            parent_configured_path
-        ).expanduser().resolve():
+        if (
+            Path(child_configured_path).expanduser().resolve()
+            != Path(parent_configured_path).expanduser().resolve()
+        ):
             raise ValueError("child provider_config_path override is forbidden")
     if isinstance(parent_configured_path, str) and parent_configured_path:
         child_spec["provider_config_path"] = parent_configured_path
@@ -5043,14 +5348,11 @@ def _child_spec(
                     if isinstance(entry, dict) and isinstance(entry.get("name"), str)
                 }
                 if not child_provider_names.issubset(parent_provider_names):
-                    raise ValueError(
-                        "child fanout_config.providers would widen parent identity"
-                    )
+                    raise ValueError("child fanout_config.providers would widen parent identity")
                 child_fanout["providers"] = [
                     copy.deepcopy(entry)
                     for entry in parent_providers
-                    if isinstance(entry, dict)
-                    and entry.get("name") in child_provider_names
+                    if isinstance(entry, dict) and entry.get("name") in child_provider_names
                 ]
         elif child_providers is not None:
             if not isinstance(child_providers, (list, tuple)):
@@ -5061,8 +5363,7 @@ def _child_spec(
                 if isinstance(entry, dict) and isinstance(entry.get("name"), str)
             }
             allowed_names = parent_authorized | {
-                value for value in (parent_spec.get("assigned_provider"),)
-                if isinstance(value, str)
+                value for value in (parent_spec.get("assigned_provider"),) if isinstance(value, str)
             }
             if not child_provider_names.issubset(allowed_names):
                 raise ValueError("child fanout_config.providers would widen parent identity")
@@ -5205,19 +5506,13 @@ def _has_dependencies(spec: dict[str, Any]) -> bool:
     return isinstance(deps, list) and len(deps) > 0
 
 
-def _resolve_width(
-    max_width: int | None, plan: dict[str, Any] | list[dict[str, Any]]
-) -> int:
+def _resolve_width(max_width: int | None, plan: dict[str, Any] | list[dict[str, Any]]) -> int:
     """Resolve the per-wave dispatch width: parameter, then plan field, then default."""
     if isinstance(max_width, int) and not isinstance(max_width, bool) and max_width > 0:
         return max_width
     if isinstance(plan, dict):
         field = plan.get("max_width")
-        if (
-            isinstance(field, int)
-            and not isinstance(field, bool)
-            and field > 0
-        ):
+        if isinstance(field, int) and not isinstance(field, bool) and field > 0:
             return field
     return MAX_WIDTH
 
@@ -5324,9 +5619,7 @@ async def _dispatch_static_waves(
     for parent, child in tree.edges:
         children[parent].append(child)
 
-    succeeded = {
-        tid for tid, result in runtime._results.items() if result.status == "succeeded"
-    }
+    succeeded = {tid for tid, result in runtime._results.items() if result.status == "succeeded"}
     terminal = set(runtime._results.keys())
 
     def cascade_skip(failed_tid: str) -> None:
@@ -5351,9 +5644,7 @@ async def _dispatch_static_waves(
 
     while len(terminal) < len(tree.nodes):
         ready_nodes = [
-            node
-            for node in ready_tasks(tree, succeeded)
-            if node.task_id not in terminal
+            node for node in ready_tasks(tree, succeeded) if node.task_id not in terminal
         ]
         if not ready_nodes:
             break
@@ -5476,9 +5767,7 @@ async def run_plan(
             _reject_reused_session(session_dir)
         await asyncio.to_thread(_write_plan, session_dir, {"tasks": specs})
         started_at = time.time()
-        redactor = _session_redactor(
-            specs, provider_environment, oauth_store=oauth_store
-        )
+        redactor = _session_redactor(specs, provider_environment, oauth_store=oauth_store)
         store = EventStore(session_dir / ".cambium" / "events.db", redactor=redactor)
         # Usage-debt ledger for admission balancing (solution C): load the
         # persisted state once, feed it live from usage_event rows, and
@@ -5518,7 +5807,8 @@ async def run_plan(
         await runtime.start()
         if routing_state_load_error is not None:
             await runtime.emit(
-                "log", task_id=None,
+                "log",
+                task_id=None,
                 message=f"routing-state load failed: {routing_state_load_error}",
             )
         runtime.set_session_tasks(specs)
@@ -5557,13 +5847,12 @@ async def run_plan(
                         # Emitted while the event store is still open — after
                         # shutdown the record could not be persisted.
                         await runtime.emit(
-                            "log", task_id=None,
+                            "log",
+                            task_id=None,
                             message=f"routing-state save failed: {exc}",
                         )
             finally:
-                await runtime.shutdown(
-                    session_status="cancelled" if cancelled else "ended"
-                )
+                await runtime.shutdown(session_status="cancelled" if cancelled else "ended")
         result = _build_session_result(runtime, session_dir, started_at, cancelled=cancelled)
         session_id = str(session_dir.resolve())
         await asyncio.to_thread(write_result, result, session_dir, session_id=session_id)
@@ -5639,7 +5928,7 @@ async def _amain_plan(
     loop = asyncio.get_running_loop()
 
     def print_event(record: dict[str, Any]) -> None:
-        print(f'{record["kind"]:>16}  {json.dumps(record["payload"])}', flush=True)
+        print(f"{record['kind']:>16}  {json.dumps(record['payload'])}", flush=True)
 
     task = asyncio.ensure_future(
         run_plan(
@@ -5654,7 +5943,7 @@ async def _amain_plan(
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, task.cancel)
-        except (NotImplementedError, RuntimeError):
+        except NotImplementedError, RuntimeError:
             pass
     try:
         plan_result = await task
@@ -5673,26 +5962,20 @@ async def _amain_plan(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="cambium supervisor", description="Cambium supervisor"
-    )
+    parser = argparse.ArgumentParser(prog="cambium supervisor", description="Cambium supervisor")
     parser.add_argument("--session-dir", required=True)
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument(
         "--plan",
-        help="path to plan JSON {\"tasks\": [{\"task_id\", \"task\", \"repo\", "
-        "\"worktree_path\", \"branch\", \"base_commit\", ...}]} "
+        help='path to plan JSON {"tasks": [{"task_id", "task", "repo", '
+        '"worktree_path", "branch", "base_commit", ...}]} '
         "(multi-worker mode)",
     )
     inputs.add_argument(
         "--task-spec",
-        help=(
-            "path to task spec JSON (one-task mode)"
-        ),
+        help=("path to task spec JSON (one-task mode)"),
     )
-    inputs.add_argument(
-        "--demo", action="store_true", help="run the built-in mutating demo"
-    )
+    inputs.add_argument("--demo", action="store_true", help="run the built-in mutating demo")
     parser.add_argument(
         "--warm-pool-size",
         type=int,

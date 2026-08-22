@@ -60,8 +60,7 @@ class FakeServer:
     def __init__(
         self,
         behaviors: list[
-            tuple[int, dict[str, Any], float]
-            | tuple[int, dict[str, Any], float, dict[str, str]]
+            tuple[int, dict[str, Any], float] | tuple[int, dict[str, Any], float, dict[str, str]]
         ],
         *,
         echo_authorization_in_body: bool = False,
@@ -88,9 +87,7 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(
-        self, index: int
-    ) -> tuple[int, dict[str, Any], float, dict[str, str]]:
+    def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior
@@ -137,8 +134,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "error": {
                         **error,
                         "message": (
-                            f"{error.get('message', '')}; "
-                            f"{self.headers.get('Authorization')}"
+                            f"{error.get('message', '')}; {self.headers.get('Authorization')}"
                         ),
                     },
                 }
@@ -509,9 +505,7 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
         [
             (
                 401,
-                _error_payload(
-                    "invalid credential; see https://body-user:body-pass@example.test"
-                ),
+                _error_payload("invalid credential; see https://body-user:body-pass@example.test"),
                 0.0,
             )
         ],
@@ -765,10 +759,7 @@ def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypat
         assert result.content == ""
         assert result.tool_calls is not None
         assert result.tool_calls[0]["function"]["name"] == "read_file"
-        assert (
-            result.tool_calls[0]["function"]["arguments"]
-            == '{"path": "README.md", "offset": 5}'
-        )
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "README.md", "offset": 5}'
         assert router.health("p_read") is HealthState.HEALTHY
     finally:
         server.close()
@@ -1017,9 +1008,7 @@ def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
     # transport allowlist (only localhost/127.0.0.1/::1), so it is a genuine
     # non-loopback http origin for the redirect target.
     target = FakeServer([(200, _ok_payload("must never arrive"), 0.0)], host="127.0.0.2")
-    redirector = FakeServer(
-        [(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})]
-    )
+    redirector = FakeServer([(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})])
     _set_keys(monkeypatch, "K_REDIRECT")
     router = Diffundo(
         (_config("p_redirect", redirector, "K_REDIRECT"),),
