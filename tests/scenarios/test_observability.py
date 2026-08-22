@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 
 from cambium.monitor import render_agent_lines, render_dashboard
-from cambium.observability import ObservabilityState, snapshot_from_events
+from cambium.observability import (
+    ObservabilityState,
+    _checkpoint_path,
+    snapshot_from_events,
+)
 from cambium.summary_trunk import SUMMARY_ENTRY_CLOSE, SUMMARY_ENTRY_OPEN
 
 
@@ -115,6 +119,29 @@ def test_terminal_state_is_not_overwritten_by_late_heartbeat() -> None:
     snapshot = state.snapshot()
     assert snapshot.agents[0].state == "failed"
     assert snapshot.agents[0].turn == 9
+
+
+def test_first_terminal_state_wins_over_late_exit() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", status="succeeded"),
+            _event(2, "exit", task_id="root"),
+        ]
+    )
+    assert snapshot.agents[0].state == "succeeded"
+    assert snapshot.succeeded_agents == 1
+    assert snapshot.failed_agents == 0
+
+
+def test_checkpoint_inspection_rejects_symlink_outside_session(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    link = session / ".cambium" / "checkpoints" / "root" / "checkpoint.json"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside)
+
+    assert _checkpoint_path(session, "root/checkpoint.json") is None
 
 
 def test_checkpoint_inspection_counts_immutable_segments(tmp_path: Path) -> None:

@@ -147,6 +147,15 @@ def test_session_listing_surfaces_invalid_results(tmp_path):
         session.list_sessions(root)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf"), 10**10_000],
+    ids=["nan", "positive-inf", "negative-inf", "huge-int"],
+)
+def test_session_timestamp_uses_negative_infinity_for_nonfinite_values(value) -> None:
+    assert session._timestamp(value) == float("-inf")
+
+
 def test_cli_session_show_renderer_failure_is_clean(capsys, tmp_path):
     root = tmp_path / "sessions"
     session_dir = root / "nan"

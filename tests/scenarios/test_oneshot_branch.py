@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+
+import pytest
 from typing import Any
 
 from cambium import oneshot
@@ -235,4 +237,68 @@ def test_auto_mode_requires_stored_credential(tmp_path: Path) -> None:
         assert "stored credentials" in str(exc)
     else:
         raise AssertionError("auto with no stored credentials must fail closed")
+
+
+def test_explicit_provider_requires_usable_credential_and_key_in_plan(
+    tmp_path: Path,
+) -> None:
+    from cambium.oneshot import _resolve_provider
+
+    repo = _repo(tmp_path / "repo")
+    config_path = _write_providers(tmp_path / "providers.json")
+    store = _stored_auth(tmp_path)  # only pa is authorized initially
+    config = oneshot.OneShotConfig(
+        prompt="p",
+        repo=repo,
+        provider="pb",
+        provider_config_path=config_path,
+    )
+
+    with pytest.raises(ValueError, match="not authorized"):
+        _resolve_provider(config, repo, auth_store=store)
+
+    store.set_provider("pb", "secret-b")
+    resolved, environment = _resolve_provider(config, repo, auth_store=store)
+    assert "CAMBIUM_PROVIDER_PB_API_KEY" in resolved.provider_env_keys
+    assert environment["CAMBIUM_PROVIDER_PB_API_KEY"] == "secret-b"
+
+
+def test_resume_requires_existing_session_artifact(tmp_path: Path) -> None:
+    config = oneshot.OneShotConfig(
+        prompt="resume",
+        repo=tmp_path,
+        session_mode=oneshot.SessionMode.RESUME,
+    )
+    session_dir = tmp_path / "session"
+
+    with pytest.raises(ValueError, match="requires an existing session"):
+        oneshot.admit_session(config, session_dir)
+    with pytest.raises(ValueError, match="requires an existing session"):
+        oneshot.build_plan(config, tmp_path, session_dir)
+
+    session_dir.mkdir()
+    with pytest.raises(ValueError, match="requires an existing session"):
+        oneshot.admit_session(config, session_dir)
+
+    (session_dir / "plan.json").write_text("{}", encoding="utf-8")
+    oneshot.admit_session(config, session_dir)
+    assert oneshot.build_plan(config, tmp_path, session_dir)["tasks"][0][
+        "session_mode"
+    ] == "resume"
+
+
+def test_resume_without_explicit_session_does_not_allocate_one(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    config = oneshot.OneShotConfig(
+        prompt="resume",
+        repo=repo,
+        target_file="file.txt",
+        marker="// marker",
+        session_mode=oneshot.SessionMode.RESUME,
+    )
+
+    with pytest.raises(ValueError, match="explicit existing session"):
+        asyncio.run(oneshot.run_oneshot(config))
+    sessions_root = repo / ".cambium" / "sessions"
+    assert not sessions_root.exists()
 
