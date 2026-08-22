@@ -33,6 +33,7 @@ def _config(path: Path, *, provider: str = "openai", required: bool = False) -> 
                         "base_url": "https://api.example.test/v1",
                         "api_key_env": auth.derived_env_name(provider),
                         "required": required,
+                        "model": "gpt-5.6",
                     }
                 ]
             }

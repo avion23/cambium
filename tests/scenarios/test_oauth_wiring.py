@@ -619,6 +619,7 @@ def test_doctor_oauth_live_skips_without_codex_providers(tmp_path: Path) -> None
                         "tier": "strong",
                         "base_url": "https://api.openai.com/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
+                        "model": "gpt-5.6",
                     }
                 ]
             }
