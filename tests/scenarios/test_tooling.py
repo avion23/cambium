@@ -184,7 +184,21 @@ def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -
     conversations = session_dir / ".cambium" / "conversations.db"
     conversations.parent.mkdir(parents=True)
     with sqlite3.connect(conversations) as connection:
-        connection.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY)")
+        connection.execute(
+            """CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                parent_id INTEGER NULL,
+                turn INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                tokens INTEGER NULL,
+                kind TEXT NOT NULL DEFAULT 'turn',
+                meta TEXT NULL
+            )"""
+        )
 
     result = _run_doctor("--session-dir", str(session_dir), cwd=tmp_path)
 
