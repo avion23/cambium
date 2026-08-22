@@ -19,8 +19,12 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install Python 3.14 and development dependencies
         run: uv sync --extra dev --python 3.14
+      - name: Adapt generator to latest upstream UI
+        run: uv run --python 3.14 python scripts/adapt_operator_upgrade_latest.py prepare
       - name: Apply implementation against latest main
         run: uv run --python 3.14 python scripts/apply_operator_upgrade.py
+      - name: Preserve latest upstream UI behavior
+        run: uv run --python 3.14 python scripts/adapt_operator_upgrade_latest.py finalize
       - name: Show generated change surface
         run: git diff --stat && git status --short
       - name: Normalize Python
@@ -37,5 +41,7 @@ jobs:
           tests/scenarios/test_oauth_wiring.py
           tests/scenarios/test_optimize.py
           tests/scenarios/test_context_epochs.py
+          tests/scenarios/test_render_stream.py
+          tests/scenarios/test_render_markdown.py
       - name: Whitespace
         run: git diff --check
