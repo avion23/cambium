@@ -348,6 +348,7 @@ class ProviderError(DiffundoError):
         retry_after_s: float | None = None,
         request_rate_status: str | None = None,
         account_quota_owner: str | None = None,
+        probe_already_in_flight: bool = False,
     ) -> None:
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
@@ -358,6 +359,9 @@ class ProviderError(DiffundoError):
         self.retry_after_s = retry_after_s
         self.request_rate_status = request_rate_status
         self.account_quota_owner = account_quota_owner
+        # A stale candidate list can race with another HALF_OPEN probe. This
+        # rejection is admission control, not provider health evidence.
+        self.probe_already_in_flight = probe_already_in_flight
 
 
 class CostBudgetExceeded(DiffundoError):
@@ -1294,27 +1298,43 @@ class Diffundo:
         *,
         model: str | None = None,
         budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
         Falls through on timeout/error/quota/refusal; providers in cooldown,
         OPEN, DISABLED, or rate-limited are skipped by the selection filter.
-        When every tier provider is unavailable the dispatch pauses on an
-        ``asyncio.Event`` and a recovery monitor wakes it (D8f); if nothing
-        recovers within the bounded pause window, raises ``AllProvidersFailed``.
+        A pinned ``model`` is strict unless this request explicitly sets
+        ``allow_model_substitution``; provider configuration alone never
+        authorizes a task to switch models. When every tier provider is
+        unavailable the dispatch pauses on an ``asyncio.Event`` and a recovery
+        monitor wakes it (D8f); if nothing recovers within the bounded pause
+        window, raises ``AllProvidersFailed``.
         """
         validate_prompt_structure(prompt)
         deadline = time.monotonic() + self._call_budget_s
         tried: list[str] = []
         last_error: BaseException | None = None
         while True:
-            candidates = await self._await_candidates(tier, model, deadline)
+            candidates = await self._await_candidates(
+                tier,
+                model,
+                deadline,
+                allow_model_substitution=allow_model_substitution,
+            )
             if not candidates:
                 raise AllProvidersFailed(tried, last_error)
+            probe_rejected = False
             for provider in candidates:
                 try:
                     result = await self._attempt(provider, prompt, deadline=deadline)
                 except ProviderError as exc:
+                    if exc.probe_already_in_flight:
+                        # A concurrent caller owns the HALF_OPEN probe. Do not
+                        # count this stale-candidate rejection as a provider
+                        # failure or make it the terminal cascade error.
+                        probe_rejected = True
+                        continue
                     tried.append(provider.name)
                     last_error = exc
                     if exc.budget_exhausted:
@@ -1328,6 +1348,10 @@ class Diffundo:
                 # on (prompt-prefix caching locality).
                 self._primary_provider = provider.name
                 return result
+            if probe_rejected and not tried:
+                # Let the active probe finish and re-evaluate health rather
+                # than returning an artificial all-providers failure.
+                continue
             raise AllProvidersFailed(tried, last_error)
 
     def health(self, name: str) -> HealthState:
@@ -1404,8 +1428,14 @@ class Diffundo:
         """Clear task-local state when a warm worker is rebound to another task."""
 
         self._provider_lease = None
+        self._primary_provider = None
 
-    def _candidates(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
+    def _candidates(
+        self,
+        tier: ProviderTier,
+        model: str | None,
+        allow_model_substitution: bool = False,
+    ) -> list[ProviderConfig]:
         candidates = list(self._candidates_unleased(tier, model))
         lease = self._provider_lease
         if lease is not None:
@@ -1420,7 +1450,8 @@ class Diffundo:
             substitutes = [
                 provider
                 for provider in candidates
-                if provider.model != requested_model
+                if allow_model_substitution
+                and provider.model != requested_model
                 and provider.allow_model_substitution
             ]
             candidates = [*exact, *substitutes]
@@ -1433,10 +1464,10 @@ class Diffundo:
 
         When ``model`` is pinned, providers in the same tier that declare a
         different model are kept as ordered fallback candidates behind the
-        strict model matches, so a quota/rate-limit failure on the pinned
-        provider can cascade to a sibling instead of surfacing as
-        ``AllProvidersFailed``. If no provider declares the pinned model, the
-        pin is a configuration error and no candidate is returned.
+        strict model matches. ``_candidates`` admits those substitutes only
+        when the request explicitly authorizes substitution and the sibling's
+        provider-global opt-in is true. If no provider declares the pinned
+        model, the pin is a configuration error and no candidate is returned.
         """
         now = time.monotonic()
         eligible: list[ProviderConfig] = []
@@ -1486,6 +1517,8 @@ class Diffundo:
         tier: ProviderTier,
         model: str | None,
         deadline: float,
+        *,
+        allow_model_substitution: bool = False,
     ) -> list[ProviderConfig]:
         """Return candidates, pausing on exhaustion (D8f) until a provider
         recovers or the pause window / deadline is spent."""
@@ -1494,7 +1527,11 @@ class Diffundo:
             now = time.monotonic()
             if now >= deadline:
                 return []
-            candidates = self._candidates(tier, model)
+            candidates = self._candidates(
+                tier,
+                model,
+                allow_model_substitution=allow_model_substitution,
+            )
             if candidates:
                 return candidates
             if paused_total >= self._pause_timeout_s:
@@ -1647,7 +1684,12 @@ class Diffundo:
         async with runtime.lock:
             probing = runtime.health in (HealthState.HALF_OPEN, HealthState.COOLDOWN)
             if probing and runtime.probe_in_flight:
-                raise ProviderError(provider.name, ProviderOutcome.ERROR, "probe already in flight")
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    "probe already in flight",
+                    probe_already_in_flight=True,
+                )
             if not runtime.bucket.try_take():
                 raise ProviderError(provider.name, ProviderOutcome.QUOTA, "token bucket empty")
             if probing:
@@ -1669,7 +1711,12 @@ class Diffundo:
                     if remaining is not None:
                         timeout_s = min(timeout_s, remaining)
                     try:
-                        raw = await self._post(provider, prompt, timeout_s=timeout_s)
+                        raw = await self._post_with_deadline(
+                            provider,
+                            prompt,
+                            timeout_s=timeout_s,
+                            deadline=deadline,
+                        )
                         result = raw.to_result(
                             provider,
                             prompt,
@@ -1766,6 +1813,67 @@ class Diffundo:
     ) -> _RawResponse:
         return await asyncio.to_thread(self._post_sync, provider, prompt, timeout_s)
 
+    @staticmethod
+    def _consume_post_task(task: asyncio.Task[Any]) -> None:
+        """Retrieve a timed-out worker task's eventual exception.
+
+        ``asyncio.to_thread`` cannot interrupt a blocking urllib call. The
+        router must still return at its wall deadline, so the timed-out task is
+        allowed to finish in the executor and its result is consumed here.
+        """
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            # Retrieving the exception is best-effort cleanup only.
+            pass
+
+    async def _post_with_deadline(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+    ) -> _RawResponse:
+        """Run one threaded HTTP operation under the call's wall deadline."""
+        if deadline is None:
+            return await self._post(provider, prompt, timeout_s=timeout_s)
+        remaining = self._remaining(deadline)
+        if remaining is None or remaining <= 0:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                "call budget exhausted",
+                budget_exhausted=True,
+            )
+        post_task = asyncio.create_task(
+            self._post(provider, prompt, timeout_s=timeout_s)
+        )
+        try:
+            # Shield the task so wait_for returns at the deadline even though
+            # cancellation cannot stop the underlying executor thread.
+            result = await asyncio.wait_for(asyncio.shield(post_task), timeout=remaining)
+        except TimeoutError as exc:
+            post_task.add_done_callback(self._consume_post_task)
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                "call budget exhausted",
+                exc,
+                budget_exhausted=True,
+            ) from exc
+        remaining = self._remaining(deadline)
+        if remaining is not None and remaining <= 0:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                "call budget exhausted",
+                budget_exhausted=True,
+            )
+        return result
+
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
@@ -1776,6 +1884,12 @@ class Diffundo:
         # header over plaintext http to a non-loopback host (security audit).
         parsed = urlparse(provider.base_url)
         scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "provider URL scheme must be http or https",
+            )
         if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
             raise ProviderError(
                 provider.name,
