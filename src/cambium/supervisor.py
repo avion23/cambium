@@ -1722,6 +1722,11 @@ class _GenOutcome:
     # Dynamic admission: the child task ids admitted at this generation's
     # terminal envelope, in deterministic order (Cache-first step 2/§5.3).
     admitted_children: tuple[str, ...] = ()
+    # Proposals observed by this generation. They are not admitted while the
+    # worker's success verdict is still provisional: _supervise admits them
+    # only after the supervisor's integrity/merge verdict (or, for a suspended
+    # generation, before the bounded child wait).
+    proposals: tuple[dict[str, Any], ...] = ()
 
 
 class _Runtime:
@@ -1775,7 +1780,10 @@ class _Runtime:
         self._last_envelope: dict[str, Any] | None = None
         # Dynamic child admission state (implementation-plan step 2).
         self._session_tasks: list[dict[str, Any]] = []
-        self._pending_children: dict[str, list[dict[str, Any]]] = {}
+        # Each proposal is tagged with the generation that emitted it. A
+        # proposal must never cross a restart boundary, and rejected terminal
+        # envelopes must explicitly reject rather than silently dropping it.
+        self._pending_children: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         self._child_envelopes: dict[str, list[dict[str, Any]]] = {}
         self._task_group: asyncio.TaskGroup | None = None
         # Per-provider concurrency lanes (H1): in-flight admission counts and
@@ -1811,6 +1819,7 @@ class _Runtime:
         self._child_result_by_generation: dict[
             str, dict[int, tuple[dict[str, Any], tuple[str | None, int | None]]]
         ] = {}
+        self._cancelled_tasks: set[str] = set()
         self._child_result_emitted: set[str] = set()
 
     @staticmethod
@@ -1989,6 +1998,8 @@ class _Runtime:
             if task_id in self._results:
                 continue
             status = "cancelled" if session_status == "cancelled" else "failed"
+            if status == "cancelled":
+                self._cancelled_tasks.add(task_id)
             self._results[task_id] = TaskResult(
                 task_id=task_id,
                 status=status,
@@ -2001,10 +2012,11 @@ class _Runtime:
         # registered worktree or branch. Cancellation is the explicit force
         # cleanup path because partial edits are no longer useful evidence.
         for spec in task_specs.values():
-            force = session_status == "cancelled" or (
-                self._results.get(spec["task_id"], TaskResult(
-                    task_id=spec["task_id"], status="failed", exit_code=1
-                )).status == "cancelled"
+            result = self._results.get(spec["task_id"])
+            force = (
+                session_status == "cancelled"
+                or spec["task_id"] in self._cancelled_tasks
+                or (result is not None and result.status == "cancelled")
             )
             try:
                 await self._prune_worktree(spec, force=force)
@@ -2198,6 +2210,22 @@ class _Runtime:
                             )
                             return
 
+                generation_invalidated = False
+                if force:
+                    try:
+                        # Cancellation has no useful evidence contract. Move
+                        # the durable fence first, before killing descendants
+                        # or deleting anything, so a detached child that wins
+                        # a process-group race cannot write with its old token.
+                        await asyncio.to_thread(next_generation, worktree)
+                        generation_invalidated = True
+                    except (OSError, RuntimeError, ValueError):
+                        await self.emit(
+                            "worktree_cleanup_deferred", task_id=task_id,
+                            reason="generation_invalidation_failed",
+                            _deferred_observers=deferred,
+                        )
+                        return
                 handle = self._handles.get(task_id)
                 if handle is not None and handle.proc is not None:
                     await _kill_worker(handle.proc)
@@ -2230,19 +2258,21 @@ class _Runtime:
                     )
                     return
 
-                try:
-                    # Invalidate the durable token while the tree is still
-                    # registered, then remove the fence and worktree. A stale
-                    # worker that survived the process-group sweep can no
-                    # longer pass its next fenced write check.
-                    await asyncio.to_thread(next_generation, worktree)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    await self.emit(
-                        "worktree_cleanup_deferred", task_id=task_id,
-                        reason="generation_invalidation_failed",
-                        _deferred_observers=deferred,
-                    )
-                    return
+                if not generation_invalidated:
+                    try:
+                        # Invalidate the durable token while the tree is still
+                        # registered, then remove the fence and worktree. A
+                        # stale worker that survived the process-group sweep
+                        # can no longer pass its next fenced write check.
+                        await asyncio.to_thread(next_generation, worktree)
+                        generation_invalidated = True
+                    except (OSError, RuntimeError, ValueError):
+                        await self.emit(
+                            "worktree_cleanup_deferred", task_id=task_id,
+                            reason="generation_invalidation_failed",
+                            _deferred_observers=deferred,
+                        )
+                        return
                 fence_dir = worktree / ".cambium"
                 if fence_dir.is_dir():
                     shutil.rmtree(fence_dir, ignore_errors=True)
@@ -2858,6 +2888,75 @@ class _Runtime:
             )
         return admitted
 
+    def _take_generation_proposals(
+        self, task_id: str, generation: int
+    ) -> tuple[dict[str, Any], ...]:
+        """Detach only one generation's buffered child proposals."""
+        entries = self._pending_children.pop(task_id, [])
+        selected: list[dict[str, Any]] = []
+        remaining: list[tuple[int, dict[str, Any]]] = []
+        for entry_generation, proposal in entries:
+            if entry_generation == generation:
+                selected.append(proposal)
+            else:
+                remaining.append((entry_generation, proposal))
+        if remaining:
+            self._pending_children[task_id] = remaining
+        return tuple(selected)
+
+    async def _reject_child_proposals(
+        self,
+        parent_task_id: str,
+        proposals: Sequence[dict[str, Any]],
+        *,
+        reason: str,
+        message: str,
+    ) -> None:
+        """Durably reject proposals that cannot cross a terminal boundary."""
+        for proposal in proposals:
+            child_task_id = _wire_str(proposal.get("child_task_id"))
+            child_kind = _wire_str(proposal.get("kind"))
+            await self.emit(
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=_wire_str(proposal.get("request_id")),
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=child_kind,
+                reason=reason,
+                message=message,
+            )
+            if child_task_id is not None:
+                await self._record_revision_conversation(
+                    outcome="rejected",
+                    parent_task_id=parent_task_id,
+                    child_task_id=child_task_id,
+                    child_kind=child_kind,
+                    request_id=_wire_str(proposal.get("request_id")),
+                    reason=reason,
+                    proposal=proposal,
+                )
+
+    async def _admit_generation_children(
+        self,
+        parent_spec: dict[str, Any],
+        parent_envelope: dict[str, Any],
+        proposals: Sequence[dict[str, Any]],
+        *,
+        include_port: bool,
+    ) -> list[str]:
+        """Admit proposals after the permitted parent lifecycle verdict."""
+        admitted: list[str] = []
+        for proposal in proposals:
+            admitted.extend(
+                await self._admit_child(parent_spec, proposal, parent_envelope)
+            )
+        if include_port and self._admission_port is not None:
+            admitted.extend(
+                await self._admit_port_proposals(parent_spec, parent_envelope)
+            )
+        return admitted
+
     async def _admit_port_proposal(
         self,
         parent_spec: dict[str, Any],
@@ -3061,15 +3160,32 @@ class _Runtime:
         self, spec: dict[str, Any], msg: Mapping[str, Any],
         *, request_id: str | None = None, generation: int | None = None,
     ) -> None:
-        """Capture the first final worker envelope for one admitted child."""
+        """Capture the latest terminal-generation envelope for one child.
+
+        A worker may emit a correlated envelope and then crash, causing a
+        restart. The envelope is provisional until the supervisor accepts that
+        generation's integrity/merge verdict, so never use a first-envelope
+        rule here. Keep the generation-indexed record as an audit/debug seam
+        and expose only the greatest terminal generation to the parent.
+        """
         task_id = spec["task_id"]
         parent_task_id = self._child_parent.get(task_id)
-        if parent_task_id is None or task_id in self._child_result_by_task:
+        if parent_task_id is None:
             return
+        terminal_generation = generation if isinstance(generation, int) else 0
         envelope = self._strict_envelope(spec, dict(msg))
-        self._child_result_by_task[task_id] = envelope
-        self._child_result_meta[task_id] = (request_id, generation)
-        self._child_envelopes.setdefault(parent_task_id, []).append(envelope)
+        by_generation = self._child_result_by_generation.setdefault(task_id, {})
+        by_generation[terminal_generation] = (envelope, (request_id, generation))
+        latest_generation = max(by_generation)
+        latest_envelope, latest_meta = by_generation[latest_generation]
+        previous = self._child_result_by_task.get(task_id)
+        self._child_result_by_task[task_id] = latest_envelope
+        self._child_result_meta[task_id] = latest_meta
+        siblings = self._child_envelopes.setdefault(parent_task_id, [])
+        if previous is not None:
+            siblings[:] = [item for item in siblings if item is not previous]
+        if latest_envelope not in siblings:
+            siblings.append(latest_envelope)
 
     def _synthetic_child_result(
         self, spec: dict[str, Any], *, cancelled: bool = False
@@ -3168,39 +3284,77 @@ class _Runtime:
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="failed", exit_code=1, reason=reason
                 )
+            except Exception as exc:
+                # Configuration, provider-routing, worktree, and spawn errors
+                # belong to this task. Never let one malformed task escape its
+                # coroutine and have TaskGroup cancel unrelated siblings.
+                detail = str(exc).strip().replace("\n", " ")[:512]
+                reason = f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__
+                await self.emit(
+                    "worker_failed", task_id=task_id, reason=reason, internal=True
+                )
+                self._results[task_id] = TaskResult(
+                    task_id=task_id, status="failed", exit_code=1, reason=reason
+                )
         except asyncio.CancelledError:
             cancelled = True
+            self._cancelled_tasks.add(task_id)
+            self._results.setdefault(
+                task_id,
+                TaskResult(
+                    task_id=task_id,
+                    status="cancelled",
+                    exit_code=1,
+                    reason="cancelled",
+                ),
+            )
             raise
         finally:
             try:
                 # Lane release (H1): only an explicit ownership token may
-                # decrement a lane.  Provider identity alone is not ownership.
+                # decrement a lane.  Provider identity alone does not prove
+                # ownership.
                 _release_lane(self._lanes, spec)
-                if task_id in self._results:
-                    await self._prune_worktree(spec)
+                result = self._results.get(task_id)
+                if result is not None:
+                    try:
+                        await self._prune_worktree(
+                            spec,
+                            force=cancelled
+                            or task_id in self._cancelled_tasks
+                            or result.status == "cancelled",
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # Cleanup is best effort and must not cancel sibling
+                        # task supervision after a task-local failure.
+                        await self.emit(
+                            "worktree_cleanup_deferred",
+                            task_id=task_id,
+                            reason=f"cleanup_exception:{exc.__class__.__name__}",
+                        )
                 # Proposals buffered but never processed are durably rejected.
                 pending = self._pending_children.pop(task_id, [])
-                for proposal in pending:
-                    await self.emit(
-                        "child_rejected", task_id=task_id,
-                        request_id=proposal.get("request_id"),
-                        parent_task_id=task_id,
-                        child_task_id=proposal["child_task_id"],
-                        child_kind=proposal.get("kind"),
+                pending_proposals = tuple(proposal for _generation, proposal in pending)
+                if pending_proposals:
+                    await self._reject_child_proposals(
+                        task_id,
+                        pending_proposals,
                         reason="ParentTerminatedWithoutResult",
-                        message="parent ended without a result envelope; proposal dropped",
+                        message="parent ended without a usable result envelope",
                     )
                 parent_task_id = spec.get("parent_task_id")
                 child_result = self._results.get(task_id)
                 if (
                     parent_task_id is not None
                     and child_result is not None
-                    and child_result.status == "failed"
+                    and child_result.status != "succeeded"
                 ):
                     await self.emit(
                         "child_failed", task_id=task_id,
                         parent_task_id=parent_task_id,
-                        reason=child_result.reason or "failed",
+                        reason=child_result.reason or child_result.status,
                     )
             finally:
                 # This is deliberately the last lifecycle step: parent
@@ -3353,19 +3507,46 @@ class _Runtime:
                 sanitized_envelope: dict[str, Any] | None = None
                 if outcome.envelope is not None and outcome.correlated:
                     sanitized_envelope = self._redact_envelope(outcome.envelope)
-                    self._last_envelope = sanitized_envelope
-                    self._task_envelopes[task_id] = sanitized_envelope
                     worker_summary = _envelope_text(sanitized_envelope, "summary")
+                    # A correlated envelope from a crashed generation is only
+                    # provisional. Retain it for the result only after that
+                    # generation supplied its required terminal exit message.
+                    if outcome.clean:
+                        self._last_envelope = sanitized_envelope
+                        self._task_envelopes[task_id] = sanitized_envelope
                 if outcome.clean:
                     envelope_status = (
                         outcome.envelope.get("status")
                         if outcome.envelope is not None else None
                     )
+                    parent_envelope = (
+                        self._redact_envelope(
+                            self._strict_envelope(
+                                spec, cast(dict[str, Any], outcome.envelope)
+                            )
+                        )
+                        if outcome.envelope is not None
+                        else {}
+                    )
                     if envelope_status == "suspended" and not self._context_reuse:
                         # Fail closed: without the flag a suspended verdict is
                         # an unsupported status, never a resume loop.
+                        await self._reject_child_proposals(
+                            task_id,
+                            outcome.proposals,
+                            reason="UnsupportedSuspension",
+                            message="context reuse is disabled for this parent",
+                        )
                         envelope_status = None
                     if envelope_status == "suspended":
+                        # A suspended generation is not a publishable success;
+                        # its children may run before the bounded resume wait.
+                        child_ids = await self._admit_generation_children(
+                            spec,
+                            parent_envelope,
+                            outcome.proposals,
+                            include_port=False,
+                        )
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             reason = "wall budget exhausted before resume"
@@ -3378,7 +3559,6 @@ class _Runtime:
                                 reason=reason, restarts=restarts, summary=worker_summary,
                             )
                             return
-                        child_ids = list(outcome.admitted_children)
                         await self._await_suspend_children(task_id, child_ids, remaining)
                         resume_payload = self._child_results_for_resume(
                             task_id, child_ids,
@@ -3405,6 +3585,12 @@ class _Runtime:
                         failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
                         if failure_reason is None:
                             failure_reason = "worker_verdict_failed"
+                        await self._reject_child_proposals(
+                            task_id,
+                            outcome.proposals,
+                            reason="ParentResultRejected",
+                            message="parent result did not report succeeded",
+                        )
                         if spec.get("resume") is not None:
                             await self.emit(
                                 "context_resume_failed", task_id=task_id,
@@ -3428,12 +3614,31 @@ class _Runtime:
                             "worker_failed", task_id=task_id, generation=generation,
                             reason=integrity,
                         )
+                        await self._reject_child_proposals(
+                            task_id,
+                            outcome.proposals,
+                            reason="ParentIntegrityFailed",
+                            message="parent success was rejected by supervisor integrity checks",
+                        )
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
                             reason=integrity, restarts=restarts, summary=worker_summary,
                         )
                         return
                     if head == spec["base_commit"]:
+                        await self._admit_generation_children(
+                            spec,
+                            parent_envelope,
+                            outcome.proposals,
+                            include_port=True,
+                        )
+                        if spec.get("parent_task_id") is not None:
+                            self._capture_child_result(
+                                spec,
+                                outcome.envelope or {},
+                                request_id=(outcome.envelope or {}).get("request_id"),
+                                generation=generation,
+                            )
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=None, restarts=restarts,
@@ -3442,18 +3647,43 @@ class _Runtime:
                         return
                     merged = await self._merge_task(spec, handle)
                     if merged is not None:
+                        await self._admit_generation_children(
+                            spec,
+                            parent_envelope,
+                            outcome.proposals,
+                            include_port=True,
+                        )
+                        if spec.get("parent_task_id") is not None:
+                            self._capture_child_result(
+                                spec,
+                                outcome.envelope or {},
+                                request_id=(outcome.envelope or {}).get("request_id"),
+                                generation=generation,
+                            )
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="succeeded", exit_code=0,
                             reason=None, merge_sha=merged, restarts=restarts,
                             summary=worker_summary,
                         )
                     else:
+                        await self._reject_child_proposals(
+                            task_id,
+                            outcome.proposals,
+                            reason="ParentMergeFailed",
+                            message="parent success was not accepted by the merge sequencer",
+                        )
                         self._results[task_id] = TaskResult(
                             task_id=task_id, status="failed", exit_code=1,
                             reason="merge_failed", restarts=restarts, summary=worker_summary,
                         )
                     return
                 if outcome.fatal:
+                    await self._reject_child_proposals(
+                        task_id,
+                        outcome.proposals,
+                        reason="ParentResultRejected",
+                        message="parent generation failed before a usable terminal result",
+                    )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
                         reason=outcome.reason, restarts=restarts, summary=worker_summary,
@@ -3472,6 +3702,12 @@ class _Runtime:
                         "worker_failed", task_id=task_id, generation=generation,
                         restarts=restarts, max_restarts=max_restarts, reason=reason,
                     )
+                    await self._reject_child_proposals(
+                        task_id,
+                        outcome.proposals,
+                        reason="ParentResultRejected",
+                        message="parent generation exhausted its restart budget",
+                    )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
                         reason=f"max_restarts ({max_restarts}): {reason}",
@@ -3489,6 +3725,12 @@ class _Runtime:
                 )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    await self._reject_child_proposals(
+                        task_id,
+                        outcome.proposals,
+                        reason="ParentResultRejected",
+                        message="parent wall budget was exhausted before restart",
+                    )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
                         reason="wall budget exhausted", restarts=restarts,
@@ -3497,6 +3739,12 @@ class _Runtime:
                     return
                 await asyncio.sleep(min(delay, remaining))
                 if deadline - time.monotonic() <= 0:
+                    await self._reject_child_proposals(
+                        task_id,
+                        outcome.proposals,
+                        reason="ParentResultRejected",
+                        message="parent wall budget was exhausted during restart backoff",
+                    )
                     self._results[task_id] = TaskResult(
                         task_id=task_id, status="failed", exit_code=1,
                         reason="wall budget exhausted", restarts=restarts,
@@ -3586,10 +3834,9 @@ class _Runtime:
             )
         cmd = self._worker_command(spec)
         env = self._worker_env(spec, generation)
-        # A new generation is a fresh worker process: proposals buffered by a
-        # previous, dead generation are stale and must not be admitted when a
-        # later generation delivers its result.
-        self._pending_children.pop(task_id, None)
+        # Proposals are tagged with this generation and returned with its
+        # outcome. They are admitted only by _supervise after the appropriate
+        # parent verdict; a restart can therefore never consume stale input.
 
         async def _report_outbound_message_too_long() -> None:
             await self.emit(
@@ -3798,9 +4045,9 @@ class _Runtime:
         # waited on and reaped as a terminal worker.
         reuse_ready = False
         keep_alive = False
-        # Cache-first: child task ids admitted at this generation's terminal
-        # envelope, in admission order (deterministic resume ordering).
-        admitted_children: list[str] = []
+        # Proposals remain in the runtime buffer until the generation has
+        # reached its terminal process state, then are detached below and
+        # returned with this generation's outcome.
 
         async def _cancel_and_kill() -> None:
             cancel_msg = {
@@ -4040,51 +4287,11 @@ class _Runtime:
                     accepted = correlated and identity_note is None and envelope is None
                     if accepted:
                         envelope = msg
-                    # Dynamic child admission: proposals are processed only
-                    # now, when the parent's terminal envelope exists (the
-                    # child's context is its own spec plus that envelope).
-                    pending = self._pending_children.pop(task_id, [])
-                    admitted: list[str] = []
-                    if accepted and (pending or self._admission_port is not None):
-                        parent_envelope = self._redact_envelope(
-                            self._strict_envelope(spec, msg)
-                        )
-                        try:
-                            for proposal in pending:
-                                admitted.extend(
-                                    await self._admit_child(spec, proposal, parent_envelope)
-                                )
-                            if self._admission_port is not None:
-                                admitted.extend(
-                                    await self._admit_port_proposals(spec, parent_envelope)
-                                )
-                        except ConversationAppendError:
-                            conversation_failure_reason = "conversation_store_append_failed"
-                            await self.emit(
-                                "worker_failed", task_id=task_id,
-                                generation=generation, reason=conversation_failure_reason,
-                            )
-                            await _kill_worker(proc)
-                            return _GenOutcome(
-                                clean=False,
-                                fatal=True,
-                                reason=conversation_failure_reason,
-                            )
-                    if (
-                        accepted
-                        and spec.get("parent_task_id") is not None
-                        and msg.get("status") in ("succeeded", "failed", "cancelled")
-                    ):
-                        # A suspended child emits no upward child_result until
-                        # its final post-resume result; publication happens
-                        # once in _complete_child under the supervisor verdict.
-                        self._capture_child_result(
-                            spec, msg,
-                            request_id=msg.get("request_id"), generation=generation,
-                        )
-                    if admitted:
-                        self._admitted_children.setdefault(task_id, []).extend(admitted)
-                        admitted_children.extend(admitted)
+                    # Proposals are retained until this generation returns.
+                    # In particular, a correlated worker ``succeeded`` envelope
+                    # is still provisional until _supervise has passed
+                    # integrity and merge; admitting here would orphan children
+                    # when that later verdict fails.
                 elif mtype == "context_checkpoint":
                     invalid = _invalid_context_checkpoint_fields(msg)
                     if invalid:
@@ -4356,6 +4563,7 @@ class _Runtime:
             except BaseException:
                 pass
 
+        generation_proposals = self._take_generation_proposals(task_id, generation)
         terminal_verdict = (
             envelope is not None
             and correlated
@@ -4372,7 +4580,7 @@ class _Runtime:
                 clean=terminal_verdict, fatal=False, reason=None,
                 exit_code=None, exit_reason=None, envelope=envelope,
                 correlated=correlated, reuse_ready=True,
-                admitted_children=tuple(admitted_children),
+                proposals=generation_proposals,
             )
         exit_code = proc.returncode
         handle.exit_code = exit_code
@@ -4408,7 +4616,7 @@ class _Runtime:
             fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",
             reason=protocol_failure or protocol_reason or reason, timeout_phase=timeout_phase,
             exit_code=exit_code, exit_reason=exit_reason, envelope=envelope,
-            correlated=correlated, admitted_children=tuple(admitted_children),
+            correlated=correlated, proposals=generation_proposals,
         )
 
     # -- publish eligibility --------------------------------------------------
