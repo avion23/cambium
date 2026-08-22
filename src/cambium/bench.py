@@ -66,6 +66,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -99,6 +100,81 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
     "canary_failed_delta": 0,
     "dataset": {"duplicate_ids": 0, "cross_split_leaks": 0},
 }
+_THRESHOLD_FIELDS = (
+    "metric_mean_delta",
+    "wall_p90_ratio",
+    "wall_p90_abs_slack",
+    "canary_failed_delta",
+)
+_DATASET_THRESHOLD_FIELDS = ("duplicate_ids", "cross_split_leaks")
+
+
+def _finite_nonnegative_float(value: str) -> float:
+    """Parse a finite, non-negative command-line threshold."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return parsed
+
+
+def _validate_thresholds(value: object, label: str = "drift_thresholds") -> dict[str, Any]:
+    """Validate the numeric values used by a drift threshold mapping."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    validated = dict(value)
+    for field in _THRESHOLD_FIELDS:
+        if field not in value:
+            continue
+        threshold = value[field]
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise ValueError(f"{label}.{field} must be numeric")
+        try:
+            finite = math.isfinite(float(threshold))
+        except (OverflowError, TypeError, ValueError):
+            finite = False
+        if not finite or threshold < 0:
+            raise ValueError(f"{label}.{field} must be finite and non-negative")
+    if "dataset" in value:
+        dataset = value["dataset"]
+        if not isinstance(dataset, Mapping):
+            raise ValueError(f"{label}.dataset must be an object")
+        validated["dataset"] = dict(dataset)
+        for field in _DATASET_THRESHOLD_FIELDS:
+            if field not in dataset:
+                continue
+            threshold = dataset[field]
+            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+                raise ValueError(f"{label}.dataset.{field} must be numeric")
+            try:
+                finite = math.isfinite(float(threshold))
+            except (OverflowError, TypeError, ValueError):
+                finite = False
+            if not finite or threshold < 0:
+                raise ValueError(
+                    f"{label}.dataset.{field} must be finite and non-negative"
+                )
+    return validated
+
+
+def _merged_thresholds(*overrides: object | None) -> dict[str, Any]:
+    """Return defaults plus validated threshold overrides."""
+    merged = dict(DEFAULT_THRESHOLDS)
+    merged["dataset"] = dict(DEFAULT_THRESHOLDS["dataset"])
+    for index, override in enumerate(overrides):
+        if override is None:
+            continue
+        validated = _validate_thresholds(override, f"drift_thresholds[{index}]")
+        for field in _THRESHOLD_FIELDS:
+            if field in validated:
+                merged[field] = validated[field]
+        dataset = validated.get("dataset")
+        if isinstance(dataset, Mapping):
+            merged["dataset"].update(dataset)
+    return merged
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
@@ -535,21 +611,31 @@ def score_examples(scored: list[ScoredRecord]) -> dict[str, float]:
     return {"mean": round(mean, 6), "std": round(std, 6), "count": len(scores)}
 
 
-def dataset_stats(records: list[dict], label_field: str = "decompose") -> dict[str, int]:
+def dataset_stats(
+    records: list[dict],
+    label_field: str = "decompose",
+    split_records: Mapping[str, list[dict]] | None = None,
+) -> dict[str, int]:
     """Duplicate ids, cross-split leaks, class balance over raw records.
 
     Class balance counts the module's declared ``label_field`` (the v1
     default is ``decompose``); the baseline schema keeps the generic
-    ``label_true``/``label_false`` key names.
+    ``label_true``/``label_false`` key names.  ``split_records`` preserves
+    split identity so repeated examples within one split are not reported as
+    cross-split leaks.
     """
     ids = [r["id"] for r in records if isinstance(r.get("id"), str)]
+    rows_by_split = split_records if split_records is not None else {"combined": records}
     seen: dict[tuple[str, str], str] = {}
     leaks = 0
-    for r in records:
-        key = (r["input"]["task"], r["input"]["context"])
-        if key in seen:
-            leaks += 1
-        seen[key] = r.get("id", "")
+    for split, rows in rows_by_split.items():
+        for r in rows:
+            key = (r["input"]["task"], r["input"]["context"])
+            previous_split = seen.get(key)
+            if previous_split is not None and previous_split != split:
+                leaks += 1
+            elif previous_split is None:
+                seen[key] = split
     return {
         "records": len(records),
         "duplicate_ids": len(ids) - len(set(ids)),
@@ -690,7 +776,13 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         "split_digests": _compute_split_digests(datasets_dir, meta),
         "metric": metric,
         "canaries": canary_stats(canary_records, canary_scores),
-        "dataset": dataset_stats(records, manifest.label_field),
+        "dataset": dataset_stats(
+            records,
+            manifest.label_field,
+            {"combined": raw.get("combined", [])}
+            if combined
+            else {split: raw.get(split, []) for split in SPLITS},
+        ),
     }
     if note:
         report["note"] = note
@@ -720,7 +812,7 @@ def _assemble_baseline(
             "wall_seconds": percentiles(list(timings.values())),
             "by_nodeid": {k: round(v, 6) for k, v in sorted(timings.items())},
         },
-        "drift_thresholds": dict(thresholds or DEFAULT_THRESHOLDS),
+        "drift_thresholds": _merged_thresholds(thresholds),
     }
     if body.get("note"):
         baseline["note"] = body["note"]
@@ -743,7 +835,8 @@ def compare_against_anchor(
 
     Threshold precedence: run-level ``thresholds`` (e.g. from
     ``--bench-metric-delta``) override the anchor's stored
-    ``drift_thresholds``, which override the defaults.
+    ``drift_thresholds``, which override the defaults. Split digests are
+    compared before metric drift, and a missing or changed digest fails closed.
 
     Metric means only fail when they fall by more than ``metric_mean_delta``;
     wall p90 fails when it exceeds ``anchor * wall_p90_ratio +
@@ -774,11 +867,38 @@ def compare_against_anchor(
             return missing_split_regressions + [version_regression]
         return [version_regression]
 
-    merged = dict(DEFAULT_THRESHOLDS)
-    merged.update(anchor.get("drift_thresholds") or {})
-    if thresholds:
-        merged.update(thresholds)
+    try:
+        anchor_thresholds = (
+            anchor["drift_thresholds"] if "drift_thresholds" in anchor else {}
+        )
+        merged = _merged_thresholds(anchor_thresholds, thresholds)
+    except ValueError as exc:
+        return missing_split_regressions + [("drift_thresholds", str(exc))]
     regressions: list[tuple[str, str]] = missing_split_regressions
+
+    report_digests = report.get("split_digests")
+    anchor_digests = anchor.get("split_digests")
+    for split in SPLITS:
+        report_digest = (
+            report_digests.get(split) if isinstance(report_digests, Mapping) else None
+        )
+        anchor_digest = (
+            anchor_digests.get(split) if isinstance(anchor_digests, Mapping) else None
+        )
+        if not isinstance(report_digest, str) or not isinstance(anchor_digest, str):
+            regressions.append(
+                (
+                    f"split_digests.{split}",
+                    "split digest is missing from the report or anchor",
+                )
+            )
+        elif report_digest != anchor_digest:
+            regressions.append(
+                (
+                    f"split_digests.{split}",
+                    f"anchor {anchor_digest} != report {report_digest}",
+                )
+            )
 
     metric_delta = merged["metric_mean_delta"]
     for split in SPLITS + ("combined",):
@@ -852,9 +972,7 @@ class BenchPlugin:
         self.mode = cast(str, config.getoption("bench"))
         bench_root = config.getoption("bench_root")
         self.root = Path(bench_root) if bench_root else None
-        self.thresholds = dict(DEFAULT_THRESHOLDS)
-        if thresholds:
-            self.thresholds.update(thresholds)
+        self.thresholds = _merged_thresholds(thresholds)
         self.times: dict[str, float] = {}
         self.item_paths: dict[str, Path] = {}
         self.module_reports: dict[str, dict[str, Any]] = {}
@@ -995,13 +1113,13 @@ def pytest_addoption(parser: Any) -> None:
     )
     group.addoption(
         "--bench-metric-delta",
-        type=float,
+        type=_finite_nonnegative_float,
         default=None,
         help="override the metric mean drop drift threshold",
     )
     group.addoption(
         "--bench-wall-ratio",
-        type=float,
+        type=_finite_nonnegative_float,
         default=None,
         help="override the wall p90 ratio drift threshold",
     )
@@ -1012,11 +1130,16 @@ def pytest_configure(config: Any) -> None:
         return
     if config.pluginmanager.hasplugin("cambium-bench"):
         return  # the entry point and -p may both register this module
-    thresholds = dict(DEFAULT_THRESHOLDS)
-    if config.getoption("bench_metric_delta") is not None:
-        thresholds["metric_mean_delta"] = config.getoption("bench_metric_delta")
-    if config.getoption("bench_wall_ratio") is not None:
-        thresholds["wall_p90_ratio"] = config.getoption("bench_wall_ratio")
+    thresholds = _merged_thresholds(
+        {
+            "metric_mean_delta": config.getoption("bench_metric_delta")
+            if config.getoption("bench_metric_delta") is not None
+            else DEFAULT_THRESHOLDS["metric_mean_delta"],
+            "wall_p90_ratio": config.getoption("bench_wall_ratio")
+            if config.getoption("bench_wall_ratio") is not None
+            else DEFAULT_THRESHOLDS["wall_p90_ratio"],
+        }
+    )
     config.pluginmanager.register(BenchPlugin(config, thresholds), "cambium-bench")
 
 
@@ -1092,7 +1215,12 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
     disabling the wall-time check.
     """
     tests_dir = MODULES_DIR / pkg_name / "tests"
-    if not tests_dir.is_dir() or tests_dir.is_symlink():
+    if tests_dir.is_symlink():
+        raise ModuleBoundaryError(
+            f"module {pkg_name!r}: tests directory is a symlink; refusing to "
+            "silently disable wall-time measurements"
+        )
+    if not tests_dir.is_dir():
         return {}
     manifest = _module_manifest(pkg_name)
     with tempfile.TemporaryDirectory(prefix="cambium-bench-timings-") as root:
@@ -1229,13 +1357,13 @@ def _cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bench-metric-delta",
-        type=float,
+        type=_finite_nonnegative_float,
         default=None,
         help="override the metric mean drop drift threshold",
     )
     parser.add_argument(
         "--bench-wall-ratio",
-        type=float,
+        type=_finite_nonnegative_float,
         default=None,
         help="override the wall p90 ratio drift threshold",
     )
@@ -1254,7 +1382,6 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    thresholds = dict(DEFAULT_THRESHOLDS)
     # The standalone CLI compares two live measurements (the recorded report
     # p90 and the gate's re-measured p90), so its default wall tolerance must
     # absorb legitimate load variation between the two runs without disabling
@@ -1262,12 +1389,17 @@ def main(argv: list[str] | None = None) -> int:
     # the observed 1.6x load swing while a 100s regression still fails. The
     # pytest plugin path keeps the strict 1.5x ratio (its anchor is a fixed
     # committed baseline), and explicit CLI flags override these defaults.
-    thresholds["wall_p90_ratio"] = 3.0
-    thresholds["wall_p90_abs_slack"] = 0.5
-    if args.bench_metric_delta is not None:
-        thresholds["metric_mean_delta"] = args.bench_metric_delta
-    if args.bench_wall_ratio is not None:
-        thresholds["wall_p90_ratio"] = args.bench_wall_ratio
+    thresholds = _merged_thresholds(
+        {
+            "wall_p90_ratio": args.bench_wall_ratio
+            if args.bench_wall_ratio is not None
+            else 3.0,
+            "wall_p90_abs_slack": 0.5,
+            "metric_mean_delta": args.bench_metric_delta
+            if args.bench_metric_delta is not None
+            else DEFAULT_THRESHOLDS["metric_mean_delta"],
+        }
+    )
     failures = 0
     root = args.bench_root or RUNTIME_BASELINE_DIR
     try:

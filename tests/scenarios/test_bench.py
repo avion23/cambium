@@ -500,6 +500,68 @@ def test_dataset_stats_honors_label_field() -> None:
     assert stats["label_false"] == 1
 
 
+def test_dataset_stats_distinguishes_same_split_duplicates_from_leaks() -> None:
+    import cambium.bench as bench
+
+    first = {
+        "id": "a",
+        "input": {"task": "same", "context": "pair"},
+        "expected": {"decompose": False},
+    }
+    second = {**first, "id": "b"}
+
+    assert bench.dataset_stats([first, second])["cross_split_leaks"] == 0
+    assert bench.dataset_stats(
+        [first, second], split_records={"train": [first], "eval": [second]}
+    )["cross_split_leaks"] == 1
+
+
+def test_compare_against_anchor_checks_split_digests() -> None:
+    import cambium.bench as bench
+
+    anchor = {
+        "dataset_version": "fixture-1",
+        "split_digests": {split: f"{split}-digest" for split in bench.SPLITS},
+        "metric": {split: {"mean": 1.0} for split in bench.SPLITS},
+        "tests": {"wall_seconds": {"p90": 1.0}},
+        "dataset": {},
+        "canaries": {"total": 1, "failed": 0},
+    }
+    report = json.loads(json.dumps(anchor))
+    report["split_digests"]["eval"] = "changed-digest"
+
+    regressions = bench.compare_against_anchor(report, anchor)
+
+    assert any(field == "split_digests.eval" for field, _detail in regressions)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-0.1"])
+def test_cli_threshold_rejects_non_finite_or_negative(value: str) -> None:
+    import cambium.bench as bench
+
+    with pytest.raises(SystemExit):
+        bench._cli_parser().parse_args(["gate", "--bench-metric-delta", value])
+
+
+def test_stored_threshold_rejects_non_finite_value() -> None:
+    import cambium.bench as bench
+
+    report = {
+        "dataset_version": "fixture-1",
+        "split_digests": {split: f"{split}-digest" for split in bench.SPLITS},
+        "metric": {split: {"mean": 1.0} for split in bench.SPLITS},
+        "tests": {"wall_seconds": {"p90": 1.0}},
+        "dataset": {},
+        "canaries": {"total": 1, "failed": 0},
+    }
+    anchor = json.loads(json.dumps(report))
+    anchor["drift_thresholds"] = {"metric_mean_delta": float("nan")}
+
+    regressions = bench.compare_against_anchor(report, anchor)
+
+    assert any(field == "drift_thresholds" for field, _detail in regressions)
+
+
 def test_cli_timeout_fails_without_combined_fallback(tmp_path, monkeypatch, capsys) -> None:
     import cambium.bench as bench
 
@@ -898,6 +960,20 @@ def test_standalone_cli_immediate_gate_does_not_false_fail_under_load(
 
 
 @SLOW
+def test_standalone_timing_rejects_symlinked_tests_directory(tmp_path, monkeypatch) -> None:
+    import cambium.bench as bench
+
+    modules_dir = _write_fixture_module(tmp_path)
+    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
+    target = tmp_path / "real-tests"
+    target.mkdir()
+    (target / "test_fixture.py").write_text("def test_ok():\n    pass\n")
+    (modules_dir / "fixture" / "tests").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(bench.ModuleBoundaryError, match="symlink"):
+        bench._measure_module_timings("fixture")
+
+
 def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
     tmp_path, monkeypatch, capsys
 ) -> None:
