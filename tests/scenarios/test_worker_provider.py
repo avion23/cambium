@@ -482,6 +482,7 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
         "good",
     ]
 
+    last_seen = time.time()
     weighted_config = worker.AgentConfig.from_init(
         {
             **init,
@@ -491,12 +492,14 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
                     "cache_hit_count": 0,
                     "latency_total_s": 300.0,
                     "latency_count": 10,
+                    "last_seen": last_seen,
                 },
                 "good": {
                     "requests": 10,
                     "cache_hit_count": 10,
                     "latency_total_s": 10.0,
                     "latency_count": 10,
+                    "last_seen": last_seen,
                 },
             },
         }
