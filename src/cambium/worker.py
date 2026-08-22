@@ -2108,6 +2108,7 @@ def _build_forked_prompt(checkpoint: ContextCheckpoint, child_task_lines: str) -
 def _fork_prompt(
     base_messages: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     continuation: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build each forked-session turn from an immutable base message list.
 
@@ -2119,7 +2120,10 @@ def _fork_prompt(
     messages.extend(copy.deepcopy(continuation))
     if not messages or messages[-1].get("role") != "user":
         messages.append({"role": "user", "content": "Continue."})
-    return {"messages": messages}
+    prompt: dict[str, Any] = {"messages": messages}
+    if tools is not None:
+        prompt["tools"] = tools
+    return prompt
 
 
 def _resolve_fork_prefix(
@@ -2351,13 +2355,47 @@ def _build_agent_prompt(
         # message keeps every payload valid without changing the static
         # system prefix (plan step 3 caching).
         messages.append({"role": "user", "content": "Continue."})
-    return {"messages": messages}
+    return {"messages": messages, "tools": tools}
 
 
 def _tool_observation(name: str, result: ToolResult) -> str:
     body = result.output if result.ok else (result.error or result.output or "")
     return _bounded_text(f"tool {name} ok={result.ok}\n{body}", MAX_OBSERVATION_BYTES)
 
+
+
+def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
+    """Translate exactly one provider-native function call to Cambium's action ADT."""
+
+    calls = getattr(result, "tool_calls", None)
+    if not calls:
+        return None
+    if len(calls) != 1:
+        raise ValueError("provider returned more than one tool call for a sequential turn")
+    call = calls[0]
+    function = call.get("function") if isinstance(call, dict) else None
+    if not isinstance(function, dict):
+        raise ValueError("provider native tool call has no function object")
+    name = function.get("name")
+    arguments = function.get("arguments", {})
+    if not isinstance(name, str) or not name:
+        raise ValueError("provider native tool call has no function name")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise ValueError("provider native tool arguments are invalid JSON") from exc
+    if not isinstance(arguments, dict):
+        raise ValueError("provider native tool arguments must be an object")
+    return {"type": "tool_call", "name": name, "arguments": arguments}
+
+
+def _bind_router_provider(router: Any, result: CallResult, task_id: str) -> None:
+    """Bind provider continuity when the concrete router exposes the lease port."""
+
+    binder = getattr(router, "bind_provider", None)
+    if callable(binder):
+        binder(result.provider, result.model, root_task_id=task_id)
 
 def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
     """Persist only the parsed action, never an optional scratchpad/thought."""
@@ -2508,6 +2546,9 @@ def _success_usage_event(
         event["prompt_prefix_bytes"] = result.prompt_prefix_bytes
     if result.provider_cache_hit is not None:
         event["provider_cache_hit"] = result.provider_cache_hit
+    quota_windows = getattr(result, "quota_windows", None)
+    if quota_windows is not None:
+        event["quota_windows"] = [dict(item) for item in quota_windows]
     return event
 
 
@@ -3717,6 +3758,7 @@ async def _run_agent_loop(
             declared_summary_model = router.declared_model(summary_result.provider)
             if declared_summary_model and summary_result.model != declared_summary_model:
                 raise ContextForkError("summary response model mismatch")
+            _bind_router_provider(router, summary_result, config.task_id)
             invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
             if invalid_usage_fields:
                 raise ContextForkError("summary usage contains invalid token counts")
@@ -3990,7 +4032,7 @@ async def _run_agent_loop(
                             cumulative_usage,
                             transcript,
                         )
-                prompt = _fork_prompt(base_messages, context_continuation)
+                prompt = _fork_prompt(base_messages, context_continuation, tools)
             # Keep the object handed to the router immutable for checkpointing.
             # A provider adapter is allowed to normalize its local request, but
             # the epoch must describe the exact object Cambium submitted.
@@ -4027,6 +4069,7 @@ async def _run_agent_loop(
                     outcome, "failed", "provider response model mismatch",
                     turn - 1, cumulative_usage, transcript,
                 )
+            _bind_router_provider(router, result, config.task_id)
             invalid_usage_fields = _invalid_usage_fields(result.usage)
             if invalid_usage_fields:
                 return _loop_result(
@@ -4069,7 +4112,7 @@ async def _run_agent_loop(
                     turn, cumulative_usage, transcript,
                 )
             try:
-                action = _parse_agent_action(result.content)
+                action = _native_tool_action(result) or _parse_agent_action(result.content)
             except ValueError as exc:
                 invalid_messages = [
                     {"role": "assistant", "content": "[invalid action omitted]"},

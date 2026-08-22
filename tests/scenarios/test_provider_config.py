@@ -240,6 +240,8 @@ def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
             cooldown_s=12.5,
             price_per_1m_in=0.25,
             price_per_1m_out=0.25,
+            price_per_1m_cached_in=0.25,
+            pricing_known=True,
         )
     ]
 

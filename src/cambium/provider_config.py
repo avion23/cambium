@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import urlparse
 
 from .auth import effective_home, validate_derived_env_name, validate_provider_id
+from .provider_scheduler import BillingMode, QuotaWindowSpec
 
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
@@ -92,6 +93,18 @@ _PROVIDER_FIELDS = frozenset(
         "protocol",
         "context_window",
         "reasoning_effort",
+        "max_concurrency",
+        "billing_mode",
+        "quota_windows",
+        "price_per_1m_in",
+        "price_per_1m_cached_in",
+        "price_per_1m_out",
+        "pricing_known",
+        "throughput_hint_tps",
+        "quality_weight",
+        "supports_native_tools",
+        "supports_python_tool",
+        "allow_model_substitution",
     }
 )
 _DEFAULTS: dict[str, object] = {
@@ -110,6 +123,18 @@ _DEFAULTS: dict[str, object] = {
     # Optional context-window capacity in tokens (H2); 0/absent means the
     # provider declares no capacity, so min_context_window tasks exclude it.
     "context_window": 0,
+    "max_concurrency": 1,
+    "billing_mode": "metered",
+    "quota_windows": (),
+    "price_per_1m_in": 0.0,
+    "price_per_1m_cached_in": 0.0,
+    "price_per_1m_out": 0.0,
+    "pricing_known": False,
+    "throughput_hint_tps": 0.0,
+    "quality_weight": 1.0,
+    "supports_native_tools": True,
+    "supports_python_tool": True,
+    "allow_model_substitution": False,
 }
 
 
@@ -132,6 +157,18 @@ class _ProviderMapping(TypedDict):
     protocol: Protocol
     context_window: int
     reasoning_effort: str | None
+    max_concurrency: int
+    billing_mode: BillingMode
+    quota_windows: tuple[QuotaWindowSpec, ...]
+    price_per_1m_in: float
+    price_per_1m_cached_in: float
+    price_per_1m_out: float
+    pricing_known: bool
+    throughput_hint_tps: float
+    quality_weight: float
+    supports_native_tools: bool
+    supports_python_tool: bool
+    allow_model_substitution: bool
 
 
 DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
@@ -287,6 +324,43 @@ def _parse_protocol(raw: dict[str, object], location: str) -> Protocol:
         ) from exc
 
 
+
+def _parse_billing_mode(value: object, location: str) -> BillingMode:
+    if not isinstance(value, str):
+        raise _error(location, "must be a billing-mode string")
+    try:
+        return BillingMode(value)
+    except ValueError as exc:
+        choices = ", ".join(mode.value for mode in BillingMode)
+        raise _error(location, f"invalid billing mode {value!r}; expected {choices}") from exc
+
+
+def _parse_quota_windows(value: object, location: str) -> tuple[QuotaWindowSpec, ...]:
+    if value in (None, ()):
+        return ()
+    if not isinstance(value, list):
+        raise _error(location, "must be a list")
+    windows: list[QuotaWindowSpec] = []
+    names: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise _error(f"{location}[{index}]", "must be an object")
+        try:
+            window = QuotaWindowSpec.from_mapping(item)
+        except ValueError as exc:
+            raise _error(f"{location}[{index}]", str(exc)) from exc
+        if window.name in names:
+            raise _error(f"{location}[{index}].name", "must be unique per provider")
+        names.add(window.name)
+        windows.append(window)
+    return tuple(windows)
+
+
+def _require_bool(value: object, location: str) -> bool:
+    if type(value) is not bool:
+        raise _error(location, "must be a boolean")
+    return value
+
 def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     location = f"providers[{index}]"
     if not isinstance(raw, dict):
@@ -387,6 +461,68 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     )
     if context_window < 0:
         raise _error(f"{location}.context_window", "must not be negative")
+    max_concurrency = _require_integer(
+        values["max_concurrency"], f"{location}.max_concurrency"
+    )
+    if max_concurrency <= 0:
+        raise _error(f"{location}.max_concurrency", "must be greater than 0")
+    billing_mode = _parse_billing_mode(
+        values["billing_mode"], f"{location}.billing_mode"
+    )
+    quota_windows = _parse_quota_windows(
+        raw.get("quota_windows", []), f"{location}.quota_windows"
+    )
+    legacy_price = price
+    price_per_1m_in = _require_number(
+        raw.get("price_per_1m_in", legacy_price), f"{location}.price_per_1m_in"
+    )
+    price_per_1m_cached_in = _require_number(
+        raw.get("price_per_1m_cached_in", price_per_1m_in),
+        f"{location}.price_per_1m_cached_in",
+    )
+    price_per_1m_out = _require_number(
+        raw.get("price_per_1m_out", legacy_price), f"{location}.price_per_1m_out"
+    )
+    for key, amount in (
+        ("price_per_1m_in", price_per_1m_in),
+        ("price_per_1m_cached_in", price_per_1m_cached_in),
+        ("price_per_1m_out", price_per_1m_out),
+    ):
+        if amount < 0:
+            raise _error(f"{location}.{key}", "must not be negative")
+    pricing_known = _require_bool(
+        raw.get(
+            "pricing_known",
+            "price" in raw
+            or any(
+                key in raw
+                for key in (
+                    "price_per_1m_in",
+                    "price_per_1m_cached_in",
+                    "price_per_1m_out",
+                )
+            ),
+        ),
+        f"{location}.pricing_known",
+    )
+    throughput_hint_tps = _require_number(
+        values["throughput_hint_tps"], f"{location}.throughput_hint_tps"
+    )
+    quality_weight = _require_number(
+        values["quality_weight"], f"{location}.quality_weight"
+    )
+    if throughput_hint_tps < 0 or quality_weight < 0:
+        raise _error(location, "throughput_hint_tps and quality_weight must be non-negative")
+    supports_native_tools = _require_bool(
+        values["supports_native_tools"], f"{location}.supports_native_tools"
+    )
+    supports_python_tool = _require_bool(
+        values["supports_python_tool"], f"{location}.supports_python_tool"
+    )
+    allow_model_substitution = _require_bool(
+        values["allow_model_substitution"], f"{location}.allow_model_substitution"
+    )
+
     # Optional Responses-API reasoning effort (codex_responses providers); an
     # absent value keeps the request body free of the reasoning field.
     reasoning_effort = raw.get("reasoning_effort")
@@ -414,6 +550,18 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "protocol": protocol,
         "context_window": context_window,
         "reasoning_effort": reasoning_effort,
+        "max_concurrency": max_concurrency,
+        "billing_mode": billing_mode,
+        "quota_windows": quota_windows,
+        "price_per_1m_in": price_per_1m_in,
+        "price_per_1m_cached_in": price_per_1m_cached_in,
+        "price_per_1m_out": price_per_1m_out,
+        "pricing_known": pricing_known,
+        "throughput_hint_tps": throughput_hint_tps,
+        "quality_weight": quality_weight,
+        "supports_native_tools": supports_native_tools,
+        "supports_python_tool": supports_python_tool,
+        "allow_model_substitution": allow_model_substitution,
     }
 
 
@@ -501,14 +649,24 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "protocol": values["protocol"],
         "context_window": values["context_window"],
         "reasoning_effort": values["reasoning_effort"],
+        "max_concurrency": values["max_concurrency"],
+        "billing_mode": values["billing_mode"],
+        "quota_windows": values["quota_windows"],
+        "price_per_1m_cached_in": values["price_per_1m_cached_in"],
+        "pricing_known": values["pricing_known"],
+        "throughput_hint_tps": values["throughput_hint_tps"],
+        "quality_weight": values["quality_weight"],
+        "supports_native_tools": values["supports_native_tools"],
+        "supports_python_tool": values["supports_python_tool"],
+        "allow_model_substitution": values["allow_model_substitution"],
     }
     price = values["price"]
     provider_fields = {field.name for field in fields(ProviderConfigType)}
-    if "price" in provider_fields:
+    if {"price_per_1m_in", "price_per_1m_out"} <= provider_fields:
+        config_values["price_per_1m_in"] = values["price_per_1m_in"]
+        config_values["price_per_1m_out"] = values["price_per_1m_out"]
+    elif "price" in provider_fields:
         config_values["price"] = price
-    elif {"price_per_1m_in", "price_per_1m_out"} <= provider_fields:
-        config_values["price_per_1m_in"] = price
-        config_values["price_per_1m_out"] = price
     else:
         raise RuntimeError("ProviderConfig has no supported price field")
 

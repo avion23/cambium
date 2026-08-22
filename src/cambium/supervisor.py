@@ -639,6 +639,7 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
         "raw_tail_bytes",
         "epoch",
         "fork_of",
+        "quota_windows",
     }
 )
 
@@ -708,6 +709,26 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
     ):
         if field in msg and not (type(msg[field]) is str and msg[field]):
             invalid.append(field)
+    quota_windows = msg.get("quota_windows")
+    if "quota_windows" in msg:
+        allowed_quota_fields = {
+            "provider", "name", "reset_at", "allowance_tokens", "used_tokens",
+            "allowance_requests", "used_requests", "reserve_fraction",
+            "remaining_tokens", "remaining_requests",
+        }
+        if (
+            not isinstance(quota_windows, list)
+            or len(quota_windows) > 16
+            or any(
+                not isinstance(item, dict)
+                or set(item) - allowed_quota_fields
+                or not isinstance(item.get("provider"), str)
+                or not isinstance(item.get("name"), str)
+                for item in quota_windows
+            )
+        ):
+            invalid.append("quota_windows")
+
     usage = msg.get("usage")
     if "usage" in msg and (
         not isinstance(usage, dict)
@@ -2554,6 +2575,13 @@ class _Runtime:
             **({"reason": reason} if reason is not None else {}),
         )
         if semantic_reuse:
+            # Cold semantic children choose an independent provider lane. Only
+            # exact cache-compatible forks inherit the parent provider/model.
+            child_spec.pop("assigned_provider", None)
+            fanout = child_spec.get("fanout_config")
+            if isinstance(fanout, dict):
+                fanout.pop("provider", None)
+                fanout.pop("assigned_provider", None)
             child_spec["summary_trunk_ref"] = epoch["checkpoint_ref"]
             return
         if not compatible or not isinstance(cache_key, dict):

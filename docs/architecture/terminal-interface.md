@@ -92,3 +92,11 @@ process that started the session.
 - Checkpoint paths are confined to the session before inspection.
 - The UI never renders arbitrary event payloads; only selected redacted fields
   enter recent-event summaries.
+
+
+## Provider resource introspection
+
+Durable usage records may include content-free quota-window snapshots. Operator
+surfaces can display provider/model leases, reset times, remaining tokens and
+requests, lane concurrency, cached/input/output tokens, output tokens/s, and
+known marginal cost without reading worker memory.

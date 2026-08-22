@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 
 from cambium import oneshot, repl, tui
@@ -789,7 +790,6 @@ def test_nested_container_dump_escapes_c1_controls() -> None:
 # REPL raw-tty input discipline: reads, prompt repaint, per-turn SIGINT
 # ---------------------------------------------------------------------------
 
-import signal
 
 
 def test_repl_raw_tty_reader_backspace_edits_partial(monkeypatch):
@@ -816,7 +816,17 @@ def test_repl_tty_prompt_repaints_after_mid_run_event(monkeypatch, tmp_path):
 
     async def scripted(config, on_event=None):
         seen_prompts.append(config.prompt)
-        on_event({"kind": "tool_event", "payload": {"tool": "run_shell", "cmd": "df -h", "ok": True, "duration_ms": 5}})
+        on_event(
+            {
+                "kind": "tool_event",
+                "payload": {
+                    "tool": "run_shell",
+                    "cmd": "df -h",
+                    "ok": True,
+                    "duration_ms": 5,
+                },
+            }
+        )
         return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
     monkeypatch.setattr(oneshot, "run_oneshot", scripted)

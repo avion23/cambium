@@ -18,6 +18,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future
@@ -938,6 +939,21 @@ async def run_read_batch(
 
 
 async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    if name == "run_python":
+        payload = args
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if not isinstance(code, str) or not code.strip():
+            code = "raise SystemExit('run_python requires non-empty code')"
+        elif len(code.encode("utf-8")) > 32768:
+            code = "raise SystemExit('run_python code exceeds 32768 bytes')"
+        return await _run_tool_without_python(
+            "run_shell",
+            {"cmd": [sys.executable, "-I", "-S", "-c", code]},
+            ctx,
+        )
+    return await _run_tool_without_python(name, args, ctx)
+
+async def _run_tool_without_python(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     """Validate and execute one named worker tool."""
     started_ns = time.monotonic_ns()
     schema_by_name = {schema["name"]: schema for schema in TOOL_SCHEMAS}

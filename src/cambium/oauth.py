@@ -1171,6 +1171,8 @@ def _validate_lock_file_stat(value: os.stat_result) -> None:
         raise OAuthStoreError("oauth lock file permissions are invalid")
 
 
+
+
 class TokenManager:
     """Per-provider refresh manager with a persistent flock'd refresh transaction.
 

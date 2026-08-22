@@ -116,6 +116,13 @@ from urllib.parse import urlparse
 
 from . import __version__
 from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
+from .provider_scheduler import (
+    BillingMode,
+    ProviderLease,
+    QuotaLedger,
+    QuotaWindowSpec,
+    quota_snapshot_json,
+)
 from .selection import Candidate, order_candidates
 
 _TIMESTAMP_PATTERN = (
@@ -256,6 +263,16 @@ class ProviderConfig:
     # absent -> the request body carries no reasoning field; the pinned codex
     # provider entry sets "max".
     reasoning_effort: str | None = None
+    max_concurrency: int = 1
+    billing_mode: BillingMode = BillingMode.METERED
+    quota_windows: tuple[QuotaWindowSpec, ...] = ()
+    price_per_1m_cached_in: float = 0.0
+    pricing_known: bool = False
+    throughput_hint_tps: float = 0.0
+    quality_weight: float = 1.0
+    supports_native_tools: bool = True
+    supports_python_tool: bool = True
+    allow_model_substitution: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +312,7 @@ class CallResult:
     prompt_prefix_bytes: int | None = None
     prompt_prefix_tokens_estimate: int | None = None
     provider_cache_hit: bool | None = None
+    quota_windows: tuple[dict[str, Any], ...] | None = None
 
 
 class DiffundoError(Exception):
@@ -1187,6 +1205,10 @@ class Diffundo:
         debt: Mapping[str, Any] | None = None,
     ) -> None:
         self._providers = tuple(providers)
+        self._provider_lease: ProviderLease | None = None
+        self._quota_ledger = (
+            QuotaLedger() if any(provider.quota_windows for provider in self._providers) else None
+        )
         self._runtimes = tuple(
             _ProviderRuntime(provider, breaker_window_size) for provider in self._providers
         )
@@ -1322,7 +1344,63 @@ class Diffundo:
 
     # -- candidate selection ------------------------------------------------- #
 
+    @property
+    def provider_lease(self) -> ProviderLease | None:
+        """Current strict semantic-branch lease, if the first call has succeeded."""
+
+        return self._provider_lease
+
+    def bind_provider(self, provider: str, model: str, *, root_task_id: str = "task") -> None:
+        """Pin every later call on this router to one provider/model branch."""
+
+        if not provider or not model:
+            raise ValueError("provider lease requires provider and model")
+        existing = self._provider_lease
+        if existing is not None:
+            if existing.provider != provider or existing.model != model:
+                raise RuntimeError(
+                    "provider continuity violation: attempted to move a live semantic branch"
+                )
+            return
+        configured = next(
+            (
+                item
+                for item in self._providers
+                if item.name == provider and item.model == model and item.enabled
+            ),
+            None,
+        )
+        if configured is None:
+            raise ValueError("provider lease does not match an enabled configured lane")
+        self._provider_lease = ProviderLease(provider, model, root_task_id)
+
+    def clear_provider_lease(self) -> None:
+        """Clear task-local state when a warm worker is rebound to another task."""
+
+        self._provider_lease = None
+
     def _candidates(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
+        candidates = list(self._candidates_unleased(tier, model))
+        lease = self._provider_lease
+        if lease is not None:
+            candidates = [
+                provider
+                for provider in candidates
+                if provider.name == lease.provider and provider.model == lease.model
+            ]
+        requested_model = model
+        if isinstance(requested_model, str) and requested_model:
+            exact = [provider for provider in candidates if provider.model == requested_model]
+            substitutes = [
+                provider
+                for provider in candidates
+                if provider.model != requested_model
+                and provider.allow_model_substitution
+            ]
+            candidates = [*exact, *substitutes]
+        return candidates
+
+    def _candidates_unleased(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
         """Tier-matching, capability-filtered, health/bucket-eligible providers,
         sorted by priority ascending, refined by measured quality within an
         equal-priority run (arch §9.1/§9.2 step 1, weighted routing).
@@ -1469,6 +1547,58 @@ class Diffundo:
     # -- provider attempt ---------------------------------------------------- #
 
     async def _attempt(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> CallResult:
+        policy = provider
+        ledger = self._quota_ledger
+        reservation = None
+        estimated_tokens = 0
+        if ledger is not None and policy.quota_windows:
+            messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
+            estimated_tokens = max(
+                1,
+                sum(
+                    len(str(message.get("content", "")).encode("utf-8"))
+                    for message in messages
+                )
+                // 4
+                + 4096,
+            )
+            reservation = await asyncio.to_thread(
+                ledger.reserve, policy.name, policy.quota_windows, estimated_tokens
+            )
+            if reservation is None:
+                raise ProviderError(
+                    policy.name,
+                    ProviderOutcome.QUOTA,
+                    "configured subscription quota window is exhausted",
+                )
+        try:
+            result = await self._quota_wrapped_attempt(provider, prompt, deadline=deadline)
+        except BaseException:
+            if reservation is not None and ledger is not None:
+                await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, 0)
+            raise
+        if reservation is not None and ledger is not None:
+            usage = result.usage if isinstance(result.usage, dict) else {}
+            total = usage.get("total_tokens")
+            if isinstance(total, bool) or not isinstance(total, (int, float)) or total < 0:
+                total = estimated_tokens
+            await asyncio.to_thread(
+                ledger.reconcile, reservation, policy.quota_windows, int(total)
+            )
+            snapshots = await asyncio.to_thread(ledger.snapshots, policy.name)
+            result = replace(
+                result,
+                quota_windows=tuple(quota_snapshot_json(snapshot) for snapshot in snapshots),
+            )
+        return result
+
+    async def _quota_wrapped_attempt(
         self,
         provider: ProviderConfig,
         prompt: dict[str, Any],

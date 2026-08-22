@@ -34,7 +34,11 @@ def test_repl_prints_current_and_cumulative_token_usage(monkeypatch) -> None:
         return SimpleNamespace(exit_code=0)
 
     monkeypatch.setattr(repl.oneshot, "run_oneshot", fake_run_oneshot)
-    monkeypatch.setattr(repl.render, "render_event_line", lambda _record, stream=None: "usage event")
+    monkeypatch.setattr(
+        repl.render,
+        "render_event_line",
+        lambda _record, stream=None: "usage event",
+    )
     monkeypatch.setattr(repl.render, "render_live_status_line", lambda _events: "")
     monkeypatch.setattr(repl.render, "render_text_result", lambda _result: "done")
 

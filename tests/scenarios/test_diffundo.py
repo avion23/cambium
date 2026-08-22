@@ -289,10 +289,10 @@ def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> No
 
 
 def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
-    fast = FakeServer([(200, _ok_payload("fast"), 0.0)])
-    fast2 = FakeServer([(200, _ok_payload("fast m2"), 0.0)])
-    strong = FakeServer([(200, _ok_payload("strong"), 0.0)])
-    balanced = FakeServer([(200, _ok_payload("balanced"), 0.0)])
+    fast = FakeServer([(200, _ok_payload("fast", model="m1"), 0.0)])
+    fast2 = FakeServer([(200, _ok_payload("fast m2", model="m2"), 0.0)])
+    strong = FakeServer([(200, _ok_payload("strong", model="m-s"), 0.0)])
+    balanced = FakeServer([(200, _ok_payload("balanced", model="m-b"), 0.0)])
     _set_keys(monkeypatch, "K_FAST", "K_FAST2", "K_STRONG", "K_BAL")
     router = Diffundo(
         (
@@ -331,16 +331,21 @@ def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
 def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
     tmp_path, monkeypatch
 ) -> None:
-    """A pinned model's matching provider failing mid-call cascades to a same
-    tier sibling that declares a different model (cascade fix), instead of
-    surfacing AllProvidersFailed."""
+    """An explicitly substitution-enabled sibling may serve after the exact
+    model lane fails; substitution is never an implicit fallback."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
     _set_keys(monkeypatch, "K_M2", "K_OTHER")
     router = Diffundo(
         (
             _config("p_m2", bad, "K_M2", model="m2"),
-            _config("p_other", sibling, "K_OTHER", model="m-other"),
+            _config(
+                "p_other",
+                sibling,
+                "K_OTHER",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
         ),
         pause_timeout_s=0.01,
     )
@@ -360,15 +365,21 @@ def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
 def test_model_pin_unavailable_at_selection_falls_through_to_sibling(
     tmp_path, monkeypatch
 ) -> None:
-    """A pinned model whose only matching provider fails into COOLDOWN cascades
-    to the eligible same-tier sibling on the next selection."""
+    """An explicitly substitution-enabled sibling remains eligible while the
+    exact model lane is in cooldown."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
     _set_keys(monkeypatch, "K_M2", "K_OTHER")
     router = Diffundo(
         (
             _config("p_m2", bad, "K_M2", model="m2", cooldown_s=60),
-            _config("p_other", sibling, "K_OTHER", model="m-other"),
+            _config(
+                "p_other",
+                sibling,
+                "K_OTHER",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
         ),
         pause_timeout_s=0.01,
     )
