@@ -38,7 +38,6 @@ async def run_tui(
     source = sys.stdin if input_stream is None else input_stream
     out = sys.stdout if output_stream is None else output_stream
     err = sys.stderr if error_stream is None else error_stream
-    dashboard_enabled = _is_tty(out) and not quiet
 
     try:
         from cambium import oneshot, render, stats
@@ -53,6 +52,7 @@ async def run_tui(
     from cambium.cli import ExitCode
     from cambium.supervisor import SessionAlreadyRunningError
 
+    dashboard_enabled = render.should_color(out) and not quiet
     failed = False
     try:
         while True:
@@ -110,7 +110,7 @@ async def run_tui(
                     )
                     if dashboard.enabled:
                         dashboard.draw(state.snapshot(session_dir=session_dir))
-                text = render.render_text_result(response)
+                text = render._sanitize_field(render.render_text_result(response))
                 if response.exit_code != 0:
                     failed = True
             except BrokenPipeError:

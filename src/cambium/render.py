@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import sys
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -100,9 +101,10 @@ def should_color(stream: Any = None) -> bool:
 
 
 def _accent(text: str, code: str, stream: Any = None) -> str:
+    safe_text = _sanitize_field(text)
     if stream is None or not should_color(stream):
-        return text
-    return f"{code}{text}{_RESET}"
+        return safe_text
+    return f"{code}{safe_text}{_RESET}"
 
 
 def _filter_safe(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,18 +159,22 @@ def render_text_result(result: Any) -> str:
     """
     record = _result_record(result)
     parts: list[str] = []
+
+    def safe(value: Any) -> str:
+        return _sanitize_field(str(value))
+
     status = record.get("status")
     if isinstance(status, str) and status:
-        parts.append(f"status={status}")
+        parts.append(f"status={_sanitize_field(status)}")
     exit_code = record.get("exit_code")
     if isinstance(exit_code, int) and not isinstance(exit_code, bool):
         parts.append(f"exit={exit_code}")
     summary = record.get("summary")
     if isinstance(summary, str) and summary:
-        parts.append(f"summary={summary!r}")
+        parts.append(f"summary={_sanitize_field(summary)!r}")
     reason = record.get("failure_reason") or record.get("reason")
     if isinstance(reason, str) and reason:
-        parts.append(f"reason={reason!r}")
+        parts.append(f"reason={_sanitize_field(reason)!r}")
     for label, key in (("commits", "commits"), ("files", "files_changed")):
         items = record.get(key)
         if isinstance(items, (list, tuple)) and items:
@@ -182,17 +188,17 @@ def render_text_result(result: Any) -> str:
         parts.append(f"metric={metric:g}")
     merge_sha = record.get("merge_sha")
     if isinstance(merge_sha, str) and merge_sha:
-        parts.append(f"merge={merge_sha[:12]}")
+        parts.append(f"merge={_sanitize_field(merge_sha)[:12]}")
     results = record.get("results")
     if isinstance(results, (list, tuple)) and results:
         parts.append(f"plan=tasks:{len(results)}")
         statuses = ", ".join(
-            str(entry.get("status")) for entry in results if isinstance(entry, Mapping)
+            safe(entry.get("status")) for entry in results if isinstance(entry, Mapping)
         )
         if statuses:
             parts.append(f"plan_status={{{statuses}}}")
         failures = [
-            f"{entry.get('task_id') or index}:{entry['reason']!r}"
+            f"{safe(entry.get('task_id') or index)}:{_sanitize_field(entry['reason'])!r}"
             for index, entry in enumerate(results)
             if isinstance(entry, Mapping)
             and entry.get("status") != "succeeded"
@@ -202,7 +208,7 @@ def render_text_result(result: Any) -> str:
         if failures:
             parts.append(f"plan_failures={{{', '.join(failures)}}}")
         summaries = [
-            f"{entry.get('task_id') or index}:{entry['summary']!r}"
+            f"{safe(entry.get('task_id') or index)}:{_sanitize_field(entry['summary'])!r}"
             for index, entry in enumerate(results)
             if isinstance(entry, Mapping)
             and isinstance(entry.get("summary"), str)
@@ -290,11 +296,12 @@ def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
             groups.append(f"last_turn=+{_human_count(last_turn)}")
     model = record.get("model")
     if isinstance(model, str) and model:
-        groups.append(f"model={model}")
+        groups.append(f"model={_sanitize_field(model)}")
     if not (isinstance(worktree, str) and worktree):
         worktree = record.get("worktree")
     if isinstance(worktree, str) and worktree:
-        groups.append(f"worktree={_short_worktree(worktree)}")
+        clean_worktree = _sanitize_field(worktree)
+        groups.append(f"worktree={_sanitize_field(_short_worktree(clean_worktree))}")
     if not groups:
         return "stats:"
     return "stats: " + " · ".join(groups)
@@ -346,7 +353,7 @@ def render_usage_breakdown(breakdown: Any) -> str:
             cost = _amount(stats.get("estimated_cost_usd"))
         if cost > 0:
             line = f"{line} · cost=${cost:.6f}"
-        return f"{name}: {line}"
+        return f"{_sanitize_field(str(name))}: {line}"
 
     lines: list[str] = [f"usage: {render_usage_stats_line(total)}"]
     if total is not None and (isinstance(total, Mapping) or is_dataclass(total)):
@@ -380,6 +387,15 @@ def _sanitize_field(text: str) -> str:
     return _EVENT_FIELD_WHITESPACE.sub(" ", cleaned)
 
 
+def _display_width(text: str) -> int:
+    return sum(
+        0
+        if unicodedata.combining(char)
+        else 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        for char in text
+    )
+
+
 def _scalar(value: Any) -> str:
     if isinstance(value, str):
         return _sanitize_field(value)
@@ -389,7 +405,7 @@ def _scalar(value: Any) -> str:
         return f"{value:g}"
     if isinstance(value, (list, tuple, dict)):
         return _dumps(value)
-    return str(value)
+    return _sanitize_field(str(value))
 
 
 def _pair(payload: Mapping[str, Any], key: str, label: str | None = None) -> str | None:
@@ -470,7 +486,7 @@ def _format_result(payload: Mapping[str, Any], stream: Any = None) -> str:
     elif status == "failed":
         status_part = f"status={_accent(status, _FAIL_RED, stream)}"
     else:
-        status_part = f"status={status}"
+        status_part = f"status={_sanitize_field(status)}"
     return _join(status_part, f"reason={reason}" if reason else None)
 
 
@@ -492,7 +508,10 @@ def _format_merge_committed(payload: Mapping[str, Any]) -> str:
     )
 
 
-_EVENT_FORMATTERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
+_EventFormatter = Callable[..., str]
+
+
+_EVENT_FORMATTERS: dict[str, _EventFormatter] = {
     "tool_event": _format_tool_event,
     "context_checkpoint": _format_context_checkpoint,
     "context_epoch_advanced": _format_context_epoch_advanced,
@@ -579,7 +598,8 @@ def render_event_line(event: Mapping[str, Any], *, stream: Any = None) -> str:
         body = formatter(payload)
     if not body:
         return ""
-    prefix = f"{_sanitize_field(kind):>16}"
+    clean_kind = _sanitize_field(kind)
+    prefix = f"{' ' * max(0, 16 - _display_width(clean_kind))}{clean_kind}"
     seq = event.get("seq")
     if isinstance(seq, int) and not isinstance(seq, bool):
         prefix = f"{seq:>6} {prefix}"
@@ -687,9 +707,8 @@ def render_tokens_per_s(events: Any) -> str:
         if not isinstance(payload, Mapping):
             continue
         latency_s = payload.get("latency_s")
-        if isinstance(latency_s, bool) or not isinstance(latency_s, (int, float)):
-            continue
-        if not math.isfinite(latency_s) or latency_s <= 0:
+        latency = _finite_number(latency_s)
+        if latency is None or latency <= 0:
             continue
         usage = payload.get("usage")
         if not isinstance(usage, Mapping):
@@ -699,7 +718,7 @@ def render_tokens_per_s(events: Any) -> str:
             tokens = _finite_number(usage.get("total_tokens"))
         if tokens is None:
             continue
-        rate = tokens / float(latency_s)
+        rate = tokens / latency
     if rate is None:
         return ""
     return f"tokens/s={rate:.1f}"
@@ -818,7 +837,7 @@ def render_status_bar(events: Any, *, session_label: str) -> str:
         if not right_parts:
             return left
         right = " · ".join(right_parts)
-        gap = columns - len(left) - len(right)
+        gap = columns - _display_width(left) - _display_width(right)
         if gap >= 1:
             return left + " " * gap + right
         right_parts.pop()

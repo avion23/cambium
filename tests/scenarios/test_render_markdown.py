@@ -71,6 +71,23 @@ def test_c0_controls_are_stripped_before_processing() -> None:
     assert "\x1b" not in rendered
 
 
+def test_c1_controls_are_stripped_without_touching_utf8_text() -> None:
+    raw = "café 中\x80between\x9bend\n"
+
+    assert render_markdown(raw) == "café 中betweenend\n"
+
+
+def test_gated_markdown_paths_sanitize_controls(monkeypatch) -> None:
+    text = "safe\x1b[31m\x9b31m\nnext"
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert render_markdown_if_tty(text, _Tty()) == "safe[31m31m\nnext"
+
+    monkeypatch.delenv("NO_COLOR")
+    monkeypatch.setenv("TERM", "dumb")
+    assert render_markdown_if_tty(text, _Tty()) == "safe[31m31m\nnext"
+
+
 def test_non_tty_stream_returns_input_unchanged(monkeypatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")

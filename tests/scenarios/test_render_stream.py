@@ -20,10 +20,14 @@ from cambium import oneshot, repl, tui
 from cambium.render import (
     _OK_GREEN,
     _RESET,
+    _display_width,
     render_active_workers,
     render_event_line,
     render_status_bar,
+    render_text_result,
     render_tokens_per_s,
+    render_usage_breakdown,
+    render_usage_stats_line,
     should_color,
 )
 from cambium.supervisor import PlanResult, TaskResult
@@ -276,6 +280,13 @@ def test_spawned_worker_cmd_is_truncated_to_60_chars() -> None:
     line = _line("spawned", {"worker": "y" * 90}, seq=2, task_id="t")
 
     assert line.endswith(f"  worker={'y' * 60}")
+
+
+def test_unknown_result_status_is_sanitized() -> None:
+    line = _line("result", {"status": "paused\x1b[31m\x9b\nnext"}, seq=1)
+
+    assert line.endswith("  status=paused[31m next")
+    assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
 
 
 def test_merge_worktree_and_child_kinds_golden() -> None:
@@ -787,6 +798,54 @@ def test_nested_container_dump_escapes_c1_controls() -> None:
     assert "\x1b" not in line
     _assert_terminal_safe(line)
     assert 'note=["a\\u009bb"]' in line
+
+
+def test_result_usage_and_breakdown_fields_are_sanitized() -> None:
+    result = render_text_result(
+        {
+            "status": "paused\x1b[31m\n",
+            "summary": "summary\x9b\ntext",
+            "merge_sha": "abc\x80def" * 4,
+            "results": [
+                {
+                    "status": "failed\x1b",
+                    "task_id": "task\x9b",
+                    "reason": "reason\ntext",
+                }
+            ],
+        }
+    )
+    stats = render_usage_stats_line(
+        {"model": "model\x1b[31m", "worktree": "/tmp/\x9bwork\n"}
+    )
+    breakdown = render_usage_breakdown(
+        {
+            "total": None,
+            "by_task": [("task\x1b\n", {"model": "model\x80"})],
+            "by_provider": [],
+        }
+    )
+
+    for line in (result, stats, breakdown):
+        assert "\x1b" not in line and "\x9b" not in line and "\x80" not in line
+        assert "\n" not in line
+
+
+def test_display_width_handles_wide_and_combining_text(monkeypatch: object) -> None:
+    wide_kind = _line("界", {"pid": 1})
+    combining_kind = _line("e\u0301", {"pid": 1})
+    assert wide_kind.startswith(" " * 14 + "界  ")
+    assert combining_kind.startswith(" " * 15 + "e\u0301  ")
+
+    _fixed_columns(monkeypatch, 80)
+    line = render_status_bar(_bar_events(), session_label="界e\u0301")
+    assert _display_width(line) == 80
+
+
+def test_tokens_per_s_skips_huge_integer_latency() -> None:
+    assert render_tokens_per_s(
+        [_usage_event(1, {"total_tokens": 100}, 10**10000)]
+    ) == ""
 # REPL raw-tty input discipline: reads, prompt repaint, per-turn SIGINT
 # ---------------------------------------------------------------------------
 
