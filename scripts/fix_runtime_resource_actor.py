@@ -3,6 +3,7 @@
 
 This file is source-controlled so the CI materialization path remains reviewable.
 The materializer is intentionally applied only to the latest verified main.
+Every generated source tree must pass the repository's unchanged static and test gates.
 """
 
 from __future__ import annotations
