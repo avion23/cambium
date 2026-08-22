@@ -15,6 +15,8 @@ import shutil
 
 from cambium import oneshot, repl, tui
 from cambium.render import (
+    _OK_GREEN,
+    _RESET,
     render_active_workers,
     render_event_line,
     render_status_bar,
@@ -121,13 +123,14 @@ def _line(
     *,
     seq: int | None = None,
     task_id: str | None = None,
+    stream: object = None,
 ) -> str:
     event: dict[str, object] = {"kind": kind, "payload": payload}
     if seq is not None:
         event["seq"] = seq
     if task_id is not None:
         event["task_id"] = task_id
-    return render_event_line(event)  # type: ignore[arg-type]
+    return render_event_line(event, stream=stream)  # type: ignore[arg-type]
 
 
 def test_unknown_kind_keeps_raw_compact_json_dump() -> None:
@@ -481,6 +484,153 @@ def test_status_bar_drops_absent_segments() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Severity accents (tty + NO_COLOR/TERM gate) and heartbeat spinner frame
+# ---------------------------------------------------------------------------
+
+
+def _color_stream(monkeypatch: object) -> None:
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        sys, "stdout", _TtyStream()
+    )
+    monkeypatch.delenv("NO_COLOR", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+
+def test_should_color_mirrors_render_markdown_if_tty_gate(
+    monkeypatch: object,
+) -> None:
+    plain = io.StringIO()
+    assert should_color(plain) is False
+
+    _color_stream(monkeypatch)
+    assert should_color(sys.stdout) is True
+
+    monkeypatch.setenv("NO_COLOR", "1")  # type: ignore[attr-defined]
+    assert should_color(sys.stdout) is False
+
+    monkeypatch.delenv("NO_COLOR")  # type: ignore[attr-defined]
+    monkeypatch.setenv("TERM", "dumb")  # type: ignore[attr-defined]
+    assert should_color(sys.stdout) is False
+
+
+def test_severity_accents_on_only_for_color_capable_stream(
+    monkeypatch: object,
+) -> None:
+    tty = _TtyStream()
+    ok = _line(
+        "tool_event",
+        {"tool": "run_shell", "cmd": "git status", "ok": True, "duration_ms": 42},
+        seq=5,
+        task_id="t",
+        stream=tty,
+    )
+    fail = _line(
+        "tool_event",
+        {"tool": "edit", "cmd": "x", "ok": False},
+        seq=6,
+        task_id="t",
+        stream=tty,
+    )
+    good = _line("result", {"status": "succeeded"}, seq=7, task_id="t", stream=tty)
+    bad = _line(
+        "result",
+        {"status": "failed", "failure_reason": "timeout"},
+        stream=tty,
+    )
+
+    assert ok.endswith("  run_shell git status \x1b[32mOK\x1b[0m 42ms")
+    assert fail.endswith("  edit x \x1b[31mFAIL\x1b[0m ?")
+    assert good.endswith("  status=\x1b[32msucceeded\x1b[0m")
+    assert bad.endswith("  status=\x1b[31mfailed\x1b[0m reason=timeout")
+
+    # The same records stay plain when the writing stream is not a color
+    # terminal, even with a tty stdout behind the scenes.
+    _color_stream(monkeypatch)
+    plain = _line("result", {"status": "succeeded"}, seq=8, task_id="t")
+
+    assert plain.endswith("  status=succeeded")
+    assert "\x1b[" not in plain
+
+
+def test_severity_accents_off_when_gated_or_other_status(monkeypatch: object) -> None:
+    tty = _TtyStream()
+
+    # stream=None (the pure default) never emits escapes, regardless of env.
+    default_plain = _line(
+        "tool_event", {"tool": "run_shell", "cmd": "git status", "ok": True}, seq=5
+    )
+    assert default_plain.endswith("  run_shell git status OK ?")
+    assert "\x1b[" not in default_plain
+
+    _color_stream(monkeypatch)
+    no_color = _line(
+        "result", {"status": "failed"}, seq=1, task_id="t"
+    )
+    monkeypatch.delenv("NO_COLOR", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.setenv("TERM", "dumb")  # type: ignore[attr-defined]
+    dumb_tty = _line(
+        "tool_event",
+        {"tool": "edit", "cmd": "x", "ok": True, "duration_ms": 3},
+        seq=2,
+        stream=tty,
+    )
+    dumb_none = _line(
+        "tool_event",
+        {"tool": "edit", "cmd": "x", "ok": False, "duration_ms": 3},
+        seq=2,
+    )
+
+    assert no_color.endswith("  status=failed")
+    for line in (no_color, dumb_tty, dumb_none):
+        for escape in ("\x1b[32m", "\x1b[31m"):
+            assert escape not in line
+    assert dumb_tty.endswith("  edit x OK 3ms")
+
+    monkeypatch.setenv("TERM", "xterm")  # type: ignore[attr-defined]
+    other = _line("session_ended", {"session_status": "ended"}, seq=3, stream=tty)
+
+    assert other.endswith("  status=ended")
+    assert "\x1b[" not in other
+
+
+def test_status_bar_spinner_rotates_over_working_heartbeats(
+    monkeypatch: object,
+) -> None:
+    _fixed_columns(monkeypatch, 100)
+    frames = ["/", "-", "\\", "|", "/"]  # len(events with heartbeat) % 4
+    events: list[dict[str, object]] = [
+        {"kind": "spawned", "payload": {}, "task_id": "t1", "monotonic_ms": 0}
+    ]
+    for index, expected in enumerate(frames):
+        events.append(
+            {
+                "kind": "heartbeat",
+                "payload": {"status": "working"},
+                "task_id": "t1",
+                "monotonic_ms": 100 + index,
+            }
+        )
+        line = render_status_bar(events, session_label="s")
+
+        parts = line.split(" · ")
+        assert parts[0] == "session=s"
+        assert parts[-1].split()[0] == expected
+
+
+def test_status_bar_spinner_needs_last_heartbeat_working(monkeypatch: object) -> None:
+    _fixed_columns(monkeypatch, 100)
+
+    working = [{"kind": "heartbeat", "payload": {"status": "working"}}]
+    assert render_status_bar(working, session_label="s") == "session=s · /"
+
+    idle = working + [{"kind": "heartbeat", "payload": {"status": "idle"}}]
+    assert render_status_bar(idle, session_label="s") == "session=s"
+
+    bare = [{"kind": "heartbeat", "payload": {}}]
+    assert render_status_bar(bare, session_label="s") == "session=s"
+
+
+# ---------------------------------------------------------------------------
 # Sink wiring: tty status-bar footer vs legacy non-tty byte behavior
 # ---------------------------------------------------------------------------
 
@@ -534,6 +684,13 @@ def test_tui_tty_draws_event_sourced_dashboard(monkeypatch, tmp_path):
     assert "\x1b[?1049l" in text
     assert "Cambium" in text
     assert "run_shell" in text
+    # The tty output stream is color-capable, so severity words carry accents.
+    assert f"run_shell df -h {_OK_GREEN}OK{_RESET} 5ms" in text
+    assert f"status={_OK_GREEN}succeeded{_RESET}" in text
+    # bar drawn after tool_event, heartbeat (keeps elapsed ticking), and
+    # result (final totals); NOT refreshed again after session_ended.
+    # 4 events -> exactly 3 draws proves session_ended refreshed nothing.
+    assert _bar_draws(text) == 3
 
 
 def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
@@ -561,7 +718,7 @@ def test_repl_tty_draws_bar_and_suppresses_after_terminal_events(monkeypatch, tm
         error_stream=io.StringIO(),
     )) == 0
     text = out.getvalue()
-    assert "run_shell df -h OK 5ms" in text
+    assert f"run_shell df -h {_OK_GREEN}OK{_RESET} 5ms" in text
     assert _bar_draws(text) == 3
 
 

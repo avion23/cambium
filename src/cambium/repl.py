@@ -122,13 +122,16 @@ async def run_repl(
                     if record.get("kind") == "usage_event":
                         usage_events.append(record)
                     if not _stream_tty:
-                        output_stream.write(render.render_event_line(record) + "\n")
+                        output_stream.write(
+                            render.render_event_line(record, stream=output_stream)
+                            + "\n"
+                        )
                         status = render.render_live_status_line(_events)
                         if status:
                             output_stream.write(status + "\n")
                         output_stream.flush()
                         return
-                    line = render.render_event_line(record)
+                    line = render.render_event_line(record, stream=output_stream)
                     if line:
                         output_stream.write(line + "\n")
                     if bar_live:

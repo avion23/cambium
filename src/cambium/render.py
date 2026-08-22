@@ -74,6 +74,35 @@ def _dumps(value: Any) -> str:
     )
 
 
+_RESET = "\x1b[0m"
+_OK_GREEN = "\x1b[32m"
+_FAIL_RED = "\x1b[31m"
+_DIM = "\x1b[2m"
+
+
+def should_color(stream: Any = None) -> bool:
+    """Return whether ``stream`` (default ``sys.stdout``) may receive ANSI color.
+
+    Mirrors the ``render_markdown_if_tty`` gate: a tty stream, no
+    ``NO_COLOR`` in the environment, and ``TERM`` other than ``dumb``.
+    """
+    target = sys.stdout if stream is None else stream
+    try:
+        if not bool(target.isatty()):
+            return False
+    except (AttributeError, OSError, ValueError):
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return os.environ.get("TERM", "") != "dumb"
+
+
+def _accent(text: str, code: str, stream: Any = None) -> str:
+    if stream is None or not should_color(stream):
+        return text
+    return f"{code}{text}{_RESET}"
+
+
 def _filter_safe(record: Mapping[str, Any]) -> dict[str, Any]:
     """Keep only canonical result fields, recursing into ``PlanResult.results``.
 
@@ -382,7 +411,7 @@ def _join(*parts: str | None) -> str:
 _TOOL_CMD_MAX_CHARS = 60
 
 
-def _format_tool_event(payload: Mapping[str, Any]) -> str:
+def _format_tool_event(payload: Mapping[str, Any], stream: Any = None) -> str:
     cmd = _text(payload, "cmd") or ""
     cmd = cmd[:_TOOL_CMD_MAX_CHARS]
     duration = payload.get("duration_ms")
@@ -391,7 +420,11 @@ def _format_tool_event(payload: Mapping[str, Any]) -> str:
         if isinstance(duration, (int, float)) and not isinstance(duration, bool)
         else "?"
     )
-    status = "OK" if payload.get("ok") is True else "FAIL"
+    status = (
+        _accent("OK", _OK_GREEN, stream)
+        if payload.get("ok") is True
+        else _accent("FAIL", _FAIL_RED, stream)
+    )
     return f"{_text(payload, 'tool') or '?'} {cmd} {status} {duration_text}"
 
 
@@ -425,9 +458,21 @@ def _format_usage_event(payload: Mapping[str, Any]) -> str:
     return _join(head, "FAILED", failure_reason)
 
 
-def _format_result(payload: Mapping[str, Any]) -> str:
+def _format_result(payload: Mapping[str, Any], stream: Any = None) -> str:
     reason = _text(payload, "reason") or _text(payload, "failure_reason")
-    return _join(_pair(payload, "status"), f"reason={reason}" if reason else None)
+    status = payload.get("status")
+    if not isinstance(status, str) or not status:
+        status_part = None
+    elif status == "succeeded":
+        status_part = f"status={_accent(status, _OK_GREEN, stream)}"
+    elif status == "failed":
+        status_part = f"status={_accent(status, _FAIL_RED, stream)}"
+    else:
+        status_part = f"status={status}"
+    return _join(status_part, f"reason={reason}" if reason else None)
+
+
+_STREAM_FORMATTERS = frozenset({_format_tool_event, _format_result})
 
 
 def _format_spawned(payload: Mapping[str, Any]) -> str:
@@ -497,7 +542,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Mapping[str, Any]], str]] = {
 }
 
 
-def render_event_line(event: Mapping[str, Any]) -> str:
+def render_event_line(event: Mapping[str, Any], *, stream: Any = None) -> str:
     """Render one redacted event record as one concise human-readable line.
 
     The line keeps the ``{seq:>6} {kind:>16} {task}  {body}`` prefix shape,
@@ -507,7 +552,9 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     module-level ``_EVENT_FORMATTERS`` table for known kinds (an empty body
     prints nothing); unknown kinds fall back to a compact-JSON dump with
     non-ASCII characters escaped so unseen payloads stay visible and
-    single-line.
+    single-line.  Severity accents (tool OK|FAIL, result succeeded|failed)
+    are emitted only when ``stream`` is the writing stream and
+    ``should_color(stream)`` holds; ``stream=None`` renders plain.
     """
     if not isinstance(event, Mapping):
         raise TypeError("render_event_line requires an event mapping")
@@ -522,11 +569,12 @@ def render_event_line(event: Mapping[str, Any]) -> str:
             if key not in _EVENT_ENVELOPE_KEYS
         }
     formatter = _EVENT_FORMATTERS.get(kind)
-    body = (
-        json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        if formatter is None
-        else formatter(payload)
-    )
+    if formatter is None:
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    elif formatter in _STREAM_FORMATTERS:
+        body = formatter(payload, stream)
+    else:
+        body = formatter(payload)
     if not body:
         return ""
     prefix = f"{_sanitize_field(kind):>16}"

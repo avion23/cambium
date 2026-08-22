@@ -90,7 +90,9 @@ async def run_tui(
                     if _dashboard.enabled:
                         _dashboard.draw(_state.snapshot(session_dir=_session_dir))
                     elif not quiet:
-                        _write_line(out, render.render_event_line(record))
+                        _write_line(
+                            out, render.render_event_line(record, stream=out)
+                        )
                         snapshot = _state.snapshot()
                         _write_line(
                             out,
