@@ -348,6 +348,7 @@ class ProviderError(DiffundoError):
         retry_after_s: float | None = None,
         request_rate_status: str | None = None,
         account_quota_owner: str | None = None,
+        probe_already_in_flight: bool = False,
     ) -> None:
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
@@ -358,6 +359,9 @@ class ProviderError(DiffundoError):
         self.retry_after_s = retry_after_s
         self.request_rate_status = request_rate_status
         self.account_quota_owner = account_quota_owner
+        # A stale candidate list can race with another HALF_OPEN probe. This
+        # rejection is admission control, not provider health evidence.
+        self.probe_already_in_flight = probe_already_in_flight
 
 
 class CostBudgetExceeded(DiffundoError):
@@ -566,73 +570,82 @@ class _RawResponse:
         try:
             choices = self.payload["choices"]
             message = choices[0]["message"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, "malformed response: no choices"
-            ) from exc
-        if message.get("refusal"):
-            raise ProviderError(
-                provider.name, ProviderOutcome.REFUSAL, "model refusal marker in response"
-            )
-        content = message.get("content")
-        raw_tool_calls = message.get("tool_calls")
-        tool_calls: tuple[dict[str, Any], ...] | None = None
-        if isinstance(raw_tool_calls, list) and raw_tool_calls:
-            for tool_call in raw_tool_calls:
-                if _tool_call_name(tool_call) is None:
-                    raise ProviderError(
-                        provider.name,
-                        ProviderOutcome.ERROR,
-                        "malformed response: tool call without a function name",
-                    )
-                try:
-                    _tool_call_arguments(tool_call)
-                except ValueError as exc:
-                    raise ProviderError(
-                        provider.name,
-                        ProviderOutcome.ERROR,
-                        f"malformed response: {exc}",
-                    ) from exc
-            tool_calls = tuple(raw_tool_calls)
-        if not isinstance(content, str):
-            if tool_calls is None:
+            if not isinstance(message, Mapping):
+                raise TypeError("message must be an object")
+            if message.get("refusal"):
                 raise ProviderError(
-                    provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
+                    provider.name, ProviderOutcome.REFUSAL, "model refusal marker in response"
                 )
-            content = ""
-        if _CONTENT_REFUSAL_RE.search(content):
-            # A 200 completion whose text is a model refusal: fall through to the
-            # next provider (documented heuristic, see module docstring). Like any
-            # refusal it never drives a health transition.
+            content = message.get("content")
+            raw_tool_calls = message.get("tool_calls")
+            tool_calls: tuple[dict[str, Any], ...] | None = None
+            if isinstance(raw_tool_calls, list) and raw_tool_calls:
+                for tool_call in raw_tool_calls:
+                    if _tool_call_name(tool_call) is None:
+                        raise ProviderError(
+                            provider.name,
+                            ProviderOutcome.ERROR,
+                            "malformed response: tool call without a function name",
+                        )
+                    try:
+                        _tool_call_arguments(tool_call)
+                    except ValueError as exc:
+                        raise ProviderError(
+                            provider.name,
+                            ProviderOutcome.ERROR,
+                            f"malformed response: {exc}",
+                        ) from exc
+                tool_calls = tuple(raw_tool_calls)
+            if not isinstance(content, str):
+                if tool_calls is None:
+                    raise ProviderError(
+                        provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
+                    )
+                content = ""
+            if _CONTENT_REFUSAL_RE.search(content):
+                # A 200 completion whose text is a model refusal: fall through to the
+                # next provider (documented heuristic, see module docstring). Like any
+                # refusal it never drives a health transition.
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.REFUSAL,
+                    f"completion content carries refusal markers: {content[:80]!r}",
+                )
+            usage = self.payload.get("usage")
+            if not isinstance(usage, dict):
+                usage = None
+            else:
+                cached_tokens = _cached_tokens(usage)
+                usage = dict(usage)
+                usage.pop("cached_tokens", None)
+                if cached_tokens is not None:
+                    usage["cached_tokens"] = cached_tokens
+            model = self.payload.get("model") or provider.model
+            if not isinstance(model, str):
+                raise TypeError("model must be a string")
+            return CallResult(
+                provider=provider.name,
+                model=model,
+                tier=provider.tier,
+                content=content,
+                latency_s=self.latency_s,
+                usage=usage,
+                estimated_cost_usd=_estimate_cost(provider, usage),
+                tool_calls=tool_calls,
+                retry_after_s=retry_after_s,
+                account_quota_owner=account_quota_owner,
+                prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+                prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
+                provider_cache_hit=_provider_cache_hit(usage),
+            )
+        except ProviderError:
+            raise
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
             raise ProviderError(
                 provider.name,
-                ProviderOutcome.REFUSAL,
-                f"completion content carries refusal markers: {content[:80]!r}",
-            )
-        usage = self.payload.get("usage")
-        if not isinstance(usage, dict):
-            usage = None
-        else:
-            cached_tokens = _cached_tokens(usage)
-            usage = dict(usage)
-            usage.pop("cached_tokens", None)
-            if cached_tokens is not None:
-                usage["cached_tokens"] = cached_tokens
-        return CallResult(
-            provider=provider.name,
-            model=self.payload.get("model") or provider.model,
-            tier=provider.tier,
-            content=content,
-            latency_s=self.latency_s,
-            usage=usage,
-            estimated_cost_usd=_estimate_cost(provider, usage),
-            tool_calls=tool_calls,
-            retry_after_s=retry_after_s,
-            account_quota_owner=account_quota_owner,
-            prompt_prefix_bytes=prompt_prefix_bytes(prompt),
-            prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
-            provider_cache_hit=_provider_cache_hit(usage),
-        )
+                ProviderOutcome.ERROR,
+                "malformed response: invalid response fields",
+            ) from exc
 
 
 class _CodexRawResponse(_RawResponse):
@@ -662,25 +675,34 @@ class _CodexRawResponse(_RawResponse):
                 ProviderOutcome.REFUSAL,
                 f"completion content carries refusal markers: {self.text[:80]!r}",
             )
-        usage = _codex_usage(self.payload)
-        response = self.payload.get("response")
-        model = provider.model
-        if isinstance(response, dict) and isinstance(response.get("model"), str):
-            model = response["model"]
-        return CallResult(
-            provider=provider.name,
-            model=model,
-            tier=provider.tier,
-            content=self.text,
-            latency_s=self.latency_s,
-            usage=usage,
-            estimated_cost_usd=_estimate_cost(provider, usage),
-            retry_after_s=retry_after_s,
-            account_quota_owner=account_quota_owner,
-            prompt_prefix_bytes=prompt_prefix_bytes(prompt),
-            prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
-            provider_cache_hit=_provider_cache_hit(usage),
-        )
+        try:
+            usage = _codex_usage(self.payload)
+            response = self.payload.get("response")
+            model = provider.model
+            if isinstance(response, dict) and isinstance(response.get("model"), str):
+                model = response["model"]
+            return CallResult(
+                provider=provider.name,
+                model=model,
+                tier=provider.tier,
+                content=self.text,
+                latency_s=self.latency_s,
+                usage=usage,
+                estimated_cost_usd=_estimate_cost(provider, usage),
+                retry_after_s=retry_after_s,
+                account_quota_owner=account_quota_owner,
+                prompt_prefix_bytes=prompt_prefix_bytes(prompt),
+                prompt_prefix_tokens_estimate=prompt_prefix_estimate_tokens(prompt),
+                provider_cache_hit=_provider_cache_hit(usage),
+            )
+        except ProviderError:
+            raise
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "malformed response: invalid response fields",
+            ) from exc
 
 
 def _provider_cache_hit(usage: dict[str, Any] | None) -> bool | None:
@@ -763,11 +785,19 @@ def _account_quota_owner(body: str, api_key: str) -> str | None:
 def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> float:
     if not usage:
         return 0.0
-    prompt_tokens = float(usage.get("prompt_tokens") or 0)
-    completion_tokens = float(usage.get("completion_tokens") or 0)
+    values: list[float] = []
+    for key in ("prompt_tokens", "completion_tokens"):
+        value = usage.get(key, 0)
+        if value is None:
+            value = 0
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"usage.{key} must be numeric")
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"usage.{key} must be finite and non-negative")
+        values.append(float(value))
     return (
-        prompt_tokens / 1_000_000 * provider.price_per_1m_in
-        + completion_tokens / 1_000_000 * provider.price_per_1m_out
+        values[0] / 1_000_000 * provider.price_per_1m_in
+        + values[1] / 1_000_000 * provider.price_per_1m_out
     )
 
 
@@ -1043,9 +1073,9 @@ def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
     }
     input_details = usage.get("input_tokens_details")
     if isinstance(input_details, dict):
-        normalized["prompt_tokens_details"] = {
-            "cached_tokens": cached_tokens if cached_tokens is not None else 0
-        }
+        normalized["prompt_tokens_details"] = dict(input_details)
+        if cached_tokens is not None:
+            normalized["prompt_tokens_details"]["cached_tokens"] = cached_tokens
         normalized["input_tokens_details"] = dict(input_details)
     output_details = usage.get("output_tokens_details")
     if isinstance(output_details, dict):
@@ -1268,27 +1298,43 @@ class Diffundo:
         *,
         model: str | None = None,
         budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
         Falls through on timeout/error/quota/refusal; providers in cooldown,
         OPEN, DISABLED, or rate-limited are skipped by the selection filter.
-        When every tier provider is unavailable the dispatch pauses on an
-        ``asyncio.Event`` and a recovery monitor wakes it (D8f); if nothing
-        recovers within the bounded pause window, raises ``AllProvidersFailed``.
+        A pinned ``model`` is strict unless this request explicitly sets
+        ``allow_model_substitution``; provider configuration alone never
+        authorizes a task to switch models. When every tier provider is
+        unavailable the dispatch pauses on an ``asyncio.Event`` and a recovery
+        monitor wakes it (D8f); if nothing recovers within the bounded pause
+        window, raises ``AllProvidersFailed``.
         """
         validate_prompt_structure(prompt)
         deadline = time.monotonic() + self._call_budget_s
         tried: list[str] = []
         last_error: BaseException | None = None
         while True:
-            candidates = await self._await_candidates(tier, model, deadline)
+            candidates = await self._await_candidates(
+                tier,
+                model,
+                deadline,
+                allow_model_substitution=allow_model_substitution,
+            )
             if not candidates:
                 raise AllProvidersFailed(tried, last_error)
+            probe_rejected = False
             for provider in candidates:
                 try:
                     result = await self._attempt(provider, prompt, deadline=deadline)
                 except ProviderError as exc:
+                    if exc.probe_already_in_flight:
+                        # A concurrent caller owns the HALF_OPEN probe. Do not
+                        # count this stale-candidate rejection as a provider
+                        # failure or make it the terminal cascade error.
+                        probe_rejected = True
+                        continue
                     tried.append(provider.name)
                     last_error = exc
                     if exc.budget_exhausted:
@@ -1302,6 +1348,10 @@ class Diffundo:
                 # on (prompt-prefix caching locality).
                 self._primary_provider = provider.name
                 return result
+            if probe_rejected and not tried:
+                # Let the active probe finish and re-evaluate health rather
+                # than returning an artificial all-providers failure.
+                continue
             raise AllProvidersFailed(tried, last_error)
 
     def health(self, name: str) -> HealthState:
@@ -1378,8 +1428,14 @@ class Diffundo:
         """Clear task-local state when a warm worker is rebound to another task."""
 
         self._provider_lease = None
+        self._primary_provider = None
 
-    def _candidates(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
+    def _candidates(
+        self,
+        tier: ProviderTier,
+        model: str | None,
+        allow_model_substitution: bool = False,
+    ) -> list[ProviderConfig]:
         candidates = list(self._candidates_unleased(tier, model))
         lease = self._provider_lease
         if lease is not None:
@@ -1394,7 +1450,8 @@ class Diffundo:
             substitutes = [
                 provider
                 for provider in candidates
-                if provider.model != requested_model
+                if allow_model_substitution
+                and provider.model != requested_model
                 and provider.allow_model_substitution
             ]
             candidates = [*exact, *substitutes]
@@ -1407,10 +1464,10 @@ class Diffundo:
 
         When ``model`` is pinned, providers in the same tier that declare a
         different model are kept as ordered fallback candidates behind the
-        strict model matches, so a quota/rate-limit failure on the pinned
-        provider can cascade to a sibling instead of surfacing as
-        ``AllProvidersFailed``. If no provider declares the pinned model, the
-        pin is a configuration error and no candidate is returned.
+        strict model matches. ``_candidates`` admits those substitutes only
+        when the request explicitly authorizes substitution and the sibling's
+        provider-global opt-in is true. If no provider declares the pinned
+        model, the pin is a configuration error and no candidate is returned.
         """
         now = time.monotonic()
         eligible: list[ProviderConfig] = []
@@ -1460,6 +1517,8 @@ class Diffundo:
         tier: ProviderTier,
         model: str | None,
         deadline: float,
+        *,
+        allow_model_substitution: bool = False,
     ) -> list[ProviderConfig]:
         """Return candidates, pausing on exhaustion (D8f) until a provider
         recovers or the pause window / deadline is spent."""
@@ -1468,7 +1527,11 @@ class Diffundo:
             now = time.monotonic()
             if now >= deadline:
                 return []
-            candidates = self._candidates(tier, model)
+            candidates = self._candidates(
+                tier,
+                model,
+                allow_model_substitution=allow_model_substitution,
+            )
             if candidates:
                 return candidates
             if paused_total >= self._pause_timeout_s:
@@ -1621,7 +1684,12 @@ class Diffundo:
         async with runtime.lock:
             probing = runtime.health in (HealthState.HALF_OPEN, HealthState.COOLDOWN)
             if probing and runtime.probe_in_flight:
-                raise ProviderError(provider.name, ProviderOutcome.ERROR, "probe already in flight")
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    "probe already in flight",
+                    probe_already_in_flight=True,
+                )
             if not runtime.bucket.try_take():
                 raise ProviderError(provider.name, ProviderOutcome.QUOTA, "token bucket empty")
             if probing:
@@ -1643,7 +1711,12 @@ class Diffundo:
                     if remaining is not None:
                         timeout_s = min(timeout_s, remaining)
                     try:
-                        raw = await self._post(provider, prompt, timeout_s=timeout_s)
+                        raw = await self._post_with_deadline(
+                            provider,
+                            prompt,
+                            timeout_s=timeout_s,
+                            deadline=deadline,
+                        )
                         result = raw.to_result(
                             provider,
                             prompt,
@@ -1740,6 +1813,67 @@ class Diffundo:
     ) -> _RawResponse:
         return await asyncio.to_thread(self._post_sync, provider, prompt, timeout_s)
 
+    @staticmethod
+    def _consume_post_task(task: asyncio.Task[Any]) -> None:
+        """Retrieve a timed-out worker task's eventual exception.
+
+        ``asyncio.to_thread`` cannot interrupt a blocking urllib call. The
+        router must still return at its wall deadline, so the timed-out task is
+        allowed to finish in the executor and its result is consumed here.
+        """
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            # Retrieving the exception is best-effort cleanup only.
+            pass
+
+    async def _post_with_deadline(
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+    ) -> _RawResponse:
+        """Run one threaded HTTP operation under the call's wall deadline."""
+        if deadline is None:
+            return await self._post(provider, prompt, timeout_s=timeout_s)
+        remaining = self._remaining(deadline)
+        if remaining is None or remaining <= 0:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                "call budget exhausted",
+                budget_exhausted=True,
+            )
+        post_task = asyncio.create_task(
+            self._post(provider, prompt, timeout_s=timeout_s)
+        )
+        try:
+            # Shield the task so wait_for returns at the deadline even though
+            # cancellation cannot stop the underlying executor thread.
+            result = await asyncio.wait_for(asyncio.shield(post_task), timeout=remaining)
+        except TimeoutError as exc:
+            post_task.add_done_callback(self._consume_post_task)
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                "call budget exhausted",
+                exc,
+                budget_exhausted=True,
+            ) from exc
+        remaining = self._remaining(deadline)
+        if remaining is not None and remaining <= 0:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                "call budget exhausted",
+                budget_exhausted=True,
+            )
+        return result
+
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
@@ -1750,6 +1884,12 @@ class Diffundo:
         # header over plaintext http to a non-loopback host (security audit).
         parsed = urlparse(provider.base_url)
         scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "provider URL scheme must be http or https",
+            )
         if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
             raise ProviderError(
                 provider.name,

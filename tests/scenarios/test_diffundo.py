@@ -40,6 +40,7 @@ from cambium.diffundo import (
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
+    _RawResponse,
     prompt_prefix_bytes,
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
@@ -350,13 +351,50 @@ def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
         pause_timeout_s=0.01,
     )
     try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        result = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                model="m2",
+                allow_model_substitution=True,
+            )
+        )
         assert isinstance(result, CallResult)
         assert result.provider == "p_other"
         assert result.model == "m-other"
         assert result.content == "sibling served"
         assert len(bad.calls) == 1  # strict match failed -> fell through
         assert len(sibling.calls) == 1
+    finally:
+        bad.close()
+        sibling.close()
+
+
+def test_model_pin_does_not_authorize_provider_global_substitution(
+    tmp_path, monkeypatch
+) -> None:
+    """A provider opt-in cannot override a task's exact-model pin."""
+    bad = FakeServer([(500, _error_payload("boom"), 0.0)])
+    sibling = FakeServer([(200, _ok_payload("must not serve", model="m-other"), 0.0)])
+    _set_keys(monkeypatch, "K_PINNED", "K_SUBSTITUTE")
+    router = Diffundo(
+        (
+            _config("p_pinned", bad, "K_PINNED", model="m2"),
+            _config(
+                "p_substitute",
+                sibling,
+                "K_SUBSTITUTE",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
+        ),
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed):
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        assert len(bad.calls) == 1
+        assert sibling.calls == []
     finally:
         bad.close()
         sibling.close()
@@ -384,12 +422,26 @@ def test_model_pin_unavailable_at_selection_falls_through_to_sibling(
         pause_timeout_s=0.01,
     )
     try:
-        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        first = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                model="m2",
+                allow_model_substitution=True,
+            )
+        )
         assert first.provider == "p_other"
         assert len(bad.calls) == 1
         assert len(sibling.calls) == 1
         # p_m2 is in COOLDOWN; the next selection relaxes straight to the sibling.
-        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        second = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                model="m2",
+                allow_model_substitution=True,
+            )
+        )
         assert second.provider == "p_other"
         assert len(bad.calls) == 1  # cooldown skipped the strict match
         assert len(sibling.calls) == 2
@@ -398,9 +450,63 @@ def test_model_pin_unavailable_at_selection_falls_through_to_sibling(
         sibling.close()
 
 
+def test_clear_provider_lease_also_clears_sticky_primary(monkeypatch) -> None:
+    first = FakeServer([(200, _ok_payload("first"), 0.0)])
+    second = FakeServer([(200, _ok_payload("second"), 0.0)])
+    _set_keys(monkeypatch, "K_LEASE_FIRST", "K_LEASE_SECOND")
+    router = Diffundo(
+        (
+            _config("p_first", first, "K_LEASE_FIRST", model="m"),
+            _config("p_second", second, "K_LEASE_SECOND", model="m"),
+        ),
+        primary_provider="p_second",
+    )
+    try:
+        bound = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert bound.provider == "p_second"
+        assert router._primary_provider == "p_second"
+        router.bind_provider("p_second", "m")
+        router.clear_provider_lease()
+        assert router.provider_lease is None
+        assert router._primary_provider is None
+
+        rebound = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert rebound.provider == "p_first"
+    finally:
+        first.close()
+        second.close()
+
+
 # --------------------------------------------------------------------------- #
 # 3. circuit breaker
 # --------------------------------------------------------------------------- #
+
+
+def test_duplicate_half_open_probe_rejection_is_benign(monkeypatch) -> None:
+    provider = ProviderConfig(
+        name="p_probe",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_PROBE",
+    )
+    router = Diffundo((provider,))
+    runtime = router._runtime(provider.name)
+    runtime.health = HealthState.HALF_OPEN
+    runtime.probe_in_flight = True
+    runtime.outcomes.append(True)
+
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(router._quota_wrapped_attempt(provider, PROMPT))
+
+    error = raised.value
+    assert error.probe_already_in_flight is True
+    assert runtime.health is HealthState.HALF_OPEN
+    assert list(runtime.outcomes) == [True]
+    # The real probe may recover independently; this rejection must not
+    # append a false outcome that would re-cool the recovered provider.
+    runtime.probe_in_flight = False
+    runtime.health = HealthState.HEALTHY
+    assert list(runtime.outcomes) == [True]
 
 
 def test_breaker_three_failures_put_provider_in_cooldown_and_skip(tmp_path, monkeypatch) -> None:
@@ -931,6 +1037,42 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
 # --------------------------------------------------------------------------- #
 
 
+def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
+    """A blocking socket read cannot extend the async call past its budget."""
+    provider = ProviderConfig(
+        name="p_threaded_slow",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_THREADED_SLOW",
+        timeout_s=5.0,
+        max_retries=0,
+    )
+    router = Diffundo((provider,), call_budget_s=0.05, pause_timeout_s=0.01)
+
+    def slow_post_sync(self, provider, prompt, timeout_s):
+        time.sleep(0.3)
+        return _RawResponse(_ok_payload("late"), 0.3)
+
+    monkeypatch.setattr(Diffundo, "_post_sync", slow_post_sync)
+
+    async def scenario() -> None:
+        start = time.monotonic()
+        with pytest.raises(AllProvidersFailed) as raised:
+            await router.call(ProviderTier.FAST, PROMPT)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.15
+        failure = raised.value
+        assert failure.last_error is not None
+        error = cast(ProviderError, failure.last_error)
+        assert error.outcome is ProviderOutcome.TIMEOUT
+        assert error.budget_exhausted is True
+        # Keep the loop alive until the deliberately orphaned executor work
+        # finishes, so the regression test also checks its cleanup callback.
+        await asyncio.sleep(0.35)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.slow  # 0.3s scripted provider delays; timing assertion
 def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
     # call_budget_s is a hard deadline over the WHOLE cascade, not just
@@ -999,6 +1141,32 @@ def test_remote_http_provider_without_config_validation_is_rejected_at_call(
     assert "http transport is allowed only for loopback hosts" in error.message
     assert "sk-test-K_INSECURE" not in str(exc.value)
     assert router.health("p_insecure") is HealthState.DISABLED
+
+
+@pytest.mark.parametrize(
+    ("scheme", "base_url"),
+    [("ftp", "ftp://provider.example/v1"), ("file", "file:///tmp/provider")],
+)
+def test_non_http_provider_schemes_are_rejected_before_urllib(
+    scheme: str, base_url: str, monkeypatch
+) -> None:
+    config = ProviderConfig(
+        name=f"p_{scheme}",
+        tier=ProviderTier.FAST,
+        base_url=base_url,
+        api_key_env=f"K_{scheme.upper()}",
+    )
+    monkeypatch.setenv(config.api_key_env, f"sk-{scheme}-secret")
+    router = Diffundo((config,), pause_timeout_s=0.01)
+
+    with pytest.raises(AllProvidersFailed) as exc:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+    failure = cast(AllProvidersFailed, exc.value)
+    assert failure.last_error is not None
+    error = cast(ProviderError, failure.last_error)
+    assert error.outcome is ProviderOutcome.AUTH_ERROR
+    assert "URL scheme must be http or https" in error.message
+    assert router.health(config.name) is HealthState.DISABLED
 
 
 # --------------------------------------------------------------------------- #

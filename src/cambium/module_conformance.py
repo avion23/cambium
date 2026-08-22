@@ -88,6 +88,10 @@ class ModuleConformanceError(ValueError):
     """Raised when a module violates the conformance contract."""
 
 
+class _GitHistoryLookupError(RuntimeError):
+    """Raised when git history exists but cannot be read reliably."""
+
+
 @dataclass(frozen=True, slots=True)
 class AuditFinding:
     """A static finding with a stable file, line, and symbol."""
@@ -316,19 +320,27 @@ def _load_jsonl_records(path: Path) -> list[tuple[int, dict[str, Any]]]:
     return records
 
 
-def _canonical_record_hash(record: dict[str, Any]) -> str | None:
+def _canonical_record_hash(record: dict[str, Any]) -> str:
     input_data = record.get("input")
     if not isinstance(input_data, dict):
-        return None
+        raise TypeError("input must be an object")
     task = input_data.get("task")
     context = input_data.get("context")
     if not isinstance(task, str) or not isinstance(context, str):
-        return None
+        raise TypeError("input.task and input.context must be strings")
+    # Keep this explicit: malformed or otherwise unhashable input must never
+    # silently disappear from the cross-split collision set.
+    hash((task, context))
     payload = json.dumps((task, context), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _git_file(revision: str, relative: Path) -> bytes | None:
+    """Read one historical file; ``None`` means it did not exist then.
+
+    A failed git invocation is different from an absent historical path.  The
+    former must fail the freeze gate rather than disabling it accidentally.
+    """
     if not _repository_available():
         return None
     try:
@@ -339,14 +351,73 @@ def _git_file(revision: str, relative: Path) -> bytes | None:
             check=False,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _GitHistoryLookupError(f"git show failed for {revision}:{relative}: {exc}") from exc
+    if result.returncode == 0:
+        return result.stdout
+    detail = result.stderr.decode(errors="replace").strip()
+    if "does not exist in" in detail or "exists on disk, but not in" in detail:
         return None
-    return result.stdout if result.returncode == 0 else None
+    raise _GitHistoryLookupError(
+        f"git show failed for {revision}:{relative}: {detail or 'unknown git error'}"
+    )
+
+
+def _git_history_revisions(spec: ModuleSpec) -> tuple[str, ...]:
+    """Return all commits touching the dataset history, newest first."""
+    if not _repository_available():
+        return ()
+    datasets = spec.path / "datasets"
+    paths = [
+        (datasets / "meta.json").relative_to(REPO_ROOT),
+        (datasets / "eval.jsonl").relative_to(REPO_ROOT),
+        (datasets / "canaries.jsonl").relative_to(REPO_ROOT),
+    ]
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%H", "--", *(path.as_posix() for path in paths)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _GitHistoryLookupError(f"git log failed for {spec.name}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        raise _GitHistoryLookupError(
+            f"git log failed for {spec.name}: {detail or 'unknown git error'}"
+        )
+    return tuple(dict.fromkeys(line.strip() for line in result.stdout.splitlines() if line.strip()))
+
+
+def _freeze_content_changed(previous: bytes, current: bytes) -> bool:
+    """Compare frozen records while tolerating historical version-only rewrites."""
+    if previous == current:
+        return False
+    try:
+        def normalize(data: bytes) -> list[dict[str, Any]]:
+            records: list[dict[str, Any]] = []
+            for line in data.decode("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("record is not an object")
+                record = dict(record)
+                record.pop("dataset_version", None)
+                records.append(record)
+            return records
+
+        return normalize(previous) != normalize(current)
+    except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return True
 
 
 def _baseline_parent(spec: ModuleSpec) -> str | None:
-    """Return the parent of the last commit that updated a module baseline."""
-    if not spec.baseline_files:
+    """Return the latest commit that updated a module baseline (compatibility helper)."""
+    if not spec.baseline_files or not _repository_available():
         return None
     try:
         result = subprocess.run(
@@ -354,7 +425,7 @@ def _baseline_parent(spec: ModuleSpec) -> str | None:
                 "git",
                 "log",
                 "-1",
-                "--format=%H^",
+                "--format=%H",
                 "--",
                 *(path.as_posix() for path in spec.baseline_files),
             ],
@@ -378,19 +449,18 @@ def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[Aud
     if not _valid_semver(version):
         return []
     try:
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        status = None
-    revisions = [revision for revision in (_baseline_parent(spec),) if revision is not None]
-    if status is not None and status.stdout:
-        revisions.insert(0, "HEAD")
+        revisions = _git_history_revisions(spec)
+    except _GitHistoryLookupError as exc:
+        path = spec.path / "datasets" / "meta.json"
+        return [
+            AuditFinding(
+                "freeze-version",
+                path,
+                0,
+                "git-history",
+                f"cannot verify frozen content history: {exc}",
+            )
+        ]
     findings: list[AuditFinding] = []
     meta_relative = (spec.path / "datasets" / "meta.json").relative_to(REPO_ROOT)
     for split, filename in (("eval", "eval.jsonl"), ("canary", "canaries.jsonl")):
@@ -400,16 +470,47 @@ def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[Aud
         except OSError:
             continue
         relative = path.relative_to(REPO_ROOT)
+        saw_current_version = False
         for revision in revisions:
-            previous = _git_file(revision, relative)
-            previous_meta = _git_file(revision, meta_relative)
-            if previous is None or previous == current or previous_meta is None:
-                continue
             try:
+                previous_meta = _git_file(revision, meta_relative)
+                if previous_meta is None:
+                    continue
                 old_meta = json.loads(previous_meta)
+            except _GitHistoryLookupError as exc:
+                findings.append(
+                    AuditFinding(
+                        "freeze-version",
+                        path,
+                        0,
+                        "git-history",
+                        f"cannot verify frozen content history: {exc}",
+                    )
+                )
+                break
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if isinstance(old_meta, dict) and old_meta.get("dataset_version") == version:
+            if not isinstance(old_meta, dict):
+                continue
+            if old_meta.get("dataset_version") != version:
+                if saw_current_version:
+                    break
+                continue
+            saw_current_version = True
+            try:
+                previous = _git_file(revision, relative)
+            except _GitHistoryLookupError as exc:
+                findings.append(
+                    AuditFinding(
+                        "freeze-version",
+                        path,
+                        0,
+                        "git-history",
+                        f"cannot verify frozen content history: {exc}",
+                    )
+                )
+                break
+            if previous is not None and _freeze_content_changed(previous, current):
                 findings.append(
                     AuditFinding(
                         "freeze-version",
@@ -624,6 +725,29 @@ def _validate_dataset_integrity(
                 f"must be integer {SUPPORTED_DATASET_SCHEMA_VERSION}",
             )
         )
+    module_label_field = manifest.label_field if manifest is not None else "decompose"
+    if not isinstance(module_label_field, str) or not module_label_field:
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                spec.path / "module.json",
+                0,
+                "label_field",
+                "must be a non-empty string when present",
+            )
+        )
+        module_label_field = "decompose"
+    if manifest is not None and schema_version != manifest.dataset_schema_version:
+        findings.append(
+            AuditFinding(
+                "dataset-integrity",
+                meta_path,
+                0,
+                "schema_version",
+                "meta.json schema_version must match module.json dataset_schema_version "
+                f"({schema_version!r} != {manifest.dataset_schema_version!r})",
+            )
+        )
     if not _valid_semver(meta.get("dataset_version")):
         findings.append(
             AuditFinding(
@@ -752,8 +876,52 @@ def _validate_dataset_integrity(
                         "top-level expected object is required (current wire schema is not data)",
                     )
                 )
+            input_obj = record.get("input")
+            if isinstance(input_obj, dict):
+                task = input_obj.get("task")
+                if not isinstance(task, str) or not task.strip():
+                    findings.append(
+                        AuditFinding(
+                            "dataset-integrity",
+                            path,
+                            line_number,
+                            "input.task",
+                            "must be a non-empty string",
+                        )
+                    )
+                if not isinstance(input_obj.get("context"), str):
+                    findings.append(
+                        AuditFinding(
+                            "dataset-integrity",
+                            path,
+                            line_number,
+                            "input.context",
+                            "must be a string",
+                        )
+                    )
             expected_obj = record.get("expected")
-            module_label_field = manifest.label_field if manifest is not None else "decompose"
+            if isinstance(expected_obj, dict):
+                label = expected_obj.get(module_label_field)
+                if not isinstance(label, bool):
+                    findings.append(
+                        AuditFinding(
+                            "dataset-integrity",
+                            path,
+                            line_number,
+                            f"expected.{module_label_field}",
+                            "must be a boolean label",
+                        )
+                    )
+                if not isinstance(expected_obj.get("reason"), str):
+                    findings.append(
+                        AuditFinding(
+                            "dataset-integrity",
+                            path,
+                            line_number,
+                            "expected.reason",
+                            "must be a string",
+                        )
+                    )
             if (
                 isinstance(expected_obj, dict)
                 and module_label_field != "decompose"
@@ -833,8 +1001,19 @@ def _validate_dataset_integrity(
                         "train/eval records must not set canary=true",
                     )
                 )
-            canonical_hash = _canonical_record_hash(record)
-            if canonical_hash is not None:
+            try:
+                canonical_hash = _canonical_record_hash(record)
+            except (TypeError, ValueError, KeyError) as exc:
+                findings.append(
+                    AuditFinding(
+                        "dataset-integrity",
+                        path,
+                        line_number,
+                        "cross_split_hash",
+                        f"canonical input cannot be hashed: {exc}",
+                    )
+                )
+            else:
                 if canonical_hash in seen_hashes:
                     first_split, first_line = seen_hashes[canonical_hash]
                     findings.append(
@@ -870,18 +1049,7 @@ def _validate_dataset_integrity(
     total_records = sum(split_counts.values())
     canary_records = records_by_split.get("canaries", [])
     manifest_path = spec.path / "module.json"
-    label_field = manifest.label_field if manifest is not None else "decompose"
-    if not isinstance(label_field, str) or not label_field:
-        findings.append(
-            AuditFinding(
-                "dataset-integrity",
-                manifest_path,
-                0,
-                "label_field",
-                "must be a non-empty string when present",
-            )
-        )
-        label_field = "decompose"
+    label_field = module_label_field
     labels = {
         True: sum(
             record.get("expected", {}).get(label_field) is True
@@ -1575,6 +1743,35 @@ def probe_module_cli(spec: ModuleSpec) -> None:
         )
     if not isinstance(value, dict):
         raise ModuleConformanceError(f"{spec.name}: JSON CLI stdout must be a JSON object")
+    if "error" in value:
+        raise ModuleConformanceError(
+            f"{spec.name}: JSON CLI returned an error-shaped object with exit 0"
+        )
+    label_field = spec.manifest.label_field if spec.manifest is not None else "decompose"
+    expected_fields = {"confidence", "reason", label_field}
+    if set(value) != expected_fields:
+        raise ModuleConformanceError(
+            f"{spec.name}: JSON CLI decision fields must be exactly "
+            f"{sorted(expected_fields)!r}, got {sorted(value)!r}"
+        )
+    label = value.get(label_field)
+    if not isinstance(label, bool):
+        raise ModuleConformanceError(
+            f"{spec.name}: JSON CLI decision field {label_field!r} must be boolean"
+        )
+    reason = value.get("reason")
+    if not isinstance(reason, str):
+        raise ModuleConformanceError(f"{spec.name}: JSON CLI reason must be a string")
+    confidence = value.get("confidence")
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence)
+        or not 0 <= confidence <= 1
+    ):
+        raise ModuleConformanceError(
+            f"{spec.name}: JSON CLI confidence must be a finite number in [0, 1]"
+        )
     _check_probe_siblings(spec, loaded_imports)
 
 
@@ -1604,6 +1801,194 @@ def _check_probe_siblings(spec: ModuleSpec, loaded_imports: set[str]) -> None:
         raise ModuleConformanceError(
             f"{spec.name}: sibling modules loaded inside the JSON CLI probe: "
             + ", ".join(siblings)
+        )
+
+
+def _evaluate_module_predictions(spec: ModuleSpec) -> None:
+    """Execute each split through the module CLI and enforce live quality gates."""
+    if spec.manifest is None:
+        raise ModuleConformanceError(f"{spec.name}: module manifest is required for evaluation")
+    cli_module = spec.manifest.cli_module
+    split_results: dict[str, list[float]] = {}
+    loaded_imports: set[str] = set()
+    try:
+        with module_offline_environment() as env, tempfile.TemporaryDirectory(
+            prefix="cambium-module-evaluate-"
+        ) as cwd:
+            import_log = Path(cwd) / "evaluate-imports.log"
+            env["CAMBIUM_MODULE_PROBE_IMPORT_LOG"] = str(import_log)
+            for split, filename in DECISION_SPLITS.items():
+                path = spec.path / "datasets" / filename
+                try:
+                    records = _load_jsonl_records(path)
+                except OSError as exc:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: cannot read {split} for live evaluation: {exc}"
+                    ) from exc
+                if split == "canaries" and not records:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live canary evaluation has no records"
+                    )
+                payload = json.dumps(
+                    {"operation": "evaluate", "records": [record for _, record in records]},
+                    separators=(",", ":"),
+                ) + "\n"
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "-m", cli_module],
+                        cwd=cwd,
+                        env=env,
+                        input=payload,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation timed out after 30 seconds"
+                    ) from exc
+                except OSError as exc:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation could not start: {exc}"
+                    ) from exc
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or "no stderr diagnostics"
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation exited "
+                        f"{result.returncode}: {detail}"
+                    )
+                if not result.stdout.endswith("\n") or result.stdout[:-1].endswith("\n"):
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation must emit one trailing newline"
+                    )
+                try:
+                    value, end = json.JSONDecoder().raw_decode(result.stdout[:-1])
+                except json.JSONDecodeError as exc:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation is not one JSON object: {exc}"
+                    ) from exc
+                if end != len(result.stdout) - 1:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation contains extra output"
+                    )
+                if not isinstance(value, dict) or "error" in value:
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation returned an error-shaped object"
+                    )
+                if set(value) != {"results"} or not isinstance(value["results"], list):
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation must return a results array"
+                    )
+                results = value["results"]
+                if len(results) != len(records):
+                    raise ModuleConformanceError(
+                        f"{spec.name}: live {split} evaluation returned {len(results)} "
+                        f"results for {len(records)} records"
+                    )
+                scores: list[float] = []
+                label_field = spec.manifest.label_field
+                for index, item in enumerate(results):
+                    if not isinstance(item, dict) or set(item) != {"prediction", "score"}:
+                        raise ModuleConformanceError(
+                            f"{spec.name}: live {split} result {index} has wrong schema"
+                        )
+                    prediction = item["prediction"]
+                    if (
+                        not isinstance(prediction, dict)
+                        or "error" in prediction
+                        or set(prediction) != {"confidence", "reason", label_field}
+                        or not isinstance(prediction.get(label_field), bool)
+                        or not isinstance(prediction.get("reason"), str)
+                    ):
+                        raise ModuleConformanceError(
+                            f"{spec.name}: live {split} prediction {index} has wrong schema"
+                        )
+                    score = item["score"]
+                    if (
+                        isinstance(score, bool)
+                        or not isinstance(score, (int, float))
+                        or not math.isfinite(score)
+                        or not 0 <= score <= 1
+                    ):
+                        raise ModuleConformanceError(
+                            f"{spec.name}: live {split} score {index} is not in [0, 1]"
+                        )
+                    scores.append(float(score))
+                split_results[split] = scores
+            loaded_imports = _probe_loaded_imports(import_log)
+    except ModuleConformanceError:
+        raise
+    _check_probe_siblings(spec, loaded_imports)
+
+    baseline_file = next(
+        (REPO_ROOT / path for path in spec.baseline_files if path.suffix.lower() == ".json"),
+        None,
+    )
+    if baseline_file is None:
+        raise ModuleConformanceError(f"{spec.name}: baseline is required for live evaluation")
+    try:
+        baseline = _load_json(baseline_file)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ModuleConformanceError(
+            f"{spec.name}: cannot read baseline for live evaluation: {exc}"
+        ) from exc
+    if not isinstance(baseline, dict):
+        raise ModuleConformanceError(f"{spec.name}: baseline must be an object for live evaluation")
+    thresholds = baseline.get("drift_thresholds")
+    baseline_metric = baseline.get("metric")
+    baseline_canaries = baseline.get("canaries")
+    if not isinstance(thresholds, dict) or not isinstance(baseline_metric, dict):
+        raise ModuleConformanceError(f"{spec.name}: baseline quality gates are unavailable")
+    metric_delta = thresholds.get("metric_mean_delta")
+    canary_delta = thresholds.get("canary_failed_delta")
+    if (
+        isinstance(metric_delta, bool)
+        or not isinstance(metric_delta, (int, float))
+        or not math.isfinite(metric_delta)
+        or metric_delta < 0
+        or isinstance(canary_delta, bool)
+        or not isinstance(canary_delta, int)
+        or canary_delta < 0
+        or not isinstance(baseline_canaries, dict)
+    ):
+        raise ModuleConformanceError(f"{spec.name}: baseline quality gates are invalid")
+    findings: list[str] = []
+    for split, scores in split_results.items():
+        fact = baseline_metric.get(split)
+        if not isinstance(fact, dict):
+            findings.append(f"metric.{split}: baseline metric is unavailable")
+            continue
+        baseline_mean = fact.get("mean")
+        if (
+            isinstance(baseline_mean, bool)
+            or not isinstance(baseline_mean, (int, float))
+            or not math.isfinite(baseline_mean)
+        ):
+            findings.append(f"metric.{split}: baseline mean is invalid")
+            continue
+        mean = sum(scores) / len(scores) if scores else float("nan")
+        if not math.isfinite(mean) or mean < baseline_mean - metric_delta:
+            findings.append(
+                f"metric.{split}: live mean {mean!r} below baseline {baseline_mean!r} "
+                f"minus allowed delta {metric_delta!r}"
+            )
+        if split == "canaries":
+            failed = sum(score < 1.0 for score in scores)
+            baseline_failed = baseline_canaries.get("failed")
+            if (
+                isinstance(baseline_failed, bool)
+                or not isinstance(baseline_failed, int)
+                or baseline_failed < 0
+                or failed > baseline_failed + canary_delta
+            ):
+                findings.append(
+                    f"canaries.failed: live {failed} exceeds baseline "
+                    f"{baseline_failed!r} plus allowed delta {canary_delta!r}"
+                )
+    if findings:
+        raise ModuleConformanceError(
+            f"{spec.name}: live quality gates failed:\n" + "\n".join(findings)
         )
 
 
@@ -2174,6 +2559,7 @@ class ModuleConformancePlugin:
                     + "\n".join(finding.format() for finding in findings)
                 )
             probe_module_cli(self.spec)
+            _evaluate_module_predictions(self.spec)
         except ModuleConformanceError as exc:
             message = str(exc)
             if (reverse_imports or external_module_files) and not message.startswith(
@@ -2216,11 +2602,31 @@ class ModuleConformancePlugin:
         passed = sum(outcome == "passed" for outcome in self.reports.values())
         skipped = sum(outcome == "skipped" for outcome in self.reports.values())
         failed = sum(outcome == "failed" for outcome in self.reports.values())
-        if passed == 0:
-            if skipped and not failed:
-                self.failures.append(f"all {skipped} collected module tests were skipped")
-            else:
-                self.failures.append("no module test passed")
+        expected_count: int | None = None
+        for baseline_path in self.spec.baseline_files:
+            if baseline_path.suffix.lower() != ".json":
+                continue
+            try:
+                baseline = _load_json(REPO_ROOT / baseline_path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            tests = baseline.get("tests") if isinstance(baseline, dict) else None
+            count = tests.get("count") if isinstance(tests, dict) else None
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 1:
+                expected_count = count
+                break
+        if expected_count is None:
+            self.failures.append("baseline test count is unavailable; refusing partial gate")
+        elif len(self.reports) != expected_count or passed != expected_count:
+            self.failures.append(
+                f"module test session is incomplete: passed={passed} skipped={skipped} "
+                f"failed={failed} reported={len(self.reports)} expected={expected_count}"
+            )
+        elif skipped or failed:
+            self.failures.append(
+                f"module test session has non-passing tests: passed={passed} "
+                f"skipped={skipped} failed={failed}"
+            )
         siblings_after = _loaded_siblings(cast(str, self.name))
         if siblings_after:
             self.failures.append(
