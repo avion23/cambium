@@ -28,4 +28,18 @@ replacement = '''        if not changed:
 '''
 if needle not in text:
     raise RuntimeError("tool-runtime compatibility insertion point not found")
-path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+text = text.replace(needle, replacement, 1)
+
+fixture = '"class Alpha:\\n    pass\\n\\ndef beta():\\n    return Alpha()\\n",'
+escaped_fixture = '"class Alpha:\\\\n    pass\\\\n\\\\ndef beta():\\\\n    return Alpha()\\\\n",'
+if fixture not in text:
+    raise RuntimeError("generated navigation fixture not found")
+text = text.replace(fixture, escaped_fixture, 1)
+
+single_line_fixture = 'target.write_text("x = 1\\n", encoding="utf-8")'
+escaped_single_line_fixture = 'target.write_text("x = 1\\\\n", encoding="utf-8")'
+if single_line_fixture not in text:
+    raise RuntimeError("generated LSP fixture not found")
+text = text.replace(single_line_fixture, escaped_single_line_fixture, 1)
+
+path.write_text(text, encoding="utf-8")
