@@ -389,6 +389,12 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
 
     auth = _parse_auth_mode(raw, location)
     protocol = _parse_protocol(raw, location)
+    if protocol is Protocol.CODEX_RESPONSES and auth is not AuthMode.CODEX_CHATGPT:
+        raise _error(
+            f"{location}.auth",
+            f"protocol {Protocol.CODEX_RESPONSES.value!r} requires auth "
+            f"{AuthMode.CODEX_CHATGPT.value!r}",
+        )
     if auth is AuthMode.CODEX_CHATGPT:
         if protocol is not Protocol.CODEX_RESPONSES:
             raise _error(
@@ -440,6 +446,8 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         raise _error(f"{location}.required", "must be a boolean")
 
     model = _require_string(values["model"], f"{location}.model")
+    if not model.strip():
+        raise _error(f"{location}.model", "must not be blank")
     priority = _require_integer(values["priority"], f"{location}.priority")
 
     cooldown_s = _require_number(values["cooldown_s"], f"{location}.cooldown_s")
@@ -529,6 +537,11 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     if reasoning_effort is not None:
         if not isinstance(reasoning_effort, str) or not reasoning_effort.strip():
             raise _error(f"{location}.reasoning_effort", "must be a non-empty string")
+        if protocol is not Protocol.CODEX_RESPONSES:
+            raise _error(
+                f"{location}.reasoning_effort",
+                f"is only supported with protocol {Protocol.CODEX_RESPONSES.value!r}",
+            )
         reasoning_effort = reasoning_effort.strip()
 
     return {

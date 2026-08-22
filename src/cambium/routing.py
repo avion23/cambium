@@ -28,11 +28,11 @@ with the optional ``token_window_allowance`` field.
 
 Provider lanes (H1) add concurrency-aware admission on top of the ledger:
 each provider owns one :class:`LaneState` (in-flight tasks plus an
-``rpm``-derived concurrency allowance) and :func:`select_lane` picks the
-provider with the lowest normalized utilization among lanes with spare
-capacity, so a wave of concurrent admissions spreads across providers instead
-of all picking the same max-min winner. 429 pressure shrinks a lane's
-effective in-flight cap (placeholder adaptive rule, see
+``rpm``-derived adaptive cap and the configured ``max_concurrency`` cap) and
+:func:`select_lane` picks the provider with the lowest normalized utilization
+among lanes with spare capacity, so a wave of concurrent admissions spreads
+across providers instead of all picking the same max-min winner. 429 pressure
+shrinks a lane's effective in-flight cap (placeholder adaptive rule, see
 ``LaneState.effective_in_flight_cap``), which is the admission-side
 backpressure that prevents retry storms.
 
@@ -589,24 +589,37 @@ class LaneState:
     """One concurrency lane per provider subscription (H1).
 
     ``in_flight`` counts tasks admitted onto the lane (batch pre-assignment or
-    admission-time assignment); ``rpm_allowance`` is the provider's configured
-    requests-per-minute, the concurrency budget the lane may keep in flight.
+    admission-time assignment). ``rpm_allowance`` is retained as the
+    adaptive/backpressure allowance, while ``max_concurrency`` is the
+    configured hard cap on simultaneous reservations. ``None`` preserves the
+    legacy direct-construction behavior for callers that do not carry provider
+    configuration into a lane; loaded provider lanes should always set it.
     """
 
     in_flight: int = 0
     rpm_allowance: float = 60.0
+    max_concurrency: int | None = None
 
     def effective_in_flight_cap(self, retry_after_count: int) -> int:
-        """In-flight cap under 429 pressure: ``max(1, floor(rpm * decay))``.
+        """Return the lower of the adaptive RPM cap and configured concurrency.
 
-        Placeholder adaptive rule: each 429-style usage event shrinks the
-        budget by ``1/50`` of the allowance, floor 50%, until live 429 events
-        stop and the debt stops accumulating. The cap never drops below 1 so
-        a pressured provider keeps serving at least one task instead of being
-        fully starved (the 429 is the provider's own backpressure signal).
+        Placeholder adaptive rule: each 429-style usage event shrinks the RPM
+        allowance by ``1/50`` of the allowance, floor 50%, until live 429
+        events stop and the debt stops accumulating. The cap never drops
+        below 1 so a pressured provider keeps serving at least one task. A
+        configured ``max_concurrency`` is an independent hard upper bound and
+        is applied after the adaptive calculation.
         """
         decay = max(0.5, 1.0 - retry_after_count / 50.0)
-        return max(1, int(self.rpm_allowance * decay))
+        cap = max(1, int(self.rpm_allowance * decay))
+        configured = self.max_concurrency
+        if configured is not None:
+            if isinstance(configured, bool) or not isinstance(configured, int):
+                # A malformed lane state must fail closed rather than turn
+                # into an unlimited admission lane.
+                return 1
+            cap = min(cap, max(1, configured))
+        return cap
 
 
 def select_lane(
@@ -618,8 +631,9 @@ def select_lane(
     """Max-min admission pick over per-provider lanes (H1).
 
     Like :func:`select_primary`, but a provider whose lane is at or above its
-    effective in-flight cap (``rpm_allowance`` decayed by that provider's
-    ``retry_after_count`` in ``debt``) is skipped entirely, so concurrent
+    effective in-flight cap (the lower of configured ``max_concurrency`` and
+    ``rpm_allowance`` decayed by that provider's ``retry_after_count`` in
+    ``debt``) is skipped entirely, so concurrent
     admissions in one wave spread across providers and a 429-pressured
     provider admits fewer tasks instead of colliding and retrying. Remaining
     providers rank by (normalized utilization, lane in_flight, requests,
@@ -640,6 +654,11 @@ def select_lane(
             continue
         matching = True
         lane = lanes.get(provider.name)
+        if lanes and lane is None:
+            # An empty lane map is the legacy "capacity not tracked" value;
+            # once a map has entries, a missing provider is an unknown lane and
+            # must not be treated as unlimited capacity.
+            continue
         if lane is not None:
             current = debt.get(provider.name) if debt is not None else None
             retry_after_count = current.retry_after_count if current is not None else 0
@@ -760,6 +779,11 @@ def score_providers(
         capability_matches += 1
         if lanes is not None:
             lane = lanes.get(provider.name)
+            if lanes and lane is None:
+                # As in select_lane, only an entirely empty map means that
+                # legacy callers did not request lane tracking. A partial map
+                # is an incomplete admission view and fails closed.
+                continue
             if lane is not None:
                 current = debt.get(provider.name) if debt is not None else None
                 retry_after_count = (

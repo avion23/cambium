@@ -103,6 +103,17 @@ def test_select_lane_ranks_utilization_then_idle_lanes_then_config_order() -> No
     assert select_lane(providers, ["m1"], tied, busy) == ("c", "m1")
 
 
+def test_select_lane_applies_configured_max_concurrency_cap() -> None:
+    provider = _pc("a", "m1", rpm=60, max_concurrency=1)
+    lane = LaneState(in_flight=1, rpm_allowance=60.0, max_concurrency=1)
+
+    with pytest.raises(ValueError):
+        select_lane([provider], ["m1"], {}, {"a": lane})
+
+    lane.in_flight = 0
+    assert select_lane([provider], ["m1"], {}, {"a": lane}) == ("a", "m1")
+
+
 def test_select_lane_skips_capped_lanes_and_raises_when_all_are_capped() -> None:
     providers = [_pc("a", "m1", rpm=1), _pc("b", "m2")]
     lanes = {"a": LaneState(in_flight=1, rpm_allowance=1.0), "b": LaneState()}
@@ -116,10 +127,21 @@ def test_select_lane_skips_capped_lanes_and_raises_when_all_are_capped() -> None
     assert select_lane(providers, ["m1"], {}, {}) == ("a", "m1")
 
 
+def test_partial_lane_map_fails_closed_for_unknown_provider() -> None:
+    providers = [_pc("a", "m1"), _pc("b", "m1")]
+    lanes = {"a": LaneState()}
+
+    assert select_lane(providers, ["m1"], {}, lanes) == ("a", "m1")
+    lanes["a"].in_flight = lanes["a"].effective_in_flight_cap(0)
+    with pytest.raises(ValueError):
+        select_lane(providers, ["m1"], {}, lanes)
+
+
 def test_effective_in_flight_cap_decays_with_429_pressure() -> None:
     assert LaneState(rpm_allowance=60.0).effective_in_flight_cap(0) == 60
     # decay = max(0.5, 1 - 25/50) = 0.5 -> cap 30
     assert LaneState(rpm_allowance=60.0).effective_in_flight_cap(25) == 30
+    assert LaneState(rpm_allowance=60.0, max_concurrency=1).effective_in_flight_cap(0) == 1
     # the decay floor keeps a pressured lane open at one task
     assert LaneState(rpm_allowance=60.0).effective_in_flight_cap(1000) == 30
     # a tiny rpm can never drop below one in-flight slot

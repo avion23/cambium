@@ -166,6 +166,25 @@ def test_score_providers_strict_filter_applies_in_batch_preassignment(
 # --------------------------------------------------------------------------- #
 
 
+def test_score_providers_fails_closed_for_partial_lane_map() -> None:
+    providers = [_pc("a", "m1"), _pc("b", "m1")]
+
+    # The unknown provider is not treated as an unlimited lane; only the
+    # provider whose lane is tracked remains eligible.
+    assert [name for name, _model, _score in score_providers(
+        providers, ["m1"], {}, lanes={"a": LaneState()}
+    )] == ["a"]
+    with pytest.raises(ValueError):
+        score_providers(
+            providers, ["m1"], {}, lanes={"a": LaneState(in_flight=60)}
+        )
+    # An entirely empty map remains the legacy untracked-lane compatibility
+    # value and does not make otherwise eligible providers disappear.
+    assert {name for name, _model, _score in score_providers(
+        providers, ["m1"], {}, lanes={}
+    )} == {"a", "b"}
+
+
 def test_score_providers_ranks_shared_quality_objective() -> None:
     providers = [_pc("a", "m1"), _pc("b", "m2")]
     # equal utilization (0 tokens): A has 9/10 cache hits and 2s avg latency,

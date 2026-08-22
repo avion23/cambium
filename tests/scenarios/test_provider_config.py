@@ -296,6 +296,18 @@ def test_codex_chatgpt_without_codex_responses_protocol_is_rejected(
         load_providers(path)
 
 
+def test_codex_responses_without_codex_chatgpt_auth_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_provider(protocol="codex_responses")],
+    )
+
+    with pytest.raises(ValueError, match="requires auth 'codex_chatgpt'"):
+        load_providers(path)
+
+
 def test_codex_chatgpt_base_url_in_file_is_rejected(tmp_path: Path) -> None:
     # Token-exfiltration guard: a modified provider file must never redirect
     # the bearer token away from the pinned profile endpoint.
@@ -324,6 +336,14 @@ def test_api_key_provider_without_api_key_env_is_rejected(tmp_path: Path) -> Non
     path = _write(tmp_path / "providers.json", [value])
 
     with pytest.raises(ValueError, match=r"missing required field\(s\).*api_key_env"):
+        load_providers(path)
+
+
+@pytest.mark.parametrize("model", ["", "   ", "\t\n"])
+def test_blank_model_is_rejected(tmp_path: Path, model: str) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(model=model)])
+
+    with pytest.raises(ValueError, match=r"providers\[0\]\.model: must not be blank"):
         load_providers(path)
 
 
@@ -379,3 +399,27 @@ def test_malformed_reasoning_effort_fails_closed(
 
     with pytest.raises(ValueError, match="reasoning_effort"):
         load_providers(path)
+
+
+def test_reasoning_effort_requires_codex_responses_protocol(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_provider(reasoning_effort="high")],
+    )
+
+    with pytest.raises(ValueError, match="only supported with protocol 'codex_responses'"):
+        load_providers(path)
+
+
+def test_cached_input_price_round_trips_independently(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path / "providers.json",
+        [_provider(price=0.40, price_per_1m_in=0.30, price_per_1m_cached_in=0.05,
+                   price_per_1m_out=0.80)],
+    )
+
+    providers = load_providers(path)
+
+    assert providers[0].price_per_1m_in == 0.30
+    assert providers[0].price_per_1m_cached_in == 0.05
+    assert providers[0].price_per_1m_out == 0.80
