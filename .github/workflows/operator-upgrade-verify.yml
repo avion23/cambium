@@ -113,7 +113,7 @@ jobs:
           git config user.name "cambium-operator-bot"
           git config user.email "cambium-operator-bot@users.noreply.github.com"
           git add -- README.md pyproject.toml uv.lock src/cambium tests/scenarios docs
-          git rm -- \
+          git rm -f -- \
             scripts/apply_operator_upgrade.py \
             scripts/adapt_operator_upgrade_latest.py \
             scripts/fix_operator_upgrade_tests.py \
