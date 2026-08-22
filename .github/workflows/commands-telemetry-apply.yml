@@ -1,0 +1,48 @@
+name: commands-telemetry-apply
+
+on:
+  push:
+    branches:
+      - codex/runtime-commands-telemetry
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/runtime-commands-telemetry
+      - run: cp scripts/apply_commands_telemetry.py /tmp/apply_commands_telemetry.py
+      - name: Pull latest upstream after interactive phase
+        run: |
+          git fetch origin main
+          BASE_SHA=$(git rev-parse origin/main)
+          git cat-file -e "$BASE_SHA:src/cambium/interactive.py"
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git checkout --detach "$BASE_SHA"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev --python 3.14
+      - name: Apply, normalize, and test
+        run: |
+          cp /tmp/apply_commands_telemetry.py scripts/apply_commands_telemetry.py
+          uv run --python 3.14 python scripts/apply_commands_telemetry.py
+          uv run --python 3.14 ruff check --fix src tests
+          uv run --python 3.14 ruff check src tests
+          uv run --python 3.14 python -m compileall -q src tests
+          uv run --python 3.14 pytest -q tests/scenarios/test_provider_resource_commands.py tests/scenarios/test_provider_resources.py tests/scenarios/test_interactive_session.py tests/scenarios/test_user_cli.py tests/scenarios/test_context_epochs.py
+          uv run --python 3.14 pytest -q -n auto
+          uv run --python 3.14 pytest -q -n auto -m slow
+          uv lock --check
+          git diff --check
+      - name: Commit and lease-protected fast-forward
+        run: |
+          rm -f scripts/apply_commands_telemetry.py
+          git config user.name "cambium-command-bot"
+          git config user.email "cambium-command-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(session): add quota telemetry and local commands"
+          git push --force-with-lease=refs/heads/main:${BASE_SHA} origin HEAD:main
