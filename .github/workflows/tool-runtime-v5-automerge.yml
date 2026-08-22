@@ -20,6 +20,7 @@ jobs:
         run: |
           cp scripts/apply_tool_runtime_v5.py /tmp/apply_tool_runtime_v5.py
           cp scripts/fix_tool_runtime_v5.py /tmp/fix_tool_runtime_v5.py
+          cp scripts/patch_tool_runtime_v5_for_main.py /tmp/patch_tool_runtime_v5_for_main.py
       - name: Start from latest clean main
         run: |
           git fetch origin main
@@ -28,10 +29,12 @@ jobs:
           mkdir -p scripts
           cp /tmp/apply_tool_runtime_v5.py scripts/apply_tool_runtime_v5.py
           cp /tmp/fix_tool_runtime_v5.py scripts/fix_tool_runtime_v5.py
+          cp /tmp/patch_tool_runtime_v5_for_main.py scripts/patch_tool_runtime_v5_for_main.py
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --extra dev --python 3.14
       - name: Apply immutable hybrid tool runtime
         run: |
+          uv run --python 3.14 python scripts/patch_tool_runtime_v5_for_main.py
           uv run --python 3.14 python scripts/apply_tool_runtime_v5.py
           uv run --python 3.14 python scripts/fix_tool_runtime_v5.py
           uv run --python 3.14 ruff format src tests
@@ -75,7 +78,8 @@ jobs:
         run: |
           rm -f \
             scripts/apply_tool_runtime_v5.py \
-            scripts/fix_tool_runtime_v5.py
+            scripts/fix_tool_runtime_v5.py \
+            scripts/patch_tool_runtime_v5_for_main.py
           git config user.name "cambium-tools-bot"
           git config user.email "cambium-tools-bot@users.noreply.github.com"
           git add -A
