@@ -130,6 +130,27 @@ def _move_quota_initialization() -> None:
     _write(path, "".join(lines))
 
 
+def _fix_model_candidate_policy() -> None:
+    path = ROOT / "src" / "cambium" / "diffundo.py"
+    _replace_in_function(
+        path,
+        "_candidates",
+        '''    exact = [provider for provider in candidates if provider.model == requested_model]
+    if exact or not any(provider.allow_model_substitution for provider in candidates):
+        candidates = exact
+''',
+        '''    exact = [provider for provider in candidates if provider.model == requested_model]
+    substitutes = [
+        provider
+        for provider in candidates
+        if provider.model != requested_model and provider.allow_model_substitution
+    ]
+    candidates = [*exact, *substitutes]
+''',
+        class_name="Diffundo",
+    )
+
+
 def _fix_native_tool_prompt_wiring() -> None:
     path = ROOT / "src" / "cambium" / "worker.py"
 
@@ -150,12 +171,12 @@ def _fix_native_tool_prompt_wiring() -> None:
 
     text = _read(path)
     _start, _end, fork_segment = _function_segment(text, "_fork_prompt")
-    if "    tools: list[dict[str, Any]],\n" not in fork_segment:
+    if "    tools: list[dict[str, Any]] | None = None,\n" not in fork_segment:
         old = '''    continuation: list[dict[str, Any]],
 ) -> dict[str, Any]:
 '''
         new = '''    continuation: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
 '''
         _replace_in_function(path, "_fork_prompt", old, new)
@@ -163,7 +184,11 @@ def _fix_native_tool_prompt_wiring() -> None:
         path,
         "_fork_prompt",
         '    return {"messages": messages}\n',
-        '    return {"messages": messages, "tools": tools}\n',
+        '''    prompt: dict[str, Any] = {"messages": messages}
+    if tools is not None:
+        prompt["tools"] = tools
+    return prompt
+''',
     )
 
     text = _read(path)
@@ -174,6 +199,27 @@ def _fix_native_tool_prompt_wiring() -> None:
         if count != 1:
             raise RuntimeError(f"worker fork prompt call: expected one match, found {count}")
         _write(path, text.replace(old_call, new_call, 1))
+
+
+def _fix_worker_optional_metadata() -> None:
+    path = ROOT / "src" / "cambium" / "worker.py"
+    _replace_in_function(
+        path,
+        "_native_tool_action",
+        "    calls = result.tool_calls\n",
+        '    calls = getattr(result, "tool_calls", None)\n',
+    )
+    _replace_in_function(
+        path,
+        "_success_usage_event",
+        '''    if result.quota_windows is not None:
+        event["quota_windows"] = [dict(item) for item in result.quota_windows]
+''',
+        '''    quota_windows = getattr(result, "quota_windows", None)
+    if quota_windows is not None:
+        event["quota_windows"] = [dict(item) for item in quota_windows]
+''',
+    )
 
 
 def _ensure_oauth_regex_import() -> None:
@@ -300,11 +346,77 @@ def _fix_generated_line_lengths() -> None:
         _write(repl_tests, text)
 
 
+def _update_legacy_tests_for_explicit_semantics() -> None:
+    provider_config = ROOT / "tests" / "scenarios" / "test_provider_config.py"
+    _replace_exact(
+        provider_config,
+        '''            price_per_1m_in=0.25,
+            price_per_1m_out=0.25,
+''',
+        '''            price_per_1m_in=0.25,
+            price_per_1m_out=0.25,
+            price_per_1m_cached_in=0.25,
+            pricing_known=True,
+''',
+    )
+
+    diffundo_tests = ROOT / "tests" / "scenarios" / "test_diffundo.py"
+    _replace_exact(
+        diffundo_tests,
+        '''    fast = FakeServer([(200, _ok_payload("fast"), 0.0)])
+    fast2 = FakeServer([(200, _ok_payload("fast m2"), 0.0)])
+    strong = FakeServer([(200, _ok_payload("strong"), 0.0)])
+    balanced = FakeServer([(200, _ok_payload("balanced"), 0.0)])
+''',
+        '''    fast = FakeServer([(200, _ok_payload("fast", model="m1"), 0.0)])
+    fast2 = FakeServer([(200, _ok_payload("fast m2", model="m2"), 0.0)])
+    strong = FakeServer([(200, _ok_payload("strong", model="m-s"), 0.0)])
+    balanced = FakeServer([(200, _ok_payload("balanced", model="m-b"), 0.0)])
+''',
+    )
+    _replace_exact(
+        diffundo_tests,
+        '''            _config("p_other", sibling, "K_OTHER", model="m-other"),
+''',
+        '''            _config(
+                "p_other",
+                sibling,
+                "K_OTHER",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
+''',
+        expected=2,
+    )
+    _replace_exact(
+        diffundo_tests,
+        '''    """A pinned model's matching provider failing mid-call cascades to a same
+    tier sibling that declares a different model (cascade fix), instead of
+    surfacing AllProvidersFailed."""
+''',
+        '''    """An explicitly substitution-enabled sibling may serve after the exact
+    model lane fails; substitution is never an implicit fallback."""
+''',
+    )
+    _replace_exact(
+        diffundo_tests,
+        '''    """A pinned model whose only matching provider fails into COOLDOWN cascades
+    to the eligible same-tier sibling on the next selection."""
+''',
+        '''    """An explicitly substitution-enabled sibling remains eligible while the
+    exact model lane is in cooldown."""
+''',
+    )
+
+
 def main() -> None:
     _move_quota_initialization()
+    _fix_model_candidate_policy()
     _fix_native_tool_prompt_wiring()
+    _fix_worker_optional_metadata()
     _ensure_oauth_regex_import()
     _fix_generated_line_lengths()
+    _update_legacy_tests_for_explicit_semantics()
 
 
 if __name__ == "__main__":
