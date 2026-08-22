@@ -28,7 +28,7 @@ jobs:
       - name: Materialize implementation
         run: |
           uv run --python 3.14 python scripts/apply_production_harness_v3.py
-          uv run --python 3.14 python scripts/fix_production_harness_v3.py
+          uv run --python 3.14 python scripts/run_production_harness_v3_fixes.py
           uv run --python 3.14 ruff check --fix src tests
       - name: Static gates
         run: |
@@ -66,6 +66,7 @@ jobs:
           git rm -f --ignore-unmatch -- \
             scripts/apply_production_harness_v3.py \
             scripts/fix_production_harness_v3.py \
+            scripts/run_production_harness_v3_fixes.py \
             .github/workflows/production-harness-v3-automerge.yml
           git diff --cached --check
           if ! git diff --cached --quiet; then
