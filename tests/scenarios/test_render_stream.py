@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import shutil
 
 from cambium import oneshot, repl, tui
@@ -831,7 +832,8 @@ def test_repl_tty_prompt_repaints_after_mid_run_event(monkeypatch, tmp_path):
     assert seen_prompts == ["hi"]
     text = out.getvalue()
     assert text.startswith("\r\033[Kcambium> ")
-    repaint_after_event = text.index("\r\033[Kcambium> ", text.index("run_shell df -h OK 5ms"))
+    _ansi_free = re.sub("\x1b\\[[0-9;]*m", "", text)
+    repaint_after_event = _ansi_free.index("cambium> ", _ansi_free.index("run_shell df -h OK 5ms"))
     assert repaint_after_event > text.index("session=")
 
 
