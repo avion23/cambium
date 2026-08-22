@@ -1766,6 +1766,28 @@ class Diffundo:
             )
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
         body = {**prompt, "model": provider.model}
+        if isinstance(body.get("tools"), list):
+            # Internal tool schemas carry {name, description, parameters}; the
+            # chat-completions wire format requires the function wrapper. The
+            # codex responses path has its own converter (_codex_tools); this
+            # is its chat counterpart.
+            wire_tools: list[dict[str, Any]] = []
+            for tool in body["tools"]:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                    continue
+                wire_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get(
+                                "parameters", {"type": "object", "properties": {}}
+                            ),
+                        },
+                    }
+                )
+            body["tools"] = wire_tools
         data = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             url,

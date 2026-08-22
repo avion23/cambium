@@ -369,23 +369,66 @@ def build_summary_request(
 
 
 def parse_summary_response(content: str, expected: SummaryExpectation) -> SummaryEntry:
-    """Validate a model-produced summary against the exact requested range."""
+    """Validate model-owned summary CONTENT and stamp OUR identity onto it.
+
+    The control block's sequence/hash/count/through_turn fields describe the
+    range WE chose to summarize — bookkeeping the caller already knows.
+    Requiring the model to echo them verbatim added no integrity (a prompt
+    injection could copy them too) while failing small models constantly.
+    Identity therefore comes from ``expected``; the model owns only the
+    semantic delta, and content bounds are still enforced.
+    """
     if not isinstance(content, str) or not content.strip():
         raise SummaryTrunkError("summary response must be non-empty JSON")
     try:
         decoded = json.loads(content)
     except (json.JSONDecodeError, RecursionError) as exc:
         raise SummaryTrunkError("summary response must be exactly one JSON object") from exc
-    entry = _entry_from_mapping(decoded)
-    for field in (
-        "sequence",
-        "source_sha256",
-        "source_message_count",
-        "through_turn",
-    ):
-        if getattr(entry, field) != getattr(expected, field):
-            raise SummaryTrunkError(f"summary response {field} does not match control")
-    return entry
+    if not isinstance(decoded, dict):
+        raise SummaryTrunkError("summary response must be exactly one JSON object")
+    if decoded.get("type", "summary_entry") != "summary_entry":
+        raise SummaryTrunkError("summary entry type must be 'summary_entry'")
+    objective = decoded.get("objective")
+    outcome = decoded.get("outcome")
+    if not isinstance(objective, str) or not objective.strip():
+        raise SummaryTrunkError(
+            "summary response objective must be a non-empty string"
+        )
+    if not isinstance(outcome, str) or not outcome.strip():
+        raise SummaryTrunkError("summary response outcome must be a non-empty string")
+
+    def _items(field: str) -> tuple[str, ...]:
+        value = decoded.get(field)
+        if value is None:
+            return ()
+        if (
+            not isinstance(value, list)
+            or len(value) > SUMMARY_MAX_ITEMS
+            or any(not isinstance(item, str) or not item for item in value)
+        ):
+            raise SummaryTrunkError(
+                f"summary response {field} must be at most {SUMMARY_MAX_ITEMS} "
+                "non-empty strings"
+            )
+        return tuple(value)
+
+    return SummaryEntry(
+        type="summary_entry",
+        sequence=expected.sequence,
+        source_sha256=expected.source_sha256,
+        source_message_count=expected.source_message_count,
+        through_turn=expected.through_turn,
+        objective=objective.strip(),
+        outcome=outcome.strip(),
+        decisions_added=_items("decisions_added"),
+        decisions_superseded=_items("decisions_superseded"),
+        facts_added=_items("facts_added"),
+        facts_invalidated=_items("facts_invalidated"),
+        files_and_symbols_changed=_items("files_and_symbols_changed"),
+        verification_results=_items("verification_results"),
+        relevant_failed_approaches=_items("relevant_failed_approaches"),
+        open_items=_items("open_items"),
+    )
 
 
 def append_summary_entry(

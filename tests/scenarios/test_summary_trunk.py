@@ -121,24 +121,34 @@ def test_semantic_provider_reuse_rejects_legacy_raw_tail() -> None:
         semantic_summary_messages([*HEAD, *TAIL_1])
 
 
-def test_summary_response_cannot_lie_about_coverage() -> None:
+def test_summary_response_identity_is_stamped_not_echoed() -> None:
     _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
     payload = json.loads(_response(expectation, label="one"))
     payload["source_sha256"] = "0" * 64
-    with pytest.raises(SummaryTrunkError, match="source_sha256"):
-        parse_summary_response(json.dumps(payload), expectation)
+    payload["sequence"] = 99
+    # A lying or sloppy model cannot corrupt identity: the parser stamps the
+    # caller's expectation over whatever the response claimed.
+    entry = parse_summary_response(json.dumps(payload), expectation)
+    assert entry.source_sha256 == expectation.source_sha256
+    assert entry.sequence == expectation.sequence
 
 
 def test_summary_response_is_strict_and_bounded() -> None:
     _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
     payload = json.loads(_response(expectation, label="one"))
     payload["tool_calls"] = []
-    with pytest.raises(SummaryTrunkError, match="field set"):
+    # Unknown extra fields are ignored; identity fields are not model-owned.
+    entry = parse_summary_response(json.dumps(payload), expectation)
+    assert entry.objective
+
+    payload = json.loads(_response(expectation, label="one"))
+    payload.pop("objective")
+    with pytest.raises(SummaryTrunkError, match="objective"):
         parse_summary_response(json.dumps(payload), expectation)
 
     payload = json.loads(_response(expectation, label="one"))
     payload["open_items"] = ["x"] * 33
-    with pytest.raises(SummaryTrunkError, match="item cap"):
+    with pytest.raises(SummaryTrunkError, match="item cap|at most"):
         parse_summary_response(json.dumps(payload), expectation)
 
 
