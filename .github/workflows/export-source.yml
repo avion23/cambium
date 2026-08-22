@@ -17,12 +17,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.head_ref || github.ref_name }}
       - name: Archive exact checkout
-        run: |
-          git rev-parse HEAD > SOURCE_SHA
-          tar --exclude=.git --exclude=.venv -czf cambium-source.tar.gz .
+        run: git archive --format=tar.gz --output="$RUNNER_TEMP/cambium-source.tar.gz" HEAD
       - uses: actions/upload-artifact@v4
         with:
           name: cambium-source
-          path: cambium-source.tar.gz
+          path: ${{ runner.temp }}/cambium-source.tar.gz
           if-no-files-found: error
           retention-days: 1
