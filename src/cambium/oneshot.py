@@ -445,6 +445,10 @@ def _resolve_provider(
     # tier authorized siblings remain as fallback candidates behind it. The
     # authorized set is every provider with a usable credential so a sibling
     # cascade never routes to a provider whose credential was never loaded.
+    # The env-key whitelist must match: a sibling without its key in the
+    # worker environment can only fail with AUTH_ERROR. Codex-oauth providers
+    # are excluded — their access token travels via CAMBIUM_OAUTH_* injection,
+    # never an api_key_env.
     store = auth_store if auth_store is not None else AuthStore()
     authorized = _authorized_provider_names(providers, store)
     codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
@@ -457,8 +461,11 @@ def _resolve_provider(
     fanout_config["tier"] = selected.tier.value
     fanout_config["model"] = effective_model
     environment = {}
-    if not _is_codex_oauth_provider(selected):
-        environment.update(_stored_provider_environment(selected.api_key_env, store))
+    for candidate in authorized:
+        if not _is_codex_oauth_provider(candidate):
+            environment.update(
+                _stored_provider_environment(candidate.api_key_env, store)
+            )
     resolved = replace(
         config,
         provider=selected.name,
@@ -466,10 +473,10 @@ def _resolve_provider(
         assigned_provider=selected.name,
         provider_config_path=config_path,
         authorized_providers=tuple(candidate.name for candidate in authorized),
-        provider_env_keys=(
-            ()
-            if _is_codex_oauth_provider(selected)
-            else (selected.api_key_env,)
+        provider_env_keys=tuple(
+            candidate.api_key_env
+            for candidate in authorized
+            if not _is_codex_oauth_provider(candidate)
         ),
         fanout_config=fanout_config,
     )
