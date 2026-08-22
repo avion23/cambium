@@ -56,7 +56,9 @@ def _patch_candidate_policy() -> None:
     if exact_index is None or assignment_index is None:
         raise RuntimeError("generated model-candidate block not found")
 
-    indent = segment[exact_index][: len(segment[exact_index]) - len(segment[exact_index].lstrip())]
+    indent = segment[exact_index][
+        : len(segment[exact_index]) - len(segment[exact_index].lstrip())
+    ]
     replacement = [
         f"{indent}exact = [provider for provider in candidates if provider.model == requested_model]\n",
         f"{indent}substitutes = [\n",
@@ -86,6 +88,7 @@ def main() -> None:
     _patch_candidate_policy()
     fixer = _load_fixer()
     fixer._fix_model_candidate_policy = lambda: None
+    fixer._fix_generated_line_lengths = lambda: None
     fixer.main()
 
 
