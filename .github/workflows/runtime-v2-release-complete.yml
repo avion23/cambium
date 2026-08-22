@@ -1,0 +1,79 @@
+name: runtime-v2-release-complete
+
+on:
+  push:
+    branches:
+      - codex/runtime-v2-release-complete
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: codex/runtime-v2-release-complete
+
+      - name: Wait for complete operator runtime
+        run: |
+          for attempt in $(seq 1 200); do
+            git fetch origin main
+            BASE_SHA=$(git rev-parse origin/main)
+            if git cat-file -e "$BASE_SHA:tests/scenarios/test_input_protocol.py" 2>/dev/null \
+              && git cat-file -e "$BASE_SHA:tests/scenarios/test_interactive_introspection.py" 2>/dev/null \
+              && git cat-file -e "$BASE_SHA:tests/scenarios/test_provider_portfolio_e2e.py" 2>/dev/null; then
+              echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+              git checkout --detach "$BASE_SHA"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "complete operator runtime did not arrive on main" >&2
+          exit 1
+
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev --python 3.14
+
+      - name: Verify complete latest main
+        run: |
+          uv lock --check
+          uv run --python 3.14 ruff check src tests
+          uv run --python 3.14 python -m compileall -q src tests
+          uv run --python 3.14 pytest -q \
+            tests/scenarios/test_input_protocol.py \
+            tests/scenarios/test_interactive_introspection.py \
+            tests/scenarios/test_interactive_session.py \
+            tests/scenarios/test_provider_portfolio_e2e.py \
+            tests/scenarios/test_oauth_refresh_singleflight.py \
+            tests/scenarios/test_provider_resources_productization.py \
+            tests/scenarios/test_provider_resources_hardening.py \
+            tests/scenarios/test_provider_resources.py \
+            tests/scenarios/test_provider_resource_commands.py \
+            tests/scenarios/test_context_epochs.py \
+            tests/scenarios/test_user_cli.py
+          uv run --python 3.14 pytest -q -n auto
+          uv run --python 3.14 pytest -q -n auto -m slow
+          git diff --check
+
+      - name: Operator smoke
+        run: |
+          tmp=$(mktemp -d)
+          uv run --python 3.14 cambium-quota init --path "$tmp/resources.json"
+          uv run --python 3.14 cambium-quota validate --path "$tmp/resources.json"
+          uv run --python 3.14 cambium-quota recommend --path "$tmp/resources.json" --task-class research
+          uv run --python 3.14 cambium monitor --help
+          uv run --python 3.14 cambium tui --help
+          uv run --python 3.14 cambium optimize should_decompose --dry-run
+
+      - name: Publish verified main and stable tag
+        run: |
+          git config user.name "cambium-release-bot"
+          git config user.email "cambium-release-bot@users.noreply.github.com"
+          git commit --allow-empty -m "chore(runtime): verify complete OpenCode-replacement runtime"
+          git push --force-with-lease=refs/heads/main:${BASE_SHA} origin HEAD:main
+          VERIFIED_SHA=$(git rev-parse HEAD)
+          git tag -f runtime-v2-complete "$VERIFIED_SHA"
+          git push --force origin refs/tags/runtime-v2-complete
