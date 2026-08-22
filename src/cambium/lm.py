@@ -910,26 +910,59 @@ class _CambiumLMMixin(_DspyLMType):
 
     @staticmethod
     def _message(message: Any) -> dict[str, Any]:
-        if all(part.type == "text" for part in message.parts):
-            content: Any = "".join(part.text for part in message.parts)
+        tool_calls = [part for part in message.parts if part.type == "tool_call"]
+        if message.role == "assistant" and tool_calls:
+            content_parts = [part for part in message.parts if part.type != "tool_call"]
+            if all(part.type == "text" for part in content_parts):
+                content: Any = "".join(part.text for part in content_parts)
+            else:
+                content = [part.model_dump(exclude_none=True) for part in content_parts]
+            rendered = {"role": message.role, "content": content or None}
+            rendered["tool_calls"] = [
+                {
+                    **({"id": part.id} if part.id is not None else {}),
+                    "type": "function",
+                    "function": {
+                        "name": part.name,
+                        "arguments": json.dumps(part.args),
+                    },
+                }
+                for part in tool_calls
+            ]
+        elif message.role == "tool" and len(message.parts) == 1 and message.parts[0].type == "tool_result":
+            result = message.parts[0]
+            if all(part.type == "text" for part in result.content):
+                content = "".join(part.text for part in result.content)
+            else:
+                content = [part.model_dump(exclude_none=True) for part in result.content]
+            rendered = {"role": message.role, "content": content}
+            if result.call_id is not None:
+                rendered["tool_call_id"] = result.call_id
+            if result.name is not None:
+                rendered["name"] = result.name
+        elif all(part.type == "text" for part in message.parts):
+            content = "".join(part.text for part in message.parts)
+            rendered = {"role": message.role, "content": content}
         else:
-            content = [part.model_dump(exclude_none=True) for part in message.parts]
-        rendered = {"role": message.role, "content": content}
+            rendered = {
+                "role": message.role,
+                "content": [part.model_dump(exclude_none=True) for part in message.parts],
+            }
         if message.name is not None:
             rendered["name"] = message.name
         return rendered
 
     @staticmethod
     def _tool(tool: Any) -> dict[str, Any]:
-        function: dict[str, Any] = {
+        rendered: dict[str, Any] = {
             "name": tool.name,
             "parameters": tool.parameters,
         }
         if tool.description is not None:
-            function["description"] = tool.description
+            rendered["description"] = tool.description
         if tool.strict is not None:
-            function["strict"] = tool.strict
-        return {"type": "function", "function": function}
+            rendered["strict"] = tool.strict
+        return rendered
 
     @staticmethod
     def _response(result: CallResult) -> Any:
