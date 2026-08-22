@@ -575,3 +575,55 @@ def test_repl_non_tty_legacy_has_no_bar_escapes(monkeypatch, tmp_path):
         error_stream=io.StringIO(),
     )) == 0
     assert "\r\033[K" not in out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Envelope field sanitization and ASCII-escaped container dumps
+# ---------------------------------------------------------------------------
+
+_FORBIDDEN_CONTROLS = set(range(0x00, 0x09)) | set(range(0x0B, 0x20)) | {0x7F}
+
+
+def _assert_terminal_safe(line: str) -> None:
+    assert line.isascii()
+    codes = {ord(ch) for ch in line}
+    assert not (_FORBIDDEN_CONTROLS & codes)
+
+
+def test_hostile_kind_is_sanitized_before_padding() -> None:
+    line = render_event_line(
+        {
+            "seq": 1,
+            "kind": "ki\x1b[31mnd\nsecond\x9bk",
+            "payload": {"a": 1},
+        }
+    )
+
+    _assert_terminal_safe(line)
+    assert "\n" not in line
+    body = json.dumps({"a": 1}, sort_keys=True, separators=(",", ":"))
+    assert line == f"{1:>6} {'ki[31mnd secondk':>16}  {body}"
+
+
+def test_hostile_task_id_is_sanitized_in_prefix() -> None:
+    line = render_event_line(
+        {
+            "seq": 2,
+            "kind": "ready",
+            "payload": {"pid": 7},
+            "task_id": "t\x1b[31mi\n\x9bd",
+        }
+    )
+
+    _assert_terminal_safe(line)
+    assert "\n" not in line
+    assert line == f"{2:>6} {'ready':>16} t[31mi d  pid=7"
+
+
+def test_nested_container_dump_escapes_c1_controls() -> None:
+    line = render_event_line({"kind": "protocol", "payload": {"note": ["a\x9bb"]}})
+
+    assert "\x9b" not in line
+    assert "\x1b" not in line
+    _assert_terminal_safe(line)
+    assert 'note=["a\\u009bb"]' in line

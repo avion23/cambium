@@ -68,7 +68,7 @@ def _dumps(value: Any) -> str:
     return json.dumps(
         value,
         sort_keys=True,
-        ensure_ascii=False,
+        ensure_ascii=True,
         allow_nan=False,
         separators=(",", ":"),
     )
@@ -501,7 +501,9 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     """Render one redacted event record as one concise human-readable line.
 
     The line keeps the ``{seq:>6} {kind:>16} {task}  {body}`` prefix shape,
-    with ``seq`` and ``task`` omitted when absent. The body comes from the
+    with ``seq`` and ``task`` omitted when absent. Envelope ``kind`` and
+    ``task_id`` pass through ``_sanitize_field`` before the prefix is padded,
+    so padding aligns on the sanitized width. The body comes from the
     module-level ``_EVENT_FORMATTERS`` table for known kinds (an empty body
     prints nothing); unknown kinds fall back to a compact-JSON dump with
     non-ASCII characters escaped so unseen payloads stay visible and
@@ -527,13 +529,13 @@ def render_event_line(event: Mapping[str, Any]) -> str:
     )
     if not body:
         return ""
-    prefix = f"{kind:>16}"
+    prefix = f"{_sanitize_field(kind):>16}"
     seq = event.get("seq")
     if isinstance(seq, int) and not isinstance(seq, bool):
         prefix = f"{seq:>6} {prefix}"
     task_id = event.get("task_id")
     if isinstance(task_id, str) and task_id:
-        prefix = f"{prefix} {task_id}"
+        prefix = f"{prefix} {_sanitize_field(task_id)}"
     return f"{prefix}  {body}"
 
 
