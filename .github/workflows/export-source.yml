@@ -1,9 +1,9 @@
 name: export-source
 
 on:
-  push:
+  pull_request:
     branches:
-      - codex/production-harness-v2
+      - main
 
 permissions:
   contents: read
@@ -15,6 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.head_ref || github.ref_name }}
       - name: Archive exact checkout
         run: |
           git rev-parse HEAD > SOURCE_SHA
