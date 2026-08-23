@@ -102,6 +102,18 @@ Two stores represent different facts and must not be merged:
 configured quota window continue to use the debt-balancing allowance rather
 than inventing a provider contract.
 
+## HTTP failure classification
+
+Provider HTTP failures pass through one classifier in `cambium.diffundo`.
+`429` responses are quota pressure: bounded `Retry-After` evidence, lane
+coldown, full-jitter retry of idempotent calls only. Plain `403` responses are
+not auth errors by default. Response-body markers split them into four classes:
+invalid credentials (quarantined per credential fingerprint), missing model
+entitlement (configuration disabled), quota/billing exhaustion (cooldown until
+reset evidence), and policy/content refusal (terminal for the request; provider
+health is not damaged). `401` quarantines authentication; network and 5xx
+failures receive bounded transient treatment; malformed responses fail closed.
+
 ## Removed alternatives
 
 The following parallel implementations are intentionally gone:

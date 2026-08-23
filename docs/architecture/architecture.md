@@ -238,11 +238,11 @@ hierarchy remain targets; approval and containment were removed by decision.
 | --- | --- | --- |
 | CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Direct-source CLI; version-only package export |
 | Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan` for plans without `depends_on`; static ready-node waves with width-bounded admission for plans with `depends_on`; one-task adapter retained |
-| Worker/IPC | `src/cambium/worker.py`, `ipc.py` | Marker mode, custom provider loop, bounded NDJSON |
+| Worker/IPC | `src/cambium/worker.py`, `ipc.py`, `prompts.py` | Marker mode, custom provider loop, bounded NDJSON; production prompt text centralized in versioned constants (`PROMPTS_VERSION`) with a drift test against worker embeds |
 | Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
 | Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic child admission wired through the injected decision port (`ArchitectusCore` or `aggregate`/`step` adapter) with conversation persistence, exposed by `Orchestrator.run` and `cambium supervisor --conversations` |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
-| Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
+| Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; bounded code navigation (`code_index`, `lsp_query`) exposed as schemas and dispatched through `run_tool`; `run_python` holds a permission key separate from shell; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
 
 Any target moves to current only after a caller and focused failure test
