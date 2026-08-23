@@ -1,9 +1,15 @@
-"""Pure full-screen terminal view model for Cambium's interactive frontend.
+"""Terminal presentation model for Cambium's interactive frontend.
 
 The cockpit is intentionally a presentation layer over immutable session and
 observability snapshots.  It owns no provider, worker, branch, or context
 state.  The only mutable value is a bounded local transcript used for the
-operator's current terminal view.
+operator's current terminal view.  Live output is appended to the terminal's
+primary buffer so the terminal, rather than a private alternate screen, owns
+scrollback.
+
+``render_cockpit`` remains available as a deterministic framed renderer for
+presentation tests and callers that need a bounded snapshot.  ``Cockpit``
+uses ``render_primary`` for the live interactive path.
 """
 
 from __future__ import annotations
@@ -29,11 +35,6 @@ _GREEN = "\x1b[1;32m"
 _YELLOW = "\x1b[1;33m"
 _RED = "\x1b[1;31m"
 _WHITE = "\x1b[1;37m"
-
-_ALT_ENTER = "\x1b[?1049h\x1b[?25l"
-_ALT_EXIT = "\x1b[?25h\x1b[?1049l"
-_HOME_CLEAR = "\x1b[H\x1b[2J"
-_CLEAR_LINE = "\x1b[2K"
 
 _CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1417,6 +1418,82 @@ def _style_kind(kind: str) -> str:
     return ""
 
 
+def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
+    """Return safe, labelled transcript rows for the append-only view."""
+    width = max(64, width)
+    body_width = max(20, width - 9)
+    # The transcript itself is bounded, but a large Markdown entry may occupy
+    # many wrapped rows.  Leave enough capacity to render the complete local
+    # view so the Cockpit can append only the suffix it has not emitted yet.
+    capacity = max(64, len(transcript.entries) * 16 + 64)
+    rows = _transcript_lines(transcript, body_width, capacity)
+    rendered: list[tuple[str, str]] = []
+    for role, text in rows:
+        rendered.append((role, _clip(_sanitize(text), width)))
+    return rendered
+
+
+def _primary_status_line(
+    snapshot: Any,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+    width: int,
+) -> str:
+    """Build the compact status row appended after each changed draw."""
+    status = _sanitize(getattr(snapshot, "session_status", "idle"))
+    agents = getattr(snapshot, "active_agents", 0)
+    tokens = _human_count(getattr(snapshot, "total_tokens", 0))
+    rate = getattr(snapshot, "output_tokens_per_s", 0.0)
+    epoch = getattr(getattr(snapshot, "context", None), "epoch", 0)
+    branch = _sanitize(branch_line)
+    provider_model = ""
+    match = re.search(r"(provider=\S+\s+model=\S+)", branch)
+    if match is not None:
+        provider_model = match.group(1)
+    details = (
+        f"status={status} · {provider_model + ' · ' if provider_model else ''}"
+        f"agents={agents} · tokens={tokens} · out/s={rate:.1f}"
+        f" · epoch={epoch} · {_sanitize(cumulative_line)}"
+        f" · {branch if not provider_model else branch.replace(provider_model, '').strip(' ·')}"
+        f" · {_sanitize(session_description)}"
+    )
+    return _clip(f"┌ Cambium · {details}", max(64, width))
+
+
+def render_primary(
+    snapshot: Any,
+    transcript: Transcript,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+    width: int,
+    color: bool = False,
+) -> list[str]:
+    """Render an append-only transcript followed by one compact status row."""
+    width = max(64, width)
+    lines = [
+        _paint(text, _ROLE_COLORS.get(role, ""), color)
+        for role, text in _primary_rows(transcript, width)
+    ]
+    lines.append(
+        _paint(
+            _primary_status_line(
+                snapshot,
+                session_description=session_description,
+                branch_line=branch_line,
+                cumulative_line=cumulative_line,
+                width=width,
+            ),
+            _DIM_CYAN,
+            color,
+        )
+    )
+    return lines
+
+
 def render_cockpit(
     snapshot: Any,
     transcript: Transcript,
@@ -1508,7 +1585,15 @@ def render_cockpit(
 
 
 class Cockpit:
-    """Persistent alternate-screen owner for one interactive frontend."""
+    """Persistent primary-buffer writer for one interactive frontend.
+
+    Unlike a conventional full-screen dashboard, a draw never homes the
+    cursor or clears the terminal.  New transcript rows and changed status
+    rows are appended to the terminal's normal buffer, which gives the
+    operator native terminal scrollback for free.  While readline owns the
+    input line, the newest draw is retained and flushed after that read ends;
+    asynchronous event output therefore cannot overwrite text being edited.
+    """
 
     def __init__(self, stream: TextIO, *, enabled: bool = True) -> None:
         self.stream = stream
@@ -1517,6 +1602,10 @@ class Cockpit:
         self._entered = False
         self._previous_sigterm_handler: Any = None
         self._last_size = os.terminal_size((120, 40))
+        self._input_active = False
+        self._pending_draw: tuple[Any, Transcript, str, str, str] | None = None
+        self._last_primary_rows: tuple[tuple[str, str], ...] = ()
+        self._last_status_line = ""
 
     @property
     def size(self) -> os.terminal_size:
@@ -1529,8 +1618,6 @@ class Cockpit:
                 signal.signal(signal.SIGTERM, self._handle_sigterm)
             except (OSError, ValueError):
                 self._previous_sigterm_handler = None
-            self.stream.write(_ALT_ENTER)
-            self.stream.flush()
             self._entered = True
         return self
 
@@ -1544,9 +1631,8 @@ class Cockpit:
         raise SystemExit(128 + signum)
 
     def close(self) -> None:
+        self.flush()
         if self._entered:
-            self.stream.write(_ALT_EXIT)
-            self.stream.flush()
             self._entered = False
         if self._previous_sigterm_handler is not None:
             try:
@@ -1565,37 +1651,76 @@ class Cockpit:
         cumulative_line: str,
         input_label: str = "›",
     ) -> None:
+        """Append changed transcript rows and a compact status row."""
+        del input_label
         if not self.enabled:
             return
         self._last_size = shutil.get_terminal_size((120, 40))
-        frame = render_cockpit(
+        request = (
             snapshot,
             transcript,
+            session_description,
+            branch_line,
+            cumulative_line,
+        )
+        if self._input_active:
+            self._pending_draw = request
+            return
+        self._draw_now(request)
+
+    def _draw_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str],
+    ) -> None:
+        snapshot, transcript, session_description, branch_line, cumulative_line = request
+        rows = tuple(_primary_rows(transcript, self._last_size.columns))
+        status_line = _primary_status_line(
+            snapshot,
             session_description=session_description,
             branch_line=branch_line,
             cumulative_line=cumulative_line,
             width=self._last_size.columns,
-            height=self._last_size.lines,
-            color=self.color,
-            input_label=input_label,
         )
-        self.stream.write(_HOME_CLEAR)
-        self.stream.write("\n".join(frame))
-        self.stream.flush()
+
+        if rows[: len(self._last_primary_rows)] == self._last_primary_rows:
+            new_rows = rows[len(self._last_primary_rows) :]
+        else:
+            # A bounded transcript can evict old rows, and a failure block can
+            # replace a previously emitted row.  Keep the append-only contract
+            # by marking the refreshed view instead of repainting history.
+            new_rows = (("dim", "··· transcript view refreshed ···"), *rows)
+
+        if new_rows or status_line != self._last_status_line:
+            for role, text in new_rows:
+                self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
+                self.stream.write("\n")
+            self.stream.write(_paint(status_line, _DIM_CYAN, self.color))
+            self.stream.write("\n")
+            self.stream.flush()
+
+        self._last_primary_rows = rows
+        self._last_status_line = status_line
+
+    def flush(self) -> None:
+        """Flush the newest draw once the input line is no longer active."""
+        if not self.enabled or self._input_active or self._pending_draw is None:
+            return
+        request = self._pending_draw
+        self._pending_draw = None
+        self._draw_now(request)
 
     def move_to_input(self, *, label: str = "›") -> None:
         if not self.enabled:
             return
-        row = max(1, self._last_size.lines - 1)
-        column = 4 + len(label)
-        self.stream.write(f"\x1b[{row};1H{_CLEAR_LINE}│ {label} ")
-        self.stream.write("\x1b[?25h")
-        self.stream.write(f"\x1b[{row};{column}H")
+        self._input_active = True
+        self.stream.write(f"{label} ")
         self.stream.flush()
 
-    def hide_cursor(self) -> None:
+    def hide_cursor(self, *, commit: bool = False) -> None:
+        self._input_active = False
         if self.enabled:
-            self.stream.write("\x1b[?25l")
+            if commit:
+                self.stream.write("\n")
             self.stream.flush()
 
 
@@ -1603,5 +1728,6 @@ __all__ = [
     "Cockpit",
     "Transcript",
     "TranscriptEntry",
+    "render_primary",
     "render_cockpit",
 ]
