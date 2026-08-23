@@ -31,8 +31,10 @@ jobs:
           enable-cache: true
       - name: Apply guarded patch
         run: python .github/apply_review.py
-      - name: Install locked development environment
-        run: uv sync --locked --extra dev
+      - name: Refresh and install locked development environment
+        run: |
+          uv lock
+          uv sync --locked --extra dev
       - name: Ruff
         run: uv run ruff check src tests
       - name: Compile
