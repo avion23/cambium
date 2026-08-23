@@ -524,12 +524,12 @@ async def _run_interactive(
                     normalized = dict(record)
                     normalized["seq"] = sequence
                     state.apply(normalized)  # noqa: B023
-                    cockpit.draw(  # noqa: B023
-                        state.snapshot(session_dir=turn.session_dir),
+                    cockpit.draw(  # noqa: B023  # noqa: B023
+                        state.snapshot(session_dir=turn.session_dir),  # noqa: B023
                         transcript,
                         session_description=session.describe(),
                         branch_line=_branch_line(session),
-                        cumulative_line=cumulative.line(),
+                        cumulative_line=cumulative.line(),  # noqa: B023
                     )
 
                 loop = asyncio.get_running_loop()
@@ -537,11 +537,11 @@ async def _run_interactive(
                     session.run_turn(turn, on_event=_live_sink)
                 )
 
-                def _request_cancel() -> None:
+                def _request_cancel() -> None:  # noqa: B023
                     nonlocal cancel_requested
-                    if not turn_task.done():
+                    if not turn_task.done():  # noqa: B023
                         cancel_requested = True
-                        turn_task.cancel()
+                        turn_task.cancel()  # noqa: B023
 
                 signal_installed = False
                 try:

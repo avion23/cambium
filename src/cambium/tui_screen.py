@@ -277,7 +277,7 @@ def _side_sections(
             tool = getattr(agent, "tool", None)
             tokens = int(getattr(agent, "total_tokens", 0))
             rate = getattr(agent, "output_tokens_per_s", None)
-            suffix = f" · {rate:.1f} out/s" if isinstance(rate, (int, float)) else ""
+            suffix = f" · {rate:.1f} out/s" if isinstance(rate, int | float) else ""
             tool_suffix = f" · {tool}" if tool else ""
             lines.append(
                 ("dim", f"   {_human_count(tokens)} tok{suffix}{tool_suffix}")
