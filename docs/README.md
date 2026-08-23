@@ -17,6 +17,8 @@ Source and tests define current behavior.
 - [`architecture/optimization.md`](architecture/optimization.md) — DSPy and
   OpenCode-data gates.
 - [`architecture/user-cli.md`](architecture/user-cli.md) — command reference.
+- [`architecture/acceptance.md`](architecture/acceptance.md) — opt-in live-provider
+  acceptance matrix, credentials, and evidence.
 - [`architecture/module-template/`](architecture/module-template/) — module
   contract.
 - [`security/threat-model.md`](security/threat-model.md) — no-sandbox trust

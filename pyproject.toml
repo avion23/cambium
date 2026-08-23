@@ -53,6 +53,7 @@ pythonpath = ["src"]
 addopts = "-m 'not slow'"
 markers = [
     "slow: subprocess/process-boundary integration scenario; run with -m slow",
+    "acceptance: opt-in live-provider acceptance; requires explicit credentials and config",
 ]
 
 [tool.ruff]

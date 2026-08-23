@@ -1,0 +1,648 @@
+"""Opt-in live-provider acceptance checks.
+
+The tests in this module deliberately have no credential fixtures.  A test
+skips until its named provider configuration, credential environment variable,
+and (for Codex) OAuth-store path are supplied explicitly by the operator.  The
+OAuth mutation cases additionally require a disposable-account confirmation.
+No token value is constructed, printed, or placed in a test constant.
+
+Run the suite with ``python -m pytest -m acceptance tests/acceptance -s``.
+The ``-s`` is useful only for an operator-supplied interactive fresh-login
+command; all other checks keep their normal pytest capture behavior.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import multiprocessing
+import os
+import shlex
+import subprocess
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty
+from typing import Any
+
+import pytest
+
+from cambium import supervisor
+from cambium.auth import oauth_env_suffix
+from cambium.diffundo import CredentialSource, Diffundo, ProviderConfig
+from cambium.oauth import (
+    DEFAULT_REFRESH_MARGIN_S,
+    InvalidGrantError,
+    OAuthError,
+    OAuthStore,
+    TokenManager,
+    oauth_store_path,
+)
+from cambium.provider_config import AuthMode, Protocol, load_providers
+
+CODEX_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_CODEX_CONFIG"
+CODEX_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_CODEX_PROVIDER"
+CODEX_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_OAUTH_STORE"
+CODEX_FRESH_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_FRESH_STORE"
+CODEX_EXPIRED_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_EXPIRED_STORE"
+CODEX_ROTATED_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_ROTATED_STORE"
+CODEX_REVOKED_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_REVOKED_STORE"
+CODEX_CONCURRENT_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_CONCURRENT_STORE"
+CODEX_RESTART_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_RESTART_STORE"
+CODEX_LOGIN_COMMAND_ENV = "CAMBIUM_ACCEPTANCE_CODEX_LOGIN_COMMAND"
+CODEX_CLIENT_ID_ENV = "CAMBIUM_ACCEPTANCE_CODEX_CLIENT_ID"
+ALLOW_OAUTH_MUTATIONS_ENV = "CAMBIUM_ACCEPTANCE_ALLOW_OAUTH_MUTATIONS"
+QUOTA_DB_ENV = "CAMBIUM_ACCEPTANCE_QUOTA_DB"
+PROBE_TIMEOUT_ENV = "CAMBIUM_ACCEPTANCE_TIMEOUT_S"
+
+ZAI_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_ZAI_CONFIG"
+ZAI_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_ZAI_PROVIDER"
+OPENROUTER_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_OPENROUTER_CONFIG"
+OPENROUTER_PAID_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_OPENROUTER_PAID_PROVIDER"
+OPENROUTER_FREE_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_OPENROUTER_FREE_PROVIDER"
+OPENCODE_ZEN_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_OPENCODE_ZEN_CONFIG"
+OPENCODE_ZEN_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_OPENCODE_ZEN_PROVIDER"
+CACHE_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_CACHE_CONFIG"
+CACHE_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_CACHE_PROVIDER"
+
+_PROBE_PROMPT = {
+    "messages": [
+        {
+            "role": "user",
+            "content": "Reply with exactly one short word: acceptance.",
+        }
+    ]
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderContext:
+    config_path: Path
+    provider: ProviderConfig
+    config_entry: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _CodexContext:
+    provider_context: _ProviderContext
+    store_path: Path
+    store: OAuthStore
+
+    @property
+    def provider(self) -> ProviderConfig:
+        return self.provider_context.provider
+
+    @property
+    def config_path(self) -> Path:
+        return self.provider_context.config_path
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        pytest.skip(f"set {name} to opt in to this live acceptance check")
+    return value
+
+
+def _required_file(name: str) -> Path:
+    path = Path(_required_env(name)).expanduser()
+    if not path.is_file():
+        pytest.fail(f"{name} must name an existing file")
+    return path
+
+
+def _load_config_entry(path: Path, provider_name: str) -> dict[str, object]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        pytest.fail(f"provider config cannot be read: {type(exc).__name__}")
+    entries = raw.get("providers") if isinstance(raw, dict) else None
+    if not isinstance(entries, list):
+        pytest.fail("provider config does not contain a providers list")
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("name") == provider_name:
+            return entry
+    pytest.fail("provider config does not contain the requested acceptance provider")
+
+
+def _provider_context(config_env: str, provider_env: str) -> _ProviderContext:
+    config_path = _required_file(config_env)
+    provider_name = _required_env(provider_env)
+    try:
+        providers = load_providers(config_path)
+    except (OSError, ValueError) as exc:
+        pytest.fail(f"{config_env} is invalid: {type(exc).__name__}: {exc}")
+    provider = next((item for item in providers if item.name == provider_name), None)
+    if provider is None:
+        pytest.fail(f"{provider_env} does not name a provider in {config_env}")
+    return _ProviderContext(
+        config_path=config_path,
+        provider=provider,
+        config_entry=_load_config_entry(config_path, provider_name),
+    )
+
+
+def _api_provider_context(config_env: str, provider_env: str) -> _ProviderContext:
+    context = _provider_context(config_env, provider_env)
+    if context.provider.auth is not AuthMode.API_KEY:
+        pytest.fail("live provider skeletons require an api_key provider entry")
+    if not context.provider.api_key_env or not os.environ.get(context.provider.api_key_env):
+        pytest.skip(f"set {context.provider.api_key_env} for the configured provider")
+    return context
+
+
+def _codex_provider_context() -> _ProviderContext:
+    context = _provider_context(CODEX_CONFIG_ENV, CODEX_PROVIDER_ENV)
+    if context.provider.auth is not AuthMode.CODEX_CHATGPT:
+        pytest.fail("Codex acceptance requires auth=codex_chatgpt")
+    if context.provider.protocol is not Protocol.CODEX_RESPONSES:
+        pytest.fail("Codex acceptance requires protocol=codex_responses")
+    return context
+
+
+def _codex_context(store_env: str = CODEX_STORE_ENV) -> _CodexContext:
+    provider_context = _codex_provider_context()
+    store_path = _required_file(store_env)
+    store = OAuthStore(store_path)
+    try:
+        record = store.read_provider(provider_context.provider.name)
+    except OAuthError as exc:
+        pytest.fail(f"{store_env} cannot be read: {type(exc).__name__}")
+    if record is None:
+        pytest.fail(f"{store_env} has no record for the configured Codex provider")
+    if record.disabled:
+        pytest.fail(f"{store_env} is already disabled; use a fresh disposable store")
+    return _CodexContext(provider_context, store_path, store)
+
+
+def _client_id() -> str | None:
+    return os.environ.get(CODEX_CLIENT_ID_ENV) or None
+
+
+def _probe_timeout() -> float:
+    raw = os.environ.get(PROBE_TIMEOUT_ENV, "90")
+    try:
+        value = float(raw)
+    except ValueError:
+        pytest.fail(f"{PROBE_TIMEOUT_ENV} must be a positive number")
+    if value <= 0:
+        pytest.fail(f"{PROBE_TIMEOUT_ENV} must be a positive number")
+    return value
+
+
+def _manager(context: _CodexContext) -> TokenManager:
+    return TokenManager(
+        context.provider.name,
+        store=context.store,
+        client_id=_client_id(),
+        refresh_timeout_s=_probe_timeout(),
+    )
+
+
+def _fresh_doc(context: _CodexContext) -> Any:
+    try:
+        doc = context.store.validate(context.provider.name)
+    except OAuthError as exc:
+        pytest.fail(f"{context.store_path} is not a usable OAuth store: {type(exc).__name__}")
+    if doc.expires_at - time.time() <= DEFAULT_REFRESH_MARGIN_S:
+        pytest.fail("acceptance store does not contain a valid, unexpired access token")
+    return doc
+
+
+def _expired_doc(context: _CodexContext) -> Any:
+    try:
+        doc = context.store.validate(context.provider.name)
+    except OAuthError as exc:
+        pytest.fail(f"{context.store_path} is not a usable OAuth store: {type(exc).__name__}")
+    if doc.expires_at > time.time():
+        pytest.fail("acceptance store does not contain an expired access token")
+    return doc
+
+
+def _live_prompt() -> dict[str, object]:
+    return json.loads(json.dumps(_PROBE_PROMPT))
+
+
+def _codex_probe(
+    context: _CodexContext,
+    access_token: str,
+    account_id: str | None,
+) -> Any:
+    router = Diffundo(
+        (context.provider,),
+        call_budget_s=_probe_timeout(),
+        pause_timeout_s=min(5.0, _probe_timeout()),
+        credential_source=CredentialSource(access_token, account_id),
+    )
+    return asyncio.run(
+        router.call(
+            context.provider.tier,
+            _live_prompt(),
+            model=context.provider.model,
+        )
+    )
+
+
+def _api_router(context: _ProviderContext, monkeypatch: pytest.MonkeyPatch) -> Diffundo:
+    quota_db = os.environ.get(QUOTA_DB_ENV)
+    if context.provider.quota_windows and not quota_db:
+        pytest.skip(f"set {QUOTA_DB_ENV} to an isolated quota database path")
+    if quota_db:
+        monkeypatch.setenv("CAMBIUM_QUOTA_DB", quota_db)
+    return Diffundo(
+        (context.provider,),
+        call_budget_s=_probe_timeout(),
+        pause_timeout_s=min(5.0, _probe_timeout()),
+        task_id="acceptance",
+    )
+
+
+def _api_probe(
+    context: _ProviderContext,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    requirements: Mapping[str, object] | None = None,
+) -> Any:
+    router = _api_router(context, monkeypatch)
+    return asyncio.run(
+        router.call(
+            context.provider.tier,
+            _live_prompt(),
+            model=context.provider.model,
+            requirements=requirements,
+        )
+    )
+
+
+def _assert_provider_result(result: Any, provider: ProviderConfig) -> None:
+    assert result.provider == provider.name
+    assert result.model == provider.model
+    assert isinstance(result.usage, dict), "live response did not report usage"
+
+
+def _allow_oauth_mutation() -> None:
+    if os.environ.get(ALLOW_OAUTH_MUTATIONS_ENV) != "1":
+        pytest.skip(
+            f"set {ALLOW_OAUTH_MUTATIONS_ENV}=1 only with disposable OAuth stores/accounts"
+        )
+
+
+def _fresh_store_target() -> Path:
+    target = Path(_required_env(CODEX_FRESH_STORE_ENV)).expanduser()
+    if target.exists():
+        pytest.fail("fresh-login target must not already exist")
+    if target.resolve() == oauth_store_path().resolve():
+        pytest.fail("fresh-login refuses to use the production OAuth store")
+    return target
+
+
+def _child_ensure_fresh(
+    store_path: str,
+    provider: str,
+    client_id: str | None,
+    timeout_s: float,
+    ready: Any,
+    start: Any,
+    results: Any,
+) -> None:
+    ready.set()
+    if not start.wait(timeout_s):
+        results.put(("error", "startup_timeout"))
+        return
+    try:
+        manager = TokenManager(
+            provider,
+            store=OAuthStore(Path(store_path)),
+            client_id=client_id,
+            refresh_timeout_s=timeout_s,
+        )
+        _access, account_id = manager.ensure_fresh()
+    except Exception as exc:  # pragma: no cover - exercised in child processes
+        results.put(("error", type(exc).__name__))
+    else:
+        results.put(("ok", account_id is not None))
+
+
+def _run_ensure_processes(
+    context: _CodexContext,
+    *,
+    count: int,
+    concurrent: bool,
+) -> list[tuple[str, object]]:
+    process_context = multiprocessing.get_context("spawn")
+    start = process_context.Event()
+    results = process_context.Queue()
+    ready_events = [process_context.Event() for _ in range(count)]
+    processes = [
+        process_context.Process(
+            target=_child_ensure_fresh,
+            args=(
+                str(context.store_path),
+                context.provider.name,
+                _client_id(),
+                _probe_timeout(),
+                ready,
+                start,
+                results,
+            ),
+        )
+        for ready in ready_events
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for ready in ready_events:
+            assert ready.wait(_probe_timeout()), "child did not reach OAuth startup"
+        if concurrent:
+            start.set()
+        else:
+            start.set()
+        deadline = time.monotonic() + max(30.0, _probe_timeout() * 2)
+        for process in processes:
+            remaining = max(0.0, deadline - time.monotonic())
+            process.join(remaining)
+        if any(process.is_alive() for process in processes):
+            pytest.fail("OAuth child process did not exit within the acceptance timeout")
+        outcomes: list[tuple[str, object]] = []
+        for _ in processes:
+            try:
+                outcomes.append(results.get(timeout=5.0))
+            except Empty:
+                pytest.fail("OAuth child process returned no acceptance result")
+        assert all(process.exitcode == 0 for process in processes)
+        return outcomes
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5.0)
+        results.close()
+        results.join_thread()
+
+
+def _cached_tokens(usage: Mapping[str, object] | None) -> int | None:
+    if not isinstance(usage, Mapping):
+        return None
+    for details_name in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(details_name)
+        if isinstance(details, Mapping):
+            value = details.get("cached_tokens")
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+    for name in ("cache_read_input_tokens", "cached_tokens"):
+        value = usage.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+@pytest.mark.acceptance
+def test_codex_fresh_login() -> None:
+    """Run an operator-supplied device login and validate its stored session."""
+    _allow_oauth_mutation()
+    provider_context = _codex_provider_context()
+    command = shlex.split(_required_env(CODEX_LOGIN_COMMAND_ENV))
+    if not command:
+        pytest.fail(f"{CODEX_LOGIN_COMMAND_ENV} must contain an executable command")
+    target = _fresh_store_target()
+    child_environment = os.environ.copy()
+    child_environment.update(
+        {
+            CODEX_FRESH_STORE_ENV: str(target),
+            CODEX_CONFIG_ENV: str(provider_context.config_path),
+            CODEX_PROVIDER_ENV: provider_context.provider.name,
+        }
+    )
+    completed = subprocess.run(
+        command,
+        env=child_environment,
+        timeout=max(900.0, _probe_timeout()),
+        check=False,
+    )
+    assert completed.returncode == 0
+    store = OAuthStore(target)
+    try:
+        doc = store.validate(provider_context.provider.name)
+    except OAuthError as exc:
+        pytest.fail(f"fresh-login command did not create a valid OAuth store: {type(exc).__name__}")
+    assert doc.expires_at > time.time()
+    manager = TokenManager(
+        provider_context.provider.name,
+        store=store,
+        client_id=_client_id(),
+        refresh_timeout_s=_probe_timeout(),
+    )
+    access_token, account_id = manager.ensure_fresh()
+    result = _codex_probe(
+        _CodexContext(provider_context, target, store),
+        access_token,
+        account_id,
+    )
+    _assert_provider_result(result, provider_context.provider)
+
+
+@pytest.mark.acceptance
+def test_codex_valid_stored_token() -> None:
+    context = _codex_context()
+    doc = _fresh_doc(context)
+    before = context.store_path.read_bytes()
+    access_token, account_id = _manager(context).ensure_fresh()
+    if access_token != doc.access_token:
+        pytest.fail("a fresh stored token was unexpectedly replaced")
+    if context.store_path.read_bytes() != before:
+        pytest.fail("a valid stored-token check changed the OAuth store")
+    result = _codex_probe(context, access_token, account_id)
+    _assert_provider_result(result, context.provider)
+
+
+@pytest.mark.acceptance
+def test_codex_expired_access_with_valid_refresh() -> None:
+    _allow_oauth_mutation()
+    context = _codex_context(CODEX_EXPIRED_STORE_ENV)
+    old_doc = _expired_doc(context)
+    access_token, account_id = _manager(context).ensure_fresh()
+    new_doc = context.store.validate(context.provider.name)
+    if access_token != new_doc.access_token:
+        pytest.fail("refresh returned an access token different from the stored token")
+    if new_doc.access_token == old_doc.access_token:
+        pytest.fail("refresh did not replace the expired access token")
+    assert new_doc.expires_at - time.time() > DEFAULT_REFRESH_MARGIN_S
+    result = _codex_probe(context, access_token, account_id)
+    _assert_provider_result(result, context.provider)
+
+
+@pytest.mark.acceptance
+def test_codex_rotated_refresh() -> None:
+    _allow_oauth_mutation()
+    context = _codex_context(CODEX_ROTATED_STORE_ENV)
+    old_doc = _expired_doc(context)
+    _manager(context).ensure_fresh()
+    new_doc = context.store.validate(context.provider.name)
+    if new_doc.refresh_token == old_doc.refresh_token:
+        pytest.fail("issuer did not rotate the refresh token")
+    if new_doc.access_token == old_doc.access_token:
+        pytest.fail("issuer did not replace the access token")
+    assert new_doc.expires_at - time.time() > DEFAULT_REFRESH_MARGIN_S
+
+
+@pytest.mark.acceptance
+def test_codex_revoked_refresh() -> None:
+    _allow_oauth_mutation()
+    context = _codex_context(CODEX_REVOKED_STORE_ENV)
+    _expired_doc(context)
+    with pytest.raises(InvalidGrantError):
+        _manager(context).ensure_fresh()
+    record = context.store.read_provider(context.provider.name)
+    assert record is not None and record.disabled
+
+
+@pytest.mark.acceptance
+def test_codex_concurrent_child_startup() -> None:
+    _allow_oauth_mutation()
+    context = _codex_context(CODEX_CONCURRENT_STORE_ENV)
+    _expired_doc(context)
+    outcomes = _run_ensure_processes(context, count=2, concurrent=True)
+    assert len(outcomes) == 2
+    assert all(status == "ok" for status, _detail in outcomes)
+    doc = context.store.validate(context.provider.name)
+    assert doc.expires_at - time.time() > DEFAULT_REFRESH_MARGIN_S
+
+
+@pytest.mark.acceptance
+def test_codex_account_id_propagation() -> None:
+    context = _codex_context()
+    doc = _fresh_doc(context)
+    assert doc.account_id
+    spec = {
+        "task_id": "acceptance-account-id",
+        "provider_config_path": str(context.config_path),
+        "worktree_path": str(Path.cwd()),
+        "fanout_config": {
+            "providers": [{"name": context.provider.name}],
+            "tier": context.provider.tier.value,
+            "model": context.provider.model,
+        },
+        "authorized_providers": [context.provider.name],
+        "authorized_providers_explicit": True,
+        "provider_env_keys": [],
+    }
+    environment = supervisor._worker_environment(
+        spec,
+        generation=1,
+        provider_environment={},
+        oauth_store=context.store,
+    )
+    suffix = oauth_env_suffix(context.provider.name)
+    access_name = f"CAMBIUM_OAUTH_ACCESS_{suffix}"
+    account_name = f"CAMBIUM_OAUTH_ACCOUNT_{suffix}"
+    if environment.get(account_name) != doc.account_id:
+        pytest.fail("stored account id was not propagated to the worker environment")
+    if environment.get(access_name) != doc.access_token:
+        pytest.fail("stored access token was not propagated to the worker environment")
+    if not context.store.path.read_bytes():
+        pytest.fail("OAuth store unexpectedly became empty")
+    refresh_name = f"CAMBIUM_OAUTH_REFRESH_{suffix}"
+    assert refresh_name not in environment
+    result = _codex_probe(context, environment[access_name], environment[account_name])
+    _assert_provider_result(result, context.provider)
+
+
+@pytest.mark.acceptance
+def test_codex_restart_and_reuse() -> None:
+    context = _codex_context(CODEX_RESTART_STORE_ENV)
+    _fresh_doc(context)
+    before = context.store.path.read_bytes()
+    first = _run_ensure_processes(context, count=1, concurrent=False)
+    second = _run_ensure_processes(context, count=1, concurrent=False)
+    assert len(first) == 1 and first[0][0] == "ok"
+    assert len(second) == 1 and second[0][0] == "ok"
+    if context.store.path.read_bytes() != before:
+        pytest.fail("a restarted child changed a valid reusable OAuth store")
+
+
+@pytest.mark.acceptance
+def test_zai_rolling_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _api_provider_context(ZAI_CONFIG_ENV, ZAI_PROVIDER_ENV)
+    if "zai" not in context.provider.name.casefold():
+        pytest.fail("z.ai acceptance provider name must contain 'zai'")
+    if not context.provider.quota_windows:
+        pytest.fail("z.ai acceptance config must declare quota_windows")
+    result = _api_probe(context, monkeypatch)
+    _assert_provider_result(result, context.provider)
+    snapshots = result.quota_windows
+    assert isinstance(snapshots, tuple) and snapshots
+    assert all(
+        isinstance(window, dict)
+        and isinstance(window.get("reset_at"), int | float)
+        and window["reset_at"] > time.time()
+        for window in snapshots
+    )
+
+
+@pytest.mark.acceptance
+def test_openrouter_paid(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _api_provider_context(OPENROUTER_CONFIG_ENV, OPENROUTER_PAID_PROVIDER_ENV)
+    if "openrouter" not in context.provider.name.casefold():
+        pytest.fail("OpenRouter paid provider name must contain 'openrouter'")
+    billing = getattr(context.provider.billing_mode, "value", context.provider.billing_mode)
+    assert billing in {"metered", "subscription"}
+    result = _api_probe(
+        context,
+        monkeypatch,
+        requirements={"allow_paid": True, "allow_free": False},
+    )
+    _assert_provider_result(result, context.provider)
+
+
+@pytest.mark.acceptance
+def test_openrouter_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _api_provider_context(OPENROUTER_CONFIG_ENV, OPENROUTER_FREE_PROVIDER_ENV)
+    if "openrouter" not in context.provider.name.casefold():
+        pytest.fail("OpenRouter free provider name must contain 'openrouter'")
+    billing = getattr(context.provider.billing_mode, "value", context.provider.billing_mode)
+    assert billing == "free"
+    result = _api_probe(
+        context,
+        monkeypatch,
+        requirements={"allow_paid": False, "allow_free": True},
+    )
+    _assert_provider_result(result, context.provider)
+
+
+@pytest.mark.acceptance
+def test_opencode_zen(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _api_provider_context(OPENCODE_ZEN_CONFIG_ENV, OPENCODE_ZEN_PROVIDER_ENV)
+    if "opencode" not in context.provider.name.casefold():
+        pytest.fail("OpenCode Zen provider name must contain 'opencode'")
+    result = _api_probe(context, monkeypatch)
+    _assert_provider_result(result, context.provider)
+
+
+@pytest.mark.acceptance
+def test_provider_reported_cache_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _api_provider_context(CACHE_CONFIG_ENV, CACHE_PROVIDER_ENV)
+    if "price_per_1m_cached_in" not in context.config_entry:
+        pytest.skip("cache-token acceptance requires price_per_1m_cached_in in provider config")
+    if context.config_entry.get("pricing_known") is not True:
+        pytest.skip("cache-token acceptance requires pricing_known=true in provider config")
+    router = _api_router(context, monkeypatch)
+
+    async def call_twice() -> tuple[Any, Any]:
+        first = await router.call(
+            context.provider.tier,
+            _live_prompt(),
+            model=context.provider.model,
+        )
+        second = await router.call(
+            context.provider.tier,
+            _live_prompt(),
+            model=context.provider.model,
+        )
+        return first, second
+
+    first, second = asyncio.run(call_twice())
+    _assert_provider_result(first, context.provider)
+    _assert_provider_result(second, context.provider)
+    assert _cached_tokens(second.usage) is not None
+    assert isinstance(second.provider_cache_hit, bool)
