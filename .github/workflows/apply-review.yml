@@ -33,7 +33,7 @@ jobs:
         run: |
           python .github/apply_review.py
           python .github/fix_review.py
-          python .github/fix_join.py
+          python .github/fix_join_driver.py
       - name: Refresh and install locked development environment
         run: |
           uv lock
@@ -61,7 +61,8 @@ jobs:
       - name: Remove patch machinery
         run: >-
           rm .github/apply_review.py .github/fix_review.py
-          .github/fix_join.py .github/workflows/apply-review.yml
+          .github/fix_join.py .github/fix_join_driver.py
+          .github/workflows/apply-review.yml
       - name: Commit verified implementation
         run: |
           git config user.name "openai-codex"
