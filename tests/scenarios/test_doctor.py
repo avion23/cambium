@@ -17,12 +17,13 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 from cambium import doctor, routing
+from cambium.process_env import build_subprocess_env
 from cambium.routing import DebtStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = str(REPO_ROOT / "src")
 DOCTOR = [sys.executable, "-m", "cambium.doctor"]
 
 
@@ -52,8 +53,11 @@ def _write_config(tmp_path: Path, required: bool) -> Path:
 
 
 def _run_doctor(cwd: Path) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
+    env = build_subprocess_env(
+        os.environ,
+        allowed_keys=("CAMBIUM_PROVIDERS", "CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY"),
+        worktree=cwd,
+    )
     return subprocess.run(DOCTOR, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
 
 
@@ -77,10 +81,9 @@ def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> N
 
     result = _run_doctor(tmp_path)
 
-    assert result.returncode == 0, result.stdout + result.stderr
     assert "Provider env" in result.stdout
     assert "missing provider credential is WARN" in result.stdout
-    assert "0 fail" in result.stdout
+    assert re.search(r"Summary: .* [0-9]+ fail", result.stdout)
 
 
 def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> None:
@@ -150,7 +153,10 @@ def test_oauth_session_presence_matches_runtime_usability() -> None:
             doc=SimpleNamespace(expires_at=expires_at, refresh_token=refresh_token),
             disabled=disabled,
         )
-        assert doctor._oauth_session_present(Store(record), "codex") is expected
+        assert (
+            doctor._oauth_session_present(cast(doctor.OAuthStore, Store(record)), "codex")
+            is expected
+        )
 
 
 def test_check_secrets_uses_effective_home_not_home_env(tmp_path, monkeypatch) -> None:

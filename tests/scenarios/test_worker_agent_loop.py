@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -748,9 +750,24 @@ def test_strip_for_fold_drops_fully_superseded_read_body() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_lint_feedback_visible_in_transcript(tmp_path: Path) -> None:
+def test_lint_feedback_visible_in_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ruff = fake_bin / "ruff"
+    fake_ruff.write_text(
+        "#!" + sys.executable + "\n"
+        "import json\n"
+        "import sys\n"
+        "print(json.dumps([{'filename': sys.argv[-1], 'code': 'invalid-syntax', "
+        "'location': {'row': 1, 'column': 1}, 'message': 'fixture syntax error'}]))\n",
+        encoding="utf-8",
+    )
+    fake_ruff.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(fake_bin), os.defpath)))
     config = _agent_config(worktree)
     router = _ScriptedRouter(
         [

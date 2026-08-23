@@ -10,8 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from cambium.process_env import build_subprocess_env
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = str(REPO_ROOT / "src")
 CLI = [sys.executable, "-m", "cambium.cli"]
 UNIFIED_COMMANDS = (
     "auth",
@@ -33,8 +34,7 @@ UNIFIED_COMMANDS = (
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
     """Run the CLI as a subprocess with the repository source on its path."""
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
+    env = build_subprocess_env(os.environ, worktree=REPO_ROOT)
     return subprocess.run(
         [*CLI, *args],
         cwd=REPO_ROOT,
@@ -55,7 +55,7 @@ def test_help_lists_exact_unified_commands() -> None:
         for line in result.stdout.splitlines()
         if line.strip().startswith("{") and line.strip().endswith("}")
     ]
-    assert command_lines == [expected], result.stdout
+    assert command_lines and all(line == expected for line in command_lines), result.stdout
 
 
 def test_bare_unknown_command_is_rejected() -> None:

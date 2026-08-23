@@ -257,10 +257,13 @@ def _utc_now_iso() -> str:
 
 
 def percentiles(times: list[float]) -> dict[str, float]:
-    """p50/p90/max over wall times via ``statistics.quantiles`` (n=100)."""
+    """Return p50/p90/max over wall times, including a singleton sample."""
     ordered = sorted(times)
     if not ordered:
         return {"p50": 0.0, "p90": 0.0, "max": 0.0}
+    if len(ordered) == 1:
+        value = round(ordered[0], 6)
+        return {"p50": value, "p90": value, "max": value}
     qs = statistics.quantiles(ordered, n=100)
     return {
         "p50": round(qs[49], 6),
