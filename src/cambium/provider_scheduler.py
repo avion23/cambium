@@ -404,11 +404,187 @@ class CastConfig(CacheHorizonConfig):
             )
         )
 
+    def rollover_decision(
+        self,
+        segment_count: int,
+        active_trunk_tokens: int,
+        *,
+        new_prefix_tokens: int,
+        expected_remaining_calls: float,
+        cache_capability: CacheCapability | Mapping[str, Any] | None,
+        cache_expired: bool = True,
+    ) -> RolloverDecision:
+        """Compare K0 write cost with the cost of continuing this epoch."""
+        return decide_rollover(
+            self,
+            segment_count,
+            active_trunk_tokens,
+            new_prefix_tokens=new_prefix_tokens,
+            expected_remaining_calls=expected_remaining_calls,
+            cache_capability=cache_capability,
+            cache_expired=cache_expired,
+        )
+
 
 # Names used by callers and architecture notes.  They intentionally point to
 # one type so policy validation cannot drift between entry points.
 CachePolicy = CastConfig
 CASTConfig = CastConfig
+
+
+@dataclass(frozen=True, slots=True)
+class RolloverDecision:
+    """Auditable economic decision for one threshold-triggered K0 rollover."""
+
+    should_rollover: bool
+    thresholds_hit: bool
+    rollover_cost: float
+    continue_cost: float
+    n_star: float
+    expected_remaining_calls: float
+    old_prefix_tokens: int
+    new_prefix_tokens: int
+    cache_expired: bool
+    reason: str
+
+    @property
+    def rollover(self) -> bool:
+        """Short boolean spelling used by CAST callers."""
+        return self.should_rollover
+
+    @property
+    def decision(self) -> str:
+        """Stable wire spelling for evidence consumers."""
+        return "rollover" if self.should_rollover else "continue"
+
+    @property
+    def evidence(self) -> dict[str, Any]:
+        """JSON-safe decision evidence without provider or prompt content."""
+        return {
+            "decision": self.decision,
+            "should_rollover": self.should_rollover,
+            "thresholds_hit": self.thresholds_hit,
+            "rollover_cost_usd": self.rollover_cost,
+            "continue_cost_usd": self.continue_cost,
+            "n_star": self.n_star,
+            "expected_remaining_calls": self.expected_remaining_calls,
+            "old_prefix_tokens": self.old_prefix_tokens,
+            "new_prefix_tokens": self.new_prefix_tokens,
+            "cache_expired": self.cache_expired,
+            "reason": self.reason,
+        }
+
+    def event(
+        self,
+        *,
+        task_id: str | None = None,
+        epoch: int | None = None,
+        checkpoint_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Build a redacted durable decision-evidence event."""
+        payload = dict(self.evidence)
+        if task_id is not None:
+            payload["task_id"] = task_id
+        if epoch is not None:
+            payload["epoch"] = epoch
+        if checkpoint_ref is not None:
+            payload["checkpoint_ref"] = checkpoint_ref
+        return {
+            "type": "cast_rollover_decision",
+            "kind": "cast_rollover_decision",
+            "payload": payload,
+        }
+
+
+def _cache_capability(value: CacheCapability | Mapping[str, Any] | None) -> CacheCapability:
+    if value is None:
+        return CacheCapability()
+    if isinstance(value, CacheCapability):
+        return value
+    if isinstance(value, Mapping):
+        return CacheCapability.from_mapping(value)
+    raise TypeError("cache_capability must be a CacheCapability or mapping")
+
+
+def decide_rollover(
+    cast_config: CastConfig,
+    segment_count: int,
+    active_trunk_tokens: int,
+    *,
+    new_prefix_tokens: int,
+    expected_remaining_calls: float,
+    cache_capability: CacheCapability | Mapping[str, Any] | None,
+    cache_expired: bool = True,
+) -> RolloverDecision:
+    """Apply CAST thresholds and compare cache write/read projections.
+
+    The one-time rollover projection writes the new K0 prefix.  Continuing an
+    expired epoch pays a cache read for the old prefix on each expected future
+    call.  ``n_star`` is the break-even remaining-call count; a rollover is
+    selected only when thresholds are due and the projected continuation cost
+    is at least the one-time write cost.  With no expired cache there is no
+    economic pressure to rebuild, so threshold evaluation remains observable
+    but chooses ``continue``.
+    """
+    if not isinstance(cast_config, CastConfig):
+        raise TypeError("cast_config must be a CastConfig")
+    thresholds_hit = cast_config.rollover_due(segment_count, active_trunk_tokens)
+    for field_name, value in (
+        ("new_prefix_tokens", new_prefix_tokens),
+        ("active_trunk_tokens", active_trunk_tokens),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{field_name} must be a non-negative integer")
+    if (
+        isinstance(expected_remaining_calls, bool)
+        or not isinstance(expected_remaining_calls, int | float)
+        or not math.isfinite(float(expected_remaining_calls))
+        or expected_remaining_calls < 0
+    ):
+        raise ValueError("expected_remaining_calls must be finite and non-negative")
+    if type(cache_expired) is not bool:
+        raise ValueError("cache_expired must be a boolean")
+    capability = _cache_capability(cache_capability)
+    old_tokens = capability.cacheable_tokens(active_trunk_tokens)
+    new_tokens = capability.cacheable_tokens(new_prefix_tokens)
+    rollover_cost = capability.cost(new_tokens, write=True)
+    per_call_continue = capability.cost(old_tokens) if cache_expired else 0.0
+    continue_cost = float(expected_remaining_calls) * per_call_continue
+    if per_call_continue > 0:
+        n_star = rollover_cost / per_call_continue
+    elif rollover_cost == 0:
+        n_star = 0.0
+    else:
+        n_star = math.inf
+    if not thresholds_hit:
+        should_rollover = False
+        reason = "thresholds_not_hit"
+    elif not cache_expired:
+        should_rollover = False
+        reason = "cache_still_warm"
+    elif continue_cost >= rollover_cost:
+        should_rollover = True
+        reason = "rollover_write_is_amortized"
+    else:
+        should_rollover = False
+        reason = "continue_read_is_cheaper"
+    return RolloverDecision(
+        should_rollover=should_rollover,
+        thresholds_hit=thresholds_hit,
+        rollover_cost=rollover_cost,
+        continue_cost=continue_cost,
+        n_star=n_star,
+        expected_remaining_calls=float(expected_remaining_calls),
+        old_prefix_tokens=old_tokens,
+        new_prefix_tokens=new_tokens,
+        cache_expired=cache_expired,
+        reason=reason,
+    )
+
+
+def decide_k0_rollover(*args: Any, **kwargs: Any) -> RolloverDecision:
+    """Compatibility alias naming the CAST projection explicitly."""
+    return decide_rollover(*args, **kwargs)
 
 
 class BillingMode(StrEnum):

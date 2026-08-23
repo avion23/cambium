@@ -15,6 +15,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .provider_scheduler import (
+    CacheCapability,
+    CastConfig,
+    RolloverDecision,
+    decide_rollover,
+)
+
 SUMMARY_ENTRY_OPEN = "<cambium-summary-entry>\n"
 SUMMARY_ENTRY_CLOSE = "\n</cambium-summary-entry>"
 SUMMARY_ENTRY_PROVENANCE = "cambium-summary-provenance: rendered-v1\n"
@@ -580,6 +587,63 @@ def rollover_summary_trunk(
     )
 
 
+def k0_rollover_decision(
+    trunk_messages: Sequence[Mapping[str, Any]],
+    cast_config: CastConfig,
+    *,
+    expected_remaining_calls: float,
+    cache_capability: CacheCapability | Mapping[str, Any] | None,
+    cache_expired: bool = True,
+    event_sink: Any = None,
+    task_id: str | None = None,
+    epoch: int | None = None,
+    checkpoint_ref: str | None = None,
+) -> RolloverDecision:
+    """Evaluate K0 economics from an immutable summary-only trunk.
+
+    The function only reads and validates the supplied checkpoint projection.
+    It computes the post-rollover prefix size without publishing a successor,
+    then optionally sends one redacted ``cast_rollover_decision`` event to a
+    callable sink or appends it to a list-like sink.
+    """
+    trunk, raw_tail = partition_summary_trunk(trunk_messages)
+    if raw_tail:
+        raise SummaryTrunkError("K0 rollover decision requires a summary-only trunk")
+    entries = summary_entries(trunk)
+    active_tokens = summary_trunk_tokens(trunk)
+    new_tokens = active_tokens
+    if entries:
+        compacted, _projection, _historical = rollover_summary_trunk(trunk)
+        new_tokens = summary_trunk_tokens(compacted)
+    decision = decide_rollover(
+        cast_config,
+        len(entries),
+        active_tokens,
+        new_prefix_tokens=new_tokens,
+        expected_remaining_calls=expected_remaining_calls,
+        cache_capability=cache_capability,
+        cache_expired=cache_expired,
+    )
+    if event_sink is not None:
+        event = decision.event(
+            task_id=task_id,
+            epoch=epoch,
+            checkpoint_ref=checkpoint_ref,
+        )
+        if callable(event_sink):
+            event_sink(event)
+        elif hasattr(event_sink, "append"):
+            event_sink.append(event)
+        else:
+            raise TypeError("event_sink must be callable or appendable")
+    return decision
+
+
+def evaluate_k0_rollover(*args: Any, **kwargs: Any) -> RolloverDecision:
+    """Compatibility alias for :func:`k0_rollover_decision`."""
+    return k0_rollover_decision(*args, **kwargs)
+
+
 def semantic_summary_messages(
     checkpoint_messages: Sequence[Mapping[str, Any]],
     *,
@@ -729,8 +793,10 @@ __all__ = [
     "compile_k0",
     "compile_k0_projection",
     "entry_mapping",
+    "evaluate_k0_rollover",
     "estimate_message_tokens",
     "is_k0_entry",
+    "k0_rollover_decision",
     "k0_entry",
     "parse_summary_message",
     "parse_summary_response",
