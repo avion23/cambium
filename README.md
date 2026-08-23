@@ -81,19 +81,43 @@ PYTHONPATH=src python -m cambium run \
   "Inspect the current task-tree implementation"
 ```
 
-Start an interactive session:
+Start a line-oriented interactive session:
 
 ```bash
 PYTHONPATH=src python -m cambium repl --repo . --auto
 ```
 
-Start the live terminal dashboard:
+Start the persistent live terminal interface:
 
 ```bash
 PYTHONPATH=src python -m cambium tui --repo . --auto
 ```
 
-Attach a monitor to an existing session:
+To reopen the same semantic branch later, give it a stable interactive root:
+
+```bash
+PYTHONPATH=src python -m cambium tui \
+  --repo . \
+  --session-dir ~/.local/state/cambium/my-project \
+  --auto
+```
+
+The TUI carries the newest immutable context checkpoint into the next prompt,
+keeps the provider/model lease when exact cache reuse is compatible, and falls
+back to the provider-neutral semantic trunk when it is not. Each prompt still
+runs in an isolated supervisor leaf and worktree. Completed Markdown responses
+remain in normal terminal scrollback; the alternate-screen dashboard is used
+only while work is active.
+
+Useful commands inside the TUI:
+
+```text
+/help  /usage  /agents  /context  /session  /new  /clear  /exit
+```
+
+Use `<<<` and `>>>` on their own lines for multiline prompts.
+
+Attach a read-only monitor to an existing supervisor leaf:
 
 ```bash
 PYTHONPATH=src python -m cambium monitor --session /path/to/session
@@ -108,6 +132,48 @@ PYTHONPATH=src python -m cambium quota observe openai five-hour \
   --allowance-tokens 1000000 \
   --remaining-tokens 750000
 ```
+
+## CAST: cache-aligned semantic trunking
+
+Cambium treats a long-running context as an append-only graph whose active
+frontier continuously replaces new raw execution noise with immutable semantic
+deltas:
+
+```text
+Durable graph
+
+ t1 --> t2 --> t3 --> t4 --> t5
+              \                 \
+               +--> S1           +--> S2
+
+Active model projection
+
+ [ stable head H ][ summary S1 ][ summary S2 ][ small raw tail W ]
+```
+
+Earlier summary bytes never change when a new summary is appended. This preserves
+an exact reusable prefix when the provider cache is still warm while keeping the
+complete raw history outside the model prompt.
+
+A compatible child receives the exact checkpoint prefix:
+
+```text
+ [ H ][ S1 ][ S2 ] --> child on the same provider/model
+```
+
+An opportunistic child on another provider starts cold but reuses the semantic
+history:
+
+```text
+ provider A: [ H_A ][ S1 ][ S2 ]
+                         |
+                         +--> provider B: [ H_B ][ S1 ][ S2 ][ child task ]
+                              semantic reuse, not a cache hit
+```
+
+The full paper proposal, fork-join diagrams, rollover economics, graph model,
+and research questions are in
+[`docs/architecture/cast.md`](docs/architecture/cast.md).
 
 ## Provider configuration
 
@@ -153,12 +219,15 @@ PYTHONPATH=src python -m pytest -m slow -q
 
 ## Session artifacts
 
-A session records its state below `<session-dir>/.cambium/`, including:
+A supervisor leaf records its state below `<session-dir>/.cambium/`, including:
 
 - `events.db` — durable event log,
 - `result.json` — final session result,
 - `conversations.db` — optional revision-boundary conversation history,
 - `checkpoints/` — worker checkpoints and immutable context epochs.
+
+A persistent TUI root additionally contains `turn-NNNN/` supervisor leaves and
+`.cambium/interactive.json`, the atomic single-writer branch manifest.
 
 The supervisor publishes through Git references. It does not refresh the
 caller's working tree or index after advancing `main`.

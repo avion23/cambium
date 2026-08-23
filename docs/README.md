@@ -8,10 +8,12 @@ Source and tests define current behavior.
   ownership, publication, and concurrency.
 - [`architecture/context-engine.md`](architecture/context-engine.md) —
   append-only summary trunks, epochs, forks, resume, and accounting.
+- [`architecture/cast.md`](architecture/cast.md) — CAST paper proposal, graph
+  model, cache-aligned segments, fork-join protocol, and rollover economics.
 - [`architecture/provider-routing.md`](architecture/provider-routing.md) —
   provider feasibility, routing, cache affinity, and debt.
 - [`architecture/terminal-interface.md`](architecture/terminal-interface.md) —
-  event-sourced TUI and monitor.
+  persistent interactive TUI, event-sourced dashboard, and monitor.
 - [`architecture/optimization.md`](architecture/optimization.md) — DSPy and
   OpenCode-data gates.
 - [`architecture/user-cli.md`](architecture/user-cli.md) — command reference.
