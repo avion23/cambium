@@ -77,3 +77,50 @@ def test_help_documents_turn_cancellation() -> None:
     assert "Ctrl-C cancels" in tui._HELP
     assert "/dashboard" in tui._HELP
     assert "/events" in tui._HELP
+
+
+def test_ctrl_c_cancels_active_turn_and_returns_to_prompt(monkeypatch, tmp_path: Path) -> None:
+    from cambium.interactive import InteractiveSession
+
+    class _Turn:
+        def __init__(self, number: int, session_dir: Path) -> None:
+            self.number = number
+            self.session_dir = session_dir
+
+    def prepare_turn(self, _prompt):
+        self.turn += 1
+        session_dir = self.root / f"turn-{self.turn:04d}"
+        session_dir.mkdir(parents=True)
+        return _Turn(self.turn, session_dir)
+
+    async def fake_run(self, _turn, *, on_event=None):
+        del on_event
+        await asyncio.Event().wait()
+
+    def complete_turn(self, _turn, *, succeeded):
+        assert succeeded is False
+
+    monkeypatch.setattr(InteractiveSession, "prepare_turn", prepare_turn, raising=False)
+    monkeypatch.setattr(InteractiveSession, "run_turn", fake_run, raising=False)
+    monkeypatch.setattr(InteractiveSession, "complete_turn", complete_turn, raising=False)
+
+    source = _Tty("work\n/exit\n")
+    output = _Tty()
+
+    async def scenario() -> int:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "add_signal_handler",
+            lambda _signal, callback: loop.call_soon(callback),
+        )
+        monkeypatch.setattr(loop, "remove_signal_handler", lambda _signal: True)
+        return await tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=source,
+            output_stream=output,
+            error_stream=io.StringIO(),
+        )
+
+    assert asyncio.run(scenario()) == 0
+    assert "turn cancelled" in output.getvalue()
