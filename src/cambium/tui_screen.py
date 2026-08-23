@@ -14,6 +14,7 @@ import shutil
 import signal
 import textwrap
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TextIO
 
@@ -49,6 +50,54 @@ _ROLE_LABELS = {
     "system": "SYSTEM",
     "error": "ERROR",
 }
+
+# The supervisor currently exposes lifecycle/tool events rather than a
+# provider-specific token stream.  Keep the accepted presentation events
+# explicit: arbitrary log payloads must never become terminal prose.
+_ASSISTANT_STREAM_KINDS = frozenset(
+    {
+        "assistant_delta",
+        "assistant_message",
+        "assistant_output",
+        "assistant_output_delta",
+        "assistant_text",
+        "assistant_text_delta",
+        "content_delta",
+        "message",
+        "message_delta",
+        "output_text_delta",
+        "partial_output",
+        "response.output_text.delta",
+        "stream_chunk",
+        "text_delta",
+    }
+)
+_TOOL_STREAM_KINDS = frozenset(
+    {
+        "tool_message",
+        "tool_message_delta",
+        "tool_output",
+        "tool_output_delta",
+    }
+)
+_STREAM_DELTA_KINDS = frozenset(
+    {
+        "assistant_delta",
+        "assistant_output_delta",
+        "assistant_text_delta",
+        "content_delta",
+        "message_delta",
+        "output_text_delta",
+        "partial_output",
+        "response.output_text.delta",
+        "stream_chunk",
+        "text_delta",
+        "tool_message_delta",
+        "tool_output_delta",
+    }
+)
+_STREAM_TEXT_LIMIT = 16_384
+_STREAM_RENDER_LIMIT = 8_192
 
 
 def _is_tty(stream: Any) -> bool:
@@ -108,6 +157,99 @@ def _paint(text: str, color: str, enabled: bool) -> str:
     return f"{color}{text}{_RESET}" if enabled else text
 
 
+def _event_data(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = record.get("payload")
+    return payload if isinstance(payload, Mapping) else record
+
+
+def _message_role(kind: str, data: Mapping[str, Any]) -> str | None:
+    role = data.get("role")
+    if role not in {"assistant", "tool"}:
+        message = data.get("message")
+        if isinstance(message, Mapping):
+            role = message.get("role")
+    if role in {"assistant", "tool"}:
+        return role
+    if kind == "tool_event" or kind in _TOOL_STREAM_KINDS:
+        return "tool"
+    if kind in _ASSISTANT_STREAM_KINDS and kind != "message":
+        return "assistant"
+    return None
+
+
+def _text_value(value: Any, *, depth: int = 0) -> str | None:
+    """Extract text from the small set of provider message shapes we display."""
+    if depth > 4:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("delta", "text", "content", "output_text", "partial", "chunk"):
+            if key in value:
+                text = _text_value(value[key], depth=depth + 1)
+                if text is not None:
+                    return text
+        message = value.get("message")
+        if message is not None:
+            return _text_value(message, depth=depth + 1)
+        return None
+    if isinstance(value, list | tuple):
+        parts: list[str] = []
+        for item in value:
+            text = _text_value(item, depth=depth + 1)
+            if text is not None:
+                parts.append(text)
+        return "".join(parts) if parts else None
+    return None
+
+
+def _result_text(data: Mapping[str, Any]) -> str | None:
+    parts: list[str] = []
+    for key in ("summary", "assistant_text", "output_text"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    results = data.get("results")
+    if isinstance(results, list | tuple):
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            summary = result.get("summary")
+            if isinstance(summary, str) and summary:
+                parts.append(summary)
+    return "\n\n".join(parts) if parts else None
+
+
+def _stream_update(
+    record: Mapping[str, Any],
+) -> tuple[str, str, bool, str | None] | None:
+    """Return ``(role, text, append, message_id)`` for displayable output."""
+    kind = record.get("kind")
+    if not isinstance(kind, str):
+        return None
+    data = _event_data(record)
+    if kind == "result":
+        text = _result_text(data)
+        if text is None:
+            return None
+        return "assistant", text, False, None
+    if kind == "tool_event" or kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
+        role = _message_role(kind, data)
+        if role is None:
+            return None
+        text = _text_value(data)
+        if not text:
+            return None
+        append = kind in _STREAM_DELTA_KINDS
+        if data.get("cumulative") is True or data.get("replace") is True:
+            append = False
+        if data.get("append") is True:
+            append = True
+        message_id = data.get("message_id") or data.get("id")
+        return role, text, append, message_id if isinstance(message_id, str) else None
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class TranscriptEntry:
     """One bounded, terminal-only transcript item."""
@@ -123,6 +265,10 @@ class Transcript:
         if max_entries < 8:
             raise ValueError("max_entries must be at least 8")
         self._entries: deque[TranscriptEntry] = deque(maxlen=max_entries)
+        self._stream_role: str | None = None
+        self._stream_text = ""
+        self._stream_message_id: str | None = None
+        self._stream_truncated = False
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
@@ -130,6 +276,7 @@ class Transcript:
 
     def clear(self) -> None:
         self._entries.clear()
+        self._clear_stream()
 
     def add(self, role: str, text: str) -> None:
         if role not in _ROLE_LABELS:
@@ -150,13 +297,101 @@ class Transcript:
     def error(self, text: str) -> None:
         self.add("error", text)
 
+    @property
+    def streaming_text(self) -> str:
+        """The bounded in-flight model text, if a turn is still generating."""
+        return self._stream_text
+
+    @property
+    def streaming_role(self) -> str | None:
+        return self._stream_role
+
+    def _clear_stream(self) -> None:
+        self._stream_role = None
+        self._stream_text = ""
+        self._stream_message_id = None
+        self._stream_truncated = False
+
+    def _commit_stream(self) -> None:
+        if self._stream_role is not None and self._stream_text:
+            self.add(self._stream_role, self._stream_text)
+        self._clear_stream()
+
+    def _bounded_stream_text(self, text: str) -> str:
+        if len(text) <= _STREAM_TEXT_LIMIT:
+            self._stream_truncated = False
+            return text
+        self._stream_truncated = True
+        return "…\n" + text[-(_STREAM_TEXT_LIMIT - 2) :]
+
+    def _update_stream(
+        self,
+        role: str,
+        text: str,
+        *,
+        append: bool,
+        message_id: str | None,
+    ) -> None:
+        if self._stream_role != role or (
+            message_id is not None
+            and self._stream_message_id is not None
+            and message_id != self._stream_message_id
+        ):
+            self._commit_stream()
+        self._stream_role = role
+        self._stream_message_id = message_id
+
+        current = self._stream_text
+        if not current:
+            merged = text
+        elif text == current or (append and current.endswith(text)):
+            merged = current
+        elif text.startswith(current):
+            # Some transports call a cumulative snapshot a delta.  Prefer the
+            # longer snapshot so a redraw never duplicates the existing tail.
+            merged = text
+        elif not append:
+            merged = text
+        else:
+            merged = current + text
+        self._stream_text = self._bounded_stream_text(_sanitize(merged))
+
+    def finish_stream(self, final_text: str | None = None) -> None:
+        """Commit the active stream and optionally replace it with final text."""
+        current = self._stream_text
+        role = self._stream_role
+        truncated = self._stream_truncated
+        self._clear_stream()
+        final = _sanitize(final_text).strip("\n") if isinstance(final_text, str) else ""
+        if not final:
+            if current and role is not None:
+                self.add(role, current)
+            return
+        if current and role == "assistant" and not truncated:
+            if final.startswith(current) or current.startswith(final):
+                final = final if len(final) >= len(current) else current
+            elif current != final:
+                final = f"{current}\n\n{final}"
+        elif current and role is not None:
+            self.add(role, current)
+        self.assistant(final)
+
     def observe_event(self, record: dict[str, Any]) -> None:
         """Promote only operator-relevant runtime events into the transcript."""
         kind = record.get("kind")
-        payload = record.get("payload")
         if not isinstance(kind, str):
             return
-        data = payload if isinstance(payload, dict) else record
+        data = _event_data(record)
+
+        update = _stream_update(record)
+        if update is not None:
+            role, text, append, message_id = update
+            self._update_stream(
+                role,
+                text,
+                append=append,
+                message_id=message_id,
+            )
 
         if kind == "tool_event":
             tool = data.get("tool")
@@ -237,18 +472,50 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
     return output
 
 
+def _entry_lines(entry: TranscriptEntry, width: int) -> list[tuple[str, str]]:
+    label = _ROLE_LABELS[entry.role]
+    body_width = max(8, width - 3)
+    rendered = [(entry.role, f" {label}")]
+    rendered.extend((entry.role, "   " + line) for line in _wrap_markdown(entry.text, body_width))
+    rendered.append((entry.role, ""))
+    return rendered
+
+
+def _stream_lines(
+    transcript: Transcript, width: int, capacity: int
+) -> list[tuple[str, str]]:
+    if not transcript.streaming_text or transcript.streaming_role is None:
+        return []
+    body_width = max(8, width - 3)
+    text = transcript.streaming_text
+    if len(text) > _STREAM_RENDER_LIMIT:
+        text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
+    label = _ROLE_LABELS[transcript.streaming_role]
+    rendered = [(transcript.streaming_role, f" {label} · generating")]
+    rendered.extend(
+        (transcript.streaming_role, "   " + line)
+        for line in _wrap_markdown(text, body_width)
+    )
+    return rendered[-max(1, capacity) :]
+
+
 def _transcript_lines(transcript: Transcript, width: int, capacity: int) -> list[tuple[str, str]]:
+    capacity = max(1, capacity)
+    active = _stream_lines(transcript, width, capacity)
+    remaining = max(0, capacity - len(active))
     rendered: list[tuple[str, str]] = []
-    for entry in transcript.entries:
-        label = _ROLE_LABELS[entry.role]
-        rendered.append((entry.role, f" {label}"))
-        body_width = max(8, width - 3)
-        for line in _wrap_markdown(entry.text, body_width):
-            rendered.append((entry.role, "   " + line))
-        rendered.append((entry.role, ""))
+    if remaining:
+        for entry in reversed(transcript.entries):
+            block = _entry_lines(entry, width)
+            if len(block) >= remaining:
+                rendered = block[-remaining:] + rendered
+                break
+            rendered = block + rendered
+            remaining -= len(block)
+    rendered.extend(active)
     if not rendered:
         rendered = [("system", " Waiting for a prompt. Type /help for commands.")]
-    return rendered[-max(1, capacity) :]
+    return rendered[-capacity:]
 
 
 def _agent_model(agent: Any) -> str:
