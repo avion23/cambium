@@ -213,7 +213,7 @@ def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
     assert text.count("run_shell") == 1
 
 
-def test_failed_tool_event_breaks_runs_and_keeps_expanded_error() -> None:
+def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
     transcript = Transcript()
     for event in (
         {"tool": "run_shell", "ok": True, "duration_ms": 141},
@@ -238,12 +238,12 @@ def test_failed_tool_event_breaks_runs_and_keeps_expanded_error() -> None:
     )
     text = "\n".join(lines)
 
+    # Failed tool events are owned by the consolidated failure block, not the
+    # transcript: successes render as compact lines, the failure does not
+    # duplicate as a transcript entry.
     assert "✓ run_shell 141ms" in text
-    assert "✗ run_shell 9273ms" in text
-    assert "TOOL" in text
-    assert "error: permission denied" in text
-    assert "✓ run_shell 2395ms" in text
-    assert "×3" not in text
+    assert "✗ run_shell 9273ms" not in text
+    assert len(transcript.entries) == 2
 
 
 def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
@@ -270,3 +270,68 @@ def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     assert "✓ run_shell 9273ms" in text
     assert "✓ git_op 2395ms" in text
     assert "×" not in text
+def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
+    transcript = Transcript()
+    events = (
+        {
+            "kind": "tool_event",
+            "task_id": "task-timeout",
+            "generation": 1,
+            "payload": {"tool": "run_shell", "ok": False, "turn": 1},
+        },
+        {
+            "kind": "timeout",
+            "task_id": "task-timeout",
+            "generation": 1,
+            "payload": {"phase": "wall"},
+        },
+        {
+            "kind": "worker_failed",
+            "task_id": "task-timeout",
+            "generation": 1,
+            "payload": {"reason": "wall", "max_restarts": 0},
+        },
+    )
+
+    for event in events:
+        transcript.observe_event(event)
+
+    transcript.finish_stream(
+        "plan=tasks:1 plan_status={failed} "
+        "plan_failures={task-timeout:'max_restarts (0): wall'}"
+    )
+
+    failures = [entry for entry in transcript.entries if entry.role == "error"]
+    assert len(failures) == 1
+    assert "task_id=task-timeout" in failures[0].text
+    assert "cause=max_restarts (0): wall" in failures[0].text
+    assert "↳ run_shell: failed" in failures[0].text
+    assert "↳ timeout: wall" in failures[0].text
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == [
+        "plan=failed"
+    ]
+
+
+def test_repeated_failure_events_do_not_duplicate_the_block_or_cause() -> None:
+    transcript = Transcript()
+    event = {
+        "kind": "worker_failed",
+        "task_id": "task-repeat",
+        "generation": 1,
+        "payload": {"reason": "wall", "max_restarts": 0},
+    }
+    for _ in range(3):
+        transcript.observe_event(dict(event))
+        transcript.observe_event(
+            {
+                "kind": "result",
+                "task_id": "task-repeat",
+                "generation": 1,
+                "payload": {"status": "failed"},
+            }
+        )
+
+    failures = [entry for entry in transcript.entries if entry.role == "error"]
+    assert len(failures) == 1
+    assert failures[0].text.count("task-repeat") == 1
+    assert failures[0].text.count("max_restarts (0): wall") == 1
