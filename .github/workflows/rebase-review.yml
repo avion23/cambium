@@ -1,6 +1,9 @@
 name: rebase-review
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - codex/cambium-correctness-docs-20260823
@@ -18,12 +21,14 @@ jobs:
         with:
           ref: codex/cambium-correctness-docs-20260823
           fetch-depth: 0
-      - name: Remove this staging commit and pull-rebase main
+      - name: Remove staging commits and pull-rebase main
         run: |
           git config user.name "openai-codex"
           git config user.email "codex@openai.com"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git reset --hard HEAD^
+          expected_remote_head="$(git rev-parse origin/codex/cambium-correctness-docs-20260823)"
+          test "$(git rev-parse HEAD)" = "$expected_remote_head"
+          echo "EXPECTED_REMOTE_HEAD=$expected_remote_head" >> "$GITHUB_ENV"
+          git reset --hard HEAD~2
           git pull --rebase origin main
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,5 +57,5 @@ jobs:
       - name: Publish rebased branch
         run: >-
           git push
-          --force-with-lease=refs/heads/codex/cambium-correctness-docs-20260823:${GITHUB_SHA}
+          --force-with-lease=refs/heads/codex/cambium-correctness-docs-20260823:${EXPECTED_REMOTE_HEAD}
           origin HEAD:refs/heads/codex/cambium-correctness-docs-20260823
