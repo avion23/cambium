@@ -77,6 +77,23 @@ def test_help_documents_turn_cancellation() -> None:
     assert "Ctrl-C cancels" in tui._HELP
     assert "/dashboard" in tui._HELP
     assert "/events" in tui._HELP
+    assert "blank line submits" in tui._HELP
+
+
+def test_tty_bracketed_paste_preserves_embedded_newlines() -> None:
+    source = _Tty("\x1b[200~line one\nline two\x1b[201~\n")
+    output = _Tty()
+
+    assert tui._read_prompt(source, output) == "line one\nline two"
+    assert tui._BRACKETED_PASTE_ENABLE in output.getvalue()
+    assert tui._BRACKETED_PASTE_DISABLE in output.getvalue()
+
+
+def test_tty_trailing_backslash_continues_until_next_line() -> None:
+    source = _Tty("line one\\\nline two\n")
+    output = _Tty()
+
+    assert tui._read_prompt(source, output) == "line one\nline two"
 
 
 def test_ctrl_c_cancels_active_turn_and_returns_to_prompt(monkeypatch, tmp_path: Path) -> None:

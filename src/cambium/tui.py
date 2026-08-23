@@ -8,6 +8,8 @@ import os
 import signal
 import sqlite3
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
@@ -27,6 +29,10 @@ except ImportError:  # pragma: no cover - platform dependent
 
 _PROMPT = "cambium> "
 _CONTINUATION_PROMPT = "... "
+_BRACKETED_PASTE_ENABLE = "\x1b[?2004h"
+_BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
+_BRACKETED_PASTE_START = "\x1b[200~"
+_BRACKETED_PASTE_END = "\x1b[201~"
 
 
 @dataclass(slots=True)
@@ -85,6 +91,8 @@ During a running turn, Ctrl-C cancels that turn and returns to this cockpit.
 The last successfully published context checkpoint remains the branch head.
 
 Multiline input:
+  bracketed paste keeps pasted newlines in one prompt.
+  end a line with \\ to continue; a blank line submits the accumulated text.
   enter <<< on its own line, write the prompt, then enter >>> on its own line.
 """
 
@@ -103,39 +111,98 @@ def _write_line(out: TextIO, line: str) -> None:
             out.write("\n")
 
 
+@contextmanager
+def _bracketed_paste_mode(source: TextIO, out: TextIO) -> Iterator[None]:
+    """Enable terminal bracketed paste only for interactive input reads."""
+    if not (_is_tty(source) and _is_tty(out)):
+        yield
+        return
+    out.write(_BRACKETED_PASTE_ENABLE)
+    out.flush()
+    try:
+        yield
+    finally:
+        out.write(_BRACKETED_PASTE_DISABLE)
+        out.flush()
+
+
+def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
+    """Remove terminal paste framing while retaining newlines in the payload."""
+    if not _is_tty(source):
+        return value.rstrip("\r\n")
+    start = value.find(_BRACKETED_PASTE_START)
+    if start < 0:
+        return value.rstrip("\r\n")
+
+    prefix = value[:start]
+    payload = value[start + len(_BRACKETED_PASTE_START) :]
+    while True:
+        end = payload.find(_BRACKETED_PASTE_END)
+        if end >= 0:
+            return prefix + payload[:end]
+        line = source.readline()
+        if line == "":
+            return prefix + payload.rstrip("\r\n")
+        payload += line
+
+
 def _input_line(
     source: TextIO, out: TextIO, prompt: str, *, native: bool
 ) -> str | None:
-    if native:
-        try:
-            return builtins.input(prompt)
-        except EOFError:
-            return None
-    out.write(prompt)
-    out.flush()
-    line = source.readline()
-    if line == "":
-        return None
-    return line.rstrip("\r\n")
+    with _bracketed_paste_mode(source, out):
+        if native:
+            try:
+                line = builtins.input(prompt)
+            except EOFError:
+                return None
+        else:
+            out.write(prompt)
+            out.flush()
+            line = source.readline()
+            if line == "":
+                return None
+    return _unframe_bracketed_paste(line, source)
+
+
+def _read_multiline(
+    value: str, read_next: Callable[[], str | None]
+) -> str | None:
+    """Apply explicit blocks and trailing-backslash line continuation."""
+    if value.strip() == "<<<":
+        lines: list[str] = []
+        while True:
+            next_value = read_next()
+            if next_value is None or next_value.strip() == ">>>":
+                return "\n".join(lines)
+            lines.append(next_value)
+
+    lines = []
+    while True:
+        if value == "":
+            return "\n".join(lines)
+        if not value.endswith("\\"):
+            if lines:
+                lines.append(value)
+                return "\n".join(lines)
+            return value
+        lines.append(value[:-1])
+        next_value = read_next()
+        if next_value is None:
+            return "\n".join(lines)
+        value = next_value
 
 
 def _read_prompt(
     source: TextIO, out: TextIO, *, native: bool = False
 ) -> str | None:
-    """Read one line or an explicit ``<<<`` / ``>>>`` multiline block."""
+    """Read one prompt, preserving pasted newlines and continued lines."""
     value = _input_line(source, out, _PROMPT, native=native)
     if value is None:
         return None
-    if value.strip() != "<<<":
-        return value
-    lines: list[str] = []
-    while True:
-        value = _input_line(source, out, _CONTINUATION_PROMPT, native=native)
-        if value is None:
-            return "\n".join(lines)
-        if value.strip() == ">>>":
-            return "\n".join(lines)
-        lines.append(value)
+    return _read_multiline(
+        value,
+        lambda: _input_line(source, out, _CONTINUATION_PROMPT, native=native),
+    )
 
 
 def _read_cockpit_prompt(
@@ -146,29 +213,14 @@ def _read_cockpit_prompt(
     def read_one(label: str) -> str | None:
         cockpit.move_to_input(label=label)
         try:
-            if native:
-                try:
-                    return builtins.input("")
-                except EOFError:
-                    return None
-            line = source.readline()
-            return None if line == "" else line.rstrip("\r\n")
+            return _input_line(source, cockpit.stream, "", native=native)
         finally:
             cockpit.hide_cursor()
 
     value = read_one("›")
     if value is None:
         return None
-    if value.strip() != "<<<":
-        return value
-    lines: list[str] = []
-    while True:
-        value = read_one("…")
-        if value is None:
-            return "\n".join(lines)
-        if value.strip() == ">>>":
-            return "\n".join(lines)
-        lines.append(value)
+    return _read_multiline(value, lambda: read_one("…"))
 
 
 def _history_path(session: InteractiveSession) -> Path:
