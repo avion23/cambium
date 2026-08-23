@@ -8,6 +8,7 @@ operator's current terminal view.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import textwrap
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, TextIO
 
 _RESET = "\x1b[0m"
@@ -953,15 +955,245 @@ def _agent_model(agent: Any) -> str:
     return model or provider or "?"
 
 
+def _side_clean(value: Any) -> str:
+    """Return one terminal-safe, single-line value for the side panel."""
+    return _sanitize(value).replace("\n", " ")
+
+
+def _side_row(kind: str, text: Any, width: int) -> tuple[str, str]:
+    """Build a side-panel row that can never wrap at the panel boundary."""
+    return kind, _clip(_side_clean(text), max(1, width))
+
+
+def _usage_field(line: str, key: str) -> str | None:
+    match = re.search(rf"(?<![\w/]){re.escape(key)}=([^\s()]+)", _side_clean(line))
+    return match.group(1) if match is not None else None
+
+
+def _usage_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value)) if math.isfinite(value) else default
+    if value is None:
+        return default
+    text = _side_clean(value).strip().lower().replace(",", "")
+    if not text or text == "free":
+        return default if not text else 0
+    multiplier = 1
+    if text[-1:] in {"k", "m"}:
+        multiplier = 1_000 if text[-1] == "k" else 1_000_000
+        text = text[:-1]
+    try:
+        number = float(text)
+    except ValueError:
+        return default
+    return max(0, int(number * multiplier)) if math.isfinite(number) else default
+
+
+def _usage_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, str):
+        value = value.strip().lstrip("$")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _format_cost(value: Any) -> str:
+    """Format a cost with four significant digits without a noisy zero cost."""
+    cost = _usage_float(value)
+    if cost == 0:
+        return "free"
+    if cost < 0:
+        return "free"
+    rendered = f"{cost:.4g}"
+    if "e" in rendered.lower():
+        rendered = format(Decimal(rendered), "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+    return f"${rendered}"
+
+
+def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[str, str]]:
+    """Render cumulative usage as aligned, compact rows."""
+
+    def field(key: str) -> str | None:
+        return _usage_field(cumulative_line, key)
+
+    snapshot_calls = _usage_int(getattr(snapshot, "calls", 0))
+    snapshot_tokens = _usage_int(getattr(snapshot, "total_tokens", 0))
+    snapshot_input = _usage_int(getattr(snapshot, "input_tokens", 0))
+    snapshot_output = _usage_int(getattr(snapshot, "output_tokens", 0))
+    snapshot_cached = _usage_int(getattr(snapshot, "cached_tokens", 0))
+    calls = _usage_int(field("calls"), snapshot_calls)
+    total_tokens = _usage_int(field("tokens"), snapshot_tokens)
+    input_tokens = _usage_int(field("in"), snapshot_input)
+    output_tokens = _usage_int(field("out"), snapshot_output)
+    cached_tokens = _usage_int(field("cached"), snapshot_cached)
+    rate = _usage_float(
+        field("out/s"),
+        _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0)),
+    )
+    cost = _usage_float(
+        field("cost"),
+        _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
+    )
+
+    label_width = 7
+
+    def row(label: str, value: str) -> tuple[str, str]:
+        return _side_row("normal", f" {label:<{label_width}}{value}", width)
+
+    token_line = f" {'tokens':<{label_width}}{_human_count(total_tokens)}"
+    has_details = any(
+        field(key) is not None or hasattr(snapshot, snapshot_key)
+        for key, snapshot_key in (
+            ("in", "input_tokens"),
+            ("out", "output_tokens"),
+            ("cached", "cached_tokens"),
+        )
+    )
+    if has_details:
+        input_value = _human_count(input_tokens)
+        output_value = _human_count(output_tokens)
+        cached_value = _human_count(cached_tokens)
+        details = (
+            f"(in {input_value} · out {output_value} · cached {cached_value})",
+            f"(in {input_value} · out {output_value} · c {cached_value})",
+            f"(in {input_value}/out {output_value}/c {cached_value})",
+            f"({input_value}/{output_value}/{cached_value})",
+            f"(in {input_value} · out {output_value})",
+            f"(in {input_value})",
+        )
+        for detail in details:
+            candidate = f"{token_line} {detail}"
+            if len(candidate) <= max(1, width):
+                token_line = candidate
+                break
+
+    return [
+        row("calls", str(calls)),
+        _side_row("normal", token_line, width),
+        row("out/s", f"{rate:.1f}"),
+        row("cost", _format_cost(cost)),
+    ]
+
+
+def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
+    """Render agents with stable glyph, task, and provider/model columns."""
+    panel_width = max(1, width)
+    name_start = 3
+    states = [
+        _side_clean(getattr(agent, "state", "?")).strip() or "?"
+        for agent in agents
+    ]
+    tasks = [
+        _side_clean(getattr(agent, "task_id", "?")).strip() or "?"
+        for agent in agents
+    ]
+    state_width = min(
+        max((len(state) for state in states), default=1),
+        max(1, panel_width - name_start - 1),
+    )
+    task_width = max(
+        1,
+        min(
+            max((len(task) for task in tasks), default=1),
+            panel_width - name_start - 1 - state_width,
+        ),
+    )
+    rows: list[tuple[str, str]] = []
+    for agent, state, task in zip(agents, states, tasks, strict=True):
+        role = "M" if getattr(agent, "role", "") == "main" else "S"
+        rows.append(
+            _side_row(
+                state,
+                f" {role} {_pad(task, task_width)} {_pad(state, state_width)}",
+                panel_width,
+            )
+        )
+        rows.append(
+            _side_row(
+                "dim",
+                " " * name_start + _agent_model(agent),
+                panel_width,
+            )
+        )
+
+        tokens = _usage_int(getattr(agent, "total_tokens", 0))
+        parts = [f"{_human_count(tokens)} tok"]
+        rate = getattr(agent, "output_tokens_per_s", None)
+        if isinstance(rate, int | float) and math.isfinite(float(rate)):
+            parts.append(f"{rate:.1f} out/s")
+        tool = _side_clean(getattr(agent, "tool", "")).strip()
+        if tool:
+            parts.append(tool)
+        stats = " " * name_start + parts[0]
+        for part in parts[1:]:
+            candidate = f"{stats} · {part}"
+            if len(candidate) <= panel_width:
+                stats = candidate
+        rows.append(_side_row("dim", stats, panel_width))
+    return rows
+
+
+def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
+    """Keep each recent event attached to its detail or omit that detail."""
+    panel_width = max(1, width)
+    kind = _side_clean(getattr(event, "kind", "event")).strip() or "event"
+    detail = _side_clean(getattr(event, "detail", "")).strip()
+    if not detail:
+        return [_side_row("dim", f" {kind}", panel_width)]
+
+    delimiter = " · "
+    kind_width = panel_width - 1 - len(delimiter) - len(detail)
+    if kind_width >= 1:
+        return [
+            _side_row(
+                "dim",
+                f" {_clip(kind, kind_width)}{delimiter}{detail}",
+                panel_width,
+            )
+        ]
+
+    kind_row = _side_row("dim", f" {kind}", panel_width)
+    detail_row = f"   {detail}"
+    if len(detail_row) <= panel_width:
+        return [kind_row, _side_row("dim", detail_row, panel_width)]
+    return [kind_row]
+
+
+def _append_side_rows(
+    lines: list[tuple[str, str]], rows: list[tuple[str, str]], capacity: int
+) -> None:
+    """Append a row block without leaving a trailing detail fragment."""
+    room = max(0, capacity - len(lines))
+    if room <= 0:
+        return
+    if len(rows) <= room:
+        lines.extend(rows)
+    else:
+        lines.append(rows[0])
+
+
 def _side_sections(
     snapshot: Any, cumulative_line: str, width: int, capacity: int
 ) -> list[tuple[str, str]]:
+    panel_width = max(1, width)
+    capacity = max(1, capacity)
     lines: list[tuple[str, str]] = []
     agents = tuple(getattr(snapshot, "agents", ()))
-    lines.append(("heading", " AGENTS"))
+    lines.append(_side_row("heading", " AGENTS", panel_width))
     if not agents:
-        lines.append(("dim", " no agents yet"))
+        lines.append(_side_row("dim", " no agents yet", panel_width))
     else:
+<<<<<<< HEAD
         for agent in agents[-6:]:
             role = "M" if getattr(agent, "role", "") == "main" else "S"
             state = str(getattr(agent, "state", "?"))
@@ -974,58 +1206,69 @@ def _side_sections(
             suffix = f" · {rate:.1f} out/s" if isinstance(rate, int | float) else ""
             tool_suffix = f" · {tool}" if tool else ""
             lines.append(("dim", f"   {_human_count(tokens)} tok{suffix}{tool_suffix}"))
+=======
+        lines.extend(_agent_rows(agents[-6:], panel_width))
+>>>>>>> pi-agent-0adbf049-0a44-44b
 
     context = getattr(snapshot, "context", None)
-    lines.append(("heading", " CONTEXT"))
+    lines.append(_side_row("heading", " CONTEXT", panel_width))
     if context is None:
-        lines.append(("dim", " unavailable"))
+        lines.append(_side_row("dim", " unavailable", panel_width))
     else:
         approx = "≈" if getattr(context, "approximate", False) else ""
         lines.extend(
             [
-                (
+                _side_row(
                     "normal",
                     f" epoch {getattr(context, 'epoch', 0)} · "
                     f"segments {getattr(context, 'summary_segments', 0)}",
+                    panel_width,
                 ),
-                (
+                _side_row(
                     "normal",
                     " trunk "
                     f"{approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
+                    panel_width,
                 ),
-                ("dim", f" {_human_bytes(getattr(context, 'summary_trunk_bytes', 0))} serialized"),
-                (
+                _side_row(
+                    "dim",
+                    f" {_human_bytes(getattr(context, 'summary_trunk_bytes', 0))} serialized",
+                    panel_width,
+                ),
+                _side_row(
                     "normal",
                     " raw "
                     f"{approx}{_human_count(getattr(context, 'estimated_raw_tail_tokens', 0))} tok",
+                    panel_width,
                 ),
-                (
+                _side_row(
                     "dim",
                     " checkpoint "
-                    + _clip(
-                        getattr(context, "checkpoint_ref", None) or "none",
-                        width - 13,
-                    ),
+                    + _side_clean(getattr(context, "checkpoint_ref", None) or "none"),
+                    panel_width,
                 ),
             ]
         )
 
-    lines.append(("heading", " SESSION USAGE"))
-    for part in cumulative_line.replace("usage: ", "", 1).split(" "):
-        if part:
-            lines.append(("normal", " " + part))
+    lines.append(_side_row("heading", " SESSION USAGE", panel_width))
+    lines.extend(_usage_rows(snapshot, cumulative_line, panel_width))
 
-    recent = tuple(getattr(snapshot, "recent_events", ()))
+    recent = tuple(
+        event
+        for event in getattr(snapshot, "recent_events", ())
+        if (
+            (kind := _side_clean(getattr(event, "kind", "")).strip()) != "dirty"
+            and not kind.startswith("worktree_cleanup")
+        )
+    )
     if recent:
-        lines.append(("heading", " RECENT"))
+        lines.append(_side_row("heading", " RECENT", panel_width))
         for event in recent[-4:]:
-            kind = _clip(str(getattr(event, "kind", "event")), 18)
-            detail = _clip(str(getattr(event, "detail", "")), width - 4)
-            lines.append(("dim", f" {kind}"))
-            if detail:
-                lines.append(("dim", f"   {detail}"))
+            _append_side_rows(lines, _recent_rows(event, panel_width), capacity)
 
-    return lines[: max(1, capacity)]
+    return [
+        _side_row(kind, text, panel_width) for kind, text in lines[:capacity]
+    ]
 
 
 def _style_kind(kind: str) -> str:

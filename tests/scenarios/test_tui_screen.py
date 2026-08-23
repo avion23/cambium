@@ -2,7 +2,9 @@
 
 from types import SimpleNamespace
 
-from cambium.tui_screen import Transcript, render_cockpit
+import pytest
+
+from cambium.tui_screen import Transcript, _side_sections, render_cockpit
 
 
 def _snapshot():
@@ -335,3 +337,55 @@ def test_repeated_failure_events_do_not_duplicate_the_block_or_cause() -> None:
     assert len(failures) == 1
     assert failures[0].text.count("task-repeat") == 1
     assert failures[0].text.count("max_restarts (0): wall") == 1
+
+
+@pytest.mark.parametrize("width", [24, 32, 48])
+def test_side_sections_are_width_safe(width: int) -> None:
+    snapshot = _snapshot()
+    snapshot.agents = (
+        SimpleNamespace(
+            task_id="a-very-long-interactive-task-id",
+            role="main",
+            state="active",
+            provider="codex",
+            model="gpt-5.6",
+            tool="read_batch",
+            total_tokens=12345,
+            output_tokens_per_s=12.4,
+        ),
+    )
+    snapshot.recent_events = (
+        SimpleNamespace(kind="worktree_cleanup", detail="internal"),
+        SimpleNamespace(kind="dirty", detail="internal"),
+        SimpleNamespace(kind="result", detail="published"),
+    )
+
+    rows = _side_sections(
+        snapshot,
+        "usage: calls=19 summaries=2 tokens=104000 (in=101000 out=2700 cached=93000) "
+        "out/s=12.4 cost=$0.000000",
+        width,
+        100,
+    )
+
+    assert rows
+    assert all("\n" not in line and len(line) <= width for _, line in rows)
+    text = "\n".join(line for _, line in rows)
+    assert "worktree_cleanup" not in text
+    assert "dirty" not in text
+    assert any(
+        line.strip().startswith("cost") and line.rstrip().endswith("free")
+        for line in text.splitlines()
+    )
+
+    usage_columns = []
+    for label, value in (("calls", "19"), ("tokens", "104k"), ("out/s", "12.4"), ("cost", "free")):
+        line = next(line for line in text.splitlines() if line.strip().startswith(label))
+        usage_columns.append(line.index(value))
+    assert len(set(usage_columns)) == 1
+
+    task_line = next(line for line in text.splitlines() if line.startswith(" M "))
+    model_line = next(line for line in text.splitlines() if line.startswith("   codex/"))
+    stats_line = next(line for line in text.splitlines() if line.startswith("   12.3k"))
+    assert task_line.index("M") == 1
+    assert task_line.index("a-") == model_line.index("codex") == stats_line.index("12.3k")
