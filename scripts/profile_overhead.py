@@ -458,9 +458,7 @@ def _git_run(repo: Path, *args: str, input_text: str | None = None) -> str:
 
 def _init_profile_repo(repo: Path, branches: int) -> tuple[str, list[str], list[Path]]:
     """Create test-style base/worker commits before timing the merge pipeline."""
-    subprocess.run(
-        ["git", "init", "--quiet", "--initial-branch=main", str(repo)], check=True
-    )
+    subprocess.run(["git", "init", "--quiet", "--initial-branch=main", str(repo)], check=True)
     _git_run(repo, "config", "user.name", "cambium-profile")
     _git_run(repo, "config", "user.email", "cambium-profile@example.test")
     _git_run(repo, "config", "gc.auto", "0")
