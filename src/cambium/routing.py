@@ -78,7 +78,41 @@ DEFAULT_TOKEN_WINDOW_ALLOWANCE = 20_000_000
 DEFAULT_ROUTING_STATE_PATH = Path.home() / ".config" / "cambium" / "routing-state.json"
 _ROUTING_STATE_VERSION = 1
 
-_REQUIREMENT_KEYS = frozenset({"quality", "min_context_window"})
+_REQUIREMENT_KEYS = frozenset(
+    {
+        "quality",
+        "min_context_window",
+        "needs_native_tools",
+        "needs_python_tool",
+        "allow_paid",
+        "allow_free",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingRequest:
+    """Immutable hard-admission facts for one provider request.
+
+    This is deliberately only a request value object.  Mutable provider health,
+    buckets, and task-to-provider binding remain owned by :mod:`diffundo`;
+    keeping the request here lets both supervisor admission and live routing
+    apply the same capability predicates without reinstating the old scheduler
+    actor.
+    """
+
+    task_id: str
+    model: str
+    expected_input_tokens: int = 0
+    expected_output_tokens: int = 0
+    required_context_tokens: int = 0
+    needs_native_tools: bool = True
+    needs_python_tool: bool = False
+    allow_model_substitution: bool = False
+    allow_paid: bool = True
+    allow_free: bool = True
+    incumbent_provider: str | None = None
+    lease: Any | None = None
 
 
 @dataclass
@@ -687,14 +721,70 @@ def select_lane(
     return winner.name, winner.model
 
 
+def context_window_satisfies(provider: Any, required_context_tokens: int) -> bool:
+    """Return whether ``provider`` declares enough context capacity.
+
+    Context is a hard capability boundary.  A missing/zero capacity is not
+    treated as unlimited when a request declares a requirement; this is the
+    same predicate used by H2 scoring and by Diffundo's live admission path.
+    """
+    if required_context_tokens <= 0:
+        return True
+    capacity = getattr(provider, "context_window", 0) or 0
+    return (
+        not isinstance(capacity, bool)
+        and isinstance(capacity, (int, float))
+        and capacity >= required_context_tokens
+    )
+
+
+def provider_satisfies_request(provider: Any, request: RoutingRequest) -> bool:
+    """Apply the request's static hard constraints to one provider.
+
+    Health, token buckets, and tier membership are intentionally outside this
+    pure predicate.  They are live state and remain in Diffundo's candidate
+    loop.  A lease is never permission to bypass context, tools, or billing.
+    """
+    if not getattr(provider, "enabled", True):
+        return False
+    lease = request.lease
+    if lease is not None:
+        if (
+            getattr(provider, "name", None) != getattr(lease, "provider", None)
+            or getattr(provider, "model", None) != getattr(lease, "model", None)
+        ):
+            return False
+    elif (
+        request.model
+        and not request.allow_model_substitution
+        and getattr(provider, "model", None) != request.model
+    ):
+        return False
+    if not context_window_satisfies(provider, request.required_context_tokens):
+        return False
+    if request.needs_native_tools and not getattr(provider, "supports_native_tools", False):
+        return False
+    if request.needs_python_tool and not getattr(provider, "supports_python_tool", False):
+        return False
+    billing = getattr(provider, "billing_mode", "metered")
+    billing_value = getattr(billing, "value", billing)
+    if billing_value in {"metered", "subscription"}:
+        if not request.allow_paid:
+            return False
+    elif not request.allow_free:
+        return False
+    return True
+
+
 def validate_requirements(requirements: Mapping[str, Any] | None) -> dict[str, Any]:
     """Validate a task's capability/quality requirements, fail-closed.
 
     ``quality`` must be ``"high"`` or ``"normal"``; ``min_context_window``
-    must be a positive int. Unknown keys raise ``ValueError`` — a task that
-    declares a requirement the selector does not understand fails closed
-    instead of silently downgrading the task. Returns a plain dict copy
-    (``{}`` for ``None``/absent).
+    must be a positive int.  Tool and billing flags, when declared, must be
+    booleans. Unknown keys raise ``ValueError`` — a task that declares a
+    requirement the selector does not understand fails closed instead of
+    silently downgrading the task. Returns a plain dict copy (``{}`` for
+    ``None``/absent).
     """
     if requirements is None:
         return {}
@@ -718,6 +808,14 @@ def validate_requirements(requirements: Mapping[str, Any] | None) -> dict[str, A
             or min_context_window <= 0
         ):
             raise ValueError("requirements.min_context_window must be a positive int")
+    for key in (
+        "needs_native_tools",
+        "needs_python_tool",
+        "allow_paid",
+        "allow_free",
+    ):
+        if key in requirements and type(requirements[key]) is not bool:
+            raise ValueError(f"requirements.{key} must be a boolean")
     return dict(requirements)
 
 
@@ -739,9 +837,10 @@ def score_providers(
     :attr:`~cambium.diffundo.ProviderConfig.context_window`) and at least as
     large as the requirement — a provider that declares no capacity can never
     satisfy the boundary, so the task is never bound to a provider that
-    cannot fit its context. Unknown requirement keys raise ``ValueError``, so
-    a cheaper/underused provider that fails the task's constraints is never
-    substituted (and no eligible provider raises, fail-closed).
+    cannot fit its context. Declared tool and billing flags are hard filters as
+    well. Unknown requirement keys raise ``ValueError``, so a cheaper/underused
+    provider that fails the task's constraints is never substituted (and no
+    eligible provider raises, fail-closed).
 
     Eligible providers use :func:`cambium.selection.order_candidates`, whose
     lexicographic quality key is success confidence, latency-SLO compliance,
@@ -757,6 +856,10 @@ def score_providers(
         raise ValueError("model_candidates must be a non-empty list of model ids")
     require_strong = requirements.get("quality") == "high"
     min_context_window = requirements.get("min_context_window")
+    needs_native_tools = requirements.get("needs_native_tools", False)
+    needs_python_tool = requirements.get("needs_python_tool", False)
+    allow_paid = requirements.get("allow_paid", True)
+    allow_free = requirements.get("allow_free", True)
     eligible: list[Any] = []
     capability_matches = 0
     models: dict[str, str] = {}
@@ -768,14 +871,21 @@ def score_providers(
             continue
         if require_strong and getattr(provider, "tier", None) is not ProviderTier.STRONG:
             continue
-        if min_context_window is not None:
-            capacity = getattr(provider, "context_window", 0) or 0
-            if (
-                isinstance(capacity, bool)
-                or not isinstance(capacity, (int, float))
-                or capacity < min_context_window
-                ):
+        if min_context_window is not None and not context_window_satisfies(
+            provider, min_context_window
+        ):
+            continue
+        if needs_native_tools and not getattr(provider, "supports_native_tools", False):
+            continue
+        if needs_python_tool and not getattr(provider, "supports_python_tool", False):
+            continue
+        billing = getattr(provider, "billing_mode", "metered")
+        billing_value = getattr(billing, "value", billing)
+        if billing_value in {"metered", "subscription"}:
+            if not allow_paid:
                 continue
+        elif not allow_free:
+            continue
         capability_matches += 1
         if lanes is not None:
             lane = lanes.get(provider.name)
