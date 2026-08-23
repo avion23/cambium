@@ -1640,6 +1640,10 @@ class WorktreeRecoveryError(RuntimeError):
     """A destructive worktree recovery command failed."""
 
 
+class ResolverJoinInvariantError(RuntimeError):
+    """A resolver lost the parent join barrier before its ref publication."""
+
+
 class ConversationAppendError(RuntimeError):
     """A revision could not be persisted to the conversation store."""
 
@@ -5496,6 +5500,7 @@ class _Runtime:
                 "_resolver_child": True,
                 "_resolver_source_branch": spec["branch"],
                 "_resolver_prepared": False,
+                "_resolver_join_invariant_failed": False,
                 "_retain_worktree": False,
             }
         )
@@ -5783,6 +5788,28 @@ class _Runtime:
                         self._task_envelopes[spec["task_id"]] = sanitized_envelope
                     await self._cleanup_resolver_worktree(resolver_spec)
                     return merged
+                if resolver_spec.get("_resolver_join_invariant_failed"):
+                    last_status = "join_invariant_failed"
+                    last_reason = "join_invariant_failed"
+                    self._results[resolver_task_id] = replace(
+                        resolver_result,
+                        status="failed",
+                        exit_code=1,
+                        reason=last_reason,
+                    )
+                    await self.emit(
+                        "resolver_failed",
+                        task_id=spec["task_id"],
+                        parent_task_id=parent_task_id,
+                        resolver_task_id=resolver_task_id,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        status=last_status,
+                        reason=last_reason,
+                    )
+                    await self._cleanup_resolver_worktree(resolver_spec)
+                    self._resolver_failures[spec["task_id"]] = last_reason
+                    return None
                 last_reason = "resolver_merge_failed"
             else:
                 last_reason = (
@@ -5857,6 +5884,25 @@ class _Runtime:
                 if not current_main:
                     raise RuntimeError("no refs/heads/main to publish onto")
                 if spec.get("_resolver_child"):
+                    parent_task_id = spec.get("parent_task_id")
+                    parent_spec = (
+                        self._session_spec(parent_task_id)
+                        if isinstance(parent_task_id, str)
+                        else None
+                    )
+                    if parent_spec is not None and not await self._assert_parent_join_invariant(
+                        parent_spec,
+                        [
+                            str(spec.get("resolver_conflict_task_id", task_id)),
+                            task_id,
+                        ],
+                        handle.generation,
+                        consume=False,
+                    ):
+                        spec["_resolver_join_invariant_failed"] = True
+                        raise ResolverJoinInvariantError(
+                            "parent worktree was not at the accepted head before resolver publish"
+                        )
                     # A resolver commits the already-resolved two-parent
                     # merge in its fresh staging worktree. Rebasing that merge
                     # commit would replay the source parent and recreate the
@@ -5906,7 +5952,17 @@ class _Runtime:
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             merge_failed = True
             error_type = exc.__class__.__name__
-            if isinstance(exc, MergeConflictError):
+            if isinstance(exc, ResolverJoinInvariantError):
+                await self.emit(
+                    "merge_failed",
+                    task_id=task_id,
+                    merge_error=error_type,
+                    status="join_invariant_failed",
+                    reason="parent_worktree_head_mismatch",
+                    message=str(exc)[:512],
+                    generation=handle.generation,
+                )
+            elif isinstance(exc, MergeConflictError):
                 summary = str(exc)[:512]
                 diff_evidence = exc.diff_evidence
                 conflict_payload = {
