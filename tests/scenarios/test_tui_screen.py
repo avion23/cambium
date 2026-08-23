@@ -181,3 +181,92 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
         height=22,
     )
     assert "CAMBIUM · generating" in "\n".join(lines)
+
+
+def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
+    transcript = Transcript()
+    for duration in (141, 512, 900, 2395):
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {
+                    "tool": "run_shell",
+                    "ok": True,
+                    "duration_ms": duration,
+                },
+            }
+        )
+
+    lines = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=4",
+        width=80,
+        height=24,
+    )
+    text = "\n".join(lines)
+
+    assert len(transcript.entries) == 4
+    assert "✓ run_shell ×4 · last 2395ms" in text
+    assert text.count("run_shell") == 1
+
+
+def test_failed_tool_event_breaks_runs_and_keeps_expanded_error() -> None:
+    transcript = Transcript()
+    for event in (
+        {"tool": "run_shell", "ok": True, "duration_ms": 141},
+        {
+            "tool": "run_shell",
+            "ok": False,
+            "duration_ms": 9273,
+            "error": "permission denied",
+        },
+        {"tool": "run_shell", "ok": True, "duration_ms": 2395},
+    ):
+        transcript.observe_event({"kind": "tool_event", "payload": event})
+
+    lines = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=3",
+        width=80,
+        height=24,
+    )
+    text = "\n".join(lines)
+
+    assert "✓ run_shell 141ms" in text
+    assert "✗ run_shell 9273ms" in text
+    assert "TOOL" in text
+    assert "error: permission denied" in text
+    assert "✓ run_shell 2395ms" in text
+    assert "×3" not in text
+
+
+def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
+    transcript = Transcript()
+    for event in (
+        {"tool": "git_op", "ok": True, "duration_ms": 141},
+        {"tool": "run_shell", "ok": True, "duration_ms": 9273},
+        {"tool": "git_op", "ok": True, "duration_ms": 2395},
+    ):
+        transcript.observe_event({"kind": "tool_event", "payload": event})
+
+    lines = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=3",
+        width=80,
+        height=24,
+    )
+    text = "\n".join(lines)
+
+    assert "✓ git_op 141ms" in text
+    assert "✓ run_shell 9273ms" in text
+    assert "✓ git_op 2395ms" in text
+    assert "×" not in text

@@ -250,12 +250,85 @@ def _stream_update(
     return None
 
 
+def _duration_ms(value: Any) -> int | float | None:
+    if type(value) not in (int, float):
+        return None
+    return value
+
+
+def _tool_status(data: Mapping[str, Any]) -> bool | None:
+    status = data.get("ok")
+    if type(status) is bool:
+        return status
+    status_name = data.get("status")
+    if isinstance(status_name, str):
+        normalized = status_name.casefold()
+        if normalized in {"failed", "failure", "error"}:
+            return False
+        if normalized in {"ok", "success", "succeeded"}:
+            return True
+    for key in ("error", "failure_reason"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return False
+    return None
+
+
+def _tool_detail_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    return _text_value(value)
+
+
+def _tool_entry_text(
+    data: Mapping[str, Any],
+    tool: str,
+    ok: bool | None,
+    duration_ms: int | float | None,
+) -> str:
+    state = "ok" if ok is True else "failed" if ok is False else "done"
+    duration = f" · {_format_duration(duration_ms)}" if duration_ms is not None else ""
+    lines = [f"{tool}: {state}{duration}"]
+    for key in ("error", "failure_reason", "reason", "message", "output", "detail"):
+        detail = _tool_detail_value(data.get(key))
+        if detail:
+            lines.append(f"{key}: {detail}")
+    return "\n".join(lines)
+
+
+def _format_duration(duration_ms: int | float | None) -> str:
+    if duration_ms is None:
+        return ""
+    if isinstance(duration_ms, float) and duration_ms.is_integer():
+        return f"{int(duration_ms)}ms"
+    return f"{duration_ms}ms"
+
+
+def _tool_line(
+    entry: TranscriptEntry,
+    *,
+    count: int = 1,
+    last_duration_ms: int | float | None = None,
+) -> str:
+    glyph = "✓" if entry.tool_ok is True else "✗" if entry.tool_ok is False else "•"
+    name = entry.tool_name or "?"
+    if count > 1:
+        line = f"{glyph} {name} ×{count}"
+        duration = _format_duration(last_duration_ms)
+        return f"{line} · last {duration}" if duration else line
+    duration = _format_duration(entry.duration_ms)
+    return f"{glyph} {name} {duration}".rstrip() if duration else f"{glyph} {name}"
+
+
 @dataclass(frozen=True, slots=True)
 class TranscriptEntry:
     """One bounded, terminal-only transcript item."""
 
     role: str
     text: str
+    tool_name: str | None = None
+    tool_ok: bool | None = None
+    duration_ms: int | float | None = None
 
 
 class Transcript:
@@ -395,12 +468,20 @@ class Transcript:
 
         if kind == "tool_event":
             tool = data.get("tool")
-            ok = data.get("ok")
-            duration = data.get("duration_ms")
+            ok = _tool_status(data)
+            duration = _duration_ms(data.get("duration_ms"))
             if isinstance(tool, str):
-                state = "ok" if ok is True else "failed" if ok is False else "done"
-                suffix = f" · {duration}ms" if isinstance(duration, int) else ""
-                self.add("tool", f"{tool}: {state}{suffix}")
+                text = _sanitize(_tool_entry_text(data, tool, ok, duration)).strip("\n")
+                if text:
+                    self._entries.append(
+                        TranscriptEntry(
+                            role="tool",
+                            text=text,
+                            tool_name=tool,
+                            tool_ok=ok,
+                            duration_ms=duration,
+                        )
+                    )
             return
 
         if kind in {"child_admitted", "child_rejected"}:
@@ -476,9 +557,71 @@ def _entry_lines(entry: TranscriptEntry, width: int) -> list[tuple[str, str]]:
     label = _ROLE_LABELS[entry.role]
     body_width = max(8, width - 3)
     rendered = [(entry.role, f" {label}")]
-    rendered.extend((entry.role, "   " + line) for line in _wrap_markdown(entry.text, body_width))
+    if entry.tool_name is not None:
+        rendered.extend(
+            (entry.role, "   " + line)
+            for line in _wrap_markdown(_tool_line(entry), body_width)
+        )
+        summary = f"{entry.tool_name}: "
+        detail = entry.text
+        if detail.startswith(summary):
+            detail = detail.split("\n", 1)[1] if "\n" in detail else ""
+        if detail:
+            rendered.extend(
+                (entry.role, "   " + line)
+                for line in _wrap_markdown(detail, body_width)
+            )
+    else:
+        rendered.extend(
+            (entry.role, "   " + line) for line in _wrap_markdown(entry.text, body_width)
+        )
     rendered.append((entry.role, ""))
     return rendered
+
+
+def _tool_compact_lines(
+    entry: TranscriptEntry,
+    width: int,
+    *,
+    count: int = 1,
+    last_duration_ms: int | float | None = None,
+) -> list[tuple[str, str]]:
+    body_width = max(8, width - 3)
+    line = _tool_line(entry, count=count, last_duration_ms=last_duration_ms)
+    return [(entry.role, " " + _clip(line, body_width))]
+
+
+def _transcript_blocks(
+    entries: tuple[TranscriptEntry, ...], width: int
+) -> list[list[tuple[str, str]]]:
+    blocks: list[list[tuple[str, str]]] = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        if entry.role != "tool" or entry.tool_name is None or entry.tool_ok is not True:
+            blocks.append(_entry_lines(entry, width))
+            index += 1
+            continue
+
+        end = index + 1
+        while (
+            end < len(entries)
+            and entries[end].role == "tool"
+            and entries[end].tool_name == entry.tool_name
+            and entries[end].tool_ok is True
+        ):
+            end += 1
+        last = entries[end - 1]
+        blocks.append(
+            _tool_compact_lines(
+                entry,
+                width,
+                count=end - index,
+                last_duration_ms=last.duration_ms,
+            )
+        )
+        index = end
+    return blocks
 
 
 def _stream_lines(
@@ -505,13 +648,10 @@ def _transcript_lines(transcript: Transcript, width: int, capacity: int) -> list
     remaining = max(0, capacity - len(active))
     rendered: list[tuple[str, str]] = []
     if remaining:
-        for entry in reversed(transcript.entries):
-            block = _entry_lines(entry, width)
-            if len(block) >= remaining:
-                rendered = block[-remaining:] + rendered
-                break
-            rendered = block + rendered
-            remaining -= len(block)
+        history = [
+            line for block in _transcript_blocks(transcript.entries, width) for line in block
+        ]
+        rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
         rendered = [("system", " Waiting for a prompt. Type /help for commands.")]
