@@ -95,6 +95,25 @@ _PROVIDER_AUTH_ALIASES: dict[str, tuple[str, ...]] = {
     "zai-coding-plan": ("zai",),
 }
 
+# z.ai's coding plan exposes shared five-hour and seven-day rolling pools.
+# These are deliberately conservative acceptance-side capacities: the probe
+# verifies that Cambium carries both rolling reset windows through the live
+# call, while the disposable local ledger prevents the check from touching a
+# developer's normal quota state.
+_ZAI_STANDARD_QUOTA_WINDOWS: tuple[dict[str, object], ...] = (
+    {
+        "name": "five-hour",
+        "duration_s": 5 * 60 * 60,
+        "token_allowance": 1_000_000,
+        "reserve_fraction": 0.05,
+    },
+    {
+        "name": "weekly",
+        "duration_s": 7 * 24 * 60 * 60,
+        "token_allowance": 5_000_000,
+    },
+)
+
 _PROBE_PROMPT = {
     "messages": [
         {
@@ -316,7 +335,50 @@ def _provider_context(config_env: str, provider_env: str) -> _ProviderContext:
     )
 
 
-def _api_provider_context(config_env: str, provider_env: str) -> _ProviderContext:
+def _synthesize_zai_provider_config(
+    context: _ProviderContext, destination: Path
+) -> _ProviderContext:
+    """Build a disposable one-provider config for an old local z.ai entry.
+
+    Local provider files predate the quota-window metadata, so adding that
+    metadata in the acceptance harness must not edit the user's trusted
+    config. The copied entry contains only provider settings and environment
+    variable names; credentials remain in the process environment.
+    """
+
+    config_entry = dict(context.config_entry)
+    config_entry["quota_windows"] = [
+        dict(window) for window in _ZAI_STANDARD_QUOTA_WINDOWS
+    ]
+    config_path = destination / "zai-acceptance-providers.json"
+    try:
+        config_path.write_text(
+            json.dumps({"providers": [config_entry]}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        providers = load_providers(config_path)
+    except (OSError, ValueError) as exc:
+        pytest.fail(
+            f"synthesized z.ai acceptance config is invalid: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    provider = next((item for item in providers if item.name == context.provider.name), None)
+    if provider is None:
+        pytest.fail("synthesized z.ai acceptance config lost the selected provider")
+    return _ProviderContext(
+        config_path=config_path,
+        provider=provider,
+        config_entry=config_entry,
+        using_default_config=True,
+    )
+
+
+def _api_provider_context(
+    config_env: str,
+    provider_env: str,
+    *,
+    generated_config_dir: Path | None = None,
+) -> _ProviderContext:
     context = _provider_context(config_env, provider_env)
     if context.provider.auth is not AuthMode.API_KEY:
         pytest.fail("live provider skeletons require an api_key provider entry")
@@ -327,7 +389,9 @@ def _api_provider_context(config_env: str, provider_env: str) -> _ProviderContex
         )
     if context.using_default_config and provider_env == ZAI_PROVIDER_ENV:
         if not context.provider.quota_windows:
-            pytest.skip("default z.ai provider config does not declare quota_windows")
+            if generated_config_dir is None:
+                pytest.fail("z.ai acceptance config synthesis requires a temporary directory")
+            context = _synthesize_zai_provider_config(context, generated_config_dir)
     if (
         context.using_default_config
         and provider_env == OPENROUTER_FREE_PROVIDER_ENV
@@ -764,8 +828,12 @@ def test_codex_restart_and_reuse() -> None:
 
 
 @pytest.mark.acceptance
-def test_zai_rolling_windows(monkeypatch: pytest.MonkeyPatch) -> None:
-    context = _api_provider_context(ZAI_CONFIG_ENV, ZAI_PROVIDER_ENV)
+def test_zai_rolling_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    context = _api_provider_context(
+        ZAI_CONFIG_ENV,
+        ZAI_PROVIDER_ENV,
+        generated_config_dir=tmp_path,
+    )
     if "zai" not in context.provider.name.casefold():
         pytest.fail("z.ai acceptance provider name must contain 'zai'")
     if not context.provider.quota_windows:

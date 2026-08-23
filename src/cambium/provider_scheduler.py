@@ -62,7 +62,10 @@ class CacheHorizonConfig:
             horizon = self.horizon_s
         minimum = self.minimum_breakpoint_tokens
         if self.min_breakpoint_tokens is not None:
-            if minimum != DEFAULT_MINIMUM_BREAKPOINT_TOKENS and minimum != self.min_breakpoint_tokens:
+            if (
+                minimum != DEFAULT_MINIMUM_BREAKPOINT_TOKENS
+                and minimum != self.min_breakpoint_tokens
+            ):
                 raise ValueError("minimum breakpoint aliases disagree")
             minimum = self.min_breakpoint_tokens
         if isinstance(horizon, bool) or not isinstance(horizon, int | float):
