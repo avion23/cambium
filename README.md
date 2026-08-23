@@ -109,13 +109,20 @@ runs in an isolated supervisor leaf and worktree. Completed Markdown responses
 remain in normal terminal scrollback; the alternate-screen dashboard is used
 only while work is active.
 
+Native terminals provide line editing and private persistent history. Press
+Ctrl-C during an active turn to cancel that turn and return to the prompt; the
+last successful checkpoint remains the semantic branch head.
+
 Useful commands inside the TUI:
 
 ```text
-/help  /usage  /agents  /context  /session  /new  /clear  /exit
+/help  /usage  /agents  /context  /session  /model
+/dashboard  /events  /new  /clear  /exit
 ```
 
-Use `<<<` and `>>>` on their own lines for multiline prompts.
+Use `<<<` and `>>>` on their own lines for multiline prompts. See
+[`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
+for the frontend and cancellation contract.
 
 Attach a read-only monitor to an existing supervisor leaf:
 
@@ -227,7 +234,8 @@ A supervisor leaf records its state below `<session-dir>/.cambium/`, including:
 - `checkpoints/` — worker checkpoints and immutable context epochs.
 
 A persistent TUI root additionally contains `turn-NNNN/` supervisor leaves and
-`.cambium/interactive.json`, the atomic single-writer branch manifest.
+`.cambium/interactive.json`, the atomic single-writer branch manifest. Native
+terminal history is stored at `.cambium/tui_history` with mode `0600`.
 
 The supervisor publishes through Git references. It does not refresh the
 caller's working tree or index after advancing `main`.
