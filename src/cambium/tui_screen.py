@@ -42,6 +42,7 @@ _ROLE_COLORS = {
     "tool": _YELLOW,
     "system": _DIM,
     "error": _RED,
+    "dim": _DIM,
 }
 _ROLE_LABELS = {
     "user": "YOU",
@@ -98,6 +99,25 @@ _STREAM_DELTA_KINDS = frozenset(
 )
 _STREAM_TEXT_LIMIT = 16_384
 _STREAM_RENDER_LIMIT = 8_192
+_FAILURE_CONTEXT_PREFIX = "↳ "
+_FAILURE_BLOCK_LIMIT = 64
+_FAILURE_EVENT_KINDS = frozenset(
+    {
+        "child_failed",
+        "compaction_failed",
+        "context_resume_failed",
+        "error",
+        "fatal_error",
+        "merge_failed",
+        "plan_failed",
+        "session_failed",
+        "task_failed",
+        "turn_failed",
+        "turn_failure",
+        "worker_failed",
+    }
+)
+_FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
 
 
 def _is_tty(stream: Any) -> bool:
@@ -229,11 +249,15 @@ def _stream_update(
         return None
     data = _event_data(record)
     if kind == "result":
+        if data.get("status") in _FAILURE_STATUSES:
+            return None
         text = _result_text(data)
         if text is None:
             return None
         return "assistant", text, False, None
     if kind == "tool_event" or kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
+        if kind == "tool_event" and data.get("ok") is False:
+            return None
         role = _message_role(kind, data)
         if role is None:
             return None
@@ -258,6 +282,133 @@ class TranscriptEntry:
     text: str
 
 
+@dataclass(slots=True)
+class _FailureBlock:
+    """Presentation state for one task failure within one turn."""
+
+    task_id: str
+    turn: int | None
+    cause: str | None
+    context: list[str]
+    entry: TranscriptEntry | None = None
+
+
+def _task_id(record: Mapping[str, Any], data: Mapping[str, Any]) -> str | None:
+    for value in (record.get("task_id"), data.get("task_id")):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _event_turn(data: Mapping[str, Any]) -> int | None:
+    value = data.get("turn")
+    return value if type(value) is int and value >= 0 else None
+
+
+def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
+    """Return a short, safe line for a failure's preceding-event context."""
+    if kind == "tool_event" and data.get("ok") is False:
+        tool = data.get("tool")
+        if not isinstance(tool, str) or not tool:
+            return "tool failed"
+        detail = data.get("failure_reason") or data.get("reason") or data.get("error")
+        line = f"{tool}: failed"
+        if isinstance(detail, str) and detail:
+            line += f" · {detail}"
+        return _sanitize(line)
+
+    if kind == "timeout":
+        phase = data.get("phase")
+        return _sanitize(
+            f"timeout: {phase}" if isinstance(phase, str) and phase else "timeout"
+        )
+
+    if kind == "restart_scheduled":
+        count = data.get("restart_count")
+        maximum = data.get("max_restarts")
+        if type(count) is int and type(maximum) is int:
+            return f"restart scheduled: {count}/{maximum}"
+        return "restart scheduled"
+
+    if kind == "usage_event":
+        reason = data.get("failure_reason")
+        if isinstance(reason, str) and reason:
+            return _sanitize(f"provider call failed: {reason}")
+
+    if kind == "protocol":
+        detail = data.get("note") or data.get("error_type")
+        if isinstance(detail, str) and detail:
+            return _sanitize(f"protocol: {detail}")
+
+    if kind == "log" and data.get("stream") == "worker-error":
+        detail = data.get("message") or data.get("error_type")
+        if isinstance(detail, str) and detail:
+            return _sanitize(f"worker error: {detail}")
+    return None
+
+
+def _failure_cause(kind: str, data: Mapping[str, Any]) -> str | None:
+    """Extract the most actionable failure cause from one terminal event."""
+    cause: str | None = None
+    for key in ("failure_reason", "reason", "message", "error"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            cause = _sanitize(value).strip()
+            break
+    maximum = data.get("max_restarts")
+    if (
+        kind == "worker_failed"
+        and type(maximum) is int
+        and maximum >= 0
+        and cause
+        and not cause.startswith("max_restarts (")
+    ):
+        cause = f"max_restarts ({maximum}): {cause}"
+    if cause:
+        return cause
+    if kind == "result":
+        status = data.get("status")
+        if isinstance(status, str) and status:
+            return _sanitize(f"worker reported {status}")
+    return _sanitize(kind.replace("_", " ")) if kind else None
+
+
+def _failure_summary(text: str) -> tuple[str | None, str | None] | None:
+    """Parse a rendered result summary without exposing its detail twice."""
+    clean = _sanitize(text)
+    if not clean:
+        return None
+    failed = bool(
+        re.search(r"\bstatus=(?:error|failed|timeout)\b", clean)
+        or re.search(r"\bplan_status=\{[^}]*\b(?:error|failed|timeout)\b", clean)
+        or "plan_failures={" in clean
+    )
+    if not failed:
+        return None
+
+    task_id: str | None = None
+    cause: str | None = None
+    plan_failures = re.search(r"\bplan_failures=\{([^}]*)\}", clean)
+    if plan_failures is not None:
+        pair = re.search(r"([^,\s:{}]+)\s*:\s*(['\"])(.*?)\2", plan_failures.group(1))
+        if pair is not None:
+            task_id = pair.group(1)
+            cause = pair.group(3)
+
+    if task_id is None:
+        task_match = re.search(r"\btask(?:_id)?=([^\s]+)", clean)
+        if task_match is not None:
+            task_id = task_match.group(1).strip("'\"")
+    if cause is None:
+        reason = re.search(r"\b(?:failure_reason|reason)=((['\"])(.*?)\2|[^\s]+)", clean)
+        if reason is not None:
+            cause = reason.group(3) if reason.group(3) is not None else reason.group(1)
+            cause = cause.strip("'\"")
+    if cause:
+        cause = _sanitize(cause).strip()
+    return task_id, cause or None
+
+
 class Transcript:
     """Bounded semantic transcript for the current interactive frontend."""
 
@@ -269,6 +420,11 @@ class Transcript:
         self._stream_text = ""
         self._stream_message_id: str | None = None
         self._stream_truncated = False
+        self._turn_serial = 0
+        self._turn_by_task: dict[str, int] = {}
+        self._failure_context: dict[tuple[str, int | None, int], list[str]] = {}
+        self._failure_blocks: dict[tuple[str, int | None, int], _FailureBlock] = {}
+        self._failure_order: deque[tuple[str, int | None, int]] = deque()
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
@@ -277,6 +433,11 @@ class Transcript:
     def clear(self) -> None:
         self._entries.clear()
         self._clear_stream()
+        self._turn_serial = 0
+        self._turn_by_task.clear()
+        self._failure_context.clear()
+        self._failure_blocks.clear()
+        self._failure_order.clear()
 
     def add(self, role: str, text: str) -> None:
         if role not in _ROLE_LABELS:
@@ -286,6 +447,8 @@ class Transcript:
             self._entries.append(TranscriptEntry(role=role, text=clean))
 
     def user(self, text: str) -> None:
+        self._turn_serial += 1
+        self._turn_by_task.clear()
         self.add("user", text)
 
     def assistant(self, text: str) -> None:
@@ -363,6 +526,13 @@ class Transcript:
         truncated = self._stream_truncated
         self._clear_stream()
         final = _sanitize(final_text).strip("\n") if isinstance(final_text, str) else ""
+        summary_failure = _failure_summary(final) if final else None
+        if summary_failure is not None:
+            task_id, cause = summary_failure
+            self._record_failure(task_id, None, cause)
+            # The detailed task/cause/context is already in the red failure
+            # block. Keep the model footer useful without repeating it.
+            final = "plan=failed"
         if not final:
             if current and role is not None:
                 self.add(role, current)
@@ -376,12 +546,132 @@ class Transcript:
             self.add(role, current)
         self.assistant(final)
 
+    def _failure_key(
+        self, task_id: str | None, turn: int | None
+    ) -> tuple[str, int | None, int]:
+        return task_id or "?", turn, self._turn_serial
+
+    def _remember_turn(self, task_id: str | None, turn: int | None) -> None:
+        if task_id is not None and turn is not None:
+            self._turn_by_task[task_id] = turn
+
+    def _context_key(
+        self, task_id: str | None, turn: int | None
+    ) -> tuple[str, int | None, int]:
+        if turn is None and task_id is not None:
+            turn = self._turn_by_task.get(task_id)
+        return self._failure_key(task_id, turn)
+
+    def _failure_block_for(
+        self, task_id: str | None, turn: int | None
+    ) -> tuple[tuple[str, int | None, int], _FailureBlock] | None:
+        key = self._context_key(task_id, turn)
+        block = self._failure_blocks.get(key)
+        if block is not None:
+            return key, block
+        wanted = task_id or "?"
+        for candidate_key in reversed(self._failure_order):
+            candidate = self._failure_blocks.get(candidate_key)
+            if (
+                candidate is not None
+                and candidate_key[2] == self._turn_serial
+                and candidate.task_id == wanted
+            ):
+                return candidate_key, candidate
+        return None
+
+    @staticmethod
+    def _selected_failure_context(context: list[str]) -> list[str]:
+        relevant = [
+            line
+            for line in context
+            if "failed" in line.lower() or "timeout" in line.lower()
+        ]
+        selected = relevant if relevant else context
+        return selected[-3:]
+
+    def _failure_text(self, block: _FailureBlock) -> str:
+        lines = [
+            "turn failed",
+            f"task_id={block.task_id}",
+            f"cause={block.cause or 'unknown failure'}",
+        ]
+        lines.extend(
+            f"{_FAILURE_CONTEXT_PREFIX}{line}"
+            for line in self._selected_failure_context(block.context)
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _prefer_failure_cause(current: str | None, candidate: str | None) -> bool:
+        if not candidate or not current or candidate == current:
+            return bool(candidate) and not current
+        if current.startswith("worker reported "):
+            return True
+        return candidate.startswith("max_restarts (") and not current.startswith("max_restarts (")
+
+    def _refresh_failure_entry(self, block: _FailureBlock) -> None:
+        entry = TranscriptEntry(role="error", text=self._failure_text(block))
+        if block.entry is not None:
+            for index, current in enumerate(self._entries):
+                if current is block.entry:
+                    self._entries[index] = entry
+                    block.entry = entry
+                    return
+        self._entries.append(entry)
+        block.entry = entry
+
+    def _record_failure(
+        self,
+        task_id: str | None,
+        turn: int | None,
+        cause: str | None,
+    ) -> None:
+        found = self._failure_block_for(task_id, turn)
+        if found is None:
+            key = self._context_key(task_id, turn)
+            block = _FailureBlock(
+                task_id=key[0],
+                turn=key[1],
+                cause=cause,
+                context=list(self._failure_context.get(key, ())),
+            )
+            self._failure_blocks[key] = block
+            self._failure_order.append(key)
+            while len(self._failure_order) > _FAILURE_BLOCK_LIMIT:
+                expired = self._failure_order.popleft()
+                self._failure_blocks.pop(expired, None)
+                self._failure_context.pop(expired, None)
+        else:
+            key, block = found
+            if self._prefer_failure_cause(block.cause, cause):
+                block.cause = cause
+            block.context = list(self._failure_context.get(key, block.context))
+        self._refresh_failure_entry(block)
+
+    def _remember_failure_context(
+        self, task_id: str | None, turn: int | None, line: str
+    ) -> None:
+        key = self._context_key(task_id, turn)
+        context = self._failure_context.setdefault(key, [])
+        if line not in context:
+            context.append(line)
+        if len(context) > 12:
+            del context[:-12]
+        found = self._failure_blocks.get(key)
+        if found is not None:
+            found.context = list(context)
+            self._refresh_failure_entry(found)
+
     def observe_event(self, record: dict[str, Any]) -> None:
         """Promote only operator-relevant runtime events into the transcript."""
         kind = record.get("kind")
         if not isinstance(kind, str):
             return
         data = _event_data(record)
+        task_id = _task_id(record, data)
+        turn = _event_turn(data)
+        self._remember_turn(task_id, turn)
 
         update = _stream_update(record)
         if update is not None:
@@ -397,6 +687,11 @@ class Transcript:
             tool = data.get("tool")
             ok = data.get("ok")
             duration = data.get("duration_ms")
+            if ok is False:
+                context_line = _failure_context_line(kind, data)
+                if context_line is not None:
+                    self._remember_failure_context(task_id, turn, context_line)
+                return
             if isinstance(tool, str):
                 state = "ok" if ok is True else "failed" if ok is False else "done"
                 suffix = f" · {duration}ms" if isinstance(duration, int) else ""
@@ -421,9 +716,13 @@ class Transcript:
             self.system(message)
             return
 
-        if kind in {"merge_failed", "compaction_failed", "worker_failed", "fatal_error"}:
-            reason = data.get("message") or data.get("reason") or data.get("failure_reason")
-            self.error(f"{kind.replace('_', ' ')}: {reason or 'unknown failure'}")
+        context_line = _failure_context_line(kind, data)
+        if context_line is not None:
+            self._remember_failure_context(task_id, turn, context_line)
+
+        failed_result = kind == "result" and data.get("status") in _FAILURE_STATUSES
+        if kind in _FAILURE_EVENT_KINDS or failed_result:
+            self._record_failure(task_id, turn, _failure_cause(kind, data))
             return
 
         if kind in {"merge_committed", "merge_published"}:
@@ -476,7 +775,13 @@ def _entry_lines(entry: TranscriptEntry, width: int) -> list[tuple[str, str]]:
     label = _ROLE_LABELS[entry.role]
     body_width = max(8, width - 3)
     rendered = [(entry.role, f" {label}")]
-    rendered.extend((entry.role, "   " + line) for line in _wrap_markdown(entry.text, body_width))
+    for line in _wrap_markdown(entry.text, body_width):
+        role = (
+            "dim"
+            if entry.role == "error" and line.lstrip().startswith(_FAILURE_CONTEXT_PREFIX)
+            else entry.role
+        )
+        rendered.append((role, "   " + line))
     rendered.append((entry.role, ""))
     return rendered
 

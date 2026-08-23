@@ -181,3 +181,70 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
         height=22,
     )
     assert "CAMBIUM · generating" in "\n".join(lines)
+
+
+def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
+    transcript = Transcript()
+    events = (
+        {
+            "kind": "tool_event",
+            "task_id": "task-timeout",
+            "generation": 1,
+            "payload": {"tool": "run_shell", "ok": False, "turn": 1},
+        },
+        {
+            "kind": "timeout",
+            "task_id": "task-timeout",
+            "generation": 1,
+            "payload": {"phase": "wall"},
+        },
+        {
+            "kind": "worker_failed",
+            "task_id": "task-timeout",
+            "generation": 1,
+            "payload": {"reason": "wall", "max_restarts": 0},
+        },
+    )
+
+    for event in events:
+        transcript.observe_event(event)
+
+    transcript.finish_stream(
+        "plan=tasks:1 plan_status={failed} "
+        "plan_failures={task-timeout:'max_restarts (0): wall'}"
+    )
+
+    failures = [entry for entry in transcript.entries if entry.role == "error"]
+    assert len(failures) == 1
+    assert "task_id=task-timeout" in failures[0].text
+    assert "cause=max_restarts (0): wall" in failures[0].text
+    assert "↳ run_shell: failed" in failures[0].text
+    assert "↳ timeout: wall" in failures[0].text
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == [
+        "plan=failed"
+    ]
+
+
+def test_repeated_failure_events_do_not_duplicate_the_block_or_cause() -> None:
+    transcript = Transcript()
+    event = {
+        "kind": "worker_failed",
+        "task_id": "task-repeat",
+        "generation": 1,
+        "payload": {"reason": "wall", "max_restarts": 0},
+    }
+    for _ in range(3):
+        transcript.observe_event(dict(event))
+        transcript.observe_event(
+            {
+                "kind": "result",
+                "task_id": "task-repeat",
+                "generation": 1,
+                "payload": {"status": "failed"},
+            }
+        )
+
+    failures = [entry for entry in transcript.entries if entry.role == "error"]
+    assert len(failures) == 1
+    assert failures[0].text.count("task-repeat") == 1
+    assert failures[0].text.count("max_restarts (0): wall") == 1
