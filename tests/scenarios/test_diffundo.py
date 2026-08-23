@@ -206,6 +206,28 @@ STATIC_HEAD = {
 }
 
 
+def test_summary_call_uses_extended_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    router = Diffundo((), call_budget_s=1.0, summary_call_budget_s=3.0)
+    deadlines: list[float] = []
+
+    async def capture_deadline(
+        tier: ProviderTier,
+        model: str | None,
+        deadline: float,
+        **kwargs: Any,
+    ) -> list[Any]:
+        deadlines.append(deadline)
+        return []
+
+    monkeypatch.setattr(router, "_await_candidates", capture_deadline)
+    started = time.monotonic()
+    with pytest.raises(AllProvidersFailed):
+        asyncio.run(router.summary_call(ProviderTier.FAST, PROMPT, model="m"))
+
+    assert len(deadlines) == 1
+    assert 2.0 < deadlines[0] - started <= 3.1
+
+
 def _config(
     name: str,
     server: FakeServer,

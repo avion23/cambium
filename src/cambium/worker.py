@@ -564,6 +564,7 @@ _DIFFUNDO_OPTIONS = frozenset(
         "breaker_failure_threshold",
         "open_backoff_base",
         "retry_base_delay_s",
+        "summary_call_budget_s",
     }
 )
 
@@ -3988,12 +3989,21 @@ async def _run_agent_loop(
             )
             sent_summary_prompt = copy.deepcopy(summary_prompt)
             try:
-                summary_result = await router.call(
-                    tier,
-                    summary_prompt,
-                    model=model,
-                    budget_usd=budget_usd,
-                )
+                summary_caller = getattr(router, "summary_call", None)
+                if callable(summary_caller):
+                    summary_result = await summary_caller(
+                        tier,
+                        summary_prompt,
+                        model=model,
+                        budget_usd=budget_usd,
+                    )
+                else:
+                    summary_result = await router.call(
+                        tier,
+                        summary_prompt,
+                        model=model,
+                        budget_usd=budget_usd,
+                    )
             except Exception as exc:
                 if writer is not None:
                     await _emit_usage_event(
