@@ -52,6 +52,34 @@ def is_cache_artifact_path(path: str) -> bool:
     )
 
 
+def process_is_alive(pid: int) -> bool:
+    """Return whether ``pid`` names a live, non-zombie process.
+
+    Session ownership is persisted across supervisor starts. ``kill(pid, 0)``
+    is the portable POSIX probe, while ``/proc/<pid>/stat`` lets Linux callers
+    distinguish a zombie (which still accepts signal 0) from a live owner.
+    Permission errors mean that a process exists but is not ours to signal.
+    """
+    if type(pid) is not int or pid <= 0:
+        return False
+    if os.name == "posix":
+        proc_stat = Path("/proc") / str(pid) / "stat"
+        try:
+            stat = proc_stat.read_text(encoding="ascii")
+            state = stat.rsplit(")", 1)[1].split(maxsplit=1)[0]
+        except (FileNotFoundError, PermissionError, OSError, UnicodeError, IndexError):
+            state = ""
+        if state:
+            return state != "Z"
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, ValueError):
+        return False
+    return True
+
+
 class GenerationConflictError(RuntimeError):
     pass
 

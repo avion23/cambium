@@ -437,7 +437,12 @@ class ObservabilityState:
                 _set_state(agent, "active")
             elif kind in {"merge_progress", "merge_started"}:
                 _set_state(agent, "merging")
-            elif kind in {"worker_failed", "task_failed", "context_resume_failed"}:
+            elif kind in {
+                "worker_failed",
+                "worker_terminated",
+                "task_failed",
+                "context_resume_failed",
+            }:
                 _set_state(agent, "failed")
             elif kind == "result":
                 status = _string(payload.get("status"))

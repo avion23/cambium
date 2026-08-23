@@ -86,6 +86,7 @@ from typing import Any, cast
 from cambium.fencing import (
     is_cache_artifact_path,
     next_generation,
+    process_is_alive,
     read_generation,
     write_generation,
 )
@@ -1703,11 +1704,37 @@ class ArchitectusAdmissionPort:
 
 
 class _SessionAdmission:
-    """Process-wide and cross-process ownership of one session directory."""
+    """Process-wide and cross-process ownership of one session directory.
+
+    The lock file also carries the owning supervisor PID. ``flock`` releases
+    automatically after SIGKILL, but the PID remains durable long enough for
+    the next supervisor to identify and reclaim the interrupted session.
+    """
 
     def __init__(self, session_dir: Path) -> None:
         self._path = session_dir.resolve() / ".cambium" / "session.lock"
         self._fd: int | None = None
+        self.previous_owner_pid: int | None = None
+
+    @staticmethod
+    def _read_owner_pid(fd: int) -> int | None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 64).decode("ascii").strip()
+            pid = int(raw, 10)
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return pid if pid > 0 else None
+
+    @staticmethod
+    def _write_owner_pid(fd: int, pid: int | None) -> None:
+        value = "" if pid is None else f"{pid}\n"
+        encoded = value.encode("ascii")
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        if encoded:
+            os.write(fd, encoded)
+        os.fsync(fd)
 
     def acquire(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1715,13 +1742,18 @@ class _SessionAdmission:
         try:
             os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.previous_owner_pid = self._read_owner_pid(fd)
+            self._write_owner_pid(fd, os.getpid())
         except BlockingIOError as exc:
             os.close(fd)
             raise SessionAlreadyRunningError(
                 f"session is already running: {self._path.parent.parent}"
             ) from exc
         except BaseException:
-            os.close(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
             raise
         self._fd = fd
 
@@ -1731,6 +1763,10 @@ class _SessionAdmission:
         fd = self._fd
         self._fd = None
         try:
+            try:
+                self._write_owner_pid(fd, None)
+            except OSError:
+                pass
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -1813,6 +1849,7 @@ class _Runtime:
         context_reuse: bool = True,
         resolver_child_enabled: bool = False,
         resolver_max_attempts: int = 1,
+        orphan_owner_pid: int | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1861,6 +1898,7 @@ class _Runtime:
         self._admission_port = self._make_admission_port(architectus)
         self._admission_port_lock = asyncio.Lock()
         self._conversations = conversations
+        self._orphan_owner_pid = orphan_owner_pid
         # Cache-first context reuse (step 2): session-level flag; per-parent
         # epoch checkpoints keyed by task id, the admitted child ids per
         # parent in admission order, and the strict child-result envelope per
@@ -2026,6 +2064,116 @@ class _Runtime:
     async def _notify_deferred_observers(self, deferred: list[tuple[dict[str, Any], bool]]) -> None:
         for record, observer_failure_is_fatal in deferred:
             await self._notify_observer(record, observer_failure_is_fatal)
+
+    async def reclaim_orphaned_worktrees(self, specs: list[dict[str, Any]]) -> None:
+        """Reclaim worktrees left by a supervisor that died without cleanup.
+
+        ``flock`` makes a session lock immediately available after SIGKILL, but
+        the PID written to that lock survives. A new owner can therefore make a
+        causal startup decision instead of guessing from a directory's mtime:
+        only a dead previous owner triggers this destructive pass, while the
+        event stream supplies the audit sequence for each terminated task. The
+        normal terminal cleanup contract (including
+        deferred dirty evidence trees) is untouched for completed sessions.
+        """
+        owner_pid = self._orphan_owner_pid
+        self._orphan_owner_pid = None
+        if owner_pid is None or process_is_alive(owner_pid):
+            return
+
+        events = await asyncio.to_thread(self._store.events_after, 0)
+        terminal_session_seqs = [
+            event["seq"]
+            for event in events
+            if event.get("kind") == "session_ended" and type(event.get("seq")) is int
+        ]
+        last_session_end = max(terminal_session_seqs, default=0)
+        post_crash = [
+            event
+            for event in events
+            if type(event.get("seq")) is int and event["seq"] > last_session_end
+        ]
+        task_events: dict[str, list[dict[str, Any]]] = {}
+        active_kinds = frozenset(
+            {
+                "task_assigned",
+                "spawned",
+                "init",
+                "ready",
+                "run_task",
+                "heartbeat",
+                "timeout",
+                "result",
+                "exit",
+                "worker_failed",
+                "task_failed",
+                "merge_started",
+                "merge_committed",
+            }
+        )
+        for event in post_crash:
+            task_id = event.get("task_id")
+            if isinstance(task_id, str) and event.get("kind") in active_kinds:
+                task_events.setdefault(task_id, []).append(event)
+
+        # A crash can happen between worktree creation and task_assigned. In
+        # that case the stale owner is the only durable ownership evidence, so
+        # inspect every path in the accepted plan. Once a task event exists,
+        # retain its event sequence numbers in the termination marker for
+        # audit/replay consumers.
+        for spec in specs:
+            task_id = spec["task_id"]
+            history = task_events.get(task_id, [])
+            worktree = Path(spec["worktree_path"]).resolve()
+            if not history and not worktree.exists():
+                continue
+            ready_events = [
+                event
+                for event in history
+                if event.get("kind") in {"ready", "reuse_ready"}
+                and isinstance(event.get("payload", {}).get("pid"), int)
+            ]
+            worker_pid = ready_events[-1]["payload"]["pid"] if ready_events else None
+            generations = [
+                event["generation"]
+                for event in history
+                if type(event.get("generation")) is int
+            ]
+            terminated_event_seqs = [
+                event["seq"] for event in history if type(event.get("seq")) is int
+            ]
+            await self.emit(
+                "worker_terminated",
+                task_id=task_id,
+                generation=max(generations, default=None),
+                pid=worker_pid,
+                supervisor_pid=owner_pid,
+                status="terminated",
+                reason="orphaned_supervisor",
+                terminated_event_seqs=terminated_event_seqs[-MAX_ENVELOPE_ITEMS:],
+                terminated_event_count=len(terminated_event_seqs),
+            )
+            await self._prune_worktree(spec, force=True)
+
+            # ``_prune_worktree`` intentionally ignores an unregistered path;
+            # remove a session-owned directory left between ``git worktree
+            # add`` and registration only after confirming it is still not a
+            # registered worktree. This closes the crash window before the
+            # first durable worker event without touching another worktree.
+            if worktree.exists():
+                repo = Path(spec["repo"]).resolve()
+                listing = await self._git(
+                    repo, "worktree", "list", "--porcelain", check=False
+                )
+                if listing.returncode == 0:
+                    registered = any(
+                        line.startswith("worktree ")
+                        and Path(line.removeprefix("worktree ").strip()).resolve() == worktree
+                        for line in listing.stdout.splitlines()
+                    )
+                    if not registered:
+                        shutil.rmtree(worktree, ignore_errors=True)
+                        await self._git(repo, "branch", "-D", spec["branch"], check=False)
 
     async def start(self) -> None:
         return
@@ -7135,6 +7283,7 @@ async def run_plan(
             context_reuse=context_reuse,
             resolver_child_enabled=resolver_child_enabled,
             resolver_max_attempts=resolver_max_attempts,
+            orphan_owner_pid=admission.previous_owner_pid,
         )
         await runtime.start()
         if routing_state_load_error is not None:
@@ -7146,6 +7295,9 @@ async def run_plan(
         runtime.set_session_tasks(specs)
         cancelled = False
         try:
+            reclaim_orphaned = getattr(runtime, "reclaim_orphaned_worktrees", None)
+            if reclaim_orphaned is not None:
+                await reclaim_orphaned(specs)
             await runtime.reconcile(specs)
             if tree is not None:
                 await _dispatch_static_waves(runtime, tree, width_limit)

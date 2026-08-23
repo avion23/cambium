@@ -520,6 +520,9 @@ _EVENT_FORMATTERS: dict[str, _EventFormatter] = {
     "reuse_ready": lambda payload: _join(_pair(payload, "pid")),
     "exit": lambda payload: _join(_pair(payload, "reason")),
     "worker_failed": lambda payload: _join(_pair(payload, "reason")),
+    "worker_terminated": lambda payload: _join(
+        _pair(payload, "reason"), _pair(payload, "status")
+    ),
     "task_failed": lambda payload: _join(_pair(payload, "reason")),
     "result": _format_result,
     "session_ended": lambda payload: _join(_pair(payload, "session_status", "status")),
@@ -647,7 +650,7 @@ def render_elapsed(events: Any) -> str:
 
 
 _WORKER_ACTIVE_INC = frozenset({"spawned"})
-_WORKER_ACTIVE_DEC = frozenset({"exit", "reuse_ready", "worker_failed"})
+_WORKER_ACTIVE_DEC = frozenset({"exit", "reuse_ready", "worker_failed", "worker_terminated"})
 
 
 def render_subagent_status(events: Any) -> str:
