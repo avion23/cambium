@@ -1,13 +1,13 @@
 """Opt-in live-provider acceptance checks.
 
-The tests in this module deliberately have no credential fixtures.  A test
-skips until its named provider configuration and credential are available. API
-keys may be supplied through the provider's configured environment variable or
-read-only from the local OpenCode and pi auth stores. Codex still requires an
-explicit OAuth-store path because its mutation cases must never touch a
-developer's normal session. The OAuth mutation cases additionally require a
-disposable-account confirmation. No token value is constructed, printed, or
-placed in a test constant.
+The tests in this module deliberately keep live credentials at the acceptance
+boundary. A test skips until its named provider configuration and credential
+are available. API keys may be supplied through the provider's configured
+environment variable or read-only from the local OpenCode and pi auth stores.
+When ``CAMBIUM_ACCEPTANCE_ALLOW_MUTATION=1`` is set, the acceptance conftest
+copies the pi Codex OAuth record into a private temporary store for each
+Codex check. It never points a test at the developer's normal store. No token
+value is constructed, printed, or placed in a test constant.
 
 Run the suite with ``python -m pytest -m acceptance tests/acceptance -s``.
 The ``-s`` is useful only for an operator-supplied interactive fresh-login
@@ -61,7 +61,10 @@ CODEX_CONCURRENT_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_CONCURRENT_STORE"
 CODEX_RESTART_STORE_ENV = "CAMBIUM_ACCEPTANCE_CODEX_RESTART_STORE"
 CODEX_LOGIN_COMMAND_ENV = "CAMBIUM_ACCEPTANCE_CODEX_LOGIN_COMMAND"
 CODEX_CLIENT_ID_ENV = "CAMBIUM_ACCEPTANCE_CODEX_CLIENT_ID"
+ALLOW_MUTATION_ENV = "CAMBIUM_ACCEPTANCE_ALLOW_MUTATION"
 ALLOW_OAUTH_MUTATIONS_ENV = "CAMBIUM_ACCEPTANCE_ALLOW_OAUTH_MUTATIONS"
+CODEX_FIXTURE_ROOT_ENV = "CAMBIUM_ACCEPTANCE_CODEX_FIXTURE_ROOT"
+CODEX_PI_AUTH_ENV = "CAMBIUM_ACCEPTANCE_CODEX_PI_AUTH"
 QUOTA_DB_ENV = "CAMBIUM_ACCEPTANCE_QUOTA_DB"
 PROBE_TIMEOUT_ENV = "CAMBIUM_ACCEPTANCE_TIMEOUT_S"
 
@@ -76,6 +79,15 @@ CACHE_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_CACHE_CONFIG"
 CACHE_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_CACHE_PROVIDER"
 OPENCODE_AUTH_ENV = "CAMBIUM_ACCEPTANCE_OPENCODE_AUTH"
 PI_AUTH_ENV = "CAMBIUM_ACCEPTANCE_PI_AUTH"
+
+_MUTATING_CODEX_STORE_ENVS = frozenset(
+    {
+        CODEX_EXPIRED_STORE_ENV,
+        CODEX_ROTATED_STORE_ENV,
+        CODEX_REVOKED_STORE_ENV,
+        CODEX_CONCURRENT_STORE_ENV,
+    }
+)
 
 _AUTH_SOURCE_NAMES = ("OpenCode", "pi")
 _AUTH_SOURCE_ENV = (OPENCODE_AUTH_ENV, PI_AUTH_ENV)
@@ -420,6 +432,8 @@ def _codex_provider_context() -> _ProviderContext:
 def _codex_context(store_env: str = CODEX_STORE_ENV) -> _CodexContext:
     provider_context = _codex_provider_context()
     store_path = _required_file(store_env)
+    if store_env in _MUTATING_CODEX_STORE_ENVS:
+        _assert_disposable_store(store_path, store_env)
     store = OAuthStore(store_path)
     try:
         record = store.read_provider(provider_context.provider.name)
@@ -548,10 +562,42 @@ def _assert_provider_result(result: Any, provider: ProviderConfig) -> None:
 
 
 def _allow_oauth_mutation() -> None:
-    if os.environ.get(ALLOW_OAUTH_MUTATIONS_ENV) != "1":
+    if os.environ.get(ALLOW_MUTATION_ENV) != "1" and os.environ.get(
+        ALLOW_OAUTH_MUTATIONS_ENV
+    ) != "1":
         pytest.skip(
-            f"set {ALLOW_OAUTH_MUTATIONS_ENV}=1 only with disposable OAuth stores/accounts"
+            f"set {ALLOW_MUTATION_ENV}=1 only with disposable copied OAuth stores/accounts"
         )
+
+
+def _fixture_root() -> Path:
+    configured = os.environ.get(CODEX_FIXTURE_ROOT_ENV, "").strip()
+    if not configured:
+        pytest.fail(
+            "Codex OAuth mutation checks require the disposable fixture; "
+            f"set {ALLOW_MUTATION_ENV}=1"
+        )
+    return Path(configured).expanduser().resolve()
+
+
+def _assert_disposable_store(path: Path, store_env: str) -> None:
+    """Refuse any mutation store that was not created by the fixture helper."""
+
+    resolved = path.expanduser().resolve()
+    root = _fixture_root()
+    if not resolved.is_relative_to(root):
+        pytest.fail(f"{store_env} is not inside the disposable Codex OAuth fixture")
+    if resolved == oauth_store_path().resolve():
+        pytest.fail(f"{store_env} resolves to the production OAuth store")
+    source_candidates = [
+        os.environ.get(CODEX_PI_AUTH_ENV, "").strip(),
+        os.environ.get(PI_AUTH_ENV, "").strip(),
+    ]
+    source = next((Path(value).expanduser() for value in source_candidates if value), None)
+    if source is None:
+        source = Path.home() / ".pi" / "agent" / "auth.json"
+    if resolved == source.resolve():
+        pytest.fail(f"{store_env} points at the read-only pi OAuth source")
 
 
 def _fresh_store_target() -> Path:
@@ -560,6 +606,9 @@ def _fresh_store_target() -> Path:
         pytest.fail("fresh-login target must not already exist")
     if target.resolve() == oauth_store_path().resolve():
         pytest.fail("fresh-login refuses to use the production OAuth store")
+    fixture_root = os.environ.get(CODEX_FIXTURE_ROOT_ENV, "").strip()
+    if fixture_root and not target.resolve().is_relative_to(Path(fixture_root).resolve()):
+        pytest.fail("fresh-login target must be inside the disposable fixture")
     return target
 
 
@@ -666,9 +715,18 @@ def _cached_tokens(usage: Mapping[str, object] | None) -> int | None:
 @pytest.mark.acceptance
 def test_codex_fresh_login() -> None:
     """Run an operator-supplied device login and validate its stored session."""
+    login_command = os.environ.get(CODEX_LOGIN_COMMAND_ENV, "").strip()
+    if not login_command:
+        pytest.skip(
+            f"set {CODEX_LOGIN_COMMAND_ENV} to run the interactive Codex device-consent "
+            "flow; fresh login is never seeded from a copied credential"
+        )
     _allow_oauth_mutation()
     provider_context = _codex_provider_context()
-    command = shlex.split(_required_env(CODEX_LOGIN_COMMAND_ENV))
+    try:
+        command = shlex.split(login_command)
+    except ValueError as exc:
+        pytest.fail(f"{CODEX_LOGIN_COMMAND_ENV} is not a valid command: {exc}")
     if not command:
         pytest.fail(f"{CODEX_LOGIN_COMMAND_ENV} must contain an executable command")
     target = _fresh_store_target()
