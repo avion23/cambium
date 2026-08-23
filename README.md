@@ -18,7 +18,7 @@ The current runtime is intentionally small:
 
 ## Status
 
-Cambium runs directly from source and currently requires Python 3.14.
+Cambium runs directly from source and currently requires Python 3.12+.
 `pyproject.toml` declares package metadata, dependencies, test extras, and the
 `cambium` / `cambium-monitor` entry points, but a checked-out repository does
 not need an editable install.

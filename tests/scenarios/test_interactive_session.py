@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import io
 from pathlib import Path
-from types import SimpleNamespace
 
 from cambium import tui
 from cambium.interactive import InteractiveSession
 from cambium.oneshot import OneShotConfig
+from cambium.supervisor import PlanResult, TaskResult
 
 
 class _Tty(io.StringIO):
@@ -125,7 +125,13 @@ def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path)
                     },
                 }
             )
-        return SimpleNamespace(exit_code=0, results=())
+        return PlanResult(
+            results=(
+                TaskResult(
+                    task_id=f"task-{turn.number}", status="succeeded", exit_code=0
+                ),
+            )
+        )
 
     monkeypatch.setattr(InteractiveSession, "run_turn", fake_run)
     source = _Tty("one\ntwo\n/usage\n/exit\n")
