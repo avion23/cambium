@@ -3946,7 +3946,7 @@ class _Runtime:
                                 spec,
                                 handle,
                                 conflict,
-                                outcome.envelope,
+                                sanitized_envelope,
                                 sanitized_envelope,
                             )
                     if merged is not None:
@@ -5566,9 +5566,12 @@ class _Runtime:
                 worktree, "diff", "--no-ext-diff", "--no-color", "--binary", "--", check=False
             )
             if conflicted:
+                bounded_conflicted = [
+                    _cap_utf8(path, MAX_ENVELOPE_FIELD_CHARS) for path in conflicted
+                ]
                 spec["conflicted_files"] = list(
                     dict.fromkeys(
-                        [*spec.get("conflicted_files", ()), *conflicted]
+                        [*spec.get("conflicted_files", ()), *bounded_conflicted]
                     )
                 )[:MAX_ENVELOPE_ITEMS]
             if diff.returncode == 0 and diff.stdout:
