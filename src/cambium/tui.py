@@ -160,9 +160,7 @@ def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
         payload += line
 
 
-def _input_line(
-    source: TextIO, out: TextIO, prompt: str, *, native: bool
-) -> str | None:
+def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> str | None:
     with _bracketed_paste_mode(source, out):
         if native:
             try:
@@ -178,9 +176,7 @@ def _input_line(
     return _unframe_bracketed_paste(line, source)
 
 
-def _read_multiline(
-    value: str, read_next: Callable[[], str | None]
-) -> str | None:
+def _read_multiline(value: str, read_next: Callable[[], str | None]) -> str | None:
     """Apply explicit blocks and trailing-backslash line continuation."""
     if value.strip() == "<<<":
         lines: list[str] = []
@@ -206,9 +202,7 @@ def _read_multiline(
         value = next_value
 
 
-def _read_prompt(
-    source: TextIO, out: TextIO, *, native: bool = False
-) -> str | None:
+def _read_prompt(source: TextIO, out: TextIO, *, native: bool = False) -> str | None:
     """Read one prompt, preserving pasted newlines and continued lines."""
     value = _input_line(source, out, _PROMPT, native=native)
     if value is None:
@@ -219,9 +213,7 @@ def _read_prompt(
     )
 
 
-def _read_cockpit_prompt(
-    source: TextIO, cockpit: Cockpit, *, native: bool
-) -> str | None:
+def _read_cockpit_prompt(source: TextIO, cockpit: Cockpit, *, native: bool) -> str | None:
     """Read input on the primary-buffer prompt line with native editing."""
 
     def read_one(label: str) -> str | None:
@@ -555,8 +547,7 @@ def _command_output(
         for head in heads:
             marker = "* " if head.current else "  "
             lines.append(
-                f"{marker}turn={head.turn} epoch={head.epoch} "
-                f"checkpoint={head.checkpoint_ref}"
+                f"{marker}turn={head.turn} epoch={head.epoch} checkpoint={head.checkpoint_ref}"
             )
         return "\n".join(lines)
     if name == "/fork":
@@ -638,8 +629,7 @@ async def _run_interactive(
         )
     else:
         transcript.system(
-            "Cambium interactive session\n"
-            "Persistent CAST branch ready. Type /help for commands."
+            "Cambium interactive session\nPersistent CAST branch ready. Type /help for commands."
         )
     sequence = 0
     failed = False
@@ -794,9 +784,7 @@ async def _run_interactive(
 
                 activity_task = loop.create_task(_activity_ticks())
 
-                def _live_sink(
-                    record: dict[str, Any], _activity: ActivityState = activity
-                ) -> None:
+                def _live_sink(record: dict[str, Any], _activity: ActivityState = activity) -> None:
                     nonlocal sequence
                     session.observe_event(turn, record)  # noqa: B023
                     transcript.observe_event(record)
@@ -815,9 +803,7 @@ async def _run_interactive(
                     )
 
                 _start_input_read()
-                turn_task = loop.create_task(
-                    session.run_turn(turn, on_event=_live_sink)
-                )
+                turn_task = loop.create_task(session.run_turn(turn, on_event=_live_sink))
 
                 def _request_cancel() -> None:  # noqa: B023
                     nonlocal cancel_requested
@@ -849,10 +835,7 @@ async def _run_interactive(
                                 cockpit.flush()
                                 if queued_prompt is None:
                                     input_eof = True
-                                elif (
-                                    queued_prompt.strip() == "!cancel"
-                                    and not turn_task.done()
-                                ):
+                                elif queued_prompt.strip() == "!cancel" and not turn_task.done():
                                     _request_cancel()
                                 else:
                                     pending_prompts.append(queued_prompt)

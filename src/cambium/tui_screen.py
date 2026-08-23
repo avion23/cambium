@@ -1064,9 +1064,7 @@ class ActivityState:
                 self._responding = False
                 return
 
-    def observe_event(
-        self, record: Mapping[str, Any], *, now: float | None = None
-    ) -> None:
+    def observe_event(self, record: Mapping[str, Any], *, now: float | None = None) -> None:
         """Fold one synthetic or durable event into the activity view."""
         if not self._active:
             if self._finished:
@@ -1104,10 +1102,7 @@ class ActivityState:
         if tool is not None:
             tool_name, tool_started_at = tool
             tool_elapsed = max(0.0, current - tool_started_at)
-            label = (
-                f"running {tool_name} {tool_elapsed:.1f}s "
-                f"· turn {turn_elapsed:.1f}s"
-            )
+            label = f"running {tool_name} {tool_elapsed:.1f}s · turn {turn_elapsed:.1f}s"
         elif self._responding:
             label = f"responding… {turn_elapsed:.1f}s"
         else:
@@ -1657,8 +1652,7 @@ def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
         subject = f"{provider}/{name}"
         full = f" {subject}: {', '.join(fields)}"
         compact_fields = [
-            field.replace(" tokens", " tok").replace(" requests", " req")
-            for field in fields
+            field.replace(" tokens", " tok").replace(" requests", " req") for field in fields
         ]
         compact = f" {subject}: {', '.join(compact_fields)}"
         if len(full) <= panel_width:
@@ -1667,9 +1661,7 @@ def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
             rows.append(_side_row("normal", compact, panel_width))
         else:
             rows.append(_side_row("normal", f" {subject}", panel_width))
-            rows.extend(
-                _side_row("dim", f"   {field}", panel_width) for field in fields
-            )
+            rows.extend(_side_row("dim", f"   {field}", panel_width) for field in fields)
     return rows
 
 
@@ -1801,11 +1793,7 @@ def _primary_status_line(
     checkpoint_match = re.search(r"(?:last_checkpoint|checkpoint)=(\S+)", session_description)
     if checkpoint_match is not None:
         checkpoint = f"last_checkpoint={_clip(checkpoint_match.group(1), 40)}"
-    priority = " · ".join(
-        part
-        for part in (f"status={status}", checkpoint, provider_model)
-        if part
-    )
+    priority = " · ".join(part for part in (f"status={status}", checkpoint, provider_model) if part)
     details = (
         f"{priority} · agents={agents} · tokens={tokens} · out/s={rate:.1f}"
         f" · epoch={epoch} · {_sanitize(cumulative_line)}"

@@ -54,6 +54,10 @@ DEFAULT_MAX_TURNS = 50
 # use the durable usage events from the current interactive branch.
 DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS = 12_000
 DEFAULT_INTERACTIVE_THROUGHPUT_SAFETY_FACTOR = 2.0
+# No-hint, no-history fallback for fresh interactive sessions.  A multi-turn
+# self-check on a slow free tier legitimately exceeds the non-interactive
+# five-minute budget; measured evidence refines this on later turns.
+DEFAULT_INTERACTIVE_WALL_BUDGET_S = 1_800.0
 
 
 class RoutingMode(Enum):
@@ -437,15 +441,20 @@ def _interactive_wall_budget_s(
         # a fast sibling cannot rescue a turn that was assigned elsewhere.
         throughput = min(hints)
     if throughput is None or throughput <= 0:
-        return DEFAULT_WALL_BUDGET_S
+        # A fresh interactive session has no throughput hint and no observed
+        # history.  A multi-turn self-check or inspection task legitimately
+        # needs many tool turns on slow providers; the non-interactive 300s
+        # floor kills healthy work, so interactive turns get a generous
+        # default until measured evidence can refine it.
+        return DEFAULT_INTERACTIVE_WALL_BUDGET_S
 
     estimated_output = max(
         DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS,
         observed_output,
     )
     estimated_output = min(float(config.max_tokens), estimated_output)
-    scaled = estimated_output / throughput * max(
-        2.0, float(config.interactive_throughput_safety_factor)
+    scaled = (
+        estimated_output / throughput * max(2.0, float(config.interactive_throughput_safety_factor))
     )
     return max(DEFAULT_WALL_BUDGET_S, scaled)
 

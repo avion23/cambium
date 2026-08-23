@@ -167,9 +167,7 @@ def test_interactive_run_plan_receives_computed_wall_budget(
     async def fake_run_plan(session_dir, plan, **_kwargs):
         captured["session_dir"] = Path(session_dir)
         captured["plan"] = plan
-        return PlanResult(
-            results=(TaskResult(task_id="oneshot", status="succeeded", exit_code=0),)
-        )
+        return PlanResult(results=(TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
     config = oneshot.OneShotConfig(
