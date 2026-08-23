@@ -19,6 +19,11 @@ The current runtime is intentionally small:
 ## Status
 
 Cambium runs directly from source and currently requires Python 3.12+.
+The persistent cockpit TUI is now the primary operator interface: it keeps one
+durable interactive branch alive across prompts, reconnects to the latest
+interactive session, supports steering with `!cancel` or Ctrl-C and queued
+follow-ups, and streams model output into the cockpit.
+The project metadata keeps `requires-python = ">=3.12"`.
 `pyproject.toml` declares package metadata, dependencies, test extras, and the
 `cambium` / `cambium-monitor` entry points, but a checked-out repository does
 not need an editable install.
@@ -55,12 +60,30 @@ plugin registry.
 
 ## Quick start
 
-Run the deterministic demo:
+Start the persistent full-screen terminal cockpit:
 
 ```bash
-PYTHONPATH=src python -m cambium supervisor \
-  --session-dir /tmp/cambium-demo \
-  --demo
+PYTHONPATH=src python -m cambium tui --repo . --auto
+```
+
+The cockpit stays alive across turns, reconnects to durable interactive state,
+streams model Markdown while a turn is running, and accepts `!cancel` or
+Ctrl-C to cancel the active turn. Prompts entered while a turn is active are
+queued as follow-ups.
+
+To reopen the same semantic branch later, give it a stable interactive root:
+
+```bash
+PYTHONPATH=src python -m cambium tui \
+  --repo . \
+  --session-dir ~/.local/state/cambium/my-project \
+  --auto
+```
+
+Start a line-oriented interactive session:
+
+```bash
+PYTHONPATH=src python -m cambium repl --repo . --auto
 ```
 
 Run one prompt against the current repository:
@@ -81,25 +104,12 @@ PYTHONPATH=src python -m cambium run \
   "Inspect the current task-tree implementation"
 ```
 
-Start a line-oriented interactive session:
+Run the deterministic demo:
 
 ```bash
-PYTHONPATH=src python -m cambium repl --repo . --auto
-```
-
-Start the persistent full-screen terminal cockpit:
-
-```bash
-PYTHONPATH=src python -m cambium tui --repo . --auto
-```
-
-To reopen the same semantic branch later, give it a stable interactive root:
-
-```bash
-PYTHONPATH=src python -m cambium tui \
-  --repo . \
-  --session-dir ~/.local/state/cambium/my-project \
-  --auto
+PYTHONPATH=src python -m cambium supervisor \
+  --session-dir /tmp/cambium-demo \
+  --demo
 ```
 
 The cockpit remains active across the complete interactive session. Its left
@@ -116,12 +126,25 @@ back to the provider-neutral semantic trunk when it is not. Each prompt still
 runs in an isolated supervisor leaf and worktree. Non-TTY output remains
 line-oriented and receives no cursor controls or ANSI colors.
 
-Useful commands inside the TUI:
+## Operator commands
 
-```text
-/help  /status  /dashboard  /events  /model  /usage  /agents
-/context  /session  /new  /clear  /exit
-```
+Enter these commands in the cockpit prompt:
+
+| Command | Action |
+| --- | --- |
+| `/help` | Show the command reference. |
+| `/usage` | Show cumulative calls, tokens, throughput, and cost. |
+| `/agents` | Show main and sub-agent lifecycle state. |
+| `/context` | Show the active trunk, raw tail, checkpoint, and epoch. |
+| `/session` | Show the persistent session and provider lease. |
+| `/new` | Start a fresh semantic branch without deleting old artifacts. |
+| `/clear` | Clear only the visible cockpit transcript. |
+| `/fork` | Fork the current context branch. |
+| `/branches` | List available persistent branches. |
+| `/compact` | Compact the active context. |
+| `/model` | Show the current provider/model lease. |
+| `/quota` | Show provider quota state. |
+| `/exit` | Close the cockpit. |
 
 Use `<<<` and `>>>` on their own lines for multiline prompts. See
 [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
@@ -226,6 +249,40 @@ process-boundary tier explicitly when needed:
 ```bash
 PYTHONPATH=src python -m pytest -m slow -q
 ```
+
+## Acceptance testing
+
+The opt-in live-provider suite reads API keys read-only from the local OpenCode
+and pi credential stores (`~/.local/share/opencode/auth.json` and
+`~/.pi/agent/auth.json`) when they are available; missing credentials skip the
+corresponding checks. Run it with:
+
+```bash
+PYTHONPATH=src python -m pytest tests/acceptance/ -q
+```
+
+## DSPy trajectory extraction
+
+Extract redacted, deduplicated decision trajectories from an OpenCode SQLite
+database or storage directory. Point `--session-dir` at the OpenCode storage;
+the extractor is read-only and requires the source path explicitly:
+
+```bash
+PYTHONPATH=src python -m cambium optimize extract \
+  --session-dir /path/to/opencode/storage \
+  --repo . \
+  --output /tmp/cambium-trajectories.jsonl
+```
+
+Use `--review-gate` to write a review queue instead of the accepted dataset.
+See [`docs/architecture/optimization.md`](docs/architecture/optimization.md)
+for the schema and approval gate.
+
+## Profiling baseline
+
+The measured runtime-overhead baseline and its reproducible profiling harness
+are documented in
+[`docs/architecture/profiling-baseline.md`](docs/architecture/profiling-baseline.md).
 
 ## Session artifacts
 
