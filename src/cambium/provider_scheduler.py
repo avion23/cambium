@@ -39,6 +39,212 @@ DEFAULT_CACHE_HORIZON_S = 60.0
 DEFAULT_MINIMUM_BREAKPOINT_TOKENS = 0
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class CacheCapability:
+    """Normalized provider prefix-cache capability and tariff metadata.
+
+    Prices are USD per million cache tokens.  A zero value is a valid free
+    tariff; callers should use :meth:`has_pricing` when they need to
+    distinguish a free cache from an undeclared capability.  The constructor
+    accepts the vocabulary used by the architecture documents (for example
+    ``minimum_cacheable_tokens``/``cache_ttl_s``) as well as the shorter names
+    used in provider files.  The stored fields stay canonical so routing and
+    rollover code do not need provider-specific aliases.
+    """
+
+    minimum_cacheable_tokens: int
+    cache_ttl_s: float
+    cache_granularity_tokens: int
+    cache_read_price: float
+    cache_write_price: float
+
+    def __init__(
+        self,
+        minimum_cacheable_tokens: int = 0,
+        cache_ttl_s: float = 0.0,
+        cache_granularity_tokens: int = 1,
+        cache_read_price: float = 0.0,
+        cache_write_price: float = 0.0,
+        *,
+        min_cacheable_tokens: int | None = None,
+        min_cacheable_block_tokens: int | None = None,
+        ttl_s: float | None = None,
+        ttl_seconds: float | None = None,
+        cache_ttl_seconds: float | None = None,
+        granularity: int | None = None,
+        granularity_tokens: int | None = None,
+        cache_block_granularity_tokens: int | None = None,
+        cache_read_price_per_1m: float | None = None,
+        cache_write_price_per_1m: float | None = None,
+    ) -> None:
+        minimum = _coalesce_alias(
+            "minimum_cacheable_tokens",
+            minimum_cacheable_tokens,
+            0,
+            (min_cacheable_tokens, min_cacheable_block_tokens),
+        )
+        ttl = _coalesce_alias(
+            "cache_ttl_s",
+            cache_ttl_s,
+            0.0,
+            (ttl_s, ttl_seconds, cache_ttl_seconds),
+        )
+        block = _coalesce_alias(
+            "cache_granularity_tokens",
+            cache_granularity_tokens,
+            1,
+            (granularity, granularity_tokens, cache_block_granularity_tokens),
+        )
+        read_price = _coalesce_alias(
+            "cache_read_price", cache_read_price, 0.0, (cache_read_price_per_1m,)
+        )
+        write_price = _coalesce_alias(
+            "cache_write_price", cache_write_price, 0.0, (cache_write_price_per_1m,)
+        )
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
+            raise ValueError("minimum_cacheable_tokens must be a non-negative integer")
+        if isinstance(block, bool) or not isinstance(block, int) or block <= 0:
+            raise ValueError("cache_granularity_tokens must be a positive integer")
+        for field_name, value in (
+            ("cache_ttl_s", ttl),
+            ("cache_read_price", read_price),
+            ("cache_write_price", write_price),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise ValueError(f"{field_name} must be a number")
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        object.__setattr__(self, "minimum_cacheable_tokens", minimum)
+        object.__setattr__(self, "cache_ttl_s", float(ttl))
+        object.__setattr__(self, "cache_granularity_tokens", block)
+        object.__setattr__(self, "cache_read_price", float(read_price))
+        object.__setattr__(self, "cache_write_price", float(write_price))
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> CacheCapability:
+        """Parse one strict provider cache-capability mapping."""
+        allowed = {
+            "minimum_cacheable_tokens",
+            "min_cacheable_tokens",
+            "min_cacheable_block_tokens",
+            "cache_ttl_s",
+            "ttl_s",
+            "ttl_seconds",
+            "cache_ttl_seconds",
+            "cache_granularity_tokens",
+            "granularity",
+            "granularity_tokens",
+            "cache_block_granularity_tokens",
+            "cache_read_price",
+            "cache_read_price_per_1m",
+            "cache_write_price",
+            "cache_write_price_per_1m",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unknown cache-capability field(s): {unknown}")
+        return cls(**dict(value))
+
+    @property
+    def min_cacheable_tokens(self) -> int:
+        """Short spelling for :attr:`minimum_cacheable_tokens`."""
+        return self.minimum_cacheable_tokens
+
+    @property
+    def min_cacheable_block_tokens(self) -> int:
+        """Compatibility spelling used by CAST scheduling notes."""
+        return self.minimum_cacheable_tokens
+
+    @property
+    def ttl_s(self) -> float:
+        """Short spelling for :attr:`cache_ttl_s`."""
+        return self.cache_ttl_s
+
+    @property
+    def ttl_seconds(self) -> float:
+        """Seconds for which an epoch is expected to remain reusable."""
+        return self.cache_ttl_s
+
+    @property
+    def granularity(self) -> int:
+        """Short spelling for :attr:`cache_granularity_tokens`."""
+        return self.cache_granularity_tokens
+
+    @property
+    def granularity_tokens(self) -> int:
+        """Compatibility spelling for cache block granularity."""
+        return self.cache_granularity_tokens
+
+    @property
+    def cache_block_granularity_tokens(self) -> int:
+        """Architecture-document spelling for cache block granularity."""
+        return self.cache_granularity_tokens
+
+    @property
+    def cache_read_price_per_1m(self) -> float:
+        """The read tariff in the unit used by provider configuration."""
+        return self.cache_read_price
+
+    @property
+    def cache_write_price_per_1m(self) -> float:
+        """The write tariff in the unit used by provider configuration."""
+        return self.cache_write_price
+
+    @property
+    def has_pricing(self) -> bool:
+        """Whether either cache tariff was explicitly useful to economics."""
+        return self.cache_read_price > 0 or self.cache_write_price > 0
+
+    @property
+    def declared(self) -> bool:
+        """Whether any non-default cache capability signal is present."""
+        return bool(
+            self.minimum_cacheable_tokens
+            or self.cache_ttl_s
+            or self.cache_granularity_tokens != 1
+            or self.has_pricing
+        )
+
+    def cacheable_tokens(self, tokens: int) -> int:
+        """Round a prefix up to the provider's cache block granularity."""
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("cache token count must be a non-negative integer")
+        if tokens == 0:
+            return 0
+        return math.ceil(tokens / self.cache_granularity_tokens) * self.cache_granularity_tokens
+
+    def supports_prefix(self, tokens: int) -> bool:
+        """Return whether a prefix is large enough for provider caching."""
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("cache token count must be a non-negative integer")
+        return tokens >= self.minimum_cacheable_tokens
+
+    def cost(self, tokens: int, *, write: bool = False) -> float:
+        """Return the tariff for *tokens* cache tokens."""
+        rounded = self.cacheable_tokens(tokens)
+        price = self.cache_write_price if write else self.cache_read_price
+        return rounded / 1_000_000 * price
+
+
+def _coalesce_alias(
+    field_name: str,
+    canonical: int | float,
+    default: int | float,
+    aliases: Sequence[int | float | None],
+) -> int | float:
+    """Choose one alias while rejecting contradictory declarations."""
+    selected = canonical
+    for alias in aliases:
+        if alias is None:
+            continue
+        if selected != default and selected != alias:
+            raise ValueError(f"{field_name} aliases disagree")
+        if any(other is not None and other != alias for other in aliases):
+            raise ValueError(f"{field_name} aliases disagree")
+        selected = alias
+    return selected
+
+
 @dataclass(frozen=True, slots=True)
 class CacheHorizonConfig:
     """Provider-neutral cache-breakpoint batching hints.
@@ -198,11 +404,187 @@ class CastConfig(CacheHorizonConfig):
             )
         )
 
+    def rollover_decision(
+        self,
+        segment_count: int,
+        active_trunk_tokens: int,
+        *,
+        new_prefix_tokens: int,
+        expected_remaining_calls: float,
+        cache_capability: CacheCapability | Mapping[str, Any] | None,
+        cache_expired: bool = True,
+    ) -> RolloverDecision:
+        """Compare K0 write cost with the cost of continuing this epoch."""
+        return decide_rollover(
+            self,
+            segment_count,
+            active_trunk_tokens,
+            new_prefix_tokens=new_prefix_tokens,
+            expected_remaining_calls=expected_remaining_calls,
+            cache_capability=cache_capability,
+            cache_expired=cache_expired,
+        )
+
 
 # Names used by callers and architecture notes.  They intentionally point to
 # one type so policy validation cannot drift between entry points.
 CachePolicy = CastConfig
 CASTConfig = CastConfig
+
+
+@dataclass(frozen=True, slots=True)
+class RolloverDecision:
+    """Auditable economic decision for one threshold-triggered K0 rollover."""
+
+    should_rollover: bool
+    thresholds_hit: bool
+    rollover_cost: float
+    continue_cost: float
+    n_star: float
+    expected_remaining_calls: float
+    old_prefix_tokens: int
+    new_prefix_tokens: int
+    cache_expired: bool
+    reason: str
+
+    @property
+    def rollover(self) -> bool:
+        """Short boolean spelling used by CAST callers."""
+        return self.should_rollover
+
+    @property
+    def decision(self) -> str:
+        """Stable wire spelling for evidence consumers."""
+        return "rollover" if self.should_rollover else "continue"
+
+    @property
+    def evidence(self) -> dict[str, Any]:
+        """JSON-safe decision evidence without provider or prompt content."""
+        return {
+            "decision": self.decision,
+            "should_rollover": self.should_rollover,
+            "thresholds_hit": self.thresholds_hit,
+            "rollover_cost_usd": self.rollover_cost,
+            "continue_cost_usd": self.continue_cost,
+            "n_star": self.n_star,
+            "expected_remaining_calls": self.expected_remaining_calls,
+            "old_prefix_tokens": self.old_prefix_tokens,
+            "new_prefix_tokens": self.new_prefix_tokens,
+            "cache_expired": self.cache_expired,
+            "reason": self.reason,
+        }
+
+    def event(
+        self,
+        *,
+        task_id: str | None = None,
+        epoch: int | None = None,
+        checkpoint_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Build a redacted durable decision-evidence event."""
+        payload = dict(self.evidence)
+        if task_id is not None:
+            payload["task_id"] = task_id
+        if epoch is not None:
+            payload["epoch"] = epoch
+        if checkpoint_ref is not None:
+            payload["checkpoint_ref"] = checkpoint_ref
+        return {
+            "type": "cast_rollover_decision",
+            "kind": "cast_rollover_decision",
+            "payload": payload,
+        }
+
+
+def _cache_capability(value: CacheCapability | Mapping[str, Any] | None) -> CacheCapability:
+    if value is None:
+        return CacheCapability()
+    if isinstance(value, CacheCapability):
+        return value
+    if isinstance(value, Mapping):
+        return CacheCapability.from_mapping(value)
+    raise TypeError("cache_capability must be a CacheCapability or mapping")
+
+
+def decide_rollover(
+    cast_config: CastConfig,
+    segment_count: int,
+    active_trunk_tokens: int,
+    *,
+    new_prefix_tokens: int,
+    expected_remaining_calls: float,
+    cache_capability: CacheCapability | Mapping[str, Any] | None,
+    cache_expired: bool = True,
+) -> RolloverDecision:
+    """Apply CAST thresholds and compare cache write/read projections.
+
+    The one-time rollover projection writes the new K0 prefix.  Continuing an
+    expired epoch pays a cache read for the old prefix on each expected future
+    call.  ``n_star`` is the break-even remaining-call count; a rollover is
+    selected only when thresholds are due and the projected continuation cost
+    is at least the one-time write cost.  With no expired cache there is no
+    economic pressure to rebuild, so threshold evaluation remains observable
+    but chooses ``continue``.
+    """
+    if not isinstance(cast_config, CastConfig):
+        raise TypeError("cast_config must be a CastConfig")
+    thresholds_hit = cast_config.rollover_due(segment_count, active_trunk_tokens)
+    for field_name, value in (
+        ("new_prefix_tokens", new_prefix_tokens),
+        ("active_trunk_tokens", active_trunk_tokens),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{field_name} must be a non-negative integer")
+    if (
+        isinstance(expected_remaining_calls, bool)
+        or not isinstance(expected_remaining_calls, int | float)
+        or not math.isfinite(float(expected_remaining_calls))
+        or expected_remaining_calls < 0
+    ):
+        raise ValueError("expected_remaining_calls must be finite and non-negative")
+    if type(cache_expired) is not bool:
+        raise ValueError("cache_expired must be a boolean")
+    capability = _cache_capability(cache_capability)
+    old_tokens = capability.cacheable_tokens(active_trunk_tokens)
+    new_tokens = capability.cacheable_tokens(new_prefix_tokens)
+    rollover_cost = capability.cost(new_tokens, write=True)
+    per_call_continue = capability.cost(old_tokens) if cache_expired else 0.0
+    continue_cost = float(expected_remaining_calls) * per_call_continue
+    if per_call_continue > 0:
+        n_star = rollover_cost / per_call_continue
+    elif rollover_cost == 0:
+        n_star = 0.0
+    else:
+        n_star = math.inf
+    if not thresholds_hit:
+        should_rollover = False
+        reason = "thresholds_not_hit"
+    elif not cache_expired:
+        should_rollover = False
+        reason = "cache_still_warm"
+    elif continue_cost >= rollover_cost:
+        should_rollover = True
+        reason = "rollover_write_is_amortized"
+    else:
+        should_rollover = False
+        reason = "continue_read_is_cheaper"
+    return RolloverDecision(
+        should_rollover=should_rollover,
+        thresholds_hit=thresholds_hit,
+        rollover_cost=rollover_cost,
+        continue_cost=continue_cost,
+        n_star=n_star,
+        expected_remaining_calls=float(expected_remaining_calls),
+        old_prefix_tokens=old_tokens,
+        new_prefix_tokens=new_tokens,
+        cache_expired=cache_expired,
+        reason=reason,
+    )
+
+
+def decide_k0_rollover(*args: Any, **kwargs: Any) -> RolloverDecision:
+    """Compatibility alias naming the CAST projection explicitly."""
+    return decide_rollover(*args, **kwargs)
 
 
 class BillingMode(StrEnum):

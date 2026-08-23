@@ -22,7 +22,7 @@ import json
 import math
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path
@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import urlparse
 
 from .auth import effective_home, validate_derived_env_name, validate_provider_id
-from .provider_scheduler import BillingMode, QuotaWindowSpec
+from .provider_scheduler import BillingMode, CacheCapability, QuotaWindowSpec
 
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
@@ -108,6 +108,24 @@ _PROVIDER_FIELDS = frozenset(
         "supports_native_tools",
         "supports_python_tool",
         "allow_model_substitution",
+        "cache_capability",
+        "cache_capabilities",
+        "cache",
+        "minimum_cacheable_tokens",
+        "min_cacheable_tokens",
+        "min_cacheable_block_tokens",
+        "cache_ttl_s",
+        "ttl_s",
+        "ttl_seconds",
+        "cache_ttl_seconds",
+        "cache_granularity_tokens",
+        "granularity",
+        "granularity_tokens",
+        "cache_block_granularity_tokens",
+        "cache_read_price",
+        "cache_read_price_per_1m",
+        "cache_write_price",
+        "cache_write_price_per_1m",
     }
 )
 _DEFAULTS: dict[str, object] = {
@@ -144,6 +162,7 @@ _DEFAULTS: dict[str, object] = {
     "supports_native_tools": True,
     "supports_python_tool": True,
     "allow_model_substitution": False,
+    "cache_capability": None,
 }
 
 
@@ -181,6 +200,7 @@ class _ProviderMapping(TypedDict):
     supports_native_tools: bool
     supports_python_tool: bool
     allow_model_substitution: bool
+    cache_capability: CacheCapability
 
 
 DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
@@ -365,6 +385,68 @@ def _parse_quota_windows(value: object, location: str) -> tuple[QuotaWindowSpec,
         names.add(window.name)
         windows.append(window)
     return tuple(windows)
+
+
+_CACHE_CAPABILITY_KEYS = frozenset(
+    {
+        "minimum_cacheable_tokens",
+        "min_cacheable_tokens",
+        "min_cacheable_block_tokens",
+        "cache_ttl_s",
+        "ttl_s",
+        "ttl_seconds",
+        "cache_ttl_seconds",
+        "cache_granularity_tokens",
+        "granularity",
+        "granularity_tokens",
+        "cache_block_granularity_tokens",
+        "cache_read_price",
+        "cache_read_price_per_1m",
+        "cache_write_price",
+        "cache_write_price_per_1m",
+    }
+)
+
+
+def _parse_cache_capability(raw: Mapping[str, object], location: str) -> CacheCapability:
+    """Parse nested or flat provider cache capability metadata.
+
+    Provider files in the wild use both ``cache`` and
+    ``cache_capability``.  Supporting both at this boundary keeps the rest of
+    the runtime on one typed object while retaining strict unknown-field
+    rejection inside the capability mapping.
+    """
+    nested_values: list[Mapping[str, object]] = []
+    for key in ("cache_capability", "cache_capabilities", "cache"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise _error(f"{location}.{key}", "must be an object")
+        nested_values.append(value)
+    if len(nested_values) > 1:
+        first = dict(nested_values[0])
+        if any(dict(value) != first for value in nested_values[1:]):
+            raise _error(location, "cache capability aliases disagree")
+
+    flat_values = {key: raw[key] for key in _CACHE_CAPABILITY_KEYS if key in raw}
+    nested = dict(nested_values[0]) if nested_values else {}
+    overlap = set(flat_values) & set(nested)
+    if overlap:
+        raise _error(
+            location,
+            "cache capability fields are declared both nested and flat: "
+            + ", ".join(sorted(overlap)),
+        )
+    values = {**nested, **flat_values}
+    if not values:
+        return CacheCapability()
+    try:
+        return CacheCapability.from_mapping(values)
+    except (TypeError, ValueError) as exc:
+        raise _error(f"{location}.cache_capability", str(exc)) from exc
 
 
 def _require_bool(value: object, location: str) -> bool:
@@ -573,6 +655,37 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     allow_model_substitution = _require_bool(
         values["allow_model_substitution"], f"{location}.allow_model_substitution"
     )
+    cache_capability = _parse_cache_capability(raw, location)
+    # ``price_per_1m_cached_in`` predates the typed capability object.  Keep it
+    # as the effective read tariff when a provider has not supplied one in the
+    # new cache block, so existing configurations participate in CAST pricing
+    # without a migration.
+    if (
+        "price_per_1m_cached_in" in raw
+        and "cache_read_price" not in raw
+        and "cache_read_price_per_1m" not in raw
+        and not any(
+            isinstance(raw.get(key), dict)
+            and any(
+                field_name in raw[key]
+                for field_name in ("cache_read_price", "cache_read_price_per_1m")
+            )
+            for key in ("cache_capability", "cache_capabilities", "cache")
+        )
+    ):
+        try:
+            cache_capability = CacheCapability(
+                minimum_cacheable_tokens=cache_capability.minimum_cacheable_tokens,
+                cache_ttl_s=cache_capability.cache_ttl_s,
+                cache_granularity_tokens=cache_capability.cache_granularity_tokens,
+                cache_read_price=_require_number(
+                    raw["price_per_1m_cached_in"],
+                    f"{location}.price_per_1m_cached_in",
+                ),
+                cache_write_price=cache_capability.cache_write_price,
+            )
+        except ValueError as exc:
+            raise _error(f"{location}.price_per_1m_cached_in", str(exc)) from exc
 
     # Optional Responses-API reasoning effort (codex_responses providers); an
     # absent value keeps the request body free of the reasoning field.
@@ -621,6 +734,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "supports_native_tools": supports_native_tools,
         "supports_python_tool": supports_python_tool,
         "allow_model_substitution": allow_model_substitution,
+        "cache_capability": cache_capability,
     }
 
 
@@ -714,6 +828,7 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "billing_mode": values["billing_mode"],
         "quota_windows": values["quota_windows"],
         "price_per_1m_cached_in": values["price_per_1m_cached_in"],
+        "cache_capability": values["cache_capability"],
         "pricing_known": values["pricing_known"],
         "throughput_hint_tps": values["throughput_hint_tps"],
         "tokens_per_s": values["tokens_per_s"],
