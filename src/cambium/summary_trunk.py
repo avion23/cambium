@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -134,6 +135,15 @@ def raw_tail_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(_canonical_json_bytes(copied)).hexdigest()
 
 
+_SUMMARY_FORBIDDEN_MARKERS = (
+    SUMMARY_ENTRY_OPEN.strip(),
+    SUMMARY_ENTRY_CLOSE.strip(),
+    SUMMARY_ENTRY_PROVENANCE.strip(),
+    SUMMARY_CONTROL_OPEN.strip(),
+    SUMMARY_CONTROL_CLOSE.strip(),
+)
+
+
 def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise SummaryTrunkError(f"summary entry {field} must be a string")
@@ -141,6 +151,11 @@ def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
         raise SummaryTrunkError(f"summary entry {field} must be non-empty")
     if len(value.encode("utf-8")) > SUMMARY_MAX_TEXT_BYTES:
         raise SummaryTrunkError(f"summary entry {field} exceeds the byte cap")
+    for marker in _SUMMARY_FORBIDDEN_MARKERS:
+        if marker and marker in value:
+            raise SummaryTrunkError(
+                f"summary entry {field} must not contain the reserved marker {marker!r}"
+            )
     return value
 
 
@@ -232,7 +247,13 @@ def _summary_payload(content: str) -> str | None:
 
 
 def parse_summary_message(message: Mapping[str, Any]) -> SummaryEntry | None:
-    """Parse a rendered entry, or return None for an ordinary message."""
+    """Parse a rendered entry, or return None for an ordinary message.
+
+    A wrapper-shaped message whose payload does not decode is treated as an
+    ordinary message so one poisoned entry demotes the remainder to raw tail
+    instead of permanently breaking partitioning; strict contexts still catch
+    that via ``summary_entries``.
+    """
     copied = _copy_message(message, "summary_message")
     payload = _summary_payload(copied["content"])
     if payload is None:
@@ -241,9 +262,45 @@ def parse_summary_message(message: Mapping[str, Any]) -> SummaryEntry | None:
         raise SummaryTrunkError("summary entries must use the user role")
     try:
         decoded = json.loads(payload)
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise SummaryTrunkError("summary entry wrapper contains invalid JSON") from exc
+    except (json.JSONDecodeError, RecursionError):
+        return None
     return _entry_from_mapping(decoded)
+
+
+_SEMANTIC_ID_RE = re.compile(r"^[DF]\d+$")
+
+
+def _entry_id_sets(
+    entry: SummaryEntry,
+) -> tuple[set[str], set[str]]:
+    """Split ID-shaped items into (added, referenced) sets; prose passes through."""
+    added: set[str] = set()
+    for item in (*entry.decisions_added, *entry.facts_added):
+        if _SEMANTIC_ID_RE.match(item):
+            added.add(item)
+    referenced: set[str] = set()
+    for item in (*entry.decisions_superseded, *entry.facts_invalidated):
+        if _SEMANTIC_ID_RE.match(item):
+            referenced.add(item)
+    return added, referenced
+
+
+def _validate_entry_refs(entry: SummaryEntry, seen_added: set[str]) -> None:
+    """ID-shaped supersede/invalidation items must reference known earlier IDs.
+
+    Prose-style items are exempt so pre-existing trunks stay readable.  Added
+    IDs must be globally unique across segments.
+    """
+    added, referenced = _entry_id_sets(entry)
+    unknown = sorted(referenced - added - seen_added)
+    if unknown:
+        raise SummaryTrunkError(
+            "summary entry supersedes/invalidates unknown IDs: " + ", ".join(unknown)
+        )
+    duplicates = sorted(added & seen_added)
+    if duplicates:
+        raise SummaryTrunkError("summary entry re-adds existing IDs: " + ", ".join(duplicates))
+    seen_added.update(added)
 
 
 def partition_summary_trunk(
@@ -273,6 +330,7 @@ def partition_summary_trunk(
     trunk = list(copied[:stable_head_messages])
     expected_sequence = 1
     seen_digests: set[str] = set()
+    seen_semantic_ids: set[str] = set()
     previous_through_turn: int | None = None
     index = stable_head_messages
     while index < len(copied):
@@ -286,6 +344,7 @@ def partition_summary_trunk(
             )
         if entry.source_sha256 in seen_digests:
             raise SummaryTrunkError("summary entry source_sha256 must be unique")
+        _validate_entry_refs(entry, seen_semantic_ids)
         if previous_through_turn is not None and entry.through_turn <= previous_through_turn:
             raise SummaryTrunkError("summary entry through_turn must increase monotonically")
         seen_digests.add(entry.source_sha256)
@@ -440,6 +499,10 @@ def append_summary_entry(
         )
     if any(existing.source_sha256 == validated_entry.source_sha256 for existing in entries):
         raise SummaryTrunkError("summary append source_sha256 is a duplicate")
+    seen_semantic_ids: set[str] = set()
+    for existing in entries:
+        _validate_entry_refs(existing, seen_semantic_ids)
+    _validate_entry_refs(validated_entry, seen_semantic_ids)
     if entries and validated_entry.through_turn <= entries[-1].through_turn:
         raise SummaryTrunkError("summary append through_turn must increase monotonically")
     appended = [*trunk, render_summary_message(validated_entry)]
