@@ -330,6 +330,9 @@ class ProviderConfig:
     dimensions; ``rpm`` and ``max_concurrency`` remain accepted aliases for
     older provider files. ``tokens_per_s`` is only a configured hint—measured
     throughput comes from routing.ProviderDebt usage evidence.
+    ``throughput_hint_tps`` and ``interactive_wall_budget_s`` are optional
+    operator hints used by the interactive frontend when it chooses a turn
+    deadline; they never alter provider transport timeouts.
     """
 
     name: str
@@ -379,6 +382,7 @@ class ProviderConfig:
     # from usage events into routing.ProviderDebt and takes precedence over
     # this hint during quality ordering.
     tokens_per_s: float | None = None
+    interactive_wall_budget_s: float | None = None
     quality_weight: float = 1.0
     supports_native_tools: bool = True
     supports_python_tool: bool = True

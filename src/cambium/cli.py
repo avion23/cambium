@@ -1090,7 +1090,9 @@ async def _run_repl(args: argparse.Namespace) -> int:
         provider=provider,
         model=model,
         auto=args.auto,
-        max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
+        # ``None`` lets the REPL resolve the interactive deadline from the
+        # selected provider's hint and the branch's measured output rate.
+        max_wall_s=args.max_wall_s,
         max_tokens=cast(int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)),
         max_turns=cast(int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)),
     )
@@ -1114,7 +1116,9 @@ async def _run_tui(args: argparse.Namespace) -> int:
         provider=provider,
         model=model,
         auto=args.auto,
-        max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
+        # ``None`` lets InteractiveSession resolve the throughput-aware
+        # interactive deadline; an explicit CLI value remains authoritative.
+        max_wall_s=args.max_wall_s,
         max_tokens=cast(int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)),
         max_turns=cast(int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)),
     )
