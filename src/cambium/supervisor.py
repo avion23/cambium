@@ -160,6 +160,11 @@ STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
 DURABLE_EVENT_TIMEOUT_S = 5.0
 
+# Index status pairs that porcelain v1 reports for unmerged (conflicted) paths.
+# Kept local to the supervisor because resolver staging uses a normal merge
+# worktree rather than the merge sequencer's rebase worktree.
+_RESOLVER_UNMERGED_PAIRS = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
+
 EventSink = Callable[[dict[str, Any]], None | Awaitable[None]]
 
 # Session-tree kind for plan tasks that do not declare one. ``build_tree``
@@ -1802,6 +1807,8 @@ class _Runtime:
         conversations: Any = None,
         warm_pool_size: int = 0,
         context_reuse: bool = True,
+        resolver_child_enabled: bool = False,
+        resolver_max_attempts: int = 1,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._store = store
@@ -1855,6 +1862,15 @@ class _Runtime:
         # parent in admission order, and the strict child-result envelope per
         # child task, captured at the child's terminal result envelope.
         self._context_reuse = context_reuse
+        if type(resolver_child_enabled) is not bool:
+            raise ValueError("resolver_child_enabled must be a boolean")
+        if type(resolver_max_attempts) is not int or resolver_max_attempts < 0:
+            raise ValueError("resolver_max_attempts must be a non-negative int")
+        # Conflict resolution is deliberately opt-in.  The attempt budget is
+        # session-scoped, with an optional per-task override validated at
+        # admission; a fresh resolver worktree is created for every attempt.
+        self._resolver_child_enabled = resolver_child_enabled
+        self._resolver_max_attempts = resolver_max_attempts
         self._task_epochs: dict[str, dict[str, Any]] = {}
         # Completion futures are registered before dynamic child tasks are
         # created.  A suspended parent waits on these futures, not on a
@@ -1874,6 +1890,11 @@ class _Runtime:
         # resume; retaining only the latest head makes repeated child joins
         # deterministic while avoiding a stale check on a later epoch.
         self._accepted_integration_heads: dict[str, str] = {}
+        # Conflict envelopes are retained until _supervise has had a chance to
+        # route an opt-in resolver child.  The merge API still returns None on
+        # conflict for compatibility with direct callers.
+        self._merge_conflicts: dict[str, dict[str, Any]] = {}
+        self._resolver_failures: dict[str, str] = {}
         self._cancelled_tasks: set[str] = set()
         # A task's normal finally block owns its first cleanup attempt.  The
         # shutdown pass only retries cancellation cleanup for admitted child
@@ -2470,6 +2491,37 @@ class _Runtime:
             payload["resume"] = spec["resume"]
         if isinstance(spec.get("summary_trunk_ref"), str):
             payload["summary_trunk_ref"] = spec["summary_trunk_ref"]
+        if spec.get("_resolver_child"):
+            # Resolver context is explicit and bounded.  Do not rely on the
+            # worker inferring the conflict from a dirty index: the dedicated
+            # child receives the two parent intents and the evidence that led
+            # to its admission, while the staged worktree grants it the only
+            # write authority it needs.
+            resolver = {
+                "conflicted_files": list(spec.get("conflicted_files", ()))[:MAX_ENVELOPE_ITEMS],
+                "diff_evidence": _cap_utf8(
+                    spec.get("diff_evidence", "")
+                    if isinstance(spec.get("diff_evidence", ""), str)
+                    else "",
+                    MAX_ENVELOPE_FIELD_CHARS,
+                ),
+                "diff_truncated": bool(spec.get("diff_truncated", False)),
+                "parent_intent_summaries": dict(
+                    spec.get("parent_intent_summaries", {})
+                    if isinstance(spec.get("parent_intent_summaries"), dict)
+                    else {}
+                ),
+                "source_branch": spec.get("_resolver_source_branch"),
+                "integration_head": spec.get("resolver_integration_head"),
+                "attempt": spec.get("resolver_attempt"),
+                "max_attempts": spec.get("resolver_max_attempts"),
+            }
+            payload["resolver"] = resolver
+            # Keep the fields available to small resolver workers that do not
+            # consume the nested object yet; all values have the same caps.
+            payload["conflicted_files"] = resolver["conflicted_files"]
+            payload["diff_evidence"] = resolver["diff_evidence"]
+            payload["parent_intent_summaries"] = resolver["parent_intent_summaries"]
         return payload
 
     # -- dynamic child admission (implementation-plan step 2) ----------------
@@ -4914,7 +4966,8 @@ class _Runtime:
         terminal_verdict = (
             envelope is not None
             and correlated
-            and envelope.get("status") in ("succeeded", "failed", "cancelled", "suspended")
+            and envelope.get("status")
+            in ("succeeded", "failed", "cancelled", "suspended", "unresolvable")
         )
         if reuse_ready and not message_too_long:
             # The worker stays alive and owns no task state; the handle no
@@ -5237,8 +5290,15 @@ class _Runtime:
         parent_spec: dict[str, Any],
         child_ids: list[str],
         generation: int,
+        *,
+        consume: bool = True,
     ) -> bool:
-        """Require the parent worktree to be at the accepted child head."""
+        """Require the parent worktree to be at the accepted child head.
+
+        Resolver publication performs a non-consuming check immediately
+        before its ref update, then consumes the newly accepted head after the
+        update.  Existing suspend/resume callers retain the consuming default.
+        """
         parent_task_id = parent_spec["task_id"]
         integration_head = self._accepted_integration_heads.get(parent_task_id)
         if integration_head is None:
@@ -5248,7 +5308,8 @@ class _Runtime:
             worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
         )
         if parent_head == integration_head:
-            self._accepted_integration_heads.pop(parent_task_id, None)
+            if consume:
+                self._accepted_integration_heads.pop(parent_task_id, None)
             return True
         summary = "parent worktree HEAD does not match accepted integration head"
         await self.emit(
@@ -5267,13 +5328,461 @@ class _Runtime:
         )
         return False
 
+    def _resolver_enabled_for(self, spec: Mapping[str, Any]) -> bool:
+        """Return whether this task may admit an automatic resolver child."""
+        if spec.get("_resolver_child"):
+            return False
+        configured = spec.get("resolver_child_enabled")
+        if configured is None:
+            return self._resolver_child_enabled
+        if type(configured) is not bool:
+            raise ValueError("resolver_child_enabled must be a boolean")
+        return configured
+
+    def _resolver_attempt_limit(self, spec: Mapping[str, Any]) -> int:
+        """Resolve the bounded resolver-attempt budget for one task."""
+        configured = spec.get("resolver_max_attempts")
+        if configured is None:
+            configured = spec.get("resolver_attempts", self._resolver_max_attempts)
+        if type(configured) is not int or configured < 0:
+            raise ValueError("resolver_max_attempts must be a non-negative int")
+        return configured
+
+    def _resolver_intent_summaries(
+        self,
+        spec: Mapping[str, Any],
+        envelope: Mapping[str, Any] | None,
+        integration_head: str,
+    ) -> dict[str, str]:
+        """Build bounded intent summaries for both sides of a conflict."""
+        worker_intent = _envelope_text(envelope, "summary")
+        if worker_intent is None:
+            worker_intent = spec.get("task") if isinstance(spec.get("task"), str) else None
+        if worker_intent is None:
+            worker_intent = f"worker branch {spec.get('branch', '<unknown>')}"
+
+        parent_task_id = spec.get("parent_task_id")
+        parent_spec = (
+            self._session_spec(parent_task_id) if isinstance(parent_task_id, str) else None
+        )
+        integration_intent = (
+            parent_spec.get("task")
+            if parent_spec is not None and isinstance(parent_spec.get("task"), str)
+            else None
+        )
+        if integration_intent is None:
+            integration_intent = f"integrate onto refs/heads/main at {integration_head}"
+        return {
+            "worker": _cap_utf8(worker_intent, MAX_ENVELOPE_FIELD_CHARS),
+            "integration": _cap_utf8(integration_intent, MAX_ENVELOPE_FIELD_CHARS),
+        }
+
+    def _build_resolver_spec(
+        self,
+        spec: dict[str, Any],
+        conflict: Mapping[str, Any],
+        envelope: Mapping[str, Any] | None,
+        *,
+        attempt: int,
+        max_attempts: int,
+    ) -> dict[str, Any]:
+        """Create a fresh, write-authorized child spec for one conflict attempt."""
+        repo = Path(spec["repo"]).resolve()
+        integration_head = conflict.get("integration_head")
+        if not isinstance(integration_head, str) or not integration_head:
+            raise ValueError("merge conflict has no integration head")
+        raw_files = conflict.get("conflicted_files")
+        conflicted_files = [
+            _cap_utf8(path, MAX_ENVELOPE_FIELD_CHARS)
+            for path in raw_files[:MAX_ENVELOPE_ITEMS]
+            if isinstance(path, str)
+        ] if isinstance(raw_files, list) else []
+        raw_evidence = conflict.get("diff_evidence", "")
+        diff_evidence = (
+            _cap_utf8(raw_evidence, MAX_ENVELOPE_FIELD_CHARS)
+            if isinstance(raw_evidence, str)
+            else ""
+        )
+        task_id = spec["task_id"]
+        digest = hashlib.sha256(f"{task_id}:{attempt}:{time.time_ns()}".encode()).hexdigest()[:16]
+        resolver_task_id = f"{task_id}-resolver-{attempt}-{digest}"
+        resolver_branch = f"cambium-resolver/{digest}-{attempt}"
+        resolver_worktree = (
+            self._session_dir / ".cambium" / "resolver-wt" / f"task-{digest}-{attempt}"
+        )
+        parent_task_id = spec.get("parent_task_id")
+        parent_task_id = parent_task_id if isinstance(parent_task_id, str) else None
+        parent_envelope = self._strict_envelope(
+            spec, dict(envelope) if envelope is not None else {}
+        )
+        resolver_worker = spec.get("resolver_worker", spec.get("worker", "cambium.worker"))
+        if not isinstance(resolver_worker, str) or not resolver_worker:
+            resolver_worker = "cambium.worker"
+        intent_summaries = self._resolver_intent_summaries(spec, envelope, integration_head)
+
+        resolver_spec = copy.deepcopy(spec)
+        for field in ("proposed_children", "resume", "context_fork", "summary_trunk_ref"):
+            resolver_spec.pop(field, None)
+        resolver_spec.update(
+            {
+                "task_id": resolver_task_id,
+                "kind": "resolver",
+                "task": (
+                    f"Resolve the merge conflict in {', '.join(conflicted_files) or 'the staged files'}; "
+                    "produce a committed merged result or report an explicit unresolvable verdict."
+                ),
+                "repo": str(repo),
+                "worktree_path": str(resolver_worktree.resolve()),
+                "branch": resolver_branch,
+                "base_commit": integration_head,
+                "worker": resolver_worker,
+                "parent_task_id": parent_task_id,
+                "parent_envelope": parent_envelope,
+                "resolver_child_enabled": False,
+                "resolver_max_attempts": 0,
+                "resolver_attempt": attempt,
+                "resolver_integration_head": integration_head,
+                "resolver_conflict_task_id": task_id,
+                "resolver_write_authority": True,
+                "conflicted_files": conflicted_files,
+                "diff_evidence": diff_evidence,
+                "diff_truncated": bool(conflict.get("diff_truncated", False)),
+                "parent_intent_summaries": intent_summaries,
+                "_resolver_child": True,
+                "_resolver_source_branch": spec["branch"],
+                "_resolver_prepared": False,
+                "_retain_worktree": False,
+            }
+        )
+        # A resolver is not a provider-scheduling escape hatch: it inherits
+        # the parent's authorization and any already-assigned provider.
+        resolver_spec["resolver_max_attempts"] = max_attempts
+        return _validate_plan_task(self._session_dir, resolver_spec)
+
+    async def _prepare_resolver_worktree(self, spec: dict[str, Any]) -> None:
+        """Seed a fresh resolver branch with the unresolved two-parent merge."""
+        if spec.get("_resolver_prepared"):
+            return
+        repo = Path(spec["repo"])
+        worktree = Path(spec["worktree_path"])
+        source_branch = spec.get("_resolver_source_branch")
+        if not isinstance(source_branch, str) or not source_branch:
+            raise ValueError("resolver source branch is missing")
+        async with self._merge_lock:
+            integration_head = await self._git_stdout(
+                repo, "rev-parse", "refs/heads/main", check=False
+            )
+            if not integration_head:
+                raise RuntimeError("no refs/heads/main to seed resolver staging")
+            spec["base_commit"] = integration_head
+            reset = await self._git(worktree, "reset", "--hard", integration_head, check=False)
+            if reset.returncode != 0:
+                raise RuntimeError(
+                    f"resolver worktree reset failed: {(reset.stderr + reset.stdout).strip()[:512]}"
+                )
+            clean = await self._git(
+                worktree, "clean", "-fd", "-e", ".cambium/", check=False
+            )
+            if clean.returncode != 0:
+                raise RuntimeError(
+                    f"resolver worktree clean failed: {(clean.stderr + clean.stdout).strip()[:512]}"
+                )
+            merge = await self._git(
+                worktree,
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                "--no-edit",
+                source_branch,
+                check=False,
+            )
+            status = await self._git(
+                worktree,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+                "-z",
+                check=False,
+            )
+            if status.returncode != 0:
+                raise RuntimeError("cannot inspect resolver staging worktree")
+            conflicted = [
+                record[3:]
+                for record in status.stdout.split("\0")
+                if len(record) >= 4
+                and record[:2] in _RESOLVER_UNMERGED_PAIRS
+                and record[3:]
+            ]
+            if merge.returncode != 0 and not conflicted:
+                raise RuntimeError(
+                    f"resolver seed merge failed: {(merge.stderr + merge.stdout).strip()[:512]}"
+                )
+            diff = await self._git(
+                worktree, "diff", "--no-ext-diff", "--no-color", "--binary", "--", check=False
+            )
+            if conflicted:
+                spec["conflicted_files"] = list(
+                    dict.fromkeys(
+                        [*spec.get("conflicted_files", ()), *conflicted]
+                    )
+                )[:MAX_ENVELOPE_ITEMS]
+            if diff.returncode == 0 and diff.stdout:
+                spec["diff_evidence"] = _cap_utf8(diff.stdout, MAX_ENVELOPE_FIELD_CHARS)
+            spec["resolver_integration_head"] = integration_head
+            spec["_resolver_prepared"] = True
+        await self.emit(
+            "resolver_staging_prepared",
+            task_id=spec["task_id"],
+            parent_task_id=spec.get("parent_task_id"),
+            source_branch=source_branch,
+            integration_head=spec.get("resolver_integration_head"),
+            conflicted_files=spec.get("conflicted_files", ()),
+            write_authority=True,
+        )
+
+    async def _cleanup_resolver_worktree(self, spec: dict[str, Any]) -> None:
+        """Remove a resolver's private worktree and branch after its attempt."""
+        try:
+            await self._prune_worktree(spec, force=True)
+        except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError) as exc:
+            await self.emit(
+                "resolver_cleanup_failed",
+                task_id=spec["task_id"],
+                reason=exc.__class__.__name__,
+            )
+        finally:
+            self._cleanup_attempted.add(spec["task_id"])
+
+    async def _resolve_merge_conflict(
+        self,
+        spec: dict[str, Any],
+        handle: WorkerHandle,
+        conflict: dict[str, Any],
+        envelope: Mapping[str, Any] | None,
+        sanitized_envelope: dict[str, Any] | None,
+    ) -> str | None:
+        """Run bounded resolver children and publish only after the join check."""
+        if not self._resolver_enabled_for(spec):
+            return None
+        max_attempts = self._resolver_attempt_limit(spec)
+        parent_task_id = spec.get("parent_task_id")
+        parent_spec = (
+            self._session_spec(parent_task_id)
+            if isinstance(parent_task_id, str)
+            else None
+        )
+        integration_head = conflict.get("integration_head")
+        if not isinstance(integration_head, str) or not integration_head:
+            integration_head = await self._git_stdout(
+                Path(spec["repo"]), "rev-parse", "refs/heads/main", check=False
+            )
+        if not integration_head:
+            self._resolver_failures[spec["task_id"]] = "resolver_missing_integration_head"
+            return None
+        # A conflict itself establishes the head against which the suspended
+        # parent must be joined.  Keep a pre-existing accepted head if another
+        # child won the merge race before this resolver was admitted.
+        if isinstance(parent_task_id, str):
+            self._accepted_integration_heads.setdefault(parent_task_id, integration_head)
+        if max_attempts == 0:
+            self._resolver_failures[spec["task_id"]] = "resolver_attempts_exhausted"
+            await self.emit(
+                "resolver_failed",
+                task_id=spec["task_id"],
+                parent_task_id=parent_task_id,
+                status="attempts_exhausted",
+                reason="resolver_attempts_exhausted",
+                conflicted_files=conflict.get("conflicted_files", ()),
+                diff_evidence=conflict.get("diff_evidence", ""),
+                attempts=0,
+                max_attempts=max_attempts,
+            )
+            return None
+
+        last_status = "failed"
+        last_reason = "resolver_failed"
+        for attempt in range(1, max_attempts + 1):
+            resolver_spec = self._build_resolver_spec(
+                spec,
+                conflict,
+                envelope,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            resolver_task_id = resolver_spec["task_id"]
+            self._session_tasks.append(
+                {
+                    "task_id": resolver_task_id,
+                    "kind": "resolver",
+                    "depends_on": [spec["task_id"]],
+                    "spec": resolver_spec,
+                }
+            )
+            try:
+                await self.emit(
+                    "resolver_child_admitted",
+                    task_id=spec["task_id"],
+                    parent_task_id=parent_task_id,
+                    resolver_task_id=resolver_task_id,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    conflicted_files=resolver_spec["conflicted_files"],
+                    diff_evidence=resolver_spec["diff_evidence"],
+                    diff_truncated=resolver_spec["diff_truncated"],
+                    parent_intent_summaries=resolver_spec["parent_intent_summaries"],
+                    source_branch=resolver_spec["_resolver_source_branch"],
+                    staging_branch=resolver_spec["branch"],
+                    write_authority=True,
+                )
+                coroutine = self.supervise_task(resolver_spec)
+                if self._task_group is None:
+                    await coroutine
+                else:
+                    child_task = self._task_group.create_task(coroutine)
+                    await child_task
+            except asyncio.CancelledError:
+                await self._cleanup_resolver_worktree(resolver_spec)
+                raise
+
+            resolver_result = self._results.get(resolver_task_id)
+            resolver_envelope = self._task_envelopes.get(resolver_task_id)
+            explicit_unresolvable = bool(
+                resolver_envelope is not None
+                and (
+                    resolver_envelope.get("status") == "unresolvable"
+                    or str(resolver_envelope.get("failure_reason", "")).lower()
+                    in {"unresolvable", "resolver_unresolvable", "unresolvable_verdict"}
+                )
+            )
+            if resolver_result is not None and resolver_result.status == "succeeded":
+                if parent_spec is not None and not await self._assert_parent_join_invariant(
+                    parent_spec,
+                    [spec["task_id"], resolver_task_id],
+                    handle.generation,
+                    consume=False,
+                ):
+                    last_status = "join_invariant_failed"
+                    last_reason = "join_invariant_failed"
+                    self._results[resolver_task_id] = replace(
+                        resolver_result,
+                        status="failed",
+                        exit_code=1,
+                        reason=last_reason,
+                    )
+                    await self.emit(
+                        "resolver_failed",
+                        task_id=spec["task_id"],
+                        parent_task_id=parent_task_id,
+                        resolver_task_id=resolver_task_id,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        status=last_status,
+                        reason=last_reason,
+                        conflicted_files=resolver_spec["conflicted_files"],
+                        diff_evidence=resolver_spec["diff_evidence"],
+                    )
+                    await self._cleanup_resolver_worktree(resolver_spec)
+                    self._resolver_failures[spec["task_id"]] = last_reason
+                    return None
+                resolver_handle = self._handles.get(resolver_task_id)
+                if resolver_handle is not None:
+                    merged = await self._merge_task(resolver_spec, resolver_handle)
+                else:
+                    merged = None
+                if merged is not None:
+                    if parent_spec is not None and not await self._assert_parent_join_invariant(
+                        parent_spec,
+                        [spec["task_id"], resolver_task_id],
+                        handle.generation,
+                    ):
+                        last_status = "join_invariant_failed"
+                        last_reason = "join_invariant_failed"
+                        self._results[resolver_task_id] = replace(
+                            resolver_result,
+                            status="failed",
+                            exit_code=1,
+                            reason=last_reason,
+                        )
+                        await self.emit(
+                            "resolver_failed",
+                            task_id=spec["task_id"],
+                            parent_task_id=parent_task_id,
+                            resolver_task_id=resolver_task_id,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            status=last_status,
+                            reason=last_reason,
+                            merge_sha=merged,
+                        )
+                        await self._cleanup_resolver_worktree(resolver_spec)
+                        self._resolver_failures[spec["task_id"]] = last_reason
+                        return None
+                    self._results[resolver_task_id] = replace(
+                        resolver_result, merge_sha=merged
+                    )
+                    await self.emit(
+                        "resolver_succeeded",
+                        task_id=spec["task_id"],
+                        parent_task_id=parent_task_id,
+                        resolver_task_id=resolver_task_id,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        status="succeeded",
+                        merge_sha=merged,
+                    )
+                    if sanitized_envelope is not None:
+                        self._last_envelope = sanitized_envelope
+                        self._task_envelopes[spec["task_id"]] = sanitized_envelope
+                    await self._cleanup_resolver_worktree(resolver_spec)
+                    return merged
+                last_reason = "resolver_merge_failed"
+            else:
+                last_reason = (
+                    _envelope_text(resolver_envelope, "failure_reason")
+                    if resolver_envelope is not None
+                    else None
+                ) or (
+                    resolver_result.reason
+                    if resolver_result is not None and resolver_result.reason
+                    else "resolver_failed"
+                )
+            last_status = "unresolvable" if explicit_unresolvable else "failed"
+            await self.emit(
+                "resolver_failed",
+                task_id=spec["task_id"],
+                parent_task_id=parent_task_id,
+                resolver_task_id=resolver_task_id,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                status=last_status,
+                reason=last_reason,
+                summary=_envelope_text(resolver_envelope, "summary"),
+                conflicted_files=resolver_spec["conflicted_files"],
+                diff_evidence=resolver_spec["diff_evidence"],
+            )
+            if resolver_result is None or resolver_result.status == "succeeded":
+                self._results[resolver_task_id] = TaskResult(
+                    task_id=resolver_task_id,
+                    status="failed",
+                    exit_code=1,
+                    reason=last_reason,
+                )
+            await self._cleanup_resolver_worktree(resolver_spec)
+            if explicit_unresolvable:
+                self._resolver_failures[spec["task_id"]] = "resolver_unresolvable"
+            elif attempt == max_attempts:
+                self._resolver_failures[spec["task_id"]] = "resolver_attempts_exhausted"
+        return None
+
     async def _merge_task(self, spec: dict[str, Any], handle: WorkerHandle) -> str | None:
         """Stage and atomically publish the worker branch onto refs/heads/main.
 
         On a non-fast-forward refusal a backward-compatible ``merge_failed``
         event is appended.  A conflict uses that same event kind but carries a
-        structured ``status=merge_conflict`` envelope; no resolver child is
-        spawned here.
+        structured ``status=merge_conflict`` envelope.  The envelope is kept
+        in ``_merge_conflicts`` so the task supervisor can optionally admit a
+        dedicated resolver child without changing this method's ``None``
+        return contract.
         """
         task_id = spec["task_id"]
         repo = Path(spec["repo"])
@@ -5291,6 +5800,7 @@ class _Runtime:
         merge_failed = False
         staging_tip: str | None = None
         current_main: str | None = None
+        self._merge_conflicts.pop(task_id, None)
         try:
             async with self._merge_lock:  # Unio single-writer: serialized merges
                 current_main = await self._git_stdout(
@@ -5351,6 +5861,7 @@ class _Runtime:
                     "integration_head": exc.integration_head or current_main,
                     "generation": handle.generation,
                 }
+                self._merge_conflicts[task_id] = dict(conflict_payload)
                 await self.emit(
                     "merge_failed",
                     task_id=task_id,
