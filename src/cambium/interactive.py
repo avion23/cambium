@@ -141,7 +141,11 @@ class InteractiveSession:
     """Single-writer semantic branch spanning many one-shot supervisor leaves."""
 
     def __init__(self, config: OneShotConfig) -> None:
-        self._base_config = config
+        # Keep the interactive marker at the frontend boundary.  A caller may
+        # construct ``InteractiveSession(OneShotConfig())`` directly (without
+        # going through the CLI), and those turns must still receive the
+        # throughput-aware default instead of the one-shot fallback.
+        self._base_config = replace(config, interactive=True)
         self.repo = oneshot.resolve_repo(config.repo)
         if config.session_root is None:
             self.root = oneshot.allocate_session_dir(self.repo)

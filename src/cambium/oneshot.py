@@ -9,6 +9,8 @@ only the selected environment name to the worker process.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import subprocess
 import tempfile
@@ -44,6 +46,14 @@ from .supervisor import (
 # 50 accommodates real multi-step work (read/diagnose/fix/verify plus a full
 # test suite) while wall/token budgets and --max-turns still bound the loop.
 DEFAULT_MAX_TURNS = 50
+
+# Interactive turns are deliberately more patient than a normal one-shot
+# only when their provider has demonstrated that it needs the time.  The
+# fallback remains the supervisor's historical five-minute budget; a first
+# turn can use the provider's static ``throughput_hint_tps`` and later turns
+# use the durable usage events from the current interactive branch.
+DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS = 12_000
+DEFAULT_INTERACTIVE_THROUGHPUT_SAFETY_FACTOR = 2.0
 
 
 class RoutingMode(Enum):
@@ -132,7 +142,12 @@ class OneShotConfig:
     provider_env_keys: tuple[str, ...] = ()
     fanout_config: Mapping[str, Any] | None = None
     base_commit: str | None = None
-    max_wall_s: float = DEFAULT_WALL_BUDGET_S
+    # ``None`` means use the normal 300-second default for one-shot plans or
+    # calculate the throughput-aware default for an interactive turn.
+    max_wall_s: float | None = None
+    interactive: bool = False
+    interactive_wall_budget_s: float | None = None
+    interactive_throughput_safety_factor: float = DEFAULT_INTERACTIVE_THROUGHPUT_SAFETY_FACTOR
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_turns: int = DEFAULT_MAX_TURNS
     max_restarts: int = 0
@@ -147,6 +162,23 @@ class OneShotConfig:
     def __post_init__(self) -> None:
         if self.auto:
             object.__setattr__(self, "routing_mode", RoutingMode.USAGE_BALANCED)
+        for name, value in (
+            ("max_wall_s", self.max_wall_s),
+            ("interactive_wall_budget_s", self.interactive_wall_budget_s),
+        ):
+            if value is not None:
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"{name} must be a finite positive number") from None
+                if not math.isfinite(parsed) or parsed <= 0:
+                    raise ValueError(f"{name} must be a finite positive number")
+        try:
+            safety_factor = float(self.interactive_throughput_safety_factor)
+        except (TypeError, ValueError):
+            raise ValueError("interactive_throughput_safety_factor must be at least 2") from None
+        if not math.isfinite(safety_factor) or safety_factor < 2:
+            raise ValueError("interactive_throughput_safety_factor must be at least 2")
 
     @property
     def task(self) -> str:
@@ -241,6 +273,198 @@ def _provider_config_path(config: OneShotConfig, repo: Path) -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
+
+
+def _interactive_history_dirs(session_dir: str | Path | None) -> tuple[Path, ...]:
+    """Return completed turn leaves for the current interactive branch.
+
+    ``run_oneshot`` resolves a provider after :class:`InteractiveSession` has
+    allocated the next ``turn-NNNN`` directory.  Reading the parent here keeps
+    the budget decision at the same config-to-plan boundary while avoiding a
+    dependency from the oneshot layer back into the interactive session
+    object.  A malformed or unavailable history is intentionally treated as
+    no history; a stale metrics file must never make a prompt fail.
+    """
+    if session_dir is None:
+        return ()
+    candidate = Path(session_dir).expanduser().resolve()
+    root = candidate.parent if candidate.name.startswith("turn-") else candidate
+    if not root.is_dir():
+        return ()
+    branch_start_turn = 0
+    manifest = root / ".cambium" / "interactive.json"
+    try:
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        value = document.get("branch_start_turn") if isinstance(document, dict) else None
+        if type(value) is int and value >= 0:
+            branch_start_turn = value
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    turns: list[tuple[int, Path]] = []
+    try:
+        children = tuple(root.iterdir())
+    except OSError:
+        return ()
+    for child in children:
+        if not child.is_dir() or not child.name.startswith("turn-"):
+            continue
+        try:
+            number = int(child.name.removeprefix("turn-"))
+        except ValueError:
+            continue
+        if number > branch_start_turn:
+            turns.append((number, child))
+    return tuple(path for _number, path in sorted(turns))
+
+
+def _usage_count(value: object) -> float | None:
+    """Return a finite non-negative usage count without trusting event data."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _usage_output_tokens(payload: Mapping[str, Any]) -> float | None:
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        return None
+    for key in ("completion_tokens", "output_tokens"):
+        value = _usage_count(usage.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _interactive_observed_metrics(
+    session_dir: str | Path | None,
+    *,
+    provider: str | None,
+    model: str | None,
+) -> tuple[float | None, float]:
+    """Return ``(output_tokens_per_second, largest_turn_output_tokens)``.
+
+    Usage events carry provider latency and output counts, so the weighted
+    rate is more stable than averaging per-call rates.  The largest completed
+    turn is a conservative estimate for the next turn's output volume.  Only
+    the active interactive branch is considered, which keeps ``/reset`` from
+    inheriting an old provider's performance profile.
+    """
+    total_output = 0.0
+    total_latency = 0.0
+    largest_turn_output = 0.0
+    for turn_dir in _interactive_history_dirs(session_dir):
+        turn_output = 0.0
+        try:
+            events = supervisor.read_events(turn_dir)
+        except Exception:  # noqa: BLE001 - history is advisory, never fatal
+            continue
+        for event in events:
+            if event.get("kind") != "usage_event":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if provider is not None and payload.get("provider") != provider:
+                continue
+            if model is not None and payload.get("model") != model:
+                continue
+            output = _usage_output_tokens(payload)
+            if output is None:
+                continue
+            turn_output += output
+            total_output += output
+            latency = _usage_count(payload.get("latency_s"))
+            if latency is not None and latency > 0:
+                total_latency += latency
+        largest_turn_output = max(largest_turn_output, turn_output)
+    rate = total_output / total_latency if total_output > 0 and total_latency > 0 else None
+    return rate, largest_turn_output
+
+
+def _interactive_wall_budget_s(
+    config: OneShotConfig,
+    providers: list[Any] | tuple[Any, ...] = (),
+    *,
+    session_dir: str | Path | None = None,
+) -> float:
+    """Resolve the effective wall budget for a one-shot or interactive turn.
+
+    Explicit ``max_wall_s`` and ``interactive_wall_budget_s`` values win.  An
+    interactive default starts at the historical 300 seconds and grows when
+    either the selected provider's configured throughput hint or the current
+    branch's measured output rate says that the estimated output would need
+    longer.  The factor is never allowed below two, protecting slow providers
+    from a deadline that is merely their nominal generation time.
+    """
+    if config.max_wall_s is not None:
+        return float(config.max_wall_s)
+    if not config.interactive:
+        return DEFAULT_WALL_BUDGET_S
+    if config.interactive_wall_budget_s is not None:
+        return float(config.interactive_wall_budget_s)
+
+    selected_name = config.provider
+    candidates = list(providers)
+    if selected_name is not None:
+        candidates = [item for item in candidates if getattr(item, "name", None) == selected_name]
+
+    configured_budgets = [
+        float(value)
+        for value in (getattr(item, "interactive_wall_budget_s", None) for item in candidates)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+    ]
+    if configured_budgets:
+        # An auto/cascade turn may be assigned to any authorized candidate;
+        # choose the largest declared bound so the chosen provider is covered.
+        return max(configured_budgets)
+
+    observed_rate, observed_output = _interactive_observed_metrics(
+        session_dir,
+        provider=selected_name,
+        model=config.model,
+    )
+    hints = [
+        float(value)
+        for value in (getattr(item, "throughput_hint_tps", 0.0) for item in candidates)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+    ]
+    throughput = observed_rate
+    if throughput is None and hints:
+        # The slowest authorized candidate is the safe default for a cascade;
+        # a fast sibling cannot rescue a turn that was assigned elsewhere.
+        throughput = min(hints)
+    if throughput is None or throughput <= 0:
+        return DEFAULT_WALL_BUDGET_S
+
+    estimated_output = max(
+        DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS,
+        observed_output,
+    )
+    estimated_output = min(float(config.max_tokens), estimated_output)
+    scaled = estimated_output / throughput * max(
+        2.0, float(config.interactive_throughput_safety_factor)
+    )
+    return max(DEFAULT_WALL_BUDGET_S, scaled)
+
+
+def _apply_interactive_wall_budget(
+    config: OneShotConfig,
+    providers: list[Any] | tuple[Any, ...],
+) -> OneShotConfig:
+    """Materialize the resolved budget before the supervisor plan is built."""
+    if config.max_wall_s is not None or not config.interactive:
+        return config
+    return replace(
+        config,
+        max_wall_s=_interactive_wall_budget_s(
+            config,
+            providers,
+            session_dir=config.session_root,
+        ),
+    )
 
 
 def _stored_provider_environment(
@@ -396,7 +620,7 @@ def _resolve_provider(
             ),
             model_candidates=tuple(sorted({candidate.model for candidate in authorized})),
         )
-        return resolved, environment
+        return _apply_interactive_wall_budget(resolved, authorized), environment
 
     if (
         config.fanout_config is not None
@@ -409,7 +633,7 @@ def _resolve_provider(
         environment = {}
         for env_name in config.provider_env_keys:
             environment.update(_stored_provider_environment(env_name, auth_store))
-        return config, environment
+        return _apply_interactive_wall_budget(config, ()), environment
 
     config_path = _provider_config_path(config, repo)
     try:
@@ -481,7 +705,7 @@ def _resolve_provider(
         ),
         fanout_config=fanout_config,
     )
-    return resolved, environment
+    return _apply_interactive_wall_budget(resolved, [selected]), environment
 
 
 def allocate_session_dir(repo: str | Path) -> Path:
@@ -519,6 +743,10 @@ def build_plan(
     )
     if config.session_mode is SessionMode.RESUME:
         admit_session(config, target_session)
+    effective_wall_s = _interactive_wall_budget_s(
+        config,
+        session_dir=target_session,
+    )
     task_id = config.task_id or "oneshot"
     worktree = (
         Path(config.worktree_path).expanduser().resolve()
@@ -534,7 +762,7 @@ def build_plan(
         "branch": branch,
         "worker": config.worker,
         "provider_env_keys": list(config.provider_env_keys),
-        "max_wall_s": config.max_wall_s,
+        "max_wall_s": effective_wall_s,
         "max_tokens": int(config.max_tokens),
         "max_turns": int(config.max_turns),
         "max_restarts": config.max_restarts,

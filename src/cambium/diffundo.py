@@ -325,6 +325,9 @@ class ProviderConfig:
     ``api_key_env`` (the transport derives the endpoint from the profile).
     ``reasoning_effort`` is a normal (non-secret) config field emitted as the
     Responses-API ``reasoning: {effort}`` body field on the codex path.
+    ``throughput_hint_tps`` and ``interactive_wall_budget_s`` are optional
+    operator hints used by the interactive frontend when it chooses a turn
+    deadline; they never alter provider transport timeouts.
     """
 
     name: str
@@ -360,6 +363,7 @@ class ProviderConfig:
     price_per_1m_cached_in: float = 0.0
     pricing_known: bool = False
     throughput_hint_tps: float = 0.0
+    interactive_wall_budget_s: float | None = None
     quality_weight: float = 1.0
     supports_native_tools: bool = True
     supports_python_tool: bool = True

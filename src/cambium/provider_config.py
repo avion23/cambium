@@ -101,6 +101,7 @@ _PROVIDER_FIELDS = frozenset(
         "price_per_1m_out",
         "pricing_known",
         "throughput_hint_tps",
+        "interactive_wall_budget_s",
         "quality_weight",
         "supports_native_tools",
         "supports_python_tool",
@@ -131,6 +132,7 @@ _DEFAULTS: dict[str, object] = {
     "price_per_1m_out": 0.0,
     "pricing_known": False,
     "throughput_hint_tps": 0.0,
+    "interactive_wall_budget_s": None,
     "quality_weight": 1.0,
     "supports_native_tools": True,
     "supports_python_tool": True,
@@ -165,6 +167,7 @@ class _ProviderMapping(TypedDict):
     price_per_1m_out: float
     pricing_known: bool
     throughput_hint_tps: float
+    interactive_wall_budget_s: float | None
     quality_weight: float
     supports_native_tools: bool
     supports_python_tool: bool
@@ -504,6 +507,17 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     throughput_hint_tps = _require_number(
         values["throughput_hint_tps"], f"{location}.throughput_hint_tps"
     )
+    interactive_wall_budget_value = values["interactive_wall_budget_s"]
+    if interactive_wall_budget_value is None:
+        interactive_wall_budget_s = None
+    else:
+        interactive_wall_budget_s = _require_number(
+            interactive_wall_budget_value, f"{location}.interactive_wall_budget_s"
+        )
+        if interactive_wall_budget_s <= 0:
+            raise _error(
+                f"{location}.interactive_wall_budget_s", "must be greater than 0"
+            )
     quality_weight = _require_number(values["quality_weight"], f"{location}.quality_weight")
     if throughput_hint_tps < 0 or quality_weight < 0:
         raise _error(location, "throughput_hint_tps and quality_weight must be non-negative")
@@ -557,6 +571,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "price_per_1m_out": price_per_1m_out,
         "pricing_known": pricing_known,
         "throughput_hint_tps": throughput_hint_tps,
+        "interactive_wall_budget_s": interactive_wall_budget_s,
         "quality_weight": quality_weight,
         "supports_native_tools": supports_native_tools,
         "supports_python_tool": supports_python_tool,
@@ -654,6 +669,7 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "price_per_1m_cached_in": values["price_per_1m_cached_in"],
         "pricing_known": values["pricing_known"],
         "throughput_hint_tps": values["throughput_hint_tps"],
+        "interactive_wall_budget_s": values["interactive_wall_budget_s"],
         "quality_weight": values["quality_weight"],
         "supports_native_tools": values["supports_native_tools"],
         "supports_python_tool": values["supports_python_tool"],
