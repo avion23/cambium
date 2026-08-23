@@ -11,9 +11,9 @@ from __future__ import annotations
 import math
 import os
 import re
-import sqlite3
 import shutil
 import signal
+import sqlite3
 import textwrap
 from collections import deque
 from collections.abc import Mapping
