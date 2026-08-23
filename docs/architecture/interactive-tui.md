@@ -59,15 +59,36 @@ starting from an unrelated prompt.
 
 ```text
 /help       command help
-/session    persistent root path
-/context    current lineage/checkpoint/provider
+/session    persistent root path and branch identity
+/model      current provider/model lease
+/context    current lineage/checkpoint/provider and trunk shape
 /usage      cumulative frontend usage
 /agents     latest main/sub-agent table
+/dashboard  copy the latest full dashboard into normal scrollback
+/events     recent durable event summaries
 /new        fresh context lineage; old artifacts remain durable
+/clear      clear the terminal
 /exit       close the frontend
 ```
 
 Multiline prompts start with `<<<` on a line by itself and end with `>>>`.
+Native terminals use the system readline implementation for editing and history.
+History is stored privately at
+`<interactive-root>/.cambium/tui_history`, limited to 1,000 entries and mode
+`0600`.
+
+## Cancellation
+
+While a turn is active, Ctrl-C cancels only that turn and returns to the input
+prompt. Cancellation propagates through the canonical supervisor task, so its
+worker processes and child tasks receive normal structured cancellation. The
+cancelled leaf remains auditable, but it cannot advance the interactive branch
+head. The next prompt therefore resumes from the last successfully published
+checkpoint rather than from a partial response.
+
+Ctrl-C while the frontend is waiting for input retains the ordinary terminal
+interrupt behavior. `/cancel` at an idle prompt explains the active-turn
+shortcut rather than pretending that an operation is running.
 
 ## TUI contents
 
@@ -81,21 +102,29 @@ While a turn is active the alternate-screen dashboard displays:
 - context epoch, immutable summary-trunk size, and raw-tail size;
 - current tool and recent durable events.
 
+Semantic colors distinguish active, successful, failed, main-agent, and
+sub-agent rows. `NO_COLOR`, `TERM=dumb`, pipes, and machine-readable output
+remain free of ANSI decoration.
+
 After a turn, Cambium leaves the alternate screen, renders the final model
 summary as terminal Markdown, prints turn usage, and prints cumulative usage for
 the interactive frontend. Normal terminal scrollback is therefore retained for
-completed results.
+completed results. `/dashboard` provides a static copy of the latest dashboard
+when the operator wants the complete view in scrollback.
 
 ## Correctness boundary
 
 The adapter is deliberately thin:
 
-1. first turns use the ordinary `oneshot.run_oneshot` path;
-2. continuation turns use the same oneshot provider resolution and plan builder;
+1. first turns use the ordinary one-shot provider-resolution and supervisor path;
+2. continuation turns use the same plan builder and execution path;
 3. the adapter adds only the already-validated `context_fork` and
    `summary_trunk_ref` descriptors;
 4. execution still belongs to the canonical supervisor;
-5. every turn has its own event store and publication transaction.
+5. every turn has its own event store and publication transaction;
+6. only a successful turn with a durable context event may publish the next
+   interactive branch head;
+7. cancelled and failed turns leave the previous branch head unchanged.
 
 This avoids weakening the existing session-reuse guard merely to obtain a chat
 loop. The user sees one long branch, while the supervisor retains isolated,
