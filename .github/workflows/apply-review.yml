@@ -37,6 +37,8 @@ jobs:
         run: |
           uv lock
           uv sync --locked --extra dev
+      - name: Normalize generated imports
+        run: uv run ruff check --fix --select I src/cambium/worker.py
       - name: Ruff
         run: uv run ruff check src tests
       - name: Compile
