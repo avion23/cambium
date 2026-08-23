@@ -88,10 +88,10 @@ def test_ctrl_c_cancels_active_turn_and_returns_to_prompt(monkeypatch, tmp_path:
             self.session_dir = session_dir
 
     def prepare_turn(self, _prompt):
-        self.turn += 1
-        session_dir = self.root / f"turn-{self.turn:04d}"
+        self._turn += 1
+        session_dir = self.root / f"turn-{self._turn:04d}"
         session_dir.mkdir(parents=True)
-        return _Turn(self.turn, session_dir)
+        return _Turn(self._turn, session_dir)
 
     async def fake_run(self, _turn, *, on_event=None):
         del on_event
