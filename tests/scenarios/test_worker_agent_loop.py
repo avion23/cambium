@@ -616,10 +616,17 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
     (worktree / "large.txt").write_text("x" * 20_000, encoding="utf-8")
     budget = 5_000
     config = replace(_agent_config(worktree), max_transcript_chars=budget)
-    read = '{"type":"tool_call","name":"read_batch","arguments":{"paths":["large.txt"]}}'
+    # Distinct paths keep every action novel under content-based progress
+    # detection while still growing the transcript past the budget.
+    for index in range(8):
+        (worktree / f"large{index}.txt").write_text("x" * 20_000, encoding="utf-8")
     router = _ScriptedRouter(
         ['{"type":"plan","steps":["inspect repeatedly","finish"]}']
-        + [read] * 7
+        + [
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":'
+            f'["large{index}.txt"]}}}}'
+            for index in range(7)
+        ]
         + ['{"type":"finish","summary":"bounded transcript"}']
     )
 
@@ -853,9 +860,9 @@ def test_consecutive_plan_actions_fail_fast_with_no_progress_reason(
     router = _ScriptedRouter(
         [
             '{"type":"plan","steps":["a"]}',
-            '{"type":"plan","steps":["b"]}',
-            '{"type":"plan","steps":["c"]}',
-            '{"type":"plan","steps":["d"]}',
+            '{"type":"plan","steps":["a"]}',
+            '{"type":"plan","steps":["a"]}',
+            '{"type":"plan","steps":["a"]}',
             '{"type":"plan","steps":["e"]}',
             '{"type":"finish","summary":"must never be reached"}',
         ]
