@@ -241,7 +241,7 @@ def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
     # Failed tool events are owned by the consolidated failure block, not the
     # transcript: successes render as compact lines, the failure does not
     # duplicate as a transcript entry.
-    assert "✓ run_shell 141ms" in text
+    assert "✓ run_shell ×2 · last 2395ms" in text
     assert "✗ run_shell 9273ms" not in text
     assert len(transcript.entries) == 2
 
