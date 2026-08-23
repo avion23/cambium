@@ -1,8 +1,9 @@
 """Pure presentation tests for the persistent terminal cockpit."""
 
+import io
 from types import SimpleNamespace
 
-from cambium.tui_screen import Transcript, render_cockpit
+from cambium.tui_screen import ActivityState, Cockpit, Transcript, render_cockpit
 
 
 def _snapshot():
@@ -270,3 +271,97 @@ def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     assert "✓ run_shell 9273ms" in text
     assert "✓ git_op 2395ms" in text
     assert "×" not in text
+
+
+def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
+    activity = ActivityState()
+    activity.start(now=10.0)
+
+    thinking = activity.render(now=10.0)
+    assert thinking.startswith("⠋ ")
+    assert "thinking… 0.0s" in thinking
+    assert activity.tick(now=10.1).startswith("⠙ ")
+
+    activity.observe_event(
+        {"kind": "assistant_delta", "payload": {"delta": "I will inspect this."}},
+        now=11.0,
+    )
+    assert "responding… 2.0s" in activity.render(now=12.0)
+
+    activity.observe_event(
+        {
+            "kind": "tool_start",
+            "payload": {"tool": "run_shell", "tool_call_id": "call-1"},
+        },
+        now=13.0,
+    )
+    running = activity.render(now=14.5)
+    assert "running run_shell 1.5s" in running
+    assert "turn 4.5s" in running
+    frame = render_cockpit(
+        _snapshot(),
+        Transcript(),
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=80,
+        height=22,
+        activity_line=running,
+    )
+    assert any("running run_shell 1.5s" in line for line in frame)
+
+    activity.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "run_shell",
+                "tool_call_id": "call-1",
+                "ok": True,
+                "duration_ms": 1500,
+            },
+        },
+        now=15.0,
+    )
+    assert "thinking… 5.0s" in activity.render(now=15.0)
+
+    activity.stop()
+    assert activity.render(now=16.0) == ""
+
+
+def test_activity_redraw_is_silent_for_non_tty() -> None:
+    stream = io.StringIO()
+    cockpit = Cockpit(stream)
+
+    cockpit.draw_activity("⠋ thinking… 1.0s")
+
+    assert stream.getvalue() == ""
+
+
+def test_activity_keeps_tool_in_flight_until_matching_end() -> None:
+    activity = ActivityState()
+    activity.start(now=1.0)
+    activity.observe_event(
+        {
+            "kind": "tool_started",
+            "payload": {"tool": "run_shell", "tool_call_id": "call-1"},
+        },
+        now=2.0,
+    )
+
+    activity.observe_event(
+        {
+            "kind": "tool_completed",
+            "payload": {"tool": "run_shell", "tool_call_id": "other-call"},
+        },
+        now=3.0,
+    )
+    assert "running run_shell" in activity.render(now=3.0)
+
+    activity.observe_event(
+        {
+            "kind": "tool_completed",
+            "payload": {"tool": "run_shell", "tool_call_id": "call-1"},
+        },
+        now=4.0,
+    )
+    assert "running run_shell" not in activity.render(now=4.0)

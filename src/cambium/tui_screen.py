@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import textwrap
+import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -98,6 +99,49 @@ _STREAM_DELTA_KINDS = frozenset(
 )
 _STREAM_TEXT_LIMIT = 16_384
 _STREAM_RENDER_LIMIT = 8_192
+
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_TOOL_START_KINDS = frozenset(
+    {
+        "tool_begin",
+        "tool_call",
+        "tool_call_started",
+        "tool_request",
+        "tool_start",
+        "tool_started",
+        "tool_invoked",
+    }
+)
+_TOOL_END_KINDS = frozenset(
+    {
+        "tool_complete",
+        "tool_completed",
+        "tool_end",
+        "tool_ended",
+        "tool_event",
+        "tool_finished",
+        "tool_result",
+    }
+)
+_TOOL_PHASE_STARTS = frozenset(
+    {"begin", "in-flight", "in_flight", "pending", "running", "start", "started"}
+)
+_TOOL_PHASE_ENDS = frozenset(
+    {
+        "cancelled",
+        "canceled",
+        "complete",
+        "completed",
+        "done",
+        "end",
+        "ended",
+        "failed",
+        "finished",
+        "ok",
+        "success",
+        "succeeded",
+    }
+)
 
 
 def _is_tty(stream: Any) -> bool:
@@ -512,6 +556,170 @@ class Transcript:
             self.system(f"repository integrated{f' · {str(sha)[:12]}' if sha else ''}")
 
 
+class ActivityState:
+    """Small mutable view of the work currently keeping a turn busy."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._finished = False
+        self._turn_started_at = 0.0
+        self._frame = 0
+        self._responding = False
+        self._next_tool_id = 0
+        self._tools: dict[str, tuple[str, float]] = {}
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self, *, now: float | None = None) -> None:
+        """Start a fresh turn clock and reset any previous in-flight work."""
+        self._active = True
+        self._finished = False
+        self._turn_started_at = time.monotonic() if now is None else now
+        self._frame = 0
+        self._responding = False
+        self._next_tool_id = 0
+        self._tools.clear()
+
+    def stop(self) -> None:
+        """Stop the line without leaving stale tool state for a later turn."""
+        self._active = False
+        self._finished = True
+        self._responding = False
+        self._tools.clear()
+
+    @staticmethod
+    def _tool_name(data: Mapping[str, Any]) -> str:
+        for key in ("tool", "tool_name", "name"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+        function = data.get("function")
+        if isinstance(function, Mapping):
+            value = function.get("name")
+            if isinstance(value, str) and value:
+                return value
+        return "tool"
+
+    @staticmethod
+    def _tool_id(data: Mapping[str, Any]) -> str | None:
+        for key in ("tool_call_id", "tool_id", "call_id", "request_id", "id"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _phase(data: Mapping[str, Any]) -> str | None:
+        for key in ("phase", "state", "status", "event"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value.lower().replace("_", "-")
+        return None
+
+    def _is_tool_start(self, kind: str, data: Mapping[str, Any]) -> bool:
+        phase = self._phase(data)
+        if kind in _TOOL_START_KINDS:
+            return True
+        return phase in _TOOL_PHASE_STARTS and kind.startswith("tool")
+
+    def _is_tool_end(self, kind: str, data: Mapping[str, Any]) -> bool:
+        phase = self._phase(data)
+        if kind == "tool_event":
+            return (
+                isinstance(data.get("ok"), bool)
+                or isinstance(data.get("duration_ms"), int | float)
+                or phase in _TOOL_PHASE_ENDS
+            )
+        if kind in _TOOL_END_KINDS:
+            return phase not in _TOOL_PHASE_STARTS
+        return phase in _TOOL_PHASE_ENDS and kind.startswith("tool")
+
+    def _start_tool(self, data: Mapping[str, Any], now: float) -> None:
+        tool_id = self._tool_id(data)
+        if tool_id is None:
+            self._next_tool_id += 1
+            key = f"anonymous:{self._next_tool_id}"
+        else:
+            key = f"id:{tool_id}"
+        self._tools[key] = (self._tool_name(data), now)
+        self._responding = False
+
+    def _finish_tool(self, data: Mapping[str, Any]) -> None:
+        tool_id = self._tool_id(data)
+        if tool_id is not None:
+            key = f"id:{tool_id}"
+            if key in self._tools:
+                del self._tools[key]
+                self._responding = False
+                return
+            return
+
+        tool_name = data.get("tool") or data.get("tool_name") or data.get("name")
+        if not isinstance(tool_name, str):
+            return
+        for key in reversed(self._tools):
+            if self._tools[key][0] == tool_name:
+                del self._tools[key]
+                self._responding = False
+                return
+
+    def observe_event(
+        self, record: Mapping[str, Any], *, now: float | None = None
+    ) -> None:
+        """Fold one synthetic or durable event into the activity view."""
+        if not self._active:
+            if self._finished:
+                return
+            self.start(now=now)
+        kind = record.get("kind")
+        if not isinstance(kind, str):
+            return
+        data = _event_data(record)
+        event_now = time.monotonic() if now is None else now
+
+        if self._is_tool_start(kind, data):
+            self._start_tool(data, event_now)
+            return
+        if self._is_tool_end(kind, data):
+            self._finish_tool(data)
+            return
+
+        update = _stream_update(record)
+        if update is not None and update[0] == "assistant" and update[1]:
+            self._responding = True
+
+    def render(self, *, now: float | None = None, advance: bool = False) -> str:
+        """Return one bounded status row, or an empty row when the turn is done."""
+        if not self._active:
+            return ""
+        if advance:
+            self._frame = (self._frame + 1) % len(_SPINNER_FRAMES)
+        current = time.monotonic() if now is None else now
+        turn_elapsed = max(0.0, current - self._turn_started_at)
+        tool = next(
+            (self._tools[key] for key in reversed(self._tools)),
+            None,
+        )
+        if tool is not None:
+            tool_name, tool_started_at = tool
+            tool_elapsed = max(0.0, current - tool_started_at)
+            label = (
+                f"running {tool_name} {tool_elapsed:.1f}s "
+                f"· turn {turn_elapsed:.1f}s"
+            )
+        elif self._responding:
+            label = f"responding… {turn_elapsed:.1f}s"
+        else:
+            label = f"thinking… {turn_elapsed:.1f}s"
+        return f"{_SPINNER_FRAMES[self._frame]} {label}"
+
+    def tick(self, *, now: float | None = None) -> str:
+        """Advance the spinner once and return the resulting row."""
+        return self.render(now=now, advance=True)
+
+
 def _wrap_markdown(text: str, width: int) -> list[str]:
     """Render Markdown structure as safe plain terminal lines before coloring."""
     width = max(8, width)
@@ -757,6 +965,11 @@ def _style_kind(kind: str) -> str:
     return ""
 
 
+def _activity_row(activity_line: str, inner: int, color: bool) -> str:
+    content = _pad(_clip(f" {activity_line}" if activity_line else "", inner), inner)
+    return "│" + _paint(content, _DIM, color) + "│"
+
+
 def render_cockpit(
     snapshot: Any,
     transcript: Transcript,
@@ -768,6 +981,7 @@ def render_cockpit(
     height: int,
     color: bool = False,
     input_label: str = "›",
+    activity_line: str = "",
 ) -> list[str]:
     """Render one deterministic full-screen frame without cursor controls."""
     width = max(64, width)
@@ -782,8 +996,9 @@ def render_cockpit(
     lines.append("│" + _pad(meta, inner) + "│")
     branch = _clip(" " + _sanitize(branch_line), inner)
     lines.append("│" + _pad(branch, inner) + "│")
+    lines.append(_activity_row(activity_line, inner, color))
 
-    body_height = height - 8
+    body_height = height - 9
     wide = width >= 104
     if wide:
         side_width = min(44, max(34, width // 3))
@@ -901,6 +1116,7 @@ class Cockpit:
         branch_line: str,
         cumulative_line: str,
         input_label: str = "›",
+        activity_line: str = "",
     ) -> None:
         if not self.enabled:
             return
@@ -915,9 +1131,19 @@ class Cockpit:
             height=self._last_size.lines,
             color=self.color,
             input_label=input_label,
+            activity_line=activity_line,
         )
         self.stream.write(_HOME_CLEAR)
         self.stream.write("\n".join(frame))
+        self.stream.flush()
+
+    def draw_activity(self, activity_line: str) -> None:
+        """Replace only the reserved activity row in the current cockpit."""
+        if not self.enabled:
+            return
+        width = max(64, self._last_size.columns)
+        row = _activity_row(activity_line, width - 2, self.color)
+        self.stream.write(f"\x1b[4;1H{_CLEAR_LINE}{row}")
         self.stream.flush()
 
     def move_to_input(self, *, label: str = "›") -> None:
@@ -937,6 +1163,7 @@ class Cockpit:
 
 
 __all__ = [
+    "ActivityState",
     "Cockpit",
     "Transcript",
     "TranscriptEntry",
