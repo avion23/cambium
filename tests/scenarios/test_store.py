@@ -21,7 +21,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -39,6 +40,27 @@ from cambium.store import (
 
 def _open(path):
     return EventStore(path, fsync_interval_s=5.0)
+
+
+class _InsertFaultConnection:
+    """Proxy one SQLite connection so the writer sees a storage failure."""
+
+    def __init__(self, connection: sqlite3.Connection, armed: threading.Event) -> None:
+        self._connection = connection
+        self._armed = armed
+        self.fired = False
+
+    def execute(self, sql: str, *parameters: Any):
+        if self._armed.is_set() and not self.fired and sql == store_module._INSERT:
+            self.fired = True
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._connection.execute(sql, *parameters)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 def test_same_path_event_store_has_one_process_owner(tmp_path) -> None:
@@ -317,6 +339,91 @@ def test_writer_dead_on_locked_db_critical_append_raises(tmp_path, monkeypatch) 
         store.append({"kind": "result", "payload": {}})
     with pytest.raises(StoreError):
         store.close()
+
+
+def test_event_append_disk_full_fails_loudly_without_partial_row(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    armed = threading.Event()
+    real_connect = store_module.sqlite3.connect
+    writer_proxy: list[_InsertFaultConnection] = []
+
+    def connect_with_insert_fault(database, *args, **kwargs):
+        connection = real_connect(database, *args, **kwargs)
+        if Path(database).resolve() == path.resolve():
+            proxy = _InsertFaultConnection(connection, armed)
+            writer_proxy.append(proxy)
+            return proxy
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect_with_insert_fault)
+    store = EventStore(path, fsync_interval_s=60.0)
+    armed.set()
+    try:
+        with pytest.raises(StoreError) as excinfo:
+            store.append({"kind": "result", "payload": {"disk": "full"}})
+        assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
+        assert "full" in str(excinfo.value.__cause__).lower()
+        assert writer_proxy[-1].fired
+        assert store._dead is not None
+        with pytest.raises(StoreError):
+            store.append({"kind": "log", "payload": {"after": "failure"}})
+        store._thread.join(1.0)
+    finally:
+        monkeypatch.undo()
+        with pytest.raises(StoreError):
+            store.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        # The failed admission burns its reserved sequence so a restart never
+        # reuses an identifier that may have reached an external observer.
+        assert reopened.append({"kind": "result", "payload": {"recovered": True}}) == 2
+    finally:
+        reopened.close()
+    assert [event["seq"] for event in read_events_file(path)] == [2]
+
+
+def test_checkpoint_disk_full_is_visible_and_reopenable(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path, fsync_interval_s=60.0)
+    real_fsync = store_module.os.fsync
+    fired = False
+
+    def fail_wal_fsync(fd: int) -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            raise OSError(28, "No space left on device")
+        real_fsync(fd)
+
+    monkeypatch.setattr(store_module.os, "fsync", fail_wal_fsync)
+    try:
+        with pytest.raises(StoreError) as excinfo:
+            store.append({"kind": "result", "payload": {"checkpoint": True}})
+        assert fired
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert excinfo.value.__cause__.errno == 28
+        assert store._dead is not None
+        store._thread.join(1.0)
+    finally:
+        monkeypatch.undo()
+        with pytest.raises(StoreError):
+            store.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+
+    reopened = EventStore(path, fsync_interval_s=60.0)
+    try:
+        assert [event["seq"] for event in reopened.events_after(0)] == [1]
+        assert reopened.append({"kind": "result", "payload": {"recovered": True}}) == 2
+    finally:
+        reopened.close()
 
 
 @pytest.mark.slow
