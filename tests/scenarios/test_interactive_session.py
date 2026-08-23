@@ -9,9 +9,10 @@ from pathlib import Path
 
 from cambium import tui
 from cambium.interactive import InteractiveSession
-from cambium.oneshot import OneShotConfig
+from cambium.oneshot import OneShotConfig, default_session_root
 from cambium.store import EventStore
 from cambium.supervisor import PlanResult, TaskResult
+from cambium.tui_screen import Transcript
 
 
 class _Tty(io.StringIO):
@@ -296,3 +297,118 @@ def test_restore_history_folds_completed_current_branch(monkeypatch, tmp_path: P
 
     assert cumulative.calls == 1
     assert cumulative.total_tokens == 15
+
+
+def test_tui_reconnects_to_latest_durable_interactive_session(tmp_path: Path) -> None:
+    root = default_session_root(tmp_path) / "prior"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    first = session.prepare_turn("durable prompt")
+    checkpoint_ref = "interactive-main/epoch-7-" + "c" * 64 + ".json"
+    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("{}", encoding="utf-8")
+    checkpoint_event = _checkpoint_event(checkpoint_ref)
+    checkpoint_event.pop("seq")
+    checkpoint_payload = checkpoint_event["payload"]
+    assert isinstance(checkpoint_payload, dict)
+    checkpoint_payload["epoch"] = 7
+
+    event_db = first.session_dir / ".cambium" / "events.db"
+    store = EventStore(event_db)
+    try:
+        store.append(
+            {
+                "kind": "task_assigned",
+                "task_id": "interactive-main",
+                "payload": {"task": "durable prompt"},
+            }
+        )
+        store.append(checkpoint_event)
+        store.append(
+            {
+                "kind": "usage_event",
+                "task_id": "interactive-main",
+                "payload": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 25,
+                        "total_tokens": 125,
+                    }
+                },
+            }
+        )
+    finally:
+        store.close()
+    (first.session_dir / ".cambium" / "result.json").write_text(
+        json.dumps({"summary": "durable answer"}), encoding="utf-8"
+    )
+    session.observe_event(first, checkpoint_event)
+    session.complete_turn(first, succeeded=True)
+    session.acquire()
+    session.release()
+
+    reconnected = InteractiveSession(OneShotConfig(repo=tmp_path))
+    transcript = Transcript()
+    cumulative, snapshot = tui._restore_history(reconnected, transcript=transcript)
+
+    assert reconnected.root == root.resolve()
+    assert reconnected.reconnected is True
+    assert reconnected.turn == 1
+    assert reconnected.last_epoch == 7
+    assert reconnected.last_checkpoint == checkpoint_ref
+    assert cumulative.calls == 1
+    assert cumulative.total_tokens == 125
+    assert snapshot.context.checkpoint_ref == checkpoint_ref
+    assert [entry.text for entry in transcript.entries if entry.role == "user"] == [
+        "durable prompt"
+    ]
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == [
+        "durable answer"
+    ]
+
+    source = _Tty("/exit\n")
+    output = _Tty()
+    error = io.StringIO()
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path),
+            input_stream=source,
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+    rendered = output.getvalue()
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "Detected prior interactive session" in rendered
+    assert "last_epoch=7" in rendered
+    assert "last_checkpoint=interactive-main/epoch-7-" in rendered
+    assert "durable prompt" in rendered
+    assert "tokens=125" in rendered
+
+
+def test_stale_interactive_lock_is_detected_and_reclaimed(tmp_path: Path) -> None:
+    session = InteractiveSession(
+        OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive")
+    )
+    session.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    session.lock_path.write_text(
+        json.dumps({"pid": 2**31 - 1, "released": False}), encoding="utf-8"
+    )
+
+    assert session.lock_status == "stale"
+    session.acquire()
+    try:
+        assert session.recovered_stale_lock is True
+        assert session.lock_status == "active"
+    finally:
+        session.release()
+    assert session.lock_status == "available"
+
+
+def test_empty_repo_start_does_not_claim_a_prior_interactive_session(tmp_path: Path) -> None:
+    session = InteractiveSession(OneShotConfig(repo=tmp_path))
+
+    assert session.reconnected is False
+    assert session.turn == 0
+    assert session.root.parent == default_session_root(tmp_path)

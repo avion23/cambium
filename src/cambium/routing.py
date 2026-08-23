@@ -27,14 +27,13 @@ implementation-plan step 3); a provider config may override it per provider
 with the optional ``token_window_allowance`` field.
 
 Provider lanes (H1) add concurrency-aware admission on top of the ledger:
-each provider owns one :class:`LaneState` (in-flight tasks plus an
-``rpm``-derived adaptive cap and the configured ``max_concurrency`` cap) and
-:func:`select_lane` picks the provider with the lowest normalized utilization
-among lanes with spare capacity, so a wave of concurrent admissions spreads
-across providers instead of all picking the same max-min winner. 429 pressure
-shrinks a lane's effective in-flight cap (placeholder adaptive rule, see
-``LaneState.effective_in_flight_cap``), which is the admission-side
-backpressure that prevents retry storms.
+each provider owns one :class:`LaneState` with independent request-rate tokens
+and in-flight capacity, and :func:`select_lane` picks the provider with the
+lowest normalized utilization among lanes with both slots available, so a wave
+of concurrent admissions spreads across providers instead of all picking the
+same max-min winner. 429 pressure reduces request-token availability for
+new-style lanes (legacy direct lanes retain their rpm-derived compatibility
+cap), which is the admission-side backpressure that prevents retry storms.
 
 Capability/quality-constrained selection (H2): when a task declares
 ``requirements``, :func:`score_providers` filters candidates strictly by
@@ -58,7 +57,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -121,9 +120,11 @@ class ProviderDebt:
     """Per-provider rolling usage state, folded from redacted usage events.
 
     ``tokens`` accumulates prompt+completion (or ``total_tokens`` when the
-    provider reports it); ``retry_after_count`` counts 429-style events
-    (``request_rate_status == "cooldown"`` or a ``failure_reason`` containing
-    ``429``). Only counts/tokens — never credentials — ever enter the ledger.
+    provider reports it); ``tokens_per_s`` records output-generation evidence
+    from completion/output tokens divided by call latency; and
+    ``retry_after_count`` counts 429-style events (``request_rate_status ==
+    "cooldown"`` or a ``failure_reason`` containing ``429``). Only
+    counts/tokens/evidence — never credentials — ever enter the ledger.
 
     ``disable_reason``/``disable_at`` carry the durable quarantine record: a
     ``config_error:``/``auth_error:`` failure reason sets both, a success
@@ -141,6 +142,13 @@ class ProviderDebt:
     cache_hit_count: int = 0
     latency_total_s: float = 0.0
     latency_count: int = 0
+    # Generation throughput evidence.  ``tokens_per_s`` is the public
+    # measured value used by quality ordering; the total/count pair lets the
+    # ledger merge concurrent sessions without treating a running average as
+    # a cumulative counter.
+    tokens_per_s: float = 0.0
+    tokens_per_s_total: float = 0.0
+    tokens_per_s_count: int = 0
     last_seen: float | None = None
     # Durable quarantine record: reason + timestamp of the last
     # config_error/auth_error call, cleared by a later success.
@@ -151,12 +159,26 @@ class ProviderDebt:
         """Fold one usage_event payload into this provider's debt."""
         timestamp = time.time() if now is None else now
         self.requests += 1
+        if self.tokens_per_s_count <= 0 and self.tokens_per_s > 0:
+            # A hand-built or older ledger entry may carry only the public
+            # average. Treat it as one prior sample before adding new usage so
+            # the first live event does not erase the existing evidence.
+            self.tokens_per_s_total = self.tokens_per_s
+            self.tokens_per_s_count = 1
         usage = event.get("usage")
+        output_tokens: float | None = None
         if isinstance(usage, Mapping):
             total = usage.get("total_tokens")
+            valid_total = False
             if isinstance(total, int | float) and not isinstance(total, bool):
-                self.tokens += int(total)
-            else:
+                try:
+                    parsed_total = float(total)
+                except (OverflowError, ValueError):
+                    parsed_total = -1.0
+                if math.isfinite(parsed_total) and parsed_total >= 0:
+                    self.tokens += int(total)
+                    valid_total = True
+            if not valid_total:
                 inputs = usage.get("input_tokens", usage.get("prompt_tokens"))
                 outputs = usage.get("output_tokens", usage.get("completion_tokens"))
                 if (
@@ -166,6 +188,20 @@ class ProviderDebt:
                     and not isinstance(outputs, bool)
                 ):
                     self.tokens += int(inputs) + int(outputs)
+            # Generation throughput deliberately uses output-side tokens so
+            # prompt/cache tokens do not make a provider look faster.  Older
+            # events may only carry total_tokens, matching the existing
+            # render_tokens_per_s fallback.
+            for key in ("completion_tokens", "output_tokens", "total_tokens"):
+                value = usage.get(key)
+                if isinstance(value, int | float) and not isinstance(value, bool):
+                    try:
+                        parsed = float(value)
+                    except (OverflowError, ValueError):
+                        continue
+                    if math.isfinite(parsed) and parsed >= 0:
+                        output_tokens = parsed
+                        break
         cost = event.get("estimated_cost_usd")
         if isinstance(cost, int | float) and not isinstance(cost, bool):
             self.cost += float(cost)
@@ -190,26 +226,40 @@ class ProviderDebt:
         if event.get("provider_cache_hit") is True:
             self.cache_hit_count += 1
         latency = event.get("latency_s")
-        if isinstance(latency, int | float) and not isinstance(latency, bool) and latency >= 0:
-            self.latency_total_s += float(latency)
+        if isinstance(latency, int | float) and not isinstance(latency, bool):
+            try:
+                parsed_latency = float(latency)
+            except (OverflowError, ValueError):
+                parsed_latency = -1.0
+        else:
+            parsed_latency = -1.0
+        if math.isfinite(parsed_latency) and parsed_latency >= 0:
+            self.latency_total_s += parsed_latency
             self.latency_count += 1
+            if output_tokens is not None and parsed_latency > 0:
+                rate = output_tokens / parsed_latency
+                if math.isfinite(rate):
+                    self.tokens_per_s_total += rate
+                    self.tokens_per_s_count += 1
+                    self.tokens_per_s = self.tokens_per_s_total / self.tokens_per_s_count
         self.last_seen = timestamp
 
 
 def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
     """Parse one ledger entry, ignoring malformed fields (tolerate corruption)."""
     debt = ProviderDebt()
-    for field, converter in (
+    for field_name, converter in (
         ("tokens", int),
         ("requests", int),
         ("failed_requests", int),
         ("retry_after_count", int),
         ("cache_hit_count", int),
         ("latency_count", int),
+        ("tokens_per_s_count", int),
     ):
-        value = entry.get(field)
+        value = entry.get(field_name)
         if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0:
-            setattr(debt, field, converter(value))
+            setattr(debt, field_name, converter(value))
     cost = entry.get("cost")
     if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0:
         debt.cost = float(cost)
@@ -220,6 +270,20 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
         and latency_total_s >= 0
     ):
         debt.latency_total_s = float(latency_total_s)
+    for field_name in ("tokens_per_s", "tokens_per_s_total"):
+        value = entry.get(field_name)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0:
+            try:
+                parsed = float(value)
+            except (OverflowError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                setattr(debt, field_name, parsed)
+    if debt.tokens_per_s_count > 0 and debt.tokens_per_s_total >= 0:
+        debt.tokens_per_s = debt.tokens_per_s_total / debt.tokens_per_s_count
+    elif debt.tokens_per_s > 0:
+        debt.tokens_per_s_total = debt.tokens_per_s
+        debt.tokens_per_s_count = 1
     last_seen = entry.get("last_seen")
     if isinstance(last_seen, int | float) and not isinstance(last_seen, bool):
         try:
@@ -323,12 +387,15 @@ class DebtStore:
             "retry_after_count",
             "cache_hit_count",
             "latency_count",
+            "tokens_per_s_count",
         )
-        float_fields = ("cost", "latency_total_s")
+        float_fields = ("cost", "latency_total_s", "tokens_per_s_total")
         updates: dict[str, Any] = {}
-        for field in (*int_fields, *float_fields):
-            before = getattr(baseline, field, 0) if baseline is not None else 0
-            updates[field] = getattr(base, field) + getattr(local, field) - before
+        for field_name in (*int_fields, *float_fields):
+            before = getattr(baseline, field_name, 0) if baseline is not None else 0
+            updates[field_name] = (
+                getattr(base, field_name) + getattr(local, field_name) - before
+            )
 
         # Quarantine record: the most recent event wins. A config/auth error
         # this session sets it; a success this session clears it (a success
@@ -345,7 +412,10 @@ class DebtStore:
         if local.last_seen is not None and (last_seen is None or local.last_seen > last_seen):
             last_seen = local.last_seen
         updates["last_seen"] = last_seen
-        return replace(base, **updates)
+        merged = replace(base, **updates)
+        if merged.tokens_per_s_count > 0 and merged.tokens_per_s_total >= 0:
+            merged.tokens_per_s = merged.tokens_per_s_total / merged.tokens_per_s_count
+        return merged
 
     def _merge_with_current(self, current: Mapping[str, ProviderDebt]) -> dict[str, ProviderDebt]:
         merged: dict[str, ProviderDebt] = {}
@@ -404,8 +474,12 @@ class DebtStore:
                     cache_hit_count=round(debt.cache_hit_count * factor),
                     latency_total_s=debt.latency_total_s * factor,
                     latency_count=round(debt.latency_count * factor),
+                    tokens_per_s_total=debt.tokens_per_s_total * factor,
+                    tokens_per_s_count=round(debt.tokens_per_s_count * factor),
                     cost=debt.cost * factor,
                 )
+                if debt.tokens_per_s_count > 0 and debt.tokens_per_s_total >= 0:
+                    debt.tokens_per_s = debt.tokens_per_s_total / debt.tokens_per_s_count
             debts[name] = debt
         self._debts = debts
         self._baseline_debts = _copy_debts(debts)
@@ -448,6 +522,9 @@ class DebtStore:
                         "cache_hit_count": debt.cache_hit_count,
                         "latency_total_s": debt.latency_total_s,
                         "latency_count": debt.latency_count,
+                        "tokens_per_s": debt.tokens_per_s,
+                        "tokens_per_s_total": debt.tokens_per_s_total,
+                        "tokens_per_s_count": debt.tokens_per_s_count,
                         "last_seen": debt.last_seen,
                     }
                     if debt.disable_reason is not None:
@@ -605,30 +682,191 @@ def select_primary(
 
 @dataclass
 class LaneState:
-    """One concurrency lane per provider subscription (H1).
+    """Per-provider admission state with separate rate and concurrency.
 
-    ``in_flight`` counts tasks admitted onto the lane (batch pre-assignment or
-    admission-time assignment). ``rpm_allowance`` is retained as the
-    adaptive/backpressure allowance, while ``max_concurrency`` is the
-    configured hard cap on simultaneous reservations. ``None`` preserves the
-    legacy direct-construction behavior for callers that do not carry provider
-    configuration into a lane; loaded provider lanes should always set it.
+    ``requests_per_minute`` is a replenishing request-token bucket;
+    ``max_in_flight`` is a hard simultaneous-request cap.  They are separate
+    dimensions: a provider can be request-rate limited while still supporting
+    many concurrent requests, or have a generous request rate while allowing
+    only one slow request at a time.
+
+    ``rpm_allowance``/``max_concurrency`` retain the direct-construction API
+    used by older callers.  A legacy lane keeps its historical rpm-derived
+    cap; provider-configured new-style lanes use only ``max_in_flight`` for
+    their in-flight cap and consume request tokens independently.  The
+    supervisor's existing ``lane.in_flight += 1`` reservation also consumes a
+    request token for a new-style lane, so the admission flow needs no second
+    scheduler or alternate counter owner.
     """
 
     in_flight: int = 0
     rpm_allowance: float = 60.0
     max_concurrency: int | None = None
+    requests_per_minute: float | None = None
+    max_in_flight: int | None = None
+    request_slots: float | None = None
+    _request_slots_updated_at: float | None = field(default=None, repr=False, compare=False)
+    _tracks_request_slots: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.in_flight, bool) or not isinstance(self.in_flight, int):
+            raise ValueError("in_flight must be an integer")
+        if self.in_flight < 0:
+            raise ValueError("in_flight must not be negative")
+        canonical = self.requests_per_minute
+        if canonical is not None:
+            if isinstance(canonical, bool) or not isinstance(canonical, int | float):
+                raise ValueError("requests_per_minute must be a positive number")
+            canonical = float(canonical)
+            if not math.isfinite(canonical) or canonical <= 0:
+                raise ValueError("requests_per_minute must be a positive number")
+            object.__setattr__(self, "requests_per_minute", canonical)
+        if self.max_in_flight is not None:
+            if isinstance(self.max_in_flight, bool) or not isinstance(self.max_in_flight, int):
+                raise ValueError("max_in_flight must be a positive integer")
+            if self.max_in_flight <= 0:
+                raise ValueError("max_in_flight must be a positive integer")
+        if canonical is not None or self.request_slots is not None:
+            if self.request_slots is None:
+                slots = canonical if canonical is not None else max(self.rpm_allowance, 1.0)
+                object.__setattr__(self, "request_slots", float(slots))
+            elif (
+                isinstance(self.request_slots, bool)
+                or not isinstance(self.request_slots, int | float)
+                or not math.isfinite(float(self.request_slots))
+                or self.request_slots < 0
+            ):
+                raise ValueError("request_slots must be a non-negative number")
+            object.__setattr__(
+                self,
+                "_request_slots_updated_at",
+                time.monotonic(),
+            )
+            object.__setattr__(self, "_tracks_request_slots", True)
+            if self.in_flight:
+                self._consume_request_slots(self.in_flight)
+
+    @classmethod
+    def from_provider(cls, provider: Any, *, in_flight: int = 0) -> LaneState:
+        """Build an independently modeled lane from a provider config.
+
+        ``ProviderConfig`` normalizes legacy rpm-only providers to a
+        conservative one in-flight slot.  The factory intentionally uses that
+        effective value, while retaining the configured request rate as a
+        separate token bucket dimension.
+        """
+        rate = getattr(provider, "requests_per_minute", getattr(provider, "rpm", 60))
+        max_in_flight = getattr(provider, "max_in_flight", None)
+        if max_in_flight is None:
+            max_in_flight = 1
+        return cls(
+            in_flight=in_flight,
+            requests_per_minute=rate,
+            max_in_flight=max_in_flight,
+        )
+
+    def configure_from_provider(self, provider: Any) -> None:
+        """Apply a provider's explicit dimensions to an existing lane.
+
+        This is used when a legacy supervisor-created lane is first observed
+        by routing.  rpm-only providers intentionally remain on the old lane
+        path; a provider declaring either new capacity field opts in through
+        ``ProviderConfig._independent_capacity_model``.
+        """
+        marker = getattr(provider, "_independent_capacity_model", None)
+        if marker is False:
+            return
+        if marker is None and not (
+            getattr(provider, "requests_per_minute", None) is not None
+            or getattr(provider, "max_in_flight", None) is not None
+        ):
+            return
+        rate = getattr(provider, "requests_per_minute", getattr(provider, "rpm", 60))
+        max_in_flight = getattr(provider, "max_in_flight", None) or 1
+        if self._tracks_request_slots:
+            return
+        object.__setattr__(self, "requests_per_minute", float(rate))
+        object.__setattr__(self, "max_in_flight", int(max_in_flight))
+        object.__setattr__(self, "request_slots", float(rate))
+        object.__setattr__(self, "_request_slots_updated_at", time.monotonic())
+        object.__setattr__(self, "_tracks_request_slots", True)
+        if self.in_flight:
+            self._consume_request_slots(self.in_flight)
+
+    def _consume_request_slots(self, count: int = 1) -> None:
+        if self.request_slots is None or count <= 0:
+            return
+        self._refill_request_slots()
+        object.__setattr__(self, "request_slots", max(0.0, self.request_slots - count))
+
+    def _refill_request_slots(self, now: float | None = None) -> None:
+        if self.request_slots is None or self.requests_per_minute is None:
+            return
+        timestamp = time.monotonic() if now is None else float(now)
+        started = self._request_slots_updated_at
+        if started is None:
+            object.__setattr__(self, "_request_slots_updated_at", timestamp)
+            return
+        elapsed = max(0.0, timestamp - started)
+        if elapsed <= 0:
+            return
+        replenished = self.request_slots + elapsed * self.requests_per_minute / 60.0
+        object.__setattr__(
+            self,
+            "request_slots",
+            min(self.requests_per_minute, replenished),
+        )
+        object.__setattr__(self, "_request_slots_updated_at", timestamp)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Treat external in-flight reservations as request-slot spends."""
+        if name == "in_flight" and getattr(self, "_tracks_request_slots", False):
+            previous = getattr(self, "in_flight", 0)
+            object.__setattr__(self, name, value)
+            if isinstance(value, int) and value > previous:
+                self._consume_request_slots(value - previous)
+            return
+        object.__setattr__(self, name, value)
+
+    def effective_request_rate(self, retry_after_count: int = 0) -> float:
+        """Return the adaptive request-rate allowance, independent of in-flight."""
+        base = self.requests_per_minute
+        if base is None:
+            base = self.rpm_allowance
+        decay = max(0.5, 1.0 - retry_after_count / 50.0)
+        return max(1.0, float(base) * decay)
+
+    def effective_request_slot_cap(self, retry_after_count: int = 0) -> int:
+        """Return the integer request-token capacity after 429 pressure."""
+        return max(1, int(self.effective_request_rate(retry_after_count)))
+
+    def has_request_slot(
+        self, retry_after_count: int = 0, *, now: float | None = None
+    ) -> bool:
+        """Whether one request token is available without consuming it."""
+        if self.request_slots is None:
+            return True
+        self._refill_request_slots(now)
+        cap = self.effective_request_slot_cap(retry_after_count)
+        if self.request_slots > cap:
+            object.__setattr__(self, "request_slots", float(cap))
+        return self.request_slots >= 1.0
 
     def effective_in_flight_cap(self, retry_after_count: int) -> int:
-        """Return the lower of the adaptive RPM cap and configured concurrency.
+        """Return only concurrent capacity for independently modeled lanes.
 
-        Placeholder adaptive rule: each 429-style usage event shrinks the RPM
-        allowance by ``1/50`` of the allowance, floor 50%, until live 429
-        events stop and the debt stops accumulating. The cap never drops
-        below 1 so a pressured provider keeps serving at least one task. A
-        configured ``max_concurrency`` is an independent hard upper bound and
-        is applied after the adaptive calculation.
+        Legacy direct lanes retain the old rpm-derived cap for compatibility.
+        New-style lanes apply 429 pressure to request tokens instead; a high
+        concurrency provider therefore does not lose its in-flight capacity
+        merely because its request rate is low.
         """
+        if self.requests_per_minute is not None or self.max_in_flight is not None:
+            configured = self.max_in_flight
+            if configured is None:
+                configured = self.max_concurrency
+            if isinstance(configured, bool) or not isinstance(configured, int):
+                return 1
+            return max(1, configured)
         decay = max(0.5, 1.0 - retry_after_count / 50.0)
         cap = max(1, int(self.rpm_allowance * decay))
         configured = self.max_concurrency
@@ -640,6 +878,34 @@ class LaneState:
             cap = min(cap, max(1, configured))
         return cap
 
+    def can_admit(self, retry_after_count: int = 0, *, now: float | None = None) -> bool:
+        """Return whether admission has both a request and in-flight slot."""
+        return self.in_flight < self.effective_in_flight_cap(
+            retry_after_count
+        ) and self.has_request_slot(
+            retry_after_count,
+            now=now,
+        )
+
+    def reserve(self, retry_after_count: int = 0, *, now: float | None = None) -> bool:
+        """Atomically consume one request slot and one in-flight slot."""
+        if not self.can_admit(retry_after_count, now=now):
+            return False
+        self._consume_request_slots()
+        object.__setattr__(self, "in_flight", self.in_flight + 1)
+        return True
+
+    def release(self) -> None:
+        """Release one in-flight slot; request tokens refill by elapsed time."""
+        if self.in_flight > 0:
+            object.__setattr__(self, "in_flight", self.in_flight - 1)
+
+
+def _lane_has_capacity(provider: Any, lane: LaneState, retry_after_count: int) -> bool:
+    """Apply provider dimensions before checking both lane slot types."""
+    lane.configure_from_provider(provider)
+    return lane.can_admit(retry_after_count)
+
 
 def select_lane(
     providers: Sequence[Any],
@@ -649,16 +915,14 @@ def select_lane(
 ) -> tuple[str, str]:
     """Max-min admission pick over per-provider lanes (H1).
 
-    Like :func:`select_primary`, but a provider whose lane is at or above its
-    effective in-flight cap (the lower of configured ``max_concurrency`` and
-    ``rpm_allowance`` decayed by that provider's ``retry_after_count`` in
-    ``debt``) is skipped entirely, so concurrent
-    admissions in one wave spread across providers and a 429-pressured
-    provider admits fewer tasks instead of colliding and retrying. Remaining
-    providers rank by (normalized utilization, lane in_flight, requests,
-    config index): max-min utilization semantics with idle lanes winning
-    ties. Raises ``ValueError`` when no enabled provider with a spare lane
-    serves a candidate model.
+    Like :func:`select_primary`, but a provider is skipped unless its lane has
+    both a request token and an in-flight slot. New-style lanes use
+    ``requests_per_minute`` only for the request-token bucket and
+    ``max_in_flight`` only for concurrent capacity. Legacy lanes retain the
+    old rpm-derived cap. Remaining providers rank by (normalized utilization,
+    lane in_flight, requests, config index): max-min utilization semantics
+    with idle lanes winning ties. Raises ``ValueError`` when no enabled
+    provider with a spare lane serves a candidate model.
     """
     candidates = tuple(candidates)
     if not candidates:
@@ -681,7 +945,7 @@ def select_lane(
         if lane is not None:
             current = debt.get(provider.name) if debt is not None else None
             retry_after_count = current.retry_after_count if current is not None else 0
-            if lane.in_flight >= lane.effective_in_flight_cap(retry_after_count):
+            if not _lane_has_capacity(provider, lane, retry_after_count):
                 continue
         serving.append((index, provider))
     if not matching:
@@ -876,7 +1140,7 @@ def score_providers(
             if lane is not None:
                 current = debt.get(provider.name) if debt is not None else None
                 retry_after_count = current.retry_after_count if current is not None else 0
-                if lane.in_flight >= lane.effective_in_flight_cap(retry_after_count):
+                if not _lane_has_capacity(provider, lane, retry_after_count):
                     continue
         eligible.append(provider)
         models[provider.name] = model

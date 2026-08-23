@@ -16,6 +16,7 @@ provider-policy stack.
 | Provider/model trunk affinity | `cambium.provider_scheduler.ProviderLease` | Immutable value bound once per semantic trunk |
 | Token/request quota reservations | `cambium.provider_scheduler.QuotaLedger` | SQLite transactions shared safely across processes |
 | Provider configuration | `cambium.provider_config` | Immutable validated records; secrets remain environment references |
+| Cache/CAST policy | `cambium.provider_scheduler.CacheHorizonConfig` / `CastConfig` | Provider-neutral breakpoint and K0 rollover thresholds |
 | Supervisor lane reservations | `cambium.supervisor` | Session-owned counters around admitted tasks |
 
 `provider_scheduler.py` keeps its historical import path because
@@ -30,7 +31,8 @@ mailbox, or concurrency ownership. Admission belongs only to `routing.py`.
    after it owns an admission slot.
 3. The selector applies hard filters first: authorization, enabled state,
    requested model, optional tier, declared task requirements, and current lane
-   capacity.
+   capacity. Request-rate tokens and `max_in_flight` are independent lane
+   dimensions; legacy `rpm`/`max_concurrency` aliases remain accepted.
 4. Without explicit quality requirements, `select_lane` balances normalized
    usage debt and in-flight lane load. With requirements, `score_providers`
    applies the capability boundary and delegates equal-priority quality order
@@ -75,7 +77,9 @@ uses current evidence in this order:
 1. failure probability;
 2. latency-SLO compliance;
 3. expected cost per successful turn;
-4. normalized latency/cache tie-break.
+4. normalized throughput/latency/cache tie-break. Measured output
+   `tokens_per_s` comes from redacted usage events; configured
+   `throughput_hint_tps` is only a fallback when fresh evidence is absent.
 
 Missing or stale evidence is a barrier that keeps configuration order. Root
 incumbency moves a provider only to the front of its own equal-priority run.
@@ -83,7 +87,8 @@ Deterministic rotation applies only where no current evidence exists.
 
 The simpler max-min admission path ranks by normalized token debt, then current
 lane load, request count, and configuration order. A provider under 429
-pressure receives a smaller effective lane cap before ranking.
+pressure receives a smaller effective request-rate allowance before ranking;
+its in-flight capacity is not silently conflated with RPM.
 
 ## Quota and debt state
 
@@ -96,6 +101,11 @@ Two stores represent different facts and must not be merged:
   token/request windows. One reservation succeeds for every window or for none
   of them, and reconciliation replaces the estimate with actual usage exactly
   once.
+- `CacheHorizonConfig` batches immutable cache breakpoints by pending tokens or
+  elapsed horizon without claiming a provider retained a cache. `CastConfig`
+  adds `max_segments` and `max_active_trunk_tokens`; when an interactive
+  summary-only trunk is due, the semantic history is materialized as one CAST
+  K0 entry in a new immutable epoch.
 
 `cambium quota observe` records trusted provider/header/dashboard evidence;
 `cambium quota status` displays the content-free snapshot. Providers without a
@@ -106,13 +116,26 @@ than inventing a provider contract.
 
 Provider HTTP failures pass through one classifier in `cambium.diffundo`.
 `429` responses are quota pressure: bounded `Retry-After` evidence, lane
-coldown, full-jitter retry of idempotent calls only. Plain `403` responses are
-not auth errors by default. Response-body markers split them into four classes:
-invalid credentials (quarantined per credential fingerprint), missing model
-entitlement (configuration disabled), quota/billing exhaustion (cooldown until
-reset evidence), and policy/content refusal (terminal for the request; provider
-health is not damaged). `401` quarantines authentication; network and 5xx
-failures receive bounded transient treatment; malformed responses fail closed.
+cooldown, and full-jitter retry within the call deadline. Plain `403` responses
+are not auth errors by default. Body markers distinguish five operational
+classes:
+
+- invalid credentials -> `AUTH_ERROR`; disable the provider and quarantine the
+  credential fingerprint. It is re-admitted only after the credential identity
+  changes;
+- missing model entitlement -> `CONFIG_ERROR`; disable that provider/model
+  configuration without treating it as bad credentials;
+- quota or billing exhaustion -> `QUOTA`; honor bounded reset/`Retry-After`
+  evidence and hold the provider in cooldown until it is eligible again;
+- policy/content refusal -> `REFUSAL`; fail the request and leave provider
+  health untouched;
+- WAF/browser/network block -> transient `ERROR` with bounded retry/cooldown;
+  it does not quarantine the credential.
+
+An unlabelled `403` remains fail-closed as authentication. `401` also
+quarantines authentication; network and 5xx failures receive bounded transient
+treatment, and malformed responses fail closed. The classification is retained
+in redacted usage/failure evidence, never in prompt or credential material.
 
 ## Removed alternatives
 
@@ -142,4 +165,8 @@ PYTHONPATH=src python -m cambium doctor
 
 A helper's existence is never integration evidence. The authoritative path is
 `supervisor -> routing -> pinned worker -> Diffundo`, with usage flowing back to
-`DebtStore` and quota state flowing through `QuotaLedger`.
+`DebtStore` and quota state flowing through `QuotaLedger`. Interactive wall
+budgets use an explicit operator value when supplied; otherwise they can scale
+from the selected provider's throughput hint and the current branch's measured
+output rate, with a safety margin, while ordinary one-shot runs retain their
+fixed default.

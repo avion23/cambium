@@ -19,12 +19,16 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import textwrap
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, TextIO
+
+from .provider_scheduler import QuotaLedger
 
 _RESET = "\x1b[0m"
 _DIM = "\x1b[2m"
@@ -1204,7 +1208,8 @@ def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[s
     label_width = 7
 
     def row(label: str, value: str) -> tuple[str, str]:
-        return _side_row("normal", f" {label:<{label_width}}{value}", width)
+        label_column = max(label_width, len(label) + 1)
+        return _side_row("normal", f" {label:<{label_column}}{value}", width)
 
     token_line = f" {'tokens':<{label_width}}{_human_count(total_tokens)}"
     has_details = any(
@@ -1215,30 +1220,49 @@ def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[s
             ("cached", "cached_tokens"),
         )
     )
+    detail_rows: list[tuple[str, str]] = []
     if has_details:
         input_value = _human_count(input_tokens)
         output_value = _human_count(output_tokens)
         cached_value = _human_count(cached_tokens)
         details = (
-            f"(in {input_value} · out {output_value} · cached {cached_value})",
-            f"(in {input_value} · out {output_value} · c {cached_value})",
-            f"(in {input_value}/out {output_value}/c {cached_value})",
-            f"({input_value}/{output_value}/{cached_value})",
-            f"(in {input_value} · out {output_value})",
-            f"(in {input_value})",
+            (f"(in {input_value} · out {output_value} · cached {cached_value})", True),
+            (f"(in {input_value}/out {output_value}/cached {cached_value})", True),
+            (f"(in {input_value} · out {output_value})", False),
+            (f"(in {input_value}/out {output_value})", False),
         )
-        for detail in details:
+        selected_detail = False
+        for detail, includes_cached in details:
             candidate = f"{token_line} {detail}"
             if len(candidate) <= max(1, width):
                 token_line = candidate
+                selected_detail = True
+                if not includes_cached:
+                    detail_rows.append(_side_row("normal", f" cached {cached_value}", width))
                 break
+        if not selected_detail:
+            detail_rows.extend(
+                [
+                    row("in", input_value),
+                    row("out", output_value),
+                    _side_row("normal", f" cached {cached_value}", width),
+                ]
+            )
 
-    return [
+    cache_rate = None
+    if cached_tokens > 0 and input_tokens > 0:
+        cache_rate = min(1.0, cached_tokens / input_tokens)
+
+    rows = [
         row("calls", str(calls)),
         _side_row("normal", token_line, width),
+        *detail_rows,
         row("out/s", f"{rate:.1f}"),
         row("cost", _format_cost(cost)),
     ]
+    if cache_rate is not None:
+        rows.append(row("cache-hit", f"{cache_rate:.0%}"))
+    return rows
 
 
 def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
@@ -1332,6 +1356,114 @@ def _append_side_rows(
         lines.append(rows[0])
 
 
+def _quota_field(window: Any, key: str, default: Any = None) -> Any:
+    if isinstance(window, Mapping):
+        return window.get(key, default)
+    return getattr(window, key, default)
+
+
+def _quota_db_exists() -> bool:
+    configured = os.environ.get("CAMBIUM_QUOTA_DB")
+    if configured:
+        path = Path(configured).expanduser()
+    else:
+        state_home = os.environ.get("XDG_STATE_HOME")
+        root = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+        path = root / "cambium" / "provider-quota.db"
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _quota_windows(snapshot: Any) -> tuple[Any, ...]:
+    windows = getattr(snapshot, "quota_windows", None)
+    if windows is None:
+        windows = getattr(snapshot, "quota_snapshots", None)
+    if windows is None:
+        for agent in getattr(snapshot, "agents", ()):
+            agent_windows = getattr(agent, "quota_windows", None)
+            if agent_windows is not None:
+                windows = agent_windows
+                break
+    if windows is None and _quota_db_exists():
+        try:
+            windows = QuotaLedger().snapshots()
+        except (OSError, ValueError, sqlite3.Error):
+            windows = ()
+    if windows is None:
+        return ()
+    if isinstance(windows, Mapping):
+        if "provider" in windows and "name" in windows:
+            return (windows,)
+        windows = windows.values()
+    try:
+        return tuple(windows)
+    except TypeError:
+        return ()
+
+
+def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
+    """Render known provider windows without clipping quota field labels."""
+    panel_width = max(1, width)
+    rows: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for window in _quota_windows(snapshot):
+        provider = _side_clean(_quota_field(window, "provider", "")).strip()
+        name = _side_clean(_quota_field(window, "name", "")).strip()
+        if not provider or not name or (provider, name) in seen:
+            continue
+        seen.add((provider, name))
+
+        token_allowance = _usage_int(
+            _quota_field(
+                window,
+                "allowance_tokens",
+                _quota_field(window, "token_allowance", 0),
+            )
+        )
+        request_allowance = _usage_int(
+            _quota_field(
+                window,
+                "allowance_requests",
+                _quota_field(window, "request_allowance", 0),
+            )
+        )
+        fields: list[str] = []
+        if token_allowance:
+            remaining = _quota_field(window, "remaining_tokens")
+            if remaining is None:
+                used = _usage_int(_quota_field(window, "used_tokens"))
+                remaining = max(0, token_allowance - used)
+            fields.append(f"{_usage_int(remaining)}/{token_allowance} tokens")
+        if request_allowance:
+            remaining = _quota_field(window, "remaining_requests")
+            if remaining is None:
+                used = _usage_int(_quota_field(window, "used_requests"))
+                remaining = max(0, request_allowance - used)
+            fields.append(f"{_usage_int(remaining)}/{request_allowance} requests")
+        if not fields:
+            continue
+
+        subject = f"{provider}/{name}"
+        full = f" {subject}: {', '.join(fields)}"
+        compact_fields = [
+            field.replace(" tokens", " tok").replace(" requests", " req")
+            for field in fields
+        ]
+        compact = f" {subject}: {', '.join(compact_fields)}"
+        if len(full) <= panel_width:
+            rows.append(_side_row("normal", full, panel_width))
+        elif len(compact) <= panel_width:
+            rows.append(_side_row("normal", compact, panel_width))
+        else:
+            rows.append(_side_row("normal", f" {subject}", panel_width))
+            rows.extend(
+                _side_row("dim", f"   {field}", panel_width) for field in fields
+            )
+    return rows
+
+
 def _side_sections(
     snapshot: Any, cumulative_line: str, width: int, capacity: int
 ) -> list[tuple[str, str]]:
@@ -1387,6 +1519,10 @@ def _side_sections(
 
     lines.append(_side_row("heading", " SESSION USAGE", panel_width))
     lines.extend(_usage_rows(snapshot, cumulative_line, panel_width))
+
+    lines.append(_side_row("heading", " QUOTA", panel_width))
+    quota_rows = _quota_rows(snapshot, panel_width)
+    lines.extend(quota_rows or [_side_row("dim", " unavailable", panel_width)])
 
     recent = tuple(
         event
@@ -1452,14 +1588,26 @@ def _primary_status_line(
     match = re.search(r"(provider=\S+\s+model=\S+)", branch)
     if match is not None:
         provider_model = match.group(1)
+    checkpoint = ""
+    checkpoint_match = re.search(r"(?:last_checkpoint|checkpoint)=(\S+)", session_description)
+    if checkpoint_match is not None:
+        checkpoint = f"last_checkpoint={_clip(checkpoint_match.group(1), 40)}"
+    priority = " · ".join(
+        part
+        for part in (f"status={status}", checkpoint, provider_model)
+        if part
+    )
     details = (
-        f"status={status} · {provider_model + ' · ' if provider_model else ''}"
-        f"agents={agents} · tokens={tokens} · out/s={rate:.1f}"
+        f"{priority} · agents={agents} · tokens={tokens} · out/s={rate:.1f}"
         f" · epoch={epoch} · {_sanitize(cumulative_line)}"
         f" · {branch if not provider_model else branch.replace(provider_model, '').strip(' ·')}"
         f" · {_sanitize(session_description)}"
     )
-    return _clip(f"┌ Cambium · {details}", max(64, width))
+    line = f"┌ Cambium · {details}"
+    # A checkpoint reference is content-addressed and can be much longer than
+    # a terminal row.  Keep it intact in native scrollback instead of clipping
+    # the durable identity; the terminal will wrap this one logical status row.
+    return line if checkpoint else _clip(line, max(64, width))
 
 
 def render_primary(
