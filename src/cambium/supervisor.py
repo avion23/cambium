@@ -630,7 +630,7 @@ def _validate_advanced_epoch_checkpoint(
             raise ValueError(f"checkpoint {field} is invalid")
         try:
             finite = math.isfinite(value)
-        except OverflowError, TypeError:
+        except (OverflowError, TypeError):
             finite = False
         if not finite or (positive and value <= 0):
             raise ValueError(f"checkpoint {field} is invalid")
@@ -838,7 +838,7 @@ def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) ->
     value = spec_value if spec_value is not None else os.environ.get(env, default)
     try:
         parsed = float(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         raise ValueError(f"invalid {key}: {value!r}") from None
     if not math.isfinite(parsed):
         raise ValueError(f"invalid {key}: value must be finite")
@@ -902,7 +902,7 @@ async def _write_json(
         write_frame(proc.stdin, frame)
         await asyncio.wait_for(proc.stdin.drain(), remaining)
         return True
-    except BrokenPipeError, ConnectionResetError, OSError, TimeoutError:
+    except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
         await _kill_worker(proc)
         return False
 
@@ -911,7 +911,7 @@ async def _kill_worker(proc: asyncio.subprocess.Process) -> None:
     """SIGKILL the worker's process group (worker is its own session/group leader)."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError, PermissionError, OSError:
+    except (ProcessLookupError, PermissionError, OSError):
         pass
 
 
@@ -948,14 +948,14 @@ def _kill_worktree_process_groups(
             if not (cwd == root or cwd.is_relative_to(root)):
                 continue
             pgid = os.getpgid(pid)
-        except FileNotFoundError, PermissionError, OSError, ValueError:
+        except (FileNotFoundError, PermissionError, OSError, ValueError):
             continue
         if pgid != own_group and pgid not in skip_groups:
             groups.add(pgid)
     for pgid in groups:
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError, PermissionError, OSError:
+        except (ProcessLookupError, PermissionError, OSError):
             pass
 
 
@@ -1143,7 +1143,7 @@ def _codex_oauth_provider_names(
     """
     try:
         providers = load_providers(_provider_config_path(source, spec))
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return frozenset()
     codex = frozenset(
         provider.name for provider in providers if provider.auth is AuthMode.CODEX_CHATGPT
@@ -1551,7 +1551,7 @@ def _bounded_metric_breakdown(value: Any) -> dict[str, Any]:
                     allow_nan=False,
                 ).encode("utf-8")
             )
-        except TypeError, ValueError, UnicodeEncodeError:
+        except (TypeError, ValueError, UnicodeEncodeError):
             truncated = True
             continue
         if encoded_size > MAX_ENVELOPE_FIELD_CHARS:
@@ -1572,7 +1572,7 @@ def _bounded_metric_breakdown(value: Any) -> dict[str, Any]:
                     allow_nan=False,
                 ).encode("utf-8")
             )
-        except TypeError, ValueError, UnicodeEncodeError:
+        except (TypeError, ValueError, UnicodeEncodeError):
             encoded_size = MAX_ENVELOPE_FIELD_CHARS + 1
         if encoded_size <= MAX_ENVELOPE_FIELD_CHARS:
             break
@@ -2015,7 +2015,7 @@ class _Runtime:
         for proc in unique_alive:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError, PermissionError, OSError:
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
         if unique_alive:
             try:
@@ -2032,7 +2032,7 @@ class _Runtime:
                         continue
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError, PermissionError, OSError:
+                    except (ProcessLookupError, PermissionError, OSError):
                         pass
                     try:
                         proc.kill()
@@ -2080,7 +2080,7 @@ class _Runtime:
             try:
                 await self._prune_worktree(spec, force=True)
                 self._cleanup_attempted.add(task_id)
-            except OSError, RuntimeError, TypeError, ValueError:
+            except (OSError, RuntimeError, TypeError, ValueError):
                 pass
         try:
             await self.emit(
@@ -2281,7 +2281,7 @@ class _Runtime:
                         # a process-group race cannot write with its old token.
                         await asyncio.to_thread(next_generation, worktree)
                         generation_invalidated = True
-                    except OSError, RuntimeError, ValueError:
+                    except (OSError, RuntimeError, ValueError):
                         await self.emit(
                             "worktree_cleanup_deferred",
                             task_id=task_id,
@@ -2294,7 +2294,7 @@ class _Runtime:
                     await _kill_worker(handle.proc)
                     try:
                         await asyncio.wait_for(handle.proc.wait(), WORKER_EXIT_WAIT_S)
-                    except TimeoutError, ProcessLookupError:
+                    except (TimeoutError, ProcessLookupError):
                         pass
                 # Pooled workers keep their cwd inside their finished
                 # worktree; killing them here would silently disable reuse
@@ -2338,7 +2338,7 @@ class _Runtime:
                         # can no longer pass its next fenced write check.
                         await asyncio.to_thread(next_generation, worktree)
                         generation_invalidated = True
-                    except OSError, RuntimeError, ValueError:
+                    except (OSError, RuntimeError, ValueError):
                         await self.emit(
                             "worktree_cleanup_deferred",
                             task_id=task_id,
@@ -4003,7 +4003,7 @@ class _Runtime:
         await _kill_worker(proc)
         try:
             await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
-        except TimeoutError, asyncio.CancelledError:
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
     async def _drive_generation(
@@ -4187,7 +4187,7 @@ class _Runtime:
                         if parse_errors > MAX_PARSE_ERRORS:
                             try:
                                 os.killpg(proc.pid, signal.SIGKILL)
-                            except ProcessLookupError, PermissionError, OSError:
+                            except (ProcessLookupError, PermissionError, OSError):
                                 pass
                         continue
                     if not isinstance(msg, dict):
@@ -4206,7 +4206,7 @@ class _Runtime:
                         if parse_errors > MAX_PARSE_ERRORS:
                             try:
                                 os.killpg(proc.pid, signal.SIGKILL)
-                            except ProcessLookupError, PermissionError, OSError:
+                            except (ProcessLookupError, PermissionError, OSError):
                                 pass
                         continue
                     await messages.put(msg)
@@ -4628,7 +4628,7 @@ class _Runtime:
                                 generation,
                                 msg,
                             )
-                        except OSError, TypeError, ValueError:
+                        except (OSError, TypeError, ValueError):
                             await self.emit(
                                 "protocol",
                                 task_id=task_id,
@@ -5309,7 +5309,7 @@ def _write_plan(session_dir: Path, plan: dict[str, Any]) -> Path:
             existing_specs = [
                 _validate_plan_task(session_dir, task) for task in _plan_tasks(existing_plan)
             ]
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             existing_specs = []
         if plan == {"tasks": existing_specs}:
             return target
@@ -5712,7 +5712,7 @@ def _fork_cache_compatible_supervisor(
                 for provider_config in load_providers(Path(config_path))
                 if provider_config.name == provider
             )
-        except OSError, StopIteration, ValueError:
+        except (OSError, StopIteration, ValueError):
             return False, "provider configuration is unavailable"
         actual_protocol = configured.protocol.value
         actual_reasoning = configured.reasoning_effort
@@ -6465,7 +6465,7 @@ async def _amain_plan(
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, task.cancel)
-        except NotImplementedError, RuntimeError:
+        except (NotImplementedError, RuntimeError):
             pass
     try:
         plan_result = await task
