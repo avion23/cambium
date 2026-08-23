@@ -2135,9 +2135,7 @@ class _Runtime:
             ]
             worker_pid = ready_events[-1]["payload"]["pid"] if ready_events else None
             generations = [
-                event["generation"]
-                for event in history
-                if type(event.get("generation")) is int
+                event["generation"] for event in history if type(event.get("generation")) is int
             ]
             terminated_event_seqs = [
                 event["seq"] for event in history if type(event.get("seq")) is int
@@ -2162,9 +2160,7 @@ class _Runtime:
             # first durable worker event without touching another worktree.
             if worktree.exists():
                 repo = Path(spec["repo"]).resolve()
-                listing = await self._git(
-                    repo, "worktree", "list", "--porcelain", check=False
-                )
+                listing = await self._git(repo, "worktree", "list", "--porcelain", check=False)
                 if listing.returncode == 0:
                     registered = any(
                         line.startswith("worktree ")
@@ -3951,8 +3947,7 @@ class _Runtime:
                                 outcome.proposals,
                                 reason="ParentJoinInvariantFailed",
                                 message=(
-                                    "parent worktree was not at the accepted "
-                                    "child integration head"
+                                    "parent worktree was not at the accepted child integration head"
                                 ),
                             )
                             self._results[task_id] = TaskResult(
@@ -5475,9 +5470,7 @@ class _Runtime:
         ):
             return
         try:
-            await self._git(
-                worktree, "merge", "--ff-only", "--no-edit", accepted_head, check=False
-            )
+            await self._git(worktree, "merge", "--ff-only", "--no-edit", accepted_head, check=False)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             return
 
@@ -5588,11 +5581,15 @@ class _Runtime:
         if not isinstance(integration_head, str) or not integration_head:
             raise ValueError("merge conflict has no integration head")
         raw_files = conflict.get("conflicted_files")
-        conflicted_files = [
-            _cap_utf8(path, MAX_ENVELOPE_FIELD_CHARS)
-            for path in raw_files[:MAX_ENVELOPE_ITEMS]
-            if isinstance(path, str)
-        ] if isinstance(raw_files, list) else []
+        conflicted_files = (
+            [
+                _cap_utf8(path, MAX_ENVELOPE_FIELD_CHARS)
+                for path in raw_files[:MAX_ENVELOPE_ITEMS]
+                if isinstance(path, str)
+            ]
+            if isinstance(raw_files, list)
+            else []
+        )
         raw_evidence = conflict.get("diff_evidence", "")
         diff_evidence = (
             _cap_utf8(raw_evidence, MAX_ENVELOPE_FIELD_CHARS)
@@ -5678,9 +5675,7 @@ class _Runtime:
                 raise RuntimeError(
                     f"resolver worktree reset failed: {(reset.stderr + reset.stdout).strip()[:512]}"
                 )
-            clean = await self._git(
-                worktree, "clean", "-fd", "-e", ".cambium/", check=False
-            )
+            clean = await self._git(worktree, "clean", "-fd", "-e", ".cambium/", check=False)
             if clean.returncode != 0:
                 raise RuntimeError(
                     f"resolver worktree clean failed: {(clean.stderr + clean.stdout).strip()[:512]}"
@@ -5707,9 +5702,7 @@ class _Runtime:
             conflicted = [
                 record[3:]
                 for record in status.stdout.split("\0")
-                if len(record) >= 4
-                and record[:2] in _RESOLVER_UNMERGED_PAIRS
-                and record[3:]
+                if len(record) >= 4 and record[:2] in _RESOLVER_UNMERGED_PAIRS and record[3:]
             ]
             if merge.returncode != 0 and not conflicted:
                 raise RuntimeError(
@@ -5723,9 +5716,7 @@ class _Runtime:
                     _cap_utf8(path, MAX_ENVELOPE_FIELD_CHARS) for path in conflicted
                 ]
                 spec["conflicted_files"] = list(
-                    dict.fromkeys(
-                        [*spec.get("conflicted_files", ()), *bounded_conflicted]
-                    )
+                    dict.fromkeys([*spec.get("conflicted_files", ()), *bounded_conflicted])
                 )[:MAX_ENVELOPE_ITEMS]
             if diff.returncode == 0 and diff.stdout:
                 spec["diff_evidence"] = _cap_utf8(diff.stdout, MAX_ENVELOPE_FIELD_CHARS)
@@ -5768,9 +5759,7 @@ class _Runtime:
         max_attempts = self._resolver_attempt_limit(spec)
         parent_task_id = spec.get("parent_task_id")
         parent_spec = (
-            self._session_spec(parent_task_id)
-            if isinstance(parent_task_id, str)
-            else None
+            self._session_spec(parent_task_id) if isinstance(parent_task_id, str) else None
         )
         integration_head = conflict.get("integration_head")
         if not isinstance(integration_head, str) or not integration_head:
@@ -5918,9 +5907,7 @@ class _Runtime:
                         await self._cleanup_resolver_worktree(resolver_spec)
                         self._resolver_failures[spec["task_id"]] = last_reason
                         return None
-                    self._results[resolver_task_id] = replace(
-                        resolver_result, merge_sha=merged
-                    )
+                    self._results[resolver_task_id] = replace(resolver_result, merge_sha=merged)
                     await self.emit(
                         "resolver_succeeded",
                         task_id=spec["task_id"],
@@ -6394,9 +6381,7 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     if "resolver_child_enabled" in spec and type(spec["resolver_child_enabled"]) is not bool:
         raise ValueError(f"task {task_id} resolver_child_enabled must be a boolean")
     for key in ("resolver_max_attempts", "resolver_attempts"):
-        if key in spec and (
-            type(spec[key]) is not int or spec[key] < 0
-        ):
+        if key in spec and (type(spec[key]) is not int or spec[key] < 0):
             raise ValueError(f"task {task_id} {key} must be a non-negative int")
     return spec
 
