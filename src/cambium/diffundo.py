@@ -96,6 +96,7 @@ from the request shape. The worker bounds transcript growth directly instead.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -155,6 +156,96 @@ _CLOUDFLARE_1010_RE = re.compile(
     r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
     r"error\s*(?:code\s*)?[:#-]?\s*1010|browser(?:['’]s)?\s+signature))",
     re.IGNORECASE | re.DOTALL,
+)
+_WAF_403_RE = re.compile(
+    r"(?:cloudflare|cf[- ]?(?:ray|error)|web application firewall|\bwaf\b|"
+    r"akamai|imperva|sucuri|bot (?:detected|detection|protection)|"
+    r"automated (?:traffic|request)|browser(?:['’]s)? signature|"
+    r"browser integrity|captcha|security (?:challenge|rule)|"
+    r"\b(?:1006|1009|1010|1015|1020)\b)",
+    re.IGNORECASE,
+)
+_HTTP_403_AUTH_MARKERS = (
+    "invalid_api_key",
+    "invalid api key",
+    "invalid_api_token",
+    "invalid api token",
+    "invalid token",
+    "token expired",
+    "token has expired",
+    "expired token",
+    "credential revoked",
+    "credentials revoked",
+    "revoked credential",
+    "invalid credential",
+    "authentication failed",
+    "authentication error",
+    "auth failed",
+    "not authenticated",
+    "api key is invalid",
+    "api key not valid",
+)
+_HTTP_403_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "insufficient quota",
+    "quota_exceeded",
+    "quota exceeded",
+    "exceeded your current quota",
+    "rate_limit",
+    "rate limit",
+    "billing_hard_limit",
+    "billing hard limit",
+    "billing",
+    "payment_required",
+    "payment required",
+    "credit balance",
+    "out of credits",
+    "credits exhausted",
+    "spend limit",
+    "usage limit",
+    "subscription limit",
+)
+_HTTP_403_MODEL_MARKERS = (
+    "model_not_found",
+    "model not found",
+    "model_not_allowed",
+    "model not allowed",
+    "model_not_available",
+    "model not available",
+    "model_not_enabled",
+    "model not enabled",
+    "model_access_denied",
+    "model access denied",
+    "model_not_entitled",
+    "model not entitled",
+    "unsupported model",
+    "unknown model",
+    "not entitled",
+    "entitlement",
+    "does not have access to model",
+    "do not have access to model",
+    "no access to model",
+    "permission to use model",
+    "model is not permitted",
+    "model forbidden",
+)
+_HTTP_403_REFUSAL_MARKERS = (
+    "content_policy",
+    "content policy",
+    "content_policy_violation",
+    "content filter",
+    "content_filter",
+    "policy violation",
+    "blocked by policy",
+    "due to policy",
+    "safety violation",
+    "safety filter",
+    "blocked by safety",
+    "prompt violates",
+    "disallowed content",
+    "moderation",
+    "responsible ai",
+    "acceptable use",
 )
 USER_AGENT = f"cambium/{__version__}"
 # Codex-ChatGPT transport identity headers, matching the codex CLI wire shape:
@@ -526,6 +617,7 @@ class _ProviderRuntime:
         "lock",
         "outcomes",
         "probe_in_flight",
+        "auth_quarantine_fingerprint",
     )
 
     def __init__(self, provider: ProviderConfig, window_size: int) -> None:
@@ -537,6 +629,10 @@ class _ProviderRuntime:
         self.lock = asyncio.Lock()
         self.outcomes: deque[bool] = deque(maxlen=window_size)
         self.probe_in_flight = False
+        # An auth failure is quarantined for this credential identity. A
+        # replacement credential is allowed to probe the provider again; a
+        # config error has no fingerprint and remains disabled.
+        self.auth_quarantine_fingerprint: str | None = None
 
 
 class _PauseTracker:
@@ -886,6 +982,55 @@ def _parse_retry_after(headers: Any) -> float | None:
     if not math.isfinite(delay):
         return None
     return max(0.0, delay)
+
+
+def _body_retry_after(message: str) -> float | None:
+    """Read a bounded reset delay from a provider's structured error body."""
+    try:
+        payload = json.loads(message)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    pending: list[Any] = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, Mapping):
+            for key in ("retry_after", "retry_after_s", "reset_after", "reset_after_s"):
+                candidate = value.get(key)
+                if isinstance(candidate, bool):
+                    continue
+                if isinstance(candidate, int | float):
+                    delay = _finite_nonnegative_float(candidate)
+                    if delay is not None:
+                        return delay
+                elif isinstance(candidate, str) and candidate.strip():
+                    try:
+                        delay = float(candidate)
+                    except ValueError:
+                        continue
+                    if math.isfinite(delay) and delay >= 0:
+                        return delay
+            for key in ("reset_at", "resetAt", "reset_time", "resetTime"):
+                candidate = value.get(key)
+                if isinstance(candidate, bool) or not isinstance(candidate, int | float):
+                    continue
+                reset_at = _finite_nonnegative_float(candidate)
+                if reset_at is not None and reset_at > 0:
+                    return max(0.0, reset_at - time.time())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return None
+
+
+def _finite_nonnegative_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
 
 
 class _SanitizedHTTPError(Exception):
@@ -1381,8 +1526,12 @@ class Diffundo:
         """Current selection-filter status for a provider."""
         runtime = self._runtime(name)
         provider = runtime.provider
-        if not provider.enabled or runtime.health is HealthState.DISABLED:
+        if not provider.enabled:
             return ProviderStatus.DISABLED
+        if runtime.health is HealthState.DISABLED:
+            self._release_auth_quarantine(runtime)
+            if runtime.health is HealthState.DISABLED:
+                return ProviderStatus.DISABLED
         if runtime.health is HealthState.OPEN:
             if runtime.open_until <= time.monotonic():
                 return ProviderStatus.HALF_OPEN
@@ -1571,7 +1720,9 @@ class Diffundo:
             ):
                 continue
             if runtime.health is HealthState.DISABLED:
-                continue
+                self._release_auth_quarantine(runtime)
+                if runtime.health is HealthState.DISABLED:
+                    continue
             if runtime.health is HealthState.OPEN:
                 if runtime.open_until > now:
                     continue
@@ -1638,8 +1789,12 @@ class Diffundo:
         runtime = self._runtime(name)
         provider = runtime.provider
         now = time.monotonic()
-        if not provider.enabled or runtime.health is HealthState.DISABLED:
+        if not provider.enabled:
             return False
+        if runtime.health is HealthState.DISABLED:
+            self._release_auth_quarantine(runtime)
+            if runtime.health is HealthState.DISABLED:
+                return False
         if runtime.health is HealthState.OPEN and runtime.open_until > now:
             return False
         if runtime.health is HealthState.COOLDOWN and runtime.cooldown_until > now:
@@ -1839,7 +1994,10 @@ class Diffundo:
                             ProviderOutcome.AUTH_ERROR,
                             ProviderOutcome.CONFIG_ERROR,
                         ):
-                            self._record_disable(provider)
+                            self._record_disable(
+                                provider,
+                                auth_quarantine=exc.outcome is ProviderOutcome.AUTH_ERROR,
+                            )
                             break
                         # A transport timeout means the endpoint (or a CDN in
                         # front of it) is tarpitting this client; re-POSTing
@@ -1881,7 +2039,9 @@ class Diffundo:
                         request_rate_status=request_rate_status,
                         account_quota_owner=last_exc.account_quota_owner,
                     ) from last_exc
-                request_rate_status = self._record_failure(provider)
+                request_rate_status = self._record_failure(
+                    provider, retry_after_s=last_exc.retry_after_s
+                )
                 raise ProviderError(
                     provider.name,
                     last_exc.outcome,
@@ -2072,7 +2232,7 @@ class Diffundo:
                 status,
                 safe_body,
                 cause=http_cause,
-                retry_after_s=_parse_retry_after(exc.headers) if status == 429 else None,
+                retry_after_s=(_parse_retry_after(exc.headers) if status in (403, 429) else None),
                 account_quota_owner=_account_quota_owner(error_body, api_key),
             )
         except urllib.error.URLError as exc:
@@ -2190,7 +2350,7 @@ class Diffundo:
                 status,
                 safe_body,
                 cause=http_cause,
-                retry_after_s=_parse_retry_after(exc.headers) if status == 429 else None,
+                retry_after_s=(_parse_retry_after(exc.headers) if status in (403, 429) else None),
                 account_quota_owner=_account_quota_owner(error_body, access_token),
             )
         except urllib.error.URLError as exc:
@@ -2240,6 +2400,8 @@ class Diffundo:
                 cause,
             )
         if status == 429:
+            if retry_after_s is None:
+                retry_after_s = _body_retry_after(message)
             return ProviderError(
                 provider.name,
                 ProviderOutcome.QUOTA,
@@ -2248,15 +2410,53 @@ class Diffundo:
                 retry_after_s=retry_after_s,
                 account_quota_owner=account_quota_owner,
             )
-        # Cloudflare's browser-signature block is a provider/network error, not
-        # evidence that the configured API credential is invalid.
-        if status == 403 and _CLOUDFLARE_1010_RE.search(message):
-            return ProviderError(
-                provider.name,
-                ProviderOutcome.ERROR,
-                f"HTTP 403 Cloudflare 1010: {message}",
-                cause,
-            )
+        if status == 403:
+            if retry_after_s is None:
+                retry_after_s = _body_retry_after(message)
+            if _WAF_403_RE.search(message) or _CLOUDFLARE_1010_RE.search(message):
+                # A WAF/browser block says nothing about the provider
+                # credential. Keep it retryable with bounded backoff.
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    f"HTTP 403 WAF/network block: {message}",
+                    cause,
+                    retry_after_s=retry_after_s,
+                )
+            lowered = message.casefold()
+            if any(marker in lowered for marker in _HTTP_403_QUOTA_MARKERS):
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.QUOTA,
+                    f"HTTP 403 quota/billing: {message}",
+                    cause,
+                    retry_after_s=retry_after_s,
+                    account_quota_owner=account_quota_owner,
+                )
+            if any(marker in lowered for marker in _HTTP_403_MODEL_MARKERS):
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.CONFIG_ERROR,
+                    f"HTTP 403 model entitlement: {message}",
+                    cause,
+                )
+            if any(marker in lowered for marker in _HTTP_403_REFUSAL_MARKERS):
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.REFUSAL,
+                    f"HTTP 403 policy/content refusal: {message}",
+                    cause,
+                )
+            if any(marker in lowered for marker in _HTTP_403_AUTH_MARKERS):
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.AUTH_ERROR,
+                    f"HTTP 403 credential rejected: {message}",
+                    cause,
+                )
+            # An unlabelled 403 remains fail-closed as an auth failure. Known
+            # provider/WAF, entitlement, quota, and policy shapes above avoid
+            # damaging provider health for their respective non-auth causes.
         if status in (401, 403):
             return ProviderError(
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
@@ -2292,24 +2492,32 @@ class Diffundo:
         """Record one success; returns the provider's request-rate status."""
         runtime = self._runtime(provider.name)
         runtime.outcomes.append(True)
+        runtime.auth_quarantine_fingerprint = None
         if runtime.health in (HealthState.UNKNOWN, HealthState.COOLDOWN, HealthState.HALF_OPEN):
             runtime.health = HealthState.HEALTHY
         return self.status(provider.name).value
 
-    def _record_failure(self, provider: ProviderConfig) -> str:
+    def _record_failure(
+        self, provider: ProviderConfig, *, retry_after_s: float | None = None
+    ) -> str:
         """Record one failure; returns the provider's request-rate status."""
         runtime = self._runtime(provider.name)
         runtime.outcomes.append(False)
         now = time.monotonic()
+        cooldown_s = provider.cooldown_s
+        if retry_after_s is not None and math.isfinite(retry_after_s) and retry_after_s >= 0:
+            # A provider reset is stronger evidence than the local default;
+            # do not probe a quota/billing failure before that reset.
+            cooldown_s = max(cooldown_s, retry_after_s)
         if runtime.health in (HealthState.UNKNOWN, HealthState.HEALTHY):
             runtime.health = HealthState.COOLDOWN
-            runtime.cooldown_until = now + provider.cooldown_s
+            runtime.cooldown_until = now + cooldown_s
         elif runtime.health in (HealthState.COOLDOWN, HealthState.HALF_OPEN):
             # PRIMARY OPEN trip: a failed probe. A provider in COOLDOWN is only
             # ever dispatched as one probe once its cooldown elapsed; HALF_OPEN
             # is itself a probe state. A failure here means persistence -> OPEN.
             runtime.health = HealthState.OPEN
-            runtime.open_until = now + provider.cooldown_s * self._open_backoff_base
+            runtime.open_until = now + cooldown_s * self._open_backoff_base
         # SECONDARY safety net (cascade-design §2.3): the sliding-window failure
         # rate can escalate COOLDOWN -> OPEN before the probe fires. It is almost
         # unreachable in practice — a full window of failures implies probes that
@@ -2322,13 +2530,48 @@ class Diffundo:
             >= self._breaker_threshold
         ):
             runtime.health = HealthState.OPEN
-            runtime.open_until = now + provider.cooldown_s * self._open_backoff_base
+            runtime.open_until = now + cooldown_s * self._open_backoff_base
         return self.status(provider.name).value
 
-    def _record_disable(self, provider: ProviderConfig) -> None:
-        self._runtime(provider.name).health = HealthState.DISABLED
+    def _record_disable(self, provider: ProviderConfig, *, auth_quarantine: bool = False) -> None:
+        runtime = self._runtime(provider.name)
+        runtime.health = HealthState.DISABLED
+        runtime.auth_quarantine_fingerprint = (
+            self._credential_fingerprint(provider) if auth_quarantine else None
+        )
 
     # -- helpers ------------------------------------------------------------- #
+
+    def _credential_fingerprint(self, provider: ProviderConfig) -> str:
+        """Return a non-secret identity for the credential currently in use."""
+        if provider.protocol is Protocol.CODEX_RESPONSES:
+            credential = self._credential_source
+            if credential is None:
+                material = b"codex:missing"
+            else:
+                material = (
+                    b"codex:"
+                    + credential.access_token.encode("utf-8")
+                    + b"\0"
+                    + (credential.account_id or "").encode("utf-8")
+                )
+        else:
+            api_key = os.environ.get(provider.api_key_env)
+            material = (
+                b"api-key:missing" if api_key is None else b"api-key:" + api_key.encode("utf-8")
+            )
+        return hashlib.sha256(material).hexdigest()
+
+    def _release_auth_quarantine(self, runtime: _ProviderRuntime) -> None:
+        """Re-admit a disabled provider only after its credential changes."""
+        fingerprint = runtime.auth_quarantine_fingerprint
+        if fingerprint is None or self._credential_fingerprint(runtime.provider) == fingerprint:
+            return
+        runtime.auth_quarantine_fingerprint = None
+        runtime.health = HealthState.UNKNOWN
+        runtime.cooldown_until = 0.0
+        runtime.open_until = 0.0
+        runtime.probe_in_flight = False
 
     def _runtime(self, name: str) -> _ProviderRuntime:
         for runtime in self._runtimes:

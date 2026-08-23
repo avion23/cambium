@@ -691,6 +691,163 @@ def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch
         blocked.close()
 
 
+def test_403_invalid_credential_is_quarantined_until_key_changes(monkeypatch) -> None:
+    server = FakeServer(
+        [
+            (403, _error_payload("invalid_api_key: credential revoked"), 0.0),
+            (200, _ok_payload("credential recovered"), 0.0),
+        ]
+    )
+    _set_keys(monkeypatch, "K_ROTATE")
+    router = Diffundo(
+        (_config("p_rotate", server, "K_ROTATE", max_retries=2),),
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as first:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, first.value.last_error)
+        assert error.outcome is ProviderOutcome.AUTH_ERROR
+        assert len(server.calls) == 1
+        assert router.health("p_rotate") is HealthState.DISABLED
+
+        # The same credential remains quarantined, without another request.
+        with pytest.raises(AllProvidersFailed):
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert len(server.calls) == 1
+
+        # A rotated credential is a new auth identity and may probe again.
+        monkeypatch.setenv("K_ROTATE", "sk-test-K_ROTATE-rotated")
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "credential recovered"
+        assert len(server.calls) == 2
+        assert router.health("p_rotate") is HealthState.HEALTHY
+    finally:
+        server.close()
+
+
+def test_403_missing_model_entitlement_is_config_error(tmp_path, monkeypatch) -> None:
+    server = FakeServer(
+        [
+            (
+                403,
+                {
+                    "error": {
+                        "code": "model_not_found",
+                        "message": "The configured model is not available to this account",
+                    }
+                },
+                0.0,
+            )
+        ]
+    )
+    _set_keys(monkeypatch, "K_MODEL_ENTITLEMENT")
+    router = Diffundo(
+        (_config("p_model_entitlement", server, "K_MODEL_ENTITLEMENT", max_retries=2),),
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.CONFIG_ERROR
+        assert len(server.calls) == 1
+        assert router.health("p_model_entitlement") is HealthState.DISABLED
+    finally:
+        server.close()
+
+
+def test_403_quota_or_billing_exhaustion_cools_until_reset(monkeypatch) -> None:
+    server = FakeServer(
+        [
+            (
+                403,
+                {
+                    "error": {
+                        "code": "insufficient_quota",
+                        "message": "billing hard limit reached",
+                    }
+                },
+                0.0,
+                {"Retry-After": "7"},
+            )
+        ]
+    )
+    _set_keys(monkeypatch, "K_BILLING")
+    router = Diffundo(
+        (_config("p_billing", server, "K_BILLING", max_retries=0, cooldown_s=1.0),),
+        pause_timeout_s=0.01,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.QUOTA
+        assert error.retry_after_s == 7.0
+        assert error.request_rate_status == "cooldown"
+        assert router.health("p_billing") is HealthState.COOLDOWN
+        assert router._runtime("p_billing").cooldown_until >= started + 6.9
+    finally:
+        server.close()
+
+
+def test_403_policy_refusal_falls_through_without_health_damage(monkeypatch) -> None:
+    refusing = FakeServer(
+        [
+            (
+                403,
+                _error_payload("content_policy_violation: blocked by safety policy"),
+                0.0,
+            )
+        ]
+    )
+    good = FakeServer([(200, _ok_payload("safe fallback"), 0.0)])
+    _set_keys(monkeypatch, "K_POLICY", "K_POLICY_GOOD")
+    router = Diffundo(
+        (
+            _config("p_policy", refusing, "K_POLICY"),
+            _config("p_policy_good", good, "K_POLICY_GOOD"),
+        )
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_policy_good"
+        assert len(refusing.calls) == 1 and len(good.calls) == 1
+        assert router.health("p_policy") is HealthState.UNKNOWN
+    finally:
+        refusing.close()
+        good.close()
+
+
+def test_403_waf_block_retries_with_bounded_backoff(monkeypatch) -> None:
+    blocked = FakeServer(
+        [(403, _error_payload("Web Application Firewall blocked automated traffic"), 0.0)]
+    )
+    _set_keys(monkeypatch, "K_WAF")
+    router = Diffundo(
+        (_config("p_waf", blocked, "K_WAF", max_retries=2),),
+        retry_base_delay_s=0.2,
+    )
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(Diffundo, "_retry_delay", lambda self, attempt_no: 0.1)
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert len(blocked.calls) == 3
+        assert sleeps == [0.1, 0.1]
+        assert router.health("p_waf") is HealthState.COOLDOWN
+    finally:
+        blocked.close()
+
+
 def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) -> None:
     # A normal OpenAI tool-call completion carries content:null plus tool_calls;
     # it is a success, not a "content missing" malformed response. A tool call
