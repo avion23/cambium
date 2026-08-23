@@ -1,23 +1,28 @@
-"""Quota-aware provider scheduling with explicit leases and single-owner admission.
+"""Shared provider leases and durable quota accounting.
 
-The module separates five dimensions that must not be collapsed into one score:
-semantic eligibility, health, concurrent capacity, quota windows, and economic
-preference. Pure ranking is deterministic; mutable admission state belongs to
-``ProviderScheduler``, an asyncio mailbox/actor. ``QuotaLedger`` uses SQLite
-``BEGIN IMMEDIATE`` transactions so independent Cambium processes cannot lose
-updates while consuming the same subscription window.
+Provider admission policy lives exclusively in :mod:`cambium.routing`.  This
+module intentionally contains no second scheduler, ranking function, mailbox,
+or lane state.  It owns only the provider-domain values shared by configuration,
+Diffundo, and the operator quota CLI:
+
+* immutable provider/model leases for one semantic trunk;
+* validated quota-window specifications;
+* transactional, cross-process quota reservations and reconciliation;
+* stable quota snapshots for observability.
+
+The historical ``ProviderScheduler`` actor was never wired into the supervisor
+and duplicated ``cambium.routing``.  Keeping the state primitives here preserves
+the existing import boundary without retaining a competing scheduling policy.
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import math
 import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -25,7 +30,7 @@ from typing import Any
 
 
 class BillingMode(StrEnum):
-    """How a provider consumes scarce resources."""
+    """How a configured provider consumes scarce capacity."""
 
     SUBSCRIPTION = "subscription"
     METERED = "metered"
@@ -35,7 +40,7 @@ class BillingMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class QuotaWindowSpec:
-    """One independently enforced request/token allowance."""
+    """One independently enforced token and/or request allowance."""
 
     name: str
     duration_s: float
@@ -87,7 +92,7 @@ class QuotaWindowSpec:
 
 @dataclass(frozen=True, slots=True)
 class ProviderLease:
-    """A strict provider/model/cache branch lease for one recursive trunk."""
+    """Strict provider/model ownership for one recursive semantic trunk."""
 
     provider: str
     model: str
@@ -98,77 +103,6 @@ class ProviderLease:
     def __post_init__(self) -> None:
         if not self.provider or not self.model or not self.root_task_id:
             raise ValueError("provider lease fields must be non-empty")
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderPolicy:
-    """Static scheduling facts for one provider/model lane."""
-
-    name: str
-    model: str
-    priority: int = 0
-    max_concurrency: int = 1
-    billing_mode: BillingMode = BillingMode.METERED
-    quota_windows: tuple[QuotaWindowSpec, ...] = ()
-    price_per_1m_in: float = 0.0
-    price_per_1m_cached_in: float = 0.0
-    price_per_1m_out: float = 0.0
-    pricing_known: bool = False
-    throughput_hint_tps: float = 0.0
-    quality_weight: float = 1.0
-    context_window: int = 0
-    supports_native_tools: bool = True
-    supports_python_tool: bool = True
-    enabled: bool = True
-
-    def __post_init__(self) -> None:
-        if not self.name or not self.model:
-            raise ValueError("provider policy name/model must be non-empty")
-        if self.max_concurrency <= 0:
-            raise ValueError("max_concurrency must be positive")
-        if self.context_window < 0:
-            raise ValueError("context_window must be non-negative")
-        for value in (
-            self.price_per_1m_in,
-            self.price_per_1m_cached_in,
-            self.price_per_1m_out,
-            self.throughput_hint_tps,
-            self.quality_weight,
-        ):
-            if not math.isfinite(value) or value < 0:
-                raise ValueError("provider policy numeric values must be finite/non-negative")
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderEvidence:
-    """Bounded empirical evidence; priors prevent one sample from dominating."""
-
-    attempts: int = 0
-    successes: int = 0
-    ewma_tps: float = 0.0
-    ewma_latency_s: float = 0.0
-
-    @property
-    def success_probability(self) -> float:
-        return (self.successes + 2.0) / (self.attempts + 3.0)
-
-
-@dataclass(frozen=True, slots=True)
-class RoutingRequest:
-    """Hard requirements plus one scheduling identity."""
-
-    task_id: str
-    model: str
-    expected_input_tokens: int = 0
-    expected_output_tokens: int = 0
-    required_context_tokens: int = 0
-    needs_native_tools: bool = True
-    needs_python_tool: bool = False
-    allow_model_substitution: bool = False
-    allow_paid: bool = True
-    allow_free: bool = True
-    incumbent_provider: str | None = None
-    lease: ProviderLease | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,20 +135,6 @@ class QuotaReservation:
     provider: str
     estimated_tokens: int
     requests: int
-
-
-@dataclass(frozen=True, slots=True)
-class AdmissionGrant:
-    policy: ProviderPolicy
-    lease: ProviderLease
-    quota_reservation: QuotaReservation | None
-
-
-@dataclass(frozen=True, slots=True)
-class SchedulerSnapshot:
-    in_flight: Mapping[str, int]
-    queued: int
-    quota_windows: tuple[QuotaWindowSnapshot, ...]
 
 
 def _state_path() -> Path:
@@ -289,11 +209,17 @@ class QuotaLedger:
         requests: int = 1,
         now: float | None = None,
     ) -> QuotaReservation | None:
+        """Atomically reserve every configured window or reserve none of them."""
+
+        if not provider:
+            raise ValueError("provider must be non-empty")
         if not windows:
             return None
         if estimated_tokens < 0 or requests < 0:
             raise ValueError("quota reservation values must be non-negative")
         timestamp = time.time() if now is None else float(now)
+        if not math.isfinite(timestamp):
+            raise ValueError("quota reservation time must be finite")
         reservation_id = uuid.uuid4().hex
         connection = self._connect()
         try:
@@ -322,6 +248,7 @@ class QuotaLedger:
                     connection.rollback()
                     return None
                 normalized.append((spec, reset_at, used_tokens, used_requests))
+
             for spec, reset_at, used_tokens, used_requests in normalized:
                 connection.execute(
                     "INSERT INTO quota_windows(provider,name,reset_at,allowance_tokens,"
@@ -366,9 +293,13 @@ class QuotaLedger:
         *,
         now: float | None = None,
     ) -> None:
+        """Replace an estimate with actual token usage exactly once."""
+
         if actual_tokens < 0:
             raise ValueError("actual_tokens must be non-negative")
         timestamp = time.time() if now is None else float(now)
+        if not math.isfinite(timestamp):
+            raise ValueError("quota reconciliation time must be finite")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -412,12 +343,30 @@ class QuotaLedger:
         reserve_fraction: float = 0.0,
         now: float | None = None,
     ) -> None:
+        """Replace a window with trusted provider/header/dashboard evidence."""
+
         timestamp = time.time() if now is None else float(now)
+        if not provider or not name:
+            raise ValueError("provider and quota window name must be non-empty")
+        if not all(math.isfinite(value) for value in (timestamp, reset_at, reserve_fraction)):
+            raise ValueError("quota observation values must be finite")
         if reset_at <= timestamp:
             return
-        used_tokens = 0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
+        if allowance_tokens < 0 or allowance_requests < 0:
+            raise ValueError("quota allowances must be non-negative")
+        if remaining_tokens is not None and remaining_tokens < 0:
+            raise ValueError("remaining_tokens must be non-negative")
+        if remaining_requests is not None and remaining_requests < 0:
+            raise ValueError("remaining_requests must be non-negative")
+        if not 0 <= reserve_fraction < 1:
+            raise ValueError("reserve_fraction must be in [0, 1)")
+        used_tokens = (
+            0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
+        )
         used_requests = (
-            0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)
+            0
+            if remaining_requests is None
+            else max(0, allowance_requests - remaining_requests)
         )
         connection = self._connect()
         try:
@@ -464,253 +413,8 @@ class QuotaLedger:
         return tuple(QuotaWindowSnapshot(*row) for row in rows)
 
 
-def _stable_unit_interval(task_id: str, provider: str) -> float:
-    digest = hashlib.sha256(f"{task_id}\0{provider}".encode()).digest()
-    return int.from_bytes(digest[:8], "big") / float(2**64 - 1)
-
-
-def _estimated_money(policy: ProviderPolicy, request: RoutingRequest) -> float:
-    if not policy.pricing_known:
-        return 0.0
-    return (
-        request.expected_input_tokens * policy.price_per_1m_in
-        + request.expected_output_tokens * policy.price_per_1m_out
-    ) / 1_000_000.0
-
-
-def _eligible(
-    policy: ProviderPolicy,
-    request: RoutingRequest,
-    in_flight: Mapping[str, int],
-) -> bool:
-    if not policy.enabled or in_flight.get(policy.name, 0) >= policy.max_concurrency:
-        return False
-    if request.lease is not None:
-        return policy.name == request.lease.provider and policy.model == request.lease.model
-    if not request.allow_model_substitution and policy.model != request.model:
-        return False
-    if request.required_context_tokens and (
-        policy.context_window <= 0 or policy.context_window < request.required_context_tokens
-    ):
-        return False
-    if request.needs_native_tools and not policy.supports_native_tools:
-        return False
-    if request.needs_python_tool and not policy.supports_python_tool:
-        return False
-    if policy.billing_mode in {BillingMode.METERED, BillingMode.SUBSCRIPTION}:
-        if not request.allow_paid:
-            return False
-    elif not request.allow_free:
-        return False
-    return True
-
-
-def rank_policies(
-    policies: Iterable[ProviderPolicy],
-    request: RoutingRequest,
-    *,
-    in_flight: Mapping[str, int] | None = None,
-    evidence: Mapping[str, ProviderEvidence] | None = None,
-) -> list[ProviderPolicy]:
-    """Return a deterministic hard-feasible, lexicographically ranked list."""
-
-    load = {} if in_flight is None else in_flight
-    observations = {} if evidence is None else evidence
-    feasible = [policy for policy in policies if _eligible(policy, request, load)]
-
-    def key(policy: ProviderPolicy) -> tuple[float, ...]:
-        sample = observations.get(policy.name, ProviderEvidence())
-        success = sample.success_probability
-        tps = sample.ewma_tps or policy.throughput_hint_tps or 1.0
-        useful_tps = max(1e-6, tps * success * max(policy.quality_weight, 1e-6))
-        service_penalty = request.expected_output_tokens / useful_tps
-        money = _estimated_money(policy, request)
-        unknown_price = 1.0 if not policy.pricing_known else 0.0
-        switch = 1.0 if request.incumbent_provider not in (None, policy.name) else 0.0
-        utilization = load.get(policy.name, 0) / policy.max_concurrency
-        tie = -_stable_unit_interval(request.task_id, policy.name)
-        return (
-            float(policy.priority),
-            switch,
-            1.0 - success,
-            service_penalty,
-            utilization,
-            money,
-            unknown_price,
-            tie,
-        )
-
-    return sorted(feasible, key=key)
-
-
-@dataclass(slots=True)
-class _Acquire:
-    request: RoutingRequest
-    future: asyncio.Future[AdmissionGrant]
-
-
-@dataclass(slots=True)
-class _Release:
-    grant: AdmissionGrant
-    actual_tokens: int
-    success: bool
-    latency_s: float
-    future: asyncio.Future[None]
-
-
-@dataclass(slots=True)
-class _Snapshot:
-    future: asyncio.Future[SchedulerSnapshot]
-
-
-@dataclass(slots=True)
-class _Close:
-    future: asyncio.Future[None]
-
-
-class ProviderScheduler:
-    """Single-owner admission mailbox for provider lanes."""
-
-    def __init__(
-        self,
-        policies: Sequence[ProviderPolicy],
-        *,
-        quota_ledger: QuotaLedger | None = None,
-    ) -> None:
-        names = [policy.name for policy in policies]
-        if len(names) != len(set(names)):
-            raise ValueError("provider policy names must be unique")
-        self._policies = tuple(policies)
-        self._ledger = quota_ledger
-        self._mailbox: asyncio.Queue[_Acquire | _Release | _Snapshot | _Close] = asyncio.Queue()
-        self._task: asyncio.Task[None] | None = None
-        self._in_flight = {policy.name: 0 for policy in policies}
-        self._evidence = {policy.name: ProviderEvidence() for policy in policies}
-
-    async def start(self) -> None:
-        if self._task is None:
-            self._task = asyncio.create_task(self._serve(), name="provider-scheduler")
-
-    async def acquire(self, request: RoutingRequest) -> AdmissionGrant:
-        await self.start()
-        future: asyncio.Future[AdmissionGrant] = asyncio.get_running_loop().create_future()
-        await self._mailbox.put(_Acquire(request, future))
-        return await future
-
-    async def release(
-        self,
-        grant: AdmissionGrant,
-        *,
-        actual_tokens: int,
-        success: bool,
-        latency_s: float,
-    ) -> None:
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        await self._mailbox.put(_Release(grant, actual_tokens, success, latency_s, future))
-        await future
-
-    async def snapshot(self) -> SchedulerSnapshot:
-        await self.start()
-        future: asyncio.Future[SchedulerSnapshot] = asyncio.get_running_loop().create_future()
-        await self._mailbox.put(_Snapshot(future))
-        return await future
-
-    async def close(self) -> None:
-        if self._task is None:
-            return
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        await self._mailbox.put(_Close(future))
-        await future
-        await self._task
-        self._task = None
-
-    async def _serve(self) -> None:
-        while True:
-            message = await self._mailbox.get()
-            try:
-                if isinstance(message, _Acquire):
-                    await self._handle_acquire(message)
-                elif isinstance(message, _Release):
-                    await self._handle_release(message)
-                elif isinstance(message, _Snapshot):
-                    windows = (
-                        ()
-                        if self._ledger is None
-                        else await asyncio.to_thread(self._ledger.snapshots)
-                    )
-                    message.future.set_result(
-                        SchedulerSnapshot(dict(self._in_flight), self._mailbox.qsize(), windows)
-                    )
-                else:
-                    message.future.set_result(None)
-                    return
-            except BaseException as exc:
-                if not message.future.done():
-                    message.future.set_exception(exc)
-
-    async def _handle_acquire(self, message: _Acquire) -> None:
-        request = message.request
-        ranked = rank_policies(
-            self._policies,
-            request,
-            in_flight=self._in_flight,
-            evidence=self._evidence,
-        )
-        if not ranked:
-            raise RuntimeError("no provider satisfies the routing request")
-        estimated = max(0, request.expected_input_tokens + request.expected_output_tokens)
-        for policy in ranked:
-            reservation = None
-            if policy.quota_windows:
-                if self._ledger is None:
-                    raise RuntimeError("quota-window provider has no quota ledger")
-                reservation = await asyncio.to_thread(
-                    self._ledger.reserve,
-                    policy.name,
-                    policy.quota_windows,
-                    estimated,
-                )
-                if reservation is None:
-                    continue
-            self._in_flight[policy.name] += 1
-            lease = ProviderLease(policy.name, policy.model, request.task_id)
-            message.future.set_result(AdmissionGrant(policy, lease, reservation))
-            return
-        raise RuntimeError("all feasible providers are quota-exhausted")
-
-    async def _handle_release(self, message: _Release) -> None:
-        name = message.grant.policy.name
-        self._in_flight[name] = max(0, self._in_flight.get(name, 0) - 1)
-        sample = self._evidence.get(name, ProviderEvidence())
-        alpha = 0.2
-        output_tps = message.actual_tokens / message.latency_s if message.latency_s > 0 else 0.0
-        self._evidence[name] = ProviderEvidence(
-            attempts=sample.attempts + 1,
-            successes=sample.successes + int(message.success),
-            ewma_tps=(
-                output_tps
-                if sample.ewma_tps <= 0
-                else (1 - alpha) * sample.ewma_tps + alpha * output_tps
-            ),
-            ewma_latency_s=(
-                message.latency_s
-                if sample.ewma_latency_s <= 0
-                else (1 - alpha) * sample.ewma_latency_s + alpha * message.latency_s
-            ),
-        )
-        reservation = message.grant.quota_reservation
-        if reservation is not None and self._ledger is not None:
-            await asyncio.to_thread(
-                self._ledger.reconcile,
-                reservation,
-                message.grant.policy.quota_windows,
-                message.actual_tokens,
-            )
-        message.future.set_result(None)
-
-
 def quota_snapshot_json(snapshot: QuotaWindowSnapshot) -> dict[str, Any]:
-    """Stable JSON projection for durable observability events."""
+    """Stable JSON projection for CLI and durable observability records."""
 
     value = asdict(snapshot)
     value["remaining_tokens"] = snapshot.remaining_tokens
@@ -719,18 +423,11 @@ def quota_snapshot_json(snapshot: QuotaWindowSnapshot) -> dict[str, Any]:
 
 
 __all__ = [
-    "AdmissionGrant",
     "BillingMode",
-    "ProviderEvidence",
     "ProviderLease",
-    "ProviderPolicy",
-    "ProviderScheduler",
     "QuotaLedger",
     "QuotaReservation",
     "QuotaWindowSnapshot",
     "QuotaWindowSpec",
-    "RoutingRequest",
-    "SchedulerSnapshot",
     "quota_snapshot_json",
-    "rank_policies",
 ]
