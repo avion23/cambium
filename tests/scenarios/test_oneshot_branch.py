@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
-from typing import Any
 
 from cambium import oneshot
 from cambium.supervisor import PlanResult, TaskResult
