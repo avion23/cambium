@@ -2442,6 +2442,8 @@ class _Runtime:
             "max_tokens": int(spec.get("max_tokens", DEFAULT_MAX_TOKENS)),
             "max_wall_s": wall_budget,
         }
+        if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
+            payload["requirements"] = dict(spec["requirements"])
         if not spec.get("fanout_config"):
             write_marker = spec.get("write_marker", True)
             if not isinstance(write_marker, bool):
@@ -4067,6 +4069,11 @@ class _Runtime:
             "provider_env_keys": list(spec.get("provider_env_keys", ())),
             "authorized_providers": list(spec.get("authorized_providers", ())),
         }
+        if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
+            # Keep the validated task contract on the worker init message; the
+            # worker owns the live Diffundo instance and must rebuild the same
+            # hard request fields for every provider call.
+            init_msg["requirements"] = dict(spec["requirements"])
         if self._debt_store is not None:
             debt = self._debt_store.as_mapping()
             if debt:
@@ -5343,6 +5350,46 @@ def _plan_tasks(plan: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, A
     raise ValueError("plan must be a dict with 'tasks' or a list of task specs")
 
 
+_ROUTING_REQUIREMENT_KEYS = frozenset(
+    {
+        "quality",
+        "min_context_window",
+        "needs_native_tools",
+        "needs_python_tool",
+        "allow_paid",
+        "allow_free",
+    }
+)
+
+
+def _task_requirements(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize task and fanout requirement declarations into one contract."""
+    merged: dict[str, Any] = {}
+    fanout_config = spec.get("fanout_config")
+    if isinstance(fanout_config, dict):
+        section = fanout_config
+        for nested_key in ("diffundo", "router"):
+            nested = fanout_config.get(nested_key)
+            if isinstance(nested, dict):
+                section = nested
+                break
+        nested_requirements = fanout_config.get("requirements")
+        if nested_requirements is None:
+            nested_requirements = section.get("requirements")
+        if nested_requirements is not None:
+            merged.update(validate_requirements(nested_requirements))
+        for key in _ROUTING_REQUIREMENT_KEYS:
+            value = fanout_config.get(key)
+            if value is None:
+                value = section.get(key)
+            if value is not None:
+                merged[key] = value
+    task_requirements = spec.get("requirements")
+    if task_requirements is not None:
+        merged.update(validate_requirements(task_requirements))
+    return validate_requirements(merged)
+
+
 def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, Any]:
     """Path safety and required-field checks for one plan task."""
     session_root = Path(session_dir).resolve()
@@ -5398,14 +5445,14 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
                 f"task {task_id} model_candidates must be a non-empty list of model ids"
             )
         spec["model_candidates"] = list(model_candidates)
-    requirements = spec.get("requirements")
-    if requirements is not None:
-        try:
-            requirements = validate_requirements(requirements)
-        except ValueError as exc:
-            raise ValueError(f"task {task_id}: {exc}") from exc
-        if requirements:
-            spec["requirements"] = requirements
+    try:
+        requirements = _task_requirements(spec)
+    except ValueError as exc:
+        raise ValueError(f"task {task_id}: {exc}") from exc
+    if requirements:
+        spec["requirements"] = requirements
+    else:
+        spec.pop("requirements", None)
     spec.setdefault("base_commit", None)
     # Internal ownership token.  A provider identity alone does not prove
     # that this task booked a lane; releases use this flag to stay balanced

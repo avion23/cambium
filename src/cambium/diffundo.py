@@ -1233,8 +1233,17 @@ class Diffundo:
         credential_source: CredentialSource | None = None,
         codex_profile: Mapping[str, object] | None = None,
         debt: Mapping[str, Any] | None = None,
+        task_id: str = "task",
+        requirements: Mapping[str, Any] | None = None,
     ) -> None:
         self._providers = tuple(providers)
+        self._task_id = task_id
+        # Keep task requirements immutable on the router. Validation happens
+        # at the routing boundary so malformed requirements fail before any
+        # provider transport is attempted.
+        self._requirements: tuple[tuple[str, Any], ...] = (
+            tuple(requirements.items()) if requirements else ()
+        )
         self._provider_lease: ProviderLease | None = None
         self._quota_ledger = (
             QuotaLedger() if any(provider.quota_windows for provider in self._providers) else None
@@ -1299,6 +1308,7 @@ class Diffundo:
         model: str | None = None,
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
+        requirements: Mapping[str, Any] | None = None,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
@@ -1312,6 +1322,12 @@ class Diffundo:
         window, raises ``AllProvidersFailed``.
         """
         validate_prompt_structure(prompt)
+        request = self._routing_request(
+            prompt,
+            model,
+            allow_model_substitution=allow_model_substitution,
+            requirements=requirements,
+        )
         deadline = time.monotonic() + self._call_budget_s
         tried: list[str] = []
         last_error: BaseException | None = None
@@ -1321,6 +1337,7 @@ class Diffundo:
                 model,
                 deadline,
                 allow_model_substitution=allow_model_substitution,
+                request=request,
             )
             if not candidates:
                 raise AllProvidersFailed(tried, last_error)
@@ -1400,9 +1417,27 @@ class Diffundo:
 
         return self._provider_lease
 
-    def bind_provider(self, provider: str, model: str, *, root_task_id: str = "task") -> None:
-        """Pin every later call on this router to one provider/model branch."""
+    def bind_provider(
+        self,
+        provider: str,
+        model: str,
+        *,
+        root_task_id: str = "task",
+        cache_identity: str = "",
+        lease: ProviderLease | None = None,
+    ) -> None:
+        """Pin every later call on this router to one provider/model branch.
 
+        ``lease`` is accepted for child/context inheritance. Reusing the
+        immutable object preserves its root and cache identity instead of
+        silently creating a fresh cache namespace for the child.
+        """
+
+        if lease is not None:
+            if lease.provider != provider or lease.model != model:
+                raise ValueError("inherited provider lease does not match provider/model")
+            root_task_id = lease.root_task_id
+            cache_identity = lease.cache_identity
         if not provider or not model:
             raise ValueError("provider lease requires provider and model")
         existing = self._provider_lease
@@ -1411,6 +1446,9 @@ class Diffundo:
                 raise RuntimeError(
                     "provider continuity violation: attempted to move a live semantic branch"
                 )
+            # Existing ownership is authoritative. In particular, an
+            # inherited non-empty cache identity must never be replaced by a
+            # later bind with the child's default empty identity.
             return
         configured = next(
             (
@@ -1422,7 +1460,16 @@ class Diffundo:
         )
         if configured is None:
             raise ValueError("provider lease does not match an enabled configured lane")
-        self._provider_lease = ProviderLease(provider, model, root_task_id)
+        self._provider_lease = (
+            lease
+            if lease is not None
+            else ProviderLease(
+                provider,
+                model,
+                root_task_id,
+                cache_identity=cache_identity,
+            )
+        )
 
     def clear_provider_lease(self) -> None:
         """Clear task-local state when a warm worker is rebound to another task."""
@@ -1430,13 +1477,53 @@ class Diffundo:
         self._provider_lease = None
         self._primary_provider = None
 
+    def _routing_request(
+        self,
+        prompt: Mapping[str, Any],
+        model: str | None,
+        *,
+        allow_model_substitution: bool,
+        requirements: Mapping[str, Any] | None,
+    ) -> Any:
+        """Build the immutable hard-admission request for one live call.
+
+        The pure request predicates live in :mod:`cambium.routing`; importing
+        them lazily avoids a module cycle because routing names ProviderTier.
+        Tool-bearing prompts require native tool support unless the task
+        explicitly opts out, while task requirements supply the remaining
+        context, billing, and quality boundaries.
+        """
+        from .routing import RoutingRequest, validate_requirements
+
+        raw = (
+            dict(requirements)
+            if requirements is not None
+            else dict(self._requirements)
+        )
+        validated = validate_requirements(raw)
+        has_native_tools = isinstance(prompt.get("tools"), list) and bool(prompt["tools"])
+        return RoutingRequest(
+            task_id=self._task_id,
+            model=model or "",
+            required_context_tokens=validated.get("min_context_window", 0),
+            needs_native_tools=validated.get("needs_native_tools", has_native_tools),
+            needs_python_tool=validated.get("needs_python_tool", False),
+            allow_model_substitution=allow_model_substitution,
+            allow_paid=validated.get("allow_paid", True),
+            allow_free=validated.get("allow_free", True),
+            quality=validated.get("quality"),
+            lease=self._provider_lease,
+        )
+
     def _candidates(
         self,
         tier: ProviderTier,
         model: str | None,
         allow_model_substitution: bool = False,
+        *,
+        request: Any | None = None,
     ) -> list[ProviderConfig]:
-        candidates = list(self._candidates_unleased(tier, model))
+        candidates = list(self._candidates_unleased(tier, model, request=request))
         lease = self._provider_lease
         if lease is not None:
             candidates = [
@@ -1457,7 +1544,13 @@ class Diffundo:
             candidates = [*exact, *substitutes]
         return candidates
 
-    def _candidates_unleased(self, tier: ProviderTier, model: str | None) -> list[ProviderConfig]:
+    def _candidates_unleased(
+        self,
+        tier: ProviderTier,
+        model: str | None,
+        *,
+        request: Any | None = None,
+    ) -> list[ProviderConfig]:
         """Tier-matching, capability-filtered, health/bucket-eligible providers,
         sorted by priority ascending, refined by measured quality within an
         equal-priority run (arch §9.1/§9.2 step 1, weighted routing).
@@ -1472,12 +1565,22 @@ class Diffundo:
         now = time.monotonic()
         eligible: list[ProviderConfig] = []
         model_declared = model is None
+        provider_satisfies_request = None
+        if request is not None:
+            from .routing import provider_satisfies_request as satisfies_request
+
+            provider_satisfies_request = satisfies_request
         for runtime in self._runtimes:
             provider = runtime.provider
             if provider.tier is not tier or not provider.enabled:
                 continue
             if model is not None and provider.model == model:
                 model_declared = True
+            if (
+                provider_satisfies_request is not None
+                and not provider_satisfies_request(provider, request)
+            ):
+                continue
             if runtime.health is HealthState.DISABLED:
                 continue
             if runtime.health is HealthState.OPEN:
@@ -1519,6 +1622,7 @@ class Diffundo:
         deadline: float,
         *,
         allow_model_substitution: bool = False,
+        request: Any | None = None,
     ) -> list[ProviderConfig]:
         """Return candidates, pausing on exhaustion (D8f) until a provider
         recovers or the pause window / deadline is spent."""
@@ -1531,6 +1635,7 @@ class Diffundo:
                 tier,
                 model,
                 allow_model_substitution=allow_model_substitution,
+                request=request,
             )
             if candidates:
                 return candidates

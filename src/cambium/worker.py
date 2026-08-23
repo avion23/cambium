@@ -855,6 +855,47 @@ def _fanout_value(config: dict[str, Any], section: dict[str, Any], key: str) -> 
     return section.get(key)
 
 
+_ROUTING_REQUIREMENT_KEYS = frozenset(
+    {
+        "quality",
+        "min_context_window",
+        "needs_native_tools",
+        "needs_python_tool",
+        "allow_paid",
+        "allow_free",
+    }
+)
+
+
+def _task_requirements(
+    source: Mapping[str, Any] | None,
+    fanout_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Combine task requirements with the equivalent fanout declarations.
+
+    Plan/task requirements are authoritative, while the nested/direct fanout
+    form keeps direct worker callers compatible with the provider config shape.
+    Every value is validated before it reaches Diffundo so malformed input
+    fails closed at the worker boundary as well as at supervisor admission.
+    """
+    from cambium.routing import validate_requirements
+
+    merged: dict[str, Any] = {}
+    if isinstance(fanout_config, dict):
+        section = _fanout_section(fanout_config)
+        nested = _fanout_value(fanout_config, section, "requirements")
+        if nested is not None:
+            merged.update(validate_requirements(nested))
+        for key in _ROUTING_REQUIREMENT_KEYS:
+            value = _fanout_value(fanout_config, section, key)
+            if value is not None:
+                merged[key] = value
+    if source is not None and source.get("requirements") is not None:
+        merged.update(validate_requirements(source["requirements"]))
+    validated = validate_requirements(merged)
+    return validated or None
+
+
 def _model_identity(
     providers: list[Any],
     tier: ProviderTier,
@@ -888,6 +929,8 @@ def _provider_router(
     authorized_providers: tuple[str, ...] = (),
     authorized_providers_explicit: bool = False,
     debt: Mapping[str, Any] | None = None,
+    task_id: str | None = None,
+    requirements: Mapping[str, Any] | None = None,
 ) -> tuple[Diffundo, ProviderTier, str, str]:
     providers = load_providers(_provider_path())
     # An explicitly empty authorized list is the historical "unrestricted"
@@ -919,9 +962,12 @@ def _provider_router(
     # primary providers, spreading requests across providers at task
     # granularity while each task keeps its context on one provider (per-
     # provider prompt-prefix caching preserved).
-    task_id = config.get("task_id") if isinstance(config, dict) else None
-    if isinstance(task_id, str) and task_id:
-        options.setdefault("rotation_seed", zlib.crc32(task_id.encode("utf-8")))
+    resolved_task_id = task_id
+    if resolved_task_id is None:
+        configured_task_id = config.get("task_id") if isinstance(config, dict) else None
+        resolved_task_id = configured_task_id if isinstance(configured_task_id, str) else None
+    if isinstance(resolved_task_id, str) and resolved_task_id:
+        options.setdefault("rotation_seed", zlib.crc32(resolved_task_id.encode("utf-8")))
     if assigned_provider is not None:
         if not any(provider.name == assigned_provider for provider in providers):
             raise ValueError(
@@ -958,6 +1004,12 @@ def _provider_router(
         options["credential_source"] = CredentialSource(
             access_token=access, account_id=account or None
         )
+    if resolved_task_id:
+        options["task_id"] = resolved_task_id
+    if requirements is None:
+        requirements = _task_requirements(None, config)
+    if requirements:
+        options["requirements"] = dict(requirements)
     return Diffundo(providers, **options), tier, model, _model_identity(
         providers, tier, model, assigned_provider=assigned_provider
     )
@@ -1039,6 +1091,7 @@ class AgentConfig:
     heartbeat_interval_s: float
     max_wall_s: float
     checkpoint_root: Path | None
+    requirements: dict[str, Any] | None = None
     max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
     # Supervisor-level admission balancing (solution C): the provider this
     # task was assigned at admission; presets Diffundo's sticky primary.
@@ -1155,6 +1208,7 @@ class AgentConfig:
                 max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S
             ),
             checkpoint_root=checkpoint_root,
+            requirements=_task_requirements(init, _provider_fanout_config(init)),
             max_transcript_chars=max_transcript_chars,
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
@@ -1197,6 +1251,9 @@ def _merge_task_config(
     base_commit = config.base_commit or run.get("base_commit")
     task = config.task if config.task.strip() else str(run.get("task", ""))
     fanout_config = config.fanout_config or _provider_fanout_config(run)
+    requirements = config.requirements
+    if requirements is None:
+        requirements = _task_requirements(run, fanout_config)
     parent_envelope = config.parent_envelope or _validate_parent_envelope(
         run.get("parent_envelope")
     )
@@ -1242,6 +1299,7 @@ def _merge_task_config(
         heartbeat_interval_s=config.heartbeat_interval_s,
         max_wall_s=max_wall_s,
         checkpoint_root=config.checkpoint_root,
+        requirements=requirements,
         max_transcript_chars=config.max_transcript_chars,
         provider_env_keys=config.provider_env_keys,
         redactor=config.redactor,
@@ -1297,6 +1355,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
             run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
         ),
         checkpoint_root=None,
+        requirements=_task_requirements(run, _provider_fanout_config(run)),
         max_transcript_chars=max_transcript_chars,
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
@@ -4489,6 +4548,8 @@ async def _do_provider_work(
             authorized_providers=config.authorized_providers,
             authorized_providers_explicit=config.authorized_providers_explicit,
             debt=config.debt,
+            task_id=config.task_id,
+            requirements=config.requirements,
         )
     except Exception as exc:
         return _loop_failure_outcome({

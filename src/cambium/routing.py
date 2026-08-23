@@ -111,6 +111,7 @@ class RoutingRequest:
     allow_model_substitution: bool = False
     allow_paid: bool = True
     allow_free: bool = True
+    quality: str | None = None
     incumbent_provider: str | None = None
     lease: Any | None = None
 
@@ -760,6 +761,8 @@ def provider_satisfies_request(provider: Any, request: RoutingRequest) -> bool:
         and getattr(provider, "model", None) != request.model
     ):
         return False
+    if request.quality == "high" and getattr(provider, "tier", None) is not ProviderTier.STRONG:
+        return False
     if not context_window_satisfies(provider, request.required_context_tokens):
         return False
     if request.needs_native_tools and not getattr(provider, "supports_native_tools", False):
@@ -854,12 +857,22 @@ def score_providers(
     candidates = tuple(candidates)
     if not candidates:
         raise ValueError("model_candidates must be a non-empty list of model ids")
-    require_strong = requirements.get("quality") == "high"
     min_context_window = requirements.get("min_context_window")
     needs_native_tools = requirements.get("needs_native_tools", False)
     needs_python_tool = requirements.get("needs_python_tool", False)
     allow_paid = requirements.get("allow_paid", True)
     allow_free = requirements.get("allow_free", True)
+    capability_request = RoutingRequest(
+        task_id="routing",
+        model="",
+        required_context_tokens=min_context_window or 0,
+        needs_native_tools=needs_native_tools,
+        needs_python_tool=needs_python_tool,
+        allow_model_substitution=True,
+        allow_paid=allow_paid,
+        allow_free=allow_free,
+        quality=requirements.get("quality"),
+    )
     eligible: list[Any] = []
     capability_matches = 0
     models: dict[str, str] = {}
@@ -869,22 +882,7 @@ def score_providers(
         model = getattr(provider, "model", "")
         if not (isinstance(model, str) and model in candidates):
             continue
-        if require_strong and getattr(provider, "tier", None) is not ProviderTier.STRONG:
-            continue
-        if min_context_window is not None and not context_window_satisfies(
-            provider, min_context_window
-        ):
-            continue
-        if needs_native_tools and not getattr(provider, "supports_native_tools", False):
-            continue
-        if needs_python_tool and not getattr(provider, "supports_python_tool", False):
-            continue
-        billing = getattr(provider, "billing_mode", "metered")
-        billing_value = getattr(billing, "value", billing)
-        if billing_value in {"metered", "subscription"}:
-            if not allow_paid:
-                continue
-        elif not allow_free:
+        if not provider_satisfies_request(provider, capability_request):
             continue
         capability_matches += 1
         if lanes is not None:
@@ -937,6 +935,9 @@ __all__ = [
     "ProviderAssignment",
     "ProviderDebt",
     "QualityWeights",
+    "RoutingRequest",
+    "context_window_satisfies",
+    "provider_satisfies_request",
     "score_providers",
     "select_lane",
     "select_primary",
