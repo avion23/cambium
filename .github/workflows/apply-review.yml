@@ -33,12 +33,15 @@ jobs:
         run: |
           python .github/apply_review.py
           python .github/fix_review.py
+          python .github/fix_join.py
       - name: Refresh and install locked development environment
         run: |
           uv lock
           uv sync --locked --extra dev
       - name: Normalize generated imports
-        run: uv run ruff check --fix --select I src/cambium/worker.py
+        run: >-
+          uv run ruff check --fix --select I
+          src/cambium/worker.py src/cambium/supervisor.py
       - name: Ruff
         run: uv run ruff check src tests
       - name: Compile
@@ -50,6 +53,7 @@ jobs:
           tests/scenarios/test_provider_scheduler.py
           tests/scenarios/test_summary_trunk.py
           tests/scenarios/test_context_epochs.py
+          tests/scenarios/test_join_invariant.py
       - name: Fast test tier
         run: uv run pytest -n auto -q
       - name: Slow test tier
@@ -57,12 +61,12 @@ jobs:
       - name: Remove patch machinery
         run: >-
           rm .github/apply_review.py .github/fix_review.py
-          .github/workflows/apply-review.yml
+          .github/fix_join.py .github/workflows/apply-review.yml
       - name: Commit verified implementation
         run: |
           git config user.name "openai-codex"
           git config user.email "codex@openai.com"
           git add -A
           git diff --cached --check
-          git commit -m "context: wire bounded CAST rollover into runtime"
+          git commit -m "context: bound CAST and make fork joins transactional"
           git push origin HEAD:codex/cambium-correctness-docs-20260823
