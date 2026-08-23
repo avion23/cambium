@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "dataset_version": "1.2.0",
+  "dataset_kind": "opencode-trajectory",
+  "split": "review_queue",
+  "created_at": "2026-08-23T19:15:31.993369+00:00",
+  "provenance": {
+    "extractor": "cambium optimize extract",
+    "source": "opencode-transcript",
+    "database_files": [
+      {
+        "name": "opencode-dev.db",
+        "sha256": "02ea9015cc14f428fe53f28d3eec7a7a62daed96161625524430c933393130c8"
+      },
+      {
+        "name": "opencode-instance2.db",
+        "sha256": "f5cf52bc03bcd732e63666ddea92b8447da5435a61de22e159cb90cf3c6fed02"
+      },
+      {
+        "name": "opencode-update-upstream.db",
+        "sha256": "3af4aac3a0fc7a8d996ce94f8f84a347ba7315335094818c29f87713cafbcc22"
+      },
+      {
+        "name": "opencode.db",
+        "sha256": "2ced717046e5a54b6e0dc11b703b2be6fa57d3c7d6b693935d380e684ff13f55"
+      }
+    ],
+    "repo_filter": [
+      "cambium",
+      "polymarket-arbitrage"
+    ],
+    "time_range": {
+      "from": "2026-08-08T00:00:00Z",
+      "to": "2026-08-23T23:59:59Z"
+    },
+    "review_gate": true
+  },
+  "counts": {
+    "records": 23,
+    "duplicates": 89,
+    "conflicts": 0,
+    "excluded": 0,
+    "unsafe": 0
+  },
+  "database_summaries": [
+    {
+      "database": "opencode-dev.db",
+      "sessions": 2450,
+      "selected_sessions": 2437,
+      "explicit_records": 104,
+      "safe_records": 104,
+      "unsafe_records": 0,
+      "repo_counts": {
+        "cambium": 104
+      },
+      "tool_counts": {
+        "bash": 104
+      },
+      "time_counts": {
+        "2026-08-09": 74,
+        "2026-08-10": 4,
+        "2026-08-11": 26
+      }
+    },
+    {
+      "database": "opencode-instance2.db",
+      "sessions": 1,
+      "selected_sessions": 1,
+      "explicit_records": 0,
+      "safe_records": 0,
+      "unsafe_records": 0,
+      "repo_counts": {},
+      "tool_counts": {},
+      "time_counts": {}
+    },
+    {
+      "database": "opencode-update-upstream.db",
+      "sessions": 1,
+      "selected_sessions": 0,
+      "explicit_records": 0,
+      "safe_records": 0,
+      "unsafe_records": 0,
+      "repo_counts": {},
+      "tool_counts": {},
+      "time_counts": {}
+    },
+    {
+      "database": "opencode.db",
+      "sessions": 174,
+      "selected_sessions": 166,
+      "explicit_records": 8,
+      "safe_records": 8,
+      "unsafe_records": 0,
+      "repo_counts": {
+        "cambium": 8
+      },
+      "tool_counts": {
+        "bash": 8
+      },
+      "time_counts": {
+        "2026-08-18": 8
+      }
+    }
+  ]
+}

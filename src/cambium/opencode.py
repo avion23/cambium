@@ -784,7 +784,25 @@ def resolve_database_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
         if not path.is_dir():
             raise FileNotFoundError(f"OpenCode source does not exist: {path}")
         for candidate in path.rglob("*"):
-            if candidate.is_file() and candidate.suffix.casefold() in suffixes:
+            if not candidate.is_file() or candidate.suffix.casefold() not in suffixes:
+                continue
+            # OpenCode storage directories also contain auxiliary SQLite files
+            # (for example release-check databases) that do not carry session
+            # data.  Ignore those discovered files, while preserving the
+            # existing error for an explicitly supplied database path.
+            try:
+                with sqlite3.connect(
+                    f"file:{candidate.resolve()}?mode=ro", uri=True, timeout=5
+                ) as connection:
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+            except sqlite3.Error:
+                continue
+            if {"session", "project", "message", "part"}.issubset(tables):
                 found.add(candidate.resolve())
     if not found:
         raise FileNotFoundError(

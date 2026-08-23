@@ -4,6 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from cambium.opencode import resolve_database_paths
 from scripts.extract_opencode_transcript_candidates import extract_candidates
 
 
@@ -295,3 +296,14 @@ def test_unsafe_candidate_is_skipped_and_counted(tmp_path: Path) -> None:
     assert result.candidates == ()
     assert result.unsafe_records == 1
     assert result.summaries[0].safe_records == 0
+
+
+def test_session_directory_ignores_auxiliary_sqlite_files(tmp_path: Path) -> None:
+    database = tmp_path / "opencode.db"
+    connection = _database(database)
+    connection.close()
+
+    auxiliary = tmp_path / "opencode-release-check.db"
+    sqlite3.connect(auxiliary).close()
+
+    assert resolve_database_paths([tmp_path]) == (database.resolve(),)
