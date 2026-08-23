@@ -499,9 +499,13 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_command = commands.add_parser(
         "optimize",
         help="run one DSPy decision-module optimization",
-        description="Run the reviewed-data DSPy optimizer and write one artifact set.",
+        description=(
+            "Run the reviewed-data DSPy optimizer, extract OpenCode trajectories, "
+            "or report an extracted dataset."
+        ),
     )
-    optimize_command.add_argument("module_name", metavar="MODULE")
+    optimize_command.add_argument("module_name", metavar="MODULE|extract|stats")
+    optimize_command.add_argument("source", nargs="?", type=Path, metavar="PATH")
     optimize_command.add_argument("--optimizer", choices=("zero", "bootstrap"), default="zero")
     optimize_command.add_argument("--budget-usd", type=float, default=2.0)
     optimize_command.add_argument("--seed", type=int, default=0)
@@ -516,6 +520,73 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transcript-candidates",
         type=Path,
         metavar="PATH",
+    )
+    optimize_command.add_argument(
+        "--database",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="PATH",
+        help="OpenCode SQLite database for optimize extract (repeatable)",
+    )
+    optimize_command.add_argument(
+        "--session-dir",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="DIR",
+        help="OpenCode storage/session directory for optimize extract (repeatable)",
+    )
+    optimize_command.add_argument(
+        "--repo",
+        action="append",
+        default=[],
+        metavar="PATH_OR_NAME",
+        help="repository filter for optimize extract (repeatable)",
+    )
+    optimize_command.add_argument(
+        "--from",
+        "--since",
+        dest="start_time",
+        metavar="TIME",
+        help="inclusive extraction start (epoch seconds or ISO-8601)",
+    )
+    optimize_command.add_argument(
+        "--to",
+        "--until",
+        dest="end_time",
+        metavar="TIME",
+        help="inclusive extraction end (epoch seconds or ISO-8601)",
+    )
+    optimize_command.add_argument(
+        "--exclude",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="PATH",
+        help="JSONL candidate file whose canonical pairs must be excluded",
+    )
+    optimize_command.add_argument(
+        "--output",
+        type=Path,
+        metavar="PATH",
+        help="output JSONL dataset for optimize extract",
+    )
+    optimize_command.add_argument(
+        "--review-gate",
+        action="store_true",
+        help="write optimize extract candidates to a needs_review queue",
+    )
+    optimize_command.add_argument(
+        "--dataset",
+        type=Path,
+        metavar="PATH",
+        help="dataset path for optimize stats/report",
+    )
+    optimize_command.add_argument(
+        "--json",
+        action="store_true",
+        help="emit optimize stats/report as JSON",
     )
 
     session = commands.add_parser(
@@ -1083,6 +1154,39 @@ def _run_quota(args: argparse.Namespace) -> int:
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
+    if args.module_name == "extract":
+        from . import opencode
+
+        delegated: list[str] = []
+        if args.source is not None:
+            delegated.append(str(args.source))
+        for option, values in (("--database", args.database), ("--session-dir", args.session_dir)):
+            for value in values:
+                delegated.extend([option, str(value)])
+        for value in args.repo:
+            delegated.extend(["--repo", value])
+        if args.start_time is not None:
+            delegated.extend(["--from", args.start_time])
+        if args.end_time is not None:
+            delegated.extend(["--to", args.end_time])
+        for value in args.exclude:
+            delegated.extend(["--exclude", str(value)])
+        if args.output is not None:
+            delegated.extend(["--output", str(args.output)])
+        if args.review_gate:
+            delegated.append("--review-gate")
+        return opencode.extract_main(delegated)
+    if args.module_name in {"stats", "report"}:
+        from . import opencode
+
+        delegated = []
+        if args.source is not None:
+            delegated.append(str(args.source))
+        if args.dataset is not None:
+            delegated.extend(["--dataset", str(args.dataset)])
+        if args.json:
+            delegated.append("--json")
+        return opencode.stats_main(delegated)
     try:
         optimize = importlib.import_module("cambium.optimize")
     except ModuleNotFoundError as exc:

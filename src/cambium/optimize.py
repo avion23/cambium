@@ -1106,6 +1106,27 @@ def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any
     )
 
 
+def extract_candidates(*args: Any, **kwargs: Any) -> Any:
+    """Load the packaged OpenCode extractor without duplicating its policy."""
+    from cambium.opencode import extract_candidates as extractor
+
+    return extractor(*args, **kwargs)
+
+
+def extract_main(argv: list[str] | None = None) -> int:
+    """Run the end-to-end trajectory extraction command."""
+    from cambium.opencode import extract_main as runner
+
+    return runner(argv)
+
+
+def stats_main(argv: list[str] | None = None) -> int:
+    """Run the extracted-dataset report command."""
+    from cambium.opencode import stats_main as runner
+
+    return runner(argv)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m cambium.optimize",
@@ -1341,8 +1362,13 @@ def _run(argv=None) -> int:
 
 
 def main(argv=None) -> int:
+    command_line = sys.argv[1:] if argv is None else argv
+    if command_line and command_line[0] == "extract":
+        return extract_main(command_line[1:])
+    if command_line and command_line[0] in {"stats", "report"}:
+        return stats_main(command_line[1:])
     try:
-        return _run(argv)
+        return _run(command_line)
     except Exception as exc:
         print(f"cambium optimize: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
