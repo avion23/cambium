@@ -4010,8 +4010,16 @@ async def _run_agent_loop(
                         epoch=usage_epoch,
                         fork_of=usage_fork_of,
                     )
+                detail = exc.__class__.__name__
+                if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
+                    inner = exc.last_error
+                    inner_message = str(inner).strip() or "<no message>"
+                    detail = (
+                        f"{detail}: {inner.__class__.__name__}: "
+                        f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
+                    )
                 raise ContextForkError(
-                    f"summary provider call failed: {exc.__class__.__name__}"
+                    f"summary provider call failed: {detail}"
                 ) from exc
             if time.monotonic() >= wall_deadline:
                 raise ContextForkError("wall budget exceeded during summary flush")
