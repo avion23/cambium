@@ -128,6 +128,8 @@ class _TrackingDiffundo(Diffundo):
         *,
         model: str | None = None,
         budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
+        requirements: Mapping[str, Any] | None = None,
     ) -> Any:
         self._ledger.check_available()
         call_budget = self._ledger.remaining_usd
@@ -138,6 +140,8 @@ class _TrackingDiffundo(Diffundo):
             prompt,
             model=model,
             budget_usd=call_budget,
+            allow_model_substitution=allow_model_substitution,
+            requirements=requirements,
         )
         self._ledger.record(getattr(result, "estimated_cost_usd", 0.0))
         if self._ledger.spent_usd > self._ledger.budget_usd:

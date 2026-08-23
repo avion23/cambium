@@ -1577,7 +1577,8 @@ class Diffundo:
             if model is not None and provider.model == model:
                 model_declared = True
             if (
-                provider_satisfies_request is not None
+                request is not None
+                and provider_satisfies_request is not None
                 and not provider_satisfies_request(provider, request)
             ):
                 continue
@@ -1753,7 +1754,7 @@ class Diffundo:
                     reservation = None
                 if reservation is not None:
                     await asyncio.to_thread(
-                        ledger.cancel, reservation, policy.quota_windows
+                        ledger.reconcile, reservation, policy.quota_windows, 0
                     )
                 raise
             if reservation is None:
