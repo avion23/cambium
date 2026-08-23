@@ -759,7 +759,7 @@ def _account_quota_owner(body: str, api_key: str) -> str | None:
     """
     try:
         payload = json.loads(body)
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -878,7 +878,7 @@ def _parse_retry_after(headers: Any) -> float | None:
         return None
     try:
         retry_at = parsedate_to_datetime(value)
-    except IndexError, OverflowError, TypeError, ValueError:
+    except (IndexError, OverflowError, TypeError, ValueError):
         return None
     if retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=UTC)
@@ -1177,7 +1177,7 @@ def _codex_config_400(message: str) -> bool:
     """
     try:
         payload = json.loads(message)
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return False
     if not isinstance(payload, dict):
         return False
