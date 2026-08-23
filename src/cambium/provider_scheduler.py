@@ -28,6 +28,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+_RESERVATION_RETENTION_S = 24 * 60 * 60
+
 
 class BillingMode(StrEnum):
     """How a configured provider consumes scarce capacity."""
@@ -189,8 +191,16 @@ class QuotaLedger:
                     reconciled INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS quota_reservation_windows (
+                    reservation_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    reset_at REAL NOT NULL,
+                    PRIMARY KEY(reservation_id, provider, name)
+                );
                 """
             )
+            self._prune_reconciled(connection, time.time() - _RESERVATION_RETENTION_S)
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -199,6 +209,33 @@ class QuotaLedger:
     @staticmethod
     def _window_reset(now: float, duration_s: float) -> float:
         return (math.floor(now / duration_s) + 1) * duration_s
+
+    @staticmethod
+    def _prune_reconciled(connection: sqlite3.Connection, before: float) -> None:
+        connection.execute(
+            "DELETE FROM quota_reservation_windows WHERE reservation_id IN ("
+            "SELECT reservation_id FROM quota_reservations "
+            "WHERE reconciled=1 AND created_at < ?)",
+            (before,),
+        )
+        connection.execute(
+            "DELETE FROM quota_reservations WHERE reconciled=1 AND created_at < ?",
+            (before,),
+        )
+
+    @staticmethod
+    def _reservation_window_reset(
+        connection: sqlite3.Connection,
+        reservation_id: str,
+        provider: str,
+        name: str,
+    ) -> float | None:
+        row = connection.execute(
+            "SELECT reset_at FROM quota_reservation_windows "
+            "WHERE reservation_id=? AND provider=? AND name=?",
+            (reservation_id, provider, name),
+        ).fetchone()
+        return None if row is None else float(row[0])
 
     def reserve(
         self,
@@ -224,6 +261,7 @@ class QuotaLedger:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
             normalized: list[tuple[QuotaWindowSpec, float, int, int]] = []
             for spec in windows:
                 row = connection.execute(
@@ -277,6 +315,14 @@ class QuotaLedger:
                 "requests,created_at) VALUES(?,?,?,?,?)",
                 (reservation_id, provider, estimated_tokens, requests, timestamp),
             )
+            connection.executemany(
+                "INSERT INTO quota_reservation_windows(reservation_id,provider,name,reset_at) "
+                "VALUES(?,?,?,?)",
+                [
+                    (reservation_id, provider, spec.name, reset_at)
+                    for spec, reset_at, _, _ in normalized
+                ],
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -314,15 +360,21 @@ class QuotaLedger:
             delta = actual_tokens - int(row[0])
             if delta:
                 for spec in windows:
+                    reset_at = self._reservation_window_reset(
+                        connection, reservation.reservation_id, reservation.provider, spec.name
+                    )
+                    if reset_at is None:
+                        continue
                     connection.execute(
                         "UPDATE quota_windows SET used_tokens=MAX(0,used_tokens+?),updated_at=? "
-                        "WHERE provider=? AND name=?",
-                        (delta, timestamp, reservation.provider, spec.name),
+                        "WHERE provider=? AND name=? AND reset_at=? AND reset_at>?",
+                        (delta, timestamp, reservation.provider, spec.name, reset_at, timestamp),
                     )
             connection.execute(
                 "UPDATE quota_reservations SET reconciled=1 WHERE reservation_id=?",
                 (reservation.reservation_id,),
             )
+            self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -371,6 +423,20 @@ class QuotaLedger:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
+            pending = connection.execute(
+                "SELECT COALESCE(SUM(reservation.estimated_tokens),0), "
+                "COALESCE(SUM(reservation.requests),0) "
+                "FROM quota_reservations AS reservation "
+                "JOIN quota_reservation_windows AS reservation_window ON "
+                "reservation_window.reservation_id=reservation.reservation_id AND "
+                "reservation_window.provider=reservation.provider "
+                "WHERE reservation.provider=? AND reservation_window.name=? "
+                "AND reservation_window.reset_at=? AND reservation.reconciled=0",
+                (provider, name, reset_at),
+            ).fetchone()
+            used_tokens += int(pending[0])
+            used_requests += int(pending[1])
             connection.execute(
                 "INSERT INTO quota_windows(provider,name,reset_at,allowance_tokens,used_tokens,"
                 "allowance_requests,used_requests,reserve_fraction,updated_at) "

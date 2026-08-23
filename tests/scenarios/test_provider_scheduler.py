@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -66,6 +67,56 @@ def test_quota_ledger_reservation_is_atomic_across_threads(tmp_path: Path) -> No
         reservations = list(pool.map(reserve, range(20)))
     assert sum(item is not None for item in reservations) == 10
     assert ledger.snapshots("zai")[0].used_requests == 10
+
+
+def test_observe_preserves_pending_reservations(tmp_path: Path) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("short", 10, token_allowance=100, request_allowance=10)
+    reservation = ledger.reserve("p", (window,), 20, now=1.0)
+    assert reservation is not None
+
+    ledger.observe(
+        "p",
+        "short",
+        reset_at=10.0,
+        allowance_tokens=100,
+        remaining_tokens=70,
+        allowance_requests=10,
+        remaining_requests=8,
+        now=2.0,
+    )
+
+    snapshot = ledger.snapshots("p")[0]
+    assert snapshot.used_tokens == 50
+    assert snapshot.used_requests == 3
+
+
+def test_late_reconciliation_does_not_touch_new_window(tmp_path: Path) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("short", 10, token_allowance=100)
+    old = ledger.reserve("p", (window,), 20, requests=0, now=1.0)
+    assert old is not None
+    assert ledger.reserve("p", (window,), 0, requests=0, now=11.0) is not None
+
+    ledger.reconcile(old, (window,), 40, now=11.0)
+
+    snapshot = ledger.snapshots("p")[0]
+    assert snapshot.reset_at == 20.0
+    assert snapshot.used_tokens == 0
+
+
+def test_reconciled_reservations_are_pruned(tmp_path: Path) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("long", 1_000_000, token_allowance=100)
+    reservation = ledger.reserve("p", (window,), 20, requests=0, now=0.0)
+    assert reservation is not None
+    ledger.reconcile(reservation, (window,), 20, now=24 * 60 * 60 + 1)
+
+    with sqlite3.connect(tmp_path / "quota.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM quota_reservation_windows").fetchone()[0] == 0
+        )
 
 
 def test_quota_reconciliation_is_idempotent(tmp_path: Path) -> None:
