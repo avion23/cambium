@@ -1193,22 +1193,7 @@ def _side_sections(
     if not agents:
         lines.append(_side_row("dim", " no agents yet", panel_width))
     else:
-<<<<<<< HEAD
-        for agent in agents[-6:]:
-            role = "M" if getattr(agent, "role", "") == "main" else "S"
-            state = str(getattr(agent, "state", "?"))
-            task = _clip(getattr(agent, "task_id", "?"), 15)
-            lines.append((state, f" {role} {task:<15} {state}"))
-            lines.append(("dim", f"   {_clip(_agent_model(agent), width - 4)}"))
-            tool = getattr(agent, "tool", None)
-            tokens = int(getattr(agent, "total_tokens", 0))
-            rate = getattr(agent, "output_tokens_per_s", None)
-            suffix = f" · {rate:.1f} out/s" if isinstance(rate, int | float) else ""
-            tool_suffix = f" · {tool}" if tool else ""
-            lines.append(("dim", f"   {_human_count(tokens)} tok{suffix}{tool_suffix}"))
-=======
         lines.extend(_agent_rows(agents[-6:], panel_width))
->>>>>>> pi-agent-0adbf049-0a44-44b
 
     context = getattr(snapshot, "context", None)
     lines.append(_side_row("heading", " CONTEXT", panel_width))
