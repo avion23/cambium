@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -100,6 +101,48 @@ class SummaryExpectation:
     source_sha256: str
     source_message_count: int
     through_turn: int
+
+
+@dataclass(frozen=True, slots=True)
+class K0Projection:
+    """The active semantic state carried into a new CAST cache epoch.
+
+    K0 is deliberately represented with the same bounded semantic values as a
+    normal :class:`SummaryEntry`.  It is a materialized view, not a new
+    summary tier: superseded decisions and invalidated facts are omitted, and
+    the source entries remain immutable historical storage.
+
+    ``constraints`` is sourced from ``relevant_failed_approaches``.  That
+    field is the existing summary format's durable representation for failed
+    approaches which constrain future work, so K0 does not add a field to the
+    wire summary schema.
+    """
+
+    decisions: tuple[str, ...]
+    facts: tuple[str, ...]
+    constraints: tuple[str, ...]
+    verification_state: tuple[str, ...]
+    open_work: tuple[str, ...]
+
+    @property
+    def verification_results(self) -> tuple[str, ...]:
+        """Compatibility spelling used by the existing summary field."""
+        return self.verification_state
+
+    @property
+    def open_items(self) -> tuple[str, ...]:
+        """Compatibility spelling used by the existing summary field."""
+        return self.open_work
+
+    def as_mapping(self) -> dict[str, list[str]]:
+        """Return a JSON-safe projection using K0's semantic names."""
+        return {
+            "decisions": list(self.decisions),
+            "facts": list(self.facts),
+            "constraints": list(self.constraints),
+            "verification_state": list(self.verification_state),
+            "open_work": list(self.open_work),
+        }
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -373,6 +416,168 @@ def summary_entries(
     return tuple(entries)
 
 
+def estimate_message_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Estimate serialized message tokens using the existing byte projection.
+
+    Provider tokenizers are intentionally not pulled into the trunk layer.
+    Four UTF-8 bytes per token is the same bounded approximation used by the
+    CAST UI for context sizing; callers should treat the result as a policy
+    hint, not provider accounting.
+    """
+    copied = [_copy_message(message, f"messages[{index}]") for index, message in enumerate(messages)]
+    if not copied:
+        return 0
+    return max(1, math.ceil(len(_canonical_json_bytes(copied)) / 4))
+
+
+def summary_trunk_tokens(
+    trunk_messages: Sequence[Mapping[str, Any]], *, stable_head_messages: int = 2
+) -> int:
+    """Return the approximate token size of a validated active trunk."""
+    trunk, raw_tail = partition_summary_trunk(
+        trunk_messages, stable_head_messages=stable_head_messages
+    )
+    if raw_tail:
+        raise SummaryTrunkError("summary trunk contains a non-summary raw tail")
+    return estimate_message_tokens(trunk)
+
+
+def _semantic_item_key(item: str) -> str:
+    """Use an explicit semantic ID when present, otherwise the item itself."""
+    match = re.match(r"^([DF]\d+)(?=\b|:)", item)
+    return match.group(1) if match is not None else item
+
+
+def _active_semantic_items(
+    entries: Sequence[SummaryEntry],
+    added_fields: tuple[str, ...],
+    invalidated_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Fold one add/invalidate pair without changing the summary schema."""
+    active: dict[str, str] = {}
+    for entry in entries:
+        for field in added_fields:
+            for item in getattr(entry, field):
+                active[_semantic_item_key(item)] = item
+        for field in invalidated_fields:
+            for item in getattr(entry, field):
+                active.pop(_semantic_item_key(item), None)
+    return tuple(active.values())
+
+
+def _unique_semantic_items(entries: Sequence[SummaryEntry], field: str) -> tuple[str, ...]:
+    """Fold an append-only semantic field while retaining source order."""
+    values: dict[str, str] = {}
+    for entry in entries:
+        for item in getattr(entry, field):
+            values.setdefault(_semantic_item_key(item), item)
+    return tuple(values.values())
+
+
+def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
+    """Compile the active state of immutable summary segments into K0.
+
+    The fold is intentionally conservative.  Decisions and facts honor the
+    existing supersede/invalidation fields; constraints, verification state,
+    and open work are append-only fields in the current summary format and are
+    retained once.  No source entry is changed or discarded by this helper.
+    """
+    normalized = tuple(
+        entry if isinstance(entry, SummaryEntry) else _entry_from_mapping(entry)
+        for entry in entries
+    )
+    if not normalized:
+        raise SummaryTrunkError("cannot compile K0 from an empty summary trunk")
+    return K0Projection(
+        decisions=_active_semantic_items(
+            normalized,
+            ("decisions_added",),
+            ("decisions_superseded",),
+        ),
+        facts=_active_semantic_items(
+            normalized,
+            ("facts_added",),
+            ("facts_invalidated",),
+        ),
+        constraints=_unique_semantic_items(normalized, "relevant_failed_approaches"),
+        verification_state=_unique_semantic_items(normalized, "verification_results"),
+        open_work=_unique_semantic_items(normalized, "open_items"),
+    )
+
+
+def compile_k0(entries: Sequence[SummaryEntry]) -> K0Projection:
+    """Short alias for :func:`compile_k0_projection`."""
+    return compile_k0_projection(entries)
+
+
+def _k0_source_sha256(entries: Sequence[SummaryEntry]) -> str:
+    return hashlib.sha256(
+        _canonical_json_bytes([entry_mapping(entry) for entry in entries])
+    ).hexdigest()
+
+
+def k0_entry(
+    entries: Sequence[SummaryEntry], projection: K0Projection | None = None
+) -> SummaryEntry:
+    """Encode K0 with the existing bounded ``SummaryEntry`` wire shape."""
+    normalized = tuple(
+        entry if isinstance(entry, SummaryEntry) else _entry_from_mapping(entry)
+        for entry in entries
+    )
+    if not normalized:
+        raise SummaryTrunkError("cannot encode K0 from an empty summary trunk")
+    active = projection if projection is not None else compile_k0_projection(normalized)
+    entry = SummaryEntry(
+        type="summary_entry",
+        sequence=1,
+        source_sha256=_k0_source_sha256(normalized),
+        source_message_count=len(normalized),
+        through_turn=max(item.through_turn for item in normalized),
+        objective="CAST K0 active semantic projection",
+        outcome=f"compacted {len(normalized)} immutable semantic segment(s)",
+        decisions_added=active.decisions,
+        decisions_superseded=(),
+        facts_added=active.facts,
+        facts_invalidated=(),
+        files_and_symbols_changed=(),
+        verification_results=active.verification_state,
+        relevant_failed_approaches=active.constraints,
+        open_items=active.open_work,
+    )
+    return _entry_from_mapping(entry_mapping(entry))
+
+
+def is_k0_entry(entry: SummaryEntry) -> bool:
+    """Return whether an entry is the CAST K0 materialized projection."""
+    return entry.objective == "CAST K0 active semantic projection"
+
+
+def rollover_summary_trunk(
+    trunk_messages: Sequence[Mapping[str, Any]], *, stable_head_messages: int = 2
+) -> tuple[list[dict[str, str]], K0Projection, tuple[SummaryEntry, ...]]:
+    """Replace an active flat trunk with one K0 entry and preserve its head.
+
+    The returned third value is the exact historical segment set used to build
+    K0.  Callers use it for rollover provenance while retaining the original
+    checkpoint/segment files unchanged.
+    """
+    trunk, raw_tail = partition_summary_trunk(
+        trunk_messages, stable_head_messages=stable_head_messages
+    )
+    if raw_tail:
+        raise SummaryTrunkError("cannot roll over a trunk with a raw tail")
+    entries = summary_entries(trunk, stable_head_messages=stable_head_messages)
+    if not entries:
+        raise SummaryTrunkError("cannot roll over a trunk with no summary entries")
+    compacted = entries
+    replacement = k0_entry(compacted)
+    return (
+        [*trunk[:stable_head_messages], render_summary_message(replacement)],
+        compile_k0_projection(compacted),
+        compacted,
+    )
+
+
 def semantic_summary_messages(
     checkpoint_messages: Sequence[Mapping[str, Any]],
     *,
@@ -513,17 +718,25 @@ def append_summary_entry(
 __all__ = [
     "SUMMARY_ENTRY_PROVENANCE",
     "SUMMARY_PROTOCOL_LINES",
+    "K0Projection",
     "SummaryEntry",
     "SummaryExpectation",
     "SummaryTrunkError",
     "append_summary_entry",
     "build_summary_request",
+    "compile_k0",
+    "compile_k0_projection",
     "entry_mapping",
+    "estimate_message_tokens",
+    "is_k0_entry",
+    "k0_entry",
     "parse_summary_message",
     "parse_summary_response",
     "partition_summary_trunk",
     "raw_tail_sha256",
     "render_summary_message",
+    "rollover_summary_trunk",
     "semantic_summary_messages",
     "summary_entries",
+    "summary_trunk_tokens",
 ]
