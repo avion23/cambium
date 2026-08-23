@@ -1048,7 +1048,6 @@ def _validate_dataset_integrity(
     }
     total_records = sum(split_counts.values())
     canary_records = records_by_split.get("canaries", [])
-    manifest_path = spec.path / "module.json"
     label_field = module_label_field
     labels = {
         True: sum(
