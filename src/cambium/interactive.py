@@ -19,6 +19,7 @@ import copy
 import json
 import os
 import shutil
+import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
@@ -36,8 +37,14 @@ from .summary_trunk import (
     summary_entries,
 )
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+
 _INTERACTIVE_SCHEMA = 1
 _MANIFEST_NAME = "interactive.json"
+_LOCK_NAME = "session.lock"
 _CONTEXT_KINDS = frozenset({"context_checkpoint", "context_epoch_advanced"})
 _FORK_FIELDS = (
     "provider",
@@ -54,6 +61,10 @@ _FORK_FIELDS = (
 
 class InteractiveSessionError(ValueError):
     """An interactive branch manifest or checkpoint seed is invalid."""
+
+
+class InteractiveSessionBusyError(InteractiveSessionError):
+    """Another frontend currently owns the interactive session lock."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,14 +168,217 @@ def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
             pass
 
 
+def _lock_document(path: Path) -> dict[str, Any] | None:
+    """Read lock metadata without treating an unreadable file as ownership."""
+    try:
+        raw = path.read_bytes()
+        if not raw or len(raw) > 4096:
+            return None
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return dict(document) if isinstance(document, Mapping) else None
+
+
+def _pid_alive(pid: Any) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class _InteractiveSessionLock:
+    """A flock-backed frontend lock whose metadata makes stale owners visible.
+
+    ``flock`` is the authority: the kernel releases it when a frontend is
+    killed, so a lock file left behind by a crash is safe to reclaim.  The
+    small metadata document is only diagnostic.  It lets operators distinguish
+    an active owner from a killed process and gives tests a deterministic way
+    to exercise stale-file recovery without relying on process timing.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fd: int | None = None
+        self._recovered_stale = False
+
+    @property
+    def recovered_stale(self) -> bool:
+        return self._recovered_stale
+
+    @staticmethod
+    def _metadata(*, released: bool) -> dict[str, Any]:
+        return {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "released": released,
+        }
+
+    def _write_metadata(self, document: Mapping[str, Any]) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        remaining = memoryview(encoded)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:  # pragma: no cover - defensive for unusual filesystems
+                raise OSError("interactive session lock write made no progress")
+            remaining = remaining[written:]
+        os.fsync(fd)
+
+    def acquire(self) -> None:
+        if self._fd is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        existed = self.path.is_file()
+        previous = _lock_document(self.path) if existed else None
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    owner = previous.get("pid") if previous is not None else None
+                    os.close(fd)
+                    detail = f"session is already running: {self.path.parent.parent}"
+                    if isinstance(owner, int) and not _pid_alive(owner):
+                        detail += f" (stale owner pid={owner})"
+                    raise InteractiveSessionBusyError(detail) from exc
+            elif previous is not None and not previous.get("released"):
+                owner = previous.get("pid")
+                if _pid_alive(owner):
+                    os.close(fd)
+                    raise InteractiveSessionBusyError(
+                        f"session is already running: {self.path.parent.parent}"
+                    )
+            self._fd = fd
+            self._recovered_stale = existed and (
+                previous is None
+                or (
+                    not bool(previous.get("released"))
+                    and not _pid_alive(previous.get("pid"))
+                )
+            )
+            self._write_metadata(self._metadata(released=False))
+        except BaseException:
+            if self._fd is None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        try:
+            self._fd = fd
+            try:
+                self._write_metadata(self._metadata(released=True))
+            except OSError:
+                pass
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            self._fd = None
+            os.close(fd)
+
+    def status(self) -> str:
+        """Return ``missing``, ``available``, ``active``, or ``stale``."""
+        if not self.path.exists():
+            return "missing"
+        metadata = _lock_document(self.path)
+        if fcntl is not None:
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(self.path, flags)
+            except OSError:
+                return "available"
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return "active"
+                finally:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                os.close(fd)
+        if metadata is None or (
+            not bool(metadata.get("released")) and not _pid_alive(metadata.get("pid"))
+        ):
+            return "stale"
+        return "available"
+
+    def __enter__(self) -> _InteractiveSessionLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.release()
+
+
+def _read_manifest_document(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 1024 * 1024:
+            return None
+        document = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return dict(document) if isinstance(document, Mapping) else None
+
+
+def _durable_mtime(root: Path) -> int:
+    """Return a monotonic-ish activity key for reconnect candidate ordering."""
+    newest = 0
+    paths = [root / ".cambium" / _MANIFEST_NAME]
+    paths.extend(root.glob("turn-*/.cambium/events.db"))
+    paths.extend(root.glob("turn-*/.cambium/checkpoints/**/*"))
+    for path in paths:
+        try:
+            newest = max(newest, path.stat().st_mtime_ns)
+        except OSError:
+            continue
+    return newest
+
+
 class InteractiveSession:
     """Single-writer semantic branch spanning many one-shot supervisor leaves."""
 
     def __init__(self, config: OneShotConfig) -> None:
         self._base_config = config
         self.repo = oneshot.resolve_repo(config.repo)
+        self._reconnected = False
         if config.session_root is None:
-            self.root = oneshot.allocate_session_dir(self.repo)
+            existing = self.latest_for_repo(self.repo)
+            if existing is None:
+                self.root = oneshot.allocate_session_dir(self.repo)
+            else:
+                self.root = existing
+                self._reconnected = True
         else:
             self.root = Path(config.session_root).expanduser().resolve()
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -173,13 +387,101 @@ class InteractiveSession:
             except OSError:
                 pass
         self._manifest_path = self.root / ".cambium" / _MANIFEST_NAME
+        if self._manifest_path.is_file() and self._has_durable_state(self.root):
+            self._reconnected = True
+        self._lock = _InteractiveSessionLock(self.root / ".cambium" / _LOCK_NAME)
         self._turn = 0
         self._branch_generation = 1
         self._branch_start_turn = 0
         self._seed: ContextSeed | None = None
         self._pending_seed: ContextSeed | None = None
+        self._last_epoch = 0
+        self._last_checkpoint: str | None = None
         self._model_preference: str | None = None
         self._load_manifest()
+        self._load_durable_head()
+
+    @classmethod
+    def latest_for_repo(cls, repo: Path) -> Path | None:
+        """Return the newest reconnectable interactive root for ``repo``.
+
+        Ordinary one-shot leaves share the repository session root, so the
+        interactive manifest is the type marker.  A manifest alone is not
+        enough to resume: at least one durable event database or checkpoint
+        must exist, which avoids reopening an abandoned empty allocation.
+        """
+        sessions = oneshot.default_session_root(repo)
+        if not sessions.is_dir():
+            return None
+        candidates: list[tuple[tuple[int, int, str], Path]] = []
+        for child in sessions.iterdir():
+            if not child.is_dir() or not (child / ".cambium" / _MANIFEST_NAME).is_file():
+                continue
+            document = _read_manifest_document(child / ".cambium" / _MANIFEST_NAME)
+            if document is None or document.get("schema") != _INTERACTIVE_SCHEMA:
+                continue
+            if document.get("repo") != str(Path(repo).resolve()):
+                continue
+            turn = document.get("turn")
+            if type(turn) is not int or turn < 1 or not cls._has_durable_state(child):
+                continue
+            candidates.append(((_durable_mtime(child), turn, child.name), child.resolve()))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[-1][1]
+
+    @staticmethod
+    def _has_durable_state(root: Path) -> bool:
+        for turn_dir in root.glob("turn-*"):
+            if not turn_dir.is_dir():
+                continue
+            state_dir = turn_dir / ".cambium"
+            if (state_dir / "events.db").is_file():
+                return True
+            checkpoints = state_dir / "checkpoints"
+            if checkpoints.is_dir() and any(path.is_file() for path in checkpoints.rglob("*")):
+                return True
+        return False
+
+    def acquire(self) -> None:
+        """Own the interactive root until :meth:`release` is called."""
+        self._lock.acquire()
+
+    def release(self) -> None:
+        """Release the interactive root lock, including after normal exit."""
+        self._lock.release()
+
+    @property
+    def lock_path(self) -> Path:
+        return self._lock.path
+
+    @property
+    def lock_status(self) -> str:
+        return self._lock.status()
+
+    @property
+    def recovered_stale_lock(self) -> bool:
+        return self._lock.recovered_stale
+
+    @property
+    def reconnected(self) -> bool:
+        return self._reconnected
+
+    @property
+    def last_epoch(self) -> int:
+        return self._last_epoch
+
+    @property
+    def last_checkpoint(self) -> str | None:
+        return self._last_checkpoint
+
+    def __enter__(self) -> InteractiveSession:
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.release()
 
     @property
     def turn(self) -> int:
@@ -303,10 +605,51 @@ class InteractiveSession:
             epoch=epoch,
         )
 
+    def _load_durable_head(self) -> None:
+        """Read the newest durable checkpoint for reconnect diagnostics."""
+        if self._seed is not None:
+            self._last_epoch = self._seed.epoch
+            self._last_checkpoint = self._seed.checkpoint_ref
+        for turn_dir in self.active_turn_dirs():
+            event_db = turn_dir / ".cambium" / "events.db"
+            if not event_db.is_file():
+                continue
+            try:
+                events = read_events_file(event_db)
+            except (OSError, StoreError, ValueError, sqlite3.Error):
+                continue
+            for event in events:
+                if event.get("kind") not in _CONTEXT_KINDS:
+                    continue
+                payload = _payload(event)
+                checkpoint_ref = payload.get("checkpoint_ref")
+                epoch = payload.get("epoch")
+                if not isinstance(checkpoint_ref, str) or type(epoch) is not int or epoch < 0:
+                    continue
+                try:
+                    checkpoint = _checkpoint_path(turn_dir, checkpoint_ref)
+                except InteractiveSessionError:
+                    continue
+                if not checkpoint.is_file() or epoch < self._last_epoch:
+                    continue
+                self._last_epoch = epoch
+                self._last_checkpoint = checkpoint_ref
+
+    def resume_summary(self) -> str:
+        """Describe the durable state that will be attached on startup."""
+        checkpoint = self._last_checkpoint or "none"
+        return (
+            "Detected prior interactive session; resuming durable state: "
+            f"turns={self._turn} last_epoch={self._last_epoch} "
+            f"last_checkpoint={checkpoint}. {self.describe()}"
+        )
+
     def reset(self) -> None:
         """Start a fresh semantic branch while retaining old turn artifacts."""
         self._seed = None
         self._pending_seed = None
+        self._last_epoch = 0
+        self._last_checkpoint = None
         self._branch_generation += 1
         self._branch_start_turn = self._turn
         self._write_manifest()
@@ -676,6 +1019,9 @@ class InteractiveSession:
             model=model if isinstance(model, str) and model else None,
             epoch=epoch if type(epoch) is int and epoch >= 0 else 0,
         )
+        if self._pending_seed.epoch >= self._last_epoch:
+            self._last_epoch = self._pending_seed.epoch
+            self._last_checkpoint = checkpoint_ref
 
     def complete_turn(self, turn: InteractiveTurn, *, succeeded: bool) -> None:
         """Publish the captured checkpoint as the next branch head."""

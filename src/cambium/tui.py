@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import json
 import os
 import signal
 import sqlite3
 import sys
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,7 +18,11 @@ from typing import Any, TextIO
 
 from cambium.render_markdown import render_markdown_if_tty
 
-from .interactive import InteractiveSession, InteractiveSessionError
+from .interactive import (
+    InteractiveSession,
+    InteractiveSessionBusyError,
+    InteractiveSessionError,
+)
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
@@ -267,10 +272,87 @@ def _branch_line(session: InteractiveSession) -> str:
     )
 
 
+def _event_payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = event.get("payload")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _event_text(payload: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _restore_result_summary(turn_dir: Path) -> str | None:
+    result_path = turn_dir / ".cambium" / "result.json"
+    try:
+        with result_path.open(encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, Mapping):
+        return None
+    summary = document.get("summary")
+    return summary if isinstance(summary, str) and summary.strip() else None
+
+
+def _restore_turn_transcript(
+    turn_dir: Path,
+    events: list[dict[str, Any]],
+    transcript: Transcript,
+) -> None:
+    """Replay durable prompt/output events into the bounded cockpit tail."""
+    prompt_seen = False
+    result_summary: str | None = None
+    for event in events:
+        kind = event.get("kind")
+        payload = _event_payload(event)
+        if kind == "task_assigned" and not prompt_seen:
+            task_id = event.get("task_id")
+            if task_id in {None, "interactive-main"}:
+                prompt = _event_text(payload, "task", "prompt", "user_prompt")
+                if prompt is not None:
+                    transcript.user(prompt)
+                    prompt_seen = True
+        elif kind in {"user_prompt", "user_message", "prompt"}:
+            prompt = _event_text(payload, "text", "content", "prompt", "task")
+            if prompt is not None:
+                transcript.user(prompt)
+                prompt_seen = True
+        elif kind == "response":
+            response = _event_text(payload, "text", "content", "summary", "output_text")
+            if response is not None:
+                transcript.assistant(response)
+        if kind == "result":
+            result_summary = _event_text(payload, "summary", "output_text") or result_summary
+        transcript.observe_event(event)
+
+    if not prompt_seen:
+        plan_path = turn_dir / "plan.json"
+        try:
+            with plan_path.open(encoding="utf-8") as stream:
+                plan = json.load(stream)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            plan = None
+        tasks = plan.get("tasks") if isinstance(plan, Mapping) else None
+        if isinstance(tasks, list) and tasks:
+            first = tasks[0]
+            if isinstance(first, Mapping):
+                prompt = first.get("task")
+                if isinstance(prompt, str) and prompt.strip():
+                    transcript.user(prompt)
+
+    transcript.finish_stream(result_summary or _restore_result_summary(turn_dir))
+
+
 def _restore_history(
     session: InteractiveSession,
+    *,
+    transcript: Transcript | None = None,
 ) -> tuple[_Cumulative, SessionSnapshot]:
-    """Rebuild current-branch usage and the latest view from durable turn logs."""
+    """Rebuild usage, dashboard state, and optionally the durable transcript tail."""
     cumulative = _Cumulative()
     latest = ObservabilityState(recent_limit=16).snapshot()
     for turn_dir in session.active_turn_dirs():
@@ -279,10 +361,13 @@ def _restore_history(
             continue
         state = ObservabilityState(recent_limit=16)
         try:
-            for event in read_events_file(event_db):
+            events = read_events_file(event_db)
+            for event in events:
                 state.apply(event)
         except (OSError, ValueError, StoreError, sqlite3.Error):
             continue
+        if transcript is not None:
+            _restore_turn_transcript(turn_dir, events, transcript)
         latest = state.snapshot(session_dir=turn_dir)
         cumulative.add(latest)
     return cumulative, latest
@@ -518,10 +603,28 @@ async def _run_interactive(
     from cambium.supervisor import SessionAlreadyRunningError
 
     session = InteractiveSession(config)
-    cumulative, last_snapshot = _restore_history(session)
+    lock_acquired = False
+    try:
+        session.acquire()
+        lock_acquired = True
+    except InteractiveSessionBusyError as exc:
+        err.write(f"cambium tui: {exc}\n")
+        err.flush()
+        return ExitCode.TEMPORARY_FAILURE
+
+    try:
+        transcript = Transcript()
+        cumulative, last_snapshot = _restore_history(session, transcript=transcript)
+    except BaseException:
+        session.release()
+        raise
     state = ObservabilityState(recent_limit=16)
-    transcript = Transcript()
-    if session.turn:
+    if session.reconnected:
+        message = session.resume_summary()
+        if session.recovered_stale_lock:
+            message += "\nRecovered a stale frontend lock from a terminated process."
+        transcript.system(message)
+    elif session.turn:
         transcript.system(
             "Cambium interactive session\n"
             f"Reopened persistent branch at turn {session.turn}. "
@@ -795,6 +898,8 @@ async def _run_interactive(
         await _close_input_reader()
         if native_input:
             _save_history(history_path)
+        if lock_acquired:
+            session.release()
 
 
 async def run_tui(
