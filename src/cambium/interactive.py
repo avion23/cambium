@@ -19,13 +19,22 @@ import copy
 import json
 import os
 import shutil
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from . import oneshot, supervisor
 from .oneshot import OneShotConfig, RoutingMode, SessionMode
+from .store import EventStore, StoreError, read_events_file
+from .summary_trunk import (
+    SummaryTrunkError,
+    is_k0_entry,
+    partition_summary_trunk,
+    rollover_summary_trunk,
+    summary_entries,
+)
 
 _INTERACTIVE_SCHEMA = 1
 _MANIFEST_NAME = "interactive.json"
@@ -57,6 +66,17 @@ class ContextSeed:
     provider: str | None
     model: str | None
     epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class BranchHead:
+    """One durable checkpoint head discovered in an interactive turn log."""
+
+    turn: int
+    epoch: int
+    checkpoint_ref: str
+    source_session: Path
+    current: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +178,7 @@ class InteractiveSession:
         self._branch_start_turn = 0
         self._seed: ContextSeed | None = None
         self._pending_seed: ContextSeed | None = None
+        self._model_preference: str | None = None
         self._load_manifest()
 
     @property
@@ -190,6 +211,8 @@ class InteractiveSession:
 
     @property
     def model(self) -> str | None:
+        if self._model_preference is not None:
+            return self._model_preference
         return self._seed.model if self._seed is not None else self._base_config.model
 
     def _manifest_document(self) -> dict[str, Any]:
@@ -210,6 +233,7 @@ class InteractiveSession:
             "branch_generation": self._branch_generation,
             "branch_start_turn": self._branch_start_turn,
             "seed": seed,
+            "model_preference": self._model_preference,
         }
 
     def _write_manifest(self) -> None:
@@ -241,6 +265,12 @@ class InteractiveSession:
         self._turn = turn
         self._branch_generation = generation
         self._branch_start_turn = branch_start
+        model_preference = document.get("model_preference")
+        if model_preference is not None and (
+            not isinstance(model_preference, str) or not model_preference.strip()
+        ):
+            raise InteractiveSessionError("interactive model preference is invalid")
+        self._model_preference = model_preference
         seed = document.get("seed")
         if seed is None:
             return
@@ -280,6 +310,235 @@ class InteractiveSession:
         self._branch_generation += 1
         self._branch_start_turn = self._turn
         self._write_manifest()
+
+    def fork(self) -> str:
+        """Start a new branch whose first turn reuses the current checkpoint."""
+        if self._seed is None:
+            raise InteractiveSessionError("cannot fork: no successful checkpoint is available")
+        self._pending_seed = None
+        self._branch_generation += 1
+        self._branch_start_turn = self._turn
+        self._write_manifest()
+        return (
+            f"forked branch generation={self._branch_generation} from "
+            f"epoch={self._seed.epoch} checkpoint={self._seed.checkpoint_ref}"
+        )
+
+    def branch_heads(self) -> tuple[BranchHead, ...]:
+        """Replay turn event stores and return their latest checkpoint heads."""
+        heads: list[BranchHead] = []
+        turn_dirs = sorted(
+            (
+                path
+                for path in self.root.glob("turn-*")
+                if path.is_dir() and path.name[5:].isdigit()
+            ),
+            key=lambda path: int(path.name[5:]),
+        )
+        for turn_dir in turn_dirs:
+            event_db = turn_dir / ".cambium" / "events.db"
+            if not event_db.is_file():
+                continue
+            latest: tuple[int, str] | None = None
+            try:
+                events = read_events_file(event_db)
+            except (OSError, ValueError, StoreError):
+                continue
+            for event in events:
+                if event.get("kind") not in {"context_checkpoint", "context_epoch_advanced"}:
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                checkpoint_ref = payload.get("checkpoint_ref")
+                epoch = payload.get("epoch")
+                if (
+                    not isinstance(checkpoint_ref, str)
+                    or not checkpoint_ref
+                    or type(epoch) is not int
+                    or epoch < 0
+                ):
+                    continue
+                latest = (epoch, checkpoint_ref)
+            if latest is None:
+                continue
+            turn = int(turn_dir.name[5:])
+            current = (
+                self._seed is not None
+                and turn == self._turn
+                and self._seed.source_session == turn_dir.resolve()
+                and self._seed.checkpoint_ref == latest[1]
+            )
+            heads.append(
+                BranchHead(
+                    turn=turn,
+                    epoch=latest[0],
+                    checkpoint_ref=latest[1],
+                    source_session=turn_dir,
+                    current=current,
+                )
+            )
+        return tuple(heads)
+
+    def set_model_preference(self, value: str) -> str:
+        """Validate and persist a model preference for subsequent turns."""
+        model = value.strip()
+        if not model or any(character.isspace() for character in model):
+            return "model: expected one configured model name"
+        provider = self.provider
+        if provider is None:
+            return "model: read-only while provider routing is automatic"
+        if model == self.model:
+            return f"model preference unchanged: provider={provider} model={model}"
+
+        configured_model: str | None = None
+        fanout = self._base_config.fanout_config
+        if isinstance(fanout, Mapping):
+            candidate = fanout.get("model")
+            if isinstance(candidate, str) and candidate:
+                configured_model = candidate
+        try:
+            from .provider_config import load_providers
+
+            provider_path = oneshot._provider_config_path(self._base_config, self.repo)
+            providers = load_providers(provider_path)
+            selected = next(
+                (
+                    candidate
+                    for candidate in providers
+                    if candidate.enabled and candidate.name == provider
+                ),
+                None,
+            )
+            if selected is None:
+                return f"model: provider {provider!r} is not configured or enabled"
+            configured_model = selected.model
+        except (OSError, ValueError) as exc:
+            if configured_model is None:
+                return f"model: read-only; provider config unavailable ({exc})"
+
+        if configured_model != model:
+            return (
+                f"model: {model!r} is not configured for provider {provider!r}"
+            )
+        self._model_preference = model
+        self._write_manifest()
+        return (
+            f"model preference set: provider={provider} model={model} "
+            "(subsequent turns)"
+        )
+
+    def compact(self) -> str:
+        """Roll the current summary-only checkpoint into a CAST K0 checkpoint.
+
+        Normal semantic summary flushing is performed by the provider-backed
+        worker at a successful turn boundary.  This operator path therefore
+        refuses a checkpoint that still has a raw tail rather than inventing a
+        model-free summary, then performs the local K0 rollover check.
+        """
+        if self._seed is None:
+            return "compact: no successful checkpoint is available"
+        seed = self._seed
+        try:
+            from .worker import AgentConfig, _load_epoch_checkpoint, _write_epoch_checkpoint
+
+            checkpoint_root = seed.source_session / ".cambium" / "checkpoints"
+            config = AgentConfig(
+                task_id="interactive-main",
+                generation=1,
+                task="interactive compaction",
+                worktree=None,
+                base_commit=None,
+                fanout_config=None,
+                max_turns=self._base_config.max_turns,
+                max_tokens=self._base_config.max_tokens,
+                shell_permission=True,
+                network_permission=False,
+                heartbeat_interval_s=1.0,
+                max_wall_s=self._base_config.max_wall_s,
+                checkpoint_root=checkpoint_root,
+                provider_env_keys=self._base_config.provider_env_keys,
+            )
+            checkpoint = _load_epoch_checkpoint(
+                config, seed.checkpoint_ref, expect_task_id=False
+            )
+            trunk, raw_tail = partition_summary_trunk(checkpoint.full_messages)
+            if raw_tail:
+                return (
+                    "compact: semantic flush is pending; raw tail remains and "
+                    "requires a provider turn"
+                )
+            entries = summary_entries(trunk)
+            if not entries:
+                return "compact: no semantic summary segments are available"
+            if len(entries) == 1 and is_k0_entry(entries[0]):
+                return f"compact: already at K0 epoch={checkpoint.epoch}"
+            rolled_messages, _projection, _history = rollover_summary_trunk(trunk)
+            cache_key = checkpoint.cache_key
+            provider = cache_key.provider
+            provider_compat = {
+                provider: (cache_key.protocol, cache_key.reasoning_effort)
+            }
+            rolled = _write_epoch_checkpoint(
+                config,
+                turn=checkpoint.turn,
+                epoch=checkpoint.epoch + 1,
+                provider_messages=rolled_messages,
+                continuation_suffix=[],
+                provider=provider,
+                model=cache_key.model,
+                tools_sha256=cache_key.tools_sha256,
+                provider_compat=provider_compat,
+                provider_boundary=cache_key.provider_boundary,
+                code_changed=checkpoint.code_changed,
+                verified_after_change=checkpoint.verified_after_change,
+                verification_failed=checkpoint.verification_failed,
+                no_progress_actions=checkpoint.no_progress_actions,
+                budget_new_tokens=checkpoint.budget_new_tokens,
+                previous_prompt_tokens=checkpoint.previous_prompt_tokens,
+                cumulative_usage=checkpoint.cumulative_usage,
+                wall_deadline=checkpoint.wall_deadline,
+            )
+            if rolled is None:
+                return "compact: checkpoint root is unavailable"
+            descriptor = _fork_descriptor(rolled.checkpoint_ref, asdict(rolled.cache_key))
+            new_seed = ContextSeed(
+                source_session=seed.source_session,
+                checkpoint_ref=rolled.checkpoint_ref,
+                descriptor={} if descriptor is None else descriptor,
+                provider=rolled.cache_key.provider,
+                model=rolled.cache_key.model,
+                epoch=rolled.epoch,
+            )
+            event_store = EventStore(seed.source_session / ".cambium" / "events.db")
+            try:
+                event_store.append(
+                    {
+                        "kind": "context_epoch_advanced",
+                        "ts": time.time(),
+                        "task_id": checkpoint.task_id,
+                        "generation": checkpoint.generation,
+                        "request_id": f"tui-compact-{time.time_ns():x}",
+                        "payload": {
+                            "checkpoint_ref": rolled.checkpoint_ref,
+                            "epoch": rolled.epoch,
+                            "turn": rolled.turn,
+                            "folded_from_epoch": checkpoint.epoch,
+                            "reason": "manual K0 rollover",
+                            "cache_key": asdict(rolled.cache_key),
+                        },
+                    }
+                )
+            finally:
+                event_store.close()
+            self._seed = new_seed
+            self._write_manifest()
+            return (
+                f"compacted: K0 rollover epoch={checkpoint.epoch}->{rolled.epoch} "
+                f"checkpoint={rolled.checkpoint_ref}"
+            )
+        except (OSError, StoreError, SummaryTrunkError, ValueError) as exc:
+            return f"compact: unavailable ({exc})"
 
     def _turn_dir(self, number: int) -> Path:
         return self.root / f"turn-{number:04d}"
@@ -331,6 +590,19 @@ class InteractiveSession:
                 changes["model"] = self._seed.model
             if changes:
                 config = replace(config, **changes)
+        if self._model_preference is not None:
+            changes = {"model": self._model_preference}
+            provider = self.provider
+            if provider is not None:
+                changes.update(
+                    {
+                        "provider": provider,
+                        "assigned_provider": provider,
+                        "routing_mode": RoutingMode.CASCADE,
+                        "auto": False,
+                    }
+                )
+            config = replace(config, **changes)
         self._pending_seed = None
         return InteractiveTurn(
             number=number,
@@ -428,6 +700,7 @@ class InteractiveSession:
 
 
 __all__ = [
+    "BranchHead",
     "ContextSeed",
     "InteractiveSession",
     "InteractiveSessionError",

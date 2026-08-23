@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from pathlib import Path
 
 from cambium import tui
 from cambium.interactive import InteractiveSession
 from cambium.oneshot import OneShotConfig
+from cambium.store import EventStore
 from cambium.supervisor import PlanResult, TaskResult
 
 
@@ -85,6 +87,100 @@ def test_interactive_reset_starts_fresh_branch(tmp_path: Path) -> None:
     session.reset()
     assert session.seed is None
     assert "branch=2" in session.describe()
+
+
+def test_interactive_fork_reuses_current_checkpoint(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    first = session.prepare_turn("inspect")
+    checkpoint_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
+    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("{}", encoding="utf-8")
+    session.observe_event(first, _checkpoint_event(checkpoint_ref))
+    session.complete_turn(first, succeeded=True)
+
+    message = session.fork()
+
+    assert "generation=2" in message
+    assert session.seed is not None
+    assert session.seed.checkpoint_ref == checkpoint_ref
+    assert session.active_turn_dirs() == ()
+
+
+def test_interactive_branches_replay_event_store_heads(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    event_db = root / "turn-0001" / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    store = EventStore(event_db)
+    try:
+        store.append(
+            {
+                "kind": "context_checkpoint",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {
+                    "checkpoint_ref": "interactive-main/epoch-001-ref.json",
+                    "epoch": 1,
+                },
+            }
+        )
+        store.append(
+            {
+                "kind": "context_epoch_advanced",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {
+                    "checkpoint_ref": "interactive-main/epoch-002-ref.json",
+                    "epoch": 2,
+                },
+            }
+        )
+    finally:
+        store.close()
+
+    heads = session.branch_heads()
+
+    assert len(heads) == 1
+    assert heads[0].epoch == 2
+    assert heads[0].checkpoint_ref.endswith("epoch-002-ref.json")
+
+
+def test_tui_model_preference_is_validated_and_applies_to_next_turn(tmp_path: Path) -> None:
+    provider_config = tmp_path / "providers.json"
+    provider_config.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "provider-a",
+                        "tier": "balanced",
+                        "base_url": "http://127.0.0.1:9999/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_PROVIDER_A_API_KEY",
+                        "model": "model-b",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    session = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "interactive",
+            provider="provider-a",
+            model="model-a",
+            provider_config_path=provider_config,
+        )
+    )
+
+    result = session.set_model_preference("model-b")
+    turn = session.prepare_turn("continue")
+
+    assert "preference set" in result
+    assert turn.config.provider == "provider-a"
+    assert turn.config.model == "model-b"
 
 
 def test_tui_multiline_input() -> None:

@@ -81,7 +81,10 @@ _HELP = """Commands:
   /agents     main/sub-agent lifecycle and provider/model rows
   /context    current trunk, raw tail, checkpoint, and epoch
   /session    persistent interactive-session identity and provider lease
-  /model      current provider/model lease and branch generation
+  /model [M]  show the provider/model lease or set a configured model preference
+  /branches   list durable branch heads with epoch/checkpoint references
+  /fork       fork a new branch from the current checkpoint
+  /compact    flush semantic context and check for a K0 rollover
   /dashboard  explain the visible live cockpit
   /events     recent durable event summaries
   /new        start a fresh semantic branch; old turn artifacts remain
@@ -436,19 +439,47 @@ def _command_output(
     cumulative: _Cumulative,
     snapshot: SessionSnapshot,
 ) -> str | None:
-    if command == "/help":
+    parts = command.split(maxsplit=1)
+    name = parts[0] if parts else command
+    argument = parts[1].strip() if len(parts) == 2 else ""
+    if name == "/help" and not argument:
         return _HELP
-    if command == "/usage":
+    if name == "/usage" and not argument:
         return cumulative.line()
-    if command == "/agents":
+    if name == "/agents" and not argument:
         return "\n".join(render_agent_lines(snapshot))
-    if command == "/context":
+    if name == "/context" and not argument:
         return _context_line(snapshot)
-    if command in {"/session", "/model"}:
+    if name == "/session" and not argument:
         return session.describe()
-    if command == "/dashboard":
+    if name == "/model":
+        if not argument:
+            return session.describe()
+        return session.set_model_preference(argument)
+    if name == "/branches" and not argument:
+        heads = session.branch_heads()
+        if not heads:
+            return "branches: none (no durable checkpoints)"
+        lines = ["branches:"]
+        for head in heads:
+            marker = "* " if head.current else "  "
+            lines.append(
+                f"{marker}turn={head.turn} epoch={head.epoch} "
+                f"checkpoint={head.checkpoint_ref}"
+            )
+        return "\n".join(lines)
+    if name == "/fork":
+        if argument:
+            return "usage: /fork"
+        try:
+            return session.fork()
+        except InteractiveSessionError as exc:
+            return str(exc)
+    if name == "/compact" and not argument:
+        return session.compact()
+    if name == "/dashboard" and not argument:
         return "The persistent cockpit is already the live dashboard."
-    if command in {"/events", "/tail"}:
+    if name in {"/events", "/tail"} and not argument:
         if not snapshot.recent_events:
             return "events: none"
         lines = ["events:"]
@@ -457,9 +488,9 @@ def _command_output(
             detail = f"  {event.detail}" if event.detail else ""
             lines.append(f"  #{event.seq:<6} {event.kind:<28} {task}{detail}")
         return "\n".join(lines)
-    if command == "/cancel":
+    if name == "/cancel" and not argument:
         return "No turn is active; press Ctrl-C while a turn is running."
-    if command == "/status":
+    if name == "/status" and not argument:
         return "\n".join(
             [
                 session.describe(),

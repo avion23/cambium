@@ -35,7 +35,7 @@ class _History:
 
 
 def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> None:
-    source = _Tty("/dashboard\n/events\n/model\n/cancel\n/exit\n")
+    source = _Tty("/dashboard\n/events\n/branches\n/fork\n/compact\n/model\n/cancel\n/exit\n")
     output = _Tty()
     error = io.StringIO()
 
@@ -53,6 +53,9 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert error.getvalue() == ""
     assert "Cambium interactive session" in text
     assert "events: none" in text
+    assert "branches: none" in text
+    assert "cannot fork: no successful checkpoint" in text
+    assert "compact: no successful checkpoint" in text
     assert "provider=auto model=auto" in text
     assert "press Ctrl-C while a turn is running" in text
     assert "┌ Cambium" in text
