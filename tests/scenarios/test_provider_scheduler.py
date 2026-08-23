@@ -1,66 +1,58 @@
 from __future__ import annotations
 
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+import cambium.provider_scheduler as provider_state
 from cambium.provider_scheduler import (
-    BillingMode,
-    ProviderEvidence,
     ProviderLease,
-    ProviderPolicy,
-    ProviderScheduler,
     QuotaLedger,
     QuotaWindowSpec,
-    RoutingRequest,
-    rank_policies,
+    quota_snapshot_json,
 )
 
 
-def _policy(name: str, **kwargs) -> ProviderPolicy:
-    return ProviderPolicy(name=name, model=kwargs.pop("model", "m"), **kwargs)
-
-
-def test_root_lease_is_a_hard_constraint() -> None:
-    policies = [_policy("a"), _policy("b", throughput_hint_tps=100)]
-    lease = ProviderLease("a", "m", "root")
-    ranked = rank_policies(policies, RoutingRequest("child", "m", lease=lease))
-    assert [item.name for item in ranked] == ["a"]
-
-
-def test_model_pin_is_strict_unless_substitution_is_explicit() -> None:
-    policies = [_policy("a", model="wanted"), _policy("b", model="other")]
-    strict = rank_policies(policies, RoutingRequest("t", "wanted"))
-    substituted = rank_policies(
-        policies, RoutingRequest("t", "missing", allow_model_substitution=True)
-    )
-    assert [item.name for item in strict] == ["a"]
-    assert {item.name for item in substituted} == {"a", "b"}
-
-
-def test_throughput_refines_only_equal_priority() -> None:
-    policies = [
-        _policy("slow", priority=0, throughput_hint_tps=1),
-        _policy("fast", priority=0, throughput_hint_tps=50),
-        _policy("lower-class", priority=1, throughput_hint_tps=1000),
-    ]
-    evidence = {
-        "slow": ProviderEvidence(attempts=100, successes=95, ewma_tps=2),
-        "fast": ProviderEvidence(attempts=100, successes=95, ewma_tps=40),
+def test_module_has_one_state_role_and_no_competing_scheduler() -> None:
+    assert not hasattr(provider_state, "ProviderScheduler")
+    assert not hasattr(provider_state, "rank_policies")
+    assert set(provider_state.__all__) == {
+        "BillingMode",
+        "ProviderLease",
+        "QuotaLedger",
+        "QuotaReservation",
+        "QuotaWindowSnapshot",
+        "QuotaWindowSpec",
+        "quota_snapshot_json",
     }
-    ranked = rank_policies(
-        policies,
-        RoutingRequest("t", "m", expected_output_tokens=1000),
-        evidence=evidence,
+
+
+def test_provider_lease_is_strictly_identified() -> None:
+    lease = ProviderLease("openai", "gpt-5.6", "root", cache_identity="prefix")
+    assert lease.provider == "openai"
+    assert lease.model == "gpt-5.6"
+    assert lease.root_task_id == "root"
+    with pytest.raises(ValueError, match="must be non-empty"):
+        ProviderLease("", "gpt-5.6", "root")
+
+
+def test_quota_window_mapping_is_strict() -> None:
+    window = QuotaWindowSpec.from_mapping(
+        {
+            "name": "five-hour",
+            "duration_s": 5 * 3600,
+            "token_allowance": 100,
+            "request_allowance": 10,
+            "reserve_fraction": 0.1,
+        }
     )
-    assert [item.name for item in ranked] == ["fast", "slow", "lower-class"]
-
-
-def test_rpm_and_concurrency_have_independent_units() -> None:
-    policy = _policy("p", max_concurrency=2)
-    assert rank_policies(
-        [policy], RoutingRequest("t", "m"), in_flight={"p": 2}
-    ) == []
+    assert window.token_allowance == 100
+    assert window.request_allowance == 10
+    with pytest.raises(ValueError, match="unknown quota-window"):
+        QuotaWindowSpec.from_mapping(
+            {"name": "bad", "duration_s": 1, "token_allowance": 1, "extra": True}
+        )
 
 
 def test_quota_ledger_reservation_is_atomic_across_threads(tmp_path: Path) -> None:
@@ -76,24 +68,41 @@ def test_quota_ledger_reservation_is_atomic_across_threads(tmp_path: Path) -> No
     assert ledger.snapshots("zai")[0].used_requests == 10
 
 
-def test_scheduler_mailbox_serializes_lane_admission(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        scheduler = ProviderScheduler(
-            [_policy("free", billing_mode=BillingMode.FREE, max_concurrency=1)],
-            quota_ledger=QuotaLedger(tmp_path / "quota.db"),
-        )
-        first = await scheduler.acquire(RoutingRequest("a", "m"))
-        try:
-            try:
-                await scheduler.acquire(RoutingRequest("b", "m"))
-            except RuntimeError as exc:
-                assert "no provider" in str(exc)
-            else:
-                raise AssertionError("second acquire unexpectedly succeeded")
-        finally:
-            await scheduler.release(first, actual_tokens=10, success=True, latency_s=1.0)
-        second = await scheduler.acquire(RoutingRequest("b", "m"))
-        await scheduler.release(second, actual_tokens=5, success=True, latency_s=1.0)
-        await scheduler.close()
+def test_quota_reconciliation_is_idempotent(tmp_path: Path) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("tokens", 300, token_allowance=100)
+    reservation = ledger.reserve("openai", (window,), 20, now=10.0)
+    assert reservation is not None
 
-    asyncio.run(scenario())
+    ledger.reconcile(reservation, (window,), 7, now=11.0)
+    ledger.reconcile(reservation, (window,), 99, now=12.0)
+
+    snapshot = ledger.snapshots("openai")[0]
+    assert snapshot.used_tokens == 7
+    assert quota_snapshot_json(snapshot)["remaining_tokens"] == 93
+
+
+def test_quota_observation_validates_and_replaces_window(tmp_path: Path) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    ledger.observe(
+        "openai",
+        "requests",
+        reset_at=200.0,
+        allowance_requests=50,
+        remaining_requests=40,
+        reserve_fraction=0.1,
+        now=100.0,
+    )
+    snapshot = ledger.snapshots("openai")[0]
+    assert snapshot.used_requests == 10
+    assert snapshot.remaining_requests == 40
+
+    with pytest.raises(ValueError, match="reserve_fraction"):
+        ledger.observe(
+            "openai",
+            "bad",
+            reset_at=200.0,
+            allowance_requests=1,
+            reserve_fraction=1.0,
+            now=100.0,
+        )
