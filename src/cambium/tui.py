@@ -26,7 +26,7 @@ from .interactive import (
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
-from .tui_screen import Cockpit, Transcript
+from .tui_screen import ActivityState, Cockpit, Transcript
 
 try:
     import readline as _readline
@@ -768,11 +768,39 @@ async def _run_interactive(
                 )
                 completed = False
                 cancel_requested = False
+                activity = ActivityState()
+                activity.start()
+                cockpit.draw(
+                    state.snapshot(session_dir=turn.session_dir),
+                    transcript,
+                    session_description=session.describe(),
+                    branch_line=_branch_line(session),
+                    cumulative_line=cumulative.line(),
+                    activity_line=activity.render(),
+                )
 
-                def _live_sink(record: dict[str, Any]) -> None:
+                loop = asyncio.get_running_loop()
+
+                async def _activity_ticks(_activity: ActivityState = activity) -> None:
+                    try:
+                        while _activity.active:
+                            await asyncio.sleep(0.1)
+                            if _activity.active:
+                                cockpit.draw_activity(_activity.tick())
+                    except asyncio.CancelledError:
+                        raise
+                    except (BrokenPipeError, OSError, ValueError):
+                        return
+
+                activity_task = loop.create_task(_activity_ticks())
+
+                def _live_sink(
+                    record: dict[str, Any], _activity: ActivityState = activity
+                ) -> None:
                     nonlocal sequence
                     session.observe_event(turn, record)  # noqa: B023
                     transcript.observe_event(record)
+                    _activity.observe_event(record)
                     sequence += 1
                     normalized = dict(record)
                     normalized["seq"] = sequence
@@ -783,6 +811,7 @@ async def _run_interactive(
                         session_description=session.describe(),
                         branch_line=_branch_line(session),
                         cumulative_line=cumulative.line(),  # noqa: B023
+                        activity_line=_activity.render(),
                     )
 
                 _start_input_read()
@@ -885,6 +914,12 @@ async def _run_interactive(
                         session.complete_turn(turn, succeeded=False)
                     raise
                 finally:
+                    activity.stop()
+                    activity_task.cancel()
+                    try:
+                        await activity_task
+                    except asyncio.CancelledError:
+                        pass
                     if signal_installed:
                         loop.remove_signal_handler(signal.SIGINT)
 
