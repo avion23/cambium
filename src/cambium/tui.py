@@ -560,6 +560,7 @@ async def _run_interactive(
                         snapshot = state.snapshot(session_dir=turn.session_dir)
                         last_snapshot = snapshot
                         cumulative.add(snapshot)
+                        transcript.finish_stream()
                         transcript.system(
                             "turn cancelled; the previous successful checkpoint "
                             "remains the branch head."
@@ -600,7 +601,7 @@ async def _run_interactive(
                 snapshot = state.snapshot(session_dir=turn.session_dir)
                 last_snapshot = snapshot
                 cumulative.add(snapshot)
-                transcript.assistant(_response_markdown(render, response))
+                transcript.finish_stream(_response_markdown(render, response))
                 cockpit.draw(
                     snapshot,
                     transcript,
