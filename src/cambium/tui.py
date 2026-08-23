@@ -17,7 +17,6 @@ from .monitor import AnsiDashboard, render_agent_lines, render_dashboard
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
 
-
 _RESET = "\033[0m"
 _CYAN = "\033[1;36m"
 _DIM_CYAN = "\033[2;36m"
@@ -416,13 +415,13 @@ async def _run_interactive(
 
             def _live_sink(record: dict[str, Any]) -> None:
                 nonlocal sequence
-                session.observe_event(turn, record)
+                session.observe_event(turn, record)  # noqa: B023
                 sequence += 1
                 normalized = dict(record)
                 normalized["seq"] = sequence
-                state.apply(normalized)
-                if dashboard.enabled:
-                    dashboard.draw(state.snapshot(session_dir=turn.session_dir))
+                state.apply(normalized)  # noqa: B023
+                if dashboard.enabled:  # noqa: B023
+                    dashboard.draw(state.snapshot(session_dir=turn.session_dir))  # noqa: B023
                 elif not quiet:
                     _write_line(out, render.render_event_line(record, stream=out))
                 out.flush()
