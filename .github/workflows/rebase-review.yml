@@ -1,0 +1,56 @@
+name: rebase-review
+
+on:
+  push:
+    branches:
+      - codex/cambium-correctness-docs-20260823
+
+permissions:
+  contents: write
+
+jobs:
+  rebase-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/cambium-correctness-docs-20260823
+          fetch-depth: 0
+      - name: Remove this staging commit and pull-rebase main
+        run: |
+          git config user.name "openai-codex"
+          git config user.email "codex@openai.com"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git reset --hard HEAD^
+          git pull --rebase origin main
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Refresh and install lock
+        run: |
+          uv lock
+          uv sync --locked --extra dev
+          if ! git diff --quiet -- uv.lock; then
+            git add uv.lock
+            git commit -m "build: refresh lock after rebase"
+          fi
+      - name: Ruff
+        run: uv run ruff check src tests
+      - name: Compile
+        run: uv run python -m compileall -q src tests
+      - name: Fast tests
+        run: uv run pytest -n auto -q
+      - name: Slow tests
+        run: uv run pytest -n auto -m slow -q
+      - name: Publish rebased branch
+        run: >-
+          git push
+          --force-with-lease=refs/heads/codex/cambium-correctness-docs-20260823:${GITHUB_SHA}
+          origin HEAD:refs/heads/codex/cambium-correctness-docs-20260823
