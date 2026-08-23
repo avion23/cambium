@@ -1109,6 +1109,7 @@ class AgentConfig:
     heartbeat_interval_s: float
     max_wall_s: float
     checkpoint_root: Path | None
+    python_permission: bool = False
     requirements: dict[str, Any] | None = None
     max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
     # Supervisor-level admission balancing (solution C): the provider this
@@ -1161,8 +1162,12 @@ class AgentConfig:
             permissions = {}
         shell_permission = permissions.get("shell", False)
         network_permission = permissions.get("network", False)
-        if not isinstance(shell_permission, bool) or not isinstance(network_permission, bool):
-            raise ValueError("init permissions.shell/network must be strict booleans")
+        python_permission = permissions.get("python", False)
+        if not all(
+            isinstance(permission, bool)
+            for permission in (shell_permission, network_permission, python_permission)
+        ):
+            raise ValueError("init permissions.shell/network/python must be strict booleans")
         heartbeat = init.get("heartbeat")
         heartbeat_interval_s = heartbeat.get("interval_s") if isinstance(heartbeat, dict) else None
         budget = init.get("budget")
@@ -1215,6 +1220,7 @@ class AgentConfig:
             max_tokens=_positive_int(init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS),
             shell_permission=shell_permission,
             network_permission=network_permission,
+            python_permission=python_permission,
             heartbeat_interval_s=_positive_float(
                 heartbeat_interval_s, "init heartbeat.interval_s", HEARTBEAT_INTERVAL_S
             ),
@@ -1298,6 +1304,7 @@ def _merge_task_config(
         max_tokens=max_tokens,
         shell_permission=config.shell_permission,
         network_permission=config.network_permission,
+        python_permission=config.python_permission,
         heartbeat_interval_s=config.heartbeat_interval_s,
         max_wall_s=max_wall_s,
         checkpoint_root=config.checkpoint_root,
@@ -1352,6 +1359,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
         shell_permission=False,
         network_permission=False,
+        python_permission=False,
         heartbeat_interval_s=HEARTBEAT_INTERVAL_S,
         max_wall_s=_positive_float(
             run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
@@ -1510,12 +1518,16 @@ _ALL_TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)
 
 
 def _exposed_tool_schemas(config: AgentConfig) -> list[dict[str, Any]]:
-    """Schemas offered to the model; shell and mutating git are permission-filtered."""
+    """Schemas offered to the model; process permissions are filtered."""
     schemas: list[dict[str, Any]] = []
     for schema in TOOL_SCHEMAS:
         name = schema["name"]
         if name == "run_shell":
             if config.shell_permission:
+                schemas.append(schema)
+            continue
+        if name == "run_python":
+            if config.python_permission:
                 schemas.append(schema)
             continue
         if name == "git_op":
@@ -4455,6 +4467,7 @@ async def _run_agent_loop(
                 policy=ToolPermissionPolicy(
                     shell=config.shell_permission,
                     network=config.network_permission,
+                    python=config.python_permission,
                 ),
             ) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)

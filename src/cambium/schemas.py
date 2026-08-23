@@ -176,6 +176,134 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "search_symbols",
+        "description": "Search bounded source declarations by symbol name in the worktree.",
+        "parameters": _parameters(
+            {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Case-insensitive symbol name or substring to search for.",
+                },
+                "exact": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Require an exact symbol-name match.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "default": 50,
+                    "description": "Maximum number of locations to return.",
+                },
+            },
+            ["query"],
+        ),
+    },
+    {
+        "name": "find_references",
+        "description": "Find bounded exact-identifier references across source files.",
+        "parameters": _parameters(
+            {
+                "symbol": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$",
+                    "description": "One identifier whose source references should be located.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 100,
+                    "description": "Maximum number of locations to return.",
+                },
+            },
+            ["symbol"],
+        ),
+    },
+    {
+        "name": "read_symbol",
+        "description": "Read a bounded numbered source window around a line in the worktree.",
+        "parameters": _parameters(
+            {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Source path relative to the worktree.",
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10_000_000,
+                    "description": "One-based source line around which to read.",
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 40,
+                    "description": "Number of source lines in the returned window.",
+                },
+            },
+            ["path", "line"],
+        ),
+    },
+    {
+        "name": "query_lsp",
+        "description": (
+            "Run one bounded operator-configured language-server navigation query. "
+            "The server command comes from CAMBIUM_LSP_COMMAND."
+        ),
+        "parameters": _parameters(
+            {
+                "method": {
+                    "type": "string",
+                    "enum": [
+                        "definition",
+                        "references",
+                        "hover",
+                        "document_symbols",
+                        "diagnostics",
+                    ],
+                    "description": "LSP query operation.",
+                },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Source path relative to the worktree.",
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10_000_000,
+                    "default": 1,
+                    "description": "One-based source line for position queries.",
+                },
+                "column": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10_000_000,
+                    "default": 1,
+                    "description": "One-based source column for position queries.",
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "minimum": 0.001,
+                    "maximum": 60,
+                    "default": 8.0,
+                    "description": "Maximum language-server query time in seconds.",
+                },
+            },
+            ["method", "path"],
+        ),
+    },
+    {
         "name": "git_op",
         "description": "Run an allowlisted git operation in the worker worktree.",
         "parameters": _parameters(

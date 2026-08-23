@@ -29,7 +29,7 @@ from queue import Empty, Queue
 from threading import Lock, Thread, current_thread
 from typing import Any, cast
 
-from . import ast_tools
+from . import ast_tools, code_index, lsp_query
 from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
@@ -50,6 +50,7 @@ ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 class ToolPermissionPolicy:
     shell: bool = True
     network: bool = True
+    python: bool = True
 
 
 @dataclass(slots=True)
@@ -827,6 +828,81 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=ok, output=output)
 
 
+def _bounded_json_output(value: Any) -> str:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise _ToolFailure(f"navigation result is not JSON serializable: {exc}") from exc
+    return _truncate_text(serialized, MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER)
+
+
+async def _search_symbols(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    try:
+        locations = await asyncio.to_thread(
+            code_index.search_symbols,
+            ctx.cwd,
+            args["query"],
+            exact=args.get("exact", False),
+            max_results=args.get("max_results", 50),
+        )
+    except ValueError as exc:
+        raise _ToolFailure(str(exc)) from exc
+    return _Outcome(
+        ok=True,
+        output=_truncate_text(
+            code_index.locations_json(locations), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
+        ),
+    )
+
+
+async def _find_references(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    try:
+        locations = await asyncio.to_thread(
+            code_index.find_references,
+            ctx.cwd,
+            args["symbol"],
+            max_results=args.get("max_results", 100),
+        )
+    except ValueError as exc:
+        raise _ToolFailure(str(exc)) from exc
+    return _Outcome(
+        ok=True,
+        output=_truncate_text(
+            code_index.locations_json(locations), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
+        ),
+    )
+
+
+async def _read_symbol(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    try:
+        window = await asyncio.to_thread(
+            code_index.read_symbol,
+            ctx.cwd,
+            args["path"],
+            args["line"],
+            context_lines=args.get("context_lines", 40),
+        )
+    except ValueError as exc:
+        raise _ToolFailure(str(exc)) from exc
+    return _Outcome(ok=True, output=_bounded_json_output(window))
+
+
+async def _query_lsp(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    try:
+        result = await asyncio.to_thread(
+            lsp_query.query_lsp,
+            ctx.cwd,
+            method=args["method"],
+            path=args["path"],
+            line=args.get("line", 1),
+            column=args.get("column", 1),
+            timeout_s=args.get("timeout_s", 8.0),
+        )
+    except (ValueError, lsp_query.LspQueryError) as exc:
+        raise _ToolFailure(str(exc)) from exc
+    return _Outcome(ok=True, output=_bounded_json_output(result))
+
+
 async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     """Register one child proposal for supervisor validation.
 
@@ -851,10 +927,14 @@ TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "edit_file": _edit_file,
     "grep_code": _grep_code,
     "get_signature": _get_signature,
+    "search_symbols": _search_symbols,
+    "find_references": _find_references,
+    "read_symbol": _read_symbol,
+    "query_lsp": _query_lsp,
     "git_op": _git_op,
     "run_shell": _run_shell,
 }
-_TOOL_PERMISSION_REQUIREMENTS = {"run_shell": "shell"}
+_TOOL_PERMISSION_REQUIREMENTS = {"run_shell": "shell", "run_python": "python"}
 
 
 async def _run_read_result(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -1011,6 +1091,13 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
             return ToolResult(
                 ok=False,
                 error="\n".join(validation_errors),
+                duration_ms=_duration_ms(started_ns),
+            )
+        required_permission = _TOOL_PERMISSION_REQUIREMENTS["run_python"]
+        if ctx.policy is not None and not getattr(ctx.policy, required_permission):
+            return ToolResult(
+                ok=False,
+                error=f"permission_denied:{required_permission}",
                 duration_ms=_duration_ms(started_ns),
             )
         code = args["code"]
