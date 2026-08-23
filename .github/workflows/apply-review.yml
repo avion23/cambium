@@ -1,0 +1,57 @@
+name: apply-review
+
+on:
+  push:
+    branches:
+      - codex/cambium-correctness-docs-20260823
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/cambium-correctness-docs-20260823
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Apply guarded patch
+        run: python .github/apply_review.py
+      - name: Install locked development environment
+        run: uv sync --locked --extra dev
+      - name: Ruff
+        run: uv run ruff check src tests
+      - name: Compile
+        run: uv run python -m compileall -q src tests
+      - name: Focused correctness tests
+        run: >-
+          uv run pytest -q
+          tests/scenarios/test_context_policy.py
+          tests/scenarios/test_provider_scheduler.py
+          tests/scenarios/test_summary_trunk.py
+          tests/scenarios/test_context_epochs.py
+      - name: Fast test tier
+        run: uv run pytest -n auto -q
+      - name: Slow test tier
+        run: uv run pytest -n auto -m slow -q
+      - name: Remove patch machinery
+        run: rm .github/apply_review.py .github/workflows/apply-review.yml
+      - name: Commit verified implementation
+        run: |
+          git config user.name "openai-codex"
+          git config user.email "codex@openai.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "context: wire bounded CAST rollover into runtime"
+          git push origin HEAD:codex/cambium-correctness-docs-20260823
