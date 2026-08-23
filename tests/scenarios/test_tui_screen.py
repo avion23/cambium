@@ -105,3 +105,79 @@ def test_transcript_is_bounded() -> None:
         transcript.system(f"entry {index}")
     assert len(transcript.entries) == 8
     assert transcript.entries[0].text == "entry 12"
+
+
+def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}}
+    )
+    first = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=80,
+        height=22,
+    )
+    transcript.observe_event(
+        {"kind": "assistant_delta", "payload": {"delta": "The stream is live."}}
+    )
+    second = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=80,
+        height=22,
+    )
+
+    assert "CAMBIUM · generating" in "\n".join(first)
+    assert "Findings" in "\n".join(first)
+    assert "The stream is live." in "\n".join(second)
+    assert transcript.entries == ()
+
+    transcript.finish_stream("# Findings\nThe stream is live.")
+    assert transcript.streaming_text == ""
+    assert transcript.entries[-1].text == "# Findings\nThe stream is live."
+
+
+def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "read_batch",
+                "message": "--- a.py ---\nold",
+                "ok": True,
+            },
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "message",
+            "payload": {"role": "assistant", "content": "I found the issue."},
+        }
+    )
+    for _ in range(20_000):
+        transcript.observe_event(
+            {"kind": "assistant_delta", "payload": {"delta": "x"}}
+        )
+
+    assert any(entry.role == "tool" and "old" in entry.text for entry in transcript.entries)
+    assert transcript.streaming_role == "assistant"
+    assert len(transcript.streaming_text) <= 16_384
+    assert transcript.streaming_text.endswith("x")
+    lines = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=80,
+        height=22,
+    )
+    assert "CAMBIUM · generating" in "\n".join(lines)
