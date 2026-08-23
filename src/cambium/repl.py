@@ -238,7 +238,7 @@ async def run_repl(
                     _events.append(record)
                     if record.get("kind") == "usage_event":
                         usage_events.append(record)
-                    if sigint_fired:
+                    if sigint_fired:  # noqa: B023
                         return
                     if not _stream_tty:
                         output_stream.write(
