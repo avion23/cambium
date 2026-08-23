@@ -30,7 +30,9 @@ jobs:
         with:
           enable-cache: true
       - name: Apply guarded patch
-        run: python .github/apply_review.py
+        run: |
+          python .github/apply_review.py
+          python .github/fix_review.py
       - name: Refresh and install locked development environment
         run: |
           uv lock
@@ -51,7 +53,9 @@ jobs:
       - name: Slow test tier
         run: uv run pytest -n auto -m slow -q
       - name: Remove patch machinery
-        run: rm .github/apply_review.py .github/workflows/apply-review.yml
+        run: >-
+          rm .github/apply_review.py .github/fix_review.py
+          .github/workflows/apply-review.yml
       - name: Commit verified implementation
         run: |
           git config user.name "openai-codex"
