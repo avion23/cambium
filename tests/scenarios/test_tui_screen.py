@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cambium.tui_screen import Transcript, _side_sections, render_cockpit
+from cambium.tui_screen import Transcript, _side_sections, _transcript_lines, render_cockpit
 
 
 def _snapshot():
@@ -213,6 +213,80 @@ def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
     assert len(transcript.entries) == 4
     assert "✓ run_shell ×4 · last 2395ms" in text
     assert text.count("run_shell") == 1
+
+
+def test_tool_detail_toggle_reveals_command_and_output_without_mutating_state() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "run_shell",
+                "ok": True,
+                "cmd": "printf 'hello'",
+                "output": "hello\nfull output line",
+            },
+        }
+    )
+
+    compact = "\n".join(text for _, text in _transcript_lines(transcript, 80, 20))
+    assert "printf 'hello'" not in compact
+    assert "full output line" not in compact
+
+    assert transcript.toggle_tool_details() is True
+    expanded = "\n".join(text for _, text in _transcript_lines(transcript, 80, 20))
+    assert "cmd: printf 'hello'" in expanded
+    assert "full output line" in expanded
+    assert "full output line" in transcript.entries[0].text
+
+
+def test_expanded_tool_output_is_bounded_without_truncating_entry_state() -> None:
+    transcript = Transcript()
+    output = "\n".join(f"output-{index}" for index in range(100))
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "run_shell",
+                "ok": True,
+                "cmd": "long-command",
+                "output": output,
+            },
+        }
+    )
+    transcript.toggle_tool_details()
+
+    rows = _transcript_lines(transcript, 80, 100)
+    rendered = "\n".join(text for _, text in rows)
+    output_rows = [text for _, text in rows if "output-" in text]
+    assert "…" in rendered
+    assert "lines hidden" in rendered
+    assert "output-0" not in rendered
+    assert "output-99" in rendered
+    assert len(output_rows) <= 40
+    assert "output-0" in transcript.entries[0].text
+    assert "output-99" in transcript.entries[0].text
+
+
+def test_failed_tool_detail_is_expanded_automatically() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "run_shell",
+                "ok": False,
+                "cmd": "cat protected.txt",
+                "error": "permission denied",
+                "output": "stderr: access blocked",
+            },
+        }
+    )
+
+    text = "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
+    assert "permission denied" in text
+    assert "stderr: access blocked" in text
+    assert "cat protected.txt" in text
 
 
 def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:

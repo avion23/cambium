@@ -101,6 +101,19 @@ _STREAM_DELTA_KINDS = frozenset(
 )
 _STREAM_TEXT_LIMIT = 16_384
 _STREAM_RENDER_LIMIT = 8_192
+_TOOL_DETAIL_RENDER_LIMIT = 40
+_TOOL_DETAIL_KEYS = (
+    "cmd",
+    "command",
+    "error",
+    "failure_reason",
+    "reason",
+    "message",
+    "output",
+    "stdout",
+    "stderr",
+    "detail",
+)
 _FAILURE_CONTEXT_PREFIX = "↳ "
 _FAILURE_BLOCK_LIMIT = 64
 _FAILURE_EVENT_KINDS = frozenset(
@@ -256,7 +269,7 @@ def _stream_update(
             return None
         return "assistant", text, False, None
     if kind == "tool_event" or kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
-        if kind == "tool_event" and data.get("ok") is False:
+        if kind == "tool_event" and _tool_status(data) is False:
             return None
         role = _message_role(kind, data)
         if role is None:
@@ -299,9 +312,19 @@ def _tool_status(data: Mapping[str, Any]) -> bool | None:
 
 
 def _tool_detail_value(value: Any) -> str | None:
+    if value is None:
+        return None
     if isinstance(value, str):
         return value
-    return _text_value(value)
+    text = _text_value(value)
+    if text is not None:
+        return text
+    if isinstance(value, list | tuple):
+        return " ".join(_sanitize(item) for item in value)
+    if isinstance(value, Mapping):
+        parts = [f"{key}={_sanitize(item)}" for key, item in value.items()]
+        return ", ".join(parts) if parts else None
+    return _sanitize(value)
 
 
 def _tool_entry_text(
@@ -313,7 +336,7 @@ def _tool_entry_text(
     state = "ok" if ok is True else "failed" if ok is False else "done"
     duration = f" · {_format_duration(duration_ms)}" if duration_ms is not None else ""
     lines = [f"{tool}: {state}{duration}"]
-    for key in ("error", "failure_reason", "reason", "message", "output", "detail"):
+    for key in _TOOL_DETAIL_KEYS:
         detail = _tool_detail_value(data.get(key))
         if detail:
             lines.append(f"{key}: {detail}")
@@ -380,14 +403,15 @@ def _event_turn(data: Mapping[str, Any]) -> int | None:
 
 def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
     """Return a short, safe line for a failure's preceding-event context."""
-    if kind == "tool_event" and data.get("ok") is False:
+    if kind == "tool_event" and _tool_status(data) is False:
         tool = data.get("tool")
         if not isinstance(tool, str) or not tool:
             return "tool failed"
-        detail = data.get("failure_reason") or data.get("reason") or data.get("error")
         line = f"{tool}: failed"
-        if isinstance(detail, str) and detail:
-            line += f" · {detail}"
+        for key in _TOOL_DETAIL_KEYS:
+            detail = _tool_detail_value(data.get(key))
+            if detail:
+                line += f" · {key}: {detail}"
         return _sanitize(line)
 
     if kind == "timeout":
@@ -497,6 +521,9 @@ class Transcript:
         self._failure_context: dict[tuple[str, int | None, int], list[str]] = {}
         self._failure_blocks: dict[tuple[str, int | None, int], _FailureBlock] = {}
         self._failure_order: deque[tuple[str, int | None, int]] = deque()
+        self._failure_previews: dict[tuple[str, int | None, int], _FailureBlock] = {}
+        self._failure_preview_order: deque[tuple[str, int | None, int]] = deque()
+        self._tool_details_expanded = False
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
@@ -510,6 +537,18 @@ class Transcript:
         self._failure_context.clear()
         self._failure_blocks.clear()
         self._failure_order.clear()
+        self._failure_previews.clear()
+        self._failure_preview_order.clear()
+
+    @property
+    def tool_details_expanded(self) -> bool:
+        """Whether tool command/output details are shown instead of compact lines."""
+        return self._tool_details_expanded
+
+    def toggle_tool_details(self) -> bool:
+        """Toggle the presentation-only expand-all tool detail view."""
+        self._tool_details_expanded = not self._tool_details_expanded
+        return self._tool_details_expanded
 
     def add(self, role: str, text: str) -> None:
         if role not in _ROLE_LABELS:
@@ -521,6 +560,8 @@ class Transcript:
     def user(self, text: str) -> None:
         self._turn_serial += 1
         self._turn_by_task.clear()
+        self._failure_previews.clear()
+        self._failure_preview_order.clear()
         self.add("user", text)
 
     def assistant(self, text: str) -> None:
@@ -635,6 +676,8 @@ class Transcript:
     ) -> tuple[tuple[str, int | None, int], _FailureBlock] | None:
         key = self._context_key(task_id, turn)
         block = self._failure_blocks.get(key)
+        if block is None:
+            block = self._failure_previews.get(key)
         if block is not None:
             return key, block
         wanted = task_id or "?"
@@ -646,7 +689,49 @@ class Transcript:
                 and candidate.task_id == wanted
             ):
                 return candidate_key, candidate
+        for candidate_key in reversed(self._failure_preview_order):
+            candidate = self._failure_previews.get(candidate_key)
+            if (
+                candidate is not None
+                and candidate_key[2] == self._turn_serial
+                and candidate.task_id == wanted
+            ):
+                return candidate_key, candidate
         return None
+
+    def _remember_failure_preview(
+        self,
+        task_id: str | None,
+        turn: int | None,
+        cause: str | None,
+    ) -> None:
+        """Retain a failed tool detail until its terminal failure is known."""
+        key = self._context_key(task_id, turn)
+        if key in self._failure_blocks:
+            return
+        block = self._failure_previews.get(key)
+        if block is None:
+            block = _FailureBlock(
+                task_id=key[0],
+                turn=key[1],
+                cause=cause,
+                context=list(self._failure_context.get(key, ())),
+            )
+            self._failure_previews[key] = block
+            self._failure_preview_order.append(key)
+            while len(self._failure_preview_order) > _FAILURE_BLOCK_LIMIT:
+                expired = self._failure_preview_order.popleft()
+                self._failure_previews.pop(expired, None)
+        elif self._prefer_failure_cause(block.cause, cause):
+            block.cause = cause
+        block.context = list(self._failure_context.get(key, block.context))
+
+    def _failure_preview_entries(self) -> tuple[TranscriptEntry, ...]:
+        return tuple(
+            TranscriptEntry(role="error", text=self._failure_text(block))
+            for key in self._failure_preview_order
+            if (block := self._failure_previews.get(key)) is not None
+        )
 
     @staticmethod
     def _selected_failure_context(context: list[str]) -> list[str]:
@@ -710,6 +795,18 @@ class Transcript:
                 self._failure_context.pop(expired, None)
         else:
             key, block = found
+            if key in self._failure_previews:
+                self._failure_previews.pop(key, None)
+                try:
+                    self._failure_preview_order.remove(key)
+                except ValueError:
+                    pass
+                self._failure_blocks[key] = block
+                self._failure_order.append(key)
+                while len(self._failure_order) > _FAILURE_BLOCK_LIMIT:
+                    expired = self._failure_order.popleft()
+                    self._failure_blocks.pop(expired, None)
+                    self._failure_context.pop(expired, None)
             if self._prefer_failure_cause(block.cause, cause):
                 block.cause = cause
             block.context = list(self._failure_context.get(key, block.context))
@@ -755,6 +852,12 @@ class Transcript:
                 context_line = _failure_context_line(kind, data)
                 if context_line is not None:
                     self._remember_failure_context(task_id, turn, context_line)
+                if any(_tool_detail_value(data.get(key)) for key in _TOOL_DETAIL_KEYS):
+                    self._remember_failure_preview(
+                        task_id,
+                        turn,
+                        _failure_cause(kind, data),
+                    )
                 return
             if isinstance(tool, str):
                 text = _sanitize(_tool_entry_text(data, tool, ok, duration)).strip("\n")
@@ -843,7 +946,20 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
     return output
 
 
-def _entry_lines(entry: TranscriptEntry, width: int) -> list[tuple[str, str]]:
+def _bounded_render_lines(lines: list[str], limit: int) -> list[str]:
+    """Bound rendered detail without changing the transcript's source text."""
+    if len(lines) <= limit:
+        return lines
+    hidden = len(lines) - max(1, limit - 1)
+    return [f"… {hidden} lines hidden", *lines[-max(1, limit - 1) :]]
+
+
+def _entry_lines(
+    entry: TranscriptEntry,
+    width: int,
+    *,
+    detail_limit: int | None = None,
+) -> list[tuple[str, str]]:
     label = _ROLE_LABELS[entry.role]
     body_width = max(8, width - 3)
     rendered = [(entry.role, f" {label}")]
@@ -856,11 +972,15 @@ def _entry_lines(entry: TranscriptEntry, width: int) -> list[tuple[str, str]]:
         if detail.startswith(summary):
             detail = detail.split("\n", 1)[1] if "\n" in detail else ""
         if detail:
-            rendered.extend(
-                (entry.role, "   " + line) for line in _wrap_markdown(detail, body_width)
-            )
+            detail_lines = _wrap_markdown(detail, body_width)
+            if detail_limit is not None:
+                detail_lines = _bounded_render_lines(detail_lines, detail_limit)
+            rendered.extend((entry.role, "   " + line) for line in detail_lines)
     else:
-        for line in _wrap_markdown(entry.text, body_width):
+        lines = _wrap_markdown(entry.text, body_width)
+        if detail_limit is not None:
+            lines = _bounded_render_lines(lines, detail_limit)
+        for line in lines:
             role = (
                 "dim"
                 if entry.role == "error" and line.lstrip().startswith(_FAILURE_CONTEXT_PREFIX)
@@ -884,13 +1004,33 @@ def _tool_compact_lines(
 
 
 def _transcript_blocks(
-    entries: tuple[TranscriptEntry, ...], width: int
+    entries: tuple[TranscriptEntry, ...],
+    width: int,
+    *,
+    expanded: bool = False,
 ) -> list[list[tuple[str, str]]]:
     blocks: list[list[tuple[str, str]]] = []
     index = 0
     while index < len(entries):
         entry = entries[index]
-        if entry.role != "tool" or entry.tool_name is None or entry.tool_ok is not True:
+        if entry.role != "tool" or entry.tool_name is None:
+            detail_limit = _TOOL_DETAIL_RENDER_LIMIT if entry.role == "error" else None
+            blocks.append(_entry_lines(entry, width, detail_limit=detail_limit))
+            index += 1
+            continue
+
+        if expanded:
+            blocks.append(
+                _entry_lines(
+                    entry,
+                    width,
+                    detail_limit=_TOOL_DETAIL_RENDER_LIMIT,
+                )
+            )
+            index += 1
+            continue
+
+        if entry.tool_ok is not True:
             blocks.append(_entry_lines(entry, width))
             index += 1
             continue
@@ -938,8 +1078,23 @@ def _transcript_lines(transcript: Transcript, width: int, capacity: int) -> list
     rendered: list[tuple[str, str]] = []
     if remaining:
         history = [
-            line for block in _transcript_blocks(transcript.entries, width) for line in block
+            line
+            for block in _transcript_blocks(
+                transcript.entries,
+                width,
+                expanded=transcript.tool_details_expanded,
+            )
+            for line in block
         ]
+        history.extend(
+            line
+            for entry in transcript._failure_preview_entries()
+            for line in _entry_lines(
+                entry,
+                width,
+                detail_limit=_TOOL_DETAIL_RENDER_LIMIT,
+            )
+        )
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
@@ -1341,7 +1496,10 @@ def render_cockpit(
             lines.append("│" + " " * inner + "│")
         lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
 
-    help_line = " /help commands · <<< multiline >>> · Ctrl-C cancel frontend · /exit close"
+    help_line = (
+        " /help commands · v expand tools · <<< multiline >>> · "
+        "Ctrl-C cancel frontend · /exit close"
+    )
     lines.append("│" + _pad(help_line, inner) + "│")
     input_line = f" {input_label} "
     lines.append("│" + _pad(input_line, inner) + "│")

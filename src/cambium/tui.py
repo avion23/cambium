@@ -87,6 +87,9 @@ _HELP = """Commands:
   /clear      clear the visible cockpit transcript
   /exit       leave Cambium
 
+Transcript view:
+  v           toggle full command/output details for every tool entry.
+
 During a running turn, Ctrl-C cancels that turn and returns to this cockpit.
 The last successfully published context checkpoint remains the branch head.
 
@@ -522,6 +525,9 @@ async def _run_interactive(
                     return ExitCode.FAILURE if failed else ExitCode.SUCCESS
                 command = prompt.strip()
                 if not command:
+                    continue
+                if command == "v":
+                    transcript.toggle_tool_details()
                     continue
                 if command == "/clear":
                     transcript.clear()

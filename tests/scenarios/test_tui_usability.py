@@ -75,9 +75,31 @@ def test_tui_history_is_private_and_bounded(monkeypatch, tmp_path: Path) -> None
 
 def test_help_documents_turn_cancellation() -> None:
     assert "Ctrl-C cancels" in tui._HELP
+    assert "toggle full command/output details" in tui._HELP
     assert "/dashboard" in tui._HELP
     assert "/events" in tui._HELP
     assert "blank line submits" in tui._HELP
+
+
+def test_v_toggles_tool_details_without_submitting_a_prompt(monkeypatch, tmp_path: Path) -> None:
+    toggles: list[bool] = []
+
+    def toggle(self) -> bool:
+        toggles.append(self.tool_details_expanded)
+        return not self.tool_details_expanded
+
+    monkeypatch.setattr(tui.Transcript, "toggle_tool_details", toggle)
+    source = _Tty("v\n/exit\n")
+
+    assert asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=source,
+            output_stream=_Tty(),
+            error_stream=io.StringIO(),
+        )
+    ) == 0
+    assert toggles == [False]
 
 
 def test_tty_bracketed_paste_preserves_embedded_newlines() -> None:
