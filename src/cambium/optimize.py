@@ -429,7 +429,7 @@ def _fuse_jlens(
             messages = render_messages(predictor, inputs)
             result = jlens_client.score(messages, expected_strings, alt_strings)
             jlens_score = jlens_client.signal(result, expected_strings)
-        except (JlenError, TypeError, ValueError, OSError):
+        except JlenError, TypeError, ValueError, OSError:
             return score
         if not isinstance(jlens_score, int | float) or not math.isfinite(jlens_score):
             return score
@@ -491,7 +491,7 @@ def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callabl
             if jlens_client is not None:
                 score = _fuse_jlens(jlens_client, expected, trace, score, jlens_weight)
             return score
-        except (ImportError, KeyError, ValueError):
+        except ImportError, KeyError, ValueError:
             return 0.0
 
     return metric
@@ -760,7 +760,7 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
             prediction = _fallback_prediction(program)
         try:
             score = scorer(example.with_prediction(prediction))
-        except (KeyError, ValueError):
+        except KeyError, ValueError:
             score = 0.0
         if isinstance(score, bool) or not isinstance(score, int | float):
             score = 0.0
@@ -970,7 +970,7 @@ def _load_manifest(module_name: str) -> object:
                 continue
             try:
                 manifest = load_module_manifest(candidate)
-            except (ModuleContractError, OSError):
+            except ModuleContractError, OSError:
                 continue
             if manifest.module_name == module_name:
                 return manifest
@@ -1175,7 +1175,7 @@ def _anti_reward_gap(
     try:
         train_gain = final["train_mean"] - baseline_means["train"]
         canary_gain = canaries["mean"] - baseline_means["canaries"]
-    except (KeyError, TypeError):
+    except KeyError, TypeError:
         return None
     return float(train_gain - canary_gain)
 
