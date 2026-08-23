@@ -1,100 +1,164 @@
 # Cambium
 
-Cambium is a Python 3.14 multi-agent coding harness with durable events,
-provider routing, append-only context trunks, Git worktree isolation, and
-replayable supervision.
+Cambium is a stdlib-first multi-agent coding harness. It supervises isolated
+worker processes, records durable session events, routes model calls across
+configured providers, and publishes successful worker commits through a fenced
+merge sequencer.
 
-Run it from the checkout:
+The current runtime is intentionally small:
 
-```sh
-uv sync --extra dev --python 3.14
-uv run cambium --help
+- one asyncio supervisor,
+- one worker implementation,
+- one provider router,
+- one task-tree model,
+- one durable event store,
+- one merge/publication path,
+- one provider-admission policy (`cambium.routing`),
+- one active tool catalogue (`cambium.schemas` + `cambium.tools`).
+
+## Status
+
+Cambium runs directly from source and currently requires Python 3.14.
+`pyproject.toml` declares package metadata, dependencies, test extras, and the
+`cambium` / `cambium-monitor` entry points, but a checked-out repository does
+not need an editable install.
+
+```bash
+PYTHONPATH=src python -m cambium version
+PYTHONPATH=src python -m cambium --help
 ```
 
-## Main commands
+Use [`agents.md`](agents.md) as the operating contract for coding agents.
+Current architecture is documented in
+[`docs/architecture/architecture.md`](docs/architecture/architecture.md), with
+the single provider-routing ownership model in
+[`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md).
+Research documents under `docs/research/` are design evidence, not additional
+runtime implementations.
 
-```sh
-# One coding task
-uv run cambium run "review and improve the repository" --repo .
+## Architecture boundaries
 
-# Interactive prompt loop; a live dashboard replaces the screen while a run is active
-uv run cambium tui --repo .
+Provider concerns are deliberately separated without duplicating ownership:
 
-# Attach a dashboard to any running or completed durable session
-uv run cambium monitor /path/to/session
-uv run cambium-monitor /path/to/session
+- `cambium.routing` owns supervisor admission, durable usage debt, capability
+  checks, and lane-aware provider/model assignment.
+- `cambium.selection` is the shared pure equal-priority quality-ordering
+  primitive used by admission and Diffundo.
+- `cambium.diffundo` owns call-time health, retry, cooldown, and transport
+  execution after a task is assigned.
+- `cambium.provider_scheduler` retains only immutable provider leases and the
+  transactional quota ledger. It contains no competing scheduler actor.
 
-# Inspect durable state without a full-screen terminal
-uv run cambium monitor /path/to/session --once
-uv run cambium monitor /path/to/session --json
+The worker uses `cambium.schemas` as the schema source of truth and
+`cambium.tools` as the sole executable tool dispatcher. There is no parallel
+plugin registry.
 
-# Session recovery and accounting
-uv run cambium session status --session-dir ROOT SESSION
-uv run cambium session usage --session-dir ROOT SESSION
-uv run cambium session resume /path/to/session
+## Quick start
 
-# DSPy decision-module optimization
-uv run cambium optimize should_decompose --dry-run
-uv run cambium optimize should_decompose --optimizer bootstrap --budget-usd 2
+Run the deterministic demo:
+
+```bash
+PYTHONPATH=src python -m cambium supervisor \
+  --session-dir /tmp/cambium-demo \
+  --demo
 ```
 
-Other command groups are `auth`, `supervisor`, `doctor`, `bench`,
-`module-test`, `repl`, `architectus`, and `version`.
+Run one prompt against the current repository:
 
-## Operator dashboard
+```bash
+PYTHONPATH=src python -m cambium run \
+  --repo . \
+  --provider openai:gpt-5.6 \
+  "Inspect the current task-tree implementation"
+```
 
-The dashboard is an event-sourced read model. It shows:
+For automatic selection across enabled providers with available credentials:
 
-- main and child-agent lifecycle state;
-- provider/model, generation, turn, epoch, and current tool per agent;
-- input, output, cached, and total tokens per agent;
-- output tokens/second and estimated cost;
-- exact latest prompt tokens when the provider reports them;
-- append-only summary-trunk segments and byte-derived trunk/raw-tail estimates;
-- recent durable events and failures.
+```bash
+PYTHONPATH=src python -m cambium run \
+  --repo . \
+  --auto \
+  "Inspect the current task-tree implementation"
+```
 
-The frontend does not inspect live worker objects. Replaying the same event log
-and checkpoints produces the same dashboard state.
+Start an interactive session:
 
-## Context model
+```bash
+PYTHONPATH=src python -m cambium repl --repo . --auto
+```
 
-Provider-backed agents use:
+Start the live terminal dashboard:
+
+```bash
+PYTHONPATH=src python -m cambium tui --repo . --auto
+```
+
+Attach a monitor to an existing session:
+
+```bash
+PYTHONPATH=src python -m cambium monitor --session /path/to/session
+```
+
+Inspect or record provider quota windows:
+
+```bash
+PYTHONPATH=src python -m cambium quota status
+PYTHONPATH=src python -m cambium quota observe openai five-hour \
+  --reset-in-s 18000 \
+  --allowance-tokens 1000000 \
+  --remaining-tokens 750000
+```
+
+## Provider configuration
+
+Cambium reads provider definitions from:
 
 ```text
-stable head + S1 + S2 + ... + Sn + bounded raw tail
+~/.config/cambium/providers.json
 ```
 
-Each summary entry covers one disjoint raw range once. Earlier summary bytes are
-never summarized or rewritten. Compatible children reuse the exact prefix;
-incompatible providers receive the semantic summary history under a fresh
-provider-specific head.
+Override the path with `CAMBIUM_PROVIDERS`. Provider files contain environment
+variable names, never secret values. API keys are stored with:
 
-## Documentation
+```bash
+PYTHONPATH=src python -m cambium auth set openai
+PYTHONPATH=src python -m cambium auth list
+PYTHONPATH=src python -m cambium doctor
+```
 
-- [`agents.md`](agents.md) — repository operating contract.
-- [`docs/architecture/architecture.md`](docs/architecture/architecture.md) —
-  runtime and ownership boundaries.
-- [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md) —
-  append-only context epochs and cache reuse.
-- [`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md) —
-  provider feasibility, routing, and accounting.
-- [`docs/architecture/terminal-interface.md`](docs/architecture/terminal-interface.md) —
-  implemented dashboard contract.
-- [`docs/architecture/optimization.md`](docs/architecture/optimization.md) —
-  DSPy data and evaluation contract.
-- [`docs/security/threat-model.md`](docs/security/threat-model.md) — active
-  no-sandbox threat model.
-- [`docs/research/README.md`](docs/research/README.md) — retained measurements
-  and research evidence.
+For Codex/ChatGPT OAuth:
 
-Source and tests are authoritative when documentation disagrees.
+```bash
+PYTHONPATH=src python -m cambium auth oauth login codex
+PYTHONPATH=src python -m cambium auth oauth status codex
+```
 
+## Local validation
 
-## Production routing and tools
+This repository does not use GitHub Actions or hosted continuous integration.
+Run checks directly from the checkout:
 
-A main semantic trunk is provider/model leased after its first successful call.
-Cold subagents may use other providers, including configured free lanes, while
-exact cache-compatible forks retain the parent lease. Provider configuration
-supports independent concurrency and quota windows. Structured tools remain the
-portable default; `run_python` adds Pi-style short Python snippets through the
-same bounded subprocess boundary as `run_shell`.
+```bash
+PYTHONPATH=src python -m pytest -q
+PYTHONPATH=src python -m ruff check src tests
+PYTHONPATH=src python -m cambium doctor
+```
+
+The default pytest invocation excludes tests marked `slow`. Run the
+process-boundary tier explicitly when needed:
+
+```bash
+PYTHONPATH=src python -m pytest -m slow -q
+```
+
+## Session artifacts
+
+A session records its state below `<session-dir>/.cambium/`, including:
+
+- `events.db` — durable event log,
+- `result.json` — final session result,
+- `conversations.db` — optional revision-boundary conversation history,
+- `checkpoints/` — worker checkpoints and immutable context epochs.
+
+The supervisor publishes through Git references. It does not refresh the
+caller's working tree or index after advancing `main`.
