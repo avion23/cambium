@@ -378,9 +378,9 @@ class ProviderConfig:
     cache_capability: CacheCapability = field(default_factory=CacheCapability)
     pricing_known: bool = False
     throughput_hint_tps: float = 0.0
-    # Optional configured throughput hint.  Measured throughput is folded
-    # from usage events into routing.ProviderDebt and takes precedence over
-    # this hint during quality ordering.
+    # Optional configured throughput hint. Measured throughput is folded from
+    # usage events into routing.ProviderDebt and takes precedence over this
+    # hint during quality ordering.
     tokens_per_s: float | None = None
     interactive_wall_budget_s: float | None = None
     quality_weight: float = 1.0
