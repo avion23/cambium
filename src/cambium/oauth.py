@@ -1417,11 +1417,11 @@ class TokenManager:
                 if latest is None:
                     raise OAuthMissingError(
                         f"provider {self._provider!r} has no oauth credentials"
-                    )
+                    ) from None
                 if latest.disabled:
                     raise InvalidGrantError(
                         f"provider {self._provider!r} is disabled until re-login"
-                    )
+                    ) from None
                 return latest.doc.access_token, latest.doc.account_id
             refreshed_refresh = refreshed.refresh_token or current.doc.refresh_token
             account_id = (
