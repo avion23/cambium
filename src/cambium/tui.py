@@ -1,11 +1,10 @@
-"""Interactive terminal frontend with a persistent semantic branch and dashboard."""
+"""Interactive terminal frontend with a persistent semantic branch and cockpit."""
 
 from __future__ import annotations
 
 import asyncio
 import builtins
 import os
-import shutil
 import signal
 import sqlite3
 import sys
@@ -16,72 +15,15 @@ from typing import Any, TextIO
 from cambium.render_markdown import render_markdown_if_tty
 
 from .interactive import InteractiveSession, InteractiveSessionError
-from .monitor import AnsiDashboard, render_agent_lines, render_dashboard
+from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
+from .tui_screen import Cockpit, Transcript
 
 try:
     import readline as _readline
 except ImportError:  # pragma: no cover - platform dependent
     _readline = None
-
-_RESET = "\033[0m"
-_CYAN = "\033[1;36m"
-_DIM_CYAN = "\033[2;36m"
-_GREEN = "\033[1;32m"
-_YELLOW = "\033[1;33m"
-_RED = "\033[1;31m"
-_MAGENTA = "\033[1;35m"
-_DIM = "\033[2m"
-
-
-def _color_line(line: str) -> str:
-    """Color one already-padded dashboard line without affecting layout math."""
-    if line.startswith("┌"):
-        return f"{_CYAN}{line}{_RESET}"
-    if line.startswith(("├", "└")):
-        return f"{_DIM_CYAN}{line}{_RESET}"
-    lowered = line.casefold()
-    if " failed " in lowered or "status=failed" in lowered or " cancelled " in lowered:
-        return f"{_RED}{line}{_RESET}"
-    if " active " in lowered or " running " in lowered or "status=running" in lowered:
-        return f"{_YELLOW}{line}{_RESET}"
-    if " succeeded " in lowered or " done " in lowered or "status=succeeded" in lowered:
-        return f"{_GREEN}{line}{_RESET}"
-    if " m  " in lowered:
-        return f"{_CYAN}{line}{_RESET}"
-    if " s  " in lowered:
-        return f"{_MAGENTA}{line}{_RESET}"
-    return f"{_DIM}{line}{_RESET}" if "waiting for events" in lowered else line
-
-
-def _use_color(stream: TextIO) -> bool:
-    return (
-        _is_tty(stream)
-        and not os.environ.get("NO_COLOR")
-        and os.environ.get("TERM", "") != "dumb"
-    )
-
-
-class _ColorDashboard(AnsiDashboard):
-    """The existing event dashboard with semantic terminal colors."""
-
-    def draw(self, snapshot: SessionSnapshot) -> None:
-        if not self.enabled:
-            return
-        size = shutil.get_terminal_size((120, 40))
-        lines = render_dashboard(
-            snapshot,
-            session_dir=self.session_dir,
-            width=size.columns,
-            height=size.lines,
-        )
-        if _use_color(self.stream):
-            lines = [_color_line(line) for line in lines]
-        self.stream.write("\033[H\033[2J")
-        self.stream.write("\n".join(lines))
-        self.stream.flush()
-
 
 _PROMPT = "cambium> "
 _CONTINUATION_PROMPT = "... "
@@ -127,19 +69,20 @@ class _Cumulative:
 
 _HELP = """Commands:
   /help       show this help
+  /status     branch, context, agents, and usage in one view
   /usage      cumulative tokens, throughput, calls, and cost
   /agents     main/sub-agent lifecycle and provider/model rows
   /context    current trunk, raw tail, checkpoint, and epoch
   /session    persistent interactive-session identity and provider lease
   /model      current provider/model lease and branch generation
-  /dashboard  render the latest full dashboard into normal scrollback
+  /dashboard  explain the visible live cockpit
   /events     recent durable event summaries
   /new        start a fresh semantic branch; old turn artifacts remain
-  /clear      clear the terminal
+  /clear      clear the visible cockpit transcript
   /exit       leave Cambium
 
-During a running turn, Ctrl-C cancels that turn and returns to this prompt. The
-last successfully published context checkpoint remains the branch head.
+During a running turn, Ctrl-C cancels that turn and returns to this cockpit.
+The last successfully published context checkpoint remains the branch head.
 
 Multiline input:
   enter <<< on its own line, write the prompt, then enter >>> on its own line.
@@ -149,7 +92,7 @@ Multiline input:
 def _is_tty(stream: Any) -> bool:
     try:
         return bool(getattr(stream, "isatty", lambda: False)())
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, ValueError):
         return False
 
 
@@ -160,7 +103,9 @@ def _write_line(out: TextIO, line: str) -> None:
             out.write("\n")
 
 
-def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> str | None:
+def _input_line(
+    source: TextIO, out: TextIO, prompt: str, *, native: bool
+) -> str | None:
     if native:
         try:
             return builtins.input(prompt)
@@ -174,7 +119,10 @@ def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> st
     return line.rstrip("\r\n")
 
 
-def _read_prompt(source: TextIO, out: TextIO, *, native: bool = False) -> str | None:
+def _read_prompt(
+    source: TextIO, out: TextIO, *, native: bool = False
+) -> str | None:
+    """Read one line or an explicit ``<<<`` / ``>>>`` multiline block."""
     value = _input_line(source, out, _PROMPT, native=native)
     if value is None:
         return None
@@ -183,6 +131,39 @@ def _read_prompt(source: TextIO, out: TextIO, *, native: bool = False) -> str | 
     lines: list[str] = []
     while True:
         value = _input_line(source, out, _CONTINUATION_PROMPT, native=native)
+        if value is None:
+            return "\n".join(lines)
+        if value.strip() == ">>>":
+            return "\n".join(lines)
+        lines.append(value)
+
+
+def _read_cockpit_prompt(
+    source: TextIO, cockpit: Cockpit, *, native: bool
+) -> str | None:
+    """Read input on the cockpit footer while preserving native line editing."""
+
+    def read_one(label: str) -> str | None:
+        cockpit.move_to_input(label=label)
+        try:
+            if native:
+                try:
+                    return builtins.input("")
+                except EOFError:
+                    return None
+            line = source.readline()
+            return None if line == "" else line.rstrip("\r\n")
+        finally:
+            cockpit.hide_cursor()
+
+    value = read_one("›")
+    if value is None:
+        return None
+    if value.strip() != "<<<":
+        return value
+    lines: list[str] = []
+    while True:
+        value = read_one("…")
         if value is None:
             return "\n".join(lines)
         if value.strip() == ">>>":
@@ -266,6 +247,17 @@ def _context_line(snapshot: SessionSnapshot) -> str:
     )
 
 
+def _response_markdown(render: Any, response: Any) -> str:
+    summaries = [
+        entry.summary
+        for entry in getattr(response, "results", ())
+        if getattr(entry, "summary", None)
+    ]
+    if summaries:
+        return "\n\n".join(summaries)
+    return render._sanitize_field(render.render_text_result(response))
+
+
 def _write_result(out: TextIO, render: Any, response: Any) -> None:
     text = render._sanitize_field(render.render_text_result(response))
     _write_line(out, text)
@@ -277,36 +269,6 @@ def _write_result(out: TextIO, render: Any, response: Any) -> None:
     if summaries:
         rendered = render_markdown_if_tty("\n\n".join(summaries), out)
         _write_line(out, rendered)
-
-
-def _write_static_dashboard(
-    out: TextIO,
-    snapshot: SessionSnapshot,
-    *,
-    session_dir: Path,
-) -> None:
-    size = shutil.get_terminal_size((120, 40))
-    height = max(18, min(size.lines - 2, 40))
-    lines = render_dashboard(
-        snapshot,
-        session_dir=session_dir,
-        width=size.columns,
-        height=height,
-    )
-    if _use_color(out):
-        lines = [_color_line(line) for line in lines]
-    _write_line(out, "\n".join(lines))
-
-
-def _event_lines(snapshot: SessionSnapshot) -> str:
-    if not snapshot.recent_events:
-        return "events: none"
-    lines = ["events:"]
-    for event in snapshot.recent_events:
-        task = event.task_id or "-"
-        detail = f"  {event.detail}" if event.detail else ""
-        lines.append(f"  #{event.seq:<6} {event.kind:<28} {task}{detail}")
-    return "\n".join(lines)
 
 
 async def _run_legacy(
@@ -411,6 +373,49 @@ async def _run_legacy(
         return ExitCode.SUCCESS
 
 
+def _command_output(
+    command: str,
+    *,
+    session: InteractiveSession,
+    cumulative: _Cumulative,
+    snapshot: SessionSnapshot,
+) -> str | None:
+    if command == "/help":
+        return _HELP
+    if command == "/usage":
+        return cumulative.line()
+    if command == "/agents":
+        return "\n".join(render_agent_lines(snapshot))
+    if command == "/context":
+        return _context_line(snapshot)
+    if command in {"/session", "/model"}:
+        return session.describe()
+    if command == "/dashboard":
+        return "The persistent cockpit is already the live dashboard."
+    if command in {"/events", "/tail"}:
+        if not snapshot.recent_events:
+            return "events: none"
+        lines = ["events:"]
+        for event in snapshot.recent_events:
+            task = event.task_id or "-"
+            detail = f"  {event.detail}" if event.detail else ""
+            lines.append(f"  #{event.seq:<6} {event.kind:<28} {task}{detail}")
+        return "\n".join(lines)
+    if command == "/cancel":
+        return "No turn is active; press Ctrl-C while a turn is running."
+    if command == "/status":
+        return "\n".join(
+            [
+                session.describe(),
+                _branch_line(session),
+                _context_line(snapshot),
+                cumulative.line(),
+                *render_agent_lines(snapshot),
+            ]
+        )
+    return None
+
+
 async def _run_interactive(
     config: Any,
     *,
@@ -419,7 +424,7 @@ async def _run_interactive(
     err: TextIO,
     quiet: bool,
 ) -> int:
-    """Run one persistent cache-aligned branch over many supervisor leaves."""
+    """Run one persistent cache-aligned branch in one persistent cockpit."""
     from cambium import render
     from cambium.auth import AuthError
     from cambium.cli import ExitCode
@@ -428,204 +433,182 @@ async def _run_interactive(
     session = InteractiveSession(config)
     cumulative, last_snapshot = _restore_history(session)
     state = ObservabilityState(recent_limit=16)
+    transcript = Transcript()
+    if session.turn:
+        transcript.system(
+            "Cambium interactive session\n"
+            f"Reopened persistent branch at turn {session.turn}. "
+            "Durable turn artifacts and the latest context checkpoint were restored."
+        )
+    else:
+        transcript.system(
+            "Cambium interactive session\n"
+            "Persistent CAST branch ready. Type /help for commands."
+        )
     sequence = 0
     failed = False
+    cockpit = Cockpit(out, enabled=not quiet)
     native_input = source is sys.stdin and out is sys.stdout
     history_path = _history_path(session)
     if native_input:
         _load_history(history_path)
 
-    _write_line(out, "Cambium interactive session")
-    _write_line(out, session.describe())
-    if cumulative.calls:
-        _write_line(out, cumulative.line())
-        _write_line(out, _context_line(last_snapshot))
-    _write_line(
-        out,
-        "Type /help for commands; use <<< ... >>> for multiline prompts. "
-        "Ctrl-C cancels an active turn.",
-    )
-    out.flush()
-
     try:
-        while True:
-            prompt = _read_prompt(source, out, native=native_input)
-            if prompt is None or prompt in {"/exit", "/quit"}:
-                out.write("\n")
-                out.flush()
-                return ExitCode.FAILURE if failed else ExitCode.SUCCESS
-            command = prompt.strip()
-            if not command:
-                continue
-            if command == "/help":
-                _write_line(out, _HELP)
-                continue
-            if command == "/usage":
-                _write_line(out, cumulative.line())
-                continue
-            if command == "/agents":
-                _write_line(out, "\n".join(render_agent_lines(last_snapshot)))
-                continue
-            if command == "/context":
-                _write_line(out, _context_line(last_snapshot))
-                continue
-            if command in {"/session", "/model"}:
-                _write_line(out, session.describe())
-                continue
-            if command == "/dashboard":
-                session_dir = (
-                    session.seed.source_session
-                    if session.seed is not None
-                    else session.root
-                )
-                _write_static_dashboard(
-                    out,
+        with cockpit:
+            while True:
+                cockpit.draw(
                     last_snapshot,
-                    session_dir=session_dir,
+                    transcript,
+                    session_description=session.describe(),
+                    branch_line=_branch_line(session),
+                    cumulative_line=cumulative.line(),
                 )
-                continue
-            if command in {"/events", "/tail"}:
-                _write_line(out, _event_lines(last_snapshot))
-                continue
-            if command == "/cancel":
-                _write_line(out, "no turn is active; press Ctrl-C while a turn is running")
-                continue
-            if command == "/new":
-                session.reset()
-                state = ObservabilityState(recent_limit=16)
-                last_snapshot = state.snapshot()
-                cumulative = _Cumulative()
-                sequence = 0
-                _write_line(out, "started a fresh semantic branch")
-                _write_line(out, session.describe())
-                continue
-            if command == "/clear":
-                out.write("\033[2J\033[H")
-                out.flush()
-                continue
-            if command.startswith("/"):
-                _write_line(out, f"unknown command: {command}; type /help")
-                continue
-
-            turn = session.prepare_turn(prompt)
-            state = ObservabilityState(recent_limit=16)
-            sequence = 1
-            state.apply(
-                {
-                    "seq": sequence,
-                    "kind": "interactive_turn_started",
-                    "task_id": "interactive-main",
-                    "payload": {"turn": turn.number},
-                }
-            )
-            dashboard = _ColorDashboard(
-                turn.session_dir,
-                stream=out,
-                enabled=not quiet,
-            )
-            completed = False
-            cancel_requested = False
-
-            def _live_sink(
-                record: dict[str, Any],
-                _turn=turn,
-                _state: ObservabilityState = state,
-                _dashboard: _ColorDashboard = dashboard,
-                _session: InteractiveSession = session,
-            ) -> None:
-                nonlocal sequence
-                _session.observe_event(_turn, record)
-                sequence += 1
-                normalized = dict(record)
-                normalized["seq"] = sequence
-                _state.apply(normalized)
-                if _dashboard.enabled:
-                    _dashboard.draw(_state.snapshot(session_dir=_turn.session_dir))
-                elif not quiet:
-                    _write_line(out, render.render_event_line(record, stream=out))
-                out.flush()
-
-            loop = asyncio.get_running_loop()
-            turn_task = loop.create_task(session.run_turn(turn, on_event=_live_sink))
-
-            def _request_cancel(_turn_task=turn_task) -> None:
-                nonlocal cancel_requested
-                if not _turn_task.done():
-                    cancel_requested = True
-                    _turn_task.cancel()
-
-            signal_installed = False
-            try:
-                try:
-                    loop.add_signal_handler(signal.SIGINT, _request_cancel)
-                    signal_installed = True
-                except (NotImplementedError, RuntimeError, ValueError):
-                    pass
-
-                try:
-                    with dashboard:
-                        response = await turn_task
-                        if dashboard.enabled:
-                            dashboard.draw(state.snapshot(session_dir=turn.session_dir))
-                except asyncio.CancelledError:
-                    if not cancel_requested:
-                        raise
-                    session.complete_turn(turn, succeeded=False)
-                    completed = True
-                    snapshot = state.snapshot(session_dir=turn.session_dir)
-                    last_snapshot = snapshot
-                    cumulative.add(snapshot)
-                    _write_line(
-                        out,
-                        "turn cancelled; the previous successful checkpoint remains "
-                        "the branch head",
+                prompt = _read_cockpit_prompt(
+                    source, cockpit, native=native_input
+                )
+                if prompt is None or prompt in {"/exit", "/quit"}:
+                    return ExitCode.FAILURE if failed else ExitCode.SUCCESS
+                command = prompt.strip()
+                if not command:
+                    continue
+                if command == "/clear":
+                    transcript.clear()
+                    transcript.system(
+                        "Cockpit transcript cleared; durable session history is unchanged."
                     )
-                    _write_line(out, cumulative.line())
-                    _write_line(out, _branch_line(session))
-                    out.flush()
+                    continue
+                if command == "/new":
+                    session.reset()
+                    state = ObservabilityState(recent_limit=16)
+                    last_snapshot = state.snapshot()
+                    cumulative = _Cumulative()
+                    sequence = 0
+                    transcript.clear()
+                    transcript.system(
+                        "Started a fresh semantic branch; old artifacts remain durable."
+                    )
+                    continue
+                if command.startswith("/"):
+                    output = _command_output(
+                        command,
+                        session=session,
+                        cumulative=cumulative,
+                        snapshot=last_snapshot,
+                    )
+                    if output is None:
+                        transcript.error(f"Unknown command: {command}. Type /help.")
+                    else:
+                        transcript.system(output)
                     continue
 
-                succeeded = response.exit_code == 0
-                session.complete_turn(turn, succeeded=succeeded)
-                completed = True
-                if not succeeded:
-                    failed = True
-            except BrokenPipeError:
-                if not completed:
-                    session.complete_turn(turn, succeeded=False)
-                return ExitCode.SUCCESS
-            except (
-                AuthError,
-                InteractiveSessionError,
-                OSError,
-                SessionAlreadyRunningError,
-                ValueError,
-            ) as exc:
-                if not completed:
-                    session.complete_turn(turn, succeeded=False)
-                failed = True
-                err.write(f"cambium tui: {exc}\n")
-                err.flush()
-                continue
-            except BaseException:
-                if not completed:
-                    session.complete_turn(turn, succeeded=False)
-                raise
-            finally:
-                if signal_installed:
-                    loop.remove_signal_handler(signal.SIGINT)
+                transcript.user(prompt)
+                turn = session.prepare_turn(prompt)
+                state = ObservabilityState(recent_limit=16)
+                sequence = 1
+                state.apply(
+                    {
+                        "seq": sequence,
+                        "kind": "interactive_turn_started",
+                        "task_id": "interactive-main",
+                        "payload": {"turn": turn.number},
+                    }
+                )
+                completed = False
+                cancel_requested = False
 
-            _write_result(out, render, response)
-            snapshot = state.snapshot(session_dir=turn.session_dir)
-            last_snapshot = snapshot
-            cumulative.add(snapshot)
-            _write_line(out, cumulative.line())
-            _write_line(out, _branch_line(session))
-            _write_line(out, _context_line(snapshot))
-            out.flush()
+                def _live_sink(record: dict[str, Any]) -> None:
+                    nonlocal sequence
+                    session.observe_event(turn, record)  # noqa: B023
+                    transcript.observe_event(record)
+                    sequence += 1
+                    normalized = dict(record)
+                    normalized["seq"] = sequence
+                    state.apply(normalized)  # noqa: B023
+                    cockpit.draw(  # noqa: B023
+                        state.snapshot(session_dir=turn.session_dir),
+                        transcript,
+                        session_description=session.describe(),
+                        branch_line=_branch_line(session),
+                        cumulative_line=cumulative.line(),
+                    )
+
+                loop = asyncio.get_running_loop()
+                turn_task = loop.create_task(
+                    session.run_turn(turn, on_event=_live_sink)
+                )
+
+                def _request_cancel() -> None:
+                    nonlocal cancel_requested
+                    if not turn_task.done():
+                        cancel_requested = True
+                        turn_task.cancel()
+
+                signal_installed = False
+                try:
+                    try:
+                        loop.add_signal_handler(signal.SIGINT, _request_cancel)
+                        signal_installed = True
+                    except (NotImplementedError, RuntimeError, ValueError):
+                        pass
+                    try:
+                        response = await turn_task
+                    except asyncio.CancelledError:
+                        if not cancel_requested:
+                            raise
+                        session.complete_turn(turn, succeeded=False)
+                        completed = True
+                        snapshot = state.snapshot(session_dir=turn.session_dir)
+                        last_snapshot = snapshot
+                        cumulative.add(snapshot)
+                        transcript.system(
+                            "turn cancelled; the previous successful checkpoint "
+                            "remains the branch head."
+                        )
+                        continue
+
+                    succeeded = response.exit_code == 0
+                    session.complete_turn(turn, succeeded=succeeded)
+                    completed = True
+                    if not succeeded:
+                        failed = True
+                except BrokenPipeError:
+                    if not completed:
+                        session.complete_turn(turn, succeeded=False)
+                    return ExitCode.SUCCESS
+                except (
+                    AuthError,
+                    InteractiveSessionError,
+                    OSError,
+                    SessionAlreadyRunningError,
+                    ValueError,
+                ) as exc:
+                    if not completed:
+                        session.complete_turn(turn, succeeded=False)
+                    failed = True
+                    transcript.error(str(exc))
+                    err.write(f"cambium tui: {exc}\n")
+                    err.flush()
+                    continue
+                except BaseException:
+                    if not completed:
+                        session.complete_turn(turn, succeeded=False)
+                    raise
+                finally:
+                    if signal_installed:
+                        loop.remove_signal_handler(signal.SIGINT)
+
+                snapshot = state.snapshot(session_dir=turn.session_dir)
+                last_snapshot = snapshot
+                cumulative.add(snapshot)
+                transcript.assistant(_response_markdown(render, response))
+                cockpit.draw(
+                    snapshot,
+                    transcript,
+                    session_description=session.describe(),
+                    branch_line=_branch_line(session),
+                    cumulative_line=cumulative.line(),
+                )
     except KeyboardInterrupt:
-        out.write("\n")
-        out.flush()
         return ExitCode.INTERRUPTED
     except BrokenPipeError:
         return ExitCode.SUCCESS
@@ -639,9 +622,9 @@ async def run_tui(
 ) -> int:
     """Run Cambium's terminal frontend.
 
-    Real terminals receive the persistent semantic-branch UI. Pipes and injected
-    streams retain the deterministic line-oriented adapter used by scripts and
-    tests.
+    Real terminals receive the persistent semantic-branch cockpit. Pipes and
+    injected streams retain the deterministic line-oriented adapter used by
+    scripts and tests.
     """
     source = sys.stdin if input_stream is None else input_stream
     out = sys.stdout if output_stream is None else output_stream
