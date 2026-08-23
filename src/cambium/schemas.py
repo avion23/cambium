@@ -317,11 +317,19 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
 
     if type(value) is str:
         min_length = schema.get("minLength")
-        if isinstance(min_length, int) and not isinstance(min_length, bool) and len(value) < min_length:
+        if (
+            isinstance(min_length, int)
+            and not isinstance(min_length, bool)
+            and len(value) < min_length
+        ):
             unit = "character" if min_length == 1 else "characters"
             errors.append(f"validation failed: '{label}' must have at least {min_length} {unit}")
         max_length = schema.get("maxLength")
-        if isinstance(max_length, int) and not isinstance(max_length, bool) and len(value) > max_length:
+        if (
+            isinstance(max_length, int)
+            and not isinstance(max_length, bool)
+            and len(value) > max_length
+        ):
             unit = "character" if max_length == 1 else "characters"
             errors.append(f"validation failed: '{label}' must have at most {max_length} {unit}")
         pattern = schema.get("pattern")
@@ -342,7 +350,10 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
         if isinstance(exclusive_minimum, bool):
             if exclusive_minimum and isinstance(minimum, (int, float)) and value <= minimum:
                 errors.append(f"validation failed: '{label}' must be > {minimum}")
-        elif isinstance(exclusive_minimum, (int, float)) and not isinstance(exclusive_minimum, bool):
+        elif (
+            isinstance(exclusive_minimum, (int, float))
+            and not isinstance(exclusive_minimum, bool)
+        ):
             if value <= exclusive_minimum:
                 errors.append(f"validation failed: '{label}' must be > {exclusive_minimum}")
         maximum = schema.get("maximum")
@@ -353,16 +364,27 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
         if isinstance(exclusive_maximum, bool):
             if exclusive_maximum and isinstance(maximum, (int, float)) and value >= maximum:
                 errors.append(f"validation failed: '{label}' must be < {maximum}")
-        elif isinstance(exclusive_maximum, (int, float)) and not isinstance(exclusive_maximum, bool):
+        elif (
+            isinstance(exclusive_maximum, (int, float))
+            and not isinstance(exclusive_maximum, bool)
+        ):
             if value >= exclusive_maximum:
                 errors.append(f"validation failed: '{label}' must be < {exclusive_maximum}")
 
     if isinstance(value, list):
         min_items = schema.get("minItems")
-        if isinstance(min_items, int) and not isinstance(min_items, bool) and len(value) < min_items:
+        if (
+            isinstance(min_items, int)
+            and not isinstance(min_items, bool)
+            and len(value) < min_items
+        ):
             errors.append(f"validation failed: '{label}' must have at least {min_items} items")
         max_items = schema.get("maxItems")
-        if isinstance(max_items, int) and not isinstance(max_items, bool) and len(value) > max_items:
+        if (
+            isinstance(max_items, int)
+            and not isinstance(max_items, bool)
+            and len(value) > max_items
+        ):
             errors.append(f"validation failed: '{label}' must have at most {max_items} items")
         item_schema = schema.get("items", {})
         if isinstance(item_schema, dict):
