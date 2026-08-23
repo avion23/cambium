@@ -75,9 +75,11 @@ agent loop instead: it loads the provider file named by the worker's absolute
     {"type": "finish", "summary": <non-empty summary>}
 
 The agent is instructed to emit a short ``plan`` action before any
-``tool_call``; the plan is kept in the transcript. The transcript is
-summarized (truncation plus a synthetic dropped-message marker, no LLM call)
-when it exceeds a character budget, so it stays bounded across turns.
+``tool_call``; the plan is kept in the transcript. With durable context reuse,
+completed raw tails become strict immutable semantic deltas. A typed CAST policy
+rolls an overgrown delta sequence into a deterministic K0 materialized view while
+retaining an immutable rollover manifest outside the active prompt. Without
+context reuse, the legacy bounded transcript projection remains available.
 
 Tool calls execute inside the worktree (with shell/git permissions from
 ``init.permissions``), emit ``tool_event`` messages, and persist
@@ -120,13 +122,15 @@ import tempfile
 import threading
 import time
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from dataclasses import field as dataclass_field
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, TypeGuard, cast
 
 from cambium.auth import oauth_env_suffix, scrub_environment
+from cambium.context_policy import CastPolicy
 from cambium.diffundo import (
     AllProvidersFailed,
     CallResult,
@@ -151,13 +155,17 @@ from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import TOOL_SCHEMAS
 from cambium.summary_trunk import (
     SUMMARY_PROTOCOL_LINES,
+    SummaryEntry,
     SummaryTrunkError,
     append_summary_entry,
     build_summary_request,
+    entry_mapping,
     parse_summary_response,
     partition_summary_trunk,
+    rollover_summary_trunk,
     semantic_summary_messages,
     summary_entries,
+    summary_trunk_tokens,
 )
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
@@ -318,6 +326,7 @@ _RESUME_KEYS = frozenset(
         "epoch",
         "child_results",
         "child_results_truncated",
+        "workspace_changed",
     }
 )
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -533,11 +542,15 @@ def _validate_resume(value: Any) -> dict[str, Any] | None:
     truncated = value.get("child_results_truncated")
     if type(truncated) is not bool:
         raise ContextForkError("resume 'child_results_truncated' must be a boolean")
+    workspace_changed = value.get("workspace_changed")
+    if type(workspace_changed) is not bool:
+        raise ContextForkError("resume 'workspace_changed' must be a boolean")
     return {
         "checkpoint_ref": checkpoint_ref,
         "epoch": epoch,
         "child_results": validated_results,
         "child_results_truncated": truncated,
+        "workspace_changed": workspace_changed,
     }
 
 
@@ -1092,6 +1105,17 @@ def _rolling_compact_thresholds(
     return threshold_high, threshold_low
 
 
+def _cast_policy(value: Any, source: str) -> CastPolicy:
+    if value is None:
+        return CastPolicy()
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{source} cast_policy must be a mapping")
+    try:
+        return CastPolicy.from_mapping(value)
+    except ValueError as exc:
+        raise ValueError(f"{source} cast_policy: {exc}") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     """Immutable per-task agent configuration parsed from init (init is authoritative)."""
@@ -1109,6 +1133,7 @@ class AgentConfig:
     heartbeat_interval_s: float
     max_wall_s: float
     checkpoint_root: Path | None
+    cast_policy: CastPolicy = dataclass_field(default_factory=CastPolicy)
     python_permission: bool = False
     requirements: dict[str, Any] | None = None
     max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
@@ -1143,6 +1168,8 @@ class AgentConfig:
 
     def __post_init__(self) -> None:
         """Derive threshold defaults for direct in-process configurations."""
+        if not isinstance(self.cast_policy, CastPolicy):
+            raise ValueError("cast_policy must be a CastPolicy")
         threshold_high = self.rolling_compact_threshold_high
         if threshold_high == 0:
             threshold_high = self.max_transcript_chars
@@ -1226,6 +1253,7 @@ class AgentConfig:
             ),
             max_wall_s=_positive_float(max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S),
             checkpoint_root=checkpoint_root,
+            cast_policy=_cast_policy(init.get("cast_policy"), "init"),
             requirements=_task_requirements(init, _provider_fanout_config(init)),
             max_transcript_chars=max_transcript_chars,
             provider_env_keys=provider_env_keys,
@@ -1273,6 +1301,9 @@ def _merge_task_config(
     summary_trunk_ref = config.summary_trunk_ref or _validate_summary_trunk_ref(
         run.get("summary_trunk_ref")
     )
+    cast_policy = config.cast_policy
+    if "cast_policy" not in init and "cast_policy" in run:
+        cast_policy = _cast_policy(run.get("cast_policy"), "run_task")
     rolling_compact = config.rolling_compact
     if "rolling_compact" not in init and "rolling_compact" in run:
         rolling_compact = _strict_bool(run.get("rolling_compact"), "run_task rolling_compact")
@@ -1308,6 +1339,7 @@ def _merge_task_config(
         heartbeat_interval_s=config.heartbeat_interval_s,
         max_wall_s=max_wall_s,
         checkpoint_root=config.checkpoint_root,
+        cast_policy=cast_policy,
         requirements=requirements,
         max_transcript_chars=config.max_transcript_chars,
         provider_env_keys=config.provider_env_keys,
@@ -1365,6 +1397,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
             run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
         ),
         checkpoint_root=None,
+        cast_policy=_cast_policy(run.get("cast_policy"), "run_task"),
         requirements=_task_requirements(run, _provider_fanout_config(run)),
         max_transcript_chars=max_transcript_chars,
         provider_env_keys=provider_env_keys,
@@ -2926,6 +2959,63 @@ def _create_epoch_checkpoint(path: Path, content: str) -> None:
     _fsync_directory(path.parent)
 
 
+def _write_cast_rollover_manifest(
+    config: AgentConfig,
+    k0: SummaryEntry,
+    source_entries: Sequence[SummaryEntry],
+) -> Path | None:
+    """Durably retain the exact source projection before publishing K0.
+
+    K0 is a materialized read view, not the authority. The manifest is written
+    first with exclusive-create semantics so a crash cannot publish a compacted
+    checkpoint whose source projection never became durable.
+    """
+    if config.checkpoint_root is None:
+        return None
+    raw: dict[str, Any] = {
+        "schema": "cambium.cast-rollover.v1",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "source_sha256": k0.source_sha256,
+        "through_turn": k0.through_turn,
+        "entries": [entry_mapping(entry) for entry in source_entries],
+        "redacted": False,
+    }
+    redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
+    payload = cast(dict[str, Any], redactor.redact_mapping(raw))
+    payload["redacted"] = payload != raw
+    content = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    content_digest = _sha256_hex(content.encode("utf-8"))[:16]
+    safe_task = _safe_task_id(config.task_id)
+    path = (
+        config.checkpoint_root
+        / safe_task
+        / "rollovers"
+        / (
+            f"k0-{k0.through_turn:06d}-{k0.source_sha256[:16]}-"
+            f"{content_digest}.json"
+        )
+    )
+    try:
+        _create_epoch_checkpoint(path, content)
+    except ContextForkError:
+        try:
+            info = path.lstat()
+            existing = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            raise
+        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and existing == content:
+            return path
+        raise
+    return path
+
+
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for key, value in pairs:
@@ -3836,6 +3926,7 @@ async def _run_agent_loop(
             and current_epoch_checkpoint.task_id == config.task_id
             and current_epoch_checkpoint.generation == config.generation
         )
+        rollover_reason: str | None = None
         try:
             summary_through_turn = turn
             existing_entries = summary_entries(trunk_messages)
@@ -3919,6 +4010,31 @@ async def _run_agent_loop(
                 raise ContextForkError("token budget exceeded during summary flush")
             summary_entry = parse_summary_response(summary_result.content, expectation)
             new_trunk = append_summary_entry(trunk_messages, summary_entry)
+            before_entries = summary_entries(new_trunk)
+            before_tokens = summary_trunk_tokens(new_trunk)
+            if config.cast_policy.rollover_due(len(before_entries), before_tokens):
+                rolled_trunk, _projection, source_entries = rollover_summary_trunk(new_trunk)
+                after_entries = summary_entries(rolled_trunk)
+                after_tokens = summary_trunk_tokens(rolled_trunk)
+                config.cast_policy.validate_rollover(
+                    before_segments=len(before_entries),
+                    before_tokens=before_tokens,
+                    after_segments=len(after_entries),
+                    after_tokens=after_tokens,
+                )
+                k0 = after_entries[0]
+                await asyncio.to_thread(
+                    _write_cast_rollover_manifest,
+                    config,
+                    k0,
+                    source_entries,
+                )
+                new_trunk = rolled_trunk
+                # K0 starts a new cache lineage. The next provider call must
+                # account its complete prompt instead of subtracting the old
+                # lineage's prompt length.
+                previous_prompt_tokens = 0
+                rollover_reason = "cast_k0_rollover"
             checkpoint = await asyncio.to_thread(
                 _write_epoch_checkpoint,
                 config,
@@ -3977,7 +4093,7 @@ async def _run_agent_loop(
                     request_id=request_id,
                     checkpoint=checkpoint,
                     folded_from_epoch=prior_epoch,
-                    reason=None,
+                    reason=rollover_reason,
                 )
             else:
                 await _emit_context_checkpoint(
@@ -4020,9 +4136,14 @@ async def _run_agent_loop(
                     "content": "[note: some child results were truncated and omitted]",
                 }
             )
-        code_changed = resume_checkpoint.code_changed
-        verified_after_change = resume_checkpoint.verified_after_change
-        verification_failed = resume_checkpoint.verification_failed
+        workspace_changed = resume["workspace_changed"]
+        code_changed = resume_checkpoint.code_changed or workspace_changed
+        verified_after_change = (
+            resume_checkpoint.verified_after_change and not workspace_changed
+        )
+        verification_failed = (
+            False if workspace_changed else resume_checkpoint.verification_failed
+        )
         no_progress_actions = resume_checkpoint.no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
         previous_prompt_tokens = resume_checkpoint.previous_prompt_tokens
@@ -4672,7 +4793,8 @@ async def _do_provider_work(
         run_request_id=run.get("request_id"),
         defer_terminal_checkpoint=True,
     )
-    if loop_outcome["status"] != "succeeded":
+    loop_status = loop_outcome["status"]
+    if loop_status not in {"succeeded", TaskStatus.SUSPENDED.value}:
         return _loop_failure_outcome(loop_outcome)
     outcome = await asyncio.to_thread(
         _finalize_worktree,
@@ -4684,6 +4806,23 @@ async def _do_provider_work(
         stop=stop,
         loop_outcome=loop_outcome,
     )
+    if loop_status == TaskStatus.SUSPENDED.value and outcome["status"] == "succeeded":
+        epoch = loop_outcome.get("epoch")
+        checkpoint_ref = loop_outcome.get("checkpoint_ref")
+        if type(epoch) is not int or epoch <= 0 or not isinstance(checkpoint_ref, str):
+            return _loop_failure_outcome(
+                {
+                    "status": "failed",
+                    "failure_reason": "suspension snapshot has no context checkpoint",
+                }
+            )
+        outcome.update(
+            status=TaskStatus.SUSPENDED.value,
+            failure_reason=None,
+            epoch=epoch,
+            checkpoint_ref=checkpoint_ref,
+            summary=loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
+        )
     final_checkpoint = outcome.pop("_checkpoint_path", None)
     terminal_checkpoint = outcome.pop("_context_checkpoint", None)
     if writer is not None and final_checkpoint is not None:

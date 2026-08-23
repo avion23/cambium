@@ -18,6 +18,8 @@ from cambium.provider_scheduler import (
 def test_module_has_one_state_role_and_no_competing_scheduler() -> None:
     assert not hasattr(provider_state, "ProviderScheduler")
     assert not hasattr(provider_state, "rank_policies")
+    assert not hasattr(provider_state, "CastConfig")
+    assert not hasattr(provider_state, "CacheHorizonConfig")
     assert set(provider_state.__all__) == {
         "BillingMode",
         "ProviderLease",

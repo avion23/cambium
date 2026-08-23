@@ -424,7 +424,10 @@ def estimate_message_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
     CAST UI for context sizing; callers should treat the result as a policy
     hint, not provider accounting.
     """
-    copied = [_copy_message(message, f"messages[{index}]") for index, message in enumerate(messages)]
+    copied = [
+        _copy_message(message, f"messages[{index}]")
+        for index, message in enumerate(messages)
+    ]
     if not copied:
         return 0
     return max(1, math.ceil(len(_canonical_json_bytes(copied)) / 4))
