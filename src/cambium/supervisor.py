@@ -3527,7 +3527,8 @@ class _Runtime:
                 # ownership.
                 _release_lane(self._lanes, spec)
                 result = self._results.get(task_id)
-                if result is not None:
+                retain_resolver_worktree = spec.get("_retain_worktree") is True
+                if result is not None and not retain_resolver_worktree:
                     try:
                         await self._prune_worktree(
                             spec,
@@ -3648,6 +3649,8 @@ class _Runtime:
                 )
                 return
         generation = await self._ensure_worktree(spec)
+        if spec.get("_resolver_child"):
+            await self._prepare_resolver_worktree(spec)
 
         # The admission semaphore bounds concurrent worker processes only.  A
         # suspended parent releases it as soon as its generation exits, waits
@@ -3889,6 +3892,28 @@ class _Runtime:
                             summary=worker_summary,
                         )
                         return
+                    if spec.get("_resolver_child"):
+                        # The parent task owns publication ordering for a
+                        # resolver.  Keep this clean, committed branch alive
+                        # until _resolve_merge_conflict has checked the join
+                        # invariant immediately before publishing it.
+                        spec["_retain_worktree"] = True
+                        await self._reject_child_proposals(
+                            task_id,
+                            outcome.proposals,
+                            reason="ResolverResultRejected",
+                            message="resolver children cannot admit nested children",
+                        )
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id,
+                            status="succeeded",
+                            exit_code=0,
+                            reason=None,
+                            merge_sha=None,
+                            restarts=restarts,
+                            summary=worker_summary,
+                        )
+                        return
                     if head == spec["base_commit"]:
                         await self._admit_generation_children(
                             spec,
@@ -3914,6 +3939,16 @@ class _Runtime:
                         )
                         return
                     merged = await self._merge_task(spec, handle)
+                    if merged is None:
+                        conflict = self._merge_conflicts.get(task_id)
+                        if conflict is not None:
+                            merged = await self._resolve_merge_conflict(
+                                spec,
+                                handle,
+                                conflict,
+                                outcome.envelope,
+                                sanitized_envelope,
+                            )
                     if merged is not None:
                         await self._admit_generation_children(
                             spec,
@@ -3944,11 +3979,12 @@ class _Runtime:
                             reason="ParentMergeFailed",
                             message="parent success was not accepted by the merge sequencer",
                         )
+                        failure_reason = self._resolver_failures.get(task_id, "merge_failed")
                         self._results[task_id] = TaskResult(
                             task_id=task_id,
                             status="failed",
                             exit_code=1,
-                            reason="merge_failed",
+                            reason=failure_reason,
                             restarts=restarts,
                             summary=worker_summary,
                         )
@@ -4026,6 +4062,8 @@ class _Runtime:
                 # consume it.
                 deadline = None
                 generation = await self._recover_worktree(spec, generation + 1)
+                if spec.get("_resolver_child"):
+                    await self._prepare_resolver_worktree(spec)
         finally:
             if semaphore is not None and semaphore_held:
                 semaphore.release()
@@ -4186,6 +4224,12 @@ class _Runtime:
             init_msg["summary_trunk_ref"] = spec["summary_trunk_ref"]
         if isinstance(spec.get("resume"), dict):
             init_msg["resume"] = spec["resume"]
+        if spec.get("_resolver_child"):
+            init_msg["resolver_child"] = True
+            init_msg["resolver_write_authority"] = {
+                "worktree": str(worktree),
+                "branch": spec["branch"],
+            }
         if encode_message(init_msg) is None:
             await _report_outbound_message_too_long()
             return _GenOutcome(
@@ -5428,7 +5472,8 @@ class _Runtime:
                 "task_id": resolver_task_id,
                 "kind": "resolver",
                 "task": (
-                    f"Resolve the merge conflict in {', '.join(conflicted_files) or 'the staged files'}; "
+                    "Resolve the merge conflict in "
+                    f"{', '.join(conflicted_files) or 'the staged files'}; "
                     "produce a committed merged result or report an explicit unresolvable verdict."
                 ),
                 "repo": str(repo),
@@ -5808,9 +5853,25 @@ class _Runtime:
                 )
                 if not current_main:
                     raise RuntimeError("no refs/heads/main to publish onto")
-                staging_tip = await asyncio.to_thread(
-                    seq.prepare_staging, repo, throwaway, branch, current_main
-                )
+                if spec.get("_resolver_child"):
+                    # A resolver commits the already-resolved two-parent
+                    # merge in its fresh staging worktree. Rebasing that merge
+                    # commit would replay the source parent and recreate the
+                    # conflict, so publish its verified tip directly through
+                    # the same atomic fast-forward primitive.
+                    staging_tip = await self._git_stdout(
+                        repo,
+                        "rev-parse",
+                        "--verify",
+                        f"refs/heads/{branch}^{{commit}}",
+                        check=False,
+                    )
+                    if not staging_tip:
+                        raise RuntimeError("resolver branch has no commit to publish")
+                else:
+                    staging_tip = await asyncio.to_thread(
+                        seq.prepare_staging, repo, throwaway, branch, current_main
+                    )
                 # publish_merge is ref-only by contract. If this repository's
                 # primary worktree has ``main`` checked out, advancing the ref
                 # leaves its files and index at the old commit; git status can
@@ -5819,7 +5880,7 @@ class _Runtime:
                 # checkout here: that would violate ref-only publication and
                 # could destroy caller-owned edits.
                 await self._flush_sequencer_events(seq, deferred_observers=deferred)
-                if hasattr(seq, "ensure_staging_clean"):
+                if hasattr(seq, "ensure_staging_clean") and not spec.get("_resolver_child"):
                     await asyncio.to_thread(seq.ensure_staging_clean, repo)
                     await self._flush_sequencer_events(seq, deferred_observers=deferred)
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
@@ -6123,6 +6184,13 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     spec.setdefault("write_marker", True)
     if not isinstance(spec["write_marker"], bool):
         raise ValueError(f"task {task_id} write_marker must be a boolean")
+    if "resolver_child_enabled" in spec and type(spec["resolver_child_enabled"]) is not bool:
+        raise ValueError(f"task {task_id} resolver_child_enabled must be a boolean")
+    for key in ("resolver_max_attempts", "resolver_attempts"):
+        if key in spec and (
+            type(spec[key]) is not int or spec[key] < 0
+        ):
+            raise ValueError(f"task {task_id} {key} must be a non-negative int")
     return spec
 
 
@@ -6867,6 +6935,8 @@ async def run_plan(
     conversations: bool | None = None,
     warm_pool_size: int = 0,
     context_reuse: bool = True,
+    resolver_child_enabled: bool = False,
+    resolver_max_attempts: int = 1,
 ) -> PlanResult:
     """Run every task in the plan concurrently under one supervisor session.
 
@@ -6900,7 +6970,9 @@ async def run_plan(
     ``ConversationStore`` at ``<session_dir>/.cambium/conversations.db`` for the
     session (closed on shutdown) and appends one row per admitted/rejected
     revision. Conversations and the warm pool default off; context reuse
-    defaults on and can be disabled by internal callers.
+    defaults on and can be disabled by internal callers. Conflict resolver
+    children are opt-in through ``resolver_child_enabled`` and are capped at
+    one attempt by default via ``resolver_max_attempts``.
 
     Dispatch shape:
 
@@ -6921,6 +6993,21 @@ async def run_plan(
       observer notification.
     """
     session_dir = Path(session_dir)
+    if type(resolver_child_enabled) is not bool:
+        raise ValueError("resolver_child_enabled must be a boolean")
+    if type(resolver_max_attempts) is not int or resolver_max_attempts < 0:
+        raise ValueError("resolver_max_attempts must be a non-negative int")
+    if isinstance(plan, dict):
+        plan_resolver_enabled = plan.get("resolver_child_enabled")
+        if plan_resolver_enabled is not None:
+            if type(plan_resolver_enabled) is not bool:
+                raise ValueError("plan resolver_child_enabled must be a boolean")
+            resolver_child_enabled = resolver_child_enabled or plan_resolver_enabled
+        plan_resolver_attempts = plan.get("resolver_max_attempts")
+        if plan_resolver_attempts is not None:
+            if type(plan_resolver_attempts) is not int or plan_resolver_attempts < 0:
+                raise ValueError("plan resolver_max_attempts must be a non-negative int")
+            resolver_max_attempts = plan_resolver_attempts
     tasks = _plan_tasks(plan)
     _reject_duplicate_task_ids(tasks)
     specs = [_validate_plan_task(session_dir, t) for t in tasks]
@@ -6987,6 +7074,8 @@ async def run_plan(
             conversations=conversations_store,
             warm_pool_size=warm_pool_size,
             context_reuse=context_reuse,
+            resolver_child_enabled=resolver_child_enabled,
+            resolver_max_attempts=resolver_max_attempts,
         )
         await runtime.start()
         if routing_state_load_error is not None:
