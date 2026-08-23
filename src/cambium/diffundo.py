@@ -1631,9 +1631,26 @@ class Diffundo:
                 // 4
                 + 4096,
             )
-            reservation = await asyncio.to_thread(
-                ledger.reserve, policy.name, policy.quota_windows, estimated_tokens
+            reserve_task = asyncio.create_task(
+                asyncio.to_thread(
+                    ledger.reserve, policy.name, policy.quota_windows, estimated_tokens
+                )
             )
+            try:
+                # ``to_thread`` cannot be stopped once the SQLite transaction has
+                # started. Shield the worker so cancellation can still clean up a
+                # reservation that commits after the caller is cancelled.
+                reservation = await asyncio.shield(reserve_task)
+            except asyncio.CancelledError:
+                try:
+                    reservation = await asyncio.shield(reserve_task)
+                except BaseException:
+                    reservation = None
+                if reservation is not None:
+                    await asyncio.to_thread(
+                        ledger.cancel, reservation, policy.quota_windows
+                    )
+                raise
             if reservation is None:
                 raise ProviderError(
                     policy.name,
