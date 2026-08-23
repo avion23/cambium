@@ -83,6 +83,7 @@ CRITICAL_KINDS = frozenset(
         "merge_progress",
         "task_assigned",
         "merge_committed",
+        "join_invariant_failed",
         "merge_staging_quarantined",
         "merge_staging_cleanup_failed",
         "merge_staging_prune_started",

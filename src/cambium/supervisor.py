@@ -102,7 +102,7 @@ from .auth import MIN_API_KEY_BYTES, oauth_env_suffix, scrub_environment
 from .conversations import ConversationStore, ConversationStoreError
 from .diffundo import prompt_prefix_bytes
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
-from .merge import MergeSequencer
+from .merge import MergeConflictError, MergeSequencer
 from .oauth import (
     DEFAULT_REFRESH_MARGIN_S,
     OAuthError,
@@ -1869,6 +1869,11 @@ class _Runtime:
         self._child_result_by_generation: dict[
             str, dict[int, tuple[dict[str, Any], tuple[str | None, int | None]]]
         ] = {}
+        # Accepted child publication heads, keyed by the suspended parent.
+        # These are consumed by the join barrier immediately before a parent
+        # resume; retaining only the latest head makes repeated child joins
+        # deterministic while avoiding a stale check on a later epoch.
+        self._accepted_integration_heads: dict[str, str] = {}
         self._cancelled_tasks: set[str] = set()
         # A task's normal finally block owns its first cleanup attempt.  The
         # shutdown pass only retries cancellation cleanup for admitted child
@@ -3731,6 +3736,24 @@ class _Runtime:
                             )
                             return
                         await self._await_suspend_children(task_id, child_ids, remaining)
+                        if not await self._assert_parent_join_invariant(
+                            spec, child_ids, generation
+                        ):
+                            await self._reject_child_proposals(
+                                task_id,
+                                outcome.proposals,
+                                reason="ParentJoinInvariantFailed",
+                                message="parent worktree was not at the accepted child integration head",
+                            )
+                            self._results[task_id] = TaskResult(
+                                task_id=task_id,
+                                status="failed",
+                                exit_code=1,
+                                reason="join_invariant_failed",
+                                restarts=restarts,
+                                summary=worker_summary,
+                            )
+                            return
                         resume_payload = self._child_results_for_resume(
                             task_id,
                             child_ids,
@@ -5146,12 +5169,108 @@ class _Runtime:
                     merge_sha=current,
                 )
 
+    def _session_spec(self, task_id: str) -> dict[str, Any] | None:
+        """Return an admitted task spec by id, if it is still in the session."""
+        for entry in self._session_tasks:
+            if entry.get("task_id") == task_id and isinstance(entry.get("spec"), dict):
+                return cast(dict[str, Any], entry["spec"])
+        return None
+
+    async def _advance_parent_worktree(
+        self,
+        child_spec: dict[str, Any],
+        accepted_head: str,
+        expected_old: str,
+    ) -> None:
+        """Fast-forward a clean suspended parent to a child integration head.
+
+        Publication advances ``refs/heads/main`` without touching any
+        worktree.  A suspended parent is the one deliberate exception: when
+        its branch is still at the publication's expected old head and its
+        tree is clean, fast-forwarding that branch makes the accepted child
+        artifact visible to the next parent generation.  If the precondition
+        is not true, leave the tree untouched; the join barrier below reports
+        the mismatch instead of destroying parent-owned state.
+        """
+        parent_task_id = child_spec.get("parent_task_id")
+        if not isinstance(parent_task_id, str):
+            return
+        parent_spec = self._session_spec(parent_task_id)
+        if parent_spec is None:
+            return
+        worktree = Path(parent_spec["worktree_path"])
+        try:
+            parent_head = await self._git_stdout(
+                worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return
+        if parent_head is None or parent_head == accepted_head or parent_head != expected_old:
+            return
+        try:
+            status = await self._git(
+                worktree,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return
+        if status.returncode != 0 or any(
+            not _status_line_is_fence(line) for line in status.stdout.splitlines()
+        ):
+            return
+        try:
+            await self._git(
+                worktree, "merge", "--ff-only", "--no-edit", accepted_head, check=False
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return
+
+    async def _assert_parent_join_invariant(
+        self,
+        parent_spec: dict[str, Any],
+        child_ids: list[str],
+        generation: int,
+    ) -> bool:
+        """Require the parent worktree to be at the accepted child head."""
+        parent_task_id = parent_spec["task_id"]
+        integration_head = self._accepted_integration_heads.get(parent_task_id)
+        if integration_head is None:
+            return True
+        worktree = Path(parent_spec["worktree_path"])
+        parent_head = await self._git_stdout(
+            worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
+        )
+        if parent_head == integration_head:
+            self._accepted_integration_heads.pop(parent_task_id, None)
+            return True
+        summary = "parent worktree HEAD does not match accepted integration head"
+        await self.emit(
+            "join_invariant_failed",
+            task_id=parent_task_id,
+            parent_task_id=parent_task_id,
+            generation=generation,
+            status="join_invariant_failed",
+            reason="parent_worktree_head_mismatch",
+            summary=summary,
+            integration_head=integration_head,
+            accepted_integration_head=integration_head,
+            parent_head=parent_head,
+            expected_head=integration_head,
+            child_task_ids=child_ids[:MAX_ENVELOPE_ITEMS],
+        )
+        return False
+
     async def _merge_task(self, spec: dict[str, Any], handle: WorkerHandle) -> str | None:
         """Stage and atomically publish the worker branch onto refs/heads/main.
 
-        On NonFastForwardError/MergeConflictError a merge_failed event is
-        appended and None is returned. The v2.1 resolver sub-task is out of
-        scope for this version (documented; event only).
+        On a non-fast-forward refusal a backward-compatible ``merge_failed``
+        event is appended.  A conflict uses that same event kind but carries a
+        structured ``status=merge_conflict`` envelope; no resolver child is
+        spawned here.
         """
         task_id = spec["task_id"]
         repo = Path(spec["repo"])
@@ -5168,6 +5287,7 @@ class _Runtime:
         cleanup_failed = False
         merge_failed = False
         staging_tip: str | None = None
+        current_main: str | None = None
         try:
             async with self._merge_lock:  # Unio single-writer: serialized merges
                 current_main = await self._git_stdout(
@@ -5202,10 +5322,38 @@ class _Runtime:
                     _deferred_observers=deferred,
                 )
                 committed_persisted = True
+                parent_task_id = spec.get("parent_task_id")
+                if isinstance(parent_task_id, str) and staging_tip is not None:
+                    self._accepted_integration_heads[parent_task_id] = staging_tip
+                    await self._advance_parent_worktree(spec, staging_tip, current_main)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             merge_failed = True
             error_type = exc.__class__.__name__
-            if error_type in ("NonFastForwardError", "MergeConflictError"):
+            if isinstance(exc, MergeConflictError):
+                summary = str(exc)[:512]
+                diff_evidence = exc.diff_evidence
+                conflict_payload = {
+                    # Keep the old event kind and fields so renderers and
+                    # operators consuming merge_failed remain compatible.
+                    "merge_error": error_type,
+                    "message": summary,
+                    "status": "merge_conflict",
+                    "conflicted_files": exc.conflicted_files,
+                    "summary": summary,
+                    "diff_evidence": diff_evidence,
+                    "evidence": diff_evidence,
+                    "diff": diff_evidence,
+                    "unified_diff": diff_evidence,
+                    "diff_truncated": exc.diff_truncated,
+                    "integration_head": exc.integration_head or current_main,
+                    "generation": handle.generation,
+                }
+                await self.emit(
+                    "merge_failed",
+                    task_id=task_id,
+                    **conflict_payload,
+                )
+            elif error_type == "NonFastForwardError":
                 await self.emit(
                     "merge_failed",
                     task_id=task_id,

@@ -57,6 +57,7 @@ DEFAULT_QUARANTINE_MAX_ENTRIES = 15
 DEFAULT_QUARANTINE_MAX_BYTES = 1 << 30
 DEFAULT_QUARANTINE_RETENTION_NS = 7 * 24 * 60 * 60 * 1_000_000_000
 DEFAULT_QUARANTINE_MIN_FREE_BYTES = 1 << 30
+CONFLICT_EVIDENCE_MAX_BYTES = 4 * 1024
 
 # git reads an all-zero old-value (like the empty string) as "the ref must not
 # exist" — an empty/zero expected_old would silently CREATE refs/heads/main.
@@ -106,11 +107,39 @@ class NonFastForwardError(RuntimeError):
 
 
 class MergeConflictError(RuntimeError):
-    """A rebase/merge of the worker branch onto ``base`` hit conflicts."""
+    """A rebase/merge of the worker branch onto ``base`` hit conflicts.
 
-    def __init__(self, message: str, conflicts: list[str]) -> None:
+    The exception carries the bounded evidence needed to publish a useful
+    conflict envelope without making callers inspect the staging worktree
+    after the failure has been cleaned up.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        conflicts: list[str],
+        *,
+        integration_head: str | None = None,
+        diff_evidence: str = "",
+        diff_truncated: bool = False,
+    ) -> None:
         super().__init__(message)
-        self.conflicts = list(conflicts)
+        self.status = "merge_conflict"
+        self.summary = message
+        self.conflicts = list(dict.fromkeys(conflicts))
+        self.conflicted_files = list(self.conflicts)
+        self.integration_head = integration_head
+        self.diff_evidence = _bounded_conflict_evidence(diff_evidence)[0]
+        self.diff_truncated = diff_truncated or self.diff_evidence != diff_evidence
+
+
+def _bounded_conflict_evidence(value: str) -> tuple[str, bool]:
+    """Cap conflict evidence by UTF-8 bytes, preserving valid text."""
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= CONFLICT_EVIDENCE_MAX_BYTES:
+        return value, False
+    bounded = encoded[:CONFLICT_EVIDENCE_MAX_BYTES].decode("utf-8", errors="ignore")
+    return bounded, True
 
 
 class QuarantineError(RuntimeError):
@@ -748,6 +777,17 @@ class MergeSequencer:
                 return list(dict.fromkeys(conflicts))
         return _parse_conflicts(rebase_output)
 
+    def _conflict_evidence(self, worktree_path: Path, rebase_output: str) -> tuple[str, bool]:
+        """Capture bounded diff evidence while the conflict index still exists."""
+        for args in (
+            ("diff", "--no-ext-diff", "--no-color", "--binary", "--"),
+            ("diff", "--cached", "--no-ext-diff", "--no-color", "--binary", "--"),
+        ):
+            result = self._run(worktree_path, *args, check=False)
+            if result.returncode == 0 and result.stdout:
+                return _bounded_conflict_evidence(result.stdout)
+        return _bounded_conflict_evidence(rebase_output)
+
     # -- public contract -----------------------------------------------------
 
     def prepare_staging(self, repo: Path, worktree_path: Path, branch: str, base: str) -> str:
@@ -816,10 +856,16 @@ class MergeSequencer:
         )
         if rebase.returncode != 0:
             conflicts = self._conflicted_paths(worktree_path, rebase.stdout + rebase.stderr)
+            diff_evidence, diff_truncated = self._conflict_evidence(
+                worktree_path, rebase.stdout + rebase.stderr
+            )
             raise MergeConflictError(
                 f"rebase of {branch} onto {base_tip} failed; "
                 f"conflicted paths: {conflicts or '(none detected)'}",
                 conflicts,
+                integration_head=base_tip,
+                diff_evidence=diff_evidence,
+                diff_truncated=diff_truncated,
             )
 
         staging_tip = self._rev_parse(worktree_path, "HEAD")
