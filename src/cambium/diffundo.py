@@ -108,7 +108,7 @@ import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from enum import Enum
@@ -119,6 +119,7 @@ from . import __version__
 from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
 from .provider_scheduler import (
     BillingMode,
+    CacheCapability,
     ProviderLease,
     QuotaLedger,
     QuotaWindowSpec,
@@ -358,6 +359,7 @@ class ProviderConfig:
     billing_mode: BillingMode = BillingMode.METERED
     quota_windows: tuple[QuotaWindowSpec, ...] = ()
     price_per_1m_cached_in: float = 0.0
+    cache_capability: CacheCapability = field(default_factory=CacheCapability)
     pricing_known: bool = False
     throughput_hint_tps: float = 0.0
     quality_weight: float = 1.0

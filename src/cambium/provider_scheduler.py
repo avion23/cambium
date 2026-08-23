@@ -39,6 +39,212 @@ DEFAULT_CACHE_HORIZON_S = 60.0
 DEFAULT_MINIMUM_BREAKPOINT_TOKENS = 0
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class CacheCapability:
+    """Normalized provider prefix-cache capability and tariff metadata.
+
+    Prices are USD per million cache tokens.  A zero value is a valid free
+    tariff; callers should use :meth:`has_pricing` when they need to
+    distinguish a free cache from an undeclared capability.  The constructor
+    accepts the vocabulary used by the architecture documents (for example
+    ``minimum_cacheable_tokens``/``cache_ttl_s``) as well as the shorter names
+    used in provider files.  The stored fields stay canonical so routing and
+    rollover code do not need provider-specific aliases.
+    """
+
+    minimum_cacheable_tokens: int
+    cache_ttl_s: float
+    cache_granularity_tokens: int
+    cache_read_price: float
+    cache_write_price: float
+
+    def __init__(
+        self,
+        minimum_cacheable_tokens: int = 0,
+        cache_ttl_s: float = 0.0,
+        cache_granularity_tokens: int = 1,
+        cache_read_price: float = 0.0,
+        cache_write_price: float = 0.0,
+        *,
+        min_cacheable_tokens: int | None = None,
+        min_cacheable_block_tokens: int | None = None,
+        ttl_s: float | None = None,
+        ttl_seconds: float | None = None,
+        cache_ttl_seconds: float | None = None,
+        granularity: int | None = None,
+        granularity_tokens: int | None = None,
+        cache_block_granularity_tokens: int | None = None,
+        cache_read_price_per_1m: float | None = None,
+        cache_write_price_per_1m: float | None = None,
+    ) -> None:
+        minimum = _coalesce_alias(
+            "minimum_cacheable_tokens",
+            minimum_cacheable_tokens,
+            0,
+            (min_cacheable_tokens, min_cacheable_block_tokens),
+        )
+        ttl = _coalesce_alias(
+            "cache_ttl_s",
+            cache_ttl_s,
+            0.0,
+            (ttl_s, ttl_seconds, cache_ttl_seconds),
+        )
+        block = _coalesce_alias(
+            "cache_granularity_tokens",
+            cache_granularity_tokens,
+            1,
+            (granularity, granularity_tokens, cache_block_granularity_tokens),
+        )
+        read_price = _coalesce_alias(
+            "cache_read_price", cache_read_price, 0.0, (cache_read_price_per_1m,)
+        )
+        write_price = _coalesce_alias(
+            "cache_write_price", cache_write_price, 0.0, (cache_write_price_per_1m,)
+        )
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
+            raise ValueError("minimum_cacheable_tokens must be a non-negative integer")
+        if isinstance(block, bool) or not isinstance(block, int) or block <= 0:
+            raise ValueError("cache_granularity_tokens must be a positive integer")
+        for field_name, value in (
+            ("cache_ttl_s", ttl),
+            ("cache_read_price", read_price),
+            ("cache_write_price", write_price),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise ValueError(f"{field_name} must be a number")
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        object.__setattr__(self, "minimum_cacheable_tokens", minimum)
+        object.__setattr__(self, "cache_ttl_s", float(ttl))
+        object.__setattr__(self, "cache_granularity_tokens", block)
+        object.__setattr__(self, "cache_read_price", float(read_price))
+        object.__setattr__(self, "cache_write_price", float(write_price))
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> CacheCapability:
+        """Parse one strict provider cache-capability mapping."""
+        allowed = {
+            "minimum_cacheable_tokens",
+            "min_cacheable_tokens",
+            "min_cacheable_block_tokens",
+            "cache_ttl_s",
+            "ttl_s",
+            "ttl_seconds",
+            "cache_ttl_seconds",
+            "cache_granularity_tokens",
+            "granularity",
+            "granularity_tokens",
+            "cache_block_granularity_tokens",
+            "cache_read_price",
+            "cache_read_price_per_1m",
+            "cache_write_price",
+            "cache_write_price_per_1m",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unknown cache-capability field(s): {unknown}")
+        return cls(**dict(value))
+
+    @property
+    def min_cacheable_tokens(self) -> int:
+        """Short spelling for :attr:`minimum_cacheable_tokens`."""
+        return self.minimum_cacheable_tokens
+
+    @property
+    def min_cacheable_block_tokens(self) -> int:
+        """Compatibility spelling used by CAST scheduling notes."""
+        return self.minimum_cacheable_tokens
+
+    @property
+    def ttl_s(self) -> float:
+        """Short spelling for :attr:`cache_ttl_s`."""
+        return self.cache_ttl_s
+
+    @property
+    def ttl_seconds(self) -> float:
+        """Seconds for which an epoch is expected to remain reusable."""
+        return self.cache_ttl_s
+
+    @property
+    def granularity(self) -> int:
+        """Short spelling for :attr:`cache_granularity_tokens`."""
+        return self.cache_granularity_tokens
+
+    @property
+    def granularity_tokens(self) -> int:
+        """Compatibility spelling for cache block granularity."""
+        return self.cache_granularity_tokens
+
+    @property
+    def cache_block_granularity_tokens(self) -> int:
+        """Architecture-document spelling for cache block granularity."""
+        return self.cache_granularity_tokens
+
+    @property
+    def cache_read_price_per_1m(self) -> float:
+        """The read tariff in the unit used by provider configuration."""
+        return self.cache_read_price
+
+    @property
+    def cache_write_price_per_1m(self) -> float:
+        """The write tariff in the unit used by provider configuration."""
+        return self.cache_write_price
+
+    @property
+    def has_pricing(self) -> bool:
+        """Whether either cache tariff was explicitly useful to economics."""
+        return self.cache_read_price > 0 or self.cache_write_price > 0
+
+    @property
+    def declared(self) -> bool:
+        """Whether any non-default cache capability signal is present."""
+        return bool(
+            self.minimum_cacheable_tokens
+            or self.cache_ttl_s
+            or self.cache_granularity_tokens != 1
+            or self.has_pricing
+        )
+
+    def cacheable_tokens(self, tokens: int) -> int:
+        """Round a prefix up to the provider's cache block granularity."""
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("cache token count must be a non-negative integer")
+        if tokens == 0:
+            return 0
+        return math.ceil(tokens / self.cache_granularity_tokens) * self.cache_granularity_tokens
+
+    def supports_prefix(self, tokens: int) -> bool:
+        """Return whether a prefix is large enough for provider caching."""
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("cache token count must be a non-negative integer")
+        return tokens >= self.minimum_cacheable_tokens
+
+    def cost(self, tokens: int, *, write: bool = False) -> float:
+        """Return the tariff for *tokens* cache tokens."""
+        rounded = self.cacheable_tokens(tokens)
+        price = self.cache_write_price if write else self.cache_read_price
+        return rounded / 1_000_000 * price
+
+
+def _coalesce_alias(
+    field_name: str,
+    canonical: int | float,
+    default: int | float,
+    aliases: Sequence[int | float | None],
+) -> int | float:
+    """Choose one alias while rejecting contradictory declarations."""
+    selected = canonical
+    for alias in aliases:
+        if alias is None:
+            continue
+        if selected != default and selected != alias:
+            raise ValueError(f"{field_name} aliases disagree")
+        if any(other is not None and other != alias for other in aliases):
+            raise ValueError(f"{field_name} aliases disagree")
+        selected = alias
+    return selected
+
+
 @dataclass(frozen=True, slots=True)
 class CacheHorizonConfig:
     """Provider-neutral cache-breakpoint batching hints.
@@ -62,7 +268,10 @@ class CacheHorizonConfig:
             horizon = self.horizon_s
         minimum = self.minimum_breakpoint_tokens
         if self.min_breakpoint_tokens is not None:
-            if minimum != DEFAULT_MINIMUM_BREAKPOINT_TOKENS and minimum != self.min_breakpoint_tokens:
+            if (
+                minimum != DEFAULT_MINIMUM_BREAKPOINT_TOKENS
+                and minimum != self.min_breakpoint_tokens
+            ):
                 raise ValueError("minimum breakpoint aliases disagree")
             minimum = self.min_breakpoint_tokens
         if isinstance(horizon, bool) or not isinstance(horizon, int | float):
