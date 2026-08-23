@@ -27,7 +27,11 @@ the repository-integrity checks pass (worker success integrity, fencing,
 expected-old ref publication, session admission, worktree confinement,
 protocol/request correlation, and quarantine). Successful publication uses an
 expected-old atomic update of `refs/heads/main`. It is ref-only and never
-refreshes the caller's checkout or index.
+refreshes the caller's checkout or index. A child publication records its
+accepted integration head and advances a clean suspended parent before the
+join barrier; the invariant is
+`post_join_parent_HEAD == accepted_integration_HEAD`. A failed join emits a
+bounded `join_invariant_failed` record and cannot resume the parent.
 
 A session-wide parallel-worker cap defaults to one worker per CPU:
 `run_plan` rewrites `max_concurrent_tasks=None` to the CPU count before
@@ -79,22 +83,33 @@ Non-critical store records can be dropped under the store overflow policy.
     the stable head and older epoch files are not mutated. The transcript remains
     bounded within `max_turns`. A
    `read_batch` tool reads related files in one bounded call, and lint feedback
-   from `write_file` reaches the agent as a tool observation.
+   from `write_file` reaches the agent as a tool observation. Summary-only
+   checkpoints can be rolled into one CAST K0 semantic projection under the
+   configured cache/CAST policy, producing a new immutable epoch.
 
 The loop bounds turns, tokens, wall time, transcript size, and summaries. It
 returns cumulative provider usage and latency as redacted metadata. `lm.py`
 contains optional DSPy-compatible `CambiumLM` and `ArchitectusLM` adapters;
 they are not a supervisor planner.
 
-`Diffundo` is a tiered provider router with health, configured RPM request-rate
-buckets, cooldown, circuit-breaker, and evidence-based candidate ordering. The
-ordering key uses success confidence, latency-SLO compliance, expected cost per
-successful turn, normalized latency/cache evidence, incumbent stickiness,
-rotation, debt, and configured order when evidence is absent. A depleted bucket
-reports `RATE_LIMITED`. It has no local response cache. HTTP 429 responses carry
-a parsed `Retry-After` delay into the same-provider retry path. One-shot runs
+`Diffundo` is a tiered provider router with health, independent request-rate
+and in-flight capacity buckets, cooldown, circuit-breaker, and evidence-based
+candidate ordering. The ordering key uses success confidence, latency-SLO
+compliance, expected cost per successful turn, measured output throughput,
+normalized latency/cache evidence, incumbent stickiness, rotation, debt, and
+configured order when evidence is absent. A depleted bucket reports
+`RATE_LIMITED`. It has no local response cache. HTTP 429 responses carry a
+parsed `Retry-After` delay into the same-provider retry path. One-shot runs
 store routing debt in `<repo>/.cambium/routing-state.json`; `DebtStore` itself
 defaults to `~/.config/cambium/routing-state.json` when no path is supplied.
+Interactive wall budgets use explicit configuration when supplied and can
+otherwise scale from provider throughput hints and measured branch usage with a
+safety factor.
+
+`provider_scheduler.py` owns the provider-neutral `CacheHorizonConfig` and
+`CastConfig` values. `summary_trunk.py` compiles immutable semantic history into
+CAST K0; interactive `/compact` and configured rollover paths write a successor
+content-addressed epoch and preserve the source segments.
 
 The escaped-secret bench canary was deleted by product decision; it is no
 longer a live blocker.
@@ -151,7 +166,9 @@ Do not use those names as current architecture components.
    `main` directly.
 4. The merge sequencer owns staging, expected-old checks, quarantine, and
    cleanup. A conflict, non-fast-forward, or cleanup violation does not
-   advance `main`.
+   advance `main`; conflicts surface as a structured `merge_failed` envelope
+   with `status=merge_conflict`, conflicted files, bounded diff evidence, and
+   the integration head.
 5. The event store owns durable rows and its writer thread. Observer copies
    cannot mutate persisted records.
 
@@ -166,7 +183,10 @@ Provider credentials are allowlisted environment values. They must not enter
 task specs, prompts persisted as events, logs, or result
 artifacts. Worktree and process-group isolation is not an OS sandbox.
 `approval.py` and `resources.py` are deleted; `tools.py`
-`run_shell`/`git_op` execute without `ApprovalGate` or `CompileGate`.
+`run_shell`/`git_op` execute without `ApprovalGate` or `CompileGate`. The
+navigation tools use the same schema/dispatch boundary as all worker tools;
+`run_python` requires the separate `python` permission key and is not granted
+by `shell`.
 
 Live-use blockers were removed by product decision; this is a local development
 tool run directly from source.
@@ -199,10 +219,10 @@ decision; worktree/process-group isolation is the only worker boundary.
 Landed (see §1 and [`implementation-plan.md`](../../implementation-plan.md)
 step 3): durable redacted usage events, provider and model identity, token/cost
 fields, request-rate status, account-quota ownership, privacy/redaction rules,
-Retry-After and `RATE_LIMITED` behavior, and prompt-prefix/cache-hit metrics are
-in place. Weighted routing remains a target: priority ordering stays the
-current policy until the usage and quota evidence from
-`scripts/usage_evidence.py` is stable.
+Retry-After and `RATE_LIMITED` behavior, prompt-prefix/cache-hit metrics, and
+measured output throughput are in place. Priority remains the first policy
+class; measured quality and throughput refine ordering only within an
+equal-priority run.
 
 ### External-provider acceptance
 
@@ -225,7 +245,7 @@ credentials/configuration are external and ephemeral.
 | Task tree | `build_tree` rejects missing dependencies, multiple roots/parents, cycles, and bounds. | A future scheduler dispatches only a validated graph with snapshotted specs. |
 | IPC | Framing limits, request IDs, heartbeat deadlines, and request-correlated result checks are enforced in `_Runtime._drive_generation`. | Stale or missing worker messages cannot complete a task. |
 | Worker | Provider/tool failures, missing results, non-zero exits, and wall/token limits fail the generation; recoverable failures may restart it. | A worker verdict is accepted only for its active generation. |
-| Merge | Conflict, non-fast-forward, unsafe quarantine, or cleanup failure stops publication. | `main` advances only through the expected-old ref contract. |
+| Merge | Conflict, non-fast-forward, unsafe quarantine, cleanup failure, or a failed parent join stops publication/resume. | `main` advances only through the expected-old ref contract; accepted child publication must satisfy `post_join_parent_HEAD == accepted_integration_HEAD`. Conflicts use a structured `merge_conflict` envelope. |
 | Store | Critical event admission waits for the writer; writer death raises; non-critical overflow follows the bounded queue policy. | Durable failure is visible; no silent success after store failure. |
 
 The table describes checks on paths that call these modules. A helper's
@@ -238,11 +258,12 @@ hierarchy remain targets; approval and containment were removed by decision.
 | --- | --- | --- |
 | CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Direct-source CLI; version-only package export |
 | Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan` for plans without `depends_on`; static ready-node waves with width-bounded admission for plans with `depends_on`; one-task adapter retained |
-| Worker/IPC | `src/cambium/worker.py`, `ipc.py`, `prompts.py` | Marker mode, custom provider loop, bounded NDJSON; production prompt text centralized in versioned constants (`PROMPTS_VERSION`) with a drift test against worker embeds |
-| Provider/LM | `diffundo.py`, `provider_config.py`, `lm.py` | Priority router and optional adapters; external proof open |
+| Worker/IPC | `src/cambium/worker.py`, `src/cambium/ipc.py`, `src/cambium/prompts.py` | Marker mode, custom provider loop, bounded NDJSON; `CODING_AGENT` and `SEMANTIC_SUMMARIZER` prompt text is centralized in versioned constants (`PROMPTS_VERSION`) with a drift test against worker embeds |
+| Provider/LM | `src/cambium/diffundo.py`, `src/cambium/routing.py`, `src/cambium/provider_config.py`, `src/cambium/lm.py` | Independent request-rate/in-flight lanes, measured `tokens_per_s` plus configured throughput hints, priority router, and optional adapters |
+| Context/CAST | `src/cambium/summary_trunk.py`, `src/cambium/provider_scheduler.py`, `src/cambium/interactive.py` | Immutable summary entries, K0 projection/rollover, cache-horizon and CAST thresholds, and interactive epoch publication |
 | Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic child admission wired through the injected decision port (`ArchitectusCore` or `aggregate`/`step` adapter) with conversation persistence, exposed by `Orchestrator.run` and `cambium supervisor --conversations` |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
-| Controls | `tools.py`, `schemas.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; bounded code navigation (`code_index`, `lsp_query`) exposed as schemas and dispatched through `run_tool`; `run_python` holds a permission key separate from shell; `approval.py` and `resources.py` are deleted |
+| Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `src/cambium/code_index.py`, `src/cambium/lsp_query.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `search_symbols` (symbol search), `find_references` (references), `read_symbol` (bounded source window), and `query_lsp` (LSP queries) are wired into `TOOL_SCHEMAS` and `run_tool`; `run_python` holds a `python` permission key separate from shell; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
 
 Any target moves to current only after a caller and focused failure test
