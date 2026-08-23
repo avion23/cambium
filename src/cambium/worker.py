@@ -564,6 +564,7 @@ _DIFFUNDO_OPTIONS = frozenset(
         "breaker_failure_threshold",
         "open_backoff_base",
         "retry_base_delay_s",
+        "summary_call_budget_s",
     }
 )
 
@@ -3988,12 +3989,21 @@ async def _run_agent_loop(
             )
             sent_summary_prompt = copy.deepcopy(summary_prompt)
             try:
-                summary_result = await router.call(
-                    tier,
-                    summary_prompt,
-                    model=model,
-                    budget_usd=budget_usd,
-                )
+                summary_caller = getattr(router, "summary_call", None)
+                if callable(summary_caller):
+                    summary_result = await summary_caller(
+                        tier,
+                        summary_prompt,
+                        model=model,
+                        budget_usd=budget_usd,
+                    )
+                else:
+                    summary_result = await router.call(
+                        tier,
+                        summary_prompt,
+                        model=model,
+                        budget_usd=budget_usd,
+                    )
             except Exception as exc:
                 if writer is not None:
                     await _emit_usage_event(
@@ -4010,8 +4020,16 @@ async def _run_agent_loop(
                         epoch=usage_epoch,
                         fork_of=usage_fork_of,
                     )
+                detail = exc.__class__.__name__
+                if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
+                    inner = exc.last_error
+                    inner_message = str(inner).strip() or "<no message>"
+                    detail = (
+                        f"{detail}: {inner.__class__.__name__}: "
+                        f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
+                    )
                 raise ContextForkError(
-                    f"summary provider call failed: {exc.__class__.__name__}"
+                    f"summary provider call failed: {detail}"
                 ) from exc
             if time.monotonic() >= wall_deadline:
                 raise ContextForkError("wall budget exceeded during summary flush")

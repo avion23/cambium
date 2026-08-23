@@ -153,6 +153,7 @@ _URL_CREDENTIALS_RE = re.compile(
 )
 _REDACTED = "[REDACTED]"
 MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_SUMMARY_CALL_BUDGET_S = 120.0
 _CLOUDFLARE_1010_RE = re.compile(
     r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
     r"error\s*(?:code\s*)?[:#-]?\s*1010|browser(?:['’]s)?\s+signature))",
@@ -1450,6 +1451,7 @@ class Diffundo:
         breaker_failure_threshold: float = 0.5,
         open_backoff_base: float = 2.0,
         retry_base_delay_s: float = 0.05,
+        summary_call_budget_s: float | None = None,
         rotation_seed: int = 0,
         primary_provider: str | None = None,
         credential_source: CredentialSource | None = None,
@@ -1493,6 +1495,20 @@ class Diffundo:
                     self._primary_provider = provider.name
                     break
         self._call_budget_s = call_budget_s
+        if summary_call_budget_s is None:
+            self._summary_call_budget_s = max(
+                DEFAULT_SUMMARY_CALL_BUDGET_S,
+                float(call_budget_s) * 2.0,
+            )
+        elif (
+            isinstance(summary_call_budget_s, bool)
+            or not isinstance(summary_call_budget_s, int | float)
+            or not math.isfinite(float(summary_call_budget_s))
+            or summary_call_budget_s <= 0
+        ):
+            raise ValueError("summary_call_budget_s must be a finite positive number")
+        else:
+            self._summary_call_budget_s = float(summary_call_budget_s)
         self._pause_timeout_s = pause_timeout_s
         self._breaker_window = breaker_window_size
         self._breaker_threshold = breaker_failure_threshold
@@ -1529,6 +1545,7 @@ class Diffundo:
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
+        call_budget_s: float | None = None,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
@@ -1542,13 +1559,21 @@ class Diffundo:
         window, raises ``AllProvidersFailed``.
         """
         validate_prompt_structure(prompt)
+        effective_call_budget_s = self._call_budget_s if call_budget_s is None else call_budget_s
+        if (
+            isinstance(effective_call_budget_s, bool)
+            or not isinstance(effective_call_budget_s, int | float)
+            or not math.isfinite(float(effective_call_budget_s))
+            or effective_call_budget_s <= 0
+        ):
+            raise ValueError("call_budget_s must be a finite positive number")
         request = self._routing_request(
             prompt,
             model,
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
         )
-        deadline = time.monotonic() + self._call_budget_s
+        deadline = time.monotonic() + float(effective_call_budget_s)
         tried: list[str] = []
         last_error: BaseException | None = None
         while True:
@@ -1588,6 +1613,34 @@ class Diffundo:
                 # than returning an artificial all-providers failure.
                 continue
             raise AllProvidersFailed(tried, last_error)
+
+    async def summary_call(
+        self,
+        tier: ProviderTier,
+        prompt: dict[str, Any],
+        *,
+        model: str | None = None,
+        budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
+        requirements: Mapping[str, Any] | None = None,
+    ) -> CallResult:
+        """Run a semantic summary with extra provider response headroom.
+
+        Summary prompts contain the complete raw execution tail and the model
+        must produce a structured entry, so they can take materially longer
+        than the short action calls that precede them.  This remains the same
+        router (and therefore the same provider lease/cascade); only its
+        bounded transport deadline is extended for the summary call.
+        """
+        return await self.call(
+            tier,
+            prompt,
+            model=model,
+            budget_usd=budget_usd,
+            allow_model_substitution=allow_model_substitution,
+            requirements=requirements,
+            call_budget_s=self._summary_call_budget_s,
+        )
 
     def health(self, name: str) -> HealthState:
         """Current circuit-breaker health state for a provider."""
