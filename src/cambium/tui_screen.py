@@ -1089,14 +1089,8 @@ def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
     """Render agents with stable glyph, task, and provider/model columns."""
     panel_width = max(1, width)
     name_start = 3
-    states = [
-        _side_clean(getattr(agent, "state", "?")).strip() or "?"
-        for agent in agents
-    ]
-    tasks = [
-        _side_clean(getattr(agent, "task_id", "?")).strip() or "?"
-        for agent in agents
-    ]
+    states = [_side_clean(getattr(agent, "state", "?")).strip() or "?" for agent in agents]
+    tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
     state_width = min(
         max((len(state) for state in states), default=1),
         max(1, panel_width - name_start - 1),
@@ -1251,9 +1245,7 @@ def _side_sections(
         for event in recent[-4:]:
             _append_side_rows(lines, _recent_rows(event, panel_width), capacity)
 
-    return [
-        _side_row(kind, text, panel_width) for kind, text in lines[:capacity]
-    ]
+    return [_side_row(kind, text, panel_width) for kind, text in lines[:capacity]]
 
 
 def _style_kind(kind: str) -> str:
