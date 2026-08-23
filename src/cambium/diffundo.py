@@ -2094,6 +2094,19 @@ class Diffundo:
                 for attempt_no in range(provider.max_retries + 1):
                     remaining = self._remaining(deadline)
                     if remaining is not None and remaining <= 0:
+                        if last_exc is not None:
+                            # A real provider response was observed before the
+                            # budget ran out; preserve its outcome and reset
+                            # evidence (e.g. Retry-After) for scheduler use.
+                            raise ProviderError(
+                                provider.name,
+                                last_exc.outcome,
+                                "call budget exhausted",
+                                last_exc.cause,
+                                budget_exhausted=True,
+                                retry_after_s=last_retry_after,
+                                account_quota_owner=last_quota_owner,
+                            ) from last_exc
                         raise ProviderError(
                             provider.name,
                             ProviderOutcome.TIMEOUT,
