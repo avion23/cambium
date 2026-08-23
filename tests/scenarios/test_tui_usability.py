@@ -9,6 +9,7 @@ from pathlib import Path
 
 from cambium import tui
 from cambium.oneshot import OneShotConfig
+from cambium.supervisor import PlanResult, TaskResult
 
 
 class _Tty(io.StringIO):
@@ -140,4 +141,70 @@ def test_ctrl_c_cancels_active_turn_and_returns_to_prompt(monkeypatch, tmp_path:
         )
 
     assert asyncio.run(scenario()) == 0
+    assert "turn cancelled" in output.getvalue()
+
+
+def test_tty_input_during_turn_is_queued_and_runs_after(monkeypatch, tmp_path: Path) -> None:
+    from cambium.interactive import InteractiveSession
+
+    prompts: list[str] = []
+
+    async def fake_run(self, turn, *, on_event=None):
+        del on_event
+        prompts.append(turn.config.prompt)
+        if turn.number == 1:
+            await asyncio.sleep(0.05)
+        return PlanResult(
+            (TaskResult(task_id=f"task-{turn.number}", status="succeeded", exit_code=0),)
+        )
+
+    monkeypatch.setattr(InteractiveSession, "run_turn", fake_run)
+    source = _Tty("first\nfollow-up\n/exit\n")
+    output = _Tty()
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=source,
+            output_stream=output,
+            error_stream=io.StringIO(),
+        )
+    )
+
+    assert code == 0
+    assert prompts == ["first", "follow-up"]
+    assert "queued: follow-up" in output.getvalue()
+
+
+def test_bang_cancel_cancels_active_turn(monkeypatch, tmp_path: Path) -> None:
+    from cambium.interactive import InteractiveSession
+
+    prompts: list[str] = []
+    completions: list[bool] = []
+
+    async def fake_run(self, turn, *, on_event=None):
+        del on_event
+        prompts.append(turn.config.prompt)
+        await asyncio.Event().wait()
+
+    def complete_turn(self, _turn, *, succeeded):
+        completions.append(succeeded)
+
+    monkeypatch.setattr(InteractiveSession, "run_turn", fake_run)
+    monkeypatch.setattr(InteractiveSession, "complete_turn", complete_turn)
+    source = _Tty("work\n!cancel\n/exit\n")
+    output = _Tty()
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=source,
+            output_stream=output,
+            error_stream=io.StringIO(),
+        )
+    )
+
+    assert code == 0
+    assert prompts == ["work"]
+    assert completions == [False]
     assert "turn cancelled" in output.getvalue()
