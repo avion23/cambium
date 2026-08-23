@@ -154,6 +154,9 @@ async def run_repl(
     error_stream: TextIO | None = None,
 ) -> int:
     """Run prompts with one fresh immutable config per prompt."""
+    # REPL turns are interactive even when the caller bypasses ``cli.py``;
+    # preserve an explicit max_wall_s while opting into the adaptive default.
+    config = replace(config, interactive=True)
     input_stream = cast(TextIO, sys.stdin if input_stream is None else input_stream)
     output_stream = cast(TextIO, sys.stdout if output_stream is None else output_stream)
     error_stream = cast(TextIO, sys.stderr if error_stream is None else error_stream)
