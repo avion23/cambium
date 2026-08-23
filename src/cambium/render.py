@@ -47,9 +47,7 @@ _SUPERVISOR_RESULT_FIELDS = frozenset(
     }
 )
 
-_SAFE_KEYS = (
-    frozenset(ROOT_RESULT_KEYS) | frozenset(CHILD_RESULT_KEYS) | _SUPERVISOR_RESULT_FIELDS
-)
+_SAFE_KEYS = frozenset(ROOT_RESULT_KEYS) | frozenset(CHILD_RESULT_KEYS) | _SUPERVISOR_RESULT_FIELDS
 
 _EVENT_ENVELOPE_KEYS = frozenset(
     {
@@ -120,13 +118,9 @@ def _filter_safe(record: Mapping[str, Any]) -> dict[str, Any]:
         if key not in _SAFE_KEYS:
             continue
         if key == "results":
-            if not isinstance(item, (list, tuple)):
+            if not isinstance(item, list | tuple):
                 continue
-            item = [
-                _filter_safe(entry)
-                for entry in item
-                if isinstance(entry, Mapping)
-            ]
+            item = [_filter_safe(entry) for entry in item if isinstance(entry, Mapping)]
         filtered[key] = item
     return filtered
 
@@ -177,20 +171,16 @@ def render_text_result(result: Any) -> str:
         parts.append(f"reason={_sanitize_field(reason)!r}")
     for label, key in (("commits", "commits"), ("files", "files_changed")):
         items = record.get(key)
-        if isinstance(items, (list, tuple)) and items:
+        if isinstance(items, list | tuple) and items:
             parts.append(f"{label}={len(items)}")
     metric = record.get("metric_score")
-    if (
-        isinstance(metric, (int, float))
-        and not isinstance(metric, bool)
-        and metric != 0
-    ):
+    if isinstance(metric, int | float) and not isinstance(metric, bool) and metric != 0:
         parts.append(f"metric={metric:g}")
     merge_sha = record.get("merge_sha")
     if isinstance(merge_sha, str) and merge_sha:
         parts.append(f"merge={_sanitize_field(merge_sha)[:12]}")
     results = record.get("results")
-    if isinstance(results, (list, tuple)) and results:
+    if isinstance(results, list | tuple) and results:
         parts.append(f"plan=tasks:{len(results)}")
         statuses = ", ".join(
             safe(entry.get("status")) for entry in results if isinstance(entry, Mapping)
@@ -262,7 +252,7 @@ def render_usage_stats_line(stats: Any, *, worktree: str | None = None) -> str:
 
     def count(key: str) -> int | None:
         value = record.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int | float):
             return None
         if isinstance(value, float) and not math.isfinite(value):
             return None
@@ -337,7 +327,7 @@ def render_usage_breakdown(breakdown: Any) -> str:
         )
 
     def _amount(value: Any) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int | float):
             return 0.0
         value = float(value)
         if not math.isfinite(value) or value <= 0:
@@ -391,7 +381,9 @@ def _display_width(text: str) -> int:
     return sum(
         0
         if unicodedata.combining(char)
-        else 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        else 2
+        if unicodedata.east_asian_width(char) in {"W", "F"}
+        else 1
         for char in text
     )
 
@@ -403,7 +395,7 @@ def _scalar(value: Any) -> str:
         return str(value)
     if isinstance(value, float) and math.isfinite(value):
         return f"{value:g}"
-    if isinstance(value, (list, tuple, dict)):
+    if isinstance(value, list | tuple | dict):
         return _dumps(value)
     return _sanitize_field(str(value))
 
@@ -435,7 +427,7 @@ def _format_tool_event(payload: Mapping[str, Any], stream: Any = None) -> str:
     duration = payload.get("duration_ms")
     duration_text = (
         f"{duration}ms"
-        if isinstance(duration, (int, float)) and not isinstance(duration, bool)
+        if isinstance(duration, int | float) and not isinstance(duration, bool)
         else "?"
     )
     status = (
@@ -551,9 +543,7 @@ _EVENT_FORMATTERS: dict[str, _EventFormatter] = {
         _pair(payload, "error_type"), _pair(payload, "note"), _pair(payload, "message", "msg")
     ),
     "parse_error": lambda payload: _join(_pair(payload, "message", "msg")),
-    "compaction_failed": lambda payload: _join(
-        _pair(payload, "epoch"), _pair(payload, "reason")
-    ),
+    "compaction_failed": lambda payload: _join(_pair(payload, "epoch"), _pair(payload, "reason")),
     "context_resume_failed": lambda payload: _join(_pair(payload, "reason")),
     "child_rejected": lambda payload: _join(
         _pair(payload, "child_task_id", "child"),
@@ -584,11 +574,7 @@ def render_event_line(event: Mapping[str, Any], *, stream: Any = None) -> str:
         kind = "event"
     payload = event.get("payload")
     if not isinstance(payload, Mapping):
-        payload = {
-            key: value
-            for key, value in event.items()
-            if key not in _EVENT_ENVELOPE_KEYS
-        }
+        payload = {key: value for key, value in event.items() if key not in _EVENT_ENVELOPE_KEYS}
     formatter = _EVENT_FORMATTERS.get(kind)
     if formatter is None:
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -610,7 +596,7 @@ def render_event_line(event: Mapping[str, Any], *, stream: Any = None) -> str:
 
 
 def _finite_number(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     try:
         number = float(value)
@@ -677,6 +663,7 @@ def render_subagent_status(events: Any) -> str:
     if not snapshot.agents:
         return ""
     return "\n".join(render_agent_lines(snapshot))
+
 
 def render_tokens_per_s(events: Any) -> str:
     """Render generation throughput in tokens per second from the latest
@@ -761,11 +748,7 @@ def render_live_status_line(events: Any) -> str:
     ``" · "`` and prefixed with ``"live: "``.  Returns ``""`` when both parts
     are empty.
     """
-    parts = [
-        part
-        for part in (render_tokens_per_s(events), render_active_workers(events))
-        if part
-    ]
+    parts = [part for part in (render_tokens_per_s(events), render_active_workers(events)) if part]
     if not parts:
         return ""
     return "live: " + " · ".join(parts)
@@ -802,11 +785,7 @@ def render_status_bar(events: Any, *, session_label: str) -> str:
             break
     if task_id:
         left_parts.append(f"task={task_id}")
-    heartbeats = [
-        record
-        for record in records
-        if record.get("kind") == "heartbeat"
-    ]
+    heartbeats = [record for record in records if record.get("kind") == "heartbeat"]
     if heartbeats:
         last = heartbeats[-1]
         status = (
@@ -824,8 +803,7 @@ def render_status_bar(events: Any, *, session_label: str) -> str:
     stats = usage_stats_from_events(records)
     if stats is not None:
         right_parts.append(
-            f"in={stats.input_tokens} out={stats.output_tokens} "
-            f"cached={stats.cached_tokens}"
+            f"in={stats.input_tokens} out={stats.output_tokens} cached={stats.cached_tokens}"
         )
         right_parts.append(f"cost=${stats.estimated_cost_usd:.6f}")
     workers = render_active_workers(records)

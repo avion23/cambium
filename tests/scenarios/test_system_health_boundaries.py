@@ -91,9 +91,7 @@ def test_zero_readings_are_valid_at_zero_thresholds() -> None:
         ({"disk_free": None}, "disk_free unavailable"),
     ],
 )
-def test_unavailable_or_zero_cpu_readings_fail_closed(
-    kwargs: dict[str, Any], reason: str
-) -> None:
+def test_unavailable_or_zero_cpu_readings_fail_closed(kwargs: dict[str, Any], reason: str) -> None:
     result, reasons = _decision(**kwargs)
 
     assert result is False
@@ -132,9 +130,7 @@ def test_missing_memory_sources_fail_closed(monkeypatch: pytest.MonkeyPatch) -> 
         ({"disk_free": math.inf}, "disk_free invalid"),
     ],
 )
-def test_negative_or_absurd_readings_fail_closed(
-    kwargs: dict[str, Any], reason: str
-) -> None:
+def test_negative_or_absurd_readings_fail_closed(kwargs: dict[str, Any], reason: str) -> None:
     result, reasons = _decision(**kwargs)
 
     assert result is False

@@ -155,13 +155,13 @@ def _python_symbols(path: Path, text: str, root: Path) -> list[SourceLocation]:
     for node in ast.walk(tree):
         kind = None
         name = None
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             kind = "function"
             name = node.name
         elif isinstance(node, ast.ClassDef):
             kind = "class"
             name = node.name
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if len(targets) == 1 and isinstance(targets[0], ast.Name):
                 kind = "variable"
@@ -260,9 +260,7 @@ def _python_reference_positions(text: str, symbol: str) -> list[tuple[int, int]]
     return positions
 
 
-_GENERIC_STRING = re.compile(
-    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)'''
-)
+_GENERIC_STRING = re.compile(r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)""")
 _GENERIC_COMMENT = re.compile(r"(?:#|//|/\\*|--).*$")
 
 
@@ -345,9 +343,7 @@ def read_symbol(
         "path": str(target.relative_to(resolved_root)),
         "start_line": start,
         "end_line": end,
-        "content": "\n".join(
-            f"{index:>6}  {lines[index - 1]}" for index in range(start, end + 1)
-        ),
+        "content": "\n".join(f"{index:>6}  {lines[index - 1]}" for index in range(start, end + 1)),
     }
 
 

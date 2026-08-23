@@ -63,14 +63,10 @@ _CREATE_TABLE = """CREATE TABLE IF NOT EXISTS conversations (
     meta     TEXT NULL
 )"""
 _CREATE_NODE_INDEX = (
-    "CREATE INDEX IF NOT EXISTS conversations_node_id_idx "
-    "ON conversations(node_id)"
+    "CREATE INDEX IF NOT EXISTS conversations_node_id_idx ON conversations(node_id)"
 )
 
-_SELECT_HEAD = (
-    "SELECT id FROM conversations WHERE node_id = ? "
-    "ORDER BY seq DESC, id DESC LIMIT 1"
-)
+_SELECT_HEAD = "SELECT id FROM conversations WHERE node_id = ? ORDER BY seq DESC, id DESC LIMIT 1"
 _SELECT_CHAIN = """WITH RECURSIVE chain(id, parent_id, depth) AS (
     SELECT id, parent_id, 0 FROM conversations WHERE id = :head_id
     UNION ALL
@@ -411,9 +407,7 @@ class ConversationStore:
         for record in records:
             tokens = record["tokens"]
             if tokens is not None:
-                tokens_by_kind[record["kind"]] = tokens_by_kind.get(record["kind"], 0) + int(
-                    tokens
-                )
+                tokens_by_kind[record["kind"]] = tokens_by_kind.get(record["kind"], 0) + int(tokens)
 
         latest_summary = next(
             (record for record in reversed(records) if record["kind"] == "summary"),
@@ -620,9 +614,7 @@ class ConversationStore:
 
                 head = conn.execute(_SELECT_HEAD, (node_id,)).fetchone()
                 if head is None:
-                    raise ValueError(
-                        f"summary range is not on node {node_id!r}'s active path"
-                    )
+                    raise ValueError(f"summary range is not on node {node_id!r}'s active path")
                 head_id = int(head[0])
                 covers_from, covers_to = summary_range
                 if covers_to != head_id:
@@ -698,9 +690,7 @@ class ConversationStore:
                 "meta": "meta TEXT",
             }
             missing = [
-                (name, definition)
-                for name, definition in required.items()
-                if name not in columns
+                (name, definition) for name, definition in required.items() if name not in columns
             ]
             if version >= _SCHEMA_VERSION and missing:
                 names = ", ".join(name for name, _ in missing)
@@ -722,9 +712,7 @@ class ConversationStore:
                 f"conversation database has invalid foreign key: {foreign_key_error}"
             )
 
-        rows = conn.execute(
-            "SELECT id, parent_id, kind, meta FROM conversations"
-        ).fetchall()
+        rows = conn.execute("SELECT id, parent_id, kind, meta FROM conversations").fetchall()
         row_ids = {int(row[0]) for row in rows}
         for row_id, parent_id, kind, meta in rows:
             if parent_id is not None and int(parent_id) not in row_ids:
@@ -740,11 +728,7 @@ class ConversationStore:
                 value = decoded.get(name)
                 if value is None:
                     continue
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, int)
-                    or value not in row_ids
-                ):
+                if isinstance(value, bool) or not isinstance(value, int) or value not in row_ids:
                     raise RuntimeError(
                         f"conversation summary row {row_id} references missing {name} {value}"
                     )
@@ -809,9 +793,7 @@ class ConversationStore:
                 raise ConversationStoreError(
                     f"cycle in conversation parent chain at id {deepest[2]}"
                 )
-            raise ConversationStoreError(
-                f"conversation parent id does not exist: {deepest[2]}"
-            )
+            raise ConversationStoreError(f"conversation parent id does not exist: {deepest[2]}")
 
         if stop_id is not None:
             stop_index = next(
@@ -819,9 +801,7 @@ class ConversationStore:
                 None,
             )
             if stop_index is None:
-                raise ValueError(
-                    f"conversation id is not on node {head_id}'s path: {stop_id}"
-                )
+                raise ValueError(f"conversation id is not on node {head_id}'s path: {stop_id}")
             rows = rows[: stop_index + 1]
 
         return [cls._row_to_dict(row) for row in rows]
@@ -912,7 +892,5 @@ class ConversationStore:
 
     @staticmethod
     def _validate_tail(tail: int | None) -> None:
-        if tail is not None and (
-            isinstance(tail, bool) or not isinstance(tail, int) or tail < 0
-        ):
+        if tail is not None and (isinstance(tail, bool) or not isinstance(tail, int) or tail < 0):
             raise ValueError("tail must be a non-negative integer or None")

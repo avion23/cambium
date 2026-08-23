@@ -78,9 +78,7 @@ def test_malformed_record_is_rejected(tmp_path) -> None:
 
 def test_missing_expected_reason_is_rejected(tmp_path) -> None:
     bad = tmp_path / "bad_reason.jsonl"
-    bad.write_text(
-        '{"input": {"task": "Do the thing."}, "expected": {"decompose": false}}\n'
-    )
+    bad.write_text('{"input": {"task": "Do the thing."}, "expected": {"decompose": false}}\n')
     try:
         ExampleDatasetLoader(bad).load()
     except DatasetError:

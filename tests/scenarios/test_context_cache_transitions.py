@@ -45,7 +45,6 @@ class _FakeCallResult:
 
 
 class _ScriptedRouter:
-
     def declared_model(self, name: str) -> str:
         return ""
 
@@ -68,12 +67,10 @@ class _ScriptedRouter:
             if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
             else None
         )
-        if isinstance(last_content, str) and last_content.startswith(
-            "<cambium-summary-control>\n"
-        ):
-            payload = last_content.removeprefix(
-                "<cambium-summary-control>\n"
-            ).removesuffix("\n</cambium-summary-control>")
+        if isinstance(last_content, str) and last_content.startswith("<cambium-summary-control>\n"):
+            payload = last_content.removeprefix("<cambium-summary-control>\n").removesuffix(
+                "\n</cambium-summary-control>"
+            )
             control = json.loads(payload)
             summary = {
                 "type": "summary_entry",
@@ -92,9 +89,7 @@ class _ScriptedRouter:
                 "relevant_failed_approaches": [],
                 "open_items": [],
             }
-            return _FakeCallResult(
-                json.dumps(summary, sort_keys=True, separators=(",", ":"))
-            )
+            return _FakeCallResult(json.dumps(summary, sort_keys=True, separators=(",", ":")))
         if not self.responses:
             raise AssertionError("router call with no scripted response")
         return _FakeCallResult(self.responses.pop(0))
@@ -206,9 +201,7 @@ async def _drive_loop(
 
 def _message_chars(messages: list[dict[str, Any]]) -> int:
     return sum(
-        len(content)
-        for message in messages
-        if isinstance(content := message.get("content"), str)
+        len(content) for message in messages if isinstance(content := message.get("content"), str)
     )
 
 
@@ -220,9 +213,7 @@ def _summary_indices(messages: list[dict[str, Any]]) -> list[int]:
     return [
         index
         for index, message in enumerate(messages)
-        if str(message.get("content", "")).startswith(
-            "<cambium-summary-entry>\n"
-        )
+        if str(message.get("content", "")).startswith("<cambium-summary-entry>\n")
     ]
 
 
@@ -246,9 +237,7 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
             {"role": "user", "content": "immutable tool schemas"},
         ],
     )
-    original_checkpoint_bytes = (
-        checkpoint_root / checkpoint.checkpoint_ref
-    ).read_bytes()
+    original_checkpoint_bytes = (checkpoint_root / checkpoint.checkpoint_ref).read_bytes()
     child = _strict_child_envelope("seed")
     seed_chars = len(worker._child_result_lines(child))
     threshold_high = seed_chars + 1
@@ -291,14 +280,11 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
     assert len(post_flush) == len(immutable_head) + 1
     assert post_flush[-1]["role"] == "user"
     assert not any(
-        "<cambium-rolling-context>" in str(message.get("content", ""))
-        for message in post_flush
+        "<cambium-rolling-context>" in str(message.get("content", "")) for message in post_flush
     )
 
     advanced = [
-        message
-        for message in writer.messages()
-        if message["type"] == "context_epoch_advanced"
+        message for message in writer.messages() if message["type"] == "context_epoch_advanced"
     ]
     assert [message["turn"] for message in advanced] == [checkpoint.turn + 2]
     folded = worker._load_epoch_checkpoint(
@@ -310,9 +296,8 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
     assert entries[0].sequence == 1
     assert entries[0].source_message_count == 3
     assert entries[0].through_turn == checkpoint.turn + 2
-    assert (
-        checkpoint_root / checkpoint.checkpoint_ref
-    ).read_bytes() == original_checkpoint_bytes
+    assert (checkpoint_root / checkpoint.checkpoint_ref).read_bytes() == original_checkpoint_bytes
+
 
 def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     tmp_path: Path,
@@ -347,10 +332,7 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
         },
         max_turns=3,
     )
-    read_call = (
-        '{"type":"tool_call","name":"read_batch",'
-        '"arguments":{"paths":["alpha.txt"]}}'
-    )
+    read_call = '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}'
     plan = '{"type":"plan","steps":["continue"]}'
     router = _ScriptedRouter([read_call, plan])
     writer = _FakeWriter()
@@ -359,9 +341,7 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
 
     assert outcome["status"] == "failed"
     advanced = [
-        message
-        for message in writer.messages()
-        if message["type"] == "context_epoch_advanced"
+        message for message in writer.messages() if message["type"] == "context_epoch_advanced"
     ]
     assert [message["turn"] for message in advanced] == [
         checkpoint.turn + 1,
@@ -407,6 +387,7 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     assert second_entries[1].through_turn == checkpoint.turn + 2
     assert first_entries[0].source_sha256 != second_entries[1].source_sha256
 
+
 def test_fork_prompt_appends_continuation_after_immutable_base() -> None:
     base = [
         {"role": "system", "content": "immutable system prompt"},
@@ -422,5 +403,5 @@ def test_fork_prompt_appends_continuation_after_immutable_base() -> None:
 
     assert prompt["messages"] == [*base, *continuation]
     assert prompt["messages"][: len(base)] == base
-    assert prompt["messages"][len(base):] == continuation
+    assert prompt["messages"][len(base) :] == continuation
     assert base == original_base

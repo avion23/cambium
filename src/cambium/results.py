@@ -67,25 +67,29 @@ EXIT_CODES: dict[str, int] = {
 }
 
 _MISSING = object()
-_FAIL_TOKENS = frozenset({
-    "error",
-    "failed",
-    "failure",
-    "false",
-    "fail",
-    "rejected",
-    "reject",
-    "timeout",
-    "timed_out",
-})
-_CANCEL_TOKENS = frozenset({
-    "cancel",
-    "cancelled",
-    "canceled",
-    "cancellation",
-    "aborted",
-    "shutdown",
-})
+_FAIL_TOKENS = frozenset(
+    {
+        "error",
+        "failed",
+        "failure",
+        "false",
+        "fail",
+        "rejected",
+        "reject",
+        "timeout",
+        "timed_out",
+    }
+)
+_CANCEL_TOKENS = frozenset(
+    {
+        "cancel",
+        "cancelled",
+        "canceled",
+        "cancellation",
+        "aborted",
+        "shutdown",
+    }
+)
 _TIMEOUT_TOKENS = frozenset({"timeout", "timed_out", "watchdog_timeout"})
 _TIMEOUT_REASON_MARKERS = (
     "timeout",
@@ -94,32 +98,36 @@ _TIMEOUT_REASON_MARKERS = (
     "ready_timeout",
     "ping_no_pong",
 )
-_REJECT_TOKENS = frozenset({
-    "reject",
-    "rejected",
-    "evaluator_reject",
-    "evaluator_rejected",
-    "evaluator_rejection",
-    "review_reject",
-    "review_rejected",
-    "review_rejection",
-})
-_HARD_FAILURE_TOKENS = frozenset({
-    "crash",
-    "crashed",
-    "failed",
-    "failure",
-    "fatal",
-    "fatal_error",
-    "protocol",
-    "protocol_error",
-    "protocol_failed",
-    "restart_exhausted",
-    "restart_exhaust",
-    "restarts_exhausted",
-    "gate_failed",
-    "merge_failed",
-})
+_REJECT_TOKENS = frozenset(
+    {
+        "reject",
+        "rejected",
+        "evaluator_reject",
+        "evaluator_rejected",
+        "evaluator_rejection",
+        "review_reject",
+        "review_rejected",
+        "review_rejection",
+    }
+)
+_HARD_FAILURE_TOKENS = frozenset(
+    {
+        "crash",
+        "crashed",
+        "failed",
+        "failure",
+        "fatal",
+        "fatal_error",
+        "protocol",
+        "protocol_error",
+        "protocol_failed",
+        "restart_exhausted",
+        "restart_exhaust",
+        "restarts_exhausted",
+        "gate_failed",
+        "merge_failed",
+    }
+)
 _FAILURE_MARKERS = (
     "crash",
     "fatal",
@@ -173,7 +181,7 @@ def _flag(value: Any) -> bool | None:
         return None
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, int | float) and not isinstance(value, bool):
         return value != 0
     token = _token(value)
     if token in {"true", "yes", "ok", "pass", "passed", "success", "succeeded"}:
@@ -198,7 +206,7 @@ def _signal_failed(value: Any) -> bool:
         value = _first_wire_value(value, ("status", "verdict", "ok", "passed", "exit_code"))
         if value is _MISSING:
             return True
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, int | float) and not isinstance(value, bool):
         return value != 0
     flag = _flag(value)
     if flag is not None:
@@ -231,9 +239,7 @@ def _signal_rejected(value: Any) -> bool:
     if flag is not None:
         return not flag
     token = _token(value)
-    if token in _REJECT_TOKENS or _has_marker(
-        token, ("evaluator_reject", "review_reject")
-    ):
+    if token in _REJECT_TOKENS or _has_marker(token, ("evaluator_reject", "review_reject")):
         return True
     return True
 
@@ -293,27 +299,27 @@ def status_from_wire(
     rejected = evaluator_rejected
     if rejected is None:
         rejected = _flag(evaluator_rejected_value)
-    fallback_rejection = (
-        not evaluator_explicit
-        and (
-            _token(evaluator_value) in _REJECT_TOKENS
-            or _has_marker(evaluator_value, ("evaluator_reject", "review_reject"))
-        )
+    fallback_rejection = not evaluator_explicit and (
+        _token(evaluator_value) in _REJECT_TOKENS
+        or _has_marker(evaluator_value, ("evaluator_reject", "review_reject"))
     )
     unknown_rejection_flag = (
-        evaluator_rejected_value is not _MISSING
-        and _flag(evaluator_rejected_value) is None
+        evaluator_rejected_value is not _MISSING and _flag(evaluator_rejected_value) is None
     )
     if (
         rejected is True
         or unknown_rejection_flag
-        or evaluator_explicit and _signal_rejected(evaluator_value)
+        or evaluator_explicit
+        and _signal_rejected(evaluator_value)
         or fallback_rejection
     ):
         return "rejected"
-    if raw_token in _REJECT_TOKENS or _token(wire_type) in _REJECT_TOKENS or _has_marker(
-        raw_status, ("evaluator_reject", "evaluator_rejection", "review_reject")
-    ) or _has_marker(wire_type, ("evaluator_reject", "review_reject")):
+    if (
+        raw_token in _REJECT_TOKENS
+        or _token(wire_type) in _REJECT_TOKENS
+        or _has_marker(raw_status, ("evaluator_reject", "evaluator_rejection", "review_reject"))
+        or _has_marker(wire_type, ("evaluator_reject", "review_reject"))
+    ):
         return "rejected"
 
     failure_value = _first_wire_value(
@@ -326,9 +332,7 @@ def status_from_wire(
             "termination_reason",
         ),
     )
-    cancellation_flag = _first_wire_value(
-        wire, ("cancelled", "canceled", "cancellation")
-    )
+    cancellation_flag = _first_wire_value(wire, ("cancelled", "canceled", "cancellation"))
     cancellation_value = _first_wire_value(
         wire,
         (
@@ -377,9 +381,12 @@ def status_from_wire(
         or _has_marker(wire_type, _FAILURE_MARKERS)
         or _has_marker(failure_value, _FAILURE_MARKERS)
         or _flag(_first_wire_value(wire, ("crashed", "crash", "protocol_error"))) is True
-        or _flag(_first_wire_value(
-            wire, ("restart_exhausted", "restart_exhaust", "max_restarts_exceeded")
-        )) is True
+        or _flag(
+            _first_wire_value(
+                wire, ("restart_exhausted", "restart_exhaust", "max_restarts_exceeded")
+            )
+        )
+        is True
     )
     if hard_failure:
         return "failed"
@@ -397,9 +404,7 @@ def status_from_wire(
                 "merge",
             ),
         )
-    merge_failed = (
-        merge_ok is not None and merge_ok is not True
-    ) or _signal_failed(merge_value)
+    merge_failed = (merge_ok is not None and merge_ok is not True) or _signal_failed(merge_value)
     if merge_failed:
         return "failed"
 
@@ -415,7 +420,7 @@ def status_from_wire(
 def _copy_sequence(value: Any) -> list[Any]:
     if value is _MISSING or value is None:
         return []
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
         raise TypeError("commits and files_changed must be sequences")
     items = list(value)
     if not all(isinstance(item, str) for item in items):
@@ -500,9 +505,7 @@ def wire_to_child_result(
     status = status_from_wire(wire)
     exit_code = _final_exit_code(_wire_value(wire, "exit_code"))
     if exit_code is not None and status == "done" and exit_code != 0:
-        raise ValueError(
-            f"worker exit_code {exit_code} does not match status {status!r}"
-        )
+        raise ValueError(f"worker exit_code {exit_code} does not match status {status!r}")
     values = {
         "parent_task_id": parent_task_id,
         "unified_diff": unified_diff,
@@ -534,7 +537,7 @@ def _final_metric_score(value: Any) -> float:
 def _final_timestamp(value: Any) -> float:
     if value is _MISSING or value is None:
         raise TypeError("timestamps must be numbers")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError("timestamps must be numbers")
     timestamp = float(value)
     if not math.isfinite(timestamp):
@@ -566,7 +569,7 @@ def _final_metric_breakdown(value: Any) -> dict[str, float]:
 def _final_sequence(value: Any) -> tuple[str, ...]:
     if value is _MISSING or value is None:
         return ()
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
         raise TypeError("commits and files_changed must be sequences")
     items = tuple(value)
     if not all(isinstance(item, str) for item in items):
@@ -706,9 +709,7 @@ def _root_from_child(
         raise TypeError("unified_diff must be a string")
     exit_code = _final_exit_code(child.get("exit_code", _MISSING))
     if exit_code is not None and status == "done" and exit_code != 0:
-        raise ValueError(
-            f"exit_code {exit_code} does not match status {status!r}"
-        )
+        raise ValueError(f"exit_code {exit_code} does not match status {status!r}")
     return Result(
         status=status,
         exit_code=EXIT_CODES[status],
@@ -725,9 +726,7 @@ def _root_from_child(
         started_at=_timestamp_or_now(started_at),
         ended_at=_timestamp_or_now(ended_at),
         failure_reason=(
-            failure_reason
-            if failure_reason is not None
-            else _failure_reason(child, status)
+            failure_reason if failure_reason is not None else _failure_reason(child, status)
         ),
     )
 
@@ -857,9 +856,7 @@ def write_result(
     if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
         raise PermissionError("the session .cambium directory could not be made private")
     target = state_dir / "result.json"
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=state_dir
-    )
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=state_dir)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:

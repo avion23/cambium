@@ -40,16 +40,21 @@ TEST_RESOURCE_THRESHOLDS = {
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    for key, value in (("user.name", "hierarchy-test"), ("user.email", "hierarchy@test"),
-                       ("gc.auto", "0")):
+    for key, value in (
+        ("user.name", "hierarchy-test"),
+        ("user.email", "hierarchy@test"),
+        ("gc.auto", "0"),
+    ):
         subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
     for name, content in files.items():
         (repo / name).write_text(content, encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"],
-                   check=True, capture_output=True)
-    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
+    )
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 def _task(
@@ -161,8 +166,7 @@ def test_static_waves_dispatch_in_dependency_order(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     statuses = {r.task_id: r.status for r in result.results}
-    assert statuses == {"root": "succeeded", "a": "succeeded",
-                        "b": "succeeded", "a1": "succeeded"}
+    assert statuses == {"root": "succeeded", "a": "succeeded", "b": "succeeded", "a1": "succeeded"}
 
     intervals = _enter_exit_intervals(_trace_lines(session_dir))
     assert set(intervals) == {"root", "a", "b", "a1"}
@@ -197,9 +201,7 @@ def _event_kinds_by_task(session_dir: Path) -> dict[str, list[tuple[int, str]]]:
     return out
 
 
-def _seq_of(
-    grouped: dict[str, list[tuple[int, str]]], task_id: str, kind: str
-) -> int | None:
+def _seq_of(grouped: dict[str, list[tuple[int, str]]], task_id: str, kind: str) -> int | None:
     for seq, current in grouped.get(task_id, []):
         if current == kind:
             return seq
@@ -228,9 +230,7 @@ def test_width_bound_caps_concurrent_dispatch(
         monkeypatch.undo()
 
 
-def _assert_wave_width(
-    tmp_path: Path, max_width: int, children: int, delay: str | None
-) -> None:
+def _assert_wave_width(tmp_path: Path, max_width: int, children: int, delay: str | None) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     files = {f"c{i}.txt": f"file c{i}\n" for i in range(1, children + 1)}
@@ -242,8 +242,9 @@ def _assert_wave_width(
         "tasks": [
             _task(session_dir, repo, base, "root", target_file="root.txt"),
             *(
-                _task(session_dir, repo, base, f"c{i}", target_file=f"c{i}.txt",
-                      depends_on=["root"])
+                _task(
+                    session_dir, repo, base, f"c{i}", target_file=f"c{i}.txt", depends_on=["root"]
+                )
                 for i in range(1, children + 1)
             ),
         ],
@@ -283,8 +284,7 @@ def test_child_receives_bounded_parent_envelope(tmp_path: Path) -> None:
     plan = {
         "tasks": [
             _task(session_dir, repo, base, "root", target_file="root.txt"),
-            _task(session_dir, repo, base, "child", target_file="child.txt",
-                  depends_on=["root"]),
+            _task(session_dir, repo, base, "child", target_file="child.txt", depends_on=["root"]),
         ]
     }
     result = _run_with_env(
@@ -332,8 +332,9 @@ def test_failed_node_cascades_skip_to_dependants(tmp_path: Path) -> None:
     plan = {
         "tasks": [
             _task(session_dir, repo, base, "root", target_file="root.txt"),
-            _task(session_dir, repo, base, "a", target_file="a.txt", depends_on=["root"],
-                  fail=True),
+            _task(
+                session_dir, repo, base, "a", target_file="a.txt", depends_on=["root"], fail=True
+            ),
             _task(session_dir, repo, base, "b", target_file="b.txt", depends_on=["root"]),
             _task(session_dir, repo, base, "a1", target_file="a1.txt", depends_on=["a"]),
         ]
@@ -388,8 +389,7 @@ def test_flat_plan_ignores_max_width_and_preserves_canary(tmp_path: Path) -> Non
     base = _make_repo(repo, files)
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, f"g{i}", target_file=f"g{i}.txt")
-            for i in range(1, 5)
+            _task(session_dir, repo, base, f"g{i}", target_file=f"g{i}.txt") for i in range(1, 5)
         ]
     }
 
@@ -423,8 +423,7 @@ def _event_kinds_by_task_full(session_dir: Path) -> list[tuple[int, str, str]]:
     out: list[tuple[int, str, str]] = []
     with sqlite3.connect(db) as conn:
         for seq, kind, task_id in conn.execute(
-            "SELECT seq, kind, task_id FROM events "
-            "WHERE kind IN ('spawned', 'result') ORDER BY seq"
+            "SELECT seq, kind, task_id FROM events WHERE kind IN ('spawned', 'result') ORDER BY seq"
         ):
             out.append((seq, kind, task_id or ""))
     return out

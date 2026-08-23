@@ -54,9 +54,7 @@ def _write_config(tmp_path: Path, required: bool) -> Path:
 def _run_doctor(cwd: Path) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
-    return subprocess.run(
-        DOCTOR, cwd=cwd, env=env, capture_output=True, text=True, timeout=300
-    )
+    return subprocess.run(DOCTOR, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
 
 
 def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> None:
@@ -96,9 +94,7 @@ def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> No
     assert "test-provider(model=example-model)=missing" in detail
 
 
-def test_doctor_provider_row_surfaces_durable_quarantine_reason(
-    tmp_path, monkeypatch
-) -> None:
+def test_doctor_provider_row_surfaces_durable_quarantine_reason(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     _write_config(tmp_path, required=False)
     monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
@@ -116,10 +112,7 @@ def test_doctor_provider_row_surfaces_durable_quarantine_reason(
     status, detail = doctor.check_provider_env(tmp_path)
 
     assert status is doctor.Status.WARN, detail
-    assert (
-        "test-provider(model=example-model)=missing (disabled: config_error:"
-        in detail
-    )
+    assert "test-provider(model=example-model)=missing (disabled: config_error:" in detail
 
 
 def test_doctor_ignores_corrupt_routing_ledger(tmp_path, monkeypatch) -> None:

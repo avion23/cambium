@@ -87,9 +87,7 @@ def _enqueue_error(
     headers: dict[str, str] | None = None,
 ) -> None:
     with REQUEST_LOCK:
-        RESPONSES.append(
-            {"status": status, "payload": payload, "headers": headers or {}}
-        )
+        RESPONSES.append({"status": status, "payload": payload, "headers": headers or {}})
 
 
 def _rate_limit_error() -> dict[str, Any]:
@@ -125,7 +123,9 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
             REQUEST_AUTHORIZATION.append(self.headers.get("Authorization", ""))
             response = cast(
                 dict[str, Any],
-                RESPONSES.pop(0) if RESPONSES else {
+                RESPONSES.pop(0)
+                if RESPONSES
+                else {
                     "status": 500,
                     "payload": _server_error(),
                     "headers": {},
@@ -164,12 +164,8 @@ class _FakeOpenAIServer:
 def _make_repo(repo: Path) -> str:
     repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "usage-event-test"], check=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "usage-event@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "usage-event-test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "usage-event@test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     (repo / "target.txt").write_text("fixture\n", encoding="utf-8")
     (repo / "notes.txt").write_text("output-sentinel-9x7q\n", encoding="utf-8")
@@ -253,18 +249,13 @@ def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> Non
 
 
 @pytest.mark.slow
-def test_durable_usage_events_redacted_and_missing_fields_omitted(
-    tmp_path, monkeypatch
-) -> None:
+def test_durable_usage_events_redacted_and_missing_fields_omitted(tmp_path, monkeypatch) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _set_provider_env(monkeypatch, config_path)
-        _enqueue(
-            '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["notes.txt"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"read_batch","arguments":{"paths":["notes.txt"]}}')
         # turn 2: 429 with Retry-After + reported quota owner, then a same-provider
         # retry succeeds (max_retries=1)
         _enqueue_error(_rate_limit_error(), status=429, headers={"Retry-After": "0"})
@@ -286,7 +277,8 @@ def test_durable_usage_events_redacted_and_missing_fields_omitted(
         task["max_restarts"] = 0
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )

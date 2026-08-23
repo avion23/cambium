@@ -74,15 +74,29 @@ from .redact import EVENT_RECORD_STRUCTURAL_FIELDS, Redactor
 
 logger = logging.getLogger(__name__)
 
-CRITICAL_KINDS = frozenset({
-    "result", "checkpoint", "worker_exit", "task_failed",
-    "merge_progress", "task_assigned", "merge_committed",
-    "merge_staging_quarantined", "merge_staging_cleanup_failed",
-    "merge_staging_prune_started", "merge_staging_pruned",
-    "context_checkpoint", "context_fork", "context_fork_skipped",
-    "context_resume", "context_resume_failed", "context_epoch_advanced",
-    "compaction_failed", "child_admitted",
-})
+CRITICAL_KINDS = frozenset(
+    {
+        "result",
+        "checkpoint",
+        "worker_exit",
+        "task_failed",
+        "merge_progress",
+        "task_assigned",
+        "merge_committed",
+        "merge_staging_quarantined",
+        "merge_staging_cleanup_failed",
+        "merge_staging_prune_started",
+        "merge_staging_pruned",
+        "context_checkpoint",
+        "context_fork",
+        "context_fork_skipped",
+        "context_resume",
+        "context_resume_failed",
+        "context_epoch_advanced",
+        "compaction_failed",
+        "child_admitted",
+    }
+)
 
 _SCHEMA = """CREATE TABLE IF NOT EXISTS events (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,9 +122,7 @@ _INSERT = (
 
 _SELECT_NEXT_SEQ = "SELECT next_seq FROM event_store_state WHERE id = 1"
 _INSERT_NEXT_SEQ = "INSERT INTO event_store_state(id, next_seq) VALUES(1, ?)"
-_UPDATE_NEXT_SEQ = (
-    "UPDATE event_store_state SET next_seq = MAX(next_seq, ?) WHERE id = 1"
-)
+_UPDATE_NEXT_SEQ = "UPDATE event_store_state SET next_seq = MAX(next_seq, ?) WHERE id = 1"
 
 _WRITER_BUSY_TIMEOUT_MS = 5000
 # Checkpoints poll busy readers; a short per-call busy wait keeps the retry
@@ -441,11 +453,7 @@ class _BoundedEventQueue:
                     self._cond.notify()
                     return dropped
 
-                evicted = (
-                    self._evict_oldest_noncritical()
-                    if evict_noncritical
-                    else None
-                )
+                evicted = self._evict_oldest_noncritical() if evict_noncritical else None
                 if evicted is None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -524,9 +532,7 @@ class _BoundedEventQueue:
     def _restore_evicted(self, item: Any) -> None:
         evicted_seq = item[0]
         for i, queued in enumerate(self._items):
-            if queued is _SENTINEL or (
-                isinstance(queued, tuple) and queued[0] > evicted_seq
-            ):
+            if queued is _SENTINEL or (isinstance(queued, tuple) and queued[0] > evicted_seq):
                 self._items.insert(i, item)
                 return
         self._items.append(item)
@@ -696,8 +702,7 @@ class EventStore:
         if dropped:
             self._record_dropped(dropped)
             logger.warning(
-                "event store overflow: dropped %d non-critical event(s), "
-                "latest seq %d kind=%r",
+                "event store overflow: dropped %d non-critical event(s), latest seq %d kind=%r",
                 dropped,
                 seq,
                 kind,
@@ -1215,17 +1220,26 @@ class EventStore:
     @staticmethod
     def _row_to_event(row: tuple) -> dict[str, Any]:
         (
-            seq, kind, payload, ts, monotonic_ms,
-            task_id, worker_id, generation, request_id,
+            seq,
+            kind,
+            payload,
+            ts,
+            monotonic_ms,
+            task_id,
+            worker_id,
+            generation,
+            request_id,
         ) = row
-        return _validate_event_record({
-            "seq": seq,
-            "kind": kind,
-            "payload": json.loads(payload),
-            "ts": ts,
-            "monotonic_ms": monotonic_ms,
-            "task_id": task_id,
-            "worker_id": worker_id,
-            "generation": generation,
-            "request_id": request_id,
-        })
+        return _validate_event_record(
+            {
+                "seq": seq,
+                "kind": kind,
+                "payload": json.loads(payload),
+                "ts": ts,
+                "monotonic_ms": monotonic_ms,
+                "task_id": task_id,
+                "worker_id": worker_id,
+                "generation": generation,
+                "request_id": request_id,
+            }
+        )

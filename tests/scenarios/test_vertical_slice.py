@@ -91,13 +91,14 @@ def test_vertical_slice_happy_path(tmp_path) -> None:
     assert result.status == "succeeded"
     assert result.exit_code == 0
     assert result.merge_sha is not None
-    assert _show_main(scratch, "hello.txt") == (
-        "hello from the vertical slice\n"
-        "// cambium-slice\n"
-    )
+    assert _show_main(scratch, "hello.txt") == ("hello from the vertical slice\n// cambium-slice\n")
     _assert_no_events_jsonl(session_dir)
     assert _protocol_sequence(read_events(session_dir)) == [
-        "init", "ready", "run_task", "result", "exit",
+        "init",
+        "ready",
+        "run_task",
+        "result",
+        "exit",
     ]
 
 
@@ -211,9 +212,7 @@ def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     assert result.timeout_phase == "ready"
     assert result.merge_sha is None
     events = read_events(session_dir)
-    assert any(
-        e["kind"] == "timeout" and e["payload"].get("phase") == "ready" for e in events
-    )
+    assert any(e["kind"] == "timeout" and e["payload"].get("phase") == "ready" for e in events)
 
 
 def test_result_json_has_exact_root_keys_and_success_verdict(tmp_path) -> None:
@@ -246,9 +245,7 @@ def test_spawned_worker_env_has_only_authorized_provider_keys(tmp_path, monkeypa
     dump_path = tmp_path / "worker-env.json"
     monkeypatch.setenv("ENV_DUMP_PATH", str(dump_path))
 
-    env_worker = str(
-        Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "env_worker.py"
-    )
+    env_worker = str(Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "env_worker.py")
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
     _make_scratch(scratch)

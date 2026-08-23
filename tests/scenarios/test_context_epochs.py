@@ -43,14 +43,22 @@ TEST_RESOURCE_THRESHOLDS = {
 }
 
 _STRICT_ENVELOPE_KEYS = {
-    "parent_task_id", "unified_diff", "diff_truncated", "summary",
-    "metric_score", "metric_breakdown", "commits", "files_changed", "status",
+    "parent_task_id",
+    "unified_diff",
+    "diff_truncated",
+    "summary",
+    "metric_score",
+    "metric_breakdown",
+    "commits",
+    "files_changed",
+    "status",
 }
 
 
 # ---------------------------------------------------------------------------
 # Shared in-process harness
 # ---------------------------------------------------------------------------
+
 
 class _FakeWriter:
     def __init__(self) -> None:
@@ -82,7 +90,6 @@ class _FakeCallResult:
 
 
 class _ScriptedRouter:
-
     def declared_model(self, name: str) -> str:
         return ""
 
@@ -105,12 +112,10 @@ class _ScriptedRouter:
             if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
             else None
         )
-        if isinstance(last_content, str) and last_content.startswith(
-            "<cambium-summary-control>\n"
-        ):
-            payload = last_content.removeprefix(
-                "<cambium-summary-control>\n"
-            ).removesuffix("\n</cambium-summary-control>")
+        if isinstance(last_content, str) and last_content.startswith("<cambium-summary-control>\n"):
+            payload = last_content.removeprefix("<cambium-summary-control>\n").removesuffix(
+                "\n</cambium-summary-control>"
+            )
             control = json.loads(payload)
             summary = {
                 "type": "summary_entry",
@@ -129,9 +134,7 @@ class _ScriptedRouter:
                 "relevant_failed_approaches": [],
                 "open_items": [],
             }
-            return _FakeCallResult(
-                json.dumps(summary, sort_keys=True, separators=(",", ":"))
-            )
+            return _FakeCallResult(json.dumps(summary, sort_keys=True, separators=(",", ":")))
         if not self.responses:
             raise AssertionError("router call with no scripted response")
         return _FakeCallResult(self.responses.pop(0))
@@ -140,12 +143,8 @@ class _ScriptedRouter:
 def _make_worktree(repo: Path) -> Path:
     repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "epochs-test"], check=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "epochs@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "epochs-test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "epochs@test"], check=True)
     (repo / "alpha.txt").write_text("alpha-content\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(
@@ -183,11 +182,13 @@ def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
 def _delegate_action(child_task_id: str) -> str:
     return (
         '{"type":"tool_call","name":"delegate","arguments":'
-        + json.dumps({
-            "child_task_id": child_task_id,
-            "kind": "test",
-            "spec": {"task": "child task", "child_only": True},
-        })
+        + json.dumps(
+            {
+                "child_task_id": child_task_id,
+                "kind": "test",
+                "spec": {"task": "child task", "child_only": True},
+            }
+        )
         + "}"
     )
 
@@ -240,7 +241,8 @@ def _write_epoch(
         config,
         turn=1,
         epoch=epoch,
-        messages=messages or [
+        messages=messages
+        or [
             {"role": "system", "content": "You are the agent."},
             {"role": "user", "content": "observe tool output"},
         ],
@@ -279,6 +281,7 @@ def _provider_boundary(provider: str = "p1", model: str = "m1") -> dict[str, Any
 # ---------------------------------------------------------------------------
 # Strict validators (worker side)
 # ---------------------------------------------------------------------------
+
 
 def test_validate_context_fork_strict_keys() -> None:
     digest = _DIGEST
@@ -345,9 +348,7 @@ def test_epoch_checkpoint_roundtrip_and_tamper(tmp_path: Path) -> None:
     config = _agent_config(tmp_path / "wt", checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(config)
 
-    loaded = worker._load_epoch_checkpoint(
-        config, checkpoint.checkpoint_ref, expect_task_id=True
-    )
+    loaded = worker._load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
     assert loaded.epoch == checkpoint.epoch
     assert loaded.cache_key == checkpoint.cache_key
     assert loaded.checkpoint_ref == checkpoint.checkpoint_ref
@@ -355,30 +356,32 @@ def test_epoch_checkpoint_roundtrip_and_tamper(tmp_path: Path) -> None:
     with pytest.raises(ContextForkError, match="task_id mismatch|invalid checkpoint_ref path"):
         worker._load_epoch_checkpoint(
             _agent_config(tmp_path / "wt", task_id="other", checkpoint_root=tmp_path / "ckpts"),
-            checkpoint.checkpoint_ref, expect_task_id=True,
+            checkpoint.checkpoint_ref,
+            expect_task_id=True,
         )
 
     with pytest.raises(ContextForkError, match="generation mismatch"):
         worker._load_epoch_checkpoint(
             _agent_config(
-                tmp_path / "wt", checkpoint_root=tmp_path / "ckpts",
+                tmp_path / "wt",
+                checkpoint_root=tmp_path / "ckpts",
                 generation=2,
             ),
-            checkpoint.checkpoint_ref, expect_task_id=True,
+            checkpoint.checkpoint_ref,
+            expect_task_id=True,
         )
 
     path = tmp_path / "ckpts" / checkpoint.checkpoint_ref
     data = json.loads(path.read_text(encoding="utf-8"))
     data["provider_messages"][1]["content"] = "tampered"
     path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-    with pytest.raises(
-        ContextForkError, match="persisted-address mismatch|prefix_sha256 mismatch"
-    ):
+    with pytest.raises(ContextForkError, match="persisted-address mismatch|prefix_sha256 mismatch"):
         worker._load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
 
     with pytest.raises(ContextForkError, match="unreadable"):
         worker._load_epoch_checkpoint(
-            config, f"epoch-agent/epoch-001-{'c' * 16}-{'d' * 16}.json",
+            config,
+            f"epoch-agent/epoch-001-{'c' * 16}-{'d' * 16}.json",
             expect_task_id=True,
         )
     with pytest.raises(ContextForkError, match="invalid checkpoint_ref path"):
@@ -399,9 +402,7 @@ def test_redacted_epoch_checkpoint_roundtrip(tmp_path: Path) -> None:
         ],
     )
 
-    loaded = worker._load_epoch_checkpoint(
-        config, checkpoint.checkpoint_ref, expect_task_id=True
-    )
+    loaded = worker._load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
     assert checkpoint.cache_key.redacted is True
     assert loaded.cache_key.redacted is True
     assert loaded.cache_key == checkpoint.cache_key
@@ -434,8 +435,10 @@ def test_child_result_lines_and_fork_prompt() -> None:
     assert prompt["messages"][-1]["content"] != "Continue."
     plan_tail = worker._fork_prompt(
         cast(Any, {"role": "system", "content": "sys"}),
-        [{"role": "user", "content": "obs"},
-         {"role": "assistant", "content": '{"type": "plan", "steps": []}'}],
+        [
+            {"role": "user", "content": "obs"},
+            {"role": "assistant", "content": '{"type": "plan", "steps": []}'},
+        ],
     )
     assert plan_tail["messages"][-1]["content"] == "Continue."
 
@@ -459,9 +462,7 @@ def test_fork_cache_compatible_matrix() -> None:
         "fanout_config": {"model": "fake-model"},
         "authorized_providers": ["fake-provider"],
     }
-    compatible, reason = worker._fork_cache_compatible(
-        child, epoch, frozenset({"fake-provider"})
-    )
+    compatible, reason = worker._fork_cache_compatible(child, epoch, frozenset({"fake-provider"}))
     assert compatible and reason is None
 
     incompatible, reason = worker._fork_cache_compatible(
@@ -471,36 +472,42 @@ def test_fork_cache_compatible_matrix() -> None:
 
     incompatible, reason = worker._fork_cache_compatible(
         {**child, "fanout_config": {"model": "other-model"}},
-        epoch, frozenset({"fake-provider"}),
+        epoch,
+        frozenset({"fake-provider"}),
     )
     assert not incompatible and "model differs" in (reason or "")
 
     incompatible, reason = worker._fork_cache_compatible(
         {**child, "fanout_config": None},
-        epoch, frozenset({"fake-provider"}),
+        epoch,
+        frozenset({"fake-provider"}),
     )
     assert not incompatible and "model differs" in (reason or "")
 
     incompatible, reason = worker._fork_cache_compatible(
         {**child, "fanout_config": {"model": "fake-model", "protocol": "other"}},
-        epoch, frozenset({"fake-provider"}),
+        epoch,
+        frozenset({"fake-provider"}),
     )
     assert not incompatible and "protocol differs" in (reason or "")
 
     incompatible, reason = worker._fork_cache_compatible(
         {**child, "fanout_config": {"model": "fake-model", "reasoning_effort": "high"}},
-        epoch, frozenset({"fake-provider"}),
+        epoch,
+        frozenset({"fake-provider"}),
     )
     assert not incompatible and "reasoning" in (reason or "")
 
     incompatible, reason = worker._fork_cache_compatible(
-        child, {**epoch, "cache_key": {**epoch["cache_key"], "redacted": True}},
+        child,
+        {**epoch, "cache_key": {**epoch["cache_key"], "redacted": True}},
         frozenset({"fake-provider"}),
     )
     assert not incompatible and "redacted" in (reason or "")
 
     incompatible, reason = worker._fork_cache_compatible(
-        child, {**epoch, "cache_key": {**epoch["cache_key"], "tools_sha256": "b" * 64}},
+        child,
+        {**epoch, "cache_key": {**epoch["cache_key"], "tools_sha256": "b" * 64}},
         frozenset({"fake-provider"}),
     )
     assert not incompatible and "tool schema" in (reason or "")
@@ -515,17 +522,14 @@ def test_fork_cache_compatible_matrix() -> None:
 # In-process loop: suspend at the delegate boundary
 # ---------------------------------------------------------------------------
 
+
 def test_suspend_cuts_epoch_at_delegate_boundary(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
-    config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True
-    )
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True)
     writer = _FakeWriter()
     router = _ScriptedRouter([_delegate_action("child-1")])
 
-    outcome = asyncio.run(
-        _drive_loop(config, worktree, router, writer)
-    )
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
     assert outcome["status"] == "suspended"
     assert outcome["epoch"] == 1
@@ -552,9 +556,7 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
     tmp_path: Path,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
-    config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True
-    )
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True)
     writer = _FakeWriter()
     router = _ScriptedRouter(['{"type":"finish","summary":"done"}'])
 
@@ -562,39 +564,32 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
 
     assert outcome["status"] == "succeeded"
     checkpoints = [
-        message
-        for message in writer.messages()
-        if message["type"] == "context_checkpoint"
+        message for message in writer.messages() if message["type"] == "context_checkpoint"
     ]
     assert len(checkpoints) == 1
     assert checkpoints[0]["epoch"] == 1
     checkpoint_ref = checkpoints[0]["checkpoint_ref"]
     assert isinstance(checkpoint_ref, str) and checkpoint_ref
-    checkpoint = worker._load_epoch_checkpoint(
-        config, checkpoint_ref, expect_task_id=True
-    )
+    checkpoint = worker._load_epoch_checkpoint(config, checkpoint_ref, expect_task_id=True)
     assert checkpoint.epoch == 1
     assert checkpoint.continuation_suffix == []
     assert "<cambium-summary-entry>" in checkpoint.provider_messages[-1]["content"]
-    usage = [
-        message for message in writer.messages() if message["type"] == "usage_event"
-    ]
+    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
     assert usage and all("epoch" not in message for message in usage)
+
 
 def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
-    config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=False
-    )
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=False)
     writer = _FakeWriter()
-    router = _ScriptedRouter([
-        _delegate_action("child-1"),
-        '{"type":"finish","summary":"done"}',
-    ])
-
-    outcome = asyncio.run(
-        _drive_loop(config, worktree, router, writer)
+    router = _ScriptedRouter(
+        [
+            _delegate_action("child-1"),
+            '{"type":"finish","summary":"done"}',
+        ]
     )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
     assert outcome["status"] == "succeeded"
     kinds = [m["type"] for m in writer.messages()]
@@ -606,12 +601,15 @@ def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
 # In-process loop: resume re-seeds the transcript from the checkpoint
 # ---------------------------------------------------------------------------
 
+
 def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(config)
     resume_config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         resume={
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "epoch": checkpoint.epoch,
@@ -622,16 +620,12 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
     writer = _FakeWriter()
     router = _ScriptedRouter(['{"type":"finish","summary":"resumed and done"}'])
 
-    outcome = asyncio.run(
-        _drive_loop(resume_config, worktree, router, writer)
-    )
+    outcome = asyncio.run(_drive_loop(resume_config, worktree, router, writer))
 
     assert outcome["status"] == "succeeded"
     first = router.prompts[0]["messages"]
     assert first[0]["role"] == "system"
-    contents = " ".join(
-        m.get("content", "") for m in first if isinstance(m.get("content"), str)
-    )
+    contents = " ".join(m.get("content", "") for m in first if isinstance(m.get("content"), str))
     assert "observe tool output" in contents
     assert "Child task result:" in contents
     assert "child did the work" in contents
@@ -647,9 +641,7 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
     config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(config)
     prefix = checkpoint.full_messages
-    original_checkpoint_bytes = (
-        tmp_path / "ckpts" / checkpoint.checkpoint_ref
-    ).read_bytes()
+    original_checkpoint_bytes = (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
     monkeypatch.setattr(worker, "MAX_CONTEXT_MESSAGES", 4)
     resume_config = _agent_config(
         worktree,
@@ -666,10 +658,8 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
     writer = _FakeWriter()
     router = _ScriptedRouter(
         [
-            '{"type":"tool_call","name":"read_batch",'
-            '"arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"tool_call","name":"read_batch",'
-            '"arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"finish","summary":"done"}',
         ]
     )
@@ -687,15 +677,11 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
     summary_prompts = [
         prompt
         for prompt in router.prompts
-        if str(prompt["messages"][-1].get("content", "")).startswith(
-            "<cambium-summary-control>"
-        )
+        if str(prompt["messages"][-1].get("content", "")).startswith("<cambium-summary-control>")
     ]
     assert len(action_prompts) == 3
     assert len(summary_prompts) == 2
-    assert all(
-        prompt["messages"][: len(prefix)] == prefix for prompt in action_prompts
-    )
+    assert all(prompt["messages"][: len(prefix)] == prefix for prompt in action_prompts)
     assert all(
         len(prompt["messages"]) - len(prefix) <= worker.MAX_CONTEXT_MESSAGES
         for prompt in action_prompts
@@ -703,27 +689,21 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
     assert (
         tmp_path / "ckpts" / checkpoint.checkpoint_ref
     ).read_bytes() == original_checkpoint_bytes
-    usage = [
-        message for message in writer.messages() if message["type"] == "usage_event"
-    ]
+    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
     assert usage[0]["epoch"] == checkpoint.epoch
     assert usage[-1]["epoch"] == checkpoint.epoch + 1
-    assert any(
-        message["type"] == "context_epoch_advanced"
-        for message in writer.messages()
-    )
-    terminal = [
-        message
-        for message in writer.messages()
-        if message["type"] == "context_checkpoint"
-    ]
+    assert any(message["type"] == "context_epoch_advanced" for message in writer.messages())
+    terminal = [message for message in writer.messages() if message["type"] == "context_checkpoint"]
     assert len(terminal) == 1
     assert terminal[0]["epoch"] == checkpoint.epoch + 3
+
 
 def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         resume={
             "checkpoint_ref": "epoch-agent/epoch-001-missing.json",
             "epoch": 1,
@@ -753,10 +733,12 @@ def test_rolling_compact_config_defaults_on() -> None:
     assert config.rolling_compact_threshold_high == 100
     assert config.rolling_compact_threshold_low == 50
 
-    defaulted = worker.AgentConfig.from_init({
-        "task_id": "default-rolling",
-        "context_reuse": True,
-    })
+    defaulted = worker.AgentConfig.from_init(
+        {
+            "task_id": "default-rolling",
+            "context_reuse": True,
+        }
+    )
     assert defaulted.rolling_compact is True
 
 
@@ -799,9 +781,7 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
 
     assert outcome["status"] == "failed"
     advanced = [
-        message
-        for message in writer.messages()
-        if message["type"] == "context_epoch_advanced"
+        message for message in writer.messages() if message["type"] == "context_epoch_advanced"
     ]
     assert len(advanced) == 1
     assert advanced[0] == {
@@ -843,13 +823,12 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
         max_turns=4,
     )
     resume_router = _ScriptedRouter(['{"type":"finish","summary":"resumed"}'])
-    resume_outcome = asyncio.run(
-        _drive_loop(resumed, worktree, resume_router, _FakeWriter())
-    )
+    resume_outcome = asyncio.run(_drive_loop(resumed, worktree, resume_router, _FakeWriter()))
     assert resume_outcome["status"] == "succeeded"
     assert resume_router.prompts[0]["messages"][: len(folded.full_messages)] == (
         folded.full_messages
     )
+
 
 def test_rolling_compact_rewrites_active_context_before_publication(
     tmp_path: Path,
@@ -920,10 +899,12 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
         _drive_loop(
             config,
             worktree,
-            _ScriptedRouter([
-                '{"type":"plan","steps":["continue"]}',
-                '{"type":"plan","steps":["continue"]}',
-            ]),
+            _ScriptedRouter(
+                [
+                    '{"type":"plan","steps":["continue"]}',
+                    '{"type":"plan","steps":["continue"]}',
+                ]
+            ),
             writer,
             run_request_id="run-hysteresis",
         )
@@ -931,8 +912,7 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
 
     assert outcome["status"] == "failed"
     advanced = [
-        message for message in writer.messages()
-        if message["type"] == "context_epoch_advanced"
+        message for message in writer.messages() if message["type"] == "context_epoch_advanced"
     ]
     assert len(advanced) == 1
     assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
@@ -945,9 +925,7 @@ def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
     base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(base_config)
     old_bytes = (tmp_path / "ckpts" / checkpoint.checkpoint_ref).read_bytes()
-    old_file_count = len(
-        list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))
-    )
+    old_file_count = len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json")))
     resume = {
         "checkpoint_ref": checkpoint.checkpoint_ref,
         "epoch": checkpoint.epoch,
@@ -983,13 +961,8 @@ def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
 
     assert outcome["status"] == "failed"
     assert len(router.prompts) == 1
-    assert "<cambium-summary-control>" in (
-        router.prompts[0]["messages"][-1]["content"]
-    )
-    failed = [
-        message for message in writer.messages()
-        if message["type"] == "compaction_failed"
-    ]
+    assert "<cambium-summary-control>" in (router.prompts[0]["messages"][-1]["content"])
+    failed = [message for message in writer.messages() if message["type"] == "compaction_failed"]
     assert len(failed) == 1
     assert failed[0] == {
         "type": "compaction_failed",
@@ -1031,15 +1004,11 @@ def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
         *checkpoint.full_messages,
         {
             "role": "user",
-            "content": worker._child_result_lines(
-                _strict_child_envelope(summary="x" * 300)
-            ),
+            "content": worker._child_result_lines(_strict_child_envelope(summary="x" * 300)),
         },
         {
             "role": "user",
-            "content": worker._child_result_lines(
-                _strict_child_envelope(summary="x" * 300)
-            ),
+            "content": worker._child_result_lines(_strict_child_envelope(summary="x" * 300)),
         },
     ]
     kinds = [message["type"] for message in writer.messages()]
@@ -1052,13 +1021,16 @@ def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
 # In-process loop: fork reuses the checkpointed prefix
 # ---------------------------------------------------------------------------
 
+
 def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(config)
     cache_key = checkpoint.cache_key
     fork_config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         context_fork={
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "provider": cache_key.provider,
@@ -1075,17 +1047,19 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
     writer = _FakeWriter()
     router = _ScriptedRouter(['{"type":"finish","summary":"forked and done"}'])
 
-    outcome = asyncio.run(
-        _drive_loop(fork_config, worktree, router, writer)
-    )
+    outcome = asyncio.run(_drive_loop(fork_config, worktree, router, writer))
 
     assert outcome["status"] == "succeeded"
     first = router.prompts[0]["messages"]
     assert first[0] == checkpoint.system_message
     assert first[: len(checkpoint.full_messages)] == checkpoint.full_messages
-    assert first[1:] == [*checkpoint.transcript, {
-        "role": "user", "content": "Child task: read the files and finish",
-    }]
+    assert first[1:] == [
+        *checkpoint.transcript,
+        {
+            "role": "user",
+            "content": "Child task: read the files and finish",
+        },
+    ]
     kinds = [m["type"] for m in writer.messages()]
     assert "context_fork_skipped" not in kinds
     usage = [m for m in writer.messages() if m["type"] == "usage_event"]
@@ -1096,7 +1070,9 @@ def test_fork_fallback_reports_skip(tmp_path: Path) -> None:
     missing_ref = f"epoch-agent/epoch-001-{'c' * 16}-{'d' * 16}.json"
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         context_fork={
             "checkpoint_ref": missing_ref,
             "provider": "loopback-provider",
@@ -1142,20 +1118,19 @@ def test_fork_descriptor_artifact_mismatch_falls_back(tmp_path: Path) -> None:
         "provider_boundary": cache_key.provider_boundary,
     }
     fork_config = _agent_config(
-        worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True,
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
         context_fork=fork_descriptor,
     )
     writer = _FakeWriter()
     router = _ScriptedRouter(['{"type":"finish","summary":"legacy path"}'])
 
-    outcome = asyncio.run(
-        _drive_loop(fork_config, worktree, router, writer)
-    )
+    outcome = asyncio.run(_drive_loop(fork_config, worktree, router, writer))
 
     assert outcome["status"] == "succeeded"
     skipped = [
-        message for message in writer.messages()
-        if message["type"] == "context_fork_skipped"
+        message for message in writer.messages() if message["type"] == "context_fork_skipped"
     ]
     assert len(skipped) == 1
     assert "mismatch" in skipped[0]["reason"]
@@ -1198,9 +1173,8 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
     assert "redacted" in (outcome["failure_reason"] or "")
     assert router.prompts == []
     assert outcome["transcript"] == []
-    assert not any(
-        message["type"] == "context_checkpoint" for message in writer.messages()
-    )
+    assert not any(message["type"] == "context_checkpoint" for message in writer.messages())
+
 
 def test_invalid_context_checkpoint_fields_matrix() -> None:
     digest = "a" * 64
@@ -1244,8 +1218,7 @@ def test_invalid_context_checkpoint_fields_matrix() -> None:
         "prefix_sha_missing": {
             **valid,
             "cache_key": {
-                key: value for key, value in valid["cache_key"].items()
-                if key != "prefix_sha256"
+                key: value for key, value in valid["cache_key"].items() if key != "prefix_sha256"
             },
         },
         "suffix_sha_bad": {
@@ -1311,9 +1284,7 @@ def test_bounded_resume_envelope_caps() -> None:
 
 def test_child_results_for_resume_order_and_synthesis(tmp_path: Path) -> None:
     runtime = _Runtime(session_dir=tmp_path, store=None)
-    runtime._results["c1"] = TaskResult(
-        task_id="c1", status="failed", exit_code=1, reason="boom"
-    )
+    runtime._results["c1"] = TaskResult(task_id="c1", status="failed", exit_code=1, reason="boom")
     runtime._child_result_by_task["c2"] = _strict_child_envelope()
 
     payload = runtime._child_results_for_resume(
@@ -1328,8 +1299,10 @@ def test_child_results_for_resume_order_and_synthesis(tmp_path: Path) -> None:
     assert payload["child_results"][1] == _strict_child_envelope()
 
     many = runtime._child_results_for_resume(
-        "t-root", [f"c{i}" for i in range(worker.MAX_ENVELOPE_ITEMS + 5)],
-        checkpoint_ref="ref", epoch=2,
+        "t-root",
+        [f"c{i}" for i in range(worker.MAX_ENVELOPE_ITEMS + 5)],
+        checkpoint_ref="ref",
+        epoch=2,
     )
     assert many["child_results_truncated"] is True
     assert len(many["child_results"]) == worker.MAX_ENVELOPE_ITEMS
@@ -1338,6 +1311,7 @@ def test_child_results_for_resume_order_and_synthesis(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Slow end-to-end: suspend -> resume orchestration over the wire
 # ---------------------------------------------------------------------------
+
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
@@ -1356,9 +1330,17 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
 
 
 def _task(
-    session_dir: Path, repo: Path, base: str, task_id: str, *,
-    worktree: str, branch: str, target_file: str, marker: str,
-    worker_path: str = "cambium.worker", **extra,
+    session_dir: Path,
+    repo: Path,
+    base: str,
+    task_id: str,
+    *,
+    worktree: str,
+    branch: str,
+    target_file: str,
+    marker: str,
+    worker_path: str = "cambium.worker",
+    **extra,
 ) -> dict:
     spec = {
         "task_id": task_id,
@@ -1445,7 +1427,10 @@ def _write_suspend_worker(path: Path) -> None:
         "              'kind': proposal['kind'], 'spec': proposal['spec']})\n"
         "    checkpoint_ref = os.environ.get(\n"
         "        'FAKE_CHECKPOINT_REF', task_id + '/epoch-001-"
-        + ('a' * 16) + '-' + ('b' * 16) + ".json')\n"
+        + ("a" * 16)
+        + "-"
+        + ("b" * 16)
+        + ".json')\n"
         "    boundary = {\n"
         "        'provider': os.environ.get('FAKE_EPOCH_PROVIDER', 'fake-provider'),\n"
         "        'endpoint': 'https://api.example',\n"
@@ -1560,18 +1545,37 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("CHILD_DUMP_PATH", str(child_dump))
 
     child = _task(
-        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-        target_file="b.txt", marker="// child-marker", worker_path=str(dump_worker),
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+        worker_path=str(dump_worker),
         provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
     )
     root = _task(
-        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-        target_file="a.txt", marker="// parent-marker",
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
         worker_path=str(suspend_worker),
         provider_env_keys=[
-            "FAKE_MODE", "CONTEXT_DUMP_PATH", "CHILD_DUMP_PATH",
-            "FAKE_CHECKPOINT_REF", "FAKE_EPOCH_PROVIDER", "FAKE_EPOCH_MODEL",
-            "FAKE_TOOLS_SHA", "FAKE_SYSTEM_SHA", "FAKE_MESSAGES_SHA",
+            "FAKE_MODE",
+            "CONTEXT_DUMP_PATH",
+            "CHILD_DUMP_PATH",
+            "FAKE_CHECKPOINT_REF",
+            "FAKE_EPOCH_PROVIDER",
+            "FAKE_EPOCH_MODEL",
+            "FAKE_TOOLS_SHA",
+            "FAKE_SYSTEM_SHA",
+            "FAKE_MESSAGES_SHA",
         ],
         proposed_children=[_child_proposal(child)],
     )
@@ -1627,20 +1631,39 @@ def test_fork_pin_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("FAKE_EPOCH_MODEL", "fake-model")
 
     child = _task(
-        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-        target_file="b.txt", marker="// child-marker", worker_path=str(dump_worker),
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+        worker_path=str(dump_worker),
         provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
         authorized_providers=["fake-provider"],
         fanout_config={"model": "fake-model"},
     )
     root = _task(
-        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-        target_file="a.txt", marker="// parent-marker",
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
         worker_path=str(suspend_worker),
         provider_env_keys=[
-            "FAKE_MODE", "CONTEXT_DUMP_PATH", "CHILD_DUMP_PATH",
-            "FAKE_CHECKPOINT_REF", "FAKE_EPOCH_PROVIDER", "FAKE_EPOCH_MODEL",
-            "FAKE_TOOLS_SHA", "FAKE_SYSTEM_SHA", "FAKE_MESSAGES_SHA",
+            "FAKE_MODE",
+            "CONTEXT_DUMP_PATH",
+            "CHILD_DUMP_PATH",
+            "FAKE_CHECKPOINT_REF",
+            "FAKE_EPOCH_PROVIDER",
+            "FAKE_EPOCH_MODEL",
+            "FAKE_TOOLS_SHA",
+            "FAKE_SYSTEM_SHA",
+            "FAKE_MESSAGES_SHA",
         ],
         proposed_children=[_child_proposal(child)],
     )
@@ -1668,6 +1691,7 @@ def test_fork_pin_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert child_init["context_reuse"] is True
     assert child_init["rolling_compact"] is True
 
+
 @pytest.mark.slow
 def test_suspend_resume_two_children_concurrency_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1694,20 +1718,38 @@ def test_suspend_resume_two_children_concurrency_one(
 
     def _child(task_id: str, target: str) -> dict:
         return _task(
-            session_dir, repo, base, task_id, worktree=f"wt-{task_id}",
-            branch=f"wt-{task_id}", target_file=target,
-            marker=f"// {task_id}-marker", worker_path=str(dump_worker),
+            session_dir,
+            repo,
+            base,
+            task_id,
+            worktree=f"wt-{task_id}",
+            branch=f"wt-{task_id}",
+            target_file=target,
+            marker=f"// {task_id}-marker",
+            worker_path=str(dump_worker),
             provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
         )
 
     root = _task(
-        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-        target_file="a.txt", marker="// parent-marker",
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
         worker_path=str(suspend_worker),
         provider_env_keys=[
-            "FAKE_MODE", "CONTEXT_DUMP_PATH", "CHILD_DUMP_PATH",
-            "FAKE_CHECKPOINT_REF", "FAKE_EPOCH_PROVIDER", "FAKE_EPOCH_MODEL",
-            "FAKE_TOOLS_SHA", "FAKE_SYSTEM_SHA", "FAKE_MESSAGES_SHA",
+            "FAKE_MODE",
+            "CONTEXT_DUMP_PATH",
+            "CHILD_DUMP_PATH",
+            "FAKE_CHECKPOINT_REF",
+            "FAKE_EPOCH_PROVIDER",
+            "FAKE_EPOCH_MODEL",
+            "FAKE_TOOLS_SHA",
+            "FAKE_SYSTEM_SHA",
+            "FAKE_MESSAGES_SHA",
         ],
         proposed_children=[
             _child_proposal(_child("c1", "b.txt")),
@@ -1717,7 +1759,9 @@ def test_suspend_resume_two_children_concurrency_one(
 
     result = asyncio.run(
         run_plan(
-            session_dir, {"tasks": [root]}, context_reuse=True,
+            session_dir,
+            {"tasks": [root]},
+            context_reuse=True,
             max_concurrent_tasks=1,
         )
     )
@@ -1737,7 +1781,8 @@ def test_suspend_resume_two_children_concurrency_one(
     child_results = resume_init["resume"]["child_results"]
     assert len(child_results) == 2
     assert {r["files_changed"][0] for r in child_results if r["files_changed"]} == {
-        "b.txt", "c.txt",
+        "b.txt",
+        "c.txt",
     }
     # Same worktree and generation across suspend/resume (no restart).
     first_init = json.loads(lines[0])
@@ -1747,18 +1792,13 @@ def test_suspend_resume_two_children_concurrency_one(
 def test_result_identity_note_matrix() -> None:
     from cambium.supervisor import _result_identity_note
 
-    assert _result_identity_note(
-        {"task_id": "t", "generation": 1}, "t", 1
-    ) is None
-    assert _result_identity_note(
-        {"task_id": "other", "generation": 1}, "t", 1
-    ) == "result task_id mismatch"
-    assert _result_identity_note(
-        {"generation": 2}, "t", 1
-    ) == "result generation mismatch"
-    assert _result_identity_note(
-        {"generation": True}, "t", 1
-    ) == "result generation mismatch"
+    assert _result_identity_note({"task_id": "t", "generation": 1}, "t", 1) is None
+    assert (
+        _result_identity_note({"task_id": "other", "generation": 1}, "t", 1)
+        == "result task_id mismatch"
+    )
+    assert _result_identity_note({"generation": 2}, "t", 1) == "result generation mismatch"
+    assert _result_identity_note({"generation": True}, "t", 1) == "result generation mismatch"
     # Absent identity fields are tolerated (older workers omit them).
     assert _result_identity_note({}, "t", 1) is None
 
@@ -1780,18 +1820,37 @@ def test_suspended_envelope_without_flag_fails_closed(
     monkeypatch.setenv("CHILD_DUMP_PATH", str(tmp_path / "child-init.json"))
 
     child = _task(
-        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-        target_file="b.txt", marker="// child-marker", worker_path=str(dump_worker),
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+        worker_path=str(dump_worker),
         provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
     )
     root = _task(
-        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-        target_file="a.txt", marker="// parent-marker",
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
         worker_path=str(suspend_worker),
         provider_env_keys=[
-            "FAKE_MODE", "CONTEXT_DUMP_PATH", "CHILD_DUMP_PATH",
-            "FAKE_CHECKPOINT_REF", "FAKE_EPOCH_PROVIDER", "FAKE_EPOCH_MODEL",
-            "FAKE_TOOLS_SHA", "FAKE_SYSTEM_SHA", "FAKE_MESSAGES_SHA",
+            "FAKE_MODE",
+            "CONTEXT_DUMP_PATH",
+            "CHILD_DUMP_PATH",
+            "FAKE_CHECKPOINT_REF",
+            "FAKE_EPOCH_PROVIDER",
+            "FAKE_EPOCH_MODEL",
+            "FAKE_TOOLS_SHA",
+            "FAKE_SYSTEM_SHA",
+            "FAKE_MESSAGES_SHA",
         ],
         proposed_children=[_child_proposal(child)],
     )

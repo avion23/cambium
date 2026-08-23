@@ -10,9 +10,7 @@ from cambium.process_env import build_subprocess_env
 def test_subprocess_environment_rejects_credential_shaped_inheritance(
     monkeypatch, tmp_path: Path
 ) -> None:
-    suffixes = tuple(
-        oauth_env_suffix(provider) for provider in ("codex.chatgpt", "oauth-provider")
-    )
+    suffixes = tuple(oauth_env_suffix(provider) for provider in ("codex.chatgpt", "oauth-provider"))
     adversarial_names = {
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
@@ -54,8 +52,7 @@ def test_subprocess_environment_rejects_credential_shaped_inheritance(
     assert len(adversarial_names) >= 30
 
     adversarial_values = {
-        name: f"credential-probe-{index}"
-        for index, name in enumerate(sorted(adversarial_names))
+        name: f"credential-probe-{index}" for index, name in enumerate(sorted(adversarial_names))
     }
     for name, value in adversarial_values.items():
         monkeypatch.setenv(name, value)

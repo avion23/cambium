@@ -790,7 +790,7 @@ def _estimate_cost(provider: ProviderConfig, usage: dict[str, Any] | None) -> fl
         value = usage.get(key, 0)
         if value is None:
             value = 0
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int | float):
             raise ValueError(f"usage.{key} must be numeric")
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"usage.{key} must be finite and non-negative")
@@ -833,19 +833,13 @@ def _tool_call_arguments(tool_call: Any) -> dict[str, Any] | None:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"tool call arguments are not valid JSON: {raw[:80]!r}"
-            ) from exc
+            raise ValueError(f"tool call arguments are not valid JSON: {raw[:80]!r}") from exc
     elif isinstance(raw, Mapping):
         parsed = dict(raw)
     else:
-        raise ValueError(
-            f"tool call arguments must be a JSON object, got {type(raw).__name__}"
-        )
+        raise ValueError(f"tool call arguments must be a JSON object, got {type(raw).__name__}")
     if not isinstance(parsed, dict):
-        raise ValueError(
-            f"tool call arguments must be a JSON object, got {type(parsed).__name__}"
-        )
+        raise ValueError(f"tool call arguments must be a JSON object, got {type(parsed).__name__}")
     return parsed
 
 
@@ -1125,7 +1119,7 @@ def _parse_codex_sse(
     for line in stream.splitlines():
         if not line.startswith("data:"):
             continue
-        data = line[len("data:"):].strip()
+        data = line[len("data:") :].strip()
         if not data or data == "[DONE]":
             continue
         try:
@@ -1144,9 +1138,7 @@ def _parse_codex_sse(
         elif event_type == "error":
             error = event.get("error")
             if isinstance(error, dict):
-                stream_error = stream_error or _codex_stream_error(
-                    provider, error, access_token
-                )
+                stream_error = stream_error or _codex_stream_error(provider, error, access_token)
         elif event_type == "response.failed":
             response = event.get("response")
             if isinstance(response, dict):
@@ -1159,10 +1151,14 @@ def _parse_codex_sse(
     if stream_error is not None:
         return {}, text, stream_error
     if completed is None:
-        return {}, text, ProviderError(
-            provider.name,
-            ProviderOutcome.ERROR,
-            "malformed codex stream: no response.completed event",
+        return (
+            {},
+            text,
+            ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "malformed codex stream: no response.completed event",
+            ),
         )
     return completed, text, None
 
@@ -1294,9 +1290,7 @@ class Diffundo:
         # within an equal-priority run by measured quality. None/empty keeps
         # the pure config-priority order. Stored as an immutable item tuple so
         # no attribute is a mutable mapping (D1).
-        self._debt: tuple[tuple[str, Any], ...] | None = (
-            tuple(debt.items()) if debt else None
-        )
+        self._debt: tuple[tuple[str, Any], ...] | None = tuple(debt.items()) if debt else None
 
     # -- public API --------------------------------------------------------- #
 
@@ -1358,9 +1352,7 @@ class Diffundo:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
-                    raise CostBudgetExceeded(
-                        result.provider, result.estimated_cost_usd, budget_usd
-                    )
+                    raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 # The provider that served owns the task's context from here
                 # on (prompt-prefix caching locality).
                 self._primary_provider = provider.name
@@ -1495,11 +1487,7 @@ class Diffundo:
         """
         from .routing import RoutingRequest, validate_requirements
 
-        raw = (
-            dict(requirements)
-            if requirements is not None
-            else dict(self._requirements)
-        )
+        raw = dict(requirements) if requirements is not None else dict(self._requirements)
         validated = validate_requirements(raw)
         has_native_tools = isinstance(prompt.get("tools"), list) and bool(prompt["tools"])
         return RoutingRequest(
@@ -1730,10 +1718,7 @@ class Diffundo:
             messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
             estimated_tokens = max(
                 1,
-                sum(
-                    len(str(message.get("content", "")).encode("utf-8"))
-                    for message in messages
-                )
+                sum(len(str(message.get("content", "")).encode("utf-8")) for message in messages)
                 // 4
                 + 4096,
             )
@@ -1753,9 +1738,7 @@ class Diffundo:
                 except BaseException:
                     reservation = None
                 if reservation is not None:
-                    await asyncio.to_thread(
-                        ledger.reconcile, reservation, policy.quota_windows, 0
-                    )
+                    await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, 0)
                 raise
             if reservation is None:
                 raise ProviderError(
@@ -1772,11 +1755,9 @@ class Diffundo:
         if reservation is not None and ledger is not None:
             usage = result.usage if isinstance(result.usage, dict) else {}
             total = usage.get("total_tokens")
-            if isinstance(total, bool) or not isinstance(total, (int, float)) or total < 0:
+            if isinstance(total, bool) or not isinstance(total, int | float) or total < 0:
                 total = estimated_tokens
-            await asyncio.to_thread(
-                ledger.reconcile, reservation, policy.quota_windows, int(total)
-            )
+            await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, int(total))
             snapshots = await asyncio.to_thread(ledger.snapshots, policy.name)
             result = replace(
                 result,
@@ -1882,9 +1863,7 @@ class Diffundo:
                         await asyncio.sleep(delay)
                         continue
                     request_rate_status = self._record_success(provider)
-                    return replace(
-                        result, request_rate_status=request_rate_status
-                    )
+                    return replace(result, request_rate_status=request_rate_status)
                 assert last_exc is not None
                 if last_exc.outcome in (
                     ProviderOutcome.REFUSAL,
@@ -1918,7 +1897,7 @@ class Diffundo:
 
     def _retry_delay(self, attempt_no: int) -> float:
         # Full jitter (mirrors arch §7.4): uniform(0, base * backoff ** n).
-        return random.uniform(0.0, self._retry_base_delay_s * (2.0 ** attempt_no))
+        return random.uniform(0.0, self._retry_base_delay_s * (2.0**attempt_no))
 
     @staticmethod
     def _remaining(deadline: float | None) -> float | None:
@@ -1971,9 +1950,7 @@ class Diffundo:
                 "call budget exhausted",
                 budget_exhausted=True,
             )
-        post_task = asyncio.create_task(
-            self._post(provider, prompt, timeout_s=timeout_s)
-        )
+        post_task = asyncio.create_task(self._post(provider, prompt, timeout_s=timeout_s))
         try:
             # Shield the task so wait_for returns at the deadline even though
             # cancellation cannot stop the underlying executor thread.
@@ -2017,8 +1994,7 @@ class Diffundo:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
-                "http transport is allowed only for loopback hosts; "
-                "remote providers require https",
+                "http transport is allowed only for loopback hosts; remote providers require https",
             )
         api_key = os.environ.get(provider.api_key_env)
         if not api_key:
@@ -2090,9 +2066,7 @@ class Diffundo:
             except Exception:
                 error_body = ""
             safe_body = _redact_error_text(error_body, api_key)[:500]
-            http_cause = _SanitizedHTTPError(
-                status, _redact_error_text(str(exc.reason), api_key)
-            )
+            http_cause = _SanitizedHTTPError(status, _redact_error_text(str(exc.reason), api_key))
             http_error = self._classify_http(
                 provider,
                 status,
@@ -2107,9 +2081,7 @@ class Diffundo:
                 outcome = ProviderOutcome.TIMEOUT
             else:
                 outcome = ProviderOutcome.ERROR
-            raise ProviderError(
-                provider.name, outcome, f"transport error: {reason}", exc
-            ) from exc
+            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
         except TimeoutError as exc:
             raise ProviderError(
                 provider.name,
@@ -2158,16 +2130,14 @@ class Diffundo:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
-                "http transport is allowed only for loopback hosts; "
-                "remote providers require https",
+                "http transport is allowed only for loopback hosts; remote providers require https",
             )
         credential = self._credential_source
         if credential is None:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
-                "provider requires auth 'codex_chatgpt' but no credential "
-                "source is injected",
+                "provider requires auth 'codex_chatgpt' but no credential source is injected",
             )
         if not credential.access_token:
             raise ProviderError(
@@ -2229,9 +2199,7 @@ class Diffundo:
                 outcome = ProviderOutcome.TIMEOUT
             else:
                 outcome = ProviderOutcome.ERROR
-            raise ProviderError(
-                provider.name, outcome, f"transport error: {reason}", exc
-            ) from exc
+            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
         except TimeoutError as exc:
             raise ProviderError(
                 provider.name,
@@ -2299,10 +2267,7 @@ class Diffundo:
             # quarantines the provider, NOT a content refusal. The generic
             # all-400 -> REFUSAL rule below is unchanged for chat_completions
             # providers.
-            if (
-                provider.protocol is Protocol.CODEX_RESPONSES
-                and _codex_config_400(message)
-            ):
+            if provider.protocol is Protocol.CODEX_RESPONSES and _codex_config_400(message):
                 return ProviderError(
                     provider.name,
                     ProviderOutcome.CONFIG_ERROR,

@@ -60,7 +60,8 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "initial"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
@@ -68,8 +69,16 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
 
 
 def _task(
-    session_dir: Path, repo: Path, base: str, task_id: str, *,
-    worktree: str, branch: str, target_file: str, marker: str, **extra,
+    session_dir: Path,
+    repo: Path,
+    base: str,
+    task_id: str,
+    *,
+    worktree: str,
+    branch: str,
+    target_file: str,
+    marker: str,
+    **extra,
 ) -> dict:
     spec = {
         "task_id": task_id,
@@ -96,7 +105,9 @@ def _kinds(events: list[dict], kind: str) -> list[dict]:
 def _show(repo: Path, ref: str, path: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "show", f"{ref}:{path}"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
 
 
@@ -140,10 +151,26 @@ def test_rp1_port_drives_valid_child_admission_with_conversation_row(tmp_path) -
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker")
-    child = _task(session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-                  target_file="b.txt", marker="// child-marker")
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root-marker",
+    )
+    child = _task(
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+    )
     core = ArchitectusCore(
         ScriptedLLM([{"action": "spawn", "task_id": "c1"}]),
         tree=_core_tree(root, child),
@@ -191,8 +218,16 @@ def test_rp2_port_malformed_proposal_rejected_no_spawn(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker")
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root-marker",
+    )
     core = ArchitectusCore(
         ScriptedLLM([{"action": "spawn", "task_id": "ghost-child"}]),
         tree=_core_tree(root),
@@ -226,8 +261,16 @@ def test_rp3_port_invalid_child_spec_rejected_no_spawn(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker")
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root-marker",
+    )
     malformed_child = {"task_id": "c1"}  # missing repo/worktree_path/branch/task
     core = ArchitectusCore(
         ScriptedLLM([{"action": "spawn", "task_id": "c1"}]),
@@ -274,10 +317,26 @@ def test_rp4_port_and_conversations_optional_by_default(tmp_path) -> None:
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-a"),
-            _task(session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
-                  target_file="b.txt", marker="// cambium-b"),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-a",
+            ),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                target_file="b.txt",
+                marker="// cambium-b",
+            ),
         ]
     }
 
@@ -303,8 +362,16 @@ def test_rp5_conversation_store_open_failure_raises(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker")
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root-marker",
+    )
     (session_dir / ".cambium").mkdir(parents=True)
     (session_dir / ".cambium" / "conversations.db").mkdir()
 
@@ -323,10 +390,28 @@ def test_rp6_conversation_append_failure_is_visible(tmp_path, monkeypatch) -> No
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker", max_restarts=0)
-    child = _task(session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-                  target_file="b.txt", marker="// child-marker", max_restarts=0)
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root-marker",
+        max_restarts=0,
+    )
+    child = _task(
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+        max_restarts=0,
+    )
     # The append failure interrupts the parent's result handling before its
     # reuse_ready is read, so the supervise finally would otherwise wait the
     # full WORKER_EXIT_WAIT_S for a pooled worker that never exits. The pool's
@@ -362,10 +447,26 @@ def test_rp7_orchestrator_forwards_port_and_conversations(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-                 target_file="a.txt", marker="// root-marker")
-    child = _task(session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-                  target_file="b.txt", marker="// child-marker")
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root-marker",
+    )
+    child = _task(
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+    )
     core = ArchitectusCore(
         ScriptedLLM([{"action": "spawn", "task_id": "c1"}]),
         tree=_core_tree(root, child),
@@ -373,9 +474,7 @@ def test_rp7_orchestrator_forwards_port_and_conversations(tmp_path) -> None:
     from cambium.orchestrator import Orchestrator
 
     result = asyncio.run(
-        Orchestrator(architectus=core, conversations=True).run(
-            str(session_dir), {"tasks": [root]}
-        )
+        Orchestrator(architectus=core, conversations=True).run(str(session_dir), {"tasks": [root]})
     )
 
     assert result.exit_code == 0

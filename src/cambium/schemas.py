@@ -296,9 +296,7 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
     options = schema.get("anyOf")
     if isinstance(options, list):
         option_errors = [
-            _validate_value(option, value, label)
-            for option in options
-            if isinstance(option, dict)
+            _validate_value(option, value, label) for option in options if isinstance(option, dict)
         ]
         if any(not option_error for option_error in option_errors):
             return []
@@ -343,30 +341,28 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
 
     if type(value) in (int, float):
         minimum = schema.get("minimum")
-        if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
+        if isinstance(minimum, int | float) and not isinstance(minimum, bool):
             if value < minimum:
                 errors.append(f"validation failed: '{label}' must be >= {minimum}")
         exclusive_minimum = schema.get("exclusiveMinimum")
         if isinstance(exclusive_minimum, bool):
-            if exclusive_minimum and isinstance(minimum, (int, float)) and value <= minimum:
+            if exclusive_minimum and isinstance(minimum, int | float) and value <= minimum:
                 errors.append(f"validation failed: '{label}' must be > {minimum}")
-        elif (
-            isinstance(exclusive_minimum, (int, float))
-            and not isinstance(exclusive_minimum, bool)
+        elif isinstance(exclusive_minimum, int | float) and not isinstance(
+            exclusive_minimum, bool
         ):
             if value <= exclusive_minimum:
                 errors.append(f"validation failed: '{label}' must be > {exclusive_minimum}")
         maximum = schema.get("maximum")
-        if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
+        if isinstance(maximum, int | float) and not isinstance(maximum, bool):
             if value > maximum:
                 errors.append(f"validation failed: '{label}' must be <= {maximum}")
         exclusive_maximum = schema.get("exclusiveMaximum")
         if isinstance(exclusive_maximum, bool):
-            if exclusive_maximum and isinstance(maximum, (int, float)) and value >= maximum:
+            if exclusive_maximum and isinstance(maximum, int | float) and value >= maximum:
                 errors.append(f"validation failed: '{label}' must be < {maximum}")
-        elif (
-            isinstance(exclusive_maximum, (int, float))
-            and not isinstance(exclusive_maximum, bool)
+        elif isinstance(exclusive_maximum, int | float) and not isinstance(
+            exclusive_maximum, bool
         ):
             if value >= exclusive_maximum:
                 errors.append(f"validation failed: '{label}' must be < {exclusive_maximum}")
@@ -498,10 +494,7 @@ if not any(
     isinstance(item, dict)
     and (
         item.get("name") == "run_python"
-        or (
-            isinstance(item.get("function"), dict)
-            and item["function"].get("name") == "run_python"
-        )
+        or (isinstance(item.get("function"), dict) and item["function"].get("name") == "run_python")
     )
     for item in TOOL_SCHEMAS
 ):

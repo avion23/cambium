@@ -46,9 +46,7 @@ def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
     return ProviderConfig(name=name, **base)
 
 
-def _config_file(
-    path: Path, providers: list[tuple[str, str, str, int]]
-) -> Path:
+def _config_file(path: Path, providers: list[tuple[str, str, str, int]]) -> Path:
     """Write a minimal valid provider config; (name, model, tier, rpm) entries."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -121,13 +119,9 @@ def test_score_providers_strict_filter_never_substitutes_weak_tier() -> None:
     assert [(name, model) for name, model, _ in scored] == [("strong", "m1")]
     # no provider satisfies the requirement -> fail closed, never downgrade
     with pytest.raises(ValueError):
-        score_providers(
-            providers[:1], ["m1"], debt, requirements={"quality": "high"}
-        )
+        score_providers(providers[:1], ["m1"], debt, requirements={"quality": "high"})
     # "normal" (and absent) applies no tier restriction
-    normal = score_providers(
-        providers, ["m1"], debt, requirements={"quality": "normal"}
-    )
+    normal = score_providers(providers, ["m1"], debt, requirements={"quality": "normal"})
     assert {name for name, _model, _score in normal} == {"weak", "strong"}
     assert score_providers(providers, ["m1"], debt)[0][0] == "weak"
 
@@ -171,18 +165,18 @@ def test_score_providers_fails_closed_for_partial_lane_map() -> None:
 
     # The unknown provider is not treated as an unlimited lane; only the
     # provider whose lane is tracked remains eligible.
-    assert [name for name, _model, _score in score_providers(
-        providers, ["m1"], {}, lanes={"a": LaneState()}
-    )] == ["a"]
+    assert [
+        name
+        for name, _model, _score in score_providers(providers, ["m1"], {}, lanes={"a": LaneState()})
+    ] == ["a"]
     with pytest.raises(ValueError):
-        score_providers(
-            providers, ["m1"], {}, lanes={"a": LaneState(in_flight=60)}
-        )
+        score_providers(providers, ["m1"], {}, lanes={"a": LaneState(in_flight=60)})
     # An entirely empty map remains the legacy untracked-lane compatibility
     # value and does not make otherwise eligible providers disappear.
-    assert {name for name, _model, _score in score_providers(
-        providers, ["m1"], {}, lanes={}
-    )} == {"a", "b"}
+    assert {name for name, _model, _score in score_providers(providers, ["m1"], {}, lanes={})} == {
+        "a",
+        "b",
+    }
 
 
 def test_score_providers_ranks_shared_quality_objective() -> None:
@@ -191,12 +185,8 @@ def test_score_providers_ranks_shared_quality_objective() -> None:
     # B has 1/10 cache hits and 20s avg latency -> A must win on
     # W_CACHE + W_LATENCY
     debt = {
-        "a": ProviderDebt(
-            requests=10, cache_hit_count=9, latency_total_s=20.0, latency_count=10
-        ),
-        "b": ProviderDebt(
-            requests=10, cache_hit_count=1, latency_total_s=200.0, latency_count=10
-        ),
+        "a": ProviderDebt(requests=10, cache_hit_count=9, latency_total_s=20.0, latency_count=10),
+        "b": ProviderDebt(requests=10, cache_hit_count=1, latency_total_s=200.0, latency_count=10),
     }
     scored = score_providers(providers, ["m1", "m2"], debt)
     assert scored[0][0] == "a"
@@ -219,13 +209,13 @@ def test_score_providers_ranks_shared_quality_objective() -> None:
 def test_requirements_validated_at_plan_validation(tmp_path) -> None:
     base = _plan_task_spec(tmp_path, "t-req")
     for bad in (
-        {"quality": "ultra"},           # unknown quality value
-        {"quality": 1},                 # non-string quality
-        {"unknown_key": True},          # unknown key
-        {"min_context_window": 0},      # not positive
-        {"min_context_window": -8},     # negative
-        {"min_context_window": True},   # bool is not an int
-        {"min_context_window": "8k"},   # non-int
+        {"quality": "ultra"},  # unknown quality value
+        {"quality": 1},  # non-string quality
+        {"unknown_key": True},  # unknown key
+        {"min_context_window": 0},  # not positive
+        {"min_context_window": -8},  # negative
+        {"min_context_window": True},  # bool is not an int
+        {"min_context_window": "8k"},  # non-int
     ):
         with pytest.raises(ValueError):
             _validate_plan_task(tmp_path, dict(base, requirements=bad))
@@ -233,9 +223,7 @@ def test_requirements_validated_at_plan_validation(tmp_path) -> None:
     with pytest.raises(ValueError):
         _validate_plan_task(tmp_path, dict(base, requirements="high"))
     # valid forms pass and are retained on the spec
-    ok = _validate_plan_task(
-        tmp_path, dict(base, requirements={"quality": "high"})
-    )
+    ok = _validate_plan_task(tmp_path, dict(base, requirements={"quality": "high"}))
     assert ok["requirements"] == {"quality": "high"}
     ok = _validate_plan_task(
         tmp_path,
@@ -252,9 +240,7 @@ def test_requirements_validated_at_plan_validation(tmp_path) -> None:
 def test_selector_rejects_unknown_requirement_keys() -> None:
     providers = [_pc("a", "m1"), _pc("b", "m2")]
     with pytest.raises(ValueError):
-        score_providers(
-            providers, ["m1", "m2"], {}, requirements={"tier": "strong"}
-        )
+        score_providers(providers, ["m1", "m2"], {}, requirements={"tier": "strong"})
     with pytest.raises(ValueError):
         validate_requirements({"quality": "high", "context": 8000})
 
@@ -300,9 +286,7 @@ _SUMMARY_CONTROL_OPEN = "<cambium-summary-control>\n"
 _SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
 
 
-def _summary_completion(
-    body: dict[str, Any], *, default_model: str
-) -> dict[str, Any] | None:
+def _summary_completion(body: dict[str, Any], *, default_model: str) -> dict[str, Any] | None:
     """Return a strict synthetic summary response without consuming actions."""
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -313,9 +297,7 @@ def _summary_completion(
         return None
     try:
         control = json.loads(
-            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(
-                _SUMMARY_CONTROL_CLOSE
-            )
+            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(_SUMMARY_CONTROL_CLOSE)
         )
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -356,9 +338,7 @@ def _summary_completion(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": json.dumps(
-                        summary, sort_keys=True, separators=(",", ":")
-                    ),
+                    "content": json.dumps(summary, sort_keys=True, separators=(",", ":")),
                 },
                 "finish_reason": "stop",
             }
@@ -499,9 +479,7 @@ def test_task_assigned_event_carries_requirements(tmp_path, monkeypatch) -> None
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.name", "routing-scored-test"], check=True
     )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "routing@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "routing@test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     (repo / "target.txt").write_text("fixture\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
@@ -510,7 +488,9 @@ def test_task_assigned_event_carries_requirements(tmp_path, monkeypatch) -> None
     )
     base = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     try:
@@ -539,17 +519,14 @@ def test_task_assigned_event_carries_requirements(tmp_path, monkeypatch) -> None
         }
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [spec]},
+                session_dir,
+                {"tasks": [spec]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
         events = read_events(session_dir)
         assert result.exit_code == 0, result
-        assigned = [
-            event["payload"]
-            for event in events
-            if event["kind"] == "task_assigned"
-        ]
+        assigned = [event["payload"] for event in events if event["kind"] == "task_assigned"]
         assert len(assigned) == 1
         payload = assigned[0]
         # the STRICT capability filter bound the task to the strong provider

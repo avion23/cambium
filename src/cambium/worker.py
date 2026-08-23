@@ -253,6 +253,7 @@ class CacheKeyDescriptor:
     redacted: bool
     provider_boundary: dict[str, Any]
 
+
 @dataclass(frozen=True, slots=True)
 class ContextCheckpoint:
     """Immutable content-addressed epoch checkpoint (plan §5.2).
@@ -297,20 +298,45 @@ class ContextCheckpoint:
         return [*self.provider_messages, *self.continuation_suffix]
 
 
-_FORK_DESCRIPTOR_KEYS = frozenset({
-    "checkpoint_ref", "provider", "model", "system_sha256", "tools_sha256",
-    "prefix_sha256", "suffix_sha256", "full_sha256", "prefix_bytes",
-    "provider_boundary",
-})
-_RESUME_KEYS = frozenset({
-    "checkpoint_ref", "epoch", "child_results", "child_results_truncated",
-})
+_FORK_DESCRIPTOR_KEYS = frozenset(
+    {
+        "checkpoint_ref",
+        "provider",
+        "model",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
+        "full_sha256",
+        "prefix_bytes",
+        "provider_boundary",
+    }
+)
+_RESUME_KEYS = frozenset(
+    {
+        "checkpoint_ref",
+        "epoch",
+        "child_results",
+        "child_results_truncated",
+    }
+)
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
-_PROVIDER_BOUNDARY_KEYS = frozenset({
-    "provider", "endpoint", "authmode", "api_key_env", "provider_env_keys",
-    "authorized_providers", "authorized_providers_explicit", "protocol", "model",
-    "tier", "reasoning_effort", "provider_config_path",
-})
+_PROVIDER_BOUNDARY_KEYS = frozenset(
+    {
+        "provider",
+        "endpoint",
+        "authmode",
+        "api_key_env",
+        "provider_env_keys",
+        "authorized_providers",
+        "authorized_providers_explicit",
+        "protocol",
+        "model",
+        "tier",
+        "reasoning_effort",
+        "provider_config_path",
+    }
+)
 
 
 def _validate_provider_boundary(value: Any) -> dict[str, Any]:
@@ -326,11 +352,14 @@ def _validate_provider_boundary(value: Any) -> dict[str, Any]:
         if unknown:
             details.append(f"unknown keys: {unknown}")
         suffix = f" ({'; '.join(details)})" if details else ""
-        raise ContextForkError(
-            "provider_boundary has an invalid key set" + suffix
-        )
+        raise ContextForkError("provider_boundary has an invalid key set" + suffix)
     required_strings = (
-        "provider", "endpoint", "authmode", "protocol", "model", "tier",
+        "provider",
+        "endpoint",
+        "authmode",
+        "protocol",
+        "model",
+        "tier",
         "provider_config_path",
     )
     for key in required_strings:
@@ -364,9 +393,7 @@ def _validate_provider_boundary(value: Any) -> dict[str, Any]:
         )
     reasoning = value.get("reasoning_effort")
     if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
-        raise ContextForkError(
-            "provider_boundary 'reasoning_effort' must be a string or null"
-        )
+        raise ContextForkError("provider_boundary 'reasoning_effort' must be a string or null")
     return {
         "provider": value["provider"],
         "endpoint": value["endpoint"],
@@ -407,8 +434,7 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
         if unknown:
             details.append(f"unknown keys: {unknown}")
         raise ContextForkError(
-            "context_fork has an invalid key set"
-            + (f" ({'; '.join(details)})" if details else "")
+            "context_fork has an invalid key set" + (f" ({'; '.join(details)})" if details else "")
         )
     checkpoint_ref = value.get("checkpoint_ref")
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
@@ -421,7 +447,10 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
     if not isinstance(model, str) or not model:
         raise ContextForkError("context_fork 'model' must be a non-empty string")
     for key in (
-        "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
         "full_sha256",
     ):
         digest = value.get(key)
@@ -476,8 +505,7 @@ def _validate_resume(value: Any) -> dict[str, Any] | None:
         if unknown:
             details.append(f"unknown keys: {unknown}")
         raise ContextForkError(
-            "resume has an invalid key set"
-            + (f" ({'; '.join(details)})" if details else "")
+            "resume has an invalid key set" + (f" ({'; '.join(details)})" if details else "")
         )
     checkpoint_ref = value.get("checkpoint_ref")
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
@@ -531,9 +559,9 @@ _DIFFUNDO_OPTIONS = frozenset(
         "breaker_window_size",
         "breaker_failure_threshold",
         "open_backoff_base",
-         "retry_base_delay_s",
-     }
- )
+        "retry_base_delay_s",
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -605,9 +633,7 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise ParentEnvelopeError(
-            f"parent_envelope must be an object, got {type(value).__name__}"
-        )
+        raise ParentEnvelopeError(f"parent_envelope must be an object, got {type(value).__name__}")
     if set(value) != _ENVELOPE_KEYS:
         missing = sorted(_ENVELOPE_KEYS - set(value))
         unknown = sorted(set(value) - _ENVELOPE_KEYS)
@@ -625,9 +651,7 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
     if parent_task_id is _MISSING or not (
         parent_task_id is None or (type(parent_task_id) is str and bool(parent_task_id))
     ):
-        raise ParentEnvelopeError(
-            "parent_envelope 'parent_task_id' must be a string or null"
-        )
+        raise ParentEnvelopeError("parent_envelope 'parent_task_id' must be a string or null")
     validated["parent_task_id"] = parent_task_id
     for key in _ENVELOPE_TEXT_KEYS:
         field = value.get(key, _MISSING)
@@ -652,13 +676,9 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
             raise ParentEnvelopeError(f"parent_envelope {key!r} exceeds the item cap")
         for item in field:
             if type(item) is not str:
-                raise ParentEnvelopeError(
-                    f"parent_envelope {key!r} must contain only strings"
-                )
+                raise ParentEnvelopeError(f"parent_envelope {key!r} must contain only strings")
             if len(item.encode("utf-8")) > MAX_ENVELOPE_FIELD_CHARS:
-                raise ParentEnvelopeError(
-                    f"parent_envelope {key!r} item exceeds the field cap"
-                )
+                raise ParentEnvelopeError(f"parent_envelope {key!r} item exceeds the field cap")
         validated[key] = list(field)
     diff_truncated = value.get("diff_truncated", _MISSING)
     if type(diff_truncated) is not bool:
@@ -673,9 +693,7 @@ def _validate_parent_envelope(value: Any) -> dict[str, Any] | None:
             and (type(metric_score) is int or math.isfinite(metric_score))
         )
     ):
-        raise ParentEnvelopeError(
-            "parent_envelope 'metric_score' must be a number or null"
-        )
+        raise ParentEnvelopeError("parent_envelope 'metric_score' must be a number or null")
     validated["metric_score"] = metric_score
     metric_breakdown = value.get("metric_breakdown", _MISSING)
     if type(metric_breakdown) is not dict:
@@ -773,9 +791,7 @@ def _require_generation(worktree: Path, generation: int) -> None:
         )
 
 
-def _write_worktree_state(
-    worktree: Path, generation: int, path: Path, content: str
-) -> None:
+def _write_worktree_state(worktree: Path, generation: int, path: Path, content: str) -> None:
     """Write worker state only while this process owns the current fence."""
     _require_generation(worktree, generation)
     path.write_text(content)
@@ -812,9 +828,7 @@ def _provider_env_keys(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _checkpoint_redactor(
-    provider_env_keys: tuple[str, ...], credentials: Any = None
-) -> Redactor:
+def _checkpoint_redactor(provider_env_keys: tuple[str, ...], credentials: Any = None) -> Redactor:
     """Build the worker's immutable redactor from its authorized credentials."""
     secret_values = [
         value
@@ -925,7 +939,9 @@ def _model_identity(
 
 
 def _provider_router(
-    config: dict[str, Any], *, assigned_provider: str | None = None,
+    config: dict[str, Any],
+    *,
+    assigned_provider: str | None = None,
     authorized_providers: tuple[str, ...] = (),
     authorized_providers_explicit: bool = False,
     debt: Mapping[str, Any] | None = None,
@@ -971,14 +987,14 @@ def _provider_router(
     if assigned_provider is not None:
         if not any(provider.name == assigned_provider for provider in providers):
             raise ValueError(
-                f"assigned_provider {assigned_provider!r} is not an authorized "
-                "configured provider"
+                f"assigned_provider {assigned_provider!r} is not an authorized configured provider"
             )
         options["primary_provider"] = assigned_provider
     if debt:
         options["debt"] = debt
     codex_providers = [
-        provider for provider in providers
+        provider
+        for provider in providers
         if getattr(provider, "auth", None) is AuthMode.CODEX_CHATGPT
     ]
     if codex_providers:
@@ -1010,8 +1026,11 @@ def _provider_router(
         requirements = _task_requirements(None, config)
     if requirements:
         options["requirements"] = dict(requirements)
-    return Diffundo(providers, **options), tier, model, _model_identity(
-        providers, tier, model, assigned_provider=assigned_provider
+    return (
+        Diffundo(providers, **options),
+        tier,
+        model,
+        _model_identity(providers, tier, model, assigned_provider=assigned_provider),
     )
 
 
@@ -1068,8 +1087,7 @@ def _rolling_compact_thresholds(
     )
     if threshold_low > threshold_high:
         raise ValueError(
-            f"{source} rolling_compact_threshold_low must not exceed "
-            "rolling_compact_threshold_high"
+            f"{source} rolling_compact_threshold_low must not exceed rolling_compact_threshold_high"
         )
     return threshold_high, threshold_low
 
@@ -1146,9 +1164,7 @@ class AgentConfig:
         if not isinstance(shell_permission, bool) or not isinstance(network_permission, bool):
             raise ValueError("init permissions.shell/network must be strict booleans")
         heartbeat = init.get("heartbeat")
-        heartbeat_interval_s = (
-            heartbeat.get("interval_s") if isinstance(heartbeat, dict) else None
-        )
+        heartbeat_interval_s = heartbeat.get("interval_s") if isinstance(heartbeat, dict) else None
         budget = init.get("budget")
         max_wall_s = budget.get("max_wall_s") if isinstance(budget, dict) else None
         worktree = init.get("worktree")
@@ -1196,17 +1212,13 @@ class AgentConfig:
             authorized_providers_explicit=authorized_explicit,
             debt=debt or None,
             max_turns=_positive_int(init.get("max_turns"), "init max_turns", DEFAULT_MAX_TURNS),
-            max_tokens=_positive_int(
-                init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS
-            ),
+            max_tokens=_positive_int(init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS),
             shell_permission=shell_permission,
             network_permission=network_permission,
             heartbeat_interval_s=_positive_float(
                 heartbeat_interval_s, "init heartbeat.interval_s", HEARTBEAT_INTERVAL_S
             ),
-            max_wall_s=_positive_float(
-                max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S
-            ),
+            max_wall_s=_positive_float(max_wall_s, "init budget.max_wall_s", DEFAULT_MAX_WALL_S),
             checkpoint_root=checkpoint_root,
             requirements=_task_requirements(init, _provider_fanout_config(init)),
             max_transcript_chars=max_transcript_chars,
@@ -1214,15 +1226,11 @@ class AgentConfig:
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
             parent_envelope=_validate_parent_envelope(init.get("parent_envelope")),
             context_reuse=_strict_bool(init.get("context_reuse"), "init context_reuse"),
-            rolling_compact=_strict_bool(
-                init.get("rolling_compact", True), "init rolling_compact"
-            ),
+            rolling_compact=_strict_bool(init.get("rolling_compact", True), "init rolling_compact"),
             rolling_compact_threshold_high=rolling_threshold_high,
             rolling_compact_threshold_low=rolling_threshold_low,
             context_fork=_validate_context_fork(init.get("context_fork")),
-            summary_trunk_ref=_validate_summary_trunk_ref(
-                init.get("summary_trunk_ref")
-            ),
+            summary_trunk_ref=_validate_summary_trunk_ref(init.get("summary_trunk_ref")),
         )
 
 
@@ -1235,9 +1243,7 @@ def _merge_task_config(
         max_turns = _positive_int(run.get("max_turns"), "run_task max_turns", DEFAULT_MAX_TURNS)
     max_tokens = config.max_tokens
     if "max_tokens" not in init:
-        max_tokens = _positive_int(
-            run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS
-        )
+        max_tokens = _positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS)
     max_wall_s = config.max_wall_s
     init_budget = init.get("budget")
     init_provided_wall = isinstance(init_budget, dict) and "max_wall_s" in init_budget
@@ -1263,9 +1269,7 @@ def _merge_task_config(
     )
     rolling_compact = config.rolling_compact
     if "rolling_compact" not in init and "rolling_compact" in run:
-        rolling_compact = _strict_bool(
-            run.get("rolling_compact"), "run_task rolling_compact"
-        )
+        rolling_compact = _strict_bool(run.get("rolling_compact"), "run_task rolling_compact")
     threshold_values: dict[str, Any] = {
         "rolling_compact_threshold_high": config.rolling_compact_threshold_high,
         "rolling_compact_threshold_low": config.rolling_compact_threshold_low,
@@ -1275,9 +1279,7 @@ def _merge_task_config(
             "rolling_compact_threshold_high"
         )
     if "rolling_compact_threshold_low" not in init:
-        threshold_values["rolling_compact_threshold_low"] = run.get(
-            "rolling_compact_threshold_low"
-        )
+        threshold_values["rolling_compact_threshold_low"] = run.get("rolling_compact_threshold_low")
     rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
         threshold_values, config.max_transcript_chars, "run_task"
     )
@@ -1361,15 +1363,11 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
         parent_envelope=_validate_parent_envelope(run.get("parent_envelope")),
         context_reuse=_strict_bool(run.get("context_reuse"), "run_task context_reuse"),
-        rolling_compact=_strict_bool(
-            run.get("rolling_compact", True), "run_task rolling_compact"
-        ),
+        rolling_compact=_strict_bool(run.get("rolling_compact", True), "run_task rolling_compact"),
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
         context_fork=_validate_context_fork(run.get("context_fork")),
-        summary_trunk_ref=_validate_summary_trunk_ref(
-            run.get("summary_trunk_ref")
-        ),
+        summary_trunk_ref=_validate_summary_trunk_ref(run.get("summary_trunk_ref")),
         resume=_validate_resume(run.get("resume")),
     )
 
@@ -1489,10 +1487,13 @@ def _invalid_usage_fields(usage: dict[str, Any] | None) -> tuple[str, ...]:
     """
     if not isinstance(usage, dict):
         return ()
-    return tuple(sorted(
-        key for key, value in usage.items()
-        if key in _USAGE_COUNT_FIELDS and not _valid_usage_count(value)
-    ))
+    return tuple(
+        sorted(
+            key
+            for key, value in usage.items()
+            if key in _USAGE_COUNT_FIELDS and not _valid_usage_count(value)
+        )
+    )
 
 
 def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
@@ -1501,8 +1502,7 @@ def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
     return {
         key: value
         for key, value in usage.items()
-        if key in _USAGE_COUNT_FIELDS
-        and _valid_usage_count(value)
+        if key in _USAGE_COUNT_FIELDS and _valid_usage_count(value)
     }
 
 
@@ -1587,15 +1587,18 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
         if not _action_keys(parsed, frozenset({"type", "steps"})):
             raise ValueError("plan must carry exactly type/steps (plus optional thought)")
         steps = parsed.get("steps")
-        if not isinstance(steps, list) or not steps or not all(
-            isinstance(step, str) and step.strip() for step in steps
+        if (
+            not isinstance(steps, list)
+            or not steps
+            or not all(isinstance(step, str) and step.strip() for step in steps)
         ):
             raise ValueError("plan steps must be a non-empty array of non-empty strings")
         return {"type": "plan", "steps": list(steps)}
     if action_type == "tool_call":
         if not _action_keys(parsed, frozenset({"type", "name", "arguments"})):
             raise ValueError(
-                "tool_call must carry exactly type/name/arguments (plus optional thought)")
+                "tool_call must carry exactly type/name/arguments (plus optional thought)"
+            )
         name = parsed.get("name")
         arguments = parsed.get("arguments")
         if not isinstance(name, str) or not name:
@@ -1680,10 +1683,7 @@ def _usage_total(usage: dict[str, Any] | None) -> int | None:
         return int(total)
     inputs = usage.get("input_tokens", usage.get("prompt_tokens"))
     outputs = usage.get("output_tokens", usage.get("completion_tokens"))
-    if (
-        _valid_usage_count(inputs)
-        and _valid_usage_count(outputs)
-    ):
+    if _valid_usage_count(inputs) and _valid_usage_count(outputs):
         return int(inputs) + int(outputs)
     return None
 
@@ -1797,7 +1797,7 @@ def _bound_observation(content: str, limit: int) -> str:
     header = match.group(0)
     if limit <= len(header):
         return content
-    body = content[len(header):]
+    body = content[len(header) :]
     body_budget = limit - len(header)
     reservation = f"\n[{len(body)} observation char(s) omitted]"
     room = body_budget - len(reservation)
@@ -1901,11 +1901,9 @@ def _summarize_transcript(
     plan and marker drop too so a degenerate budget still fits. The input
     transcript is never mutated.
     """
-    if measure(transcript) <= budget and (
-        max_messages is None or len(transcript) <= max_messages
-    ):
+    if measure(transcript) <= budget and (max_messages is None or len(transcript) <= max_messages):
         return list(transcript)
-    tail = transcript[-(keep_turns * 2):] if keep_turns > 0 else []
+    tail = transcript[-(keep_turns * 2) :] if keep_turns > 0 else []
     plan = _plan_message(transcript)
     tail = [message for message in tail if message is not plan]
     if max_messages is not None:
@@ -2016,8 +2014,7 @@ def _strip_for_fold(continuation: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 )
         elif name == "run_shell" and ok and obs_index != last_passing_shell:
             rewrites[obs_index] = (
-                f"{header}[run_shell: passed "
-                "(output omitted - superseded by a later run)]"
+                f"{header}[run_shell: passed (output omitted - superseded by a later run)]"
             )
     if not rewrites:
         return list(continuation)
@@ -2048,9 +2045,14 @@ def _render_rolling_compaction(
     inner_budget = budget - len(_ROLLING_CONTEXT_OPEN) - len(_ROLLING_CONTEXT_CLOSE)
 
     def measure(messages: list[dict[str, Any]]) -> int:
-        return len(json.dumps(
-            messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
-        ))
+        return len(
+            json.dumps(
+                messages,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
 
     summarized = _summarize_transcript(
         _strip_for_fold(continuation),
@@ -2061,9 +2063,7 @@ def _render_rolling_compaction(
     )
     content = (
         _ROLLING_CONTEXT_OPEN
-        + json.dumps(
-            summarized, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-        )
+        + json.dumps(summarized, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + _ROLLING_CONTEXT_CLOSE
     )
     return [{"role": "user", "content": content}]
@@ -2121,11 +2121,13 @@ def _child_task_lines(task: str, parent_envelope: dict[str, Any] | None) -> str:
     """
     lines = [f"Child task: {_bounded_text(task, MAX_ENVELOPE_FIELD_CHARS)}"]
     if parent_envelope:
-        lines.extend([
-            "<cambium-parent-context>",
-            _parent_envelope_lines(parent_envelope),
-            "</cambium-parent-context>",
-        ])
+        lines.extend(
+            [
+                "<cambium-parent-context>",
+                _parent_envelope_lines(parent_envelope),
+                "</cambium-parent-context>",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -2221,14 +2223,19 @@ def _resolve_fork_prefix(
         "prefix_sha256": _messages_sha256(checkpoint.provider_messages),
         "suffix_sha256": _messages_sha256(checkpoint.continuation_suffix),
         "full_sha256": _messages_sha256(checkpoint.full_messages),
-        "prefix_bytes": prompt_prefix_bytes(
-            {"messages": checkpoint.provider_messages}
-        ) or 0,
+        "prefix_bytes": prompt_prefix_bytes({"messages": checkpoint.provider_messages}) or 0,
         "provider_boundary": cache_key.provider_boundary,
     }
     for field in (
-        "provider", "model", "protocol", "system_sha256", "tools_sha256",
-        "prefix_sha256", "suffix_sha256", "full_sha256", "prefix_bytes",
+        "provider",
+        "model",
+        "protocol",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
+        "full_sha256",
+        "prefix_bytes",
         "provider_boundary",
     ):
         descriptor_value = descriptor.get(field)
@@ -2294,9 +2301,7 @@ def _provider_task_tools_hash() -> str:
     compatibility asserts this hash, never assumes it (plan §5.5).
     """
     return _sha256_hex(
-        json.dumps(_exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG), sort_keys=True).encode(
-            "utf-8"
-        )
+        json.dumps(_exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG), sort_keys=True).encode("utf-8")
     )
 
 
@@ -2315,8 +2320,13 @@ def _fork_cache_compatible(
     if not isinstance(cache_key, dict):
         return False, "epoch has no cache_key"
     if set(cache_key) < {
-        "provider", "model", "protocol", "reasoning_effort", "tools_sha256",
-        "redacted", "provider_boundary",
+        "provider",
+        "model",
+        "protocol",
+        "reasoning_effort",
+        "tools_sha256",
+        "redacted",
+        "provider_boundary",
     }:
         return False, "epoch cache_key is incomplete"
     if cache_key.get("redacted") is True:
@@ -2375,32 +2385,33 @@ def _build_agent_prompt(
             "identity and never guess."
         )
     system_lines.extend(SUMMARY_PROTOCOL_LINES)
-    system_lines.extend([
-        "In normal mode, return exactly one JSON object; it must be one action:",
-        '  plan:      {"type": "plan", "steps": ["...", "..."]}',
-        '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
-        '  finish:    {"type": "finish", "summary": <non-empty summary>}',
-        'An optional "thought" field may be added to the same object to record your '
-        "reasoning; the action fields above must remain exact.",
-        "Your FIRST action must be a short plan: list the concrete steps before any "
-        "tool_call.",
-        "Approach:",
-        "- Reading uses only the batch read tool (read_batch); individual file "
-        "reads are unavailable, so read all needed files in one batch call.",
-        "- Read the relevant files before editing; verify each change before moving on.",
-        "- If a tool call fails, diagnose the error and retry with a corrected call.",
-        "- When the task changes code, run the relevant tests via run_shell; only emit "
-        "finish after the change is verified and the tests pass. If tests fail, iterate.",
-        "- Emit finish only when the task is complete and verified.",
-        "Examples:",
-        '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", '
-        '"run tests"]}',
-        '  {"type": "tool_call", "name": "read_batch", '
-        '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
-        '  {"type": "finish", "summary": "implemented and verified the change"}',
-        "Available tools:",
-        json.dumps(tools, sort_keys=True),
-    ])
+    system_lines.extend(
+        [
+            "In normal mode, return exactly one JSON object; it must be one action:",
+            '  plan:      {"type": "plan", "steps": ["...", "..."]}',
+            '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
+            '  finish:    {"type": "finish", "summary": <non-empty summary>}',
+            'An optional "thought" field may be added to the same object to record your '
+            "reasoning; the action fields above must remain exact.",
+            "Your FIRST action must be a short plan: list the concrete steps before any tool_call.",
+            "Approach:",
+            "- Reading uses only the batch read tool (read_batch); individual file "
+            "reads are unavailable, so read all needed files in one batch call.",
+            "- Read the relevant files before editing; verify each change before moving on.",
+            "- If a tool call fails, diagnose the error and retry with a corrected call.",
+            "- When the task changes code, run the relevant tests via run_shell; only emit "
+            "finish after the change is verified and the tests pass. If tests fail, iterate.",
+            "- Emit finish only when the task is complete and verified.",
+            "Examples:",
+            '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", '
+            '"run tests"]}',
+            '  {"type": "tool_call", "name": "read_batch", '
+            '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
+            '  {"type": "finish", "summary": "implemented and verified the change"}',
+            "Available tools:",
+            json.dumps(tools, sort_keys=True),
+        ]
+    )
     messages = [
         {"role": "system", "content": "\n".join(system_lines)},
         _task_message(task),
@@ -2421,7 +2432,6 @@ def _build_agent_prompt(
 def _tool_observation(name: str, result: ToolResult) -> str:
     body = result.output if result.ok else (result.error or result.output or "")
     return _bounded_text(f"tool {name} ok={result.ok}\n{body}", MAX_OBSERVATION_BYTES)
-
 
 
 def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
@@ -2456,6 +2466,7 @@ def _bind_router_provider(router: Any, result: CallResult, task_id: str) -> None
     binder = getattr(router, "bind_provider", None)
     if callable(binder):
         binder(result.provider, result.model, root_task_id=task_id)
+
 
 def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
     """Persist only the parsed action, never an optional scratchpad/thought."""
@@ -2511,21 +2522,22 @@ async def _emit_tool_event(
     turn: int,
     tool_result: ToolResult,
 ) -> None:
-    await send(writer, {
-        "type": "tool_event",
-        "task_id": config.task_id,
-        "generation": config.generation,
-        "tool": name,
-        "cmd": _safe_cmd(name, args),
-        "turn": turn,
-        "ok": bool(tool_result.ok),
-        "duration_ms": int(tool_result.duration_ms),
-    })
+    await send(
+        writer,
+        {
+            "type": "tool_event",
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "tool": name,
+            "cmd": _safe_cmd(name, args),
+            "turn": turn,
+            "ok": bool(tool_result.ok),
+            "duration_ms": int(tool_result.duration_ms),
+        },
+    )
 
 
-def _prompt_context_usage_fields(
-    prompt: Mapping[str, Any], *, call_kind: str
-) -> dict[str, Any]:
+def _prompt_context_usage_fields(prompt: Mapping[str, Any], *, call_kind: str) -> dict[str, Any]:
     """Describe the active prompt shape without exposing prompt content.
 
     Byte counts use the exact canonical request representation Cambium handed
@@ -2718,14 +2730,17 @@ async def _emit_checkpoint(
     state_ref: Path,
     commits_so_far: list[str],
 ) -> None:
-    await send(writer, {
-        "type": "checkpoint",
-        "task_id": config.task_id,
-        "generation": config.generation,
-        "turn": turn,
-        "state_ref": str(state_ref),
-        "commits_so_far": commits_so_far,
-    })
+    await send(
+        writer,
+        {
+            "type": "checkpoint",
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "turn": turn,
+            "state_ref": str(state_ref),
+            "commits_so_far": commits_so_far,
+        },
+    )
 
 
 async def _persist_checkpoint(
@@ -2766,9 +2781,7 @@ def _default_provider_boundary(
         "api_key_env": "",
         "provider_env_keys": list(config.provider_env_keys),
         "authorized_providers": (
-            list(config.authorized_providers)
-            if config.authorized_providers_explicit
-            else None
+            list(config.authorized_providers) if config.authorized_providers_explicit else None
         ),
         "authorized_providers_explicit": config.authorized_providers_explicit,
         "protocol": protocol or "unknown-protocol",
@@ -2803,9 +2816,7 @@ def _provider_boundary(
         "api_key_env": api_key_env or "",
         "provider_env_keys": list(config.provider_env_keys),
         "authorized_providers": (
-            list(config.authorized_providers)
-            if config.authorized_providers_explicit
-            else None
+            list(config.authorized_providers) if config.authorized_providers_explicit else None
         ),
         "authorized_providers_explicit": config.authorized_providers_explicit,
         "protocol": protocol_value,
@@ -2976,22 +2987,19 @@ def _write_epoch_checkpoint(
             raise ContextForkError(f"checkpoint {name} must be a non-negative integer")
     if cumulative_usage is None:
         cumulative_usage = {}
-    if (
-        not isinstance(cumulative_usage, Mapping)
-        or any(
-            not isinstance(key, str)
-            or not isinstance(value, int)
-            or isinstance(value, bool)
-            or value < 0
-            for key, value in cumulative_usage.items()
-        )
+    if not isinstance(cumulative_usage, Mapping) or any(
+        not isinstance(key, str)
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        for key, value in cumulative_usage.items()
     ):
         raise ContextForkError("checkpoint cumulative_usage has invalid counts")
     if wall_deadline is None:
         wall_deadline = time.time() + config.max_wall_s
     if (
         isinstance(wall_deadline, bool)
-        or not isinstance(wall_deadline, (int, float))
+        or not isinstance(wall_deadline, int | float)
         or not math.isfinite(float(wall_deadline))
         or wall_deadline <= 0
     ):
@@ -2999,9 +3007,10 @@ def _write_epoch_checkpoint(
     if provider_compat is None:
         provider_compat = {}
     protocol, reasoning_effort = provider_compat.get(provider or "", ("unknown", None))
-    boundary = dict(provider_boundary or _default_provider_boundary(
-        config, provider, model, protocol, reasoning_effort
-    ))
+    boundary = dict(
+        provider_boundary
+        or _default_provider_boundary(config, provider, model, protocol, reasoning_effort)
+    )
     boundary = _validate_provider_boundary(boundary)
     full_messages = [*provider_messages, *continuation_suffix]
     prefix_sha256 = _messages_sha256(provider_messages)
@@ -3012,9 +3021,7 @@ def _write_epoch_checkpoint(
         model=model,
         protocol=protocol,
         reasoning_effort=reasoning_effort,
-        system_sha256=_sha256_hex(
-            str(provider_messages[0].get("content", "")).encode("utf-8")
-        ),
+        system_sha256=_sha256_hex(str(provider_messages[0].get("content", "")).encode("utf-8")),
         tools_sha256=tools_sha256,
         prefix_sha256=prefix_sha256,
         suffix_sha256=suffix_sha256,
@@ -3052,30 +3059,38 @@ def _write_epoch_checkpoint(
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
     payload = cast(
         dict[str, Any],
-        redactor.redact_mapping(asdict(replace(
-            checkpoint, checkpoint_ref=placeholder_ref,
-        ))),
+        redactor.redact_mapping(
+            asdict(
+                replace(
+                    checkpoint,
+                    checkpoint_ref=placeholder_ref,
+                )
+            )
+        ),
     )
     redacted = payload != asdict(replace(checkpoint, checkpoint_ref=placeholder_ref))
     if redacted:
         redacted_provider_messages = payload["provider_messages"]
         redacted_continuation_suffix = payload["continuation_suffix"]
         redacted_cache_key = payload["cache_key"]
-        redacted_cache_key.update({
-            "system_sha256": _sha256_hex(
-                str(redacted_provider_messages[0]["content"]).encode("utf-8")
-            ),
-            "prefix_sha256": _messages_sha256(redacted_provider_messages),
-            "suffix_sha256": _messages_sha256(redacted_continuation_suffix),
-            "full_sha256": _messages_sha256([
-                *redacted_provider_messages, *redacted_continuation_suffix,
-            ]),
-            "prefix_bytes": prompt_prefix_bytes(
-                {"messages": redacted_provider_messages}
-            ) or 0,
-            "message_count": len(redacted_provider_messages),
-            "redacted": True,
-        })
+        redacted_cache_key.update(
+            {
+                "system_sha256": _sha256_hex(
+                    str(redacted_provider_messages[0]["content"]).encode("utf-8")
+                ),
+                "prefix_sha256": _messages_sha256(redacted_provider_messages),
+                "suffix_sha256": _messages_sha256(redacted_continuation_suffix),
+                "full_sha256": _messages_sha256(
+                    [
+                        *redacted_provider_messages,
+                        *redacted_continuation_suffix,
+                    ]
+                ),
+                "prefix_bytes": prompt_prefix_bytes({"messages": redacted_provider_messages}) or 0,
+                "message_count": len(redacted_provider_messages),
+                "redacted": True,
+            }
+        )
         redacted_cache_key["provider_boundary"] = _validate_provider_boundary(
             redacted_cache_key["provider_boundary"]
         )
@@ -3116,30 +3131,33 @@ async def _emit_context_checkpoint(
     request_id: str | None = None,
 ) -> None:
     cache_key = checkpoint.cache_key
-    await send(writer, {
-        "type": "context_checkpoint",
-        "request_id": request_id,
-        "task_id": config.task_id,
-        "generation": config.generation,
-        "epoch": checkpoint.epoch,
-        "turn": checkpoint.turn,
-        "checkpoint_ref": checkpoint.checkpoint_ref,
-        "cache_key": {
-            "provider": cache_key.provider,
-            "model": cache_key.model,
-            "protocol": cache_key.protocol,
-            "reasoning_effort": cache_key.reasoning_effort,
-            "system_sha256": cache_key.system_sha256,
-            "tools_sha256": cache_key.tools_sha256,
-            "prefix_sha256": cache_key.prefix_sha256,
-            "suffix_sha256": cache_key.suffix_sha256,
-            "full_sha256": cache_key.full_sha256,
-            "prefix_bytes": cache_key.prefix_bytes,
-            "message_count": cache_key.message_count,
-            "redacted": cache_key.redacted,
-            "provider_boundary": cache_key.provider_boundary,
+    await send(
+        writer,
+        {
+            "type": "context_checkpoint",
+            "request_id": request_id,
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "epoch": checkpoint.epoch,
+            "turn": checkpoint.turn,
+            "checkpoint_ref": checkpoint.checkpoint_ref,
+            "cache_key": {
+                "provider": cache_key.provider,
+                "model": cache_key.model,
+                "protocol": cache_key.protocol,
+                "reasoning_effort": cache_key.reasoning_effort,
+                "system_sha256": cache_key.system_sha256,
+                "tools_sha256": cache_key.tools_sha256,
+                "prefix_sha256": cache_key.prefix_sha256,
+                "suffix_sha256": cache_key.suffix_sha256,
+                "full_sha256": cache_key.full_sha256,
+                "prefix_bytes": cache_key.prefix_bytes,
+                "message_count": cache_key.message_count,
+                "redacted": cache_key.redacted,
+                "provider_boundary": cache_key.provider_boundary,
+            },
         },
-    })
+    )
 
 
 async def _emit_context_epoch_advanced(
@@ -3151,18 +3169,21 @@ async def _emit_context_epoch_advanced(
     folded_from_epoch: int,
     reason: str | None,
 ) -> None:
-    await send(writer, {
-        "type": "context_epoch_advanced",
-        "request_id": request_id,
-        "task_id": config.task_id,
-        "generation": config.generation,
-        "epoch": checkpoint.epoch,
-        "turn": checkpoint.turn,
-        "checkpoint_ref": checkpoint.checkpoint_ref,
-        "cache_key": asdict(checkpoint.cache_key),
-        "folded_from_epoch": folded_from_epoch,
-        "reason": reason,
-    })
+    await send(
+        writer,
+        {
+            "type": "context_epoch_advanced",
+            "request_id": request_id,
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "epoch": checkpoint.epoch,
+            "turn": checkpoint.turn,
+            "checkpoint_ref": checkpoint.checkpoint_ref,
+            "cache_key": asdict(checkpoint.cache_key),
+            "folded_from_epoch": folded_from_epoch,
+            "reason": reason,
+        },
+    )
 
 
 async def _emit_compaction_failed(
@@ -3177,14 +3198,17 @@ async def _emit_compaction_failed(
     if config.redactor is not None:
         safe_reason = config.redactor.redact_escaped(safe_reason)
         safe_reason = _cap_utf8(safe_reason, MAX_ENVELOPE_FIELD_CHARS)
-    await send(writer, {
-        "type": "compaction_failed",
-        "request_id": request_id,
-        "task_id": config.task_id,
-        "generation": config.generation,
-        "epoch": epoch,
-        "reason": safe_reason,
-    })
+    await send(
+        writer,
+        {
+            "type": "compaction_failed",
+            "request_id": request_id,
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "epoch": epoch,
+            "reason": safe_reason,
+        },
+    )
 
 
 def _load_epoch_checkpoint(
@@ -3204,8 +3228,8 @@ def _load_epoch_checkpoint(
     root = root.resolve()
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
         raise ContextForkError("invalid checkpoint_ref")
-    task_component, ref_epoch, _address_pre, address_persisted = (
-        _validate_checkpoint_ref_shape(checkpoint_ref)
+    task_component, ref_epoch, _address_pre, address_persisted = _validate_checkpoint_ref_shape(
+        checkpoint_ref
     )
     if expect_task_id and task_component != _safe_task_id(config.task_id):
         raise ContextForkError("invalid checkpoint_ref path")
@@ -3231,22 +3255,35 @@ def _load_epoch_checkpoint(
             parse_constant=_reject_json_constant,
         )
     except (OSError, ValueError) as exc:
-        raise ContextForkError(
-            f"checkpoint unreadable: {exc.__class__.__name__}"
-        ) from exc
+        raise ContextForkError(f"checkpoint unreadable: {exc.__class__.__name__}") from exc
     if not isinstance(data, dict):
         raise ContextForkError("checkpoint is not an object")
     if _checkpoint_address(data) != address_persisted:
         raise ContextForkError("checkpoint persisted-address mismatch")
     if data.get("epoch") != ref_epoch:
         raise ContextForkError("checkpoint epoch does not match its filename")
-    expected_keys = frozenset({
-        "schema", "task_id", "generation", "epoch", "turn", "created_at",
-        "cache_key", "provider_messages", "continuation_suffix", "checkpoint_ref",
-        "code_changed", "verified_after_change", "verification_failed",
-        "no_progress_actions", "budget_new_tokens", "previous_prompt_tokens",
-        "cumulative_usage", "wall_deadline",
-    })
+    expected_keys = frozenset(
+        {
+            "schema",
+            "task_id",
+            "generation",
+            "epoch",
+            "turn",
+            "created_at",
+            "cache_key",
+            "provider_messages",
+            "continuation_suffix",
+            "checkpoint_ref",
+            "code_changed",
+            "verified_after_change",
+            "verification_failed",
+            "no_progress_actions",
+            "budget_new_tokens",
+            "previous_prompt_tokens",
+            "cumulative_usage",
+            "wall_deadline",
+        }
+    )
     if set(data) != expected_keys:
         raise ContextForkError("checkpoint has an invalid key set")
     if data.get("schema") != CHECKPOINT_EPOCH_SCHEMA:
@@ -3288,11 +3325,23 @@ def _load_epoch_checkpoint(
     cache_key = data.get("cache_key")
     if not isinstance(cache_key, dict):
         raise ContextForkError("checkpoint cache_key missing")
-    cache_keys = frozenset({
-        "provider", "model", "protocol", "reasoning_effort", "system_sha256",
-        "tools_sha256", "prefix_sha256", "suffix_sha256", "full_sha256",
-        "prefix_bytes", "message_count", "redacted", "provider_boundary",
-    })
+    cache_keys = frozenset(
+        {
+            "provider",
+            "model",
+            "protocol",
+            "reasoning_effort",
+            "system_sha256",
+            "tools_sha256",
+            "prefix_sha256",
+            "suffix_sha256",
+            "full_sha256",
+            "prefix_bytes",
+            "message_count",
+            "redacted",
+            "provider_boundary",
+        }
+    )
     if set(cache_key) != cache_keys:
         raise ContextForkError("checkpoint cache_key has an invalid key set")
     expected = {
@@ -3317,7 +3366,10 @@ def _load_epoch_checkpoint(
         if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
             raise ContextForkError("checkpoint cache_key reasoning_effort invalid")
         for key in (
-            "system_sha256", "tools_sha256", "prefix_sha256", "suffix_sha256",
+            "system_sha256",
+            "tools_sha256",
+            "prefix_sha256",
+            "suffix_sha256",
             "full_sha256",
         ):
             digest = cache_key.get(key)
@@ -3350,9 +3402,7 @@ def _load_epoch_checkpoint(
     for key in ("code_changed", "verified_after_change", "verification_failed"):
         if type(data.get(key)) is not bool:
             raise ContextForkError(f"checkpoint {key} invalid")
-    for key in (
-        "budget_new_tokens", "previous_prompt_tokens", "no_progress_actions"
-    ):
+    for key in ("budget_new_tokens", "previous_prompt_tokens", "no_progress_actions"):
         value = data.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ContextForkError(f"checkpoint {key} invalid")
@@ -3369,10 +3419,10 @@ def _load_epoch_checkpoint(
     wall_deadline = data.get("wall_deadline")
     if (
         isinstance(created_at, bool)
-        or not isinstance(created_at, (int, float))
+        or not isinstance(created_at, int | float)
         or not math.isfinite(float(created_at))
         or isinstance(wall_deadline, bool)
-        or not isinstance(wall_deadline, (int, float))
+        or not isinstance(wall_deadline, int | float)
         or not math.isfinite(float(wall_deadline))
         or wall_deadline <= 0
     ):
@@ -3466,11 +3516,7 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
         scratch = Path(run["scratch_repo"]).resolve()
         worktree = Path(run["worktree_path"]).resolve()
         generation = run.get("generation")
-        if (
-            isinstance(generation, bool)
-            or not isinstance(generation, int)
-            or generation <= 0
-        ):
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
             outcome["failure_reason"] = "invalid worker generation"
             return outcome
         raw_write_marker = run.get("write_marker", True)
@@ -3494,7 +3540,8 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
         session_root = scratch.parent
         if not worktree.is_relative_to(session_root):
             outcome["failure_reason"] = (
-                f"worktree_path {worktree} outside session scratch root {session_root}")
+                f"worktree_path {worktree} outside session scratch root {session_root}"
+            )
             return outcome
         target = (worktree / target_file).resolve()
         if not target.is_relative_to(worktree):
@@ -3564,8 +3611,7 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
             "-m",
             f"cambium-ipc: {run['task_id']}",
             "-m",
-            f"Cambium-Worker-Generation: {generation}\n"
-            f"Cambium-Worker-Identity: {worker_identity}",
+            f"Cambium-Worker-Generation: {generation}\nCambium-Worker-Identity: {worker_identity}",
             cwd=worktree,
         )
         if rc != 0:
@@ -3737,9 +3783,7 @@ async def _run_agent_loop(
             return False, str(exc)
         raw_tail = [*legacy_tail, *copy.deepcopy(context_continuation)]
         rolling_gate = (
-            config.rolling_compact
-            and config.context_reuse
-            and config.checkpoint_root is not None
+            config.rolling_compact and config.context_reuse and config.checkpoint_root is not None
         )
         raw_size = _transcript_chars(raw_tail)
         if not force:
@@ -3845,18 +3889,14 @@ async def _run_agent_loop(
                     epoch=usage_epoch,
                     fork_of=usage_fork_of,
                 )
-            cumulative_usage = _accumulate_usage(
-                cumulative_usage, summary_result.usage
-            )
+            cumulative_usage = _accumulate_usage(cumulative_usage, summary_result.usage)
             summary_prompt_tokens = _usage_prompt_tokens(summary_result.usage)
             summary_completion_tokens = _usage_completion_tokens(summary_result.usage)
             if summary_prompt_tokens is None:
                 budget_new_tokens += summary_total
                 previous_prompt_tokens = 0
             else:
-                budget_new_tokens += max(
-                    0, summary_prompt_tokens - previous_prompt_tokens
-                )
+                budget_new_tokens += max(0, summary_prompt_tokens - previous_prompt_tokens)
                 previous_prompt_tokens = summary_prompt_tokens
                 budget_new_tokens += (
                     summary_completion_tokens
@@ -3865,9 +3905,7 @@ async def _run_agent_loop(
                 )
             if budget_new_tokens > config.max_tokens:
                 raise ContextForkError("token budget exceeded during summary flush")
-            summary_entry = parse_summary_response(
-                summary_result.content, expectation
-            )
+            summary_entry = parse_summary_response(summary_result.content, expectation)
             new_trunk = append_summary_entry(trunk_messages, summary_entry)
             checkpoint = await asyncio.to_thread(
                 _write_epoch_checkpoint,
@@ -3878,9 +3916,7 @@ async def _run_agent_loop(
                 continuation_suffix=[],
                 provider=summary_result.provider,
                 model=model,
-                tools_sha256=_sha256_hex(
-                    json.dumps(tools, sort_keys=True).encode("utf-8")
-                ),
+                tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
                 provider_compat=provider_compat,
                 provider_boundary=provider_boundaries.get(summary_result.provider),
                 code_changed=code_changed,
@@ -3901,9 +3937,7 @@ async def _run_agent_loop(
             failure_reason = str(exc).strip() or exc.__class__.__name__
             if config.redactor is not None:
                 failure_reason = config.redactor.redact_escaped(failure_reason)
-            failure_reason = _cap_utf8(
-                failure_reason, MAX_ENVELOPE_FIELD_CHARS
-            )
+            failure_reason = _cap_utf8(failure_reason, MAX_ENVELOPE_FIELD_CHARS)
             if writer is not None:
                 await _emit_compaction_failed(
                     writer,
@@ -3954,8 +3988,12 @@ async def _run_agent_loop(
                 raise ContextForkError("checkpoint redacted")
         except ContextForkError as exc:
             return _loop_result(
-                outcome, "failed", f"context_resume_failed: {exc}", 0,
-                cumulative_usage, transcript,
+                outcome,
+                "failed",
+                f"context_resume_failed: {exc}",
+                0,
+                cumulative_usage,
+                transcript,
             )
         current_epoch_checkpoint = resume_checkpoint
         base_messages = tuple(copy.deepcopy(resume_checkpoint.full_messages))
@@ -3964,10 +4002,12 @@ async def _run_agent_loop(
             for child_result in resume["child_results"]
         ]
         if resume["child_results_truncated"]:
-            context_continuation.append({
-                "role": "user",
-                "content": "[note: some child results were truncated and omitted]",
-            })
+            context_continuation.append(
+                {
+                    "role": "user",
+                    "content": "[note: some child results were truncated and omitted]",
+                }
+            )
         code_changed = resume_checkpoint.code_changed
         verified_after_change = resume_checkpoint.verified_after_change
         verification_failed = resume_checkpoint.verification_failed
@@ -3998,13 +4038,16 @@ async def _run_agent_loop(
                 usage_fork_of = fork_checkpoint.checkpoint_ref
                 _sync_context_transcript()
         if fork_skip is not None and writer is not None:
-            await send(writer, {
-                "type": "context_fork_skipped",
-                "request_id": run_request_id,
-                "task_id": config.task_id,
-                "generation": config.generation,
-                "reason": fork_skip,
-            })
+            await send(
+                writer,
+                {
+                    "type": "context_fork_skipped",
+                    "request_id": run_request_id,
+                    "task_id": config.task_id,
+                    "generation": config.generation,
+                    "reason": fork_skip,
+                },
+            )
 
     if base_messages is None and config.summary_trunk_ref is not None:
         try:
@@ -4013,9 +4056,7 @@ async def _run_agent_loop(
             )
             if semantic_checkpoint.cache_key.redacted:
                 raise ContextForkError("checkpoint redacted")
-            summaries = semantic_summary_messages(
-                semantic_checkpoint.full_messages
-            )
+            summaries = semantic_summary_messages(semantic_checkpoint.full_messages)
             semantic_prompt = _build_agent_prompt(
                 config.task,
                 tools,
@@ -4023,30 +4064,27 @@ async def _run_agent_loop(
                 model_identity,
                 parent_envelope=config.parent_envelope,
             )
-            semantic_trunk, semantic_tail = partition_summary_trunk(
-                semantic_prompt["messages"]
-            )
+            semantic_trunk, semantic_tail = partition_summary_trunk(semantic_prompt["messages"])
             base_messages = tuple(copy.deepcopy(semantic_trunk))
             context_continuation = copy.deepcopy(semantic_tail)
             usage_fork_of = config.summary_trunk_ref
             _sync_context_transcript()
         except (ContextForkError, SummaryTrunkError) as exc:
             if writer is not None:
-                await send(writer, {
-                    "type": "context_fork_skipped",
-                    "request_id": run_request_id,
-                    "task_id": config.task_id,
-                    "generation": config.generation,
-                    "reason": f"semantic summary reuse failed: {exc}",
-                })
+                await send(
+                    writer,
+                    {
+                        "type": "context_fork_skipped",
+                        "request_id": run_request_id,
+                        "task_id": config.task_id,
+                        "generation": config.generation,
+                        "reason": f"semantic summary reuse failed: {exc}",
+                    },
+                )
 
     # The main agent starts in trunk mode too. The stable head is frozen once;
     # later summaries extend it and the raw working tail remains separate.
-    if (
-        base_messages is None
-        and config.context_reuse
-        and config.checkpoint_root is not None
-    ):
+    if base_messages is None and config.context_reuse and config.checkpoint_root is not None:
         initial_prompt = _build_agent_prompt(
             config.task,
             tools,
@@ -4054,16 +4092,12 @@ async def _run_agent_loop(
             model_identity,
             parent_envelope=config.parent_envelope,
         )
-        initial_trunk, initial_tail = partition_summary_trunk(
-            initial_prompt["messages"]
-        )
+        initial_trunk, initial_tail = partition_summary_trunk(initial_prompt["messages"])
         base_messages = tuple(copy.deepcopy(initial_trunk))
         context_continuation = copy.deepcopy(initial_tail)
         _sync_context_transcript()
 
-    wall_deadline = time.monotonic() + max(
-        0.0, absolute_wall_deadline - time.time()
-    )
+    wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
         for turn in range(first_turn, config.max_turns + 1):
             progress.turn = turn
@@ -4074,14 +4108,21 @@ async def _run_agent_loop(
                 )
             if time.monotonic() >= wall_deadline:
                 return _loop_result(
-                    outcome, "failed", "wall budget exceeded", turn - 1,
-                    cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    "wall budget exceeded",
+                    turn - 1,
+                    cumulative_usage,
+                    transcript,
                 )
             _require_generation(worktree, config.generation)
             if base_messages is None:
                 transcript = _summarize_transcript(transcript, config.max_transcript_chars)
                 prompt = _build_agent_prompt(
-                    config.task, tools, transcript, model_identity,
+                    config.task,
+                    tools,
+                    transcript,
+                    model_identity,
                     parent_envelope=config.parent_envelope,
                 )
             else:
@@ -4119,43 +4160,62 @@ async def _run_agent_loop(
                             prompt=sent_prompt,
                             call_kind="agent",
                         ),
-                        epoch=usage_epoch, fork_of=usage_fork_of,
+                        epoch=usage_epoch,
+                        fork_of=usage_fork_of,
                     )
                 return _loop_result(
-                    outcome, "failed", f"provider call failed: {exc.__class__.__name__}",
-                    turn - 1, cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    f"provider call failed: {exc.__class__.__name__}",
+                    turn - 1,
+                    cumulative_usage,
+                    transcript,
                 )
             if time.monotonic() >= wall_deadline:
                 return _loop_result(
-                    outcome, "failed", "wall budget exceeded", turn,
-                    cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    "wall budget exceeded",
+                    turn,
+                    cumulative_usage,
+                    transcript,
                 )
             declared_model = router.declared_model(result.provider)
             if declared_model and result.model != declared_model:
                 return _loop_result(
-                    outcome, "failed", "provider response model mismatch",
-                    turn - 1, cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    "provider response model mismatch",
+                    turn - 1,
+                    cumulative_usage,
+                    transcript,
                 )
             _bind_router_provider(router, result, config.task_id)
             invalid_usage_fields = _invalid_usage_fields(result.usage)
             if invalid_usage_fields:
                 return _loop_result(
-                    outcome, "failed", "provider usage contains invalid token counts",
-                    turn - 1, cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    "provider usage contains invalid token counts",
+                    turn - 1,
+                    cumulative_usage,
+                    transcript,
                 )
             total = _usage_total(result.usage)
             if total is None:
                 return _loop_result(
-                    outcome, "failed", "provider usage missing usable token counts",
-                    turn - 1, cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    "provider usage missing usable token counts",
+                    turn - 1,
+                    cumulative_usage,
+                    transcript,
                 )
             if writer is not None:
                 await _emit_usage_event(
                     writer,
                     config,
-                    _success_usage_event(
-                        result, turn, prompt=sent_prompt, call_kind="agent"
-                    ),
+                    _success_usage_event(result, turn, prompt=sent_prompt, call_kind="agent"),
                     epoch=usage_epoch,
                     fork_of=usage_fork_of,
                 )
@@ -4175,17 +4235,22 @@ async def _run_agent_loop(
                 )
             if budget_new_tokens > config.max_tokens:
                 return _loop_result(
-                    outcome, "failed", "token budget exceeded",
-                    turn, cumulative_usage, transcript,
+                    outcome,
+                    "failed",
+                    "token budget exceeded",
+                    turn,
+                    cumulative_usage,
+                    transcript,
                 )
             try:
                 action = _native_tool_action(result) or _parse_agent_action(result.content)
             except ValueError as exc:
                 invalid_messages = [
                     {"role": "assistant", "content": "[invalid action omitted]"},
-                    {"role": "user", "content": _bounded_text(
-                        f"invalid action: {exc}", MAX_OBSERVATION_BYTES
-                    )},
+                    {
+                        "role": "user",
+                        "content": _bounded_text(f"invalid action: {exc}", MAX_OBSERVATION_BYTES),
+                    },
                 ]
                 if base_messages is None:
                     transcript.extend(invalid_messages)
@@ -4195,10 +4260,13 @@ async def _run_agent_loop(
                 no_progress_actions += 1
                 if no_progress_actions > MAX_CONSECUTIVE_PLANS:
                     return _loop_result(
-                        outcome, "failed",
+                        outcome,
+                        "failed",
                         f"agent made no progress: {no_progress_actions} consecutive "
                         "actions without a tool call",
-                        turn, cumulative_usage, transcript,
+                        turn,
+                        cumulative_usage,
+                        transcript,
                     )
                 continue
             trailing = _action_trailing(result.content)
@@ -4207,10 +4275,13 @@ async def _run_agent_loop(
                 no_progress_actions += 1
                 if no_progress_actions > MAX_CONSECUTIVE_PLANS:
                     return _loop_result(
-                        outcome, "failed",
+                        outcome,
+                        "failed",
                         f"agent made no progress: {no_progress_actions} consecutive "
                         "actions without a tool call",
-                        turn, cumulative_usage, transcript,
+                        turn,
+                        cumulative_usage,
+                        transcript,
                     )
                 if base_messages is None:
                     transcript.append(action_message)
@@ -4219,9 +4290,9 @@ async def _run_agent_loop(
                 else:
                     context_continuation.append(action_message)
                     if trailing:
-                        context_continuation.append({
-                            "role": "user", "content": _TRAILING_ACTION_NOTE
-                        })
+                        context_continuation.append(
+                            {"role": "user", "content": _TRAILING_ACTION_NOTE}
+                        )
                     context_continuation.append({"role": "user", "content": "Continue."})
                     _sync_context_transcript()
                 progress.tool = "plan"
@@ -4388,9 +4459,7 @@ async def _run_agent_loop(
             ) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)
             if name == "delegate" and tool_result.ok and writer is not None:
-                await _emit_delegated_child(
-                    writer, config, arguments, request_id=run_request_id
-                )
+                await _emit_delegated_child(writer, config, arguments, request_id=run_request_id)
             if tool_result.ok:
                 if name in ("write_file", "edit_file"):
                     code_changed = True
@@ -4411,9 +4480,7 @@ async def _run_agent_loop(
             else:
                 continuation_suffix = [action_message]
                 if trailing:
-                    continuation_suffix.append({
-                        "role": "user", "content": _TRAILING_ACTION_NOTE
-                    })
+                    continuation_suffix.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                 continuation_suffix.append(observation)
                 state_message = _context_state_message(
                     code_changed=code_changed,
@@ -4433,10 +4500,7 @@ async def _run_agent_loop(
             if config.context_reuse and name == "delegate" and tool_result.ok:
                 checkpoint: ContextCheckpoint | None = None
                 checkpoint_was_emitted = False
-                if (
-                    base_messages is not None
-                    and config.checkpoint_root is not None
-                ):
+                if base_messages is not None and config.checkpoint_root is not None:
                     _folded, compaction_failure = await _bound_context_continuation(
                         turn, force=True
                     )
@@ -4458,7 +4522,8 @@ async def _run_agent_loop(
                             _canonical_action_message(action),
                             *(
                                 [{"role": "user", "content": _TRAILING_ACTION_NOTE}]
-                                if trailing else []
+                                if trailing
+                                else []
                             ),
                             observation,
                             _context_state_message(
@@ -4480,9 +4545,7 @@ async def _run_agent_loop(
                         continuation_suffix=continuation_suffix,
                         provider=result.provider,
                         model=model,
-                        tools_sha256=_sha256_hex(
-                            json.dumps(tools, sort_keys=True).encode("utf-8")
-                        ),
+                        tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
                         provider_compat=provider_compat,
                         provider_boundary=provider_boundaries.get(result.provider),
                         code_changed=code_changed,
@@ -4511,8 +4574,12 @@ async def _run_agent_loop(
                         "checkpoint_ref": checkpoint.checkpoint_ref,
                     }
         return _loop_result(
-            outcome, "failed", f"max turns exceeded ({config.max_turns})",
-            config.max_turns, cumulative_usage, transcript,
+            outcome,
+            "failed",
+            f"max turns exceeded ({config.max_turns})",
+            config.max_turns,
+            cumulative_usage,
+            transcript,
         )
     except GenerationFenceError as exc:
         return _loop_result(
@@ -4530,16 +4597,21 @@ async def _do_provider_work(
     worktree = Path(run["worktree_path"]).resolve()
     session_root = Path(run["scratch_repo"]).resolve().parent
     if not worktree.is_relative_to(session_root):
-        return _loop_failure_outcome({
-            "status": "failed",
-            "failure_reason": (
-                f"worktree_path {worktree} outside session scratch root {session_root}"),
-        })
+        return _loop_failure_outcome(
+            {
+                "status": "failed",
+                "failure_reason": (
+                    f"worktree_path {worktree} outside session scratch root {session_root}"
+                ),
+            }
+        )
     if not worktree.exists():
-        return _loop_failure_outcome({
-            "status": "failed",
-            "failure_reason": f"worker worktree is missing: {worktree}",
-        })
+        return _loop_failure_outcome(
+            {
+                "status": "failed",
+                "failure_reason": f"worker worktree is missing: {worktree}",
+            }
+        )
     try:
         fanout_config = cast(dict[str, Any], config.fanout_config)
         router, tier, model, model_identity = _provider_router(
@@ -4552,21 +4624,20 @@ async def _do_provider_work(
             requirements=config.requirements,
         )
     except Exception as exc:
-        return _loop_failure_outcome({
-            "status": "failed",
-            "failure_reason": f"provider routing failed: {exc.__class__.__name__}",
-        })
+        return _loop_failure_outcome(
+            {
+                "status": "failed",
+                "failure_reason": f"provider routing failed: {exc.__class__.__name__}",
+            }
+        )
     try:
         provider_path = _provider_path()
         configured_providers = load_providers(provider_path)
         provider_compat = {
-            p.name: (p.protocol.value, p.reasoning_effort)
-            for p in configured_providers
+            p.name: (p.protocol.value, p.reasoning_effort) for p in configured_providers
         }
         provider_boundaries = {
-            p.name: _provider_boundary(
-                config, p, provider_config_path=provider_path
-            )
+            p.name: _provider_boundary(config, p, provider_config_path=provider_path)
             for p in configured_providers
         }
     except Exception:
@@ -4604,8 +4675,11 @@ async def _do_provider_work(
     terminal_checkpoint = outcome.pop("_context_checkpoint", None)
     if writer is not None and final_checkpoint is not None:
         await _emit_checkpoint(
-            writer, config, loop_outcome.get("turn", 0),
-            Path(final_checkpoint), outcome.get("commits", []),
+            writer,
+            config,
+            loop_outcome.get("turn", 0),
+            Path(final_checkpoint),
+            outcome.get("commits", []),
         )
     if writer is not None and terminal_checkpoint is not None:
         await _emit_context_checkpoint(
@@ -4649,10 +4723,7 @@ def _finalize_worktree(
 
     def _write_terminal_epoch() -> ContextCheckpoint | None:
         terminal_epoch = loop_outcome.get("_terminal_epoch")
-        if (
-            not config.context_reuse
-            or not isinstance(terminal_epoch, dict)
-        ):
+        if not config.context_reuse or not isinstance(terminal_epoch, dict):
             return None
         return _write_epoch_checkpoint(config, **terminal_epoch)
 
@@ -4690,9 +4761,7 @@ def _finalize_worktree(
             env=scrub_environment(),
         )
         if status_proc.returncode != 0:
-            outcome["failure_reason"] = (
-                f"git status failed: {status_proc.stderr.strip()}"
-            )
+            outcome["failure_reason"] = f"git status failed: {status_proc.stderr.strip()}"
             return outcome
         changed: list[str] = []
         ignored: list[str] = []
@@ -4702,9 +4771,7 @@ def _finalize_worktree(
                 path = path.split(" -> ", 1)[1]
             if not path or path == ".cambium" or path.startswith(".cambium/"):
                 continue
-            if (
-                is_cache_artifact_path(path)
-            ):
+            if is_cache_artifact_path(path):
                 continue
             if line[:2] == "!!":
                 ignored.append(path)
@@ -4720,9 +4787,7 @@ def _finalize_worktree(
             "rev-parse", "--verify", f"{base_commit}^{{commit}}", cwd=worktree
         )
         if rc != 0:
-            outcome["failure_reason"] = (
-                f"cannot resolve base_commit {base_commit}: {err}"
-            )
+            outcome["failure_reason"] = f"cannot resolve base_commit {base_commit}: {err}"
             return outcome
         if head_sha != resolved_base:
             outcome["failure_reason"] = (
@@ -4749,9 +4814,9 @@ def _finalize_worktree(
                 files_changed=[],
                 diff="",
                 diff_truncated=False,
-                summary=(
-                    loop_outcome.get("summary") or f"completed {config.task_id}"
-                )[:MAX_SUMMARY_CHARS],
+                summary=(loop_outcome.get("summary") or f"completed {config.task_id}")[
+                    :MAX_SUMMARY_CHARS
+                ],
             )
             if terminal_checkpoint is not None:
                 outcome["_context_checkpoint"] = terminal_checkpoint
@@ -4770,8 +4835,7 @@ def _finalize_worktree(
             "-m",
             f"cambium-agent: {config.task_id}",
             "-m",
-            f"Cambium-Worker-Generation: {generation}\n"
-            f"Cambium-Worker-Identity: {worker_identity}",
+            f"Cambium-Worker-Generation: {generation}\nCambium-Worker-Identity: {worker_identity}",
             cwd=worktree,
         )
         if rc != 0:
@@ -4796,9 +4860,9 @@ def _finalize_worktree(
             files_changed=changed,
             diff=diff,
             diff_truncated=diff_truncated,
-            summary=(
-                loop_outcome.get("summary") or f"completed {config.task_id}"
-            )[:MAX_SUMMARY_CHARS],
+            summary=(loop_outcome.get("summary") or f"completed {config.task_id}")[
+                :MAX_SUMMARY_CHARS
+            ],
         )
         if final_checkpoint is not None:
             outcome["_checkpoint_path"] = str(final_checkpoint)
@@ -4825,15 +4889,18 @@ async def _heartbeat_loop(
         turn = progress.turn if progress is not None else 0
         tool = progress.tool if progress is not None else None
         status = progress.status if progress is not None else "working"
-        await send(writer, {
-            "type": "heartbeat",
-            "task_id": task_id,
-            "generation": generation,
-            "turn": turn,
-            "tool": tool,
-            "status": status,
-            "monotonic_ms": _monotonic_ms(),
-        })
+        await send(
+            writer,
+            {
+                "type": "heartbeat",
+                "task_id": task_id,
+                "generation": generation,
+                "turn": turn,
+                "tool": tool,
+                "status": status,
+                "monotonic_ms": _monotonic_ms(),
+            },
+        )
         if stop.is_set():
             # Observed the stop flag right after this send: exit at the safe
             # point (between iterations) instead of starting another send.
@@ -4874,8 +4941,7 @@ async def _emit_proposed_children(
     for index, proposal in enumerate(proposals):
         if not isinstance(proposal, dict):
             raise ChildProposalError(
-                f"proposed_children[{index}] must be an object, "
-                f"got {type(proposal).__name__}"
+                f"proposed_children[{index}] must be an object, got {type(proposal).__name__}"
             )
         child_task_id = proposal.get("child_task_id")
         kind = proposal.get("kind")
@@ -4885,21 +4951,20 @@ async def _emit_proposed_children(
                 f"proposed_children[{index}].child_task_id must be a non-empty string"
             )
         if not isinstance(kind, str) or not kind:
-            raise ChildProposalError(
-                f"proposed_children[{index}].kind must be a non-empty string"
-            )
+            raise ChildProposalError(f"proposed_children[{index}].kind must be a non-empty string")
         if not isinstance(child_spec, dict):
-            raise ChildProposalError(
-                f"proposed_children[{index}].spec must be an object"
-            )
-        await send(writer, {
-            "type": "propose_child",
-            "request_id": make_request_id("propose"),
-            "parent_task_id": task_id,
-            "child_task_id": child_task_id,
-            "kind": kind,
-            "spec": child_spec,
-        })
+            raise ChildProposalError(f"proposed_children[{index}].spec must be an object")
+        await send(
+            writer,
+            {
+                "type": "propose_child",
+                "request_id": make_request_id("propose"),
+                "parent_task_id": task_id,
+                "child_task_id": child_task_id,
+                "kind": kind,
+                "spec": child_spec,
+            },
+        )
 
 
 async def _emit_delegated_child(
@@ -4917,14 +4982,17 @@ async def _emit_delegated_child(
     this task's terminal envelope; the tool result is emitted before this
     message so the model's observation stays bounded and independent.
     """
-    await send(writer, {
-        "type": "propose_child",
-        "request_id": request_id or make_request_id("propose"),
-        "parent_task_id": config.task_id,
-        "child_task_id": arguments["child_task_id"],
-        "kind": arguments["kind"],
-        "spec": arguments["spec"],
-    })
+    await send(
+        writer,
+        {
+            "type": "propose_child",
+            "request_id": request_id or make_request_id("propose"),
+            "parent_task_id": config.task_id,
+            "child_task_id": arguments["child_task_id"],
+            "kind": arguments["kind"],
+            "spec": arguments["spec"],
+        },
+    )
 
 
 async def _run_task(
@@ -4941,9 +5009,7 @@ async def _run_task(
     progress = AgentProgress()
 
     hb = asyncio.create_task(
-        _heartbeat_loop(
-            writer, task_id, generation, stop, progress, config.heartbeat_interval_s
-        )
+        _heartbeat_loop(writer, task_id, generation, stop, progress, config.heartbeat_interval_s)
     )
     try:
         outcome = await do_work(run, stop, config=config, writer=writer, progress=progress)
@@ -5015,13 +5081,16 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
 async def _emit_result(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
     """Emit result_envelope + the authoritative exit_message (normal completion)."""
     await _emit_result_envelope(writer, outcome)
-    await send(writer, {
-        "type": "exit_message",
-        "task_id": outcome["task_id"],
-        "generation": outcome["generation"],
-        "reason": _exit_reason(outcome["status"]),
-        "monotonic_ms": _monotonic_ms(),
-    })
+    await send(
+        writer,
+        {
+            "type": "exit_message",
+            "task_id": outcome["task_id"],
+            "generation": outcome["generation"],
+            "reason": _exit_reason(outcome["status"]),
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
 
 
 async def _await_on_shutdown(
@@ -5057,13 +5126,16 @@ async def _send_ok(
     task_id: str,
     generation: int,
 ) -> None:
-    await send(writer, {
-        "type": "ok",
-        "request_id": msg.get("request_id") if isinstance(msg, dict) else None,
-        "task_id": task_id,
-        "generation": generation,
-        "monotonic_ms": _monotonic_ms(),
-    })
+    await send(
+        writer,
+        {
+            "type": "ok",
+            "request_id": msg.get("request_id") if isinstance(msg, dict) else None,
+            "task_id": task_id,
+            "generation": generation,
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
 
 
 async def _send_pong(
@@ -5072,33 +5144,42 @@ async def _send_pong(
     task_id: str,
     generation: int,
 ) -> None:
-    await send(writer, {
-        "type": "pong",
-        "request_id": msg.get("request_id"),
-        "task_id": task_id,
-        "generation": generation,
-        "monotonic_ms": _monotonic_ms(),
-    })
+    await send(
+        writer,
+        {
+            "type": "pong",
+            "request_id": msg.get("request_id"),
+            "task_id": task_id,
+            "generation": generation,
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
 
 
 async def _fatal(writer: asyncio.StreamWriter, msg: Any, message: str) -> int:
     context = msg if isinstance(msg, dict) else {}
-    await send(writer, {
-        "type": "fatal_error",
-        "request_id": context.get("request_id"),
-        "task_id": context.get("task_id"),
-        "generation": context.get("generation"),
-        "error_type": "invalid_message",
-        "message": message[:500],
-        "recoverable": False,
-    })
-    await send(writer, {
-        "type": "exit_message",
-        "task_id": context.get("task_id"),
-        "generation": context.get("generation"),
-        "reason": "fatal",
-        "monotonic_ms": _monotonic_ms(),
-    })
+    await send(
+        writer,
+        {
+            "type": "fatal_error",
+            "request_id": context.get("request_id"),
+            "task_id": context.get("task_id"),
+            "generation": context.get("generation"),
+            "error_type": "invalid_message",
+            "message": message[:500],
+            "recoverable": False,
+        },
+    )
+    await send(
+        writer,
+        {
+            "type": "exit_message",
+            "task_id": context.get("task_id"),
+            "generation": context.get("generation"),
+            "reason": "fatal",
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
     return 1
 
 
@@ -5128,15 +5209,18 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
         init_config = AgentConfig.from_init(first)
     except ValueError as exc:
         return await _fatal(writer, first, f"invalid init config: {exc}")
-    await send(writer, {
-        "type": "ready",
-        "request_id": init_rid,
-        "task_id": task_id,
-        "pid": os.getpid(),
-        "generation": generation,
-        "proto": first.get("proto", PROTO),
-        "monotonic_ms": _monotonic_ms(),
-    })
+    await send(
+        writer,
+        {
+            "type": "ready",
+            "request_id": init_rid,
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": generation,
+            "proto": first.get("proto", PROTO),
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
     # Worker-reuse opt-in (eval-3 ADOPT): when the init asks for it, the
     # worker stays alive after the task and waits for a rebind init on stdin
     # instead of exiting. The single-init exit behavior below is unchanged
@@ -5155,7 +5239,8 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
         # envelope. With a task in flight the read simply waits.
         read_timeout = None if current is not None else idle_timeout
         read_task = asyncio.create_task(
-            asyncio.wait_for(read_message(reader), timeout=read_timeout))
+            asyncio.wait_for(read_message(reader), timeout=read_timeout)
+        )
         pending = {read_task}
         if current is not None:
             pending.add(current)
@@ -5176,25 +5261,31 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 return await _fatal(writer, {}, f"task crashed: {exc}")
             await _emit_result_envelope(writer, outcome)
             if not worker_reuse:
-                await send(writer, {
-                    "type": "exit_message",
-                    "task_id": outcome["task_id"],
-                    "generation": outcome["generation"],
-                    "reason": _exit_reason(outcome["status"]),
-                    "monotonic_ms": _monotonic_ms(),
-                })
+                await send(
+                    writer,
+                    {
+                        "type": "exit_message",
+                        "task_id": outcome["task_id"],
+                        "generation": outcome["generation"],
+                        "reason": _exit_reason(outcome["status"]),
+                        "monotonic_ms": _monotonic_ms(),
+                    },
+                )
                 return 0
             # Reuse path: report ready-for-reuse and loop back to read the
             # next init instead of exiting. All per-task state (agent loop,
             # transcript, tool state, LM clients) is rebuilt from the new
             # init's config on rebind.
-            await send(writer, {
-                "type": "reuse_ready",
-                "task_id": outcome["task_id"],
-                "generation": outcome["generation"],
-                "pid": os.getpid(),
-                "monotonic_ms": _monotonic_ms(),
-            })
+            await send(
+                writer,
+                {
+                    "type": "reuse_ready",
+                    "task_id": outcome["task_id"],
+                    "generation": outcome["generation"],
+                    "pid": os.getpid(),
+                    "monotonic_ms": _monotonic_ms(),
+                },
+            )
             continue
 
         try:
@@ -5211,13 +5302,16 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                     await task
                 except BaseException:
                     pass
-            await send(writer, {
-                "type": "exit_message",
-                "task_id": task_id,
-                "generation": generation,
-                "reason": "idle",
-                "monotonic_ms": _monotonic_ms(),
-            })
+            await send(
+                writer,
+                {
+                    "type": "exit_message",
+                    "task_id": task_id,
+                    "generation": generation,
+                    "reason": "idle",
+                    "monotonic_ms": _monotonic_ms(),
+                },
+            )
             return 0
         except MessageTooLong:
             return await _fatal(writer, {}, "wire line exceeded the length cap")
@@ -5230,13 +5324,16 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 # pipe or exited): a pooled worker exits cleanly.
                 return 0
             # stdin closed: no further requests can arrive.
-            await send(writer, {
-                "type": "exit_message",
-                "task_id": task_id,
-                "generation": generation,
-                "reason": "crash",
-                "monotonic_ms": _monotonic_ms(),
-            })
+            await send(
+                writer,
+                {
+                    "type": "exit_message",
+                    "task_id": task_id,
+                    "generation": generation,
+                    "reason": "crash",
+                    "monotonic_ms": _monotonic_ms(),
+                },
+            )
             return 1
 
         mtype = msg.get("type") if isinstance(msg, dict) else None
@@ -5272,15 +5369,18 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             init_config = new_config
             worker_reuse = bool(msg.get("worker_reuse"))
             stop = threading.Event()
-            await send(writer, {
-                "type": "ready",
-                "request_id": init_rid,
-                "task_id": task_id,
-                "pid": os.getpid(),
-                "generation": generation,
-                "proto": msg.get("proto", PROTO),
-                "monotonic_ms": _monotonic_ms(),
-            })
+            await send(
+                writer,
+                {
+                    "type": "ready",
+                    "request_id": init_rid,
+                    "task_id": task_id,
+                    "pid": os.getpid(),
+                    "generation": generation,
+                    "proto": msg.get("proto", PROTO),
+                    "monotonic_ms": _monotonic_ms(),
+                },
+            )
             continue
         if mtype == "run_task":
             if current is not None:
@@ -5300,7 +5400,8 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             task_config = _merge_task_config(init_config, first, task_run)
             current_request_id = msg["request_id"]
             current = asyncio.create_task(
-                _run_task(writer, task_run, task_id, generation, stop, task_config))
+                _run_task(writer, task_run, task_id, generation, stop, task_config)
+            )
         elif mtype == "check_health":
             await _send_ok(writer, msg, task_id, generation)
         elif mtype == "ping":
@@ -5313,8 +5414,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 logger.info("steer: cancel requested")
                 stop.set()
             else:
-                logger.info("steer (v2.1 hook; continuing): %s",
-                            json.dumps(payload)[:200])
+                logger.info("steer (v2.1 hook; continuing): %s", json.dumps(payload)[:200])
         elif mtype == "cancel":
             logger.info("cancel: aborting current task")
             await _send_ok(writer, msg, task_id, generation)
@@ -5327,17 +5427,18 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 current = None
                 request_id = current_request_id
                 current_request_id = None
-                outcome = await _await_on_shutdown(
-                    task, task_id, generation, request_id
-                )
+                outcome = await _await_on_shutdown(task, task_id, generation, request_id)
                 await _emit_result_envelope(writer, outcome)
-            await send(writer, {
-                "type": "exit_message",
-                "task_id": task_id,
-                "generation": generation,
-                "reason": "shutdown",
-                "monotonic_ms": _monotonic_ms(),
-            })
+            await send(
+                writer,
+                {
+                    "type": "exit_message",
+                    "task_id": task_id,
+                    "generation": generation,
+                    "reason": "shutdown",
+                    "monotonic_ms": _monotonic_ms(),
+                },
+            )
             return 0
         else:
             return await _fatal(writer, msg, f"unknown message type {mtype!r}")
@@ -5371,8 +5472,7 @@ async def _open_stdio() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     read_protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: read_protocol, sys.stdin.buffer)
     write_protocol = _WriterProtocol()
-    transport, _ = await loop.connect_write_pipe(
-        lambda: write_protocol, sys.stdout.buffer)
+    transport, _ = await loop.connect_write_pipe(lambda: write_protocol, sys.stdout.buffer)
     writer = asyncio.StreamWriter(transport, write_protocol, reader, loop)
     return reader, writer
 

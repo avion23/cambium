@@ -72,7 +72,7 @@ def _serialize_output(output: ReviewOutput) -> dict[str, bool | float | str]:
         raise TypeError("module returned an invalid decision")
     if not isinstance(output.reason, str):
         raise TypeError("module returned an invalid reason")
-    if isinstance(output.confidence, bool) or not isinstance(output.confidence, (int, float)):
+    if isinstance(output.confidence, bool) or not isinstance(output.confidence, int | float):
         raise TypeError("module returned an invalid confidence")
     if not math.isfinite(output.confidence) or not 0.0 <= output.confidence <= 1.0:
         raise ValueError("module returned confidence outside [0.0, 1.0]")
@@ -103,9 +103,7 @@ async def _evaluate(
             raise SchemaInvalidError(f"record {index}.expected must be a JSON object")
         expected_review = expected.get("review")
         if not isinstance(expected_review, bool):
-            raise SchemaInvalidError(
-                f"record {index}.expected.review must be a boolean"
-            )
+            raise SchemaInvalidError(f"record {index}.expected.review must be a boolean")
         if not isinstance(expected.get("reason"), str):
             raise SchemaInvalidError(f"record {index}.expected.reason must be a string")
         canary = record.get("canary", False)
@@ -114,11 +112,7 @@ async def _evaluate(
         prediction = await module.decide(task_input)
         prediction_wire = _serialize_output(prediction)
         expected_typed = dict(expected)
-        expected_typed["review"] = (
-            Decision.REVIEW
-            if expected_review
-            else Decision.DO_NOT_REVIEW
-        )
+        expected_typed["review"] = Decision.REVIEW if expected_review else Decision.DO_NOT_REVIEW
         score = module.metric(
             Example(
                 input=task_input,
@@ -127,7 +121,7 @@ async def _evaluate(
                 canary=canary,
             )
         )
-        if isinstance(score, bool) or not isinstance(score, (int, float)):
+        if isinstance(score, bool) or not isinstance(score, int | float):
             raise TypeError(f"record {index}: module metric is not numeric")
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             raise ValueError(f"record {index}: module metric is outside [0.0, 1.0]")
@@ -154,9 +148,7 @@ def _write_error(exc: Exception) -> int:
 def main() -> int:
     """Read one JSON request and emit one JSON response."""
     try:
-        payload = json.loads(
-            sys.stdin.buffer.read(), object_pairs_hook=_reject_duplicate_fields
-        )
+        payload = json.loads(sys.stdin.buffer.read(), object_pairs_hook=_reject_duplicate_fields)
         module = ShouldReviewModule()
         if isinstance(payload, dict) and "operation" in payload:
             operation = payload.get("operation")

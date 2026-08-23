@@ -122,9 +122,7 @@ def should_decompose(task: str, context: str = "") -> DecomposeOutput:
         evidence += 1
         reasons.append("per-item work signaled by 'each'")
 
-    file_refs = re.findall(
-        r"[A-Za-z0-9_./-]+\.(?:py|rs|ts|js|go|toml|json|yaml|md|sh|sql)\b", task
-    )
+    file_refs = re.findall(r"[A-Za-z0-9_./-]+\.(?:py|rs|ts|js|go|toml|json|yaml|md|sh|sql)\b", task)
     if len(file_refs) >= 3:
         evidence += 1
         reasons.append("three or more files touched")
@@ -137,8 +135,7 @@ def should_decompose(task: str, context: str = "") -> DecomposeOutput:
     action_verbs = [
         clause
         for clause in clauses
-        if (words := clause.split())
-        and words[0].lower().rstrip(".") in ACTION_VERBS
+        if (words := clause.split()) and words[0].lower().rstrip(".") in ACTION_VERBS
     ]
     if len(action_verbs) >= 3:
         evidence += 2

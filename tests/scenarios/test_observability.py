@@ -198,9 +198,7 @@ def test_dashboard_and_status_render_core_introspection(tmp_path: Path) -> None:
             ),
         ]
     )
-    dashboard = "\n".join(
-        render_dashboard(snapshot, session_dir=tmp_path, width=120, height=24)
-    )
+    dashboard = "\n".join(render_dashboard(snapshot, session_dir=tmp_path, width=120, height=24))
     status = "\n".join(render_agent_lines(snapshot))
     assert "codex/gpt" in dashboard
     assert "out/s=2.0" in dashboard

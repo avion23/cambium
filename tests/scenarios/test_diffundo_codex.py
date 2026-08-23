@@ -58,10 +58,7 @@ class CodexServer:
 
     def __init__(
         self,
-        behaviors: list[
-            tuple[int, object, float]
-            | tuple[int, object, float, dict[str, str]]
-        ],
+        behaviors: list[tuple[int, object, float] | tuple[int, object, float, dict[str, str]]],
         *,
         host: str = "127.0.0.1",
     ) -> None:
@@ -210,7 +207,7 @@ def _ok_stream(model: str = "gpt-5.6-luna", text: str = "Hello, world") -> str:
             "content_index": 0,
         },
         _delta(text[: len(text) // 2]),
-        _delta(text[len(text) // 2:]),
+        _delta(text[len(text) // 2 :]),
         {
             "type": "response.output_text.done",
             "item_id": "it_1",
@@ -350,7 +347,13 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
     # fixed insertion order: model, input, store, stream, then tools, then
     # tool_choice, then reasoning
     assert list(first.keys()) == [
-        "model", "input", "store", "stream", "tools", "tool_choice", "reasoning",
+        "model",
+        "input",
+        "store",
+        "stream",
+        "tools",
+        "tool_choice",
+        "reasoning",
     ]
 
 
@@ -558,9 +561,7 @@ def test_codex_http_400_shape_rejection_stays_content_refusal() -> None:
     # The documented live shape rejections ("Stream must be set to true",
     # "Store must be set to false", "Input must be a list") name no model or
     # parameter; they keep the generic 400 -> REFUSAL fall-through.
-    server = CodexServer(
-        [(400, {"error": {"message": "Input must be a list"}}, 0.0)]
-    )
+    server = CodexServer([(400, {"error": {"message": "Input must be a list"}}, 0.0)])
     router = _router(server)
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -624,9 +625,7 @@ def test_codex_non_loopback_http_origin_is_rejected_before_request() -> None:
 
 def test_codex_redirect_fails_closed_and_never_contacts_target() -> None:
     target = CodexServer([(200, _ok_stream(), 0.0)])
-    redirector = CodexServer(
-        [(302, {}, 0.0, {"Location": f"{target.base_url}{CODEX_PATH}"})]
-    )
+    redirector = CodexServer([(302, {}, 0.0, {"Location": f"{target.base_url}{CODEX_PATH}"})])
     router = _router(redirector)
     try:
         with pytest.raises(AllProvidersFailed) as exc:

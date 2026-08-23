@@ -85,9 +85,7 @@ def test_concurrent_writers_publish_complete_last_writer_result(tmp_path: Path) 
             ("done", "failed", "rejected", "timeout", "cancelled", "done", "failed", "timeout")
         )
     )
-    allowed_records = [result_to_dict(initial)] + [
-        result_to_dict(result) for result in candidates
-    ]
+    allowed_records = [result_to_dict(initial)] + [result_to_dict(result) for result in candidates]
     barrier = threading.Barrier(len(candidates))
     stop = threading.Event()
     invalid_reads: list[bool] = []

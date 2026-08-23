@@ -152,7 +152,7 @@ def test_select_lane_applies_429_backpressure_from_debt() -> None:
     providers = [_pc("a", "m1", rpm=3), _pc("b", "m2", rpm=3)]
     debt = {
         "a": ProviderDebt(retry_after_count=25),  # cap floor(3 * 0.5) = 1
-        "b": ProviderDebt(),                      # cap 3
+        "b": ProviderDebt(),  # cap 3
     }
     lanes = {"a": LaneState(rpm_allowance=3.0), "b": LaneState(rpm_allowance=3.0)}
     # a's 429-decayed cap is one slot; once it is full only b can serve
@@ -204,7 +204,7 @@ def test_batch_preassignment_429_pressure_reduces_admissions(tmp_path) -> None:
     specs = [_spec(f"t-{i}", config_path) for i in range(4)]
     debt = {
         "a": ProviderDebt(retry_after_count=25),  # cap floor(3 * 0.5) = 1
-        "b": ProviderDebt(),                      # cap 3
+        "b": ProviderDebt(),  # cap 3
     }
     lanes: dict[str, LaneState] = {}
 
@@ -243,7 +243,9 @@ def test_batch_preassignment_skips_pinned_and_no_fanout_tasks(tmp_path) -> None:
 def test_release_lane_returns_in_flight_to_zero_and_noops_without_reservation() -> None:
     lanes = {"a": LaneState(in_flight=1), "b": LaneState()}
     spec = {
-        "task_id": "t", "assigned_provider": "a", "fanout_config": {"model": "m1"},
+        "task_id": "t",
+        "assigned_provider": "a",
+        "fanout_config": {"model": "m1"},
         "_lane_reserved": True,
     }
 

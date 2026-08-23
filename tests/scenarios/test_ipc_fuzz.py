@@ -152,9 +152,7 @@ def test_read_message_deterministic_random_bytes_never_escapes_or_hangs() -> Non
 
 def test_read_message_one_mib_plus_one_byte_resyncs() -> None:
     async def scenario() -> None:
-        reader = _reader_with(
-            b"x" * (MAX_LINE_BYTES + 1) + b"\n" + b'{"type":"after-too-long"}\n'
-        )
+        reader = _reader_with(b"x" * (MAX_LINE_BYTES + 1) + b"\n" + b'{"type":"after-too-long"}\n')
         with pytest.raises(MessageTooLong) as raised:
             await asyncio.wait_for(read_message(reader), timeout=5.0)
         assert raised.value.length == MAX_LINE_BYTES + 1

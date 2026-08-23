@@ -95,11 +95,7 @@ def _add_constant_shape(
 
 
 def _structural_strings(record: dict[str, object], fields: frozenset[str]) -> set[str]:
-    return {
-        value
-        for key, value in record.items()
-        if key in fields and isinstance(value, str)
-    }
+    return {value for key, value in record.items() if key in fields and isinstance(value, str)}
 
 
 def test_emitted_protocol_shapes_preserve_structure_and_redact_payloads() -> None:
@@ -145,10 +141,13 @@ def test_emitted_protocol_shapes_preserve_structure_and_redact_payloads() -> Non
         ],
     }
     assert secret not in repr(redacted_event)
-    assert event_redactor.redact_protocol_record(
-        cast(dict[str, Any], redacted_event),
-        structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS,
-    ) == redacted_event
+    assert (
+        event_redactor.redact_protocol_record(
+            cast(dict[str, Any], redacted_event),
+            structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS,
+        )
+        == redacted_event
+    )
 
     raw_worker = _worker_result()
     assert set(raw_worker) == {
@@ -181,9 +180,7 @@ def test_emitted_protocol_shapes_preserve_structure_and_redact_payloads() -> Non
         "epoch",
         "checkpoint_ref",
     } <= WORKER_RESULT_STRUCTURAL_FIELDS
-    worker = _add_constant_shape(
-        raw_worker, WORKER_RESULT_STRUCTURAL_FIELDS, "worker"
-    )
+    worker = _add_constant_shape(raw_worker, WORKER_RESULT_STRUCTURAL_FIELDS, "worker")
     worker_redactor = build_session_redactor(
         _structural_strings(worker, WORKER_RESULT_STRUCTURAL_FIELDS) | {secret}
     )
@@ -199,10 +196,13 @@ def test_emitted_protocol_shapes_preserve_structure_and_redact_payloads() -> Non
         "***": "***",
         "nested": [{"***": "***"}],
     }
-    assert worker_redactor.redact_protocol_record(
-        cast(dict[str, Any], redacted_worker),
-        structural_fields=WORKER_RESULT_STRUCTURAL_FIELDS,
-    ) == redacted_worker
+    assert (
+        worker_redactor.redact_protocol_record(
+            cast(dict[str, Any], redacted_worker),
+            structural_fields=WORKER_RESULT_STRUCTURAL_FIELDS,
+        )
+        == redacted_worker
+    )
 
 
 def test_oauth_account_fingerprint_is_stable_distinct_and_bounded() -> None:

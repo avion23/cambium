@@ -105,9 +105,7 @@ def test_child_mapper_rejects_out_of_range_metrics() -> None:
     with pytest.raises(ValueError, match="metric_score"):
         wire_to_child_result(_wire(metric_breakdown={"x": 2}))
     with pytest.raises(ValueError, match="metric_score"):
-        wire_to_child_result(
-            _wire(metrics={"metric_score": 0.5, "metric_breakdown": {"x": 2}})
-        )
+        wire_to_child_result(_wire(metrics={"metric_score": 0.5, "metric_breakdown": {"x": 2}}))
     child = wire_to_child_result(_wire(metric_score=0.9, metric_breakdown={"x": 0.7}))
     assert child["metric_score"] == 0.9
     assert child["metric_breakdown"] == {"x": 0.7}
@@ -215,9 +213,7 @@ def test_successful_evaluator_verdict_maps_to_done() -> None:
 
     assert status == "done"
     assert EXIT_CODES[status] == 0
-    assert status_from_wire({"status": "succeeded", "evaluator": {"ok": False}}) == (
-        "rejected"
-    )
+    assert status_from_wire({"status": "succeeded", "evaluator": {"ok": False}}) == ("rejected")
 
 
 def test_success_reason_is_advisory_not_cancellation(tmp_path: Path) -> None:

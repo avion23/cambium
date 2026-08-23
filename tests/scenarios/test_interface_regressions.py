@@ -48,21 +48,31 @@ def test_no_change_completion_returns_success_across_user_interfaces(monkeypatch
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
     tui_out = _FlushStream()
-    assert asyncio.run(tui.run_tui(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n"),
-        output_stream=tui_out,
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n"),
+                output_stream=tui_out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     assert "plan_status={succeeded}" in tui_out.getvalue()
     assert "I reviewed the repository but changed nothing." in tui_out.getvalue()
 
-    assert asyncio.run(repl.run_repl(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n/exit\n"),
-        output_stream=io.StringIO(),
-        error_stream=io.StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n/exit\n"),
+                output_stream=io.StringIO(),
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
     assert cli.main(["run", "hi", "--repo", str(tmp_path)]) == 0
 
 
@@ -74,10 +84,14 @@ def test_tui_programming_error_terminates(monkeypatch, tmp_path):
     out = _FlushStream()
     err = _FlushStream()
     with pytest.raises(RuntimeError, match="backend unavailable"):
-        asyncio.run(tui.run_tui(
-            oneshot.OneShotConfig(repo=tmp_path),
-            input_stream=io.StringIO("hi\n"), output_stream=out, error_stream=err,
-        ))
+        asyncio.run(
+            tui.run_tui(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n"),
+                output_stream=out,
+                error_stream=err,
+            )
+        )
 
 
 def test_repl_programming_error_terminates(monkeypatch, tmp_path):
@@ -90,10 +104,14 @@ def test_repl_programming_error_terminates(monkeypatch, tmp_path):
     out = _FlushStream()
     err = _FlushStream()
     with pytest.raises(RuntimeError, match="backend unavailable"):
-        asyncio.run(repl.run_repl(
-            oneshot.OneShotConfig(repo=tmp_path), input_stream=io.StringIO("bad\nok\n"),
-            output_stream=out, error_stream=err,
-        ))
+        asyncio.run(
+            repl.run_repl(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("bad\nok\n"),
+                output_stream=out,
+                error_stream=err,
+            )
+        )
 
 
 def test_nested_plan_result_renders_reason_summary_and_safe_json():
@@ -213,12 +231,14 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
         store.close()
     out = _FlushStream()
     err = _FlushStream()
-    code = asyncio.run(tui.run_tui(
-        oneshot.OneShotConfig(repo=tmp_path, session_root=session_dir),
-        input_stream=io.StringIO("hi\n"),
-        output_stream=out,
-        error_stream=err,
-    ))
+    code = asyncio.run(
+        tui.run_tui(
+            oneshot.OneShotConfig(repo=tmp_path, session_root=session_dir),
+            input_stream=io.StringIO("hi\n"),
+            output_stream=out,
+            error_stream=err,
+        )
+    )
     value = out.getvalue()
     assert code == 0
     assert err.getvalue() == ""
@@ -242,17 +262,17 @@ def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(stats, "session_usage_stats", _fail_stats)
     out = _FlushStream()
     err = _FlushStream()
-    code = asyncio.run(tui.run_tui(
-        oneshot.OneShotConfig(repo=tmp_path),
-        input_stream=io.StringIO("hi\n"),
-        output_stream=out,
-        error_stream=err,
-    ))
+    code = asyncio.run(
+        tui.run_tui(
+            oneshot.OneShotConfig(repo=tmp_path),
+            input_stream=io.StringIO("hi\n"),
+            output_stream=out,
+            error_stream=err,
+        )
+    )
     value = out.getvalue()
     assert code == 0
-    assert err.getvalue() == (
-        "cambium tui: usage stats unavailable: stats backend unavailable\n"
-    )
+    assert err.getvalue() == ("cambium tui: usage stats unavailable: stats backend unavailable\n")
     assert "plan_status={succeeded}" in value
     assert "stats:" not in value
 

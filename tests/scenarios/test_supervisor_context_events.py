@@ -104,9 +104,7 @@ def _write_checkpoint_worker(path: Path, event: dict[str, Any]) -> None:
 def _make_repo(tmp_path: Path) -> tuple[Path, Path, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(
-        ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "context-events"], check=True)
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.email", "context-events@test"], check=True
@@ -185,10 +183,10 @@ def test_incomplete_context_checkpoint_is_rejected_without_epoch_update(
         assert outcome.clean is True
         assert "task" not in runtime._task_epochs
         rejected = [
-            record for record in store.records
+            record
+            for record in store.records
             if record["kind"] == "protocol"
-            and record["payload"].get("note")
-            == "context_checkpoint rejected: invalid field(s)"
+            and record["payload"].get("note") == "context_checkpoint rejected: invalid field(s)"
         ]
         assert rejected
 
@@ -356,9 +354,7 @@ def test_failed_resume_emits_durable_context_resume_failed(tmp_path: Path) -> No
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     repo.parent.mkdir()
-    subprocess.run(
-        ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "resume-events"], check=True)
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.email", "resume-events@test"], check=True

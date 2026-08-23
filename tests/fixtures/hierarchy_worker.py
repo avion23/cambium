@@ -79,19 +79,27 @@ def main() -> int:
     init_rid = init["request_id"]
     task_id = init["task_id"]
     generation = init.get("generation", 1)
-    send({
-        "type": "ready",
-        "request_id": init_rid,
-        "task_id": task_id,
-        "pid": os.getpid(),
-        "generation": generation,
-        "proto": 1,
-    })
+    send(
+        {
+            "type": "ready",
+            "request_id": init_rid,
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": generation,
+            "proto": 1,
+        }
+    )
 
     run = read_msg()
     if run is None or run.get("type") != "run_task":
-        send({"type": "exit_message", "task_id": task_id,
-              "generation": generation, "reason": "crash"})
+        send(
+            {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": generation,
+                "reason": "crash",
+            }
+        )
         return 1
     run_rid = run["request_id"]
     _dump_payload(run, task_id)
@@ -99,37 +107,41 @@ def main() -> int:
 
     if _is_fail_marker(run.get("marker")):
         _trace(f"EXIT {task_id} failed")
-        send({
-            "type": "result_envelope",
-            "request_id": run_rid,
-            "task_id": task_id,
-            "generation": generation,
-            "status": "failed",
-            "commits": [],
-            "files_changed": [],
-            "diff": "",
-            "failure_reason": "injected_hierarchy_failure",
-        })
-        send({"type": "exit_message", "task_id": task_id,
-              "generation": generation, "reason": "done"})
+        send(
+            {
+                "type": "result_envelope",
+                "request_id": run_rid,
+                "task_id": task_id,
+                "generation": generation,
+                "status": "failed",
+                "commits": [],
+                "files_changed": [],
+                "diff": "",
+                "failure_reason": "injected_hierarchy_failure",
+            }
+        )
+        send(
+            {"type": "exit_message", "task_id": task_id, "generation": generation, "reason": "done"}
+        )
         return 0
 
     _delay()
     status, failure_reason, commits, files_changed, diff = do_work(run)
     _trace(f"EXIT {task_id} {status}")
-    send({
-        "type": "result_envelope",
-        "request_id": run_rid,
-        "task_id": task_id,
-        "generation": generation,
-        "status": status,
-        "commits": commits,
-        "files_changed": files_changed,
-        "diff": diff,
-        "failure_reason": failure_reason,
-    })
-    send({"type": "exit_message", "task_id": task_id,
-          "generation": generation, "reason": "done"})
+    send(
+        {
+            "type": "result_envelope",
+            "request_id": run_rid,
+            "task_id": task_id,
+            "generation": generation,
+            "status": status,
+            "commits": commits,
+            "files_changed": files_changed,
+            "diff": diff,
+            "failure_reason": failure_reason,
+        }
+    )
+    send({"type": "exit_message", "task_id": task_id, "generation": generation, "reason": "done"})
     return 0
 
 

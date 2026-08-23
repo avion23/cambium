@@ -65,23 +65,19 @@ def test_select_lane_does_not_call_a_non_matching_pool_exhausted() -> None:
         select_lane([_provider("a", "other")], ["m1"], {}, {})
 
     assert type(exc_info.value) is ValueError
-    assert str(exc_info.value) == (
-        "model_candidates ['m1'] match no enabled configured provider"
-    )
+    assert str(exc_info.value) == ("model_candidates ['m1'] match no enabled configured provider")
 
 
 def test_resolve_assignment_handles_empty_single_and_zero_lane_pools() -> None:
     provider = _provider("a", "m1")
 
-    assignment = cast(
-        ProviderAssignment, resolve_assignment([provider], ["m1"], {}, {})
-    )
+    assignment = cast(ProviderAssignment, resolve_assignment([provider], ["m1"], {}, {}))
     assert assignment.provider == "a"
     assert assignment.model == "m1"
     assert assignment.tier == "fast"
-    assert cast(
-        ProviderAssignment, resolve_assignment([provider], ["m1"], {}, None)
-    ).provider == "a"
+    assert (
+        cast(ProviderAssignment, resolve_assignment([provider], ["m1"], {}, None)).provider == "a"
+    )
 
     with pytest.raises(ValueError, match="match no enabled configured provider"):
         resolve_assignment([], ["m1"], {}, {})

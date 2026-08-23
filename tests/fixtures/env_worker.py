@@ -34,22 +34,51 @@ def main() -> int:
 
     init_rid = init["request_id"]
     task_id = init["task_id"]
-    send({"type": "ready", "request_id": init_rid, "task_id": task_id,
-          "pid": os.getpid(), "generation": init.get("generation", 1), "proto": 1})
+    send(
+        {
+            "type": "ready",
+            "request_id": init_rid,
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": init.get("generation", 1),
+            "proto": 1,
+        }
+    )
 
     run = read_msg()
     if run is None or run.get("type") != "run_task":
-        send({"type": "exit_message", "task_id": task_id,
-              "generation": init.get("generation", 1), "reason": "crash"})
+        send(
+            {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": init.get("generation", 1),
+                "reason": "crash",
+            }
+        )
         return 1
     run_rid = run["request_id"]
     status, failure_reason, commits, files_changed, diff = do_work(run)
-    send({"type": "result_envelope", "request_id": run_rid, "task_id": task_id,
-          "generation": init.get("generation", 1), "status": status,
-          "commits": commits, "files_changed": files_changed, "diff": diff,
-          "failure_reason": failure_reason})
-    send({"type": "exit_message", "task_id": task_id,
-          "generation": init.get("generation", 1), "reason": "done"})
+    send(
+        {
+            "type": "result_envelope",
+            "request_id": run_rid,
+            "task_id": task_id,
+            "generation": init.get("generation", 1),
+            "status": status,
+            "commits": commits,
+            "files_changed": files_changed,
+            "diff": diff,
+            "failure_reason": failure_reason,
+        }
+    )
+    send(
+        {
+            "type": "exit_message",
+            "task_id": task_id,
+            "generation": init.get("generation", 1),
+            "reason": "done",
+        }
+    )
     return 0
 
 

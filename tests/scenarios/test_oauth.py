@@ -135,8 +135,7 @@ class _FakeIssuerHandler(BaseHTTPRequestHandler):
             with _FAKE_LOCK:
                 _FAKE.poll_count += 1
                 pending = (
-                    _FAKE.poll_mode == "pending_forever"
-                    or _FAKE.poll_count <= _FAKE.poll_pending
+                    _FAKE.poll_mode == "pending_forever" or _FAKE.poll_count <= _FAKE.poll_pending
                 )
                 sleep_s = _FAKE.device_token_sleep_s
             if sleep_s > 0:
@@ -519,9 +518,7 @@ def test_import_codex_cli_session_edge_cases(tmp_path: Path) -> None:
         import_codex_cli_session(path)
 
     path.write_text(
-        json.dumps(
-            _codex_session(tokens={"access_token": "only", "refresh_token": None})
-        ),
+        json.dumps(_codex_session(tokens={"access_token": "only", "refresh_token": None})),
         encoding="utf-8",
     )
     with pytest.raises(OAuthError):
@@ -757,7 +754,10 @@ def test_refresh_timeout_keeps_last_good(tmp_path: Path) -> None:
         before = path.read_bytes()
 
         manager = TokenManager(
-            "codex", store, client_id=FAKE_CLIENT_ID, issuer=server.issuer,
+            "codex",
+            store,
+            client_id=FAKE_CLIENT_ID,
+            issuer=server.issuer,
             refresh_timeout_s=0.3,
         )
         with pytest.raises(RefreshUnavailableError):
@@ -869,7 +869,10 @@ def test_device_flow_http_timeout(tmp_path: Path) -> None:
         server.fake.device_token_sleep_s = 2.0
         store = OAuthStore(_store_path(tmp_path))
         flow = DeviceFlow(
-            "codex", client_id=FAKE_CLIENT_ID, issuer=server.issuer, store=store,
+            "codex",
+            client_id=FAKE_CLIENT_ID,
+            issuer=server.issuer,
+            store=store,
             http_timeout_s=0.3,
         )
 

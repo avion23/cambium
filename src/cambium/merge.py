@@ -296,8 +296,13 @@ class MergeSequencer:
 
     def _in_progress(self, worktree_path: Path) -> bool:
         markers = (
-            "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
-            "REVERT_HEAD", "BISECT_LOG", "sequencer",
+            "rebase-merge",
+            "rebase-apply",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "BISECT_LOG",
+            "sequencer",
         )
         for marker in markers:
             result = self._run(worktree_path, "rev-parse", "--git-path", marker, check=False)
@@ -307,8 +312,13 @@ class MergeSequencer:
 
     def _dirty_reasons(self, worktree_path: Path) -> list[str]:
         status_result = self._run(
-            worktree_path, "status", "--porcelain=v1", "--untracked-files=all",
-            "--ignored=matching", "-z", check=False,
+            worktree_path,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "-z",
+            check=False,
         )
         if status_result.returncode != 0:
             raise StagingCleanupError("cannot inspect staging worktree state")
@@ -339,8 +349,7 @@ class MergeSequencer:
             if not task_dir.is_dir() or task_dir.is_symlink():
                 continue
             entries.extend(
-                entry for entry in task_dir.iterdir()
-                if entry.is_dir() and not entry.is_symlink()
+                entry for entry in task_dir.iterdir() if entry.is_dir() and not entry.is_symlink()
             )
         return entries
 
@@ -378,7 +387,10 @@ class MergeSequencer:
             suffix = branch.removeprefix("cambium-merge/")
             self._run_repo(common_dir, "branch", "-D", branch, check=False)
             self._run_repo(
-                common_dir, "update-ref", "-d", f"{STAGING_REF_PREFIX}/{suffix}",
+                common_dir,
+                "update-ref",
+                "-d",
+                f"{STAGING_REF_PREFIX}/{suffix}",
                 check=False,
             )
 
@@ -408,9 +420,7 @@ class MergeSequencer:
                 (entry for entry in entries if os.path.samestat(entry.stat(), newest_stat)), None
             )
         if newest_entry is not None and newest_allocated_bytes is not None:
-            measured[newest_entry] = (
-                measured[newest_entry][0], newest_allocated_bytes
-            )
+            measured[newest_entry] = (measured[newest_entry][0], newest_allocated_bytes)
         newest_bytes = measured.get(cast(Path, newest_entry), (0, 0))[1]
         if newest_entry is not None and newest_bytes > self._quarantine_max_bytes:
             raise StagingCleanupError("newest quarantine artifact exceeds the byte cap")
@@ -466,9 +476,7 @@ class MergeSequencer:
         ):
             raise StagingCleanupError("quarantine bounds cannot be satisfied")
 
-    def _quarantine_staging(
-        self, repo: Path, worktree_path: Path, reasons: list[str]
-    ) -> Path:
+    def _quarantine_staging(self, repo: Path, worktree_path: Path, reasons: list[str]) -> Path:
         root = self._quarantine_root()
         task_name = f"task-{self._task_key}"
         destination_name = f"{time.time_ns()}-{secrets.token_hex(8)}"
@@ -491,9 +499,7 @@ class MergeSequencer:
             )
             if not all(self._is_open_child(*link) for link in chain):
                 raise StagingCleanupError("quarantine path changed before worktree move")
-            anchored_destination = Path(
-                f"/proc/{os.getpid()}/fd/{task_fd}/{destination_name}"
-            )
+            anchored_destination = Path(f"/proc/{os.getpid()}/fd/{task_fd}/{destination_name}")
             anchored_root = Path(f"/proc/{os.getpid()}/fd/{root_fd}")
 
             def restore_staging() -> None:
@@ -517,7 +523,11 @@ class MergeSequencer:
                     )
 
             result = self._run_repo(
-                repo, "worktree", "move", str(worktree_path), str(anchored_destination),
+                repo,
+                "worktree",
+                "move",
+                str(worktree_path),
+                str(anchored_destination),
                 check=False,
             )
             allocated: int = 0
@@ -535,8 +545,10 @@ class MergeSequencer:
                     raise
             if result.returncode != 0:
                 self._event(
-                    "merge_staging_cleanup_failed", task=self._task_id,
-                    staging_sha=staging_sha, reason="worktree-move-failed",
+                    "merge_staging_cleanup_failed",
+                    task=self._task_id,
+                    staging_sha=staging_sha,
+                    reason="worktree-move-failed",
                 )
                 raise StagingCleanupError("cannot move dirty staging worktree to quarantine")
 
@@ -575,9 +587,7 @@ class MergeSequencer:
                 }
                 self._event("merge_staging_quarantined", **quarantine_payload)
                 if self._durable_event is not None:
-                    self._durable_event(
-                        "merge_staging_quarantined", dict(quarantine_payload)
-                    )
+                    self._durable_event("merge_staging_quarantined", dict(quarantine_payload))
                     durably_recorded = True
             except (OSError, RuntimeError) as exc:
                 if not all(self._is_open_child(*link) for link in chain):
@@ -608,7 +618,12 @@ class MergeSequencer:
             return destination
         finally:
             for fd in (
-                destination_fd, task_fd, root_fd, quarantine_fd, cambium_fd, session_fd,
+                destination_fd,
+                task_fd,
+                root_fd,
+                quarantine_fd,
+                cambium_fd,
+                session_fd,
                 source_parent_fd,
             ):
                 if fd >= 0:
@@ -697,8 +712,7 @@ class MergeSequencer:
                 repo,
                 ["rev-parse", "--verify", f"refs/heads/{branch}"],
                 cause=(
-                    f"branch {branch!r} is not a local branch and could not be "
-                    "fetched from origin"
+                    f"branch {branch!r} is not a local branch and could not be fetched from origin"
                 ),
             ) from None
 
@@ -709,9 +723,7 @@ class MergeSequencer:
             {"GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"},
         )
 
-    def _conflicted_paths(
-        self, worktree_path: Path, rebase_output: str
-    ) -> list[str]:
+    def _conflicted_paths(self, worktree_path: Path, rebase_output: str) -> list[str]:
         """Unmerged paths from ``--porcelain=v1 -z``, falling back to rebase output.
 
         ``-z`` emits NUL-separated records with unquoted pathnames, so a path
@@ -738,9 +750,7 @@ class MergeSequencer:
 
     # -- public contract -----------------------------------------------------
 
-    def prepare_staging(
-        self, repo: Path, worktree_path: Path, branch: str, base: str
-    ) -> str:
+    def prepare_staging(self, repo: Path, worktree_path: Path, branch: str, base: str) -> str:
         """Rebase ``branch`` onto ``base`` in the throwaway worktree.
 
         Returns the staging tip SHA after making it reachable from
@@ -780,8 +790,14 @@ class MergeSequencer:
             self._run_repo(repo, "update-ref", staging_ref, worker_tip, check=True)
             try:
                 self._run_repo(
-                    repo, "worktree", "add", "-B", staging_branch, str(worktree_path),
-                    worker_tip, check=True,
+                    repo,
+                    "worktree",
+                    "add",
+                    "-B",
+                    staging_branch,
+                    str(worktree_path),
+                    worker_tip,
+                    check=True,
                 )
             except GitError:
                 self._run_repo(repo, "update-ref", "-d", staging_ref, check=False)
@@ -792,7 +808,10 @@ class MergeSequencer:
         self._staging_ref = staging_ref
 
         rebase = self._run(
-            worktree_path, "rebase", base_tip, check=False,
+            worktree_path,
+            "rebase",
+            base_tip,
+            check=False,
             env=self._rebase_env(worktree_path),
         )
         if rebase.returncode != 0:
@@ -931,8 +950,7 @@ class MergeSequencer:
                 new_tip=new_tip_commit,
                 expected_old=expected_old,
                 detail=(
-                    f"{new_tip_commit} is not a descendant of {expected_old} "
-                    "(no fast-forward)"
+                    f"{new_tip_commit} is not a descendant of {expected_old} (no fast-forward)"
                 ),
             )
 
@@ -970,9 +988,7 @@ class MergeSequencer:
         if self._session_dir is None:
             return
         root = self._quarantine_root()
-        identity_pattern = re.compile(
-            r"merge/task-[0-9a-f]{16}/[0-9]+-[0-9a-f]{16}"
-        )
+        identity_pattern = re.compile(r"merge/task-[0-9a-f]{16}/[0-9]+-[0-9a-f]{16}")
         for payload in events:
             quarantine_id = payload.get("quarantine_id")
             device = payload.get("quarantine_device")
@@ -1086,9 +1102,7 @@ class MergeSequencer:
             reasons = self._dirty_reasons(worktree_path)
             if reasons:
                 staging_ref = self._staging_ref
-                staging_tip = (
-                    self._rev_parse(repo, staging_ref) if staging_ref else None
-                )
+                staging_tip = self._rev_parse(repo, staging_ref) if staging_ref else None
                 if staging_tip == current:
                     if self._durable_event is None:
                         raise StagingCleanupError(
@@ -1107,8 +1121,11 @@ class MergeSequencer:
                 self._quarantine_staging(repo, worktree_path, reasons)
                 if staging_tip == current:
                     self._event(
-                        "merge_reconciled", task=self._task_id, new=current,
-                        repo=str(repo), staging_ref=staging_ref,
+                        "merge_reconciled",
+                        task=self._task_id,
+                        new=current,
+                        repo=str(repo),
+                        staging_ref=staging_ref,
                         reason="ref-advanced-before-event",
                     )
             else:
@@ -1117,12 +1134,20 @@ class MergeSequencer:
                     reconciled_tip = self._rev_parse(repo, reconciled_ref)
         if reconciled_tip == current:
             self._event(
-                "merge_committed", task=self._task_id, new=current, repo=str(repo),
-                staging_ref=reconciled_ref, reason="recovered-ref-advance",
+                "merge_committed",
+                task=self._task_id,
+                new=current,
+                repo=str(repo),
+                staging_ref=reconciled_ref,
+                reason="recovered-ref-advance",
             )
             self._event(
-                "merge_reconciled", task=self._task_id, new=current, repo=str(repo),
-                staging_ref=reconciled_ref, reason="ref-advanced-before-event",
+                "merge_reconciled",
+                task=self._task_id,
+                new=current,
+                repo=str(repo),
+                staging_ref=reconciled_ref,
+                reason="ref-advanced-before-event",
             )
         elif self._worktree_path is not None:
             self.cleanup_staging(repo)
@@ -1176,8 +1201,10 @@ class MergeSequencer:
                     except GitError:
                         pass
                 self._event(
-                    "merge_staging_cleanup_failed", task=self._task_id,
-                    staging_sha=staging_sha, reason=exc.__class__.__name__,
+                    "merge_staging_cleanup_failed",
+                    task=self._task_id,
+                    staging_sha=staging_sha,
+                    reason=exc.__class__.__name__,
                 )
             raise
         else:

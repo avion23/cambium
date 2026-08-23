@@ -48,13 +48,27 @@ def main() -> int:
     init_rid = init["request_id"]
     task_id = init["task_id"]
 
-    send({"type": "ready", "request_id": init_rid, "task_id": task_id,
-          "pid": os.getpid(), "generation": generation, "proto": 1})
+    send(
+        {
+            "type": "ready",
+            "request_id": init_rid,
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": generation,
+            "proto": 1,
+        }
+    )
 
     run = read_msg()
     if run is None or run.get("type") != "run_task":
-        send({"type": "exit_message", "task_id": task_id,
-              "generation": generation, "reason": "crash"})
+        send(
+            {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": generation,
+                "reason": "crash",
+            }
+        )
         return 1
 
     worktree = Path(run["worktree_path"]).resolve()
@@ -69,11 +83,19 @@ def main() -> int:
     if generation == 1:
         return 3  # crash mid-edit: no result_envelope, no exit_message
 
-    send({"type": "result_envelope", "request_id": run["request_id"], "task_id": task_id,
-          "generation": generation, "status": "succeeded",
-          "commits": [], "files_changed": [file.name], "diff": ""})
-    send({"type": "exit_message", "task_id": task_id,
-          "generation": generation, "reason": "done"})
+    send(
+        {
+            "type": "result_envelope",
+            "request_id": run["request_id"],
+            "task_id": task_id,
+            "generation": generation,
+            "status": "succeeded",
+            "commits": [],
+            "files_changed": [file.name],
+            "diff": "",
+        }
+    )
+    send({"type": "exit_message", "task_id": task_id, "generation": generation, "reason": "done"})
     return 0
 
 

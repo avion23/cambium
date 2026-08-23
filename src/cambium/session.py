@@ -42,9 +42,7 @@ class InvalidSessionError(ValueError):
     def __init__(self, entries: list[SessionEntry]) -> None:
         self.entries = entries
         described = ", ".join(str(entry.path) for entry in entries[:3])
-        super().__init__(
-            f"{len(entries)} invalid session(s) under the session root: {described}"
-        )
+        super().__init__(f"{len(entries)} invalid session(s) under the session root: {described}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +175,7 @@ def _session_entry(path: Path) -> SessionEntry | None:
 
 
 def _timestamp(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return float("-inf")
     try:
         number = float(value)

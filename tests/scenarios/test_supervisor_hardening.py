@@ -51,6 +51,7 @@ def test_plan_manifest_is_idempotent_and_immutable(tmp_path: Path) -> None:
         supervisor_module._write_plan(tmp_path, {"tasks": [{"task_id": "other"}]})
     assert path.read_bytes() == original
 
+
 PROBE_ENV = {
     "TEST_API_KEY_DEMO": "sk-demo-value",
     "TEST_DB_PWD_DEMO": "demo-password",
@@ -140,19 +141,19 @@ def _install_env_hooks(repo: Path, worker_report: Path, merge_report: Path) -> N
     hooks = repo / ".git" / "hooks"
     pre_commit = (
         "#!/bin/sh\n"
-        "if [ -n \"${CAMBIUM_TEST_PROVIDER_KEY:-}\" ]; then provider=present; "
+        'if [ -n "${CAMBIUM_TEST_PROVIDER_KEY:-}" ]; then provider=present; '
         "else provider=absent; fi\n"
-        "if [ -n \"${TEST_API_KEY_DEMO:-}\" ]; then unrelated=present; "
+        'if [ -n "${TEST_API_KEY_DEMO:-}" ]; then unrelated=present; '
         "else unrelated=absent; fi\n"
-        f"printf '%s %s\\n' \"$provider\" \"$unrelated\" > {shlex.quote(str(worker_report))}\n"
+        f'printf \'%s %s\\n\' "$provider" "$unrelated" > {shlex.quote(str(worker_report))}\n'
     )
     pre_rebase = (
         "#!/bin/sh\n"
-        "if [ -n \"${CAMBIUM_TEST_PROVIDER_KEY:-}\" ]; then provider=present; "
+        'if [ -n "${CAMBIUM_TEST_PROVIDER_KEY:-}" ]; then provider=present; '
         "else provider=absent; fi\n"
-        "if [ -n \"${TEST_API_KEY_DEMO:-}\" ]; then unrelated=present; "
+        'if [ -n "${TEST_API_KEY_DEMO:-}" ]; then unrelated=present; '
         "else unrelated=absent; fi\n"
-        f"printf '%s %s\\n' \"$provider\" \"$unrelated\" > {shlex.quote(str(merge_report))}\n"
+        f'printf \'%s %s\\n\' "$provider" "$unrelated" > {shlex.quote(str(merge_report))}\n'
     )
     for name, content in (
         ("pre-commit", pre_commit),
@@ -246,11 +247,19 @@ def test_only_one_run_plan_owns_a_session(tmp_path: Path) -> None:
     repo = session_dir / "repo"
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     first = _task(
-        session_dir, repo, base, "first", worker=FAKE_WORKER,
+        session_dir,
+        repo,
+        base,
+        "first",
+        worker=FAKE_WORKER,
         gate="grep -q '// first' hello.txt",
     )
     second = _task(
-        session_dir, repo, base, "second", worker=FAKE_WORKER,
+        session_dir,
+        repo,
+        base,
+        "second",
+        worker=FAKE_WORKER,
         gate="grep -q '// second' hello.txt",
     )
 
@@ -310,10 +319,7 @@ def test_session_redactor_removes_declared_secret_from_db_and_observers(
         "send({'type': 'exit_message', 'task_id': run['task_id'], 'reason': 'done'})\n",
         encoding="utf-8",
     )
-    gate = (
-        f"printf '%s\\n' \"${provider_key}\" >&2; "
-        "grep -q '// t-secret' hello.txt"
-    )
+    gate = f"printf '%s\\n' \"${provider_key}\" >&2; grep -q '// t-secret' hello.txt"
     task = _task(
         session_dir,
         repo,
@@ -375,9 +381,7 @@ def test_short_declared_provider_credential_is_rejected_before_worker_or_events(
     )
 
     with pytest.raises(ValueError, match="too short"):
-        supervisor_module._worker_environment(
-            spec, 1, provider_environment=provider_environment
-        )
+        supervisor_module._worker_environment(spec, 1, provider_environment=provider_environment)
     with pytest.raises(ValueError, match="too short"):
         asyncio.run(
             run_plan(
@@ -437,9 +441,7 @@ def test_registered_protocol_values_preserve_event_kinds_and_status(
     assert envelope["summary"] == "*** *** ***"
     assert envelope["failure_reason"] == "***: *** ***"
 
-    result = asyncio.run(
-        run_plan(session_dir, {"tasks": [task]}, on_event=observed.append)
-    )
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}, on_event=observed.append))
     events = read_events(session_dir)
 
     assert result.results[0].status == "succeeded"
@@ -527,9 +529,7 @@ def test_stdin_write_deadline_kills_non_reader_group(tmp_path: Path, monkeypatch
     assert "stdin" in (result.results[0].reason or "")
     events = read_events(session_dir)
     assert any(
-        event["kind"] == "timeout"
-        and event["payload"].get("phase") == "stdin"
-        for event in events
+        event["kind"] == "timeout" and event["payload"].get("phase") == "stdin" for event in events
     )
 
 
@@ -544,8 +544,7 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     worktree = session_dir / "wt-t-generation"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-generation",
-         str(worktree), base],
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-generation", str(worktree), base],
         check=True,
         capture_output=True,
     )
@@ -566,9 +565,7 @@ def test_generation_seven_advances_and_never_rolls_back_on_restart(
     assert result.results[0].status == "succeeded"
     assert result.results[0].restarts == 1
     generations = [
-        event["generation"]
-        for event in read_events(session_dir)
-        if event["kind"] == "init"
+        event["generation"] for event in read_events(session_dir) if event["kind"] == "init"
     ]
     assert generations == [8, 9]
     assert 7 not in generations
@@ -588,8 +585,7 @@ def test_generation_survives_crash_after_worktree_clean(
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     worktree = session_dir / "wt-t-crash-window"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-crash-window",
-         str(worktree), base],
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-crash-window", str(worktree), base],
         check=True,
         capture_output=True,
     )
@@ -625,9 +621,7 @@ def test_generation_survives_crash_after_worktree_clean(
     assert result.results[0].status == "succeeded"
     assert [9, after_crash] == [9, 10]
     generations = [
-        event["generation"]
-        for event in read_events(session_dir)
-        if event["kind"] == "init"
+        event["generation"] for event in read_events(session_dir) if event["kind"] == "init"
     ]
     assert generations == [11, 12]  # never rolls back below the crash window
     # The terminal clean worktree is pruned (phase (d) acceptance), so the
@@ -646,8 +640,17 @@ def test_worktree_registration_requires_an_exact_path_match(
     base = _make_repo(repo, {"hello.txt": "hello\n"})
     registered_extra = session_dir / "wt-task-extra"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-task-extra",
-         str(registered_extra), base],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt-task-extra",
+            str(registered_extra),
+            base,
+        ],
         check=True,
         capture_output=True,
     )
@@ -717,8 +720,7 @@ def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
     base = _make_repo(repo, {"hello.txt": "published\n"})
     worktree = session_dir / "wt-t-invalid-base"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-invalid-base",
-         str(worktree), base],
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-invalid-base", str(worktree), base],
         check=True,
         capture_output=True,
     )
@@ -740,18 +742,24 @@ def test_invalid_base_commit_rejects_registered_dirty_worktree_without_spawn(
 
     assert result.results[0].status == "failed"
     assert not _kinds(read_events(session_dir), "spawned")
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == base
-    assert subprocess.run(
-        ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout == "published\n"
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == "published\n"
+    )
 
 
 @pytest.mark.parametrize("failed_command", ["reset", "clean"])
@@ -764,8 +772,17 @@ def test_recovery_git_failure_fails_task_without_spawn_or_publish(
     base = _make_repo(repo, {"hello.txt": "published\n"})
     worktree = session_dir / "wt-t-recovery-failure"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-t-recovery-failure",
-         str(worktree), base],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt-t-recovery-failure",
+            str(worktree),
+            base,
+        ],
         check=True,
         capture_output=True,
     )
@@ -796,18 +813,24 @@ def test_recovery_git_failure_fails_task_without_spawn_or_publish(
 
     assert result.results[0].status == "failed"
     assert not _kinds(read_events(session_dir), "spawned")
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == base
-    assert subprocess.run(
-        ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout == "published\n"
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == "published\n"
+    )
 
 
 @pytest.mark.parametrize("worker", [EOF_QUIET_WORKER, EOF_STALE_PONG_WORKER])
@@ -838,8 +861,7 @@ def test_eof_requires_exact_fresh_pong_and_kills_stale_or_silent_worker(
     assert _kinds(events, "ping")
     assert not _kinds(events, "pong")
     assert any(
-        event["kind"] == "protocol"
-        and "correlated pong" in event["payload"].get("note", "")
+        event["kind"] == "protocol" and "correlated pong" in event["payload"].get("note", "")
         for event in events
     )
 
@@ -892,18 +914,24 @@ def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
 
     assert result.results[0].status == "succeeded"
     assert result.results[0].merge_sha is not None
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() != base
-    assert "// advanced-head" in subprocess.run(
-        ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        != base
+    )
+    assert (
+        "// advanced-head"
+        in subprocess.run(
+            ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
     assert _kinds(events, "merge_started")
     assert _kinds(events, "merge_committed")
 
@@ -956,12 +984,15 @@ def test_ready_protocol_version_mismatch_is_terminal_without_run_gate_or_merge(
     assert not _kinds(events, "gate")
     assert not _kinds(events, "merge_started")
     assert not _kinds(events, "merge_committed")
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == base
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base
+    )
 
 
 @pytest.mark.slow
@@ -1053,17 +1084,17 @@ def test_cli_rejects_duplicate_before_repo_bootstrap_hook(tmp_path: Path, monkey
     plan_path.write_text(json.dumps({"tasks": [task, task]}), encoding="utf-8")
 
     assert (
-        supervisor_module.main(
-            ["--session-dir", str(session_dir), "--plan", str(plan_path)]
-        )
-        == 2
+        supervisor_module.main(["--session-dir", str(session_dir), "--plan", str(plan_path)]) == 2
     )
 
     assert not hook_report.exists()
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
-        capture_output=True,
-    ).returncode != 0
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+        ).returncode
+        != 0
+    )
     assert not session_dir.exists()
 
 

@@ -85,9 +85,9 @@ def _assert_defined_outcomes(
     outcomes: list[Any], defined_errors: tuple[type[BaseException], ...]
 ) -> None:
     for outcome in outcomes:
-        assert outcome is None or isinstance(outcome, int) or isinstance(
-            outcome, defined_errors
-        ), f"append returned an undefined outcome: {outcome!r}"
+        assert outcome is None or isinstance(outcome, int) or isinstance(outcome, defined_errors), (
+            f"append returned an undefined outcome: {outcome!r}"
+        )
 
 
 def _close_event_store(store: EventStore) -> None:

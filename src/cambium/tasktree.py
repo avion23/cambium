@@ -356,8 +356,7 @@ def build_tree(
     for parent, kids in children.items():
         if len(kids) > max_width:
             raise WidthBoundError(
-                f"task {parent!r} fans out to {len(kids)} children, "
-                f"exceeding max_width {max_width}"
+                f"task {parent!r} fans out to {len(kids)} children, exceeding max_width {max_width}"
             )
 
     nodes = tuple(
@@ -424,8 +423,7 @@ def ready_tasks(tree: TaskTree, finished: set[str]) -> list[TaskNode]:
     result = [
         node
         for node in tree.nodes
-        if node.task_id not in done
-        and (node.parent_task_id is None or node.parent_task_id in done)
+        if node.task_id not in done and (node.parent_task_id is None or node.parent_task_id in done)
     ]
     result.sort(key=lambda node: (node.depth, node.width_idx, node.task_id))
     return result
@@ -499,9 +497,7 @@ def upward_result(node: TaskNode) -> dict[str, Any]:
     if not isinstance(summary, str):
         raise TaskTreeError("upward result summary must be a string")
     commits = spec.get("commits", [])
-    if not isinstance(commits, list) or not all(
-        isinstance(commit, str) for commit in commits
-    ):
+    if not isinstance(commits, list) or not all(isinstance(commit, str) for commit in commits):
         raise TaskTreeError("upward result commits must be a list of strings")
     files_changed = spec.get("files_changed", [])
     if not isinstance(files_changed, list) or not all(
@@ -527,8 +523,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(
         prog="python -m cambium.tasktree",
         description=(
-            "Read a task plan JSON object from PLAN or stdin and print its "
-            "topological order."
+            "Read a task plan JSON object from PLAN or stdin and print its topological order."
         ),
     )
     parser.add_argument(

@@ -22,9 +22,7 @@ from cambium.supervisor import _Runtime
 
 
 def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check
-    )
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check)
 
 
 def _rev(cwd: Path, rev: str) -> str:
@@ -33,8 +31,11 @@ def _rev(cwd: Path, rev: str) -> str:
 
 def _init_repo(repo: Path) -> str:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    for key, value in (("user.name", "durable-test"), ("user.email", "durable@test"),
-                       ("gc.auto", "0")):
+    for key, value in (
+        ("user.name", "durable-test"),
+        ("user.email", "durable@test"),
+        ("gc.auto", "0"),
+    ):
         _run(repo, "config", key, value)
     (repo / "base.txt").write_text("base\n")
     _run(repo, "add", "base.txt")
@@ -97,7 +98,8 @@ def test_durable_event_timeout_fails_merge_closed_but_event_lands(
         landed: list[dict] = []
         while time.monotonic() < deadline:
             landed = [
-                event for event in store.events_after(0)
+                event
+                for event in store.events_after(0)
                 if event["kind"] == "merge_staging_quarantined"
             ]
             if landed:

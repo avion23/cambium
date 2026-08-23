@@ -626,7 +626,7 @@ def _validate_advanced_epoch_checkpoint(
         raise ValueError("checkpoint cumulative_usage is invalid")
     for field, positive in (("created_at", False), ("wall_deadline", True)):
         value = data.get(field)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int | float):
             raise ValueError(f"checkpoint {field} is invalid")
         try:
             finite = math.isfinite(value)
@@ -1071,15 +1071,15 @@ def _provider_env_keys(spec: dict[str, Any]) -> frozenset[str]:
     """Return only validated provider-key names declared by a task."""
     values: list[Any] = []
     explicit = spec.get("provider_env_keys")
-    if isinstance(explicit, (list, tuple)):
+    if isinstance(explicit, list | tuple):
         values.extend(explicit)
     fanout_config = spec.get("fanout_config")
     if isinstance(fanout_config, dict):
         configured = fanout_config.get("provider_env_keys")
-        if isinstance(configured, (list, tuple)):
+        if isinstance(configured, list | tuple):
             values.extend(configured)
         providers = fanout_config.get("providers")
-        if isinstance(providers, (list, tuple)):
+        if isinstance(providers, list | tuple):
             values.extend(
                 provider.get("api_key_env") for provider in providers if isinstance(provider, dict)
             )
@@ -1115,7 +1115,7 @@ def _fanout_provider_names(spec: Mapping[str, Any]) -> frozenset[str]:
     fanout_config = spec.get("fanout_config")
     if isinstance(fanout_config, dict):
         providers = fanout_config.get("providers")
-        if isinstance(providers, (list, tuple)):
+        if isinstance(providers, list | tuple):
             names.update(
                 entry["name"]
                 for entry in providers
@@ -1150,7 +1150,7 @@ def _codex_oauth_provider_names(
     )
     authorized_raw = spec.get("authorized_providers")
     authorized_explicit = spec.get("authorized_providers_explicit", bool(authorized_raw))
-    if isinstance(authorized_raw, (list, tuple)):
+    if isinstance(authorized_raw, list | tuple):
         authorized = frozenset(name for name in authorized_raw if isinstance(name, str) and name)
         # An explicit empty authorization is a deliberate deny-all set.  Only
         # plans from before provider identities were carried use the legacy
@@ -1361,7 +1361,7 @@ def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
     latency = value.get("latency_s")
     if not isinstance(provider, str) or not isinstance(model, str):
         return None
-    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+    if isinstance(latency, bool) or not isinstance(latency, int | float):
         return None
     usage = value.get("usage")
     if not isinstance(usage, dict):
@@ -5345,7 +5345,7 @@ def _plan_tasks(plan: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, A
         if not isinstance(tasks, list):
             raise ValueError("plan dict must contain a 'tasks' list")
         return list(tasks)
-    if isinstance(plan, (list, tuple)):
+    if isinstance(plan, list | tuple):
         return list(plan)
     raise ValueError("plan must be a dict with 'tasks' or a list of task specs")
 
@@ -5418,15 +5418,15 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     if Path(spec["repo"]).resolve() == worktree:
         raise ValueError(f"task {task_id}: worktree_path must not be the repo itself ({worktree})")
     provider_env_keys = spec.get("provider_env_keys", ())
-    if isinstance(provider_env_keys, (str, bytes)):
+    if isinstance(provider_env_keys, str | bytes):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
-    if not isinstance(provider_env_keys, (list, tuple)):
+    if not isinstance(provider_env_keys, list | tuple):
         raise ValueError(f"task {task_id} provider_env_keys must be a list of names")
     spec["provider_env_keys"] = list(provider_env_keys)
     authorized_providers = spec.get("authorized_providers", ())
     if (
-        isinstance(authorized_providers, (str, bytes))
-        or not isinstance(authorized_providers, (list, tuple))
+        isinstance(authorized_providers, str | bytes)
+        or not isinstance(authorized_providers, list | tuple)
         or not all(isinstance(name, str) and name for name in authorized_providers)
     ):
         raise ValueError(f"task {task_id} authorized_providers must be a list of names")
@@ -5437,7 +5437,7 @@ def _validate_plan_task(session_dir: Path, task: dict[str, Any]) -> dict[str, An
     model_candidates = spec.get("model_candidates")
     if model_candidates is not None:
         if (
-            not isinstance(model_candidates, (list, tuple))
+            not isinstance(model_candidates, list | tuple)
             or not model_candidates
             or not all(isinstance(model, str) and bool(model.strip()) for model in model_candidates)
         ):
@@ -5549,7 +5549,7 @@ def _resolve_model_candidates(
     authorized_explicit = spec.get("authorized_providers_explicit", "authorized_providers" in spec)
     authorized = (
         frozenset(name for name in authorized_raw if isinstance(name, str) and name)
-        if isinstance(authorized_raw, (list, tuple)) and (authorized_explicit or authorized_raw)
+        if isinstance(authorized_raw, list | tuple) and (authorized_explicit or authorized_raw)
         else None
     )
     if authorized is None:
@@ -5683,7 +5683,7 @@ def _fork_cache_compatible_supervisor(
                     for entry in providers
                     if isinstance(entry, dict) and isinstance(entry.get("name"), str)
                 ]
-                if isinstance(providers, (list, tuple))
+                if isinstance(providers, list | tuple)
                 else []
             )
             if len(names) == 1:
@@ -5763,7 +5763,7 @@ def _child_spec(
     raw_keys = child_spec.get("provider_env_keys")
     if raw_keys is None:
         child_keys = set(parent_keys)
-    elif isinstance(raw_keys, (list, tuple)):
+    elif isinstance(raw_keys, list | tuple):
         child_keys = set(raw_keys)
     else:
         raise ValueError("child provider_env_keys must be a list of names")
@@ -5781,7 +5781,7 @@ def _child_spec(
     if raw_authorized is None:
         requested_authorized = set(parent_authorized)
         child_authorized_explicit = parent_authorized_explicit
-    elif isinstance(raw_authorized, (list, tuple)):
+    elif isinstance(raw_authorized, list | tuple):
         requested_authorized = set(raw_authorized)
         child_authorized_explicit = True
     else:
@@ -5826,7 +5826,7 @@ def _child_spec(
         nested_keys = child_fanout.get("provider_env_keys")
         if nested_keys is None:
             nested_keys = parent_nested_keys
-        elif not isinstance(nested_keys, (list, tuple)):
+        elif not isinstance(nested_keys, list | tuple):
             raise ValueError("child fanout_config.provider_env_keys must be a list")
         nested_key_set = set(nested_keys)
         if not all(isinstance(key, str) for key in nested_key_set):
@@ -5841,7 +5841,7 @@ def _child_spec(
 
         parent_providers = parent_fanout.get("providers")
         child_providers = child_fanout.get("providers")
-        if isinstance(parent_providers, (list, tuple)):
+        if isinstance(parent_providers, list | tuple):
             parent_provider_names = {
                 entry.get("name")
                 for entry in parent_providers
@@ -5849,7 +5849,7 @@ def _child_spec(
             }
             if child_providers is None:
                 child_fanout["providers"] = copy.deepcopy(list(parent_providers))
-            elif not isinstance(child_providers, (list, tuple)):
+            elif not isinstance(child_providers, list | tuple):
                 raise ValueError("child fanout_config.providers must be a list")
             else:
                 child_provider_names = {
@@ -5865,7 +5865,7 @@ def _child_spec(
                     if isinstance(entry, dict) and entry.get("name") in child_provider_names
                 ]
         elif child_providers is not None:
-            if not isinstance(child_providers, (list, tuple)):
+            if not isinstance(child_providers, list | tuple):
                 raise ValueError("child fanout_config.providers must be a list")
             child_provider_names = {
                 entry.get("name")

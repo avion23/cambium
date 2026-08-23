@@ -25,7 +25,10 @@ MARKER_ERROR = "marker task requires target_file and marker"
 
 async def _drive_worker(session_dir: Path) -> dict:
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", "-m", "cambium.worker",
+        sys.executable,
+        "-u",
+        "-m",
+        "cambium.worker",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -46,19 +49,28 @@ async def _drive_worker(session_dir: Path) -> dict:
 
     stderr_task = asyncio.create_task(_drain_stderr())
 
-    assert proc.stdin is not None, (
-        f"worker stdin missing: returncode={proc.returncode!r}"
+    assert proc.stdin is not None, f"worker stdin missing: returncode={proc.returncode!r}"
+    proc.stdin.write(
+        (
+            json.dumps(
+                {
+                    "type": "init",
+                    "request_id": "init-minimal-001",
+                    "task_id": "minimal-001",
+                    "generation": 1,
+                    "proto": 1,
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
     )
-    proc.stdin.write((json.dumps({
-        "type": "init", "request_id": "init-minimal-001", "task_id": "minimal-001",
-        "generation": 1, "proto": 1,
-    }) + "\n").encode("utf-8"))
     await proc.stdin.drain()
     ready = await read_message(stdout_reader, limit=MAX_LINE_BYTES)
     assert ready is not None and ready["type"] == "ready"
 
     payload = {
-        "type": "run_task", "request_id": "run-minimal-001",
+        "type": "run_task",
+        "request_id": "run-minimal-001",
         "task_id": "minimal-001",
         "task": "do the minimal thing",
         "repo": str(session_dir / "scratch"),
@@ -88,8 +100,7 @@ async def _drive_worker(session_dir: Path) -> dict:
     exit_msg = await read_message(stdout_reader, limit=MAX_LINE_BYTES)
     returncode = await proc.wait()
     stderr = await stderr_task
-    return {"envelope": envelope, "exit_msg": exit_msg, "returncode": returncode,
-            "stderr": stderr}
+    return {"envelope": envelope, "exit_msg": exit_msg, "returncode": returncode, "stderr": stderr}
 
 
 def test_minimal_plan_missing_target_file_fails_cleanly(tmp_path) -> None:

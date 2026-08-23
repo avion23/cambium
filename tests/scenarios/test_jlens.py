@@ -32,9 +32,9 @@ def test_nonfinite_commitment_is_not_clamped_to_one() -> None:
 def test_nonfinite_commitment_falls_back_to_valid_layer_rank() -> None:
     client = JlenClient("http://example.test")
 
-    assert client.signal(
-        {"commitment": math.nan, "layers": {"29": {"expected_rank": 1}}}, []
-    ) == 1.0
+    assert (
+        client.signal({"commitment": math.nan, "layers": {"29": {"expected_rank": 1}}}, []) == 1.0
+    )
 
 
 @pytest.mark.parametrize("value", [None, 1, [], "score"])

@@ -18,9 +18,16 @@ def main() -> int:
     init = json.loads(sys.stdin.readline())
     if init.get("type") != "init":
         return 1
-    send({"type": "ready", "request_id": init["request_id"],
-          "task_id": init["task_id"], "pid": os.getpid(),
-          "generation": init.get("generation", 1), "proto": 1})
+    send(
+        {
+            "type": "ready",
+            "request_id": init["request_id"],
+            "task_id": init["task_id"],
+            "pid": os.getpid(),
+            "generation": init.get("generation", 1),
+            "proto": 1,
+        }
+    )
     time.sleep(1e9)
     return 0
 

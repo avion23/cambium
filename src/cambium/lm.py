@@ -137,6 +137,7 @@ _JSON_TUPLE_MARKER = 2
 
 
 if TYPE_CHECKING:
+
     class _DspyLMType:
         callbacks: Any
         cache: bool
@@ -519,18 +520,12 @@ class _CambiumLMMixin(_DspyLMType):
             raise TypeError("CambiumLM.copy accepts keyword arguments only")
         self._validate_model(self._provider_model)
         self._validate_budget(self._budget_usd)
-        launch_kwargs = self._safe_kwargs({"launch_kwargs": self.launch_kwargs})[
-            "launch_kwargs"
-        ]
+        launch_kwargs = self._safe_kwargs({"launch_kwargs": self.launch_kwargs})["launch_kwargs"]
         train_kwargs = self._safe_kwargs({"train_kwargs": self.train_kwargs})["train_kwargs"]
         adapter_overrides = {
-            key: kwargs[key]
-            for key in ("diffundo", "tier", "model", "budget_usd")
-            if key in kwargs
+            key: kwargs[key] for key in ("diffundo", "tier", "model", "budget_usd") if key in kwargs
         }
-        private_overrides = {
-            key: kwargs[key] for key in _ADAPTER_PRIVATE_FIELDS if key in kwargs
-        }
+        private_overrides = {key: kwargs[key] for key in _ADAPTER_PRIVATE_FIELDS if key in kwargs}
         if private_overrides:
             if "_budget_usd" in private_overrides:
                 self._validate_budget(private_overrides["_budget_usd"])
@@ -717,9 +712,7 @@ class _CambiumLMMixin(_DspyLMType):
                     price_per_1m_in=provider["price_per_1m_in"],
                     price_per_1m_out=provider["price_per_1m_out"],
                     auth=AuthMode(provider.get("auth", AuthMode.API_KEY.value)),
-                    protocol=Protocol(
-                        provider.get("protocol", Protocol.CHAT_COMPLETIONS.value)
-                    ),
+                    protocol=Protocol(provider.get("protocol", Protocol.CHAT_COMPLETIONS.value)),
                     reasoning_effort=provider.get("reasoning_effort"),
                 )
                 for provider in raw_providers
@@ -975,9 +968,7 @@ class _CambiumLMMixin(_DspyLMType):
         if result.content:
             parts.append({"type": "text", "text": result.content})
         for tool_call in result.tool_calls or ():
-            parts.append(
-                _CambiumLMMixin._tool_call_part(tool_call, provider=result.provider)
-            )
+            parts.append(_CambiumLMMixin._tool_call_part(tool_call, provider=result.provider))
         if not parts:
             parts.append({"type": "text", "text": ""})
         # cache_hit records what the provider reported; the adapter itself
@@ -989,9 +980,7 @@ class _CambiumLMMixin(_DspyLMType):
             usage=result.usage,
             cost=result.estimated_cost_usd,
             cache_hit=(
-                bool(result.provider_cache_hit)
-                if result.provider_cache_hit is not None
-                else False
+                bool(result.provider_cache_hit) if result.provider_cache_hit is not None else False
             ),
             metadata={
                 "provider": result.provider,
@@ -999,11 +988,7 @@ class _CambiumLMMixin(_DspyLMType):
                 "latency_s": result.latency_s,
                 "prompt_prefix_bytes": result.prompt_prefix_bytes,
                 **(
-                    {
-                        "prompt_prefix_tokens_estimate": (
-                            result.prompt_prefix_tokens_estimate
-                        )
-                    }
+                    {"prompt_prefix_tokens_estimate": (result.prompt_prefix_tokens_estimate)}
                     if result.prompt_prefix_tokens_estimate is not None
                     else {}
                 ),
@@ -1072,8 +1057,8 @@ class ArchitectusLM:
     _SYSTEM_PROMPT = (
         "You are Architectus, the task-tree scheduler. Return only a compact JSON array "
         "of action objects for the next scheduling wave; no markdown, no prose. Every "
-        "action object must be exactly {\"action\": \"<kind>\", \"task_id\": \"<existing "
-        "id>\"} with kind one of: spawn, steer, aggregate, replan, reset_retry, "
+        'action object must be exactly {"action": "<kind>", "task_id": "<existing '
+        'id>"} with kind one of: spawn, steer, aggregate, replan, reset_retry, '
         "abort_subtree. The task_id must be one of the task ids listed in "
         "tree_state.nodes; never invent an id or a kind. Prefer spawning the ready "
         "nodes first."

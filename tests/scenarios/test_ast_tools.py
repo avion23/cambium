@@ -57,12 +57,12 @@ def test_references_are_counted_and_sorted() -> None:
 
 
 def test_signature_extracts_multiline_header_and_body_line_count() -> None:
-    source = '''def build(
+    source = """def build(
     value,
 ):
     result = helper(value)
     return result
-'''
+"""
 
     assert ast_tools.extract_signature(source, "build") == {
         "name": "build",
@@ -76,7 +76,7 @@ def test_signature_extracts_multiline_header_and_body_line_count() -> None:
 
 
 def test_non_ascii_before_definition_keeps_line_and_signature() -> None:
-    source = '# § comment\n\nclass Café:\n    pass\n'
+    source = "# § comment\n\nclass Café:\n    pass\n"
 
     definition = ast_tools.find_definitions(source)[0]
 

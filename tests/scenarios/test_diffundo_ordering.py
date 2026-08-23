@@ -52,8 +52,7 @@ class FakeServer:
     def __init__(
         self,
         behaviors: list[
-            tuple[int, dict[str, Any], float]
-            | tuple[int, dict[str, Any], float, dict[str, str]]
+            tuple[int, dict[str, Any], float] | tuple[int, dict[str, Any], float, dict[str, str]]
         ],
         *,
         echo_authorization_in_body: bool = False,
@@ -80,9 +79,7 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(
-        self, index: int
-    ) -> tuple[int, dict[str, Any], float, dict[str, str]]:
+    def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior
@@ -227,8 +224,7 @@ def test_equal_priority_providers_stick_to_primary_per_instance(monkeypatch) -> 
         # One instance = one task: every call lands on the same provider so
         # the task's growing context stays on one provider (prompt-prefix
         # caching preserved). No per-call rotation.
-        served = [asyncio.run(router.call(ProviderTier.FAST, PROMPT)).provider
-                  for _ in range(6)]
+        served = [asyncio.run(router.call(ProviderTier.FAST, PROMPT)).provider for _ in range(6)]
         assert served == ["p_first"] * 6
         assert len(first.calls) == 6
         assert len(second.calls) == 0

@@ -54,7 +54,6 @@ class _FakeCallResult:
 
 
 class _ScriptedRouter:
-
     def declared_model(self, name: str) -> str:
         return ""
 
@@ -77,9 +76,7 @@ class _ScriptedRouter:
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
-def test_env_float_rejects_non_finite_values(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
+def test_env_float_rejects_non_finite_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     default = 17.5
     monkeypatch.setenv("CAMBIUM_TEST_FLOAT", value)
 
@@ -93,12 +90,8 @@ def test_env_float_rejects_non_finite_values(
 def _make_worktree(repo: Path, branch: str = "agent-loop") -> Path:
     repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "agent-loop-test"], check=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "agent-loop@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "agent-loop-test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "agent-loop@test"], check=True)
     (repo / "alpha.txt").write_text("alpha-content\n", encoding="utf-8")
     (repo / "beta.txt").write_text("beta-content\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
@@ -153,6 +146,7 @@ async def _drive_loop(
 # Plan-before-act: plan action parses, is stored, and the loop proceeds
 # ---------------------------------------------------------------------------
 
+
 def test_build_agent_prompt_last_message_is_always_user() -> None:
     """Payloads must not end on a system/assistant message (ZAI/GLM 1214)."""
     prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], [])
@@ -163,7 +157,7 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
     # the builder appends a neutral user continuation.
     plan_transcript = [
         {"role": "user", "content": "Begin."},
-        {"role": "assistant", "content": "{\"type\": \"plan\", \"steps\": []}"},
+        {"role": "assistant", "content": '{"type": "plan", "steps": []}'},
     ]
     prompt2 = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], plan_transcript)
     assert prompt2["messages"][-1]["role"] == "user"
@@ -233,9 +227,7 @@ def test_build_agent_prompt_head_passes_d8c_lint() -> None:
     """The static head (first 3 lines) carries no volatile timestamp or
     request_id token; dynamic content sits at the bottom (D8c)."""
     tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    prompt = worker._build_agent_prompt(
-        "a task", tools, [], model_identity="codex/gpt-5.6-luna"
-    )
+    prompt = worker._build_agent_prompt("a task", tools, [], model_identity="codex/gpt-5.6-luna")
     validate_prompt_structure(prompt)  # raises PromptStructureError on churn
     head = prompt["messages"][0]["content"]
     assert "Task:" not in head  # dynamic content is user-role data, not head
@@ -256,9 +248,7 @@ def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
         "commits": ["abc123"],
         "status": "succeeded",
     }
-    prompt = worker._build_agent_prompt(
-        "continue the work", tools, [], parent_envelope=envelope
-    )
+    prompt = worker._build_agent_prompt("continue the work", tools, [], parent_envelope=envelope)
     system_content = prompt["messages"][0]["content"]
     assert "Task:" not in system_content
     assert "Parent task context:" not in system_content
@@ -280,42 +270,45 @@ def test_parent_envelope_rejects_oversized_and_incomplete_fields() -> None:
     """Strict parent envelopes reject malformed or oversized payloads."""
     tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
     with pytest.raises(worker.ParentEnvelopeError, match="summary.*field cap"):
-        worker._validate_parent_envelope({
-            "parent_task_id": "parent",
-            "unified_diff": "",
-            "diff_truncated": False,
-            "summary": "x" * 100_000,
-            "metric_score": None,
-            "metric_breakdown": {},
-            "files_changed": [],
-            "commits": [],
-            "status": "succeeded",
-        })
+        worker._validate_parent_envelope(
+            {
+                "parent_task_id": "parent",
+                "unified_diff": "",
+                "diff_truncated": False,
+                "summary": "x" * 100_000,
+                "metric_score": None,
+                "metric_breakdown": {},
+                "files_changed": [],
+                "commits": [],
+                "status": "succeeded",
+            }
+        )
     with pytest.raises(worker.ParentEnvelopeError, match="must be an object"):
         worker._validate_parent_envelope("not a dict")
     with pytest.raises(worker.ParentEnvelopeError, match="unknown keys"):
         worker._validate_parent_envelope({"unknown_key": 1})
-    content = worker._build_agent_prompt(
-        "task", tools, [], parent_envelope=None
-    )["messages"][0]["content"]
+    content = worker._build_agent_prompt("task", tools, [], parent_envelope=None)["messages"][0][
+        "content"
+    ]
     assert "Parent task context:" not in content
 
 
 def test_parent_envelope_rejects_non_string_list_items() -> None:
     """Strict parent envelopes reject non-string list items."""
     with pytest.raises(worker.ParentEnvelopeError, match="only strings"):
-        worker._validate_parent_envelope({
-            "parent_task_id": "parent",
-            "unified_diff": "",
-            "diff_truncated": False,
-            "summary": "ok",
-            "metric_score": None,
-            "metric_breakdown": {},
-            "files_changed": ["a.py", {"path": "b.py"}],
-            "commits": ["abc"],
-            "status": "succeeded",
-        })
-
+        worker._validate_parent_envelope(
+            {
+                "parent_task_id": "parent",
+                "unified_diff": "",
+                "diff_truncated": False,
+                "summary": "ok",
+                "metric_score": None,
+                "metric_breakdown": {},
+                "files_changed": ["a.py", {"path": "b.py"}],
+                "commits": ["abc"],
+                "status": "succeeded",
+            }
+        )
 
 
 def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
@@ -380,8 +373,7 @@ def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}',
             '{"type":"finish","summary":"tests failed anyway"}',
             '{"type":"finish","summary":"still unverified"}',
-            '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["note.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["note.txt"]}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
             '{"type":"finish","summary":"verified"}',
         ]
@@ -449,10 +441,7 @@ def test_finish_after_verified_change_succeeds(tmp_path: Path) -> None:
 
     assert outcome["status"] == "succeeded"
     assert outcome["summary"] == "verified edit"
-    assert not any(
-        "finish rejected" in message["content"]
-        for message in outcome["transcript"]
-    )
+    assert not any("finish rejected" in message["content"] for message in outcome["transcript"])
 
 
 def test_plan_and_thought_round_trip_through_parser() -> None:
@@ -460,9 +449,10 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         "type": "plan",
         "steps": ["a", "b"],
     }
-    assert worker._parse_agent_action(
-        '{"type":"plan","steps":["a"],"thought":"reasoning"}'
-    ) == {"type": "plan", "steps": ["a"]}
+    assert worker._parse_agent_action('{"type":"plan","steps":["a"],"thought":"reasoning"}') == {
+        "type": "plan",
+        "steps": ["a"],
+    }
     assert worker._parse_agent_action(
         '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]},'
         '"thought":"need context"}'
@@ -507,9 +497,9 @@ def test_lenient_parse_accepts_raw_control_characters_in_strings() -> None:
         "arguments": {"path": "hello.py", "content": "print('hello world')\n\t"},
     }
     assert worker._action_trailing(action) == ""
-    assert worker._action_trailing(
-        action + '{"type":"plan","steps":["a"]}'
-    ).startswith('{"type":"plan"')
+    assert worker._action_trailing(action + '{"type":"plan","steps":["a"]}').startswith(
+        '{"type":"plan"'
+    )
     with pytest.raises(ValueError):
         worker._parse_agent_action('{"type":"finish","summary":"broken\n-oops}')
 
@@ -548,21 +538,15 @@ def test_summarize_transcript_large_trimmed_keeps_plan_and_marker(tmp_path: Path
     assert result[0] == plan_message
     assert json.loads(result[0]["content"])["type"] == "plan"
     # a synthetic dropped-message marker reports what was removed
-    assert any(
-        "prior context" in message.get("content", "") for message in result
-    )
-    marker = next(
-        message for message in result if "prior context" in message.get("content", "")
-    )
+    assert any("prior context" in message.get("content", "") for message in result)
+    marker = next(message for message in result if "prior context" in message.get("content", ""))
     # turn-atomic dropping: 4 turn pairs fall to the keep_turns window and
     # 4 more whole turns drop to fit the budget (12 messages total)
     assert "12 earlier message(s) dropped" in marker["content"]
     # exactly the newest 2 whole turns (4 messages) survive untruncated
     tail = result[2:]
     assert len(tail) == 4
-    assert [message["role"] for message in tail] == (
-        ["assistant", "user"] * 2
-    )
+    assert [message["role"] for message in tail] == (["assistant", "user"] * 2)
     assert "f7.py" in tail[-2]["content"]
     assert tail[-1]["content"] == "x" * 2_000  # whole turns, never sliced
 
@@ -578,8 +562,7 @@ def test_summarize_transcript_bounds_oversized_observation_inside_wrapper(
         {
             "role": "assistant",
             "content": (
-                '{"type":"tool_call","name":"read_batch",'
-                '"arguments":{"paths":["big.txt"]}}'
+                '{"type":"tool_call","name":"read_batch","arguments":{"paths":["big.txt"]}}'
             ),
         },
         {"role": "user", "content": f"tool read_batch ok=True\n--- big.txt ---\n{body}"},
@@ -615,15 +598,11 @@ def test_render_rolling_compaction_wrapper_always_closed_and_parseable() -> None
         assert rendered[0]["role"] == "user"
         assert content.startswith("<cambium-rolling-context>\n")
         assert content.endswith("\n</cambium-rolling-context>")
-        inner = content[
-            len("<cambium-rolling-context>\n"): -len("\n</cambium-rolling-context>")
-        ]
+        inner = content[len("<cambium-rolling-context>\n") : -len("\n</cambium-rolling-context>")]
         parsed = json.loads(inner)
         assert isinstance(parsed, list)
         # Degenerate budgets below the wrapper size still close cleanly.
-        wrapper_floor = (
-            len("<cambium-rolling-context>\n") + 2 + len("\n</cambium-rolling-context>")
-        )
+        wrapper_floor = len("<cambium-rolling-context>\n") + 2 + len("\n</cambium-rolling-context>")
         if len(content) > wrapper_floor:
             assert len(content) <= budget
     assert continuation == snapshot
@@ -635,10 +614,7 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
     (worktree / "large.txt").write_text("x" * 20_000, encoding="utf-8")
     budget = 5_000
     config = replace(_agent_config(worktree), max_transcript_chars=budget)
-    read = (
-        '{"type":"tool_call","name":"read_batch","arguments":'
-        '{"paths":["large.txt"]}}'
-    )
+    read = '{"type":"tool_call","name":"read_batch","arguments":{"paths":["large.txt"]}}'
     router = _ScriptedRouter(
         ['{"type":"plan","steps":["inspect repeatedly","finish"]}']
         + [read] * 7
@@ -666,9 +642,16 @@ def test_strip_for_fold_drops_obsolete_reads_and_superseded_passes() -> None:
     latest verification, identifiers, and the plan survive; idempotent."""
 
     def call(name: str, args: dict[str, Any]) -> dict[str, str]:
-        return {"role": "assistant", "content": json.dumps({
-            "type": "tool_call", "name": name, "arguments": args,
-        })}
+        return {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": name,
+                    "arguments": args,
+                }
+            ),
+        }
 
     def obs(name: str, ok: bool, body: str) -> dict[str, str]:
         return {"role": "user", "content": f"tool {name} ok={ok}\n{body}"}
@@ -701,8 +684,7 @@ def test_strip_for_fold_drops_obsolete_reads_and_superseded_passes() -> None:
     assert stripped[2] == continuation[2]
     # the passing run before the later failure+pass is superseded
     assert stripped[6]["content"] == (
-        "tool run_shell ok=True\n"
-        "[run_shell: passed (output omitted - superseded by a later run)]"
+        "tool run_shell ok=True\n[run_shell: passed (output omitted - superseded by a later run)]"
     )
     # the edit, the failure, and the latest passing verification stay whole
     assert stripped[4] == continuation[4]
@@ -718,29 +700,35 @@ def test_strip_for_fold_drops_fully_superseded_read_body() -> None:
     continuation = [
         {
             "role": "assistant",
-            "content": json.dumps({
-                "type": "tool_call",
-                "name": "read_batch",
-                "arguments": {"paths": ["a.py", "b.py"]},
-            }),
+            "content": json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "read_batch",
+                    "arguments": {"paths": ["a.py", "b.py"]},
+                }
+            ),
         },
         {"role": "user", "content": "tool read_batch ok=True\n--- a.py ---\nx\n\n--- b.py ---\ny"},
         {
             "role": "assistant",
-            "content": json.dumps({
-                "type": "tool_call",
-                "name": "edit_file",
-                "arguments": {"path": "a.py", "old_string": "x", "new_string": "z"},
-            }),
+            "content": json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "edit_file",
+                    "arguments": {"path": "a.py", "old_string": "x", "new_string": "z"},
+                }
+            ),
         },
         {"role": "user", "content": "tool edit_file ok=True\nedited"},
         {
             "role": "assistant",
-            "content": json.dumps({
-                "type": "tool_call",
-                "name": "read_batch",
-                "arguments": {"paths": ["b.py"]},
-            }),
+            "content": json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "read_batch",
+                    "arguments": {"paths": ["b.py"]},
+                }
+            ),
         },
         {"role": "user", "content": "tool read_batch ok=True\n--- b.py ---\ny"},
     ]
@@ -748,8 +736,7 @@ def test_strip_for_fold_drops_fully_superseded_read_body() -> None:
     stripped = worker._strip_for_fold(continuation)
 
     assert stripped[1]["content"] == (
-        "tool read_batch ok=True\n"
-        "[read_batch: a.py, b.py (omitted - file on disk)]"
+        "tool read_batch ok=True\n[read_batch: a.py, b.py (omitted - file on disk)]"
     )
     # the re-read of b.py is the latest read of that path: body kept
     assert stripped[5] == continuation[5]
@@ -864,8 +851,7 @@ def test_consecutive_plan_actions_fail_fast_with_no_progress_reason(
     assert outcome["turn"] == 3  # failed on the 3rd consecutive plan
     assert len(router.prompts) == 3  # no further router calls
     assert not any(
-        "must never be reached" in message["content"]
-        for message in outcome["transcript"]
+        "must never be reached" in message["content"] for message in outcome["transcript"]
     )
 
 
@@ -914,8 +900,7 @@ def test_concatenated_actions_first_action_parsed_trailing_noted(tmp_path: Path)
     assert outcome["turn"] == 2
     assert len(router.prompts) == 2
     assert any(
-        "trailing JSON was ignored" in message["content"]
-        for message in outcome["transcript"]
+        "trailing JSON was ignored" in message["content"] for message in outcome["transcript"]
     )
 
 
@@ -984,12 +969,8 @@ def _finalize_worktree_outcome(
 def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
-    (worktree / "main.py").write_text(
-        "def add(a, b):\n    return a + b\n", encoding="utf-8"
-    )
-    subprocess.run(
-        ["git", "-C", str(worktree), "add", "main.py"], check=True, capture_output=True
-    )
+    (worktree / "main.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "main.py"], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(worktree), "commit", "-m", "add main.py"],
         check=True,
@@ -999,9 +980,7 @@ def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) 
     config = replace(_agent_config(worktree), base_commit=base_commit)
 
     # The agent's real change, left uncommitted in the worktree.
-    (worktree / "main.py").write_text(
-        "def add(a, b):\n    return a - b\n", encoding="utf-8"
-    )
+    (worktree / "main.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
     # Incidental artifacts of the agent's verification tool use.
     pytest_cache = worktree / ".pytest_cache"
     pytest_cache.mkdir()
@@ -1038,8 +1017,7 @@ def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) 
     assert committed == ["main.py"]
     assert "main.py" in outcome["diff"]
     assert not any(
-        ".pyc" in name or "__pycache__" in name or ".pytest_cache" in name
-        for name in committed
+        ".pyc" in name or "__pycache__" in name or ".pytest_cache" in name for name in committed
     )
 
 

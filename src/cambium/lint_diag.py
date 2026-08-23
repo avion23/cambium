@@ -61,11 +61,7 @@ def _parse_diagnostics(path: Path, output: str) -> list[dict[str, Any]]:
     payload = json.loads(output or "[]")
     if not isinstance(payload, list):
         return []
-    return [
-        _normalize_diagnostic(path, item)
-        for item in payload[:50]
-        if isinstance(item, dict)
-    ]
+    return [_normalize_diagnostic(path, item) for item in payload[:50] if isinstance(item, dict)]
 
 
 def format_diags(diags: list[dict], *, max_lines: int = 20) -> str:
@@ -103,9 +99,7 @@ class LintDiag:
         self.timeout_s = timeout_s
         if lint_cmd is None:
             ruff = shutil.which("ruff")
-            self.lint_cmd = (
-                [ruff, "check", "--output-format", "json"] if ruff is not None else None
-            )
+            self.lint_cmd = [ruff, "check", "--output-format", "json"] if ruff is not None else None
         else:
             self.lint_cmd = list(lint_cmd)
 
@@ -127,23 +121,27 @@ class LintDiag:
                 timeout=self.timeout_s,
             )
         except subprocess.TimeoutExpired:
-            return [{
-                "path": str(path),
-                "line": None,
-                "col": None,
-                "message": f"lint timed out after {self.timeout_s}s",
-                "code": "lint-timeout",
-            }]
+            return [
+                {
+                    "path": str(path),
+                    "line": None,
+                    "col": None,
+                    "message": f"lint timed out after {self.timeout_s}s",
+                    "code": "lint-timeout",
+                }
+            ]
         try:
             diagnostics = _parse_diagnostics(path, result.stdout)
         except (TypeError, ValueError, RecursionError) as exc:
-            return [{
-                "path": str(path),
-                "line": None,
-                "col": None,
-                "message": f"lint output was invalid: {exc}",
-                "code": "lint-error",
-            }]
+            return [
+                {
+                    "path": str(path),
+                    "line": None,
+                    "col": None,
+                    "message": f"lint output was invalid: {exc}",
+                    "code": "lint-error",
+                }
+            ]
         if result.returncode != 0:
             # Ruff uses exit status 1 for ordinary findings, which are already
             # represented by its JSON list. Other failures (and status 1 with

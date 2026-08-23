@@ -76,9 +76,7 @@ def test_mapping_keys_are_redacted_for_all_secret_shapes() -> None:
         "OPENAI_API_KEY",
     )
 
-    output = cast(
-        dict[object, object], R.redact_mapping({key: "safe" for key in secret_keys})
-    )
+    output = cast(dict[object, object], R.redact_mapping({key: "safe" for key in secret_keys}))
 
     serialized = repr(output)
     for secret in secret_keys:
@@ -414,6 +412,7 @@ def test_build_session_redactor_defaults_to_provider_patterns() -> None:
     assert SK not in output
     assert "ordinary=value" in output
 
+
 def test_register_secret_redacts_values_registered_after_construction() -> None:
     old = "opaque-old-value"
     rotated = "opaque-rotated-" + "R" * 24
@@ -439,24 +438,16 @@ def test_register_secret_is_thread_safe_and_rejects_bad_input() -> None:
         for index in range(20):
             redactor.register_secret(f"{prefix}-{index}-" + "T" * 16)
 
-    threads = [
-        threading.Thread(target=register, args=(name,)) for name in ("t0", "t1")
-    ]
+    threads = [threading.Thread(target=register, args=(name,)) for name in ("t0", "t1")]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
-    text = " ".join(
-        f"t{name}-{index}-" + "T" * 16
-        for name in (0, 1)
-        for index in range(20)
-    )
+    text = " ".join(f"t{name}-{index}-" + "T" * 16 for name in (0, 1) for index in range(20))
     output = redactor.redact(text)
     assert all(
-        f"t{name}-{index}-" + "T" * 16 not in output
-        for name in (0, 1)
-        for index in range(20)
+        f"t{name}-{index}-" + "T" * 16 not in output for name in (0, 1) for index in range(20)
     )
     assert len(redactor.secret_values) == 40
     with pytest.raises(TypeError):

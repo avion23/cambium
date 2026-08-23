@@ -163,9 +163,7 @@ def _package_files(name: str) -> tuple[Path, ...]:
         return ()
     return tuple(
         sorted(
-            path.relative_to(REPO_ROOT)
-            for path in module_path.rglob("*")
-            if _is_regular_file(path)
+            path.relative_to(REPO_ROOT) for path in module_path.rglob("*") if _is_regular_file(path)
         )
     )
 
@@ -397,6 +395,7 @@ def _freeze_content_changed(previous: bytes, current: bytes) -> bool:
     if previous == current:
         return False
     try:
+
         def normalize(data: bytes) -> list[dict[str, Any]]:
             records: list[dict[str, Any]] = []
             for line in data.decode("utf-8").splitlines():
@@ -538,7 +537,7 @@ def _valid_baseline_date(value: object) -> bool:
 def _finite_non_negative(value: object) -> bool:
     return (
         not isinstance(value, bool)
-        and isinstance(value, (int, float))
+        and isinstance(value, int | float)
         and math.isfinite(value)
         and value >= 0
     )
@@ -681,9 +680,7 @@ def _module_relative_path(path: Path, spec: ModuleSpec) -> str | None:
         return None
 
 
-def _validate_dataset_integrity(
-    spec: ModuleSpec, manifest: ModuleManifest | None = None
-) -> None:
+def _validate_dataset_integrity(spec: ModuleSpec, manifest: ModuleManifest | None = None) -> None:
     """Validate the frozen split contract without importing the decision package."""
     findings: list[AuditFinding] = []
     datasets = spec.path / "datasets"
@@ -1043,9 +1040,7 @@ def _validate_dataset_integrity(
         "tests",
         "drift_thresholds",
     }
-    split_counts = {
-        split: len(records) for split, records in records_by_split.items()
-    }
+    split_counts = {split: len(records) for split, records in records_by_split.items()}
     total_records = sum(split_counts.values())
     canary_records = records_by_split.get("canaries", [])
     label_field = module_label_field
@@ -1135,8 +1130,7 @@ def _validate_dataset_integrity(
                     baseline_file,
                     0,
                     "module",
-                    f"must match module.json module_name "
-                    f"({manifest.module_name!r})",
+                    f"must match module.json module_name ({manifest.module_name!r})",
                 )
             )
         if baseline.get("dataset_version") != meta.get("dataset_version"):
@@ -1203,7 +1197,7 @@ def _validate_dataset_integrity(
                     value = fact.get(field)
                     if (
                         isinstance(value, bool)
-                        or not isinstance(value, (int, float))
+                        or not isinstance(value, int | float)
                         or not math.isfinite(value)
                         or value < 0
                         or (field == "mean" and value > 1)
@@ -1271,7 +1265,7 @@ def _validate_dataset_integrity(
             coverage = canaries.get("taxonomy_coverage")
             if (
                 isinstance(coverage, bool)
-                or not isinstance(coverage, (int, float))
+                or not isinstance(coverage, int | float)
                 or not math.isfinite(coverage)
                 or not 0 <= coverage <= 1
             ):
@@ -1316,7 +1310,7 @@ def _validate_dataset_integrity(
                         )
                     if (
                         isinstance(duration, bool)
-                        or not isinstance(duration, (int, float))
+                        or not isinstance(duration, int | float)
                         or not math.isfinite(duration)
                         or duration < 0
                     ):
@@ -1577,7 +1571,7 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "            tokens = shlex.split(command)\n"
             "        except ValueError:\n"
             "            tokens = command.split()\n"
-            "        return [token.strip('\\\"\\\';&|()') for token in tokens]\n"
+            "        return [token.strip('\\\"\\';&|()') for token in tokens]\n"
             "    if isinstance(args, (list, tuple)):\n"
             "        values = list(args)\n"
             "        if executable is not None:\n"
@@ -1597,7 +1591,7 @@ def module_offline_environment() -> Iterator[dict[str, str]]:
             "        tokens = command.split()\n"
             "    if executable is not None and tokens:\n"
             "        tokens[0] = _resolved_command(os.fsdecode(executable))\n"
-            "    return [token.strip('\\\"\\\';&|()') for token in tokens]\n"
+            "    return [token.strip('\\\"\\';&|()') for token in tokens]\n"
             "\n"
             "def _network_executable(tokens, executable=None):\n"
             "    if executable is not None:\n"
@@ -1700,9 +1694,10 @@ def probe_module_cli(spec: ModuleSpec) -> None:
     command = [sys.executable, "-m", cli_module]
     loaded_imports: set[str] = set()
     try:
-        with module_offline_environment() as env, tempfile.TemporaryDirectory(
-            prefix="cambium-module-"
-        ) as cwd:
+        with (
+            module_offline_environment() as env,
+            tempfile.TemporaryDirectory(prefix="cambium-module-") as cwd,
+        ):
             import_log = Path(cwd) / "probe-imports.log"
             env["CAMBIUM_MODULE_PROBE_IMPORT_LOG"] = str(import_log)
             result = subprocess.run(
@@ -1723,9 +1718,7 @@ def probe_module_cli(spec: ModuleSpec) -> None:
 
     if result.returncode != 0:
         detail = result.stderr.strip() or "no stderr diagnostics"
-        raise ModuleConformanceError(
-            f"{spec.name}: JSON CLI exited {result.returncode}: {detail}"
-        )
+        raise ModuleConformanceError(f"{spec.name}: JSON CLI exited {result.returncode}: {detail}")
     if not result.stdout.endswith("\n") or result.stdout[:-1].endswith("\n"):
         raise ModuleConformanceError(
             f"{spec.name}: JSON CLI stdout must contain one object and one trailing newline"
@@ -1764,7 +1757,7 @@ def probe_module_cli(spec: ModuleSpec) -> None:
     confidence = value.get("confidence")
     if (
         isinstance(confidence, bool)
-        or not isinstance(confidence, (int, float))
+        or not isinstance(confidence, int | float)
         or not math.isfinite(confidence)
         or not 0 <= confidence <= 1
     ):
@@ -1798,8 +1791,7 @@ def _check_probe_siblings(spec: ModuleSpec, loaded_imports: set[str]) -> None:
     )
     if siblings:
         raise ModuleConformanceError(
-            f"{spec.name}: sibling modules loaded inside the JSON CLI probe: "
-            + ", ".join(siblings)
+            f"{spec.name}: sibling modules loaded inside the JSON CLI probe: " + ", ".join(siblings)
         )
 
 
@@ -1811,9 +1803,10 @@ def _evaluate_module_predictions(spec: ModuleSpec) -> None:
     split_results: dict[str, list[float]] = {}
     loaded_imports: set[str] = set()
     try:
-        with module_offline_environment() as env, tempfile.TemporaryDirectory(
-            prefix="cambium-module-evaluate-"
-        ) as cwd:
+        with (
+            module_offline_environment() as env,
+            tempfile.TemporaryDirectory(prefix="cambium-module-evaluate-") as cwd,
+        ):
             import_log = Path(cwd) / "evaluate-imports.log"
             env["CAMBIUM_MODULE_PROBE_IMPORT_LOG"] = str(import_log)
             for split, filename in DECISION_SPLITS.items():
@@ -1828,10 +1821,13 @@ def _evaluate_module_predictions(spec: ModuleSpec) -> None:
                     raise ModuleConformanceError(
                         f"{spec.name}: live canary evaluation has no records"
                     )
-                payload = json.dumps(
-                    {"operation": "evaluate", "records": [record for _, record in records]},
-                    separators=(",", ":"),
-                ) + "\n"
+                payload = (
+                    json.dumps(
+                        {"operation": "evaluate", "records": [record for _, record in records]},
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
                 try:
                     result = subprocess.run(
                         [sys.executable, "-m", cli_module],
@@ -1854,8 +1850,7 @@ def _evaluate_module_predictions(spec: ModuleSpec) -> None:
                 if result.returncode != 0:
                     detail = result.stderr.strip() or "no stderr diagnostics"
                     raise ModuleConformanceError(
-                        f"{spec.name}: live {split} evaluation exited "
-                        f"{result.returncode}: {detail}"
+                        f"{spec.name}: live {split} evaluation exited {result.returncode}: {detail}"
                     )
                 if not result.stdout.endswith("\n") or result.stdout[:-1].endswith("\n"):
                     raise ModuleConformanceError(
@@ -1906,7 +1901,7 @@ def _evaluate_module_predictions(spec: ModuleSpec) -> None:
                     score = item["score"]
                     if (
                         isinstance(score, bool)
-                        or not isinstance(score, (int, float))
+                        or not isinstance(score, int | float)
                         or not math.isfinite(score)
                         or not 0 <= score <= 1
                     ):
@@ -1943,7 +1938,7 @@ def _evaluate_module_predictions(spec: ModuleSpec) -> None:
     canary_delta = thresholds.get("canary_failed_delta")
     if (
         isinstance(metric_delta, bool)
-        or not isinstance(metric_delta, (int, float))
+        or not isinstance(metric_delta, int | float)
         or not math.isfinite(metric_delta)
         or metric_delta < 0
         or isinstance(canary_delta, bool)
@@ -1961,7 +1956,7 @@ def _evaluate_module_predictions(spec: ModuleSpec) -> None:
         baseline_mean = fact.get("mean")
         if (
             isinstance(baseline_mean, bool)
-            or not isinstance(baseline_mean, (int, float))
+            or not isinstance(baseline_mean, int | float)
             or not math.isfinite(baseline_mean)
         ):
             findings.append(f"metric.{split}: baseline mean is invalid")
@@ -2053,15 +2048,11 @@ def _literal_import_target(node: ast.Call) -> str | None:
     ``None`` means the call cannot be statically resolved (variable, keyword
     override, or missing argument); callers fail closed on it.
     """
-    if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
-        node.args[0].value, str
-    ):
+    if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
         return node.args[0].value
     for keyword in node.keywords:
         if keyword.arg == "name":
-            if isinstance(keyword.value, ast.Constant) and isinstance(
-                keyword.value.value, str
-            ):
+            if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
                 return keyword.value.value
             return None
     return None
@@ -2143,9 +2134,7 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
                 if issue:
                     issues.append(issue)
                 for alias in node.names:
-                    issue = _check_import_target(
-                        f"{node.module}.{alias.name}", path, node, spec
-                    )
+                    issue = _check_import_target(f"{node.module}.{alias.name}", path, node, spec)
                     if issue:
                         issues.append(issue)
         elif isinstance(node, ast.Call):
@@ -2155,8 +2144,7 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
             )
             if isinstance(function, ast.Attribute) and function.attr == "import_module":
                 is_import_call = (
-                    isinstance(function.value, ast.Name)
-                    and function.value.id in importlib_names
+                    isinstance(function.value, ast.Name) and function.value.id in importlib_names
                 )
             if isinstance(function, ast.Attribute) and function.attr == "__import__":
                 is_import_call = isinstance(function.value, ast.Name) and function.value.id in {
@@ -2180,9 +2168,7 @@ def _scan_python_file(path: Path, spec: ModuleSpec) -> list[str]:
 def scan_module_imports(spec: ModuleSpec) -> None:
     """Reject sibling/provider imports and syntax errors in tracked Python files."""
     issues = [
-        issue
-        for path in spec.python_files
-        for issue in _scan_python_file(REPO_ROOT / path, spec)
+        issue for path in spec.python_files for issue in _scan_python_file(REPO_ROOT / path, spec)
     ]
     if issues:
         raise ModuleConformanceError(f"{spec.name}:\n" + "\n".join(issues))
@@ -2193,7 +2179,8 @@ def _reverse_scan_paths() -> tuple[Path, ...]:
     paths = [
         path
         for path in sorted(PACKAGE_ROOT.glob("*.py"))
-        if path.name not in {
+        if path.name
+        not in {
             "module_conformance.py",
             "cli.py",
             # optimize.py is the sanctioned in-process DSPy consumer, like cli.py
@@ -2201,7 +2188,7 @@ def _reverse_scan_paths() -> tuple[Path, ...]:
             "optimize.py",
         }
     ]
-    for directory_name in (("scripts", "tools") if _repository_available() else ()):
+    for directory_name in ("scripts", "tools") if _repository_available() else ():
         directory = REPO_ROOT / directory_name
         if directory.is_dir():
             paths.extend(sorted(path for path in directory.rglob("*.py") if _is_regular_file(path)))
@@ -2211,7 +2198,7 @@ def _reverse_scan_paths() -> tuple[Path, ...]:
 def _reverse_enclosing_symbol(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
     current = parents.get(node)
     while current is not None:
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(current, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             return current.name
         current = parents.get(current)
     return "<module>"
@@ -2299,8 +2286,8 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
                 parents[child] = parent
-        importlib_names, import_module_names, builtin_import_names = (
-            _reverse_importlib_aliases(tree)
+        importlib_names, import_module_names, builtin_import_names = _reverse_importlib_aliases(
+            tree
         )
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -2327,9 +2314,9 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
                         targets.extend(
                             target
                             for alias in node.names
-                            if (target := _reverse_target(
-                                ["cambium", "modules", alias.name], names
-                            ))
+                            if (
+                                target := _reverse_target(["cambium", "modules", alias.name], names)
+                            )
                             is not None
                         )
                 elif node.level:
@@ -2358,8 +2345,7 @@ def scan_reverse_imports() -> tuple[AuditFinding, ...]:
             )
             if isinstance(function, ast.Attribute) and function.attr == "import_module":
                 is_dynamic_import = (
-                    isinstance(function.value, ast.Name)
-                    and function.value.id in importlib_names
+                    isinstance(function.value, ast.Name) and function.value.id in importlib_names
                 )
             if isinstance(function, ast.Attribute) and function.attr == "__import__":
                 is_dynamic_import = (
@@ -2446,9 +2432,7 @@ def scan_external_module_files() -> tuple[AuditFinding, ...]:
                     re.MULTILINE,
                 )
             else:
-                reference = re.compile(
-                    rf"(?<![\w.])cambium\.modules\.{re.escape(module_name)}\b"
-                )
+                reference = re.compile(rf"(?<![\w.])cambium\.modules\.{re.escape(module_name)}\b")
             match = reference.search(text)
             if match is None:
                 continue
@@ -2476,9 +2460,7 @@ class ProviderImportBlocker:
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
         if _is_provider_import(fullname):
-            raise ModuleNotFoundError(
-                f"provider import blocked by module conformance: {fullname}"
-            )
+            raise ModuleNotFoundError(f"provider import blocked by module conformance: {fullname}")
         return None
 
 
@@ -2639,11 +2621,14 @@ class ModuleConformancePlugin:
     ) -> None:
         if self.spec is None:
             return
-        counts = {outcome: sum(value == outcome for value in self.reports.values()) for outcome in (
-            "passed",
-            "failed",
-            "skipped",
-        )}
+        counts = {
+            outcome: sum(value == outcome for value in self.reports.values())
+            for outcome in (
+                "passed",
+                "failed",
+                "skipped",
+            )
+        }
         terminalreporter.section("cambium module conformance")
         terminalreporter.write_line(
             f"{self.name}: passed={counts['passed']} failed={counts['failed']} "

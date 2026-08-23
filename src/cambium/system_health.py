@@ -147,7 +147,7 @@ def health(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
 
 
 def _is_finite_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return False
     try:
         return math.isfinite(float(value))
@@ -210,15 +210,10 @@ def decide_heavy_work(
 
     if available_frac is None:
         reasons.append("mem_available_frac unavailable")
-    elif (
-        not _is_finite_number(available_frac)
-        or not 0.0 <= available_frac <= 1.0
-    ):
+    elif not _is_finite_number(available_frac) or not 0.0 <= available_frac <= 1.0:
         reasons.append("mem_available_frac invalid")
     elif minimum_memory is not None and available_frac < minimum_memory:
-        reasons.append(
-            f"mem_available_frac {available_frac:.3f} < {minimum_memory:.3f}"
-        )
+        reasons.append(f"mem_available_frac {available_frac:.3f} < {minimum_memory:.3f}")
 
     if load1 is None:
         reasons.append("load1 unavailable")

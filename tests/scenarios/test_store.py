@@ -44,11 +44,7 @@ def _open(path):
 def test_same_path_event_store_has_one_process_owner(tmp_path) -> None:
     path = tmp_path / "events.db"
     store = _open(path)
-    script = (
-        "import sys\n"
-        "from cambium.store import EventStore\n"
-        "EventStore(sys.argv[1])\n"
-    )
+    script = "import sys\nfrom cambium.store import EventStore\nEventStore(sys.argv[1])\n"
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script, str(path)],
@@ -91,17 +87,27 @@ def test_append_rejects_records_replay_would_reject(tmp_path) -> None:
 def test_append_read_back_fields_and_monotonic_seq(tmp_path) -> None:
     store = _open(tmp_path / "events.db")
     try:
-        seq1 = store.append({
-            "kind": "worker_started", "payload": {"pid": 20471, "phase": "ready"},
-            "ts": "1754212801.204", "monotonic_ms": 481234568400,
-            "task_id": "wt-001", "worker_id": "wt-001#1", "generation": 1,
-            "request_id": "r1",
-        })
+        seq1 = store.append(
+            {
+                "kind": "worker_started",
+                "payload": {"pid": 20471, "phase": "ready"},
+                "ts": "1754212801.204",
+                "monotonic_ms": 481234568400,
+                "task_id": "wt-001",
+                "worker_id": "wt-001#1",
+                "generation": 1,
+                "request_id": "r1",
+            }
+        )
         seq2 = store.append({"kind": "log", "payload": {"line": "hello"}})
-        seq3 = store.append({
-            "kind": "result", "payload": {"status": "done"},
-            "monotonic_ms": 481234580700, "task_id": "wt-001",
-        })
+        seq3 = store.append(
+            {
+                "kind": "result",
+                "payload": {"status": "done"},
+                "monotonic_ms": 481234580700,
+                "task_id": "wt-001",
+            }
+        )
         assert seq1 == 1
         assert seq2 == 2
         assert seq3 == 3
@@ -212,9 +218,7 @@ def test_events_after_returns_only_newer_ordered(tmp_path) -> None:
         store.close()
 
 
-def test_read_events_file_is_noncreating_read_only_observer(
-    tmp_path, monkeypatch
-) -> None:
+def test_read_events_file_is_noncreating_read_only_observer(tmp_path, monkeypatch) -> None:
     path = tmp_path / "existing" / "events.db"
     store = _open(path)
     try:
@@ -229,17 +233,19 @@ def test_read_events_file_is_noncreating_read_only_observer(
     monkeypatch.setattr(store_module.Path, "mkdir", fail_side_effect)
     monkeypatch.setattr(store_module.threading.Thread, "start", fail_side_effect)
 
-    assert read_events_file(path, 0) == [{
-        "seq": 1,
-        "kind": "result",
-        "payload": {"done": True},
-        "ts": None,
-        "monotonic_ms": None,
-        "task_id": None,
-        "worker_id": None,
-        "generation": None,
-        "request_id": None,
-    }]
+    assert read_events_file(path, 0) == [
+        {
+            "seq": 1,
+            "kind": "result",
+            "payload": {"done": True},
+            "ts": None,
+            "monotonic_ms": None,
+            "task_id": None,
+            "worker_id": None,
+            "generation": None,
+            "request_id": None,
+        }
+    ]
 
     missing = tmp_path / "missing" / "events.db"
     assert read_events_file(missing, 0) == []
@@ -282,9 +288,7 @@ def test_corrupt_db_init_raises_not_hangs(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_writer_dead_on_locked_db_critical_append_raises(
-    tmp_path, monkeypatch
-) -> None:
+def test_writer_dead_on_locked_db_critical_append_raises(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
     # The writer's SQLite busy timeout is what bounds the wait on the locked
     # DB; the value is an implementation detail, not the signal. The signal
@@ -357,9 +361,7 @@ def test_writer_execute_failure_counts_removed_noncritical_and_burns_sequence(
     assert [event["seq"] for event in reopened.events_after(0)] == [2]
 
 
-def test_stalled_writer_flood_drops_non_critical_preserves_critical(
-    tmp_path, monkeypatch
-) -> None:
+def test_stalled_writer_flood_drops_non_critical_preserves_critical(tmp_path, monkeypatch) -> None:
     store = EventStore(
         tmp_path / "events.db",
         fsync_interval_s=60.0,
@@ -414,9 +416,7 @@ def test_stalled_writer_flood_drops_non_critical_preserves_critical(
 
 @pytest.mark.slow
 def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatch) -> None:
-    store = EventStore(
-        tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.4
-    )
+    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.4)
     release = threading.Event()
     recovered = threading.Event()
     real_fsync = EventStore._fsync_now
@@ -556,9 +556,7 @@ def test_close_reports_writer_not_stopped_after_sentinel_failure(tmp_path, monke
     # free alongside the stalled non-critical item), so close() spends its
     # deadline on the writer join rather than on the sentinel admission wait;
     # the force-stop verdict is what this test pins.
-    store = EventStore(
-        path, fsync_interval_s=60.0, max_queue_size=2, critical_timeout_s=60.0
-    )
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=2, critical_timeout_s=60.0)
     fsync_started = threading.Event()
     release = threading.Event()
     append_errors: list[BaseException] = []
@@ -791,9 +789,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
 
     def append_starter() -> None:
         try:
-            first_result.append(
-                cast(int, store.append({"kind": "result", "payload": {"i": 0}}))
-            )
+            first_result.append(cast(int, store.append({"kind": "result", "payload": {"i": 0}})))
         except BaseException as exc:
             starter_errors.append(exc)
         finally:
@@ -831,9 +827,7 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
 @pytest.mark.slow
 def test_failed_eviction_reservation_restores_event_and_sequence(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(
-        path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2
-    )
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.2)
     release = threading.Event()
     stalled = threading.Event()
     starter_errors: list[BaseException] = []
@@ -1176,9 +1170,7 @@ def test_writer_death_rejects_waiting_admission_and_wakes_all_callers(
             store._thread.join(1.0)
 
 
-def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
-    tmp_path, monkeypatch
-) -> None:
+def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(tmp_path, monkeypatch) -> None:
     store = EventStore(
         tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=30.0
     )
@@ -1302,11 +1294,13 @@ def test_redactor_runs_before_storage_on_long_strings_with_shaped_key(tmp_path) 
         redactor=Redactor(secret_values={opaque_key}),
     )
     try:
-        store.append({
-            "kind": "result",
-            "payload": {"message": "x" * 500 + " " + shaped_key, "stderr": opaque_key},
-            "request_id": "x" * 500 + " " + shaped_key,
-        })
+        store.append(
+            {
+                "kind": "result",
+                "payload": {"message": "x" * 500 + " " + shaped_key, "stderr": opaque_key},
+                "request_id": "x" * 500 + " " + shaped_key,
+            }
+        )
     finally:
         store.close()
 

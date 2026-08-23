@@ -49,9 +49,7 @@ _SUMMARY_CONTROL_OPEN = "<cambium-summary-control>\n"
 _SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
 
 
-def _summary_completion(
-    body: dict[str, Any], *, default_model: str
-) -> dict[str, Any] | None:
+def _summary_completion(body: dict[str, Any], *, default_model: str) -> dict[str, Any] | None:
     """Return a strict synthetic summary response without consuming actions."""
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -62,9 +60,7 @@ def _summary_completion(
         return None
     try:
         control = json.loads(
-            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(
-                _SUMMARY_CONTROL_CLOSE
-            )
+            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(_SUMMARY_CONTROL_CLOSE)
         )
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -105,9 +101,7 @@ def _summary_completion(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": json.dumps(
-                        summary, sort_keys=True, separators=(",", ":")
-                    ),
+                    "content": json.dumps(summary, sort_keys=True, separators=(",", ":")),
                 },
                 "finish_reason": "stop",
             }
@@ -168,9 +162,7 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError:
             body = {}
-        summary_response = _summary_completion(
-            body, default_model="loopback-model"
-        )
+        summary_response = _summary_completion(body, default_model="loopback-model")
         with REQUEST_LOCK:
             if summary_response is None:
                 REQUESTS.append(body)
@@ -356,7 +348,11 @@ class _WorkerRunner:
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-S", "-u", "-m", "cambium.worker",
+            sys.executable,
+            "-S",
+            "-u",
+            "-m",
+            "cambium.worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -386,9 +382,7 @@ class _WorkerRunner:
         proc = self.proc
         assert proc is not None
         stdout = cast(asyncio.StreamReader, proc.stdout)
-        return await asyncio.wait_for(
-            read_message(stdout, limit=MAX_LINE_BYTES), timeout
-        )
+        return await asyncio.wait_for(read_message(stdout, limit=MAX_LINE_BYTES), timeout)
 
     async def stop(self) -> None:
         if self.proc is not None and self.proc.returncode is None:
@@ -426,17 +420,29 @@ async def _drive_worker(
     runner = _WorkerRunner(env)
     await runner.start()
     try:
-        await runner.send({
-            "type": "init", "request_id": "init-1", "task_id": "agent-001",
-            "generation": generation, **init,
-        })
+        await runner.send(
+            {
+                "type": "init",
+                "request_id": "init-1",
+                "task_id": "agent-001",
+                "generation": generation,
+                **init,
+            }
+        )
         ready = await runner.recv()
         assert ready is not None and ready["type"] == "ready", f"stderr={runner.stderr_lines!r}"
-        await runner.send({
-            "type": "run_task", "request_id": "run-1", "task_id": "agent-001",
-            "scratch_repo": str(repo), "worktree_path": str(worktree),
-            "branch": branch, "generation": generation, **run,
-        })
+        await runner.send(
+            {
+                "type": "run_task",
+                "request_id": "run-1",
+                "task_id": "agent-001",
+                "scratch_repo": str(repo),
+                "worktree_path": str(worktree),
+                "branch": branch,
+                "generation": generation,
+                **run,
+            }
+        )
         messages: list[dict[str, Any]] = []
         while True:
             msg = await runner.recv()
@@ -520,9 +526,7 @@ def test_worker_init_debt_snapshot_orders_router_and_missing_debt_is_neutral(
 
 
 @pytest.mark.slow
-def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
-    tmp_path, monkeypatch
-) -> None:
+def test_worker_agent_loop_read_edit_finish_one_fenced_commit(tmp_path, monkeypatch) -> None:
     """read_batch -> edit_file -> run_shell -> finish: 4 model calls, one merge, no leaks.
 
     The provider config is supplied through ``CAMBIUM_PROVIDERS`` so this
@@ -533,9 +537,7 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
     try:
         project = tmp_path / "project"
         project.mkdir()
-        config_path = _provider_config(
-            project / "providers.json", server.base_url
-        )
+        config_path = _provider_config(project / "providers.json", server.base_url)
         monkeypatch.chdir(project)
         monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
         monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
@@ -546,8 +548,7 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
             os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])),
         )
         _enqueue(
-            '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["notes.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["notes.txt"]}}',
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         )
         _enqueue(
@@ -556,10 +557,7 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
             '"new_string":"fixture\\n// provider-alpha\\n"}}',
             usage={"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
         )
-        _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":'
-            '{"cmd":["true"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue(
             '{"type":"finish","summary":"read target.txt and appended a provider marker"}',
             usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21},
@@ -571,7 +569,8 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
         task = _task(session_dir, repo, base, config_path)
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
@@ -594,7 +593,9 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(
 
         tool_events = [e for e in events if e["kind"] == "tool_event"]
         assert [e["payload"]["tool"] for e in tool_events] == [
-            "read_batch", "edit_file", "run_shell"
+            "read_batch",
+            "edit_file",
+            "run_shell",
         ]
         assert all(e["payload"]["ok"] is True for e in tool_events)
         assert [e["payload"]["turn"] for e in tool_events] == [1, 2, 3]
@@ -666,7 +667,8 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         task = _task(session_dir, repo, base, config_path)
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
@@ -679,12 +681,15 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         assert result.results[0].status == "succeeded"
         assert result.results[0].merge_sha is None
         assert result.results[0].summary == summary
-        assert subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip() == base
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
         assert not [event for event in events if event["kind"] == "merge_started"]
         assert not [event for event in events if event["kind"] == "merge_committed"]
         assert events[-1]["kind"] == "session_ended"
@@ -705,11 +710,8 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         server.close()
 
 
-
 @pytest.mark.slow
-def test_worker_advanced_head_no_change_fails_and_main_unchanged(
-    tmp_path, monkeypatch
-) -> None:
+def test_worker_advanced_head_no_change_fails_and_main_unchanged(tmp_path, monkeypatch) -> None:
     """A provider that commits directly (permitted shell) must never succeed
     as a no-op: the worktree looks clean but HEAD has advanced beyond the
     base commit, so the worker fails and the supervisor never merges."""
@@ -731,7 +733,8 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(
         task["max_restarts"] = 0
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
@@ -742,12 +745,15 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(
         reason = cast(str, result.results[0].reason)
         assert "advanced beyond base_commit" in reason
         assert result.results[0].merge_sha is None
-        assert subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip() == base
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
         assert not [event for event in events if event["kind"] == "merge_started"]
         assert not [event for event in events if event["kind"] == "merge_committed"]
     finally:
@@ -773,8 +779,7 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
             '"new_string":"fixture\\n// provider-1\\n"}}'
         )
         _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":'
-            '["git","add","target.txt"]}}'
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["git","add","target.txt"]}}'
         )
         _enqueue(
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":'
@@ -785,10 +790,7 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
             '{"path":"notes.txt","old_string":"output-sentinel-7x9q\\n",'
             '"new_string":"output-sentinel-7x9q\\n// dirty-after-commit\\n"}}'
         )
-        _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":'
-            '{"cmd":["true"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue('{"type":"finish","summary":"committed directly then edited"}')
 
         session_dir = tmp_path / "session"
@@ -798,7 +800,8 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
         task["max_restarts"] = 0
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
@@ -810,12 +813,15 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
         assert "advanced beyond base_commit" in reason
         assert "refusing to publish unverified changes" in reason
         assert result.results[0].merge_sha is None
-        assert subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip() == base
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == base
+        )
         assert not [event for event in events if event["kind"] == "merge_started"]
         assert not [event for event in events if event["kind"] == "merge_committed"]
     finally:
@@ -838,9 +844,7 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
     try:
         project = tmp_path / "project"
         project.mkdir()
-        config_path = _provider_config(
-            project / "providers.json", server.base_url
-        )
+        config_path = _provider_config(project / "providers.json", server.base_url)
         monkeypatch.chdir(project)
         monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
         monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
@@ -874,29 +878,23 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
             '"new_string":"fixture\\n// provider-root\\n"}}'
         )
         _enqueue(
-            '{"type":"tool_call","name":"delegate","arguments":'
-            + json.dumps(delegate_args)
-            + "}"
+            '{"type":"tool_call","name":"delegate","arguments":' + json.dumps(delegate_args) + "}"
         )
-        _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":'
-            '{"cmd":["true"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue('{"type":"finish","summary":"edited target.txt and delegated a child"}')
 
         task = _task(session_dir, repo, base, config_path)
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
         events = read_events(session_dir)
 
         assert result.exit_code == 0
-        assert {r.task_id for r in result.results} == {
-            "worker-provider", "worker-provider-child"
-        }
+        assert {r.task_id for r in result.results} == {"worker-provider", "worker-provider-child"}
         assert all(r.status == "succeeded" for r in result.results)
 
         admitted = [e for e in events if e["kind"] == "child_admitted"]
@@ -912,7 +910,9 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
 
         merged = subprocess.run(
             ["git", "-C", str(repo), "show", "refs/heads/main:notes.txt"],
-            check=True, capture_output=True, text=True,
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout
         assert merged.endswith("// provider-child\n")
         # the child's marker is the agent's own: no provider secret leaked
@@ -972,9 +972,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             '"new_string":"fixture\\n// provider-cache-parent\\n"}}'
         )
         _enqueue(
-            '{"type":"tool_call","name":"delegate","arguments":'
-            + json.dumps(delegate_args)
-            + "}"
+            '{"type":"tool_call","name":"delegate","arguments":' + json.dumps(delegate_args) + "}"
         )
         _enqueue(
             '{"type":"finish","summary":"child provider call completed"}',
@@ -998,7 +996,10 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             if kind == "context_checkpoint" and event["payload"]["epoch"] == 1:
                 checkpoint_ref = cast(str, event["payload"]["checkpoint_ref"])
                 checkpoint_file: Path = (
-                    session_dir / ".cambium" / "checkpoints" / task["task_id"]
+                    session_dir
+                    / ".cambium"
+                    / "checkpoints"
+                    / task["task_id"]
                     / checkpoint_ref.split("/", 1)[1]
                 )
                 checkpoint_path = checkpoint_file
@@ -1031,7 +1032,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert checkpoint_event["epoch"] == 1
         checkpoint_ref = checkpoint_event["checkpoint_ref"]
         assert isinstance(checkpoint_ref, str) and checkpoint_ref
-        assert checkpoint_ref.startswith(f'{task["task_id"]}/')
+        assert checkpoint_ref.startswith(f"{task['task_id']}/")
         assert checkpoint_event["cache_key"]["redacted"] is False
 
         assert checkpoint_path is not None
@@ -1046,9 +1047,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert len(requests) == 4
         assert len(summary_requests) == 2
         assert all(request["model"] == "loopback-model" for request in requests)
-        assert all(
-            request["model"] == "loopback-model" for request in summary_requests
-        )
+        assert all(request["model"] == "loopback-model" for request in summary_requests)
         assert all(
             str(request["messages"][-1].get("content", "")).startswith(
                 "<cambium-summary-control>\n"
@@ -1144,9 +1143,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert buckets["resume_later"]["calls"] == 1
 
         assert result.exit_code == 0
-        assert {item.task_id for item in result.results} == {
-            task["task_id"], child_task_id
-        }
+        assert {item.task_id for item in result.results} == {task["task_id"], child_task_id}
         assert all(item.status == "succeeded" for item in result.results)
         assert PROVIDER_SECRET not in json.dumps(events)
     finally:
@@ -1170,7 +1167,8 @@ def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch)
         task["max_restarts"] = 0
         result = asyncio.run(
             run_plan(
-                session_dir, {"tasks": [task]},
+                session_dir,
+                {"tasks": [task]},
                 routing_state_path=str(tmp_path / "routing-state.json"),
             )
         )
@@ -1200,10 +1198,7 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
-        _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":'
-            '{"cmd":["true"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue('{"type":"finish","summary":"edited target.txt"}')
 
         session_dir = tmp_path / "slice-provider"
@@ -1297,9 +1292,7 @@ def test_worker_fenced_git_argv_disables_hooks(
 
     worker._fenced_git(tmp_path, 1, "commit", "-m", "message")
 
-    assert calls == [
-        ["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "message"]
-    ]
+    assert calls == [["git", "-c", "core.hooksPath=/dev/null", "commit", "-m", "message"]]
 
 
 # ---------------------------------------------------------------------------
@@ -1315,8 +1308,7 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         for _ in range(3):
             _enqueue(
-                '{"type":"tool_call","name":"read_batch","arguments":'
-                '{"paths":["target.txt"]}}'
+                '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}'
             )
 
         session_dir = tmp_path / "session"
@@ -1325,8 +1317,9 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         env = _worker_env(config_path, session_dir)
         init = _agent_init(config_path, max_turns=3, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="limits")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="limits"
+            )
         )
 
         assert result["status"] == "failed"
@@ -1350,8 +1343,7 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
         # 600 new input tokens plus 0 completion push the 1500 budget over
         # before the edit_file action is executed.
         _enqueue(
-            '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["target.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}',
             usage={"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
         )
         _enqueue(
@@ -1367,8 +1359,9 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
         env = _worker_env(config_path, session_dir)
         init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="tokens")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="tokens"
+            )
         )
 
         assert result["status"] == "failed"
@@ -1392,8 +1385,7 @@ def test_worker_token_budget_binds_total_only_usage(tmp_path) -> None:
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _enqueue(
-            '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["target.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}',
             usage={"total_tokens": 1000},
         )
         _enqueue(
@@ -1409,8 +1401,9 @@ def test_worker_token_budget_binds_total_only_usage(tmp_path) -> None:
         env = _worker_env(config_path, session_dir)
         init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="tokens-total")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="tokens-total"
+            )
         )
 
         assert result["status"] == "failed"
@@ -1437,8 +1430,9 @@ def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
         env = _worker_env(config_path, session_dir)
         init = _agent_init(config_path, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="usage")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="usage"
+            )
         )
 
         assert result["status"] == "failed"
@@ -1467,8 +1461,7 @@ def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
         env = _worker_env(config_path, session_dir)
         init = _agent_init(config_path, budget={"max_wall_s": 0.1}, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="wall")
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="wall")
         )
 
         assert result["status"] == "failed"
@@ -1508,8 +1501,9 @@ def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
             config_path, permissions={"shell": False, "network": False}, spec=TASK_TEXT
         )
         result, messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="shell-deny")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="shell-deny"
+            )
         )
 
         assert result["status"] == "succeeded"
@@ -1544,10 +1538,7 @@ def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
-        _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":'
-            '{"cmd":["true"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue('{"type":"finish","summary":"edited target.txt"}')
 
         session_dir = tmp_path / "session"
@@ -1558,8 +1549,9 @@ def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
             config_path, permissions={"shell": True, "network": False}, spec=TASK_TEXT
         )
         result, messages, rc, _stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="strict")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="strict"
+            )
         )
 
         assert result["status"] == "succeeded"
@@ -1586,19 +1578,13 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        _enqueue(
-            '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["notes.txt"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"read_batch","arguments":{"paths":["notes.txt"]}}')
         _enqueue(
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
-        _enqueue(
-            '{"type":"tool_call","name":"run_shell","arguments":'
-            '{"cmd":["true"]}}'
-        )
+        _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue('{"type":"finish","summary":"read and edited target.txt"}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
@@ -1618,8 +1604,9 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
             spec=TASK_TEXT,
         )
         result, messages, rc, stderr = asyncio.run(
-            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT},
-                          branch="observe")
+            _drive_worker(
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="observe"
+            )
         )
 
         assert result["status"] == "succeeded"

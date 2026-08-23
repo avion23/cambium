@@ -616,11 +616,7 @@ def _decodes_to(text: str, value: str) -> bool:
     while len(decoded) < len(value) and position < len(text):
         character, position = _decode_escape_char(text, position)
         decoded.append(character)
-    return (
-        len(decoded) == len(value)
-        and "".join(decoded) == value
-        and position == len(text)
-    )
+    return len(decoded) == len(value) and "".join(decoded) == value and position == len(text)
 
 
 def _replace_spans(text: str, spans: list[tuple[int, int]], replacement: str) -> str:
@@ -657,9 +653,7 @@ def _literal_spans(text: str) -> list[tuple[int, int]]:
         positions: Iterable[int]
         if markers:
             positions = (
-                position
-                for marker in markers
-                for position in _marker_positions(text, marker)
+                position for marker in markers for position in _marker_positions(text, marker)
             )
         elif index == 7:
             positions = (match.start() for match in _CASE_BEARER_RE.finditer(text))
@@ -770,7 +764,7 @@ def _context_replacement(match: re.Match[str], replacement: str) -> str:
             value = _redact_cookie_body(
                 double, replacement, set_cookie=normalised.startswith("set_")
             )
-            return f"{prefix}\"{value}\""
+            return f'{prefix}"{value}"'
         if single is not None:
             value = _redact_cookie_body(
                 single, replacement, set_cookie=normalised.startswith("set_")
@@ -785,7 +779,7 @@ def _context_replacement(match: re.Match[str], replacement: str) -> str:
         return match.group(0)
 
     if double is not None:
-        return f"{prefix}\"{replacement}\""
+        return f'{prefix}"{replacement}"'
     if single is not None:
         return f"{prefix}'{replacement}'"
 
@@ -803,9 +797,7 @@ def _context_replacement(match: re.Match[str], replacement: str) -> str:
     return prefix + replacement + value[next_field.start() :] + trailing
 
 
-_FIELD_NAME_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
-)
+_FIELD_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _VALUE_STOP_CHARS = frozenset(" \t\r\n,;{}[])")
 _HEADER_VALUE_STOP_CHARS = frozenset("\r\n,;{}[])")
 _COOKIE_VALUE_STOP_CHARS = frozenset("\r\n,{}[])")
@@ -1091,7 +1083,7 @@ def _cookie_context_value_key(key: object, value: object) -> bool:
         return False
     if normalised == "value":
         return True
-    return not isinstance(value, (Mapping, Sequence)) or isinstance(value, (str, bytes, bytearray))
+    return not isinstance(value, Mapping | Sequence) or isinstance(value, str | bytes | bytearray)
 
 
 def _child_context(key: object, value: object, context: _StructuredContext) -> _StructuredContext:
@@ -1102,7 +1094,7 @@ def _child_context(key: object, value: object, context: _StructuredContext) -> _
         return _StructuredContext.HEADERS
     if normalised in {"cookies", "cookie_jar", "cookiejar"}:
         return _StructuredContext.COOKIES
-    if context is _StructuredContext.COOKIES and isinstance(value, (Mapping, Sequence)):
+    if context is _StructuredContext.COOKIES and isinstance(value, Mapping | Sequence):
         return _StructuredContext.COOKIES
     return context
 
@@ -1125,16 +1117,13 @@ def _redact_mapping_key(
         return key
     if is_secret_name(key):
         return redactor.replacement
-    if (
-        structural_fields is not None
-        and _normalise_name(key) in structural_fields
-    ):
+    if structural_fields is not None and _normalise_name(key) in structural_fields:
         return redactor._redact_structural(key)
     return redactor.redact(key)
 
 
 def _normalise_structural_fields(fields: Iterable[str]) -> frozenset[str]:
-    if isinstance(fields, (str, bytes)):
+    if isinstance(fields, str | bytes):
         raise TypeError("structural_fields must be an iterable of field names")
     normalised: set[str] = set()
     for field in fields:
@@ -1187,38 +1176,66 @@ def _clone_structured(
             result: dict[object, object] = {}
             _memoise(state, current, current_context, current_role, result)
             mapping = cast(dict[object, object], result)
-            frames.append((
-                "mapping", current, mapping, iter(current.items()), None,
-                current_context, current_role,
-            ))
+            frames.append(
+                (
+                    "mapping",
+                    current,
+                    mapping,
+                    iter(current.items()),
+                    None,
+                    current_context,
+                    current_role,
+                )
+            )
             return result
 
         if isinstance(current, list):
             result_list: list[object] = []
             _memoise(state, current, current_context, current_role, result_list)
-            frames.append((
-                "sequence", current, result_list, iter(current), None,
-                current_context, current_role,
-            ))
+            frames.append(
+                (
+                    "sequence",
+                    current,
+                    result_list,
+                    iter(current),
+                    None,
+                    current_context,
+                    current_role,
+                )
+            )
             return result_list
 
         if isinstance(current, tuple):
             placeholder = _TuplePlaceholder()
             items: list[object] = []
             _memoise(state, current, current_context, current_role, placeholder)
-            frames.append((
-                "tuple", current, items, iter(current), placeholder,
-                current_context, current_role,
-            ))
+            frames.append(
+                (
+                    "tuple",
+                    current,
+                    items,
+                    iter(current),
+                    placeholder,
+                    current_context,
+                    current_role,
+                )
+            )
             return placeholder
 
-        if isinstance(current, Sequence) and not isinstance(current, (bytes, bytearray)):
+        if isinstance(current, Sequence) and not isinstance(current, bytes | bytearray):
             result_sequence: list[object] = []
             _memoise(state, current, current_context, current_role, result_sequence)
-            frames.append((
-                "sequence", current, result_sequence, iter(current), None,
-                current_context, current_role,
-            ))
+            frames.append(
+                (
+                    "sequence",
+                    current,
+                    result_sequence,
+                    iter(current),
+                    None,
+                    current_context,
+                    current_role,
+                )
+            )
             return result_sequence
 
         return current
@@ -1277,13 +1294,9 @@ def _resolve_tuple_placeholders(node: object, seen: set[int]) -> object:
             object,
             list[object] | None,
         ]
-    ] = [
-        ("visit", node, root, 0, None)
-    ]
+    ] = [("visit", node, root, 0, None)]
 
-    def assign(
-        parent: dict[object, object] | list[object], slot: object, value: object
-    ) -> None:
+    def assign(parent: dict[object, object] | list[object], slot: object, value: object) -> None:
         if isinstance(parent, dict):
             parent[slot] = value
         else:
@@ -1385,14 +1398,14 @@ class Redactor:
         self._patterns = DEFAULT_PATTERNS if patterns is None else tuple(patterns)
         if any(not isinstance(pattern, re.Pattern) for pattern in self._patterns):
             raise TypeError("patterns must contain compiled regular expressions")
-        if isinstance(secret_values, (str, bytes)):
+        if isinstance(secret_values, str | bytes):
             raise TypeError("secret_values must be an iterable of values, not a string")
         registered = frozenset() if secret_values is None else frozenset(secret_values)
         if any(not isinstance(value, str) for value in registered):
             raise TypeError("secret_values must contain strings")
         if any(not value for value in registered):
             raise ValueError("secret_values must not contain empty strings")
-        if isinstance(whole_values, (str, bytes)):
+        if isinstance(whole_values, str | bytes):
             raise TypeError("whole_values must be an iterable of values, not a string")
         whole = frozenset() if whole_values is None else frozenset(whole_values)
         if any(not isinstance(value, str) for value in whole):
@@ -1674,7 +1687,7 @@ def build_worker_env(
 
     if not isinstance(base, Mapping):
         raise TypeError("base must be a mapping")
-    if isinstance(allowlist, (str, bytes)):
+    if isinstance(allowlist, str | bytes):
         raise TypeError("allowlist must be an iterable of names, not a string")
     if overrides is not None and not isinstance(overrides, Mapping):
         raise TypeError("overrides must be a mapping")

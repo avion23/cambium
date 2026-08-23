@@ -219,9 +219,7 @@ def test_invalid_meta_rejected_by_load_and_load_split(tmp_path) -> None:
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 def test_non_finite_meta_json_constants_rejected(tmp_path, constant) -> None:
     src = _fresh_copy(tmp_path)
-    (src / "meta.json").write_text(
-        f'{{"corrupt": {constant}}}\n', encoding="utf-8"
-    )
+    (src / "meta.json").write_text(f'{{"corrupt": {constant}}}\n', encoding="utf-8")
 
     with pytest.raises(DatasetError, match="invalid JSON"):
         ExampleDatasetLoader(src).load()

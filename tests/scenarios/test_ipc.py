@@ -87,9 +87,7 @@ def _make_scratch(repo: Path) -> str:
     ).stdout.strip()
 
 
-def _install_blocking_clean_filter(
-    repo: Path, started: Path, release: Path
-) -> str:
+def _install_blocking_clean_filter(repo: Path, started: Path, release: Path) -> str:
     """Make ``git add hello.txt`` block via a clean filter until ``release``.
 
     A clean filter is a repository-local git config (not a hook), so it still
@@ -110,9 +108,15 @@ def _install_blocking_clean_filter(
         capture_output=True,
     )
     subprocess.run(
-        ["git", "-C", str(repo), "config", "filter.cambiumblock.clean",
-         f"sh -c ': > {shlex.quote(str(started))}; "
-         f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; cat'"],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "config",
+            "filter.cambiumblock.clean",
+            f"sh -c ': > {shlex.quote(str(started))}; "
+            f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done; cat'",
+        ],
         check=True,
     )
     subprocess.run(
@@ -171,7 +175,10 @@ class WorkerSupervisor:
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", "-m", "cambium.worker",
+            sys.executable,
+            "-u",
+            "-m",
+            "cambium.worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -194,16 +201,24 @@ class WorkerSupervisor:
             self._generation = int(msg.get("generation", 1))
             msg = {
                 **msg,
-                "heartbeat": msg.get("heartbeat")
-                or {"interval_s": TEST_HEARTBEAT_INTERVAL_S},
+                "heartbeat": msg.get("heartbeat") or {"interval_s": TEST_HEARTBEAT_INTERVAL_S},
             }
         if msg.get("type") == "run_task":
             scratch = Path(msg["scratch_repo"]).resolve()
             worktree = Path(msg["worktree_path"]).resolve()
             if not worktree.exists():
                 subprocess.run(
-                    ["git", "-C", str(scratch), "worktree", "add", "-b",
-                     msg["branch"], str(worktree), "main"],
+                    [
+                        "git",
+                        "-C",
+                        str(scratch),
+                        "worktree",
+                        "add",
+                        "-b",
+                        msg["branch"],
+                        str(worktree),
+                        "main",
+                    ],
                     check=True,
                     capture_output=True,
                 )
@@ -214,9 +229,7 @@ class WorkerSupervisor:
 
     async def recv(self, timeout: float = 30.0) -> dict[str, Any]:
         assert self.proc is not None
-        message = await asyncio.wait_for(
-            read_message(self.stdout, limit=MAX_LINE_BYTES), timeout
-        )
+        message = await asyncio.wait_for(read_message(self.stdout, limit=MAX_LINE_BYTES), timeout)
         return cast(dict[str, Any], message)
 
     async def recv_result(self, timeout: float = 30.0) -> tuple[dict, list[dict]]:
@@ -228,12 +241,11 @@ class WorkerSupervisor:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise AssertionError("timed out waiting for result_envelope")
-            msg = await asyncio.wait_for(
-                read_message(self.stdout, limit=MAX_LINE_BYTES), remaining
-            )
+            msg = await asyncio.wait_for(read_message(self.stdout, limit=MAX_LINE_BYTES), remaining)
             if msg is None:
-                raise AssertionError(f"EOF while waiting for result_envelope; "
-                                     f"stderr={self.stderr_lines!r}")
+                raise AssertionError(
+                    f"EOF while waiting for result_envelope; stderr={self.stderr_lines!r}"
+                )
             mtype = msg["type"]
             if mtype == "result_envelope":
                 return msg, heartbeats
@@ -266,8 +278,15 @@ async def _happy_handshake(session_dir: Path) -> None:
     w = WorkerSupervisor()
     await w.start()
     try:
-        await w.send({"type": "init", "request_id": init_rid, "task_id": "ipc-001",
-                      "generation": 2, "proto": 1})
+        await w.send(
+            {
+                "type": "init",
+                "request_id": init_rid,
+                "task_id": "ipc-001",
+                "generation": 2,
+                "proto": 1,
+            }
+        )
         ready = await w.recv()
         assert ready["type"] == "ready"
         assert ready["request_id"] == init_rid  # ready echoes init rid
@@ -377,8 +396,9 @@ def test_worker_happy_path_8x_no_corrupted_lines(tmp_path) -> None:
             try:
                 init_rid = f"init-{i:04d}"
                 run_rid = f"run-{i:04d}"
-                await w.send({"type": "init", "request_id": init_rid,
-                              "task_id": "ipc-20x", "generation": 1})
+                await w.send(
+                    {"type": "init", "request_id": init_rid, "task_id": "ipc-20x", "generation": 1}
+                )
                 ready = await w.recv()
                 assert ready["type"] == "ready"
                 assert ready["request_id"] == init_rid
@@ -418,8 +438,9 @@ def test_worker_invalid_input_fatal_error(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": init_rid, "task_id": "ipc-neg",
-                          "generation": 1})
+            await w.send(
+                {"type": "init", "request_id": init_rid, "task_id": "ipc-neg", "generation": 1}
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
@@ -452,13 +473,15 @@ def test_worker_cancel_acks_ok_then_aborts(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": init_rid, "task_id": "ipc-cancel",
-                          "generation": 3})
+            await w.send(
+                {"type": "init", "request_id": init_rid, "task_id": "ipc-cancel", "generation": 3}
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
-            await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-cancel", work_delay_s=2.0))
+            await w.send(
+                _run_task_msg(session_dir, run_rid=run_rid, task_id="ipc-cancel", work_delay_s=2.0)
+            )
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -503,19 +526,31 @@ def test_worker_steer_free_text_cancel_does_not_abort(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-steer-1",
-                          "task_id": "ipc-steer", "generation": 1})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-steer-1",
+                    "task_id": "ipc-steer",
+                    "generation": 1,
+                }
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
-            await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.3))
+            await w.send(
+                _run_task_msg(session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=0.3)
+            )
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
             # steer with the word "cancel" in free text: must be ignored
-            await w.send({"type": "steer", "request_id": "steer-1",
-                          "payload": {"note": "please cancel this step, thanks"}})
+            await w.send(
+                {
+                    "type": "steer",
+                    "request_id": "steer-1",
+                    "payload": {"note": "please cancel this step, thanks"},
+                }
+            )
             hb2 = await w.recv()
             assert hb2["type"] == "heartbeat"  # task still running: not aborted
 
@@ -543,18 +578,26 @@ def test_worker_steer_action_cancel_aborts(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-steer-2",
-                          "task_id": "ipc-steer", "generation": 1})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-steer-2",
+                    "task_id": "ipc-steer",
+                    "generation": 1,
+                }
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
-            await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=2.0))
+            await w.send(
+                _run_task_msg(session_dir, run_rid=run_rid, task_id="ipc-steer", work_delay_s=2.0)
+            )
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
-            await w.send({"type": "steer", "request_id": "steer-2",
-                          "payload": {"action": "cancel"}})
+            await w.send(
+                {"type": "steer", "request_id": "steer-2", "payload": {"action": "cancel"}}
+            )
             result, _heartbeats = await w.recv_result()
             assert result["request_id"] == run_rid
             assert result["status"] == "cancelled"
@@ -581,13 +624,20 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-health-1",
-                          "task_id": "ipc-health", "generation": 5})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-health-1",
+                    "task_id": "ipc-health",
+                    "generation": 5,
+                }
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
-            await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.3))
+            await w.send(
+                _run_task_msg(session_dir, run_rid=run_rid, task_id="ipc-health", work_delay_s=0.3)
+            )
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -629,8 +679,14 @@ def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-ping-1",
-                          "task_id": "ipc-ping", "generation": 1})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-ping-1",
+                    "task_id": "ipc-ping",
+                    "generation": 1,
+                }
+            )
             assert (await w.recv())["type"] == "ready"
             await w.send({"type": "ping", "request_id": "ping-exact-1"})
             pong = await w.recv()
@@ -661,13 +717,24 @@ def test_real_worker_rejects_generation_change_before_state_and_git_writes(tmp_p
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-fence-1",
-                          "task_id": "ipc-fence", "generation": 2})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-fence-1",
+                    "task_id": "ipc-fence",
+                    "generation": 2,
+                }
+            )
             assert (await w.recv())["type"] == "ready"
-            await w.send(_run_task_msg(
-                session_dir, run_rid="run-fence-1", work_delay_s=0.3,
-                task_id="ipc-fence", generation=2,
-            ))
+            await w.send(
+                _run_task_msg(
+                    session_dir,
+                    run_rid="run-fence-1",
+                    work_delay_s=0.3,
+                    task_id="ipc-fence",
+                    generation=2,
+                )
+            )
             assert (await w.recv())["type"] == "heartbeat"
             write_generation(worktree, 3)
             result, _ = await w.recv_result()
@@ -697,13 +764,23 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-fence-hook",
-                          "task_id": "ipc-fence-hook", "generation": 2})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-fence-hook",
+                    "task_id": "ipc-fence-hook",
+                    "generation": 2,
+                }
+            )
             assert (await w.recv())["type"] == "ready"
-            await w.send(_run_task_msg(
-                session_dir, run_rid="run-fence-hook", task_id="ipc-fence-hook",
-                generation=2,
-            ))
+            await w.send(
+                _run_task_msg(
+                    session_dir,
+                    run_rid="run-fence-hook",
+                    task_id="ipc-fence-hook",
+                    generation=2,
+                )
+            )
             deadline = asyncio.get_running_loop().time() + 5.0
             while not hook_started.exists():
                 assert asyncio.get_running_loop().time() < deadline
@@ -728,12 +805,15 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
         text=True,
     ).stdout.strip()
     assert commits_after_fence == "0"
-    assert MARKER not in subprocess.run(
-        ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    assert (
+        MARKER
+        not in subprocess.run(
+            ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
 
 
 @pytest.mark.slow
@@ -749,13 +829,23 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-post-commit-fence",
-                          "task_id": "ipc-post-commit-fence", "generation": 2})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-post-commit-fence",
+                    "task_id": "ipc-post-commit-fence",
+                    "generation": 2,
+                }
+            )
             assert (await w.recv())["type"] == "ready"
-            await w.send(_run_task_msg(
-                session_dir, run_rid="run-post-commit-fence",
-                task_id="ipc-post-commit-fence", generation=2,
-            ))
+            await w.send(
+                _run_task_msg(
+                    session_dir,
+                    run_rid="run-post-commit-fence",
+                    task_id="ipc-post-commit-fence",
+                    generation=2,
+                )
+            )
             result, _ = await w.recv_result()
             assert result["status"] == "succeeded"
             assert await w.process.wait() == 0
@@ -769,25 +859,33 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     # repository hooks are disabled and cannot hold the post-commit window open
     # deterministically) leaves the landed commit to supervisor recovery, which
     # resets the branch to base.
-    commits_before_recovery = int(subprocess.run(
-        ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout)
+    commits_before_recovery = int(
+        subprocess.run(
+            ["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
     assert commits_before_recovery == 1
-    assert MARKER in subprocess.run(
-        ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert MARKER not in subprocess.run(
-        ["git", "-C", str(scratch), "show", "refs/heads/main:hello.txt"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    assert (
+        MARKER
+        in subprocess.run(
+            ["git", "-C", str(worktree), "show", "HEAD:hello.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert (
+        MARKER
+        not in subprocess.run(
+            ["git", "-C", str(scratch), "show", "refs/heads/main:hello.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
 
     write_generation(worktree, 3)
     assert read_generation(worktree) == 3
@@ -795,28 +893,36 @@ def test_worker_fence_advance_during_post_commit_leaves_cleanup_to_supervisor(
     from cambium import supervisor as supervisor_module
 
     runtime = supervisor_module._Runtime(session_dir, None)
-    recovered_generation = asyncio.run(runtime._recover_worktree({
-        "repo": str(scratch),
-        "worktree_path": str(worktree),
-        "branch": "wt-ipc-001",
-        "base_commit": base,
-        "task_id": "ipc-post-commit-fence",
-    }))
+    recovered_generation = asyncio.run(
+        runtime._recover_worktree(
+            {
+                "repo": str(scratch),
+                "worktree_path": str(worktree),
+                "branch": "wt-ipc-001",
+                "base_commit": base,
+                "task_id": "ipc-post-commit-fence",
+            }
+        )
+    )
 
     assert recovered_generation == 4
     assert read_generation(worktree) == 4
-    assert subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == base
+    assert (
+        subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base
+    )
     assert MARKER not in (worktree / "hello.txt").read_text(encoding="utf-8")
 
 
 @pytest.mark.slow
 def test_stale_worker_never_mutates_newer_generations_staged_work(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
@@ -824,8 +930,15 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     worktree = session_dir / "wt"
     subprocess.run(
         [
-            "git", "-C", str(scratch), "worktree", "add", "-b", "wt-stale",
-            str(worktree), base,
+            "git",
+            "-C",
+            str(scratch),
+            "worktree",
+            "add",
+            "-b",
+            "wt-stale",
+            str(worktree),
+            base,
         ],
         check=True,
         capture_output=True,
@@ -864,15 +977,22 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     monkeypatch.setattr(worker_module, "_fenced_git", blocking_fenced_git)
     result_holder: list[dict] = []
     worker_thread = threading.Thread(
-        target=lambda: result_holder.append(asyncio.run(worker_module.do_work({
-            "scratch_repo": str(scratch),
-            "worktree_path": str(worktree),
-            "target_file": "hello.txt",
-            "marker": MARKER,
-            "write_marker": True,
-            "task_id": "stale-generation-1",
-            "generation": 1,
-        }, threading.Event()))),
+        target=lambda: result_holder.append(
+            asyncio.run(
+                worker_module.do_work(
+                    {
+                        "scratch_repo": str(scratch),
+                        "worktree_path": str(worktree),
+                        "target_file": "hello.txt",
+                        "marker": MARKER,
+                        "write_marker": True,
+                        "task_id": "stale-generation-1",
+                        "generation": 1,
+                    },
+                    threading.Event(),
+                )
+            )
+        ),
         daemon=True,
     )
     worker_thread.start()
@@ -908,18 +1028,25 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     assert result_holder[0]["status"] == "failed"
     assert "generation mismatch" in result_holder[0]["failure_reason"]
     assert read_generation(worktree) == 2
-    assert subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() == head_before_stale_detection
-    assert subprocess.run(
-        ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines() == staged_before_stale_detection == ["generation-2.txt"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == head_before_stale_detection
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        == staged_before_stale_detection
+        == ["generation-2.txt"]
+    )
     assert generation_2_file.read_text(encoding="utf-8") == "generation 2 in progress\n"
 
 
@@ -934,13 +1061,22 @@ def test_worker_shutdown_graceful_exit(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-shutdown-1",
-                          "task_id": "ipc-shutdown", "generation": 4})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-shutdown-1",
+                    "task_id": "ipc-shutdown",
+                    "generation": 4,
+                }
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
-            await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-shutdown", work_delay_s=5.0))
+            await w.send(
+                _run_task_msg(
+                    session_dir, run_rid=run_rid, task_id="ipc-shutdown", work_delay_s=5.0
+                )
+            )
             hb = await w.recv()
             assert hb["type"] == "heartbeat"
 
@@ -1007,8 +1143,14 @@ def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
         w = WorkerSupervisor(env={"CAMBIUM_IDLE_TIMEOUT_S": "0.3"})
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-idle-1",
-                          "task_id": "ipc-idle", "generation": 1})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-idle-1",
+                    "task_id": "ipc-idle",
+                    "generation": 1,
+                }
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
@@ -1035,13 +1177,22 @@ def test_worker_diff_cap_bytes_and_truncation_flag(tmp_path) -> None:
         w = WorkerSupervisor()
         await w.start()
         try:
-            await w.send({"type": "init", "request_id": "init-bigdiff-1",
-                          "task_id": "ipc-bigdiff", "generation": 1})
+            await w.send(
+                {
+                    "type": "init",
+                    "request_id": "init-bigdiff-1",
+                    "task_id": "ipc-bigdiff",
+                    "generation": 1,
+                }
+            )
             ready = await w.recv()
             assert ready["type"] == "ready"
 
-            await w.send(_run_task_msg(
-                session_dir, run_rid=run_rid, task_id="ipc-bigdiff", marker=big_marker))
+            await w.send(
+                _run_task_msg(
+                    session_dir, run_rid=run_rid, task_id="ipc-bigdiff", marker=big_marker
+                )
+            )
             result, _ = await w.recv_result()
 
             assert result["status"] == "succeeded"

@@ -137,7 +137,7 @@ def test_cli_rejects_invalid_typed_input(payload: dict, message: str) -> None:
     assert message in result.stderr
 
 
-@pytest.mark.parametrize("payload", ["", "[]", "{\"task\": \"one\"} {\"task\": \"two\"}"])
+@pytest.mark.parametrize("payload", ["", "[]", '{"task": "one"} {"task": "two"}'])
 def test_cli_returns_json_error_for_invalid_input_document(payload: str) -> None:
     result = _run_cli(payload)
 
@@ -149,9 +149,7 @@ def test_cli_returns_json_error_for_invalid_input_document(payload: str) -> None
 
 
 def test_cli_handles_unicode_task() -> None:
-    result = _run_cli(
-        json.dumps({"task": "Fix the 'café' encoding in the Ünïcode handler."})
-    )
+    result = _run_cli(json.dumps({"task": "Fix the 'café' encoding in the Ünïcode handler."}))
 
     assert result.returncode == 0, result.stderr
     output = _one_json_object(result.stdout)
@@ -204,9 +202,7 @@ def test_cli_decide_operation_returns_results_array() -> None:
 
 
 def test_cli_decide_operation_requires_inputs_array() -> None:
-    result = _run_cli(
-        json.dumps({"operation": "decide", "inputs": {"task": "Split the work."}})
-    )
+    result = _run_cli(json.dumps({"operation": "decide", "inputs": {"task": "Split the work."}}))
 
     assert result.returncode != 0
     error = _one_json_object(result.stdout)["error"]

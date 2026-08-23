@@ -67,14 +67,24 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
 def _show(repo: Path, ref: str, path: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "show", f"{ref}:{path}"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
 
 
 def _marker_task(
-    session_dir: Path, repo: Path, base: str, task_id: str, *,
-    worktree: str, branch: str, marker: str, target_file: str = "a.txt",
-    depends_on: list[str] | None = None, **extra: object,
+    session_dir: Path,
+    repo: Path,
+    base: str,
+    task_id: str,
+    *,
+    worktree: str,
+    branch: str,
+    marker: str,
+    target_file: str = "a.txt",
+    depends_on: list[str] | None = None,
+    **extra: object,
 ) -> dict[str, object]:
     task: dict[str, object] = {
         "task_id": task_id,
@@ -147,7 +157,10 @@ class _WorkerDriver:
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", "-m", "cambium.worker",
+            sys.executable,
+            "-u",
+            "-m",
+            "cambium.worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -186,16 +199,10 @@ class _WorkerDriver:
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise AssertionError(
-                    f"timed out waiting for {mtype}; stderr={self.stderr_lines!r}"
-                )
-            msg = await asyncio.wait_for(
-                read_message(stdout, limit=MAX_LINE_BYTES), remaining
-            )
+                raise AssertionError(f"timed out waiting for {mtype}; stderr={self.stderr_lines!r}")
+            msg = await asyncio.wait_for(read_message(stdout, limit=MAX_LINE_BYTES), remaining)
             if msg is None:
-                raise AssertionError(
-                    f"EOF while waiting for {mtype}; stderr={self.stderr_lines!r}"
-                )
+                raise AssertionError(f"EOF while waiting for {mtype}; stderr={self.stderr_lines!r}")
             if msg["type"] == mtype:
                 return msg
             if msg["type"] != "heartbeat":
@@ -326,17 +333,31 @@ def test_supervisor_pool_reuses_worker_across_tasks(tmp_path: Path, monkeypatch)
     # pools its worker), then t-b must pop that pooled process.
     plan = {
         "tasks": [
-            _marker_task(session_dir, repo, base, "t-a", worktree="wt-a",
-                         branch="wt-a", marker="// cambium-a", target_file="a.txt"),
-            _marker_task(session_dir, repo, base, "t-b", worktree="wt-b",
-                         branch="wt-b", marker="// cambium-b", target_file="b.txt",
-                         depends_on=["t-a"]),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                marker="// cambium-a",
+                target_file="a.txt",
+            ),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                marker="// cambium-b",
+                target_file="b.txt",
+                depends_on=["t-a"],
+            ),
         ]
     }
 
-    result = asyncio.run(
-        run_plan(session_dir, plan, max_concurrent_tasks=1, warm_pool_size=2)
-    )
+    result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1, warm_pool_size=2))
 
     assert result.exit_code == 0
     assert {r.task_id for r in result.results} == {"t-a", "t-b"}
@@ -362,9 +383,7 @@ def test_supervisor_pool_reuses_worker_across_tasks(tmp_path: Path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-def test_restarted_generation_spawns_fresh_never_reuses_pool(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_restarted_generation_spawns_fresh_never_reuses_pool(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     monkeypatch.setattr(supervisor_module, "RESTART_MAX_DELAY_S", 0.02)
     monkeypatch.setenv("CAMBIUM_WARM_POOL_SIZE", "2")
@@ -387,19 +406,51 @@ def test_restarted_generation_spawns_fresh_never_reuses_pool(
     # fresh (allow_pool=False) instead of popping the second pooled process.
     plan = {
         "tasks": [
-            _marker_task(session_dir, repo, base, "t-root", worktree="wt-root",
-                         branch="wt-root", marker="// cambium-root",
-                         target_file="root.txt"),
-            _marker_task(session_dir, repo, base, "t-a", worktree="wt-a",
-                         branch="wt-a", marker="// cambium-a", target_file="a.txt",
-                         depends_on=["t-root"]),
-            _marker_task(session_dir, repo, base, "t-b", worktree="wt-b",
-                         branch="wt-b", marker="// cambium-b", target_file="b.txt",
-                         depends_on=["t-root"]),
-            _marker_task(session_dir, repo, base, "t-crash", worktree="wt-crash",
-                         branch="wt-crash", marker="// cambium-crash",
-                         target_file="c.txt", max_restarts=1, max_wall_s=0.001,
-                         depends_on=["t-b"]),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-root",
+                worktree="wt-root",
+                branch="wt-root",
+                marker="// cambium-root",
+                target_file="root.txt",
+            ),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                marker="// cambium-a",
+                target_file="a.txt",
+                depends_on=["t-root"],
+            ),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                marker="// cambium-b",
+                target_file="b.txt",
+                depends_on=["t-root"],
+            ),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-crash",
+                worktree="wt-crash",
+                branch="wt-crash",
+                marker="// cambium-crash",
+                target_file="c.txt",
+                max_restarts=1,
+                max_wall_s=0.001,
+                depends_on=["t-b"],
+            ),
         ]
     }
 
@@ -409,7 +460,9 @@ def test_restarted_generation_spawns_fresh_never_reuses_pool(
     assert crash_result.status == "failed"
     assert crash_result.restarts == 1
     assert {r.task_id for r in result.results if r.status == "succeeded"} == {
-        "t-root", "t-a", "t-b"
+        "t-root",
+        "t-a",
+        "t-b",
     }
     events = read_events(session_dir)
 
@@ -424,9 +477,7 @@ def test_restarted_generation_spawns_fresh_never_reuses_pool(
     reused = _kinds(events, "worker_reused")
     crash_reused = [e for e in reused if e["task_id"] == "t-crash"]
     assert [e["generation"] for e in crash_reused] == [1]
-    assert not [
-        e for e in crash_reused if e["generation"] == 2
-    ]
+    assert not [e for e in crash_reused if e["generation"] == 2]
 
 
 # ---------------------------------------------------------------------------
@@ -434,25 +485,37 @@ def test_restarted_generation_spawns_fresh_never_reuses_pool(
 # ---------------------------------------------------------------------------
 
 
-def test_pool_disabled_size_zero_keeps_single_init_behavior(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_pool_disabled_size_zero_keeps_single_init_behavior(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CAMBIUM_WARM_POOL_SIZE", "0")
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
     plan = {
         "tasks": [
-            _marker_task(session_dir, repo, base, "t-a", worktree="wt-a",
-                         branch="wt-a", marker="// cambium-a", target_file="a.txt"),
-            _marker_task(session_dir, repo, base, "t-b", worktree="wt-b",
-                         branch="wt-b", marker="// cambium-b", target_file="b.txt"),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                marker="// cambium-a",
+                target_file="a.txt",
+            ),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                marker="// cambium-b",
+                target_file="b.txt",
+            ),
         ]
     }
 
-    result = asyncio.run(
-        run_plan(session_dir, plan, max_concurrent_tasks=1, warm_pool_size=0)
-    )
+    result = asyncio.run(run_plan(session_dir, plan, max_concurrent_tasks=1, warm_pool_size=0))
 
     assert result.exit_code == 0
     assert all(r.status == "succeeded" for r in result.results)
@@ -477,8 +540,15 @@ def test_session_end_kills_idle_pooled_workers(tmp_path: Path, monkeypatch) -> N
     base = _make_repo(repo, {"a.txt": "file a\n"})
     plan = {
         "tasks": [
-            _marker_task(session_dir, repo, base, "t-a", worktree="wt-a",
-                         branch="wt-a", marker="// cambium-a"),
+            _marker_task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                marker="// cambium-a",
+            ),
         ]
     }
 

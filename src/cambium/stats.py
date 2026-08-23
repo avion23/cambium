@@ -97,7 +97,7 @@ def _row_cached(usage: Mapping[str, Any]) -> int:
 
 def _row_cost(payload: Mapping[str, Any]) -> float:
     value = payload.get("estimated_cost_usd")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return 0.0
     value = float(value)
     return value if math.isfinite(value) and value >= 0 else 0.0
@@ -188,9 +188,7 @@ def _events_table_exists(connection: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def _read_usage_rows(
-    db: Path, *, with_task_id: bool
-) -> list[Mapping[str, Any]] | None:
+def _read_usage_rows(db: Path, *, with_task_id: bool) -> list[Mapping[str, Any]] | None:
     """Read usage_event rows from ``db``; None when the events table is absent.
 
     Connects read-only and returns None only for a missing ``events`` table
@@ -299,8 +297,7 @@ def usage_breakdown_from_events(events: Sequence[Mapping[str, Any]]) -> UsageBre
         return None
     return UsageBreakdown(
         by_task=tuple(
-            (task_id, _stats_from_accumulator(task_accs[task_id]))
-            for task_id in task_order
+            (task_id, _stats_from_accumulator(task_accs[task_id])) for task_id in task_order
         ),
         by_provider=tuple(
             (provider, _stats_from_accumulator(provider_accs[provider]))

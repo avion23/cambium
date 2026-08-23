@@ -78,13 +78,9 @@ def _context_checkpoint_message(task_id: str = "task") -> dict[str, Any]:
 def _make_repo(tmp_path: Path) -> tuple[Path, Path, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(
-        ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "contract"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "contract@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "contract@test"], check=True)
     (repo / "file.txt").write_text("content\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(
@@ -159,15 +155,17 @@ def _write_checkpoint_file(session_dir: Path, event: dict[str, Any]) -> None:
     path = session_dir / ".cambium" / "checkpoints" / checkpoint_ref
     path.parent.mkdir(parents=True)
     path.write_text(
-        json.dumps({
-            "provider_messages": [
-                {"role": "system", "content": "system TOP-SECRET"},
-                {"role": "user", "content": "question"},
-            ],
-            "continuation_suffix": [
-                {"role": "assistant", "content": "answer TOP-SECRET"},
-            ],
-        }),
+        json.dumps(
+            {
+                "provider_messages": [
+                    {"role": "system", "content": "system TOP-SECRET"},
+                    {"role": "user", "content": "question"},
+                ],
+                "continuation_suffix": [
+                    {"role": "assistant", "content": "answer TOP-SECRET"},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -187,9 +185,7 @@ def _write_advanced_checkpoint(session_dir: Path) -> dict[str, Any]:
         "tools_sha256": _provider_task_tools_hash(),
         "prefix_sha256": worker._messages_sha256(provider_messages),
         "suffix_sha256": worker._messages_sha256(continuation_suffix),
-        "full_sha256": worker._messages_sha256(
-            [*provider_messages, *continuation_suffix]
-        ),
+        "full_sha256": worker._messages_sha256([*provider_messages, *continuation_suffix]),
         "prefix_bytes": prompt_prefix_bytes({"messages": provider_messages}) or 0,
         "message_count": len(provider_messages),
         "redacted": False,
@@ -216,9 +212,7 @@ def _write_advanced_checkpoint(session_dir: Path) -> dict[str, Any]:
         "wall_deadline": 10.0,
     }
     persisted_address = worker._checkpoint_address(payload)
-    checkpoint_ref = (
-        f"task/epoch-002-{'a' * 16}-{persisted_address}.json"
-    )
+    checkpoint_ref = f"task/epoch-002-{'a' * 16}-{persisted_address}.json"
     payload["checkpoint_ref"] = checkpoint_ref
     path = session_dir / ".cambium" / "checkpoints" / checkpoint_ref
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,7 +266,8 @@ def test_context_checkpoint_appends_redacted_raw_rows_and_replays_files(
         assert all(row["node_id"] == "task" for row in rows)
         assert all(row["kind"] == "turn" for row in rows)
         assert all(
-            row["meta"] == {
+            row["meta"]
+            == {
                 "checkpoint_ref": event["checkpoint_ref"],
                 "epoch": 1,
             }
@@ -449,8 +444,7 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "compaction_failed rejected: invalid field(s)",
     }
     assert any(
-        record["payload"].get("note")
-        == "context_epoch_advanced rejected: invalid checkpoint"
+        record["payload"].get("note") == "context_epoch_advanced rejected: invalid checkpoint"
         for record in rejected
     )
     assert "context_epoch_advanced" in CRITICAL_KINDS

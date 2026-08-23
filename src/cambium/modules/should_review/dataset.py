@@ -164,11 +164,9 @@ class ExampleDatasetLoader(DatasetLoader):
     ) -> list[Example]:
         records = load_jsonl(path)
         require_versions = (
-            (require_envelope or path.stem in {split.value for split in Split})
-            and bool(
-                meta.get("schema_version") is not None
-                or meta.get("dataset_version") is not None
-            )
+            require_envelope or path.stem in {split.value for split in Split}
+        ) and bool(
+            meta.get("schema_version") is not None or meta.get("dataset_version") is not None
         )
         examples: list[Example] = []
         seen_ids: dict[str, int] = {}
@@ -191,15 +189,9 @@ class ExampleDatasetLoader(DatasetLoader):
             try:
                 task_input = TaskInput(**record["input"])
             except TypeError as exc:
-                raise DatasetError(
-                    f"{path}:{line_no}: invalid input fields: {exc}"
-                ) from exc
+                raise DatasetError(f"{path}:{line_no}: invalid input fields: {exc}") from exc
             expected = dict(record["expected"])
-            expected["review"] = (
-                Decision.REVIEW
-                if expected["review"]
-                else Decision.DO_NOT_REVIEW
-            )
+            expected["review"] = Decision.REVIEW if expected["review"] else Decision.DO_NOT_REVIEW
             examples.append(
                 Example(
                     input=task_input,
@@ -258,9 +250,7 @@ class ExampleDatasetLoader(DatasetLoader):
         if mismatches:
             raise DatasetError(f"{path}:{line_no}: version drift: {', '.join(mismatches)}")
 
-    def _check_no_cross_split_collisions(
-        self, splits: list[tuple[str, Sequence[Example]]]
-    ) -> None:
+    def _check_no_cross_split_collisions(self, splits: list[tuple[str, Sequence[Example]]]) -> None:
         seen: dict[str, tuple[str, str]] = {}
         for split_name, examples in splits:
             for example in examples:
@@ -283,9 +273,7 @@ class ExampleDatasetLoader(DatasetLoader):
 
     def _validate(self, record: dict, line_no: int, path: Path) -> None:
         if not {"input", "expected"} <= record.keys():
-            raise DatasetError(
-                f"{path}:{line_no}: record must have 'input' and 'expected'"
-            )
+            raise DatasetError(f"{path}:{line_no}: record must have 'input' and 'expected'")
         for key in ("input", "expected"):
             if not isinstance(record[key], dict):
                 raise DatasetError(f"{path}:{line_no}: {key} must be an object")
@@ -294,9 +282,7 @@ class ExampleDatasetLoader(DatasetLoader):
         if not isinstance(record["input"].get("context"), str):
             raise DatasetError(f"{path}:{line_no}: input.context must be a string")
         if not isinstance(record["expected"].get("review"), bool):
-            raise DatasetError(
-                f"{path}:{line_no}: expected.review must be a boolean"
-            )
+            raise DatasetError(f"{path}:{line_no}: expected.review must be a boolean")
         decompose = record["expected"].get("decompose")
         if not isinstance(decompose, bool) or decompose != record["expected"]["review"]:
             raise DatasetError(
@@ -304,9 +290,7 @@ class ExampleDatasetLoader(DatasetLoader):
                 "(generic v1 class-balance field)"
             )
         if not isinstance(record["expected"].get("reason"), str):
-            raise DatasetError(
-                f"{path}:{line_no}: expected.reason must be a string"
-            )
+            raise DatasetError(f"{path}:{line_no}: expected.reason must be a string")
         canary = record.get("canary", False)
         if not isinstance(canary, bool):
             raise DatasetError(f"{path}:{line_no}: canary must be a boolean")

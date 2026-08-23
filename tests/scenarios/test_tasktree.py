@@ -35,10 +35,12 @@ def _chain_plan(length: int = 200) -> dict:
     with the documented DepthBoundError instead of a stack or recursion error.
     The depth bound fires at depth 4 regardless of total length, so 200 tasks
     exercise the same code paths as any larger chain."""
-    return _plan([
-        (f"task-{index}", "TEST", [] if index == 0 else [f"task-{index - 1}"])
-        for index in range(length)
-    ])
+    return _plan(
+        [
+            (f"task-{index}", "TEST", [] if index == 0 else [f"task-{index - 1}"])
+            for index in range(length)
+        ]
+    )
 
 
 def _run_cli(payload: str = "", *args: str) -> subprocess.CompletedProcess[str]:
@@ -65,11 +67,13 @@ def test_unified_cli_rejects_tasktree() -> None:
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_prints_topological_order_json_lines() -> None:
-    plan = _plan([
-        ("r", "FEATURE", []),
-        ("a", "BUGFIX", ["r"]),
-        ("b", "REFACTOR", ["r"]),
-    ])
+    plan = _plan(
+        [
+            ("r", "FEATURE", []),
+            ("a", "BUGFIX", ["r"]),
+            ("b", "REFACTOR", ["r"]),
+        ]
+    )
     result = _run_cli(json.dumps(plan))
     assert result.returncode == 0, result.stderr
     assert [json.loads(line) for line in result.stdout.splitlines()] == ["r", "a", "b"]
@@ -78,10 +82,12 @@ def test_cli_prints_topological_order_json_lines() -> None:
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_reads_plan_from_json_file(tmp_path: Path) -> None:
-    plan = _plan([
-        ("r", "FEATURE", []),
-        ("a", "BUGFIX", ["r"]),
-    ])
+    plan = _plan(
+        [
+            ("r", "FEATURE", []),
+            ("a", "BUGFIX", ["r"]),
+        ]
+    )
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
 
@@ -94,10 +100,12 @@ def test_cli_reads_plan_from_json_file(tmp_path: Path) -> None:
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_explicit_dash_reads_plan_from_stdin() -> None:
-    plan = _plan([
-        ("r", "FEATURE", []),
-        ("a", "BUGFIX", ["r"]),
-    ])
+    plan = _plan(
+        [
+            ("r", "FEATURE", []),
+            ("a", "BUGFIX", ["r"]),
+        ]
+    )
 
     result = _run_cli(json.dumps(plan), "-")
 
@@ -199,12 +207,14 @@ def test_cli_bad_plan_argument_exits_two_with_stderr(tmp_path: Path) -> None:
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
 def test_cli_cyclic_plan_exits_one_with_stderr() -> None:
-    plan = _plan([
-        ("r", "FEATURE", []),
-        ("a", "BUGFIX", ["b"]),
-        ("b", "REFACTOR", ["c"]),
-        ("c", "TEST", ["a"]),
-    ])
+    plan = _plan(
+        [
+            ("r", "FEATURE", []),
+            ("a", "BUGFIX", ["b"]),
+            ("b", "REFACTOR", ["c"]),
+            ("c", "TEST", ["a"]),
+        ]
+    )
     result = _run_cli(json.dumps(plan))
     assert result.returncode == 1
     assert "cycle" in result.stderr

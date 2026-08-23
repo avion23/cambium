@@ -161,7 +161,7 @@ class OneShotConfig:
 
 def resolve_repo(repo: str | Path) -> Path:
     """Resolve a non-empty repository argument to an absolute path."""
-    if not isinstance(repo, (str, Path)) or (isinstance(repo, str) and not repo.strip()):
+    if not isinstance(repo, str | Path) or (isinstance(repo, str) and not repo.strip()):
         raise ValueError("one-shot repository must be a non-empty path")
     return Path(repo).expanduser().resolve()
 
@@ -291,9 +291,7 @@ def _oauth_doc_present(provider_name: str) -> bool:
     return document is not None
 
 
-def _provider_credential_ready(
-    provider: Any, auth_store: AuthStore
-) -> bool:
+def _provider_credential_ready(provider: Any, auth_store: AuthStore) -> bool:
     """One credential-availability boundary over the separate stores.
 
     API-key providers are ready when their environment name resolves to a
@@ -315,9 +313,7 @@ def _provider_credential_ready(
     return bool(launch_environment.get(env_name))
 
 
-def _authorized_provider_names(
-    providers: list[Any], auth_store: AuthStore
-) -> list[Any]:
+def _authorized_provider_names(providers: list[Any], auth_store: AuthStore) -> list[Any]:
     """Return the enabled providers with a usable credential, in config order.
 
     This is the single place that decides which provider identities a run may
@@ -375,8 +371,7 @@ def _resolve_provider(
             )
         if not authorized:
             raise ValueError(
-                "no enabled provider with stored credentials; configure an "
-                "API key or OAuth session"
+                "no enabled provider with stored credentials; configure an API key or OAuth session"
             )
         environment: dict[str, str] = {}
         for candidate in authorized:
@@ -399,9 +394,7 @@ def _resolve_provider(
                 for candidate in authorized
                 if not _is_codex_oauth_provider(candidate) and candidate.api_key_env
             ),
-            model_candidates=tuple(
-                sorted({candidate.model for candidate in authorized})
-            ),
+            model_candidates=tuple(sorted({candidate.model for candidate in authorized})),
         )
         return resolved, environment
 
@@ -447,8 +440,7 @@ def _resolve_provider(
         )
     if not any(candidate.name == selected.name for candidate in authorized):
         raise ValueError(
-            f"selected provider {selected.name!r} is not authorized: "
-            "credential is unavailable"
+            f"selected provider {selected.name!r} is not authorized: credential is unavailable"
         )
     codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
 
@@ -474,9 +466,7 @@ def _resolve_provider(
     environment = {}
     for candidate in authorized:
         if not _is_codex_oauth_provider(candidate):
-            environment.update(
-                _stored_provider_environment(candidate.api_key_env, store)
-            )
+            environment.update(_stored_provider_environment(candidate.api_key_env, store))
     resolved = replace(
         config,
         provider=selected.name,
@@ -595,9 +585,7 @@ def admit_session(config: OneShotConfig, session_dir: Path) -> None:
     _reject_reused_session(path)
 
 
-async def run_oneshot(
-    config: OneShotConfig, on_event: EventSink | None = None
-) -> PlanResult:
+async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) -> PlanResult:
     """Run one prompt through exactly one supervisor plan."""
     repo = resolve_repo(config.repo)
     preflight(config, repo)
@@ -610,15 +598,11 @@ async def run_oneshot(
         preflight(config, repo, explicit_session_dir)
         admit_session(config, explicit_session_dir)
     elif config.session_mode is SessionMode.RESUME:
-        raise ValueError(
-            "one-shot resume requires an explicit existing session directory"
-        )
+        raise ValueError("one-shot resume requires an explicit existing session directory")
 
     resolved, provider_environment = _resolve_provider(config, repo)
     session_dir = (
-        explicit_session_dir
-        if explicit_session_dir is not None
-        else allocate_session_dir(repo)
+        explicit_session_dir if explicit_session_dir is not None else allocate_session_dir(repo)
     )
     preflight(resolved, repo, session_dir)
     plan = build_plan(resolved, repo, session_dir)

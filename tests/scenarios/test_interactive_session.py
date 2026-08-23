@@ -99,9 +99,7 @@ def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path)
 
     async def fake_run(self, turn, *, on_event=None):
         seen_context_forks.append(turn.context_fork)
-        checkpoint_ref = (
-            f"interactive-main/epoch-{turn.number}-" + f"{turn.number:064x}" + ".json"
-        )
+        checkpoint_ref = f"interactive-main/epoch-{turn.number}-" + f"{turn.number:064x}" + ".json"
         checkpoint = turn.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_text("{}", encoding="utf-8")
@@ -126,11 +124,7 @@ def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path)
                 }
             )
         return PlanResult(
-            results=(
-                TaskResult(
-                    task_id=f"task-{turn.number}", status="succeeded", exit_code=0
-                ),
-            )
+            results=(TaskResult(task_id=f"task-{turn.number}", status="succeeded", exit_code=0),)
         )
 
     monkeypatch.setattr(InteractiveSession, "run_turn", fake_run)

@@ -28,16 +28,17 @@ def test_fold_twice_does_not_change_the_store(tmp_path) -> None:
             folded_from=first,
         )
         before = store.history("node")
-        count_before = sqlite3.connect(path).execute(
-            "SELECT count(*) FROM conversations"
-        ).fetchone()[0]
+        count_before = (
+            sqlite3.connect(path).execute("SELECT count(*) FROM conversations").fetchone()[0]
+        )
 
         assert summary is not None
         assert store.fold("node", "condensed", tokens_before=7, tokens_after=2) == summary
         assert store.history("node") == before
-        assert sqlite3.connect(path).execute(
-            "SELECT count(*) FROM conversations"
-        ).fetchone()[0] == count_before
+        assert (
+            sqlite3.connect(path).execute("SELECT count(*) FROM conversations").fetchone()[0]
+            == count_before
+        )
         assert [record["id"] for record in store.raw_range("node", first, second)] == [
             first,
             second,
@@ -227,9 +228,7 @@ def test_unicode_and_empty_folds_are_safe(tmp_path) -> None:
         assert store.fold("empty", "ignored") is None
         content = "\u65e5\u672c\u8a9e \U0001f30a \u043f\u0440\u0438\u0432\u0435\u0442"
         store.append("unicode", "user", content)
-        summary = store.fold(
-            "unicode", "\u8981\u7d04 \U0001f680", tokens_before=3, tokens_after=1
-        )
+        summary = store.fold("unicode", "\u8981\u7d04 \U0001f680", tokens_before=3, tokens_after=1)
 
         assert summary is not None
         assert store.fold("unicode", "\u8981\u7d04 \U0001f680") == summary

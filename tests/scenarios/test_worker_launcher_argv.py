@@ -52,14 +52,25 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
     )
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
 def _task(
-    session_dir: Path, repo: Path, base: str, task_id: str, *,
-    worktree: str, branch: str, target_file: str, marker: str, gate: str,
-    worker: str | None = None, provider_env_keys: list[str] | None = None,
+    session_dir: Path,
+    repo: Path,
+    base: str,
+    task_id: str,
+    *,
+    worktree: str,
+    branch: str,
+    target_file: str,
+    marker: str,
+    gate: str,
+    worker: str | None = None,
+    provider_env_keys: list[str] | None = None,
 ) -> dict:
     spec = {
         "task_id": task_id,
@@ -152,12 +163,20 @@ def test_script_worker_spawns_exact_argv_and_confined_env(tmp_path, monkeypatch)
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, "t-argv", worktree="wt-argv", branch="wt-argv",
-                target_file="a.txt", marker="// cambium-argv",
+                session_dir,
+                repo,
+                base,
+                "t-argv",
+                worktree="wt-argv",
+                branch="wt-argv",
+                target_file="a.txt",
+                marker="// cambium-argv",
                 gate="grep -q '// cambium-argv' a.txt",
                 worker=str(script),
                 provider_env_keys=[
-                    "CAMBIUM_PROVIDER_OPENAI_API_KEY", "ARGV_DUMP_PATH", "ENV_DUMP_PATH",
+                    "CAMBIUM_PROVIDER_OPENAI_API_KEY",
+                    "ARGV_DUMP_PATH",
+                    "ENV_DUMP_PATH",
                 ],
             )
         ]

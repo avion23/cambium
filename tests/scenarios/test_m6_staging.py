@@ -180,9 +180,7 @@ def _make_repo(repo: Path) -> str:
     repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "m6-test"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "m6@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "m6@test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     (repo / "target.txt").write_text("fixture\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
@@ -230,9 +228,7 @@ def _remove_worker_worktree(repo: Path, worktree: Path, branch: str) -> None:
 
 def _set_absolute_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep module workers importable after the supervisor changes cwd."""
-    pythonpath = os.pathsep.join(
-        filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")])
-    )
+    pythonpath = os.pathsep.join(filter(None, [str(ROOT / "src"), os.environ.get("PYTHONPATH")]))
     monkeypatch.setenv("PYTHONPATH", pythonpath)
 
 
@@ -277,11 +273,15 @@ def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) ->
         assert first.provider == second.provider == "m6-fake-fast"
         assert first.model == second.model == "m6-fake-model"
         assert first.content == second.content == DECISION
-        assert first.usage == second.usage == {
-            "prompt_tokens": 18,
-            "completion_tokens": 11,
-            "total_tokens": 29,
-        }
+        assert (
+            first.usage
+            == second.usage
+            == {
+                "prompt_tokens": 18,
+                "completion_tokens": 11,
+                "total_tokens": 29,
+            }
+        )
         assert first.latency_s >= 0.0
 
         assert FAKE_REQUESTS["count"] == 2  # identical calls are not cached

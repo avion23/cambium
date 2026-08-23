@@ -219,9 +219,7 @@ def _serialize_signature_result(result: dict[str, Any]) -> str:
 
     envelope = {**result, "signature": "", "truncated": True}
     if len(serialize(envelope).encode("utf-8")) > MAX_OUTPUT_BYTES:
-        return serialize(
-            {"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True}
-        )
+        return serialize({"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True})
 
     signature = result["signature"]
     low = 0
@@ -238,9 +236,7 @@ def _serialize_signature_result(result: dict[str, Any]) -> str:
             high = midpoint - 1
 
     if not best_signature:
-        return serialize(
-            {"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True}
-        )
+        return serialize({"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True})
     envelope["signature"] = best_signature
     return serialize(envelope)
 
@@ -611,8 +607,7 @@ def _read_and_extract_signature(
 
     if len(raw) > MAX_READ_BYTES:
         raise _ToolFailure(
-            f"get_signature source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): "
-            f"{display_path}"
+            f"get_signature source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): {display_path}"
         )
     try:
         source = raw.decode("utf-8")
@@ -636,21 +631,17 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     try:
         signature = await asyncio.wait_for(
             asyncio.get_running_loop().run_in_executor(
-                executor,
-                _read_and_extract_signature, ctx, path, display_path, symbol
+                executor, _read_and_extract_signature, ctx, path, display_path, symbol
             ),
             timeout=GET_SIGNATURE_READ_TIMEOUT_S,
         )
     except TimeoutError as exc:
         raise _ToolFailure(
-            f"get_signature read timed out after {GET_SIGNATURE_READ_TIMEOUT_S}s: "
-            f"{display_path}"
+            f"get_signature read timed out after {GET_SIGNATURE_READ_TIMEOUT_S}s: {display_path}"
         ) from exc
     except SyntaxError as exc:
         location = f" at line {exc.lineno}" if exc.lineno is not None else ""
-        raise _ToolFailure(
-            f"could not parse {display_path}{location}: {exc.msg}"
-        ) from exc
+        raise _ToolFailure(f"could not parse {display_path}{location}: {exc.msg}") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
     if signature is None:
@@ -662,14 +653,10 @@ async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
 def _process_output(stdout: Any, stderr: Any) -> str:
     standard_output = (
-        stdout.decode("utf-8", errors="replace")
-        if isinstance(stdout, bytes)
-        else str(stdout or "")
+        stdout.decode("utf-8", errors="replace") if isinstance(stdout, bytes) else str(stdout or "")
     )
     standard_error = (
-        stderr.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes)
-        else str(stderr or "")
+        stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
     )
     if standard_output and standard_error:
         separator = "" if standard_output.endswith("\n") else "\n"
@@ -853,10 +840,7 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     child_task_id = args["child_task_id"]
     return _Outcome(
         ok=True,
-        output=(
-            f"child {child_task_id} proposed; "
-            "admission is validated when this task completes"
-        ),
+        output=(f"child {child_task_id} proposed; admission is validated when this task completes"),
     )
 
 
@@ -952,9 +936,11 @@ async def run_read_batch(
         )
 
     offered_tools = ctx.init.get("tools") if isinstance(ctx.init, Mapping) else None
-    read_offered = isinstance(offered_tools, Sequence) and not isinstance(
-        offered_tools, (str, bytes, bytearray)
-    ) and "read_batch" in offered_tools
+    read_offered = (
+        isinstance(offered_tools, Sequence)
+        and not isinstance(offered_tools, str | bytes | bytearray)
+        and "read_batch" in offered_tools
+    )
 
     preflight_errors: list[str] = []
     if not read_offered:
@@ -973,9 +959,7 @@ async def run_read_batch(
             continue
         raw_path = arguments.get("path")
         errors = validate_tool_call(schema, {"paths": [raw_path]})
-        preflight_errors.extend(
-            f"batch_index {batch_index}: {error}" for error in errors
-        )
+        preflight_errors.extend(f"batch_index {batch_index}: {error}" for error in errors)
         if errors:
             continue
         try:
@@ -992,10 +976,7 @@ async def run_read_batch(
         async with semaphore:
             return await _run_read_result(args, ctx)
 
-    tasks = [
-        asyncio.create_task(_bounded_read(_read_batch_arguments(call)))
-        for call in batch
-    ]
+    tasks = [asyncio.create_task(_bounded_read(_read_batch_arguments(call))) for call in batch]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
     results: list[ToolResult] = []
     for gathered_result in gathered:
@@ -1047,6 +1028,7 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
             ctx,
         )
     return await _run_tool_without_python(name, args, ctx)
+
 
 async def _run_tool_without_python(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     """Validate and execute one named worker tool."""

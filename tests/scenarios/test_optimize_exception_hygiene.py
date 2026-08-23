@@ -49,9 +49,7 @@ def test_only_public_main_keeps_generic_exception_boundary() -> None:
 
     assert len(handlers) == 1
     main = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "main"
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main"
     )
     assert any(handler in ast.walk(main) for handler in handlers)
 
@@ -185,8 +183,7 @@ def test_loader_import_and_data_failures_are_handled_but_type_errors_propagate(
 def test_transcript_loader_handles_dataset_error_but_propagates_type_error(tmp_path: Path) -> None:
     candidate_path = tmp_path / optimize._TRANSCRIPT_CANDIDATES_FILENAME
     candidate_path.write_text(
-        '{"id": "approved", "candidate": true, '
-        '"review_status": "approved", "redacted": true}\n',
+        '{"id": "approved", "candidate": true, "review_status": "approved", "redacted": true}\n',
         encoding="utf-8",
     )
 
@@ -248,9 +245,9 @@ def test_score_adapter_handles_parse_and_value_failures_but_not_type_errors() ->
         def metric(self, _example):
             raise ValueError("bad metric input")
 
-    assert asyncio.run(
-        optimize._score_examples_async(ValueErrorMetricProgram(), [_gold()])
-    ) == [0.0]
+    assert asyncio.run(optimize._score_examples_async(ValueErrorMetricProgram(), [_gold()])) == [
+        0.0
+    ]
 
     class TypeErrorMetricProgram(ValueErrorMetricProgram):
         def metric(self, _example):

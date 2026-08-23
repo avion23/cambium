@@ -15,13 +15,9 @@ from cambium.supervisor import PlanResult, TaskResult
 
 def _repo(path: Path) -> Path:
     path.mkdir()
-    subprocess.run(
-        ["git", "init", "-b", "main", str(path)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(path), "config", "user.name", "oneshot-test"], check=True)
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.email", "oneshot@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "oneshot@test"], check=True)
     (path / "file.txt").write_text("file\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(path), "add", "file.txt"], check=True, capture_output=True)
     subprocess.run(
@@ -71,9 +67,7 @@ def test_default_sessions_get_distinct_branches_and_succeed(monkeypatch, tmp_pat
             capture_output=True,
         )
         runs.append((Path(session_dir), task["branch"]))
-        return PlanResult(
-            (TaskResult(task_id=task["task_id"], status="succeeded", exit_code=0),)
-        )
+        return PlanResult((TaskResult(task_id=task["task_id"], status="succeeded", exit_code=0),))
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
     config = oneshot.OneShotConfig(
@@ -208,7 +202,10 @@ def test_auto_mode_rejects_pinned_provider_or_model(tmp_path: Path) -> None:
 
     repo = _repo(tmp_path / "repo")
     config = oneshot.OneShotConfig(
-        prompt="p", repo=repo, auto=True, provider="pa",
+        prompt="p",
+        repo=repo,
+        auto=True,
+        provider="pa",
         provider_config_path=_write_providers(tmp_path / "providers.json"),
     )
     try:
@@ -224,7 +221,9 @@ def test_auto_mode_requires_stored_credential(tmp_path: Path) -> None:
 
     repo = _repo(tmp_path / "repo")
     config = oneshot.OneShotConfig(
-        prompt="p", repo=repo, auto=True,
+        prompt="p",
+        repo=repo,
+        auto=True,
         provider_config_path=_write_providers(tmp_path / "providers.json"),
     )
     # a real, EMPTY AuthStore: every provider's credential lookup fails
@@ -282,9 +281,7 @@ def test_resume_requires_existing_session_artifact(tmp_path: Path) -> None:
 
     (session_dir / "plan.json").write_text("{}", encoding="utf-8")
     oneshot.admit_session(config, session_dir)
-    assert oneshot.build_plan(config, tmp_path, session_dir)["tasks"][0][
-        "session_mode"
-    ] == "resume"
+    assert oneshot.build_plan(config, tmp_path, session_dir)["tasks"][0]["session_mode"] == "resume"
 
 
 def test_resume_without_explicit_session_does_not_allocate_one(tmp_path: Path) -> None:
@@ -301,4 +298,3 @@ def test_resume_without_explicit_session_does_not_allocate_one(tmp_path: Path) -
         asyncio.run(oneshot.run_oneshot(config))
     sessions_root = repo / ".cambium" / "sessions"
     assert not sessions_root.exists()
-

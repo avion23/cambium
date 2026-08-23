@@ -39,9 +39,7 @@ EXPECTED_EVENT_COLUMNS = {
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
-    )
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
 def _init_repo(repo: Path) -> str:
@@ -92,10 +90,12 @@ def test_real_worker_result_correlates_and_exit_has_no_request_id(tmp_path: Path
             assert proc.stdin is not None
             assert proc.stdout is not None
 
-            proc.stdin.write((
-                f'{{"type":"init","request_id":"{init_request_id}",'
-                f'"task_id":"{task_id}","generation":1,"proto":1}}\n'
-            ).encode())
+            proc.stdin.write(
+                (
+                    f'{{"type":"init","request_id":"{init_request_id}",'
+                    f'"task_id":"{task_id}","generation":1,"proto":1}}\n'
+                ).encode()
+            )
             await proc.stdin.drain()
             ready = await asyncio.wait_for(read_message(proc.stdout), 15.0)
             assert ready is not None
@@ -186,11 +186,14 @@ def test_merge_rejects_invalid_old_values_non_fast_forward_and_quarantine(tmp_pa
 
 def test_worker_env_drops_api_key_names_and_controls_path(tmp_path: Path) -> None:
     redact = pytest.importorskip("cambium.redact")
-    env = redact.build_worker_env({
-        "TEST_API_KEY_DEMO": "not-for-workers",
-        "PATH": "/host/bin",
-        "HOME": "/home/host",
-    }, worktree=tmp_path / "worker")
+    env = redact.build_worker_env(
+        {
+            "TEST_API_KEY_DEMO": "not-for-workers",
+            "PATH": "/host/bin",
+            "HOME": "/home/host",
+        },
+        worktree=tmp_path / "worker",
+    )
     assert "TEST_API_KEY_DEMO" not in env
     assert env["PATH"] == os.defpath
     assert env["HOME"] == str((tmp_path / "worker").resolve() / ".cambium" / "home")

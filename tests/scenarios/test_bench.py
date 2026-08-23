@@ -168,8 +168,7 @@ def _inprocess_module_cli(cli_module, payload, **kwargs):
         sys.stdin = stdin_old
     if holder["rc"] != 0:
         raise ModuleCLIError(
-            f"module {cli_module!r}: CLI exited {holder['rc']}: "
-            f"{stderr.getvalue().strip()[:300]}"
+            f"module {cli_module!r}: CLI exited {holder['rc']}: {stderr.getvalue().strip()[:300]}"
         )
     return _json.loads(stdout.getvalue())
 
@@ -321,9 +320,7 @@ def test_report_writes_valid_baseline(tmp_path, monkeypatch) -> None:
     assert baseline["dataset"]["duplicate_ids"] == 0
     assert baseline["dataset"]["cross_split_leaks"] == 0
     assert baseline["dataset"]["canaries"] == 10
-    meta = json.loads(
-        (REPO_ROOT / "src/cambium/modules/example/datasets/meta.json").read_text()
-    )
+    meta = json.loads((REPO_ROOT / "src/cambium/modules/example/datasets/meta.json").read_text())
     assert baseline["split_digests"] == meta["split_digests"]
     assert baseline["tests"]["count"] == len(MODULE_TESTS)
     assert set(baseline["tests"]["wall_seconds"]) == {"p50", "p90", "max"}
@@ -349,9 +346,7 @@ def test_fixture_module_report_and_gate_use_neutral_contract(tmp_path, monkeypat
     bench_root = tmp_path / "baselines"
 
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
-    baseline = json.loads(
-        (bench_root / "fixture_module" / "baseline.json").read_text()
-    )
+    baseline = json.loads((bench_root / "fixture_module" / "baseline.json").read_text())
     assert baseline["dataset_version"] == "fixture-1"
     assert baseline["dataset"]["records"] == 3
     assert baseline["metric"]["train"] == {"mean": 1.0, "std": 0.0, "count": 1}
@@ -403,9 +398,7 @@ def test_invalid_module_name_fails_closed_before_baseline_write(
     assert not (tmp_path / "target" / "baseline.json").exists()
 
 
-def test_split_version_drift_fallback_fails_gate(
-    tmp_path, monkeypatch, capsys
-) -> None:
+def test_split_version_drift_fallback_fails_gate(tmp_path, monkeypatch, capsys) -> None:
     import cambium.bench as bench
 
     modules_dir = _write_fixture_module(
@@ -511,9 +504,12 @@ def test_dataset_stats_distinguishes_same_split_duplicates_from_leaks() -> None:
     second = {**first, "id": "b"}
 
     assert bench.dataset_stats([first, second])["cross_split_leaks"] == 0
-    assert bench.dataset_stats(
-        [first, second], split_records={"train": [first], "eval": [second]}
-    )["cross_split_leaks"] == 1
+    assert (
+        bench.dataset_stats([first, second], split_records={"train": [first], "eval": [second]})[
+            "cross_split_leaks"
+        ]
+        == 1
+    )
 
 
 def test_compare_against_anchor_checks_split_digests() -> None:
@@ -639,9 +635,7 @@ def test_invalid_utf8_cli_output_fails_without_combined_fallback_or_baseline(
     assert not (bench_root / "fixture_module" / "baseline.json").exists()
 
 
-def test_module_subprocess_env_does_not_inherit_provider_credentials(
-    tmp_path, monkeypatch
-) -> None:
+def test_module_subprocess_env_does_not_inherit_provider_credentials(tmp_path, monkeypatch) -> None:
     import cambium.bench as bench
 
     secret = "opaque-bench-env-probe-value-42"
@@ -737,7 +731,8 @@ def test_bench_stderr_never_leaks_multiline_provider_credential_raw_or_escaped(
                 print(json.dumps({"error": {"message": __SECRET__}}))
                 raise SystemExit(__EXIT_CODE__)
                 """
-            ).replace("__SECRET__", repr(secret))
+            )
+            .replace("__SECRET__", repr(secret))
             .replace("__EXIT_CODE__", repr(exit_code))
         )
         monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
@@ -901,9 +896,7 @@ def test_standalone_cli_report_records_module_test_timings(tmp_path, monkeypatch
     )
 
 
-def test_standalone_cli_gate_detects_wall_time_regression(
-    tmp_path, monkeypatch, capsys
-) -> None:
+def test_standalone_cli_gate_detects_wall_time_regression(tmp_path, monkeypatch, capsys) -> None:
     """The standalone gate must compare live wall p90 against the anchor.
 
     Empty live timings (the previous CLI behavior) would silently disable the
@@ -914,10 +907,7 @@ def test_standalone_cli_gate_detects_wall_time_regression(
     modules_dir = _write_fixture_module(tmp_path)
     monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    nodeid = (
-        "src/cambium/modules/fixture/tests/"
-        "test_fixture.py::test_always_passes"
-    )
+    nodeid = "src/cambium/modules/fixture/tests/test_fixture.py::test_always_passes"
 
     monkeypatch.setattr(bench, "_measure_module_timings", lambda _pkg: {nodeid: 0.01})
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 0
@@ -1111,9 +1101,7 @@ def test_cli_report_protects_committed_baseline(tmp_path, monkeypatch) -> None:
     assert bench.main(["report"]) == 0
 
     assert committed.read_bytes() == before  # committed baseline untouched
-    runtime = (
-        REPO_ROOT / ".cambium" / "baselines" / "should_decompose" / "baseline.json"
-    )
+    runtime = REPO_ROOT / ".cambium" / "baselines" / "should_decompose" / "baseline.json"
     assert runtime.exists()
     assert json.loads(runtime.read_text())["module"] == "should_decompose"
 
@@ -1134,9 +1122,7 @@ def test_cli_full_drift_report_writes_artifact(tmp_path, monkeypatch) -> None:
     modules_dir = _write_fixture_module(tmp_path)
     monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
     bench_root = tmp_path / "baselines"
-    assert bench.main(
-        ["report", "--full", "--drift-report", "--bench-root", str(bench_root)]
-    ) == 0
+    assert bench.main(["report", "--full", "--drift-report", "--bench-root", str(bench_root)]) == 0
     assert (bench_root / "fixture_module" / "baseline.json").is_file()
     artifact = json.loads((bench_root / "drift-report.json").read_text())
     assert artifact["full"] is True

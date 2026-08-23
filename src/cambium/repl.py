@@ -37,9 +37,7 @@ else:
     readline = cast(_Readline, _readline)
 
 
-_BAR_TERMINAL_KINDS = frozenset(
-    {"result", "session_ended", "exit", "worker_failed", "reuse_ready"}
-)
+_BAR_TERMINAL_KINDS = frozenset({"result", "session_ended", "exit", "worker_failed", "reuse_ready"})
 
 _PROMPT = "cambium> "
 
@@ -191,6 +189,7 @@ async def run_repl(
         if _read_stdin_byte is not _ORIGINAL_READ_BYTE:
             byte_source = _read_stdin_byte
         else:
+
             def byte_source() -> bytes:
                 data = input_stream.read(1)
                 if isinstance(data, str):
@@ -242,8 +241,7 @@ async def run_repl(
                         return
                     if not _stream_tty:
                         output_stream.write(
-                            render.render_event_line(record, stream=output_stream)
-                            + "\n"
+                            render.render_event_line(record, stream=output_stream) + "\n"
                         )
                         status = render.render_live_status_line(_events)
                         if status:
@@ -255,9 +253,7 @@ async def run_repl(
                         output_stream.write(line + "\n")
                     if bar_live:
                         output_stream.write("\r\033[K")
-                        bar = render.render_status_bar(
-                            _events, session_label=_session_label
-                        )
+                        bar = render.render_status_bar(_events, session_label=_session_label)
                         if bar:
                             output_stream.write(bar + "\n")
                         if record.get("kind") in _BAR_TERMINAL_KINDS:
@@ -275,9 +271,7 @@ async def run_repl(
                     except asyncio.CancelledError:
                         if not sigint_fired:
                             raise
-                        bar = render.render_status_bar(
-                            events, session_label=session_label
-                        )
+                        bar = render.render_status_bar(events, session_label=session_label)
                         if stream_tty:
                             output_stream.write("\r\033[K")
                             if bar:

@@ -129,7 +129,7 @@ def _validate_thresholds(value: object, label: str = "drift_thresholds") -> dict
         if field not in value:
             continue
         threshold = value[field]
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        if isinstance(threshold, bool) or not isinstance(threshold, int | float):
             raise ValueError(f"{label}.{field} must be numeric")
         try:
             finite = math.isfinite(float(threshold))
@@ -146,16 +146,14 @@ def _validate_thresholds(value: object, label: str = "drift_thresholds") -> dict
             if field not in dataset:
                 continue
             threshold = dataset[field]
-            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            if isinstance(threshold, bool) or not isinstance(threshold, int | float):
                 raise ValueError(f"{label}.dataset.{field} must be numeric")
             try:
                 finite = math.isfinite(float(threshold))
             except (OverflowError, TypeError, ValueError):
                 finite = False
             if not finite or threshold < 0:
-                raise ValueError(
-                    f"{label}.dataset.{field} must be finite and non-negative"
-                )
+                raise ValueError(f"{label}.dataset.{field} must be finite and non-negative")
     return validated
 
 
@@ -390,9 +388,7 @@ def _is_provider_selection_error(exc: Exception) -> bool:
     )
 
 
-def _run_one_quality_prompt(
-    repo: Path, task_id: str, prompt: str
-) -> dict[str, Any] | None:
+def _run_one_quality_prompt(repo: Path, task_id: str, prompt: str) -> dict[str, Any] | None:
     """Run one prompt against ``repo``; None when no provider is configured."""
     from cambium.oneshot import OneShotConfig, run_oneshot
 
@@ -547,13 +543,10 @@ def _validate_split_versions(
     for index, record in enumerate(records, start=1):
         record_schema = record.get("schema_version")
         record_dataset = record.get("dataset_version")
-        schema_matches = (
-            schema_version is None
-            or (
-                isinstance(record_schema, int)
-                and not isinstance(record_schema, bool)
-                and record_schema == schema_version
-            )
+        schema_matches = schema_version is None or (
+            isinstance(record_schema, int)
+            and not isinstance(record_schema, bool)
+            and record_schema == schema_version
         )
         dataset_matches = dataset_version is None or (
             isinstance(record_dataset, str) and record_dataset == dataset_version
@@ -589,7 +582,7 @@ async def _predict(manifest: ModuleManifest, records: list[dict]) -> list[Scored
                 f"module {manifest.package_name!r}: evaluate result {index} is not an object"
             )
         score = result.get("score")
-        if isinstance(score, bool) or not isinstance(score, (int, float)):
+        if isinstance(score, bool) or not isinstance(score, int | float):
             raise ModuleCLIError(
                 f"module {manifest.package_name!r}: evaluate result {index} has no numeric score"
             )
@@ -655,8 +648,7 @@ def canary_stats(raw_canaries: list[dict], canary_scores: list[float]) -> dict[s
     kinds = [
         r["canary_info"]["kind"]
         for r in raw_canaries
-        if isinstance(r.get("canary_info"), dict)
-        and isinstance(r["canary_info"].get("kind"), str)
+        if isinstance(r.get("canary_info"), dict) and isinstance(r["canary_info"].get("kind"), str)
     ]
     present = sorted(set(kinds))
     coverage = round(
@@ -671,9 +663,7 @@ def canary_stats(raw_canaries: list[dict], canary_scores: list[float]) -> dict[s
     }
 
 
-def _compute_split_digests(
-    datasets_dir: Path, meta: dict[str, Any] | None
-) -> dict[str, str]:
+def _compute_split_digests(datasets_dir: Path, meta: dict[str, Any] | None) -> dict[str, str]:
     """SHA-256 map of the exact split JSONL bytes, meta.json values as fallback."""
     recorded = meta.get("split_digests") if isinstance(meta, dict) else None
     digests: dict[str, str] = {}
@@ -736,9 +726,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
             metric[split] = score_examples(scored[split])
             if split == "canaries":
                 canary_scores = [
-                    example.score
-                    for example in scored[split]
-                    if _is_canary(example.record)
+                    example.score for example in scored[split] if _is_canary(example.record)
                 ]
     except (DatasetError, ModuleSplitError) as exc:
         pairs = datasets_dir / f"{pkg_name}_pairs.jsonl"
@@ -762,9 +750,7 @@ def build_module_report(pkg_name: str) -> dict[str, Any]:
         scored["combined"] = asyncio.run(_predict(manifest, raw["combined"]))
         metric["combined"] = score_examples(scored["combined"])
         canary_scores = [
-            example.score
-            for example in scored["combined"]
-            if _is_canary(example.record)
+            example.score for example in scored["combined"] if _is_canary(example.record)
         ]
 
     records = [r for split in SPLITS for r in raw.get(split, [])] or raw.get("combined", [])
@@ -868,9 +854,7 @@ def compare_against_anchor(
         return [version_regression]
 
     try:
-        anchor_thresholds = (
-            anchor["drift_thresholds"] if "drift_thresholds" in anchor else {}
-        )
+        anchor_thresholds = anchor["drift_thresholds"] if "drift_thresholds" in anchor else {}
         merged = _merged_thresholds(anchor_thresholds, thresholds)
     except ValueError as exc:
         return missing_split_regressions + [("drift_thresholds", str(exc))]
@@ -879,12 +863,8 @@ def compare_against_anchor(
     report_digests = report.get("split_digests")
     anchor_digests = anchor.get("split_digests")
     for split in SPLITS:
-        report_digest = (
-            report_digests.get(split) if isinstance(report_digests, Mapping) else None
-        )
-        anchor_digest = (
-            anchor_digests.get(split) if isinstance(anchor_digests, Mapping) else None
-        )
+        report_digest = report_digests.get(split) if isinstance(report_digests, Mapping) else None
+        anchor_digest = anchor_digests.get(split) if isinstance(anchor_digests, Mapping) else None
         if not isinstance(report_digest, str) or not isinstance(anchor_digest, str):
             regressions.append(
                 (
@@ -911,8 +891,7 @@ def compare_against_anchor(
             regressions.append(
                 (
                     f"metric.{split}.mean",
-                    f"{a_metric['mean']} -> {r_metric['mean']} "
-                    f"(drop {drop:.4f} > {metric_delta})",
+                    f"{a_metric['mean']} -> {r_metric['mean']} (drop {drop:.4f} > {metric_delta})",
                 )
             )
 
@@ -952,8 +931,7 @@ def compare_against_anchor(
         regressions.append(
             (
                 "canaries.failed",
-                f"{a_canaries.get('failed', 0)} + {canary_delta} -> "
-                f"{r_canaries.get('failed', 0)}",
+                f"{a_canaries.get('failed', 0)} + {canary_delta} -> {r_canaries.get('failed', 0)}",
             )
         )
 
@@ -1055,9 +1033,7 @@ class BenchPlugin:
                     self.regressions[report["module"]] = regressions
                     session.exitstatus = 1
 
-    def pytest_terminal_summary(
-        self, terminalreporter: Any, exitstatus: Any, config: Any
-    ) -> None:
+    def pytest_terminal_summary(self, terminalreporter: Any, exitstatus: Any, config: Any) -> None:
         if self.error:
             terminalreporter.section("cambium bench", yellow=True)
             terminalreporter.write_line(f"ERROR {self.error}", red=True)
@@ -1263,12 +1239,13 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
             ) from exc
         baseline_path = Path(root) / manifest.module_name / "baseline.json"
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or b"no diagnostic output").decode(
-                errors="replace"
-            ).strip()
+            detail = (
+                (result.stderr or result.stdout or b"no diagnostic output")
+                .decode(errors="replace")
+                .strip()
+            )
             raise ModuleBoundaryError(
-                f"module {pkg_name!r}: timing run exited {result.returncode}: "
-                f"{detail[:500]}"
+                f"module {pkg_name!r}: timing run exited {result.returncode}: {detail[:500]}"
             )
         if not baseline_path.is_file():
             raise ModuleBoundaryError(
@@ -1288,7 +1265,7 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
         measured = {
             str(nodeid): float(duration)
             for nodeid, duration in timings.items()
-            if isinstance(duration, (int, float)) and not isinstance(duration, bool)
+            if isinstance(duration, int | float) and not isinstance(duration, bool)
         }
         if not measured:
             raise ModuleBoundaryError(
@@ -1391,9 +1368,7 @@ def main(argv: list[str] | None = None) -> int:
     # committed baseline), and explicit CLI flags override these defaults.
     thresholds = _merged_thresholds(
         {
-            "wall_p90_ratio": args.bench_wall_ratio
-            if args.bench_wall_ratio is not None
-            else 3.0,
+            "wall_p90_ratio": args.bench_wall_ratio if args.bench_wall_ratio is not None else 3.0,
             "wall_p90_abs_slack": 0.5,
             "metric_mean_delta": args.bench_metric_delta
             if args.bench_metric_delta is not None

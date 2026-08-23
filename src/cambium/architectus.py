@@ -103,7 +103,7 @@ class ScriptedLLM:
             self._callable = next_actions
             return
 
-        if isinstance(next_actions, (str, bytes)):
+        if isinstance(next_actions, str | bytes):
             raise TypeError("next_actions must be action mappings, action lists, or a callable")
         scripted = list(next_actions)
         if not scripted:
@@ -113,7 +113,7 @@ class ScriptedLLM:
             return
 
         for index, wave in enumerate(scripted):
-            if isinstance(wave, (str, bytes)) or not isinstance(wave, Sequence):
+            if isinstance(wave, str | bytes) or not isinstance(wave, Sequence):
                 raise TypeError(f"scripted wave {index} must be a sequence of action mappings")
             if not all(isinstance(item, Mapping) for item in wave):
                 raise TypeError(f"scripted wave {index} must contain action mappings")
@@ -131,7 +131,7 @@ class ScriptedLLM:
             result = self._callable(state_copy, events_copy)
             if inspect.isawaitable(result):
                 result = await result
-            if isinstance(result, (str, bytes)) or not isinstance(result, Sequence):
+            if isinstance(result, str | bytes) or not isinstance(result, Sequence):
                 raise TypeError("LLM callable must return a sequence of action mappings")
             if not all(isinstance(item, Mapping) for item in result):
                 raise TypeError("LLM callable must return action mappings")
@@ -381,7 +381,7 @@ class ArchitectusCore:
         ]
         state = wave._tree_state(ready, blocked)
         proposed = await self._llm.decide(copy.deepcopy(state), copy.deepcopy(events))
-        if isinstance(proposed, (str, bytes)) or not isinstance(proposed, Sequence):
+        if isinstance(proposed, str | bytes) or not isinstance(proposed, Sequence):
             raise TypeError("LLM decide must return a sequence of action mappings")
 
         admitted_actions = wave._admit_actions(proposed, ready)
@@ -520,9 +520,7 @@ class ArchitectusCore:
         self._in_flight.difference_update(subtree)
         return subtree
 
-    def _restore_reset_retry_tasks(
-        self, durable_state: Mapping[str, Any] | None
-    ) -> set[str]:
+    def _restore_reset_retry_tasks(self, durable_state: Mapping[str, Any] | None) -> set[str]:
         """Restore reset consumption from the durable construction snapshot."""
         if durable_state is None:
             return set()
@@ -530,8 +528,8 @@ class ArchitectusCore:
             raise TypeError("durable_state must be a mapping")
 
         consumed = durable_state.get(_RESET_RETRY_CONSUMED_KEY, ())
-        if isinstance(consumed, (str, bytes)) or not isinstance(
-            consumed, (list, tuple, set, frozenset)
+        if isinstance(consumed, str | bytes) or not isinstance(
+            consumed, list | tuple | set | frozenset
         ):
             raise TypeError("durable_state.reset_retry_consumed must be a sequence")
 
@@ -552,9 +550,7 @@ class ArchitectusCore:
         explicitly_aborted: set[str] = set()
         for action in proposed_actions:
             if ActionKind(action["action"]) is ActionKind.ABORT_SUBTREE:
-                explicitly_aborted.update(
-                    self._subtree_task_ids(self._action_task_id(action))
-                )
+                explicitly_aborted.update(self._subtree_task_ids(self._action_task_id(action)))
         ready_ids = [node.task_id for node in ready]
         ready_rank = {task_id: index for index, task_id in enumerate(ready_ids)}
         capacity = max(self._max_width - len(self._in_flight), 0)
@@ -616,9 +612,7 @@ class ArchitectusCore:
         if len(accepted_spawn_ids) > capacity:
             accepted_spawn_ids = accepted_spawn_ids[:capacity]
             accepted_spawns = [
-                accepted
-                for accepted in accepted_spawns
-                if accepted[1] in accepted_spawn_ids
+                accepted for accepted in accepted_spawns if accepted[1] in accepted_spawn_ids
             ]
 
         spawn_assignments: dict[int, str] = {}
@@ -641,9 +635,7 @@ class ArchitectusCore:
                     spawn_task_id not in aborted_descendant_spawn_ids
                     and spawn_task_id not in suppressed_spawn_ids
                 ):
-                    actions.append(
-                        {"action": ActionKind.SPAWN.value, "task_id": spawn_task_id}
-                    )
+                    actions.append({"action": ActionKind.SPAWN.value, "task_id": spawn_task_id})
                 continue
             for index, action in non_spawn:
                 if index == raw_index:
@@ -655,9 +647,7 @@ class ArchitectusCore:
                 self._in_flight.add(task_id)
         return actions
 
-    def _validate_actions(
-        self, proposed: Sequence[Mapping[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _validate_actions(self, proposed: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Validate and normalize a complete action wave before applying it."""
         task_actions = {
             ActionKind.SPAWN,
@@ -798,9 +788,7 @@ class ArchitectusCore:
             envelope = self._finished.get(child_id)
             if envelope is not None:
                 # The stored object has already passed exact-key validation.
-                segments.append(
-                    {"kind": "child_envelope", "envelope": copy.deepcopy(envelope)}
-                )
+                segments.append({"kind": "child_envelope", "envelope": copy.deepcopy(envelope)})
 
         files = self._relevant_files(node, config)
         for path in files:
@@ -812,9 +800,11 @@ class ArchitectusCore:
         raw_files: Any = config.get("relevant_files", config.get("files", ()))
         if isinstance(raw_files, str):
             raw_files = [raw_files]
-        files: list[str] = [path for path in raw_files if isinstance(path, str)] if isinstance(
-            raw_files, Sequence
-        ) else []
+        files: list[str] = (
+            [path for path in raw_files if isinstance(path, str)]
+            if isinstance(raw_files, Sequence)
+            else []
+        )
         changed_files = config.get("files_changed", ())
         if isinstance(changed_files, str):
             changed_files = [changed_files]
@@ -836,9 +826,7 @@ class ArchitectusCore:
         return merged
 
     @staticmethod
-    def _static_prefix(
-        config: Mapping[str, Any], core_directive: str | None = None
-    ) -> list[str]:
+    def _static_prefix(config: Mapping[str, Any], core_directive: str | None = None) -> list[str]:
         static = config.get("static", {})
         static_config = static if isinstance(static, Mapping) else {}
         system = static_config.get(

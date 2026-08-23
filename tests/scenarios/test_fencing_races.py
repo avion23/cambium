@@ -16,9 +16,7 @@ from cambium.fencing import (
 
 
 @pytest.mark.parametrize("write_order", ("low-high", "high-low"))
-def test_next_and_write_generation_keep_the_highest_token(
-    tmp_path: Path, write_order: str
-) -> None:
+def test_next_and_write_generation_keep_the_highest_token(tmp_path: Path, write_order: str) -> None:
     worktree = tmp_path / write_order
     low = next_generation(worktree)
 
@@ -82,7 +80,5 @@ def test_cache_artifact_paths_do_not_follow_symlink_aliases(tmp_path: Path) -> N
         ("src/module.pyc.bak", False),
     ),
 )
-def test_cache_artifact_paths_use_exact_normalized_components(
-    path: str, expected: bool
-) -> None:
+def test_cache_artifact_paths_use_exact_normalized_components(path: str, expected: bool) -> None:
     assert is_cache_artifact_path(path) is expected

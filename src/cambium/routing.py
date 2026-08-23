@@ -147,36 +147,34 @@ class ProviderDebt:
     disable_reason: str | None = None
     disable_at: float | None = None
 
-    def record(
-        self, event: Mapping[str, Any], *, now: float | None = None
-    ) -> None:
+    def record(self, event: Mapping[str, Any], *, now: float | None = None) -> None:
         """Fold one usage_event payload into this provider's debt."""
         timestamp = time.time() if now is None else now
         self.requests += 1
         usage = event.get("usage")
         if isinstance(usage, Mapping):
             total = usage.get("total_tokens")
-            if isinstance(total, (int, float)) and not isinstance(total, bool):
+            if isinstance(total, int | float) and not isinstance(total, bool):
                 self.tokens += int(total)
             else:
                 inputs = usage.get("input_tokens", usage.get("prompt_tokens"))
                 outputs = usage.get("output_tokens", usage.get("completion_tokens"))
                 if (
-                    isinstance(inputs, (int, float))
+                    isinstance(inputs, int | float)
                     and not isinstance(inputs, bool)
-                    and isinstance(outputs, (int, float))
+                    and isinstance(outputs, int | float)
                     and not isinstance(outputs, bool)
                 ):
                     self.tokens += int(inputs) + int(outputs)
         cost = event.get("estimated_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        if isinstance(cost, int | float) and not isinstance(cost, bool):
             self.cost += float(cost)
         failure_reason = event.get("failure_reason")
         if isinstance(failure_reason, str) and failure_reason:
             self.failed_requests += 1
-            if failure_reason.startswith(
-                "config_error:"
-            ) or failure_reason.startswith("auth_error:"):
+            if failure_reason.startswith("config_error:") or failure_reason.startswith(
+                "auth_error:"
+            ):
                 # A quarantine-class failure: record the durable disable reason.
                 self.disable_reason = failure_reason
                 self.disable_at = timestamp
@@ -192,11 +190,7 @@ class ProviderDebt:
         if event.get("provider_cache_hit") is True:
             self.cache_hit_count += 1
         latency = event.get("latency_s")
-        if (
-            isinstance(latency, (int, float))
-            and not isinstance(latency, bool)
-            and latency >= 0
-        ):
+        if isinstance(latency, int | float) and not isinstance(latency, bool) and latency >= 0:
             self.latency_total_s += float(latency)
             self.latency_count += 1
         self.last_seen = timestamp
@@ -214,20 +208,20 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
         ("latency_count", int),
     ):
         value = entry.get(field)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0:
             setattr(debt, field, converter(value))
     cost = entry.get("cost")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+    if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0:
         debt.cost = float(cost)
     latency_total_s = entry.get("latency_total_s")
     if (
-        isinstance(latency_total_s, (int, float))
+        isinstance(latency_total_s, int | float)
         and not isinstance(latency_total_s, bool)
         and latency_total_s >= 0
     ):
         debt.latency_total_s = float(latency_total_s)
     last_seen = entry.get("last_seen")
-    if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
+    if isinstance(last_seen, int | float) and not isinstance(last_seen, bool):
         try:
             parsed_last_seen = float(last_seen)
         except (OverflowError, ValueError):
@@ -240,7 +234,7 @@ def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
         debt.disable_reason = disable_reason
     disable_at = entry.get("disable_at")
     if (
-        isinstance(disable_at, (int, float))
+        isinstance(disable_at, int | float)
         and not isinstance(disable_at, bool)
         and disable_at >= 0
     ):
@@ -348,16 +342,12 @@ class DebtStore:
             updates["disable_at"] = None
 
         last_seen = base.last_seen
-        if local.last_seen is not None and (
-            last_seen is None or local.last_seen > last_seen
-        ):
+        if local.last_seen is not None and (last_seen is None or local.last_seen > last_seen):
             last_seen = local.last_seen
         updates["last_seen"] = last_seen
         return replace(base, **updates)
 
-    def _merge_with_current(
-        self, current: Mapping[str, ProviderDebt]
-    ) -> dict[str, ProviderDebt]:
+    def _merge_with_current(self, current: Mapping[str, ProviderDebt]) -> dict[str, ProviderDebt]:
         merged: dict[str, ProviderDebt] = {}
         for name in set(current) | set(self._debts):
             on_disk = current.get(name)
@@ -475,9 +465,7 @@ class DebtStore:
                 )
                 temporary_path: Path | None = Path(temporary_name)
                 try:
-                    with os.fdopen(
-                        descriptor, "w", encoding="utf-8", newline="\n"
-                    ) as handle:
+                    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
                         handle.write(content)
                         handle.flush()
                         os.fsync(handle.fileno())
@@ -500,16 +488,14 @@ class DebtStore:
 
 def _window_allowance(provider: Any) -> float:
     allowance = getattr(provider, "token_window_allowance", 0.0) or 0.0
-    if isinstance(allowance, bool) or not isinstance(allowance, (int, float)):
+    if isinstance(allowance, bool) or not isinstance(allowance, int | float):
         return float(DEFAULT_TOKEN_WINDOW_ALLOWANCE)
     if allowance <= 0:
         return float(DEFAULT_TOKEN_WINDOW_ALLOWANCE)
     return float(allowance)
 
 
-def _normalized_utilization(
-    provider: Any, debt: Mapping[str, ProviderDebt] | None
-) -> float:
+def _normalized_utilization(provider: Any, debt: Mapping[str, ProviderDebt] | None) -> float:
     current = debt.get(provider.name) if debt is not None else None
     tokens = current.tokens if current is not None else 0
     return tokens / _window_allowance(provider)
@@ -569,9 +555,7 @@ def resolve_assignment(
     return ProviderAssignment(provider=provider_name, model=model, tier=tier)
 
 
-def _assignment_tier(
-    providers: Sequence[Any], provider_name: str, pinned_tier: str | None
-) -> str:
+def _assignment_tier(providers: Sequence[Any], provider_name: str, pinned_tier: str | None) -> str:
     """The call tier for an assigned provider (mirrors worker routing)."""
     if isinstance(pinned_tier, str) and pinned_tier:
         return pinned_tier
@@ -734,7 +718,7 @@ def context_window_satisfies(provider: Any, required_context_tokens: int) -> boo
     capacity = getattr(provider, "context_window", 0) or 0
     return (
         not isinstance(capacity, bool)
-        and isinstance(capacity, (int, float))
+        and isinstance(capacity, int | float)
         and capacity >= required_context_tokens
     )
 
@@ -750,10 +734,9 @@ def provider_satisfies_request(provider: Any, request: RoutingRequest) -> bool:
         return False
     lease = request.lease
     if lease is not None:
-        if (
-            getattr(provider, "name", None) != getattr(lease, "provider", None)
-            or getattr(provider, "model", None) != getattr(lease, "model", None)
-        ):
+        if getattr(provider, "name", None) != getattr(lease, "provider", None) or getattr(
+            provider, "model", None
+        ) != getattr(lease, "model", None):
             return False
     elif (
         request.model
@@ -796,9 +779,7 @@ def validate_requirements(requirements: Mapping[str, Any] | None) -> dict[str, A
     unknown = [key for key in requirements if key not in _REQUIREMENT_KEYS]
     if unknown:
         unknown.sort(key=repr)
-        raise ValueError(
-            "unknown requirement key(s): " + ", ".join(map(repr, unknown))
-        )
+        raise ValueError("unknown requirement key(s): " + ", ".join(map(repr, unknown)))
     if "quality" in requirements:
         quality = requirements["quality"]
         if not isinstance(quality, str) or quality not in ("high", "normal"):
@@ -894,9 +875,7 @@ def score_providers(
                 continue
             if lane is not None:
                 current = debt.get(provider.name) if debt is not None else None
-                retry_after_count = (
-                    current.retry_after_count if current is not None else 0
-                )
+                retry_after_count = current.retry_after_count if current is not None else 0
                 if lane.in_flight >= lane.effective_in_flight_cap(retry_after_count):
                     continue
         eligible.append(provider)
@@ -920,10 +899,8 @@ def score_providers(
         weights=DEFAULT_WEIGHTS,
     )
     return [
-        (provider.name, models[provider.name], float(rank))
-        for rank, provider in enumerate(ordered)
+        (provider.name, models[provider.name], float(rank)) for rank, provider in enumerate(ordered)
     ]
-
 
 
 __all__ = [

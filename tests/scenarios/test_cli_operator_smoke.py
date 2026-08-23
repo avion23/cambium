@@ -34,9 +34,7 @@ UNIFIED_COMMANDS = (
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
     """Run the CLI as a subprocess with the repository source on its path."""
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        filter(None, [SRC_DIR, env.get("PYTHONPATH")])
-    )
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return subprocess.run(
         [*CLI, *args],
         cwd=REPO_ROOT,
@@ -175,6 +173,4 @@ def test_version_prints_a_version_string() -> None:
     result = _run("version")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert re.fullmatch(
-        r"\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?", result.stdout.strip()
-    )
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?", result.stdout.strip())

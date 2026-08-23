@@ -84,9 +84,7 @@ def _plan(session_dir: Path) -> dict[str, list[dict[str, str]]]:
 
 
 def test_cli_warm_pool_default_is_zero() -> None:
-    args = cli._build_parser().parse_args(
-        ["supervisor", "--session-dir", "/tmp/session", "--demo"]
-    )
+    args = cli._build_parser().parse_args(["supervisor", "--session-dir", "/tmp/session", "--demo"])
 
     assert args.warm_pool_size == 0
 
@@ -103,16 +101,19 @@ def test_cli_supervisor_forwards_explicit_warm_pool_size(
         lambda argv=None: cast(Any, calls.append(list(argv or []))) or 0,
     )
 
-    assert cli.main(
-        [
-            "supervisor",
-            "--session-dir",
-            str(tmp_path),
-            "--demo",
-            "--warm-pool-size",
-            "3",
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                "supervisor",
+                "--session-dir",
+                str(tmp_path),
+                "--demo",
+                "--warm-pool-size",
+                "3",
+            ]
+        )
+        == 0
+    )
     assert calls == [
         [
             "--session-dir",
@@ -221,14 +222,17 @@ def test_warm_pool_environment_is_ignored_by_current_entry_points(
 
     monkeypatch.setattr(supervisor, "_validate_task_repositories", lambda specs: None)
     monkeypatch.setattr(supervisor, "_amain_plan", fake_amain)
-    assert supervisor_main(
-        [
-            "--session-dir",
-            str(module_session),
-            "--task-spec",
-            str(spec_path),
-        ]
-    ) == 0
+    assert (
+        supervisor_main(
+            [
+                "--session-dir",
+                str(module_session),
+                "--task-spec",
+                str(spec_path),
+            ]
+        )
+        == 0
+    )
     assert module_sizes == [0]
 
     # Direct callers use the same literal default and do not read the env.

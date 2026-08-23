@@ -154,7 +154,7 @@ def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _finite_non_negative(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     try:
         number = float(value)
@@ -457,9 +457,7 @@ class ObservabilityState:
             if type(epoch) is int and epoch >= 0:
                 agent.epoch = max(agent.epoch, epoch)
 
-            provider = _string(payload.get("provider")) or _string(
-                payload.get("assigned_provider")
-            )
+            provider = _string(payload.get("provider")) or _string(payload.get("assigned_provider"))
             model = _string(payload.get("model"))
             if provider is not None:
                 agent.provider = provider
@@ -510,9 +508,7 @@ class ObservabilityState:
                 if isinstance(cache_key, Mapping):
                     prefix_bytes = cache_key.get("prefix_bytes")
                     if type(prefix_bytes) is int and prefix_bytes >= 0:
-                        agent.active_context_bytes = max(
-                            agent.active_context_bytes, prefix_bytes
-                        )
+                        agent.active_context_bytes = max(agent.active_context_bytes, prefix_bytes)
                     message_count = cache_key.get("message_count")
                     if type(message_count) is int and message_count >= 0:
                         agent.active_context_messages = max(
@@ -591,18 +587,12 @@ class ObservabilityState:
             )
 
         checkpoint_metrics = _read_checkpoint_context(
-            Path(session_dir).expanduser().resolve()
-            if session_dir is not None
-            else None,
+            Path(session_dir).expanduser().resolve() if session_dir is not None else None,
             context_agent.checkpoint_ref if context_agent is not None else None,
         )
         stable_head_bytes = 0
-        summary_trunk_bytes = (
-            context_agent.summary_trunk_bytes if context_agent is not None else 0
-        )
-        summary_segments = (
-            context_agent.summary_segments if context_agent is not None else 0
-        )
+        summary_trunk_bytes = context_agent.summary_trunk_bytes if context_agent is not None else 0
+        summary_segments = context_agent.summary_segments if context_agent is not None else 0
         raw_tail_bytes = context_agent.raw_tail_bytes if context_agent is not None else 0
         active_context_messages = (
             context_agent.active_context_messages if context_agent is not None else 0
@@ -623,14 +613,10 @@ class ObservabilityState:
         active_context_bytes = (
             context_agent.active_context_bytes if context_agent is not None else 0
         )
-        active_context_bytes = max(
-            active_context_bytes, summary_trunk_bytes + raw_tail_bytes
-        )
+        active_context_bytes = max(active_context_bytes, summary_trunk_bytes + raw_tail_bytes)
         context = ContextSnapshot(
             task_id=context_agent.task_id if context_agent is not None else None,
-            checkpoint_ref=(
-                context_agent.checkpoint_ref if context_agent is not None else None
-            ),
+            checkpoint_ref=(context_agent.checkpoint_ref if context_agent is not None else None),
             epoch=context_agent.epoch if context_agent is not None else 0,
             exact_prompt_tokens=(
                 context_agent.exact_prompt_tokens if context_agent is not None else None
@@ -666,16 +652,10 @@ class ObservabilityState:
         return SessionSnapshot(
             session_status=self._session_status,
             agents=tuple(snapshots),
-            active_agents=sum(
-                snapshot.state in _ACTIVE_STATES for snapshot in snapshots
-            ),
+            active_agents=sum(snapshot.state in _ACTIVE_STATES for snapshot in snapshots),
             queued_agents=sum(snapshot.state == "queued" for snapshot in snapshots),
-            succeeded_agents=sum(
-                snapshot.state == "succeeded" for snapshot in snapshots
-            ),
-            failed_agents=sum(
-                snapshot.state in {"failed", "cancelled"} for snapshot in snapshots
-            ),
+            succeeded_agents=sum(snapshot.state == "succeeded" for snapshot in snapshots),
+            failed_agents=sum(snapshot.state in {"failed", "cancelled"} for snapshot in snapshots),
             calls=calls,
             summary_calls=summary_calls,
             input_tokens=input_tokens,

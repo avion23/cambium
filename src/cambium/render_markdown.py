@@ -33,9 +33,9 @@ _C0_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x0d\x0e-\x1f\x80-\x9f]")
 _HEADING = re.compile(r"^(#{1,4}) (.*)$")
 _FENCE_MARKER = re.compile(r"^```")
 _INLINE = re.compile(
-    r"`([^`\n]+)`"                      # code span
-    r"|\*\*(\S(?:[^*\n]*\S)?)\*\*"      # bold
-    r"|\*(\S(?:[^*\n]*\S)?)\*"          # italic
+    r"`([^`\n]+)`"  # code span
+    r"|\*\*(\S(?:[^*\n]*\S)?)\*\*"  # bold
+    r"|\*(\S(?:[^*\n]*\S)?)\*"  # italic
 )
 
 

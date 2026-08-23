@@ -35,8 +35,15 @@ TEST_RESOURCE_THRESHOLDS = {
 }
 
 _STRICT_ENVELOPE_KEYS = {
-    "parent_task_id", "unified_diff", "diff_truncated", "summary",
-    "metric_score", "metric_breakdown", "commits", "files_changed", "status",
+    "parent_task_id",
+    "unified_diff",
+    "diff_truncated",
+    "summary",
+    "metric_score",
+    "metric_breakdown",
+    "commits",
+    "files_changed",
+    "status",
 }
 
 
@@ -50,7 +57,8 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "initial"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
@@ -58,9 +66,17 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
 
 
 def _task(
-    session_dir: Path, repo: Path, base: str, task_id: str, *,
-    worktree: str, branch: str, target_file: str, marker: str,
-    worker: str = "cambium.worker", **extra,
+    session_dir: Path,
+    repo: Path,
+    base: str,
+    task_id: str,
+    *,
+    worktree: str,
+    branch: str,
+    target_file: str,
+    marker: str,
+    worker: str = "cambium.worker",
+    **extra,
 ) -> dict:
     spec = {
         "task_id": task_id,
@@ -96,7 +112,9 @@ def _child_proposal(spec: dict) -> dict:
 def _show(repo: Path, ref: str, path: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "show", f"{ref}:{path}"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
 
 
@@ -162,27 +180,68 @@ def _write_child_dump_worker(dump_worker: Path) -> None:
 def test_dc1_rejected_revisions_spawn_nothing(tmp_path) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n",
-                             "c.txt": "file c\n", "d.txt": "file d\n"})
+    base = _make_repo(
+        repo, {"a.txt": "file a\n", "b.txt": "file b\n", "c.txt": "file c\n", "d.txt": "file d\n"}
+    )
 
-    c4 = _task(session_dir, repo, base, "c4", worktree="wt-c4", branch="wt-c4",
-               target_file="d.txt", marker="// c4")
-    c3 = _task(session_dir, repo, base, "c3", worktree="wt-c3", branch="wt-c3",
-               target_file="d.txt", marker="// c3",
-               proposed_children=[_child_proposal(c4)])
-    c2 = _task(session_dir, repo, base, "c2", worktree="wt-c2", branch="wt-c2",
-               target_file="c.txt", marker="// c2",
-               proposed_children=[_child_proposal(c3)])
-    c1 = _task(session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-               target_file="b.txt", marker="// c1",
-               proposed_children=[_child_proposal(c2)])
+    c4 = _task(
+        session_dir,
+        repo,
+        base,
+        "c4",
+        worktree="wt-c4",
+        branch="wt-c4",
+        target_file="d.txt",
+        marker="// c4",
+    )
+    c3 = _task(
+        session_dir,
+        repo,
+        base,
+        "c3",
+        worktree="wt-c3",
+        branch="wt-c3",
+        target_file="d.txt",
+        marker="// c3",
+        proposed_children=[_child_proposal(c4)],
+    )
+    c2 = _task(
+        session_dir,
+        repo,
+        base,
+        "c2",
+        worktree="wt-c2",
+        branch="wt-c2",
+        target_file="c.txt",
+        marker="// c2",
+        proposed_children=[_child_proposal(c3)],
+    )
+    c1 = _task(
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// c1",
+        proposed_children=[_child_proposal(c2)],
+    )
     duplicate = dict(c1, task_id="t-root")  # spec shape only; rejected as dup
-    root = _task(session_dir, repo, base, "t-root", worktree="wt-root",
-                 branch="wt-root", target_file="a.txt", marker="// root",
-                 proposed_children=[
-                     _child_proposal(duplicate),
-                     _child_proposal(c1),
-                 ])
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// root",
+        proposed_children=[
+            _child_proposal(duplicate),
+            _child_proposal(c1),
+        ],
+    )
     # c1 runs from the same base as the root but must not touch the root's
     # file: disjoint files keep every admitted merge conflict-free.
 
@@ -214,8 +273,12 @@ def test_dc1_rejected_revisions_spawn_nothing(tmp_path) -> None:
     )
     assert refs.returncode != 0
     # The valid chain merged: every admitted marker is on main.
-    for name, marker in (("a.txt", "// root"), ("b.txt", "// c1"),
-                         ("c.txt", "// c2"), ("d.txt", "// c3")):
+    for name, marker in (
+        ("a.txt", "// root"),
+        ("b.txt", "// c1"),
+        ("c.txt", "// c2"),
+        ("d.txt", "// c3"),
+    ):
         assert marker in _show(repo, "main", name)
 
 
@@ -237,15 +300,28 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
     monkeypatch.setenv("CONTEXT_DUMP_PATH", str(context_dump))
 
     child = _task(
-        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-        target_file="b.txt", marker="// child-marker", worker=str(dump_worker),
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+        worker=str(dump_worker),
         provider_env_keys=["FAKE_MODE", "CONTEXT_DUMP_PATH"],
     )
     # The root declares CONTEXT_DUMP_PATH itself so the child may inherit it:
     # children inherit, never exceed, the parent's provider_env_keys.
     root = _task(
-        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-        target_file="a.txt", marker="// parent-marker",
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
         provider_env_keys=["FAKE_MODE", "CONTEXT_DUMP_PATH"],
         proposed_children=[_child_proposal(child)],
     )
@@ -278,8 +354,14 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
     assert envelope["commits"]
     assert envelope["files_changed"] == ["a.txt"]
     serialized = json.dumps(payload)
-    for forbidden in ("transcript", "scratchpad", "trajectory", "chain_of_thought",
-                      "sibling", "parent_transcript"):
+    for forbidden in (
+        "transcript",
+        "scratchpad",
+        "trajectory",
+        "chain_of_thought",
+        "sibling",
+        "parent_transcript",
+    ):
         assert forbidden not in serialized
 
     # --- child upward envelope: strict key set, reaches only its parent ---
@@ -312,12 +394,25 @@ def test_dc3_failed_child_emits_child_failed_for_parent(tmp_path) -> None:
     # write_marker=false forces the child's worker to report failed, so the
     # child ends with a recorded "failed" result.
     child = _task(
-        session_dir, repo, base, "c1", worktree="wt-c1", branch="wt-c1",
-        target_file="b.txt", marker="// child-marker", write_marker=False,
+        session_dir,
+        repo,
+        base,
+        "c1",
+        worktree="wt-c1",
+        branch="wt-c1",
+        target_file="b.txt",
+        marker="// child-marker",
+        write_marker=False,
     )
     root = _task(
-        session_dir, repo, base, "t-root", worktree="wt-root", branch="wt-root",
-        target_file="a.txt", marker="// parent-marker",
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
         proposed_children=[_child_proposal(child)],
     )
 

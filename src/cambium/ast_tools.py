@@ -68,9 +68,7 @@ class _SourceIndex:
     def from_source(cls, source: str) -> _SourceIndex:
         encoded = source.encode("utf-8")
         line_starts = [0]
-        line_starts.extend(
-            offset + 1 for offset, byte in enumerate(encoded) if byte == ord("\n")
-        )
+        line_starts.extend(offset + 1 for offset, byte in enumerate(encoded) if byte == ord("\n"))
         return cls(source, encoded, tuple(line_starts))
 
     def position(self, byte_offset: int) -> tuple[int, int]:
@@ -228,9 +226,7 @@ def _find_definitions_tree(source: str, path: str = "") -> list[dict[str, Any]]:
         if definition_node is None:
             continue
         definition = _tree_definition(index, definition_node)
-        definitions.append(
-            _definition_result(index, definition, first_line=True, path=path)
-        )
+        definitions.append(_definition_result(index, definition, first_line=True, path=path))
     return definitions
 
 
@@ -265,7 +261,7 @@ def _extract_signature_tree(source: str, name: str) -> dict[str, Any] | None:
 def _ast_kind(node: _stdlib_ast.AST) -> str | None:
     if isinstance(node, _stdlib_ast.ClassDef):
         return "class"
-    if isinstance(node, (_stdlib_ast.FunctionDef, _stdlib_ast.AsyncFunctionDef)):
+    if isinstance(node, _stdlib_ast.FunctionDef | _stdlib_ast.AsyncFunctionDef):
         return "function"
     return None
 
@@ -315,9 +311,7 @@ def _find_definitions_stdlib(source: str, path: str = "") -> list[dict[str, Any]
         if _ast_kind(node) is None:
             continue
         definition = _ast_definition(index, node)
-        definitions.append(
-            _definition_result(index, definition, first_line=True, path=path)
-        )
+        definitions.append(_definition_result(index, definition, first_line=True, path=path))
     return definitions
 
 

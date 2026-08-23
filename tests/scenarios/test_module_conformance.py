@@ -154,10 +154,7 @@ def test_offline_child_denies_absolute_network_client_path() -> None:
 @pytest.mark.slow
 @pytest.mark.parametrize("client", ["curl", "wget", "nc", "ssh"])
 def test_offline_child_denies_shell_network_client(client: str) -> None:
-    probe = (
-        "import subprocess; "
-        f"subprocess.run({client + ' --version'!r}, shell=True, check=False)"
-    )
+    probe = f"import subprocess; subprocess.run({client + ' --version'!r}, shell=True, check=False)"
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
             [sys.executable, "-c", probe],
@@ -235,8 +232,7 @@ def test_offline_child_denies_shell_network_client_realpath_with_whitespace_path
 def test_offline_guard_does_not_require_strace(monkeypatch) -> None:
     monkeypatch.setenv("PATH", "/nonexistent")
     probe = (
-        "import subprocess, sys; "
-        "subprocess.run([sys.executable, '-c', 'print(42)'], check=True)"
+        "import subprocess, sys; subprocess.run([sys.executable, '-c', 'print(42)'], check=True)"
     )
     with module_conformance.module_offline_environment() as env:
         result = subprocess.run(
@@ -318,8 +314,7 @@ def test_offline_child_rejects_python_flag_after_option_argument_with_executable
         listener.listen()
         port = listener.getsockname()[1]
         socket_probe = (
-            "import socket; "
-            f"socket.create_connection(('127.0.0.1', {port}), timeout=2).close()"
+            f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=2).close()"
         )
         probe = (
             "import subprocess, sys; "

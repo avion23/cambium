@@ -128,8 +128,7 @@ class AuthDocument:
     def as_mapping(self) -> dict[str, dict[str, str]]:
         """Return the schema mapping for serialization or an atomic update."""
         return {
-            credential.provider: {"api_key": credential.api_key}
-            for credential in self.providers
+            credential.provider: {"api_key": credential.api_key} for credential in self.providers
         }
 
 
@@ -293,8 +292,7 @@ def serialize_document(document: AuthDocument) -> bytes:
         "providers": document.as_mapping(),
     }
     return (
-        json.dumps(raw, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        .encode("utf-8")
+        json.dumps(raw, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
         + b"\n"
     )
 
@@ -355,9 +353,7 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
                 except FileExistsError:
                     pass
                 except OSError as exc:
-                    raise AuthStoreError(
-                        "could not create the auth store directory"
-                    ) from exc
+                    raise AuthStoreError("could not create the auth store directory") from exc
             try:
                 child_fd = os.open(name, flags, dir_fd=parent_fd)
             except FileNotFoundError:
@@ -384,9 +380,7 @@ def _open_directory(path: Path, *, create: bool) -> int | None:
                 or current.st_dev != opened_stat.st_dev
                 or current.st_ino != opened_stat.st_ino
             ):
-                raise AuthStoreError(
-                    "auth store directory path changed during validation"
-                )
+                raise AuthStoreError("auth store directory path changed during validation")
 
         opened.pop()
         return parent_fd
@@ -558,15 +552,30 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
         directory_fd = _open_directory(directory, create=False)
     except AuthError as exc:
         return StoreMetadata(
-            path=target, directory_exists=True, directory_secure=False,
-            directory_uid=directory_uid, directory_mode=directory_mode, file_exists=False,
-            file_secure=False, file_uid=None, file_mode=None, file_nlink=None, issue=str(exc),
+            path=target,
+            directory_exists=True,
+            directory_secure=False,
+            directory_uid=directory_uid,
+            directory_mode=directory_mode,
+            file_exists=False,
+            file_secure=False,
+            file_uid=None,
+            file_mode=None,
+            file_nlink=None,
+            issue=str(exc),
         )
     if directory_fd is None:
         return StoreMetadata(
-            path=target, directory_exists=False, directory_secure=False,
-            directory_uid=None, directory_mode=None, file_exists=False,
-            file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
+            path=target,
+            directory_exists=False,
+            directory_secure=False,
+            directory_uid=None,
+            directory_mode=None,
+            file_exists=False,
+            file_secure=False,
+            file_uid=None,
+            file_mode=None,
+            file_nlink=None,
         )
 
     directory_stat = os.fstat(directory_fd)
@@ -578,15 +587,20 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
             file_fd = _open_secure_file(directory_fd, target.name)
         except FileNotFoundError:
             return StoreMetadata(
-                path=target, directory_exists=True, directory_secure=True,
-                directory_uid=directory_uid, directory_mode=directory_mode, file_exists=False,
-                file_secure=False, file_uid=None, file_mode=None, file_nlink=None,
+                path=target,
+                directory_exists=True,
+                directory_secure=True,
+                directory_uid=directory_uid,
+                directory_mode=directory_mode,
+                file_exists=False,
+                file_secure=False,
+                file_uid=None,
+                file_mode=None,
+                file_nlink=None,
             )
         except AuthError as exc:
             try:
-                file_stat = os.stat(
-                    target.name, dir_fd=directory_fd, follow_symlinks=False
-                )
+                file_stat = os.stat(target.name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError:
                 file_stat = None
             if file_stat is not None:
@@ -594,10 +608,17 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
                 file_mode = stat.S_IMODE(file_stat.st_mode)
                 file_nlink = file_stat.st_nlink
             return StoreMetadata(
-                path=target, directory_exists=True, directory_secure=True,
-                directory_uid=directory_uid, directory_mode=directory_mode,
-                file_exists=file_stat is not None, file_secure=False, file_uid=file_uid,
-                file_mode=file_mode, file_nlink=file_nlink, issue=str(exc),
+                path=target,
+                directory_exists=True,
+                directory_secure=True,
+                directory_uid=directory_uid,
+                directory_mode=directory_mode,
+                file_exists=file_stat is not None,
+                file_secure=False,
+                file_uid=file_uid,
+                file_mode=file_mode,
+                file_nlink=file_nlink,
+                issue=str(exc),
             )
         try:
             file_stat = os.fstat(file_fd)
@@ -605,9 +626,15 @@ def inspect_metadata(path: Path | None = None) -> StoreMetadata:
             file_mode = stat.S_IMODE(file_stat.st_mode)
             file_nlink = file_stat.st_nlink
             return StoreMetadata(
-                path=target, directory_exists=True, directory_secure=True,
-                directory_uid=directory_uid, directory_mode=directory_mode, file_exists=True,
-                file_secure=True, file_uid=file_uid, file_mode=file_mode,
+                path=target,
+                directory_exists=True,
+                directory_secure=True,
+                directory_uid=directory_uid,
+                directory_mode=directory_mode,
+                file_exists=True,
+                file_secure=True,
+                file_uid=file_uid,
+                file_mode=file_mode,
                 file_nlink=file_nlink,
             )
         finally:
@@ -719,8 +746,7 @@ def build_launch_environment(
         credentials = document.providers
     elif isinstance(document, Mapping):
         credentials = tuple(
-            ProviderCredential(provider, api_key)
-            for provider, api_key in sorted(document.items())
+            ProviderCredential(provider, api_key) for provider, api_key in sorted(document.items())
         )
         document = AuthDocument(AUTH_VERSION, credentials)
     else:

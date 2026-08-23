@@ -81,13 +81,13 @@ class QuotaWindowSpec:
         reserve = value.get("reserve_fraction", 0.0)
         if not isinstance(name, str):
             raise ValueError("quota window name must be a string")
-        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
             raise ValueError("quota window duration_s must be a number")
         if isinstance(tokens, bool) or not isinstance(tokens, int):
             raise ValueError("quota window token_allowance must be an integer")
         if isinstance(requests, bool) or not isinstance(requests, int):
             raise ValueError("quota window request_allowance must be an integer")
-        if isinstance(reserve, bool) or not isinstance(reserve, (int, float)):
+        if isinstance(reserve, bool) or not isinstance(reserve, int | float):
             raise ValueError("quota window reserve_fraction must be a number")
         return cls(name, float(duration), tokens, requests, float(reserve))
 
@@ -412,13 +412,9 @@ class QuotaLedger:
             raise ValueError("remaining_requests must be non-negative")
         if not 0 <= reserve_fraction < 1:
             raise ValueError("reserve_fraction must be in [0, 1)")
-        used_tokens = (
-            0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
-        )
+        used_tokens = 0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
         used_requests = (
-            0
-            if remaining_requests is None
-            else max(0, allowance_requests - remaining_requests)
+            0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)
         )
         connection = self._connect()
         try:

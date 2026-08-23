@@ -105,7 +105,7 @@ def _make_sqlite_store(path) -> None:
 def _damage_payload(path, seq: int) -> None:
     conn = sqlite3.connect(path)
     try:
-        conn.execute("UPDATE events SET payload = ? WHERE seq = ?", ("{\"broken\":", seq))
+        conn.execute("UPDATE events SET payload = ? WHERE seq = ?", ('{"broken":', seq))
         conn.commit()
     finally:
         conn.close()

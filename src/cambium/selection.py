@@ -38,7 +38,7 @@ def _field(entry: Any, name: str, default: Any) -> Any:
 
 
 def _number(value: Any, default: float = 0.0) -> float:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, int | float) and not isinstance(value, bool):
         return max(0.0, float(value))
     return default
 
@@ -65,7 +65,7 @@ def quality_score(
     last_seen = _field(entry, "last_seen", None)
     if (
         isinstance(last_seen, bool)
-        or not isinstance(last_seen, (int, float))
+        or not isinstance(last_seen, int | float)
         or not math.isfinite(float(last_seen))
         or now - float(last_seen) > weights.stale_after_s
     ):
@@ -129,17 +129,13 @@ def order_candidates[T: Candidate](
             end += 1
         measured_start = start
         while measured_start < end:
-            score = _quality_entry(
-                ordered[measured_start], debt, now=now, weights=weights
-            )
+            score = _quality_entry(ordered[measured_start], debt, now=now, weights=weights)
             if score is None:
                 measured_start += 1
                 continue
             measured_end = measured_start + 1
             while measured_end < end:
-                next_score = _quality_entry(
-                    ordered[measured_end], debt, now=now, weights=weights
-                )
+                next_score = _quality_entry(ordered[measured_end], debt, now=now, weights=weights)
                 if next_score is None:
                     break
                 measured_end += 1

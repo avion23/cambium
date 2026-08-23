@@ -113,9 +113,7 @@ def test_transcript_candidates_load_only_approved_records(tmp_path: Path) -> Non
 
 def test_cli_exposes_monitor_and_optimizer_commands() -> None:
     monitor = cli._build_parser().parse_args(["monitor", "--once"])
-    optimizer = cli._build_parser().parse_args(
-        ["optimize", "should_decompose", "--dry-run"]
-    )
+    optimizer = cli._build_parser().parse_args(["optimize", "should_decompose", "--dry-run"])
     assert monitor.command == "monitor"
     assert optimizer.command == "optimize"
     assert optimizer.module_name == "should_decompose"

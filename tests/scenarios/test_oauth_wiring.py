@@ -481,8 +481,7 @@ def test_cli_device_flow_stores_session_and_keeps_code_off_stdout(
     assert fake_issuer.fake.exchange_count == 1
     # The verification URL and user code reached only the injected TTY writer.
     assert any(
-        f"{fake_issuer.issuer}/codex/device" in line and USER_CODE in line
-        for line in tty_lines
+        f"{fake_issuer.issuer}/codex/device" in line and USER_CODE in line for line in tty_lines
     )
     # stdout/stderr carry the outcome line only — never a token or code.
     captured = capsys.readouterr()
@@ -512,6 +511,7 @@ def test_cli_device_flow_defaults_to_pinned_public_client(
     )
     assert store.read_provider("codex") is not None
     assert fake_issuer.fake.exchange_count == 1
+
 
 def test_cli_oauth_parser_rejects_conflicting_subcommands(capsys) -> None:
     with pytest.raises(SystemExit) as raised:
@@ -548,9 +548,7 @@ def test_doctor_oauth_live_refreshable_and_reachable(
     assert "issuer HTTP 200" in detail
 
 
-def test_doctor_oauth_live_rejected_grant_fails(
-    tmp_path: Path, fake_issuer: _FakeIssuer
-) -> None:
+def test_doctor_oauth_live_rejected_grant_fails(tmp_path: Path, fake_issuer: _FakeIssuer) -> None:
     config = _codex_config(tmp_path / "providers.json")
     store = OAuthStore(_store_path(tmp_path))
     store.save_provider(_doc(expires_at=time.time() - 100))
@@ -569,9 +567,7 @@ def test_doctor_oauth_live_rejected_grant_fails(
     assert "codex=refresh-rejected" in detail
 
 
-def test_doctor_oauth_live_missing_session_warns(
-    tmp_path: Path, fake_issuer: _FakeIssuer
-) -> None:
+def test_doctor_oauth_live_missing_session_warns(tmp_path: Path, fake_issuer: _FakeIssuer) -> None:
     config = _codex_config(tmp_path / "providers.json")
     store = OAuthStore(_store_path(tmp_path))  # empty
 
@@ -607,6 +603,7 @@ def test_doctor_oauth_live_without_override_uses_public_client(
     assert status is doctor.Status.PASS
     assert "codex=refreshable" in detail
     assert fake_issuer.fake.refresh_count == 1
+
 
 def test_doctor_oauth_live_skips_without_codex_providers(tmp_path: Path) -> None:
     config = tmp_path / "providers.json"
@@ -707,9 +704,7 @@ def test_provider_router_fails_closed_without_oauth_env(tmp_path: Path) -> None:
         os.environ["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
         os.environ.pop("CAMBIUM_OAUTH_ACCESS_CODEX", None)
         try:
-            worker._provider_router(
-                {"diffundo": {"tier": "strong", "model": "gpt-5.6-luna"}}
-            )
+            worker._provider_router({"diffundo": {"tier": "strong", "model": "gpt-5.6-luna"}})
         except ValueError as exc:
             assert "CAMBIUM_OAUTH_ACCESS_CODEX" in str(exc)
         else:

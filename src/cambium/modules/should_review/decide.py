@@ -68,7 +68,20 @@ CONCURRENCY_TERMS = frozenset(
 )
 
 FILE_EXTENSIONS = (
-    "py", "rs", "ts", "js", "go", "toml", "json", "yaml", "yml", "md", "sh", "sql", "txt", "cfg",
+    "py",
+    "rs",
+    "ts",
+    "js",
+    "go",
+    "toml",
+    "json",
+    "yaml",
+    "yml",
+    "md",
+    "sh",
+    "sql",
+    "txt",
+    "cfg",
 )
 
 _REFUSAL_RE = re.compile(
@@ -151,9 +164,7 @@ def should_review(task: str, context: str = "") -> ReviewOutput:
         reasons.append("TODO/FIXME/HACK marker left in result")
 
     stake_hits = [
-        term
-        for term in SENSITIVE_TERMS | DESTRUCTIVE_TERMS | CONCURRENCY_TERMS
-        if term in lowered
+        term for term in SENSITIVE_TERMS | DESTRUCTIVE_TERMS | CONCURRENCY_TERMS if term in lowered
     ]
     if len(stake_hits) >= 4:
         evidence += 2
@@ -169,8 +180,7 @@ def should_review(task: str, context: str = "") -> ReviewOutput:
         reasons.append("task names files but result references none")
 
     if len(task_files) >= 3 and (
-        _NO_TESTS_RE.search(lowered)
-        or not _TEST_RE.search(f"{lowered} {lowered_context}")
+        _NO_TESTS_RE.search(lowered) or not _TEST_RE.search(f"{lowered} {lowered_context}")
     ):
         evidence += 1
         reasons.append("large diff without tests")

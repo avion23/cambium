@@ -79,9 +79,7 @@ def test_unified_supervisor_forwards_module_input_options(
 
     monkeypatch.setattr(supervisor, "main", fake_main)
 
-    assert cli.main(
-        ["supervisor", "--session-dir", str(tmp_path), option, "input.json"]
-    ) == 17
+    assert cli.main(["supervisor", "--session-dir", str(tmp_path), option, "input.json"]) == 17
     assert calls == [["--session-dir", str(tmp_path), option, "input.json"]]
 
 
@@ -95,17 +93,20 @@ def test_unified_supervisor_forwards_demo_and_warm_pool(monkeypatch, tmp_path: P
         lambda argv=None: calls.append(list(argv or [])) or 0,
     )
 
-    assert cli.main(
-        [
-            "supervisor",
-            "--session-dir",
-            str(tmp_path),
-            "--demo",
-            "--warm-pool-size",
-            "2",
-            "--conversations",
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                "supervisor",
+                "--session-dir",
+                str(tmp_path),
+                "--demo",
+                "--warm-pool-size",
+                "2",
+                "--conversations",
+            ]
+        )
+        == 0
+    )
     assert calls == [
         [
             "--session-dir",

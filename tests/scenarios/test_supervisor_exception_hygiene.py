@@ -111,32 +111,26 @@ def _caught_names(handler: ast.ExceptHandler) -> set[str]:
     nodes = [handler.type]
     if isinstance(handler.type, ast.Tuple):
         nodes = list(handler.type.elts)
-    return {
-        node.id
-        for node in nodes
-        if isinstance(node, ast.Name)
-    }
+    return {node.id for node in nodes if isinstance(node, ast.Name)}
 
 
 def test_target_handlers_are_explicit() -> None:
     source = Path(inspect.getfile(supervisor_module)).read_text(encoding="utf-8")
     tree = ast.parse(source)
     runtime = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "_Runtime"
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_Runtime"
     )
     methods = {
         node.name: node
         for node in runtime.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     }
     emit_handlers = _target_handlers(methods["emit"])
     drive = methods["_drive_generation"]
     cancel_handlers = [
         handler
         for node in ast.walk(drive)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         and node.name == "_cancel_and_kill"
         for handler in _target_handlers(node)
     ]

@@ -187,9 +187,7 @@ def test_symlink_hardlink_and_directory_mode_are_rejected(tmp_path: Path) -> Non
         store.read()
 
 
-def test_foreign_file_owner_is_rejected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_foreign_file_owner_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _store_path(tmp_path)
     store = auth.AuthStore(path)
     store.set_provider("openai", SECRET)
@@ -247,9 +245,7 @@ def test_read_rejects_symlinked_intermediate_component(tmp_path: Path) -> None:
     outside_directory.mkdir(parents=True, mode=0o700)
     outside_path = outside_directory / "auth.json"
     outside_path.write_bytes(
-        auth.serialize_document(
-            auth.AuthDocument(1, (auth.ProviderCredential("openai", SECRET),))
-        )
+        auth.serialize_document(auth.AuthDocument(1, (auth.ProviderCredential("openai", SECRET),)))
     )
     outside_path.chmod(0o600)
     (home / ".local").symlink_to(outside, target_is_directory=True)

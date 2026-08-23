@@ -105,9 +105,7 @@ def _provider_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _split_provider_model(
-    provider: str | None, model: str | None
-) -> tuple[str | None, str | None]:
+def _split_provider_model(provider: str | None, model: str | None) -> tuple[str | None, str | None]:
     """Resolve combined ``--provider NAME:MODEL`` / ``--model NAME/MODEL`` CLI
     forms into separate provider and model values.
 
@@ -136,17 +134,9 @@ def _split_provider_model(
             model_name = model
             if not model_name:
                 raise ValueError("--model must be MODEL or PROVIDER/MODEL")
-    if (
-        provider_model is not None
-        and model_name is not None
-        and provider_model != model_name
-    ):
+    if provider_model is not None and model_name is not None and provider_model != model_name:
         raise ValueError("--provider and --model specify conflicting models")
-    if (
-        provider_name is not None
-        and model_provider is not None
-        and provider_name != model_provider
-    ):
+    if provider_name is not None and model_provider is not None and provider_name != model_provider:
         raise ValueError("--provider and --model specify conflicting providers")
     return (
         provider_name if provider_name is not None else model_provider,
@@ -471,7 +461,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="suppress live event updates and print only completed results",
     )
 
-
     monitor = commands.add_parser(
         "monitor",
         help="attach the operator dashboard to a durable session",
@@ -491,9 +480,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     quota.add_argument("--db", type=Path, help=argparse.SUPPRESS)
     quota_commands = quota.add_subparsers(dest="quota_command", required=True)
-    quota_status = quota_commands.add_parser(
-        "status", help="show known provider quota windows"
-    )
+    quota_status = quota_commands.add_parser("status", help="show known provider quota windows")
     quota_status.add_argument("--provider")
     quota_status.add_argument("--json", action="store_true")
     quota_observe = quota_commands.add_parser(
@@ -515,9 +502,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Run the reviewed-data DSPy optimizer and write one artifact set.",
     )
     optimize_command.add_argument("module_name", metavar="MODULE")
-    optimize_command.add_argument(
-        "--optimizer", choices=("zero", "bootstrap"), default="zero"
-    )
+    optimize_command.add_argument("--optimizer", choices=("zero", "bootstrap"), default="zero")
     optimize_command.add_argument("--budget-usd", type=float, default=2.0)
     optimize_command.add_argument("--seed", type=int, default=0)
     optimize_command.add_argument("--tier", default="fast")
@@ -761,17 +746,14 @@ def _run_auth_oauth_logout(store: OAuthStore, provider: str) -> int:
         return 1
     if removed:
         print(
-            f"removed local oauth session for provider {provider} "
-            "(the issuer session is unchanged)"
+            f"removed local oauth session for provider {provider} (the issuer session is unchanged)"
         )
     else:
         print(f"provider {provider} has no stored oauth session")
     return 0
 
 
-def _run_auth_oauth_import(
-    store: OAuthStore, path: str | Path | None = None
-) -> int:
+def _run_auth_oauth_import(store: OAuthStore, path: str | Path | None = None) -> int:
     try:
         doc = import_codex_cli_session(path)
         store.save_provider(doc)
@@ -822,11 +804,7 @@ def _run_auth_oauth_device(
         store=store,
     )
     try:
-        flow.run(
-            on_code=lambda url, code: writer(
-                f"Open {url} and enter the code {code}" + "\n"
-            )
-        )
+        flow.run(on_code=lambda url, code: writer(f"Open {url} and enter the code {code}" + "\n"))
     except KeyboardInterrupt:
         print("cambium auth: device flow canceled", file=sys.stderr)
         return 130
@@ -841,6 +819,7 @@ def _run_auth_oauth_device(
         return 1
     print(f"stored oauth session for provider {provider}")
     return 0
+
 
 def _run_auth_oauth(args: argparse.Namespace) -> int:
     if args.oauth_command == "import-codex-cli":
@@ -877,8 +856,7 @@ def _run_bench(args: argparse.Namespace) -> int:
         if exc.name in {"pytest", "tree_sitter", "tree_sitter_python"}:
             missing = exc.name.replace("_", "-")
             print(
-                f"cambium bench: {missing} is not installed; "
-                "run `pip install cambium[test]`",
+                f"cambium bench: {missing} is not installed; run `pip install cambium[test]`",
                 file=sys.stderr,
             )
             return 1
@@ -906,8 +884,7 @@ def _run_module_test(args: argparse.Namespace) -> int:
         if exc.name in {"pytest", "tree_sitter", "tree_sitter_python"}:
             missing = exc.name.replace("_", "-")
             print(
-                f"cambium module-test: {missing} is not installed; "
-                "run `pip install cambium[test]`",
+                f"cambium module-test: {missing} is not installed; run `pip install cambium[test]`",
                 file=sys.stderr,
             )
             return 1
@@ -1043,12 +1020,8 @@ async def _run_repl(args: argparse.Namespace) -> int:
         model=model,
         auto=args.auto,
         max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
-        max_tokens=cast(
-            int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)
-        ),
-        max_turns=cast(
-            int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)
-        ),
+        max_tokens=cast(int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)),
+        max_turns=cast(int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)),
     )
     return await repl.run_repl(config)
 
@@ -1071,12 +1044,8 @@ async def _run_tui(args: argparse.Namespace) -> int:
         model=model,
         auto=args.auto,
         max_wall_s=_budget_or_default(args.max_wall_s, oneshot.DEFAULT_WALL_BUDGET_S),
-        max_tokens=cast(
-            int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)
-        ),
-        max_turns=cast(
-            int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)
-        ),
+        max_tokens=cast(int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)),
+        max_turns=cast(int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)),
     )
     return await tui.run_tui(config, quiet=getattr(args, "quiet", False))
 
@@ -1119,8 +1088,7 @@ def _run_optimize(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         if exc.name == "dspy":
             print(
-                "cambium optimize: DSPy is not installed; "
-                "run `uv sync --extra dspy --python 3.14`",
+                "cambium optimize: DSPy is not installed; run `uv sync --extra dspy --python 3.14`",
                 file=sys.stderr,
             )
             return 1
@@ -1141,9 +1109,7 @@ def _run_optimize(args: argparse.Namespace) -> int:
     if args.include_transcript_candidates:
         delegated.append("--include-transcript-candidates")
     if args.transcript_candidates is not None:
-        delegated.extend(
-            ["--transcript-candidates", str(args.transcript_candidates)]
-        )
+        delegated.extend(["--transcript-candidates", str(args.transcript_candidates)])
     return optimize.main(delegated)
 
 
@@ -1197,8 +1163,7 @@ def _run_session(args: argparse.Namespace) -> int:
         path = candidate if candidate.is_absolute() else root / candidate
         if not (path / ".cambium" / "events.db").is_file():
             print(
-                f"cambium session: event log is missing: "
-                f"{path / '.cambium' / 'events.db'}",
+                f"cambium session: event log is missing: {path / '.cambium' / 'events.db'}",
                 file=sys.stderr,
             )
             return 1
@@ -1305,9 +1270,7 @@ def _live_architectus_llm(
     else:
         env_name = selected.api_key_env
         if not os.environ.get(env_name):
-            raise ValueError(
-                "API-key Architectus calls require a credential-source interface"
-            )
+            raise ValueError("API-key Architectus calls require a credential-source interface")
 
     diffundo = Diffundo(providers, **options)
     lm = CambiumLM(diffundo, selected_tier, model=selected.model)
@@ -1319,9 +1282,7 @@ async def _architectus_waves(core: Any, waves: int) -> list[list[dict[str, Any]]
     results: list[list[dict[str, Any]]] = []
     for _ in range(waves):
         actions = await core.step([{"kind": "tick"}])
-        if not isinstance(actions, list) or not all(
-            isinstance(action, dict) for action in actions
-        ):
+        if not isinstance(actions, list) or not all(isinstance(action, dict) for action in actions):
             raise ValueError("decision actions are not a JSON array of action objects")
         results.append(actions)
     return results
@@ -1332,10 +1293,7 @@ async def _run_architectus(args: argparse.Namespace) -> int:
     from .architectus import ArchitectusCore, ScriptedLLM
     from .tasktree import build_tree
 
-    task = (
-        args.task
-        or "Add a docstring to the build_tree function in src/cambium/tasktree.py"
-    )
+    task = args.task or "Add a docstring to the build_tree function in src/cambium/tasktree.py"
     tree = build_tree(
         {
             "tasks": [

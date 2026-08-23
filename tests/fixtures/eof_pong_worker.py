@@ -25,15 +25,28 @@ def main() -> int:
         return 1
     task_id = init["task_id"]
     generation = init.get("generation", 1)
-    send({"type": "ready", "request_id": init["request_id"],
-          "task_id": task_id, "pid": os.getpid(),
-          "generation": generation, "proto": 1})
+    send(
+        {
+            "type": "ready",
+            "request_id": init["request_id"],
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": generation,
+            "proto": 1,
+        }
+    )
     if not sys.stdin.readline():
         return 1
     # This pong belongs to init, not to the ping the supervisor will issue
     # after EOF. It is deliberately stale.
-    send({"type": "pong", "request_id": init["request_id"],
-          "task_id": task_id, "generation": generation})
+    send(
+        {
+            "type": "pong",
+            "request_id": init["request_id"],
+            "task_id": task_id,
+            "generation": generation,
+        }
+    )
     os.close(1)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:

@@ -101,7 +101,7 @@ class JlenClient:
             raise JlenError("jlens score service returned a non-object result")
         commitment = result.get("commitment")
         if (
-            isinstance(commitment, (int, float))
+            isinstance(commitment, int | float)
             and not isinstance(commitment, bool)
             and math.isfinite(float(commitment))
         ):
@@ -116,7 +116,7 @@ class JlenClient:
             rank = info.get("expected_rank")
             if (
                 isinstance(rank, bool)
-                or not isinstance(rank, (int, float))
+                or not isinstance(rank, int | float)
                 or not math.isfinite(float(rank))
             ):
                 continue

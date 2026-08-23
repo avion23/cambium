@@ -108,10 +108,12 @@ def test_concurrent_async_appends_are_serialized(tmp_path) -> None:
     store = _open(tmp_path / "conversations.db")
 
     async def append_many() -> None:
-        await asyncio.gather(*(
-            asyncio.to_thread(store.append, "node", "assistant", str(index))
-            for index in range(100)
-        ))
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(store.append, "node", "assistant", str(index))
+                for index in range(100)
+            )
+        )
 
     try:
         asyncio.run(append_many())

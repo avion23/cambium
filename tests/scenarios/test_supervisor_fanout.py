@@ -67,14 +67,25 @@ def _make_repo(repo: Path, files: dict[str, str]) -> str:
 def _show(repo: Path, ref: str, path: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "show", f"{ref}:{path}"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
 
 
 def _task(
-    session_dir: Path, repo: Path, base: str, task_id: str, *,
-    worktree: str, branch: str, target_file: str, marker: str, gate: str = "",
-    worker: str = WORKER, **extra,
+    session_dir: Path,
+    repo: Path,
+    base: str,
+    task_id: str,
+    *,
+    worktree: str,
+    branch: str,
+    target_file: str,
+    marker: str,
+    gate: str = "",
+    worker: str = WORKER,
+    **extra,
 ) -> dict:
     spec = {
         "task_id": task_id,
@@ -107,7 +118,9 @@ def _kinds(events: list[dict], kind: str) -> list[dict]:
 def _worktree_paths(repo: Path) -> list[Path]:
     output = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     return [
         Path(line.removeprefix("worktree ")).resolve()
@@ -117,10 +130,13 @@ def _worktree_paths(repo: Path) -> list[Path]:
 
 
 def _branch_exists(repo: Path, branch: str) -> bool:
-    return subprocess.run(
-        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        check=False,
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -136,12 +152,39 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
 
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-a", gate="grep -q '// cambium-a' a.txt"),
-            _task(session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
-                  target_file="b.txt", marker="// cambium-b", gate="grep -q '// cambium-b' b.txt"),
-            _task(session_dir, repo, base, "t-c", worktree="wt-c", branch="wt-c",
-                  target_file="c.txt", marker="// cambium-c", gate="grep -q '// cambium-c' c.txt"),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-a",
+                gate="grep -q '// cambium-a' a.txt",
+            ),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                target_file="b.txt",
+                marker="// cambium-b",
+                gate="grep -q '// cambium-b' b.txt",
+            ),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-c",
+                worktree="wt-c",
+                branch="wt-c",
+                target_file="c.txt",
+                marker="// cambium-c",
+                gate="grep -q '// cambium-c' c.txt",
+            ),
         ]
     }
 
@@ -152,8 +195,11 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert all(r.status == "succeeded" for r in result.results)
     assert all(r.merge_sha is not None for r in result.results)
 
-    for name, marker in (("a.txt", "// cambium-a"), ("b.txt", "// cambium-b"),
-                         ("c.txt", "// cambium-c")):
+    for name, marker in (
+        ("a.txt", "// cambium-a"),
+        ("b.txt", "// cambium-b"),
+        ("c.txt", "// cambium-c"),
+    ):
         assert marker in _show(repo, "main", name)
 
     assert _worktree_paths(repo) == [repo.resolve()]
@@ -183,6 +229,8 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
     assert sum(kind == "worktree_pruned" for kind, _task_id in terminal) == 3
     assert not any(kind == "worktree_cleanup_deferred" for kind, _task_id in terminal)
     assert ("session_ended", None) in terminal
+
+
 @pytest.mark.slow
 def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
     """max_concurrent_tasks=1: the second task spawns only after the first ends."""
@@ -191,10 +239,26 @@ def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-a"),
-            _task(session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
-                  target_file="b.txt", marker="// cambium-b"),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-a",
+            ),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                target_file="b.txt",
+                marker="// cambium-b",
+            ),
         ]
     }
 
@@ -211,11 +275,11 @@ def test_concurrency_cap_one_serializes_tasks(tmp_path) -> None:
     # release, which happens before merge/prune).
     first, second = spawned[0], spawned[1]
     first_worker_end = max(
-        e["seq"] for e in events
+        e["seq"]
+        for e in events
         if e["task_id"] == first["task_id"] and e["kind"] in ("result", "exit")
     )
     assert second["seq"] > first_worker_end
-
 
 
 @pytest.mark.slow
@@ -226,13 +290,25 @@ def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
-                target_file="a.txt", marker="// cambium-a",
+                session_dir,
+                repo,
+                base,
+                "t-a",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-a",
                 gate="grep -q '// cambium-a' a.txt",
             ),
             _task(
-                session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
-                target_file="b.txt", marker="// cambium-b",
+                session_dir,
+                repo,
+                base,
+                "t-b",
+                worktree="wt-b",
+                branch="wt-b",
+                target_file="b.txt",
+                marker="// cambium-b",
                 gate="grep -q '// cambium-b' b.txt",
             ),
         ]
@@ -278,7 +354,8 @@ def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None
 @pytest.mark.slow
 def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> None:
     worker = tmp_path / "branch-lock-worker.py"
-    worker.write_text(textwrap.dedent("""
+    worker.write_text(
+        textwrap.dedent("""
         import json
         import subprocess
         import sys
@@ -318,7 +395,9 @@ def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> N
             "generation": init.get("generation", 1),
             "reason": "done",
         })
-    """), encoding="utf-8")
+    """),
+        encoding="utf-8",
+    )
 
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -328,8 +407,14 @@ def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> N
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, "t-branch-lock", worktree="wt-branch-lock",
-                branch=branch, target_file="a.txt", marker="// cambium-locked",
+                session_dir,
+                repo,
+                base,
+                "t-branch-lock",
+                worktree="wt-branch-lock",
+                branch=branch,
+                target_file="a.txt",
+                marker="// cambium-locked",
                 worker=str(worker),
             )
         ]
@@ -363,7 +448,8 @@ def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> N
 @pytest.mark.slow
 def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) -> None:
     worker = tmp_path / "dirty-worker.py"
-    worker.write_text(textwrap.dedent("""
+    worker.write_text(
+        textwrap.dedent("""
         import json
         import subprocess
         import sys
@@ -404,7 +490,9 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
             "generation": init.get("generation", 1),
             "reason": "done",
         })
-    """), encoding="utf-8")
+    """),
+        encoding="utf-8",
+    )
 
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -415,8 +503,15 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, "t-dirty-worker", worktree=branch, branch=branch,
-                target_file="a.txt", marker="// cambium-dirty", worker=str(worker),
+                session_dir,
+                repo,
+                base,
+                "t-dirty-worker",
+                worktree=branch,
+                branch=branch,
+                target_file="a.txt",
+                marker="// cambium-dirty",
+                worker=str(worker),
             )
         ]
     }
@@ -459,7 +554,8 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
 @pytest.mark.slow
 def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
     worker = tmp_path / "wrong-ready-worker.py"
-    worker.write_text(textwrap.dedent("""
+    worker.write_text(
+        textwrap.dedent("""
         import json
         import subprocess
         import sys
@@ -497,7 +593,9 @@ def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
             "generation": generation,
             "reason": "done",
         })
-    """), encoding="utf-8")
+    """),
+        encoding="utf-8",
+    )
 
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -549,9 +647,15 @@ def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, task_id, worktree="wt-observer-cancel",
-                branch="wt-observer-cancel", target_file="a.txt",
-                marker="// observer-cancel", gate="grep -q '// observer-cancel' a.txt",
+                session_dir,
+                repo,
+                base,
+                task_id,
+                worktree="wt-observer-cancel",
+                branch="wt-observer-cancel",
+                target_file="a.txt",
+                marker="// observer-cancel",
+                gate="grep -q '// observer-cancel' a.txt",
             )
         ]
     }
@@ -564,7 +668,9 @@ def test_merge_committed_observer_cancellation_is_nonfatal(tmp_path) -> None:
     events = read_events(session_dir)
     main_tip = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     assert result.exit_code == 0
@@ -586,8 +692,14 @@ def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) ->
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, "t-external-cancel", worktree="wt-external-cancel",
-                branch="wt-external-cancel", target_file="a.txt", marker="// must-not-merge",
+                session_dir,
+                repo,
+                base,
+                "t-external-cancel",
+                worktree="wt-external-cancel",
+                branch="wt-external-cancel",
+                target_file="a.txt",
+                marker="// must-not-merge",
                 gate="grep -q '// must-not-merge' a.txt",
             )
         ]
@@ -612,7 +724,9 @@ def test_external_cancellation_during_critical_observer_aborts_plan(tmp_path) ->
     events = read_events(session_dir)
     main_tip = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     assert main_tip == base
@@ -638,9 +752,18 @@ def test_t2_never_ready_restarts_to_cap_no_merge(tmp_path, monkeypatch) -> None:
 
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-hang", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-hang",
-                  gate="grep -q '// cambium-hang' a.txt", max_restarts=3),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-hang",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-hang",
+                gate="grep -q '// cambium-hang' a.txt",
+                max_restarts=3,
+            ),
         ]
     }
 
@@ -680,9 +803,18 @@ def test_t3_crash_mid_edit_recovered_worktree(tmp_path, monkeypatch) -> None:
 
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-crash", worktree="wt-crash", branch="wt-crash",
-                  target_file="hello.txt", marker="// cambium-recovered",
-                  gate="grep -q '// cambium-recovered' hello.txt", worker=CRASH_WORKER),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-crash",
+                worktree="wt-crash",
+                branch="wt-crash",
+                target_file="hello.txt",
+                marker="// cambium-recovered",
+                gate="grep -q '// cambium-recovered' hello.txt",
+                worker=CRASH_WORKER,
+            ),
         ]
     }
 
@@ -717,10 +849,28 @@ def test_t4_same_file_race_one_wins_loser_merge_failed(tmp_path, monkeypatch) ->
 
     # Both branches start from the fixed base. Whichever merge publishes first
     # wins; the other rebase conflicts on the same line.
-    a = _task(session_dir, repo, base, "t-a", worktree="wt-a", branch="wt-a",
-              target_file="hello.txt", marker="// cambium-a", gate="true")
-    b = _task(session_dir, repo, base, "t-b", worktree="wt-b", branch="wt-b",
-              target_file="hello.txt", marker="// cambium-b", gate="true")
+    a = _task(
+        session_dir,
+        repo,
+        base,
+        "t-a",
+        worktree="wt-a",
+        branch="wt-a",
+        target_file="hello.txt",
+        marker="// cambium-a",
+        gate="true",
+    )
+    b = _task(
+        session_dir,
+        repo,
+        base,
+        "t-b",
+        worktree="wt-b",
+        branch="wt-b",
+        target_file="hello.txt",
+        marker="// cambium-b",
+        gate="true",
+    )
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [a, b]}))
 
@@ -757,9 +907,17 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
 
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-garbage", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-garbage",
-                  gate="grep -q '// cambium-garbage' a.txt"),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-garbage",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-garbage",
+                gate="grep -q '// cambium-garbage' a.txt",
+            ),
         ]
     }
 
@@ -789,9 +947,18 @@ def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
 
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-noise", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-noise",
-                  gate="grep -q '// cambium-noise' a.txt", max_restarts=2),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-noise",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-noise",
+                gate="grep -q '// cambium-noise' a.txt",
+                max_restarts=2,
+            ),
         ]
     }
 
@@ -818,9 +985,17 @@ def test_t5_valid_non_object_stdout_tolerated(tmp_path, monkeypatch) -> None:
 
     plan = {
         "tasks": [
-            _task(session_dir, repo, base, "t-valid-nobj", worktree="wt-a", branch="wt-a",
-                  target_file="a.txt", marker="// cambium-valid-nobj",
-                  gate="grep -q '// cambium-valid-nobj' a.txt"),
+            _task(
+                session_dir,
+                repo,
+                base,
+                "t-valid-nobj",
+                worktree="wt-a",
+                branch="wt-a",
+                target_file="a.txt",
+                marker="// cambium-valid-nobj",
+                gate="grep -q '// cambium-valid-nobj' a.txt",
+            ),
         ]
     }
 
@@ -855,11 +1030,11 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
                 "repo": str(repo),
                 "worktree_path": str(session_dir / "wt-slow"),
                 "branch": "wt-slow",
-                    "worker": WORKER,
-                    "gate": "true",
-                    "provider_env_keys": ["FAKE_MODE"],
-                    "resource_thresholds": TEST_RESOURCE_THRESHOLDS,
-                }
+                "worker": WORKER,
+                "gate": "true",
+                "provider_env_keys": ["FAKE_MODE"],
+                "resource_thresholds": TEST_RESOURCE_THRESHOLDS,
+            }
         ]
     }
     plan_path = tmp_path / "plan.json"
@@ -869,9 +1044,19 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
     env["FAKE_MODE"] = "noready"
     env["PYTHONPATH"] = str(ROOT / "src")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "cambium.supervisor",
-         "--plan", str(plan_path), "--session-dir", str(session_dir)],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        [
+            sys.executable,
+            "-m",
+            "cambium.supervisor",
+            "--plan",
+            str(plan_path),
+            "--session-dir",
+            str(session_dir),
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     try:
         events_db = session_dir / ".cambium" / "events.db"
@@ -881,10 +1066,13 @@ def test_t6_sigterm_midrun_clean_shutdown_store_integrity(tmp_path) -> None:
             if events_db.is_file():
                 try:
                     with sqlite3.connect(events_db) as connection:
-                        init_seen = connection.execute(
-                            "SELECT 1 FROM events WHERE kind = ? AND task_id = ? LIMIT 1",
-                            ("init", "t-slow"),
-                        ).fetchone() is not None
+                        init_seen = (
+                            connection.execute(
+                                "SELECT 1 FROM events WHERE kind = ? AND task_id = ? LIMIT 1",
+                                ("init", "t-slow"),
+                            ).fetchone()
+                            is not None
+                        )
                 except sqlite3.OperationalError:
                     pass
             if init_seen:
@@ -920,13 +1108,15 @@ def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) ->
     worker_tree = session_dir / "wt-gap"
     subprocess.run(
         ["git", "-C", str(repo), "worktree", "add", "-b", "wt-gap", str(worker_tree), base],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     (worker_tree / "precrash.txt").write_text("committed\n")
     subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
     subprocess.run(
         ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
     staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
@@ -939,8 +1129,14 @@ def test_restart_reconciles_publish_gap_and_preserves_dirty_staging(tmp_path) ->
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, task_id, worktree="wt-gap", branch="wt-gap",
-                target_file="a.txt", marker="// after-restart",
+                session_dir,
+                repo,
+                base,
+                task_id,
+                worktree="wt-gap",
+                branch="wt-gap",
+                target_file="a.txt",
+                marker="// after-restart",
                 gate="grep -q '// after-restart' a.txt",
             )
         ]
@@ -978,13 +1174,15 @@ def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(
     worker_tree = session_dir / "wt-clean-gap"
     subprocess.run(
         ["git", "-C", str(repo), "worktree", "add", "-b", "wt-clean-gap", str(worker_tree), base],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     (worker_tree / "precrash.txt").write_text("committed\n")
     subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
     subprocess.run(
         ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
     staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
@@ -995,8 +1193,14 @@ def test_restart_reconciles_publish_gap_with_clean_staging_without_rerun(
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, task_id, worktree="wt-clean-gap", branch="wt-clean-gap",
-                target_file="a.txt", marker="// must-not-rerun",
+                session_dir,
+                repo,
+                base,
+                task_id,
+                worktree="wt-clean-gap",
+                branch="wt-clean-gap",
+                target_file="a.txt",
+                marker="// must-not-rerun",
                 gate="grep -q '// must-not-rerun' a.txt",
                 provider_env_keys=list(credentials),
             )
@@ -1026,15 +1230,26 @@ def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
     task_id = "t-reconcile-observer-failure"
     worker_tree = session_dir / "wt-reconcile-observer-failure"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-reconcile-observer-failure",
-         str(worker_tree), base],
-        check=True, capture_output=True,
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt-reconcile-observer-failure",
+            str(worker_tree),
+            base,
+        ],
+        check=True,
+        capture_output=True,
     )
     (worker_tree / "precrash.txt").write_text("committed\n")
     subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
     subprocess.run(
         ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
     staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
@@ -1044,9 +1259,15 @@ def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, task_id, worktree="wt-reconcile-observer-failure",
-                branch="wt-reconcile-observer-failure", target_file="a.txt",
-                marker="// must-not-run", gate="grep -q '// must-not-run' a.txt",
+                session_dir,
+                repo,
+                base,
+                task_id,
+                worktree="wt-reconcile-observer-failure",
+                branch="wt-reconcile-observer-failure",
+                target_file="a.txt",
+                marker="// must-not-run",
+                gate="grep -q '// must-not-run' a.txt",
             )
         ]
     }
@@ -1065,7 +1286,8 @@ def test_merge_reconciled_observer_failure_is_fatal(tmp_path) -> None:
 
 @pytest.mark.slow
 def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ) -> None:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -1073,15 +1295,26 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     task_id = "t-lost-reconciliation"
     worker_tree = session_dir / "wt-lost-reconciliation"
     subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "wt-lost-reconciliation",
-         str(worker_tree), base],
-        check=True, capture_output=True,
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt-lost-reconciliation",
+            str(worker_tree),
+            base,
+        ],
+        check=True,
+        capture_output=True,
     )
     (worker_tree / "precrash.txt").write_text("committed\n")
     subprocess.run(["git", "-C", str(worker_tree), "add", "precrash.txt"], check=True)
     subprocess.run(
         ["git", "-C", str(worker_tree), "commit", "-m", "precrash"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
     staging = session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
@@ -1092,9 +1325,15 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, task_id, worktree="wt-lost-reconciliation",
-                branch="wt-lost-reconciliation", target_file="a.txt",
-                marker="// must-never-run", gate="grep -q '// must-never-run' a.txt",
+                session_dir,
+                repo,
+                base,
+                task_id,
+                worktree="wt-lost-reconciliation",
+                branch="wt-lost-reconciliation",
+                target_file="a.txt",
+                marker="// must-never-run",
+                gate="grep -q '// must-never-run' a.txt",
             )
         ]
     }
@@ -1117,16 +1356,15 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     quarantined = _kinds(first_events, "merge_staging_quarantined")
     assert len(quarantined) == 1
     assert committed[0]["seq"] < quarantined[0]["seq"]
-    artifact = (
-        session_dir / ".cambium" / "quarantine"
-        / quarantined[0]["payload"]["quarantine_id"]
-    )
+    artifact = session_dir / ".cambium" / "quarantine" / quarantined[0]["payload"]["quarantine_id"]
     assert (artifact / "recovery-evidence.bin").read_bytes() == b"preserve this evidence"
     expired = time.time_ns() - 8 * 24 * 60 * 60 * 1_000_000_000
     os.utime(artifact, ns=(expired, expired))
     commits_after_recovery = subprocess.run(
         ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     second = asyncio.run(run_plan(session_dir, plan))
@@ -1136,10 +1374,15 @@ def test_restart_after_lost_reconciliation_event_does_not_execute_twice(
     assert second.results[0].merge_sha == staged
     assert not _kinds(events, "spawned")
     assert len(_kinds(events, "merge_committed")) == 1
-    assert subprocess.run(
-        ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip() == commits_after_recovery
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--count", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == commits_after_recovery
+    )
 
 
 @pytest.mark.slow
@@ -1159,8 +1402,14 @@ def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypat
     plan = {
         "tasks": [
             _task(
-                session_dir, repo, base, task_id, worktree="wt-store", branch="wt-store",
-                target_file="a.txt", marker="// published-before-store-failure",
+                session_dir,
+                repo,
+                base,
+                task_id,
+                worktree="wt-store",
+                branch="wt-store",
+                target_file="a.txt",
+                marker="// published-before-store-failure",
                 gate="grep -q '// published-before-store-failure' a.txt",
             )
         ]
@@ -1180,9 +1429,17 @@ def test_merge_committed_persistence_failure_retains_staging(tmp_path, monkeypat
     assert (staging / "a.txt").read_text().endswith("// published-before-store-failure\n")
     assert _show(repo, "main", "a.txt").endswith("// published-before-store-failure\n")
     refs = subprocess.run(
-        ["git", "-C", str(repo), "for-each-ref", "--format=%(refname)",
-         f"refs/cambium/staging/{task_key}-*"],
-        check=True, capture_output=True, text=True,
+        [
+            "git",
+            "-C",
+            str(repo),
+            "for-each-ref",
+            "--format=%(refname)",
+            f"refs/cambium/staging/{task_key}-*",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.splitlines()
     assert len(refs) == 1
 
@@ -1262,9 +1519,7 @@ def test_resource_preflight_is_opt_in_and_skipped_without_thresholds(tmp_path, m
         resource_thresholds=None,
     )
 
-    result = asyncio.run(
-        run_plan(session_dir, {"tasks": [task]}, resource_thresholds=None)
-    )
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}, resource_thresholds=None))
 
     assert result.exit_code == 0
     assert result.results[0].exit_code == 0

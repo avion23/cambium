@@ -102,9 +102,7 @@ def test_tier_restricts_priority_order(tmp_path: Path) -> None:
         ],
     )
 
-    selected = select_provider(
-        load_providers(path), tier=diffundo.ProviderTier.FAST
-    )
+    selected = select_provider(load_providers(path), tier=diffundo.ProviderTier.FAST)
 
     assert selected.name == "llama"
 

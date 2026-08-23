@@ -47,12 +47,18 @@ def test_measure_worker_coldstart_runs_and_emits_parseable_summary(tmp_path) -> 
     clone = tmp_path / "clone"
 
     cmd = [
-        sys.executable, str(SCRIPT),
-        "--repo", str(clone),
-        "--source", str(source),
-        "--tasks", "1",
-        "--python", sys.executable,
-        "--pythonpath", str(ROOT / "src"),
+        sys.executable,
+        str(SCRIPT),
+        "--repo",
+        str(clone),
+        "--source",
+        str(source),
+        "--tasks",
+        "1",
+        "--python",
+        sys.executable,
+        "--pythonpath",
+        str(ROOT / "src"),
     ]
     env = dict(__import__("os").environ)
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)

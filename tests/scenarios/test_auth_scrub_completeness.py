@@ -6,9 +6,7 @@ from cambium import auth
 
 
 def test_scrub_environment_removes_provider_and_sdk_credentials() -> None:
-    oauth_suffixes = tuple(
-        auth.oauth_env_suffix(provider) for provider in ("codex", "foo.bar-baz")
-    )
+    oauth_suffixes = tuple(auth.oauth_env_suffix(provider) for provider in ("codex", "foo.bar-baz"))
     credential_names = [
         auth.derived_env_name("openai"),
         auth.derived_env_name("anthropic"),
@@ -69,9 +67,7 @@ def test_scrub_environment_removes_provider_and_sdk_credentials() -> None:
         ("\u00e9" * 2, False),
     ],
 )
-def test_api_key_minimum_uses_utf8_bytes_and_rejects_blank(
-    value: str, accepted: bool
-) -> None:
+def test_api_key_minimum_uses_utf8_bytes_and_rejects_blank(value: str, accepted: bool) -> None:
     if accepted:
         credential = auth.ProviderCredential("test", value)
         assert credential.api_key == value

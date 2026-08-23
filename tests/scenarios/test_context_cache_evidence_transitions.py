@@ -177,12 +177,8 @@ def test_aggregate_reports_sessions_with_missing_boundary_metadata(
     assert transition["prefix_sha256"] is None
     assert transition["boundary_metadata_missing"] == ["cache_key.prefix_sha256"]
     assert report["sessions_lacking_boundary_metadata"] == [str(session)]
-    assert sessions[0]["boundary_metadata_missing"] == [
-        "seq=1: cache_key.prefix_sha256"
-    ]
-    assert warnings == [
-        f"{session}: boundary metadata missing: seq=1: cache_key.prefix_sha256"
-    ]
+    assert sessions[0]["boundary_metadata_missing"] == ["seq=1: cache_key.prefix_sha256"]
+    assert warnings == [f"{session}: boundary metadata missing: seq=1: cache_key.prefix_sha256"]
     assert report["measurement"]["epoch_transition"] == {
         "boundary_kinds": ["context_checkpoint", "context_epoch_advanced"],
         "prefix_bytes_source": "payload.cache_key.prefix_bytes",

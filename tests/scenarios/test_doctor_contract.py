@@ -32,9 +32,7 @@ def _forced_failure(*args: object, **kwargs: object) -> tuple[doctor.Status, str
 def test_each_check_failure_has_stable_report_contract(
     target: str, name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(
-        doctor, "check_python", lambda: (doctor.Status.PASS, "3.14.0 (>= 3.14)")
-    )
+    monkeypatch.setattr(doctor, "check_python", lambda: (doctor.Status.PASS, "3.14.0 (>= 3.14)"))
     monkeypatch.setattr(doctor, target, _forced_failure)
 
     checks = doctor.run_checks(None, tmp_path)
@@ -124,8 +122,7 @@ def test_format_report_keeps_credential_names_and_redacts_values(
             8,
             "Provider env",
             doctor.Status.WARN,
-            f"{credentials['CAMBIUM_PROVIDER_FAKE_API_KEY']} "
-            "CAMBIUM_PROVIDER_FAKE_API_KEY",
+            f"{credentials['CAMBIUM_PROVIDER_FAKE_API_KEY']} CAMBIUM_PROVIDER_FAKE_API_KEY",
         ),
         doctor.Check(
             15,

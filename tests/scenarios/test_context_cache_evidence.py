@@ -48,9 +48,7 @@ def _usage(
     return payload
 
 
-def test_aggregate_classifies_parent_fork_and_resume_calls(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_aggregate_classifies_parent_fork_and_resume_calls(tmp_path: Path, monkeypatch) -> None:
     session = tmp_path / "session"
     session.mkdir()
     events = [
@@ -88,22 +86,14 @@ def test_aggregate_classifies_parent_fork_and_resume_calls(
 
 def test_generation_scopes_fork_first_calls() -> None:
     events = [
-        _event(
-            "child", _usage("chat", fork_of="parent/epoch"), seq=1, generation=1
-        ),
-        _event(
-            "child", _usage("chat", fork_of="parent/epoch"), seq=2, generation=1
-        ),
-        _event(
-            "child", _usage("chat", fork_of="parent/epoch"), seq=3, generation=2
-        ),
+        _event("child", _usage("chat", fork_of="parent/epoch"), seq=1, generation=1),
+        _event("child", _usage("chat", fork_of="parent/epoch"), seq=2, generation=1),
+        _event("child", _usage("chat", fork_of="parent/epoch"), seq=3, generation=2),
     ]
 
     classified = evidence._classify_events(events, "session")
 
-    assert [bucket for bucket, _ in classified] == [
-        "fork_first", "fork_later", "fork_first"
-    ]
+    assert [bucket for bucket, _ in classified] == ["fork_first", "fork_later", "fork_first"]
 
 
 def test_generation_scopes_resume_first_calls_and_preserves_baseline() -> None:
@@ -118,7 +108,11 @@ def test_generation_scopes_resume_first_calls_and_preserves_baseline() -> None:
     classified = evidence._classify_events(events, "session")
 
     assert [bucket for bucket, _ in classified] == [
-        "resume_first", "resume_later", "resume_first", "baseline", "baseline"
+        "resume_first",
+        "resume_later",
+        "resume_first",
+        "baseline",
+        "baseline",
     ]
 
 
@@ -142,9 +136,7 @@ def test_missing_cache_fields_are_not_counted_as_misses(monkeypatch, tmp_path: P
     assert comparison["fork_first"]["meets_threshold"] is None
 
 
-def test_missing_db_is_reported_without_reading_or_creating_it(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_missing_db_is_reported_without_reading_or_creating_it(tmp_path: Path, monkeypatch) -> None:
     missing = tmp_path / "missing"
     missing.mkdir()
     calls: list[Path] = []
@@ -158,8 +150,13 @@ def test_missing_db_is_reported_without_reading_or_creating_it(
 
     assert providers == {}
     assert calls == []
-    assert sessions == [{
-        "dir": str(missing), "usage_events": 0, "usable_events": 0,
-        "skipped": True, "missing_db": True,
-    }]
+    assert sessions == [
+        {
+            "dir": str(missing),
+            "usage_events": 0,
+            "usable_events": 0,
+            "skipped": True,
+            "missing_db": True,
+        }
+    ]
     assert warnings == [f"{missing}: no event DB; skipped"]

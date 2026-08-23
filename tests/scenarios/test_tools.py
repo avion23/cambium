@@ -63,9 +63,7 @@ def _batch_context(tmp_path: Path, events: list[dict] | None = None) -> ToolCont
 
 
 @pytest.mark.slow  # 3x100ms scripted reads; concurrency proven by overlap, not wall clock
-def test_read_batch_runs_three_100ms_reads_concurrently(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_read_batch_runs_three_100ms_reads_concurrently(tmp_path: Path, monkeypatch) -> None:
     for name in ("one.txt", "two.txt", "three.txt"):
         (tmp_path / name).write_text(name, encoding="utf-8")
 
@@ -122,14 +120,13 @@ def test_read_batch_orders_results_and_events_after_out_of_order_completion(
     assert completion_order == [2, 0, 1]
     assert [result.output for result in results] == ["zero.txt", "one.txt", "two.txt"]
     assert [event["batch_index"] for event in events] == [0, 1, 2]
-    assert all(set(event) == {
-        "type", "tool", "batch_index", "batch_size", "ok", "duration_ms"
-    } for event in events)
+    assert all(
+        set(event) == {"type", "tool", "batch_index", "batch_size", "ok", "duration_ms"}
+        for event in events
+    )
 
 
-def test_read_batch_rejects_mixed_array_atomically(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_read_batch_rejects_mixed_array_atomically(tmp_path: Path, monkeypatch) -> None:
     events: list[dict] = []
     called = False
 
@@ -153,9 +150,7 @@ def test_read_batch_rejects_mixed_array_atomically(
     assert events == []
 
 
-def test_read_batch_rejects_path_outside_confined_root(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_read_batch_rejects_path_outside_confined_root(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "inside.txt").write_text("inside", encoding="utf-8")
     called = False
 
@@ -232,9 +227,7 @@ def test_read_batch_concurrency_is_bounded(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_read_batch_requires_read_batch_in_init_tools(tmp_path: Path) -> None:
-    results = asyncio.run(
-        run_read_batch([{"path": "anything.txt"}], ToolContext(tmp_path))
-    )
+    results = asyncio.run(run_read_batch([{"path": "anything.txt"}], ToolContext(tmp_path)))
 
     assert len(results) == 1
     assert not results[0].ok
@@ -247,8 +240,7 @@ class _LintFeedback:
 
     def format_diags(self, diagnostics: list[dict]) -> str:
         return "\n".join(
-            f"{item['path']}:{item['line']}:{item['col']}: "
-            f"{item['code']} {item['message']}"
+            f"{item['path']}:{item['line']}:{item['col']}: {item['code']} {item['message']}"
             for item in diagnostics
         )
 
@@ -278,9 +270,7 @@ def test_write_file_rejects_path_escape(tmp_path: Path) -> None:
     assert "escapes worktree" in (result.error or "")
 
 
-def test_write_file_rejects_symlink_swapped_parent(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_write_file_rejects_symlink_swapped_parent(tmp_path: Path, monkeypatch) -> None:
     parent = tmp_path / "parent"
     outside = tmp_path / "outside"
     parent.mkdir()
@@ -367,9 +357,7 @@ def test_grep_code_falls_back_to_stdlib_regex(tmp_path: Path, monkeypatch) -> No
     assert "sample.py:2:needle here" in result.output
 
 
-def test_grep_code_timeout_falls_back_to_stdlib_regex(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_grep_code_timeout_falls_back_to_stdlib_regex(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "sample.py").write_text("needle here\n", encoding="utf-8")
     monkeypatch.setattr(tools.shutil, "which", lambda _name: "/fake/rg")
 
@@ -456,9 +444,7 @@ def test_get_signature_reports_missing_symbol(tmp_path: Path) -> None:
     assert "symbol not found" in (missing.error or "")
 
 
-def test_get_signature_does_not_follow_replaced_validated_file(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_get_signature_does_not_follow_replaced_validated_file(tmp_path: Path, monkeypatch) -> None:
     sample = tmp_path / "sample.py"
     outside = tmp_path.parent / "outside.py"
     sample.write_text("def build():\n    return 'inside'\n", encoding="utf-8")
@@ -487,9 +473,7 @@ def test_get_signature_rejects_replaced_worktree_root(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     root.mkdir()
     outside.mkdir()
-    (outside / "sample.py").write_text(
-        "def build():\n    return 'outside'\n", encoding="utf-8"
-    )
+    (outside / "sample.py").write_text("def build():\n    return 'outside'\n", encoding="utf-8")
     context = ToolContext(root)
 
     root.rename(tmp_path / "original-worktree")
@@ -519,9 +503,7 @@ def test_get_signature_rejects_oversized_source(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow  # 100ms scripted parse; proves the dispatcher yields via timing
-def test_get_signature_read_and_parse_do_not_block_dispatcher(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_get_signature_read_and_parse_do_not_block_dispatcher(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
     original_extract_signature = tools.ast_tools.extract_signature
 
@@ -551,9 +533,7 @@ def test_get_signature_read_and_parse_do_not_block_dispatcher(
 
 
 @pytest.mark.slow  # 0.6s blocked-read wait behind a 0.3s tool timeout; timing assertion
-def test_get_signature_timeout_does_not_wait_for_blocked_read(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_get_signature_timeout_does_not_wait_for_blocked_read(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "sample.py").write_text("def build():\n    pass\n", encoding="utf-8")
     original_read = tools._read_and_extract_signature
 
@@ -575,9 +555,7 @@ def test_get_signature_timeout_does_not_wait_for_blocked_read(
 
     assert elapsed < 0.5
     assert not result.ok
-    assert result.error == (
-        "get_signature read timed out after 0.3s: sample.py"
-    )
+    assert result.error == ("get_signature read timed out after 0.3s: sample.py")
 
 
 def test_get_signature_caps_serialized_output(tmp_path: Path) -> None:
@@ -702,9 +680,7 @@ def test_write_file_reports_lint_timeout(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow  # python interpreter spawn; asserts subprocess execution
-def test_tool_subprocesses_do_not_inherit_provider_credentials(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_tool_subprocesses_do_not_inherit_provider_credentials(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CAMBIUM_PROVIDER_OPENAI_API_KEY", "tool-secret")
     command = [
         sys.executable,

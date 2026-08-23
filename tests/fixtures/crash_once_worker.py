@@ -21,9 +21,7 @@ def read_message() -> dict | None:
 
 
 def git(*args: str, cwd: Path) -> tuple[int, str, str]:
-    result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
@@ -33,9 +31,16 @@ def main() -> int:
         return 1
     generation = int(init["generation"])
     task_id = init["task_id"]
-    send({"type": "ready", "request_id": init["request_id"],
-          "task_id": task_id, "pid": os.getpid(),
-          "generation": generation, "proto": 1})
+    send(
+        {
+            "type": "ready",
+            "request_id": init["request_id"],
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": generation,
+            "proto": 1,
+        }
+    )
     run = read_message()
     if run is None or run.get("type") != "run_task":
         return 1
@@ -53,11 +58,19 @@ def main() -> int:
         sentinel.write_text(str(generation), encoding="ascii")
         return 3
 
-    send({"type": "result_envelope", "request_id": run["request_id"],
-          "task_id": task_id, "generation": generation, "status": "succeeded",
-          "commits": [], "files_changed": [run["target_file"]], "diff": ""})
-    send({"type": "exit_message", "task_id": task_id,
-          "generation": generation, "reason": "done"})
+    send(
+        {
+            "type": "result_envelope",
+            "request_id": run["request_id"],
+            "task_id": task_id,
+            "generation": generation,
+            "status": "succeeded",
+            "commits": [],
+            "files_changed": [run["target_file"]],
+            "diff": "",
+        }
+    )
+    send({"type": "exit_message", "task_id": task_id, "generation": generation, "reason": "done"})
     return 0
 
 

@@ -60,9 +60,7 @@ def test_parser_defaults_to_fast_tier() -> None:
 
 
 def test_parser_can_opt_in_to_transcript_candidates() -> None:
-    args = optimize._parser().parse_args(
-        ["should_decompose", "--include-transcript-candidates"]
-    )
+    args = optimize._parser().parse_args(["should_decompose", "--include-transcript-candidates"])
 
     assert args.include_transcript_candidates
     assert args.transcript_candidates is None
@@ -76,9 +74,7 @@ class OfflineProgram(dspy.Module):
     def __init__(self, lm: dspy.LM) -> None:
         super().__init__()
         self._lm = lm
-        self.predict = dspy.Predict(
-            "task: str, context: str -> decision: str, reason: str"
-        )
+        self.predict = dspy.Predict("task: str, context: str -> decision: str, reason: str")
 
     def forward(self, task: str, context: str = ""):
         with dspy.context(lm=self._lm):
@@ -267,11 +263,15 @@ def test_main_budget_exhausted_run_writes_report_into_artifact_set(
     monkeypatch.setattr(optimize, "_load_manifest", lambda _name: manifest)
     monkeypatch.setattr(optimize, "load_program_class", lambda _manifest: OfflineProgram)
     monkeypatch.setattr(optimize, "_load_dataset_loader", lambda _manifest: loader)
-    monkeypatch.setattr(optimize, "_baseline_means", lambda _manifest: {
-        "train": 1.0,
-        "eval": 1.0,
-        "canaries": 1.0,
-    })
+    monkeypatch.setattr(
+        optimize,
+        "_baseline_means",
+        lambda _manifest: {
+            "train": 1.0,
+            "eval": 1.0,
+            "canaries": 1.0,
+        },
+    )
     monkeypatch.setattr(optimize, "_construct_lm", lambda *_args: OfflineLM())
     monkeypatch.setattr(optimize, "build_trainsets", lambda _loader, seed: ([], []))
 
@@ -296,12 +296,7 @@ def test_main_budget_exhausted_run_writes_report_into_artifact_set(
 
 def test_missing_transcript_candidates_fail_only_when_opted_in(tmp_path: Path) -> None:
     source = (
-        Path(__file__).resolve().parents[2]
-        / "src"
-        / "cambium"
-        / "modules"
-        / "example"
-        / "datasets"
+        Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example" / "datasets"
     )
     datasets = tmp_path / "datasets"
     shutil.copytree(source, datasets)
@@ -322,12 +317,7 @@ def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
     tmp_path: Path,
 ) -> None:
     source = (
-        Path(__file__).resolve().parents[2]
-        / "src"
-        / "cambium"
-        / "modules"
-        / "example"
-        / "datasets"
+        Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example" / "datasets"
     )
     datasets = tmp_path / "datasets"
     shutil.copytree(source, datasets)
@@ -360,9 +350,9 @@ def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
         encoding="utf-8",
     )
 
-    loader = optimize._import_target(
-        "cambium.modules.example.dataset"
-    ).ExampleDatasetLoader(datasets)
+    loader = optimize._import_target("cambium.modules.example.dataset").ExampleDatasetLoader(
+        datasets
+    )
     frozen = (
         loader.load_split(Split.TRAIN)
         + loader.load_split(Split.EVAL)
@@ -384,24 +374,14 @@ def test_transcript_candidates_are_deduplicated_and_frozen_splits_are_unchanged(
     frozen_pairs = {(item.input.task, item.input.context) for item in frozen}
     augmented_pairs = {(item.input.task, item.input.context) for item in augmented}
     assert augmented_pairs.isdisjoint(
-        {
-            (item.input.task, item.input.context)
-            for item in loader.load_split(Split.EVAL)
-        }
+        {(item.input.task, item.input.context) for item in loader.load_split(Split.EVAL)}
     )
     assert augmented_pairs.isdisjoint(
-        {
-            (item.input.task, item.input.context)
-            for item in loader.load_split(Split.CANARIES)
-        }
+        {(item.input.task, item.input.context) for item in loader.load_split(Split.CANARIES)}
     )
-    assert sum(
-        item.input.task == "Synthetic candidate only" for item in augmented
-    ) == 1
-    assert all(
-        (item.input.task, item.input.context) in frozen_pairs
-        for item in validation
-    )
+    assert sum(item.input.task == "Synthetic candidate only" for item in augmented) == 1
+    assert all((item.input.task, item.input.context) in frozen_pairs for item in validation)
+
 
 def test_baseline_means_reads_all_three_splits() -> None:
     manifest = SimpleNamespace(
@@ -419,8 +399,7 @@ def test_baseline_means_rejects_dataset_digest_drift(tmp_path: Path) -> None:
     package_dir = tmp_path / "example"
     shutil.copytree(source, package_dir)
     (package_dir / "datasets" / "train.jsonl").write_text(
-        (package_dir / "datasets" / "train.jsonl").read_text(encoding="utf-8")
-        + "\n",
+        (package_dir / "datasets" / "train.jsonl").read_text(encoding="utf-8") + "\n",
         encoding="utf-8",
     )
     manifest = SimpleNamespace(
@@ -495,7 +474,5 @@ def test_main_dry_run_does_not_construct_an_lm(monkeypatch) -> None:
 
 
 def test_main_tiny_budget_fails_without_crashing() -> None:
-    result = optimize.main(
-        ["should_decompose", "--optimizer", "zero", "--budget-usd", "0.000001"]
-    )
+    result = optimize.main(["should_decompose", "--optimizer", "zero", "--budget-usd", "0.000001"])
     assert result != 0

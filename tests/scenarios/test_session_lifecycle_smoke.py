@@ -37,9 +37,7 @@ def _assert_command(
     output = result.stdout + result.stderr
     command = " ".join([*CLI, *args])
     assert result.returncode == 0, (
-        f"{command} exited {result.returncode}\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
+        f"{command} exited {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     assert substring in output, f"{command} output did not contain {substring!r}\n{output}"
 

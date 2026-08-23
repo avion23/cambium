@@ -105,9 +105,7 @@ def test_env_report_only_returns_presence_booleans(
             _provider("missing"),
         ],
     )
-    monkeypatch.setenv(
-        "CAMBIUM_PROVIDER_PRESENT_API_KEY", "secret-value-that-must-not-be-reported"
-    )
+    monkeypatch.setenv("CAMBIUM_PROVIDER_PRESENT_API_KEY", "secret-value-that-must-not-be-reported")
     monkeypatch.delenv("CAMBIUM_PROVIDER_MISSING_API_KEY", raising=False)
 
     providers = load_providers(path)
@@ -389,9 +387,7 @@ def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> No
     "value",
     [5, "", "   ", True],
 )
-def test_malformed_reasoning_effort_fails_closed(
-    tmp_path: Path, value: object
-) -> None:
+def test_malformed_reasoning_effort_fails_closed(tmp_path: Path, value: object) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_codex_provider(reasoning_effort=value)],
@@ -414,8 +410,11 @@ def test_reasoning_effort_requires_codex_responses_protocol(tmp_path: Path) -> N
 def test_cached_input_price_round_trips_independently(tmp_path: Path) -> None:
     path = _write(
         tmp_path / "providers.json",
-        [_provider(price=0.40, price_per_1m_in=0.30, price_per_1m_cached_in=0.05,
-                   price_per_1m_out=0.80)],
+        [
+            _provider(
+                price=0.40, price_per_1m_in=0.30, price_per_1m_cached_in=0.05, price_per_1m_out=0.80
+            )
+        ],
     )
 
     providers = load_providers(path)

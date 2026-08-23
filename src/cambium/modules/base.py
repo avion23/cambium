@@ -113,10 +113,7 @@ def _is_secret_shaped(value: str) -> bool:
     if len(value) >= 16:
         return True
     return any(
-        character.isdigit()
-        or character.isupper()
-        or character in "-_./+=:"
-        for character in value
+        character.isdigit() or character.isupper() or character in "-_./+=:" for character in value
     )
 
 
@@ -200,9 +197,7 @@ def load_module_manifest(
     name = package_name or directory.name
     path = directory / MODULE_MANIFEST_FILENAME
     if not path.is_file():
-        raise ModuleContractError(
-            f"module {name!r}: missing required manifest field 'module.json'"
-        )
+        raise ModuleContractError(f"module {name!r}: missing required manifest field 'module.json'")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -214,9 +209,7 @@ def load_module_manifest(
 
     for key in _REQUIRED_MANIFEST_FIELDS:
         if key not in data:
-            raise ModuleContractError(
-                f"module {name!r}: missing required manifest field {key!r}"
-            )
+            raise ModuleContractError(f"module {name!r}: missing required manifest field {key!r}")
 
     contract_version = _manifest_int(data, "contract_version", path)
     if contract_version != MODULE_CONTRACT_VERSION:
@@ -396,9 +389,7 @@ def run_module_cli(
             f"module {cli_module!r}: CLI output is not one JSON object: {exc}"
         ) from exc
     if not isinstance(output, dict):
-        raise ModuleCLIError(
-            f"module {cli_module!r}: CLI output must be one JSON object"
-        )
+        raise ModuleCLIError(f"module {cli_module!r}: CLI output must be one JSON object")
     if "error" in output:
         status = _split_error_status(output)
         if status is not None:

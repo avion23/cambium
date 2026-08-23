@@ -204,8 +204,7 @@ def render_dashboard(
     compact = width < 105
     if compact:
         header = (
-            " R  TASK                 STATE      MODEL                    "
-            "TURN  TOKENS   OUT/S TOOL"
+            " R  TASK                 STATE      MODEL                    TURN  TOKENS   OUT/S TOOL"
         )
     else:
         header = (
@@ -250,8 +249,7 @@ def render_dashboard(
         detail = f"  {event.detail}" if event.detail else ""
         lines.append(
             _inside(
-                f" #{event.seq:<6} {_clip(event.kind, 24):<24} "
-                f"{_clip(task, 24):<24}{detail}",
+                f" #{event.seq:<6} {_clip(event.kind, 24):<24} {_clip(task, 24):<24}{detail}",
                 width,
             )
         )
@@ -261,8 +259,7 @@ def render_dashboard(
         lines.append(_inside("", width))
     lines.append(
         _inside(
-            "Ctrl-C: close monitor  •  "
-            "runtime continues unless its owner cancels it",
+            "Ctrl-C: close monitor  •  runtime continues unless its owner cancels it",
             width,
         )
     )
@@ -386,9 +383,7 @@ def resolve_session(value: str | Path | None, *, repo: str | Path | None = None)
         if env_value:
             session = Path(env_value).expanduser().resolve()
         else:
-            latest = _latest_session(
-                None if repo is None else Path(repo).expanduser().resolve()
-            )
+            latest = _latest_session(None if repo is None else Path(repo).expanduser().resolve())
             if latest is None:
                 raise ValueError("no Cambium session with an event log was found")
             session = latest.resolve()

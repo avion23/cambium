@@ -102,9 +102,7 @@ def test_header_validator_rejects_zero_padded_leap_day_and_uuid_shapes(token: st
 
 def test_header_validator_counts_mixed_line_endings() -> None:
     with pytest.raises(PromptStructureError, match=r"line 4:"):
-        validate_prompt_structure(
-            _prompt(("system", "stable\r\nnext\nthird\rrequest_id=req-1"))
-        )
+        validate_prompt_structure(_prompt(("system", "stable\r\nnext\nthird\rrequest_id=req-1")))
 
 
 def test_codex_sse_reconstruction_accepts_mixed_line_endings() -> None:
@@ -113,10 +111,7 @@ def test_codex_sse_reconstruction_accepts_mixed_line_endings() -> None:
         "response": {"model": "m", "usage": {}},
     }
     delta = {"type": "response.output_text.delta", "delta": "done"}
-    stream = (
-        f"data: {json.dumps(delta)}\r\n\r\n"
-        f"data: {json.dumps(completed)}\n\n"
-    )
+    stream = f"data: {json.dumps(delta)}\r\n\r\ndata: {json.dumps(completed)}\n\n"
     provider = ProviderConfig(
         name="p",
         tier=ProviderTier.FAST,

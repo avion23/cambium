@@ -23,9 +23,7 @@ from cambium.supervisor import PlanResult, TaskResult
 
 
 def _repo(path: Path) -> Path:
-    subprocess.run(
-        ["git", "init", "-b", "main", str(path)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(path), "config", "user.name", "cli-test"], check=True)
     subprocess.run(["git", "-C", str(path), "config", "user.email", "cli@test"], check=True)
     (path / "file.txt").write_text("file\n", encoding="utf-8")
@@ -206,19 +204,29 @@ def test_repl_and_tui_make_a_new_config_per_prompt(monkeypatch, tmp_path: Path) 
     monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
     base = oneshot.OneShotConfig(repo=tmp_path / "repo", provider="demo")
     repl_out = StringIO()
-    assert asyncio.run(repl.run_repl(
-        base,
-        input_stream=StringIO("first\n/exit\n"),
-        output_stream=repl_out,
-        error_stream=StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                base,
+                input_stream=StringIO("first\n/exit\n"),
+                output_stream=repl_out,
+                error_stream=StringIO(),
+            )
+        )
+        == 0
+    )
     tui_out = StringIO()
-    assert asyncio.run(tui.run_tui(
-        base,
-        input_stream=StringIO("second\n"),
-        output_stream=tui_out,
-        error_stream=StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                base,
+                input_stream=StringIO("second\n"),
+                output_stream=tui_out,
+                error_stream=StringIO(),
+            )
+        )
+        == 0
+    )
 
     assert [config.prompt for config in configs] == ["first", "second"]
     assert all(config.repo == base.repo and config.provider == base.provider for config in configs)
@@ -238,18 +246,28 @@ def test_repl_and_tui_return_nonzero_for_failed_plan_result(monkeypatch, tmp_pat
     monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
     base = oneshot.OneShotConfig(repo=tmp_path / "repo", provider="demo")
 
-    assert asyncio.run(repl.run_repl(
-        base,
-        input_stream=StringIO("failed\n/exit\n"),
-        output_stream=StringIO(),
-        error_stream=StringIO(),
-    )) == 1
-    assert asyncio.run(tui.run_tui(
-        base,
-        input_stream=StringIO("failed\n"),
-        output_stream=StringIO(),
-        error_stream=StringIO(),
-    )) == 1
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                base,
+                input_stream=StringIO("failed\n/exit\n"),
+                output_stream=StringIO(),
+                error_stream=StringIO(),
+            )
+        )
+        == 1
+    )
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                base,
+                input_stream=StringIO("failed\n"),
+                output_stream=StringIO(),
+                error_stream=StringIO(),
+            )
+        )
+        == 1
+    )
 
 
 def test_default_provider_config_ignores_target_repository_config(
@@ -314,9 +332,7 @@ def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
         return _plan_result()
 
     monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
-    result = asyncio.run(
-        oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo))
-    )
+    result = asyncio.run(oneshot.run_oneshot(oneshot.OneShotConfig(prompt="implicit", repo=repo)))
 
     assert result.exit_code == 0
     task = captured["plan"]["tasks"][0]
@@ -418,9 +434,7 @@ def _write_events_db(path: Path) -> None:
         store.close()
 
 
-def test_session_readers_and_cli_expose_paths_and_result_data(
-    capsys, tmp_path: Path
-) -> None:
+def test_session_readers_and_cli_expose_paths_and_result_data(capsys, tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     _write_result(root / "old", 1.0)
     _write_events_db(root / "old")
@@ -442,9 +456,7 @@ def test_session_readers_and_cli_expose_paths_and_result_data(
     assert json.loads(capsys.readouterr().out)["summary"] == "new"
 
 
-def test_session_show_reads_result_without_event_db(
-    capsys, tmp_path: Path
-) -> None:
+def test_session_show_reads_result_without_event_db(capsys, tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     _write_result(root / "incomplete", 1.0)
     event_db = root / "incomplete" / ".cambium" / "events.db"
@@ -495,21 +507,26 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
             {"kind": "spawned", "task_id": "alpha", "generation": 1},
             {"kind": "ready", "task_id": "alpha", "generation": 1},
             {"kind": "run_task", "task_id": "alpha", "generation": 1},
-            {"kind": "heartbeat", "task_id": "alpha", "generation": 1,
-             "payload": {"turn": 3}},
-            {"kind": "usage_event", "task_id": "alpha", "generation": 1,
-             "payload": {"provider": "codex", "turn": 4}},
-            {"kind": "tool_event", "task_id": "alpha", "generation": 1,
-             "payload": {"turn": 7}},
-            {"kind": "heartbeat", "task_id": "alpha", "generation": 2,
-             "payload": {"turn": 7}},
+            {"kind": "heartbeat", "task_id": "alpha", "generation": 1, "payload": {"turn": 3}},
+            {
+                "kind": "usage_event",
+                "task_id": "alpha",
+                "generation": 1,
+                "payload": {"provider": "codex", "turn": 4},
+            },
+            {"kind": "tool_event", "task_id": "alpha", "generation": 1, "payload": {"turn": 7}},
+            {"kind": "heartbeat", "task_id": "alpha", "generation": 2, "payload": {"turn": 7}},
             # beta: worker failed at generation 1
             {"kind": "spawned", "task_id": "beta", "generation": 1},
             {"kind": "worker_failed", "task_id": "beta", "generation": 1},
             # gamma: merged successfully
             {"kind": "spawned", "task_id": "gamma", "generation": 1},
-            {"kind": "result", "task_id": "gamma", "generation": 1,
-             "payload": {"status": "succeeded"}},
+            {
+                "kind": "result",
+                "task_id": "gamma",
+                "generation": 1,
+                "payload": {"status": "succeeded"},
+            },
             # delta: assigned but never spawned
             {"kind": "task_assigned", "task_id": "delta", "generation": 1},
         ],
@@ -609,9 +626,7 @@ def test_session_resume_rejects_missing_plan(capsys, tmp_path: Path) -> None:
     assert "Traceback" not in captured.err
 
 
-def test_session_resume_delegates_to_supervisor_main(
-    monkeypatch, capsys, tmp_path: Path
-) -> None:
+def test_session_resume_delegates_to_supervisor_main(monkeypatch, capsys, tmp_path: Path) -> None:
     from cambium import supervisor
 
     session_dir = tmp_path / "crashed"
@@ -630,8 +645,15 @@ def test_session_resume_delegates_to_supervisor_main(
     assert cli.main(["session", "resume", str(session_dir)]) == 130
     assert capsys.readouterr().out == ""
     assert calls == [
-        (["--session-dir", str(session_dir.resolve()), "--plan",
-          str((session_dir / "plan.json").resolve())], {})
+        (
+            [
+                "--session-dir",
+                str(session_dir.resolve()),
+                "--plan",
+                str((session_dir / "plan.json").resolve()),
+            ],
+            {},
+        )
     ]
     delegated = calls[0][0]
     assert delegated.count("--plan") == 1
@@ -680,9 +702,7 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
         "tier": "fast",
         "model": "demo-model",
     }
-    assert captured["plan"]["tasks"][0]["provider_config_path"] == str(
-        config_path.resolve()
-    )
+    assert captured["plan"]["tasks"][0]["provider_config_path"] == str(config_path.resolve())
     assert captured["kwargs"]["provider_environment"] == {env_name: secret}
     assert secret not in repr(captured["plan"])
     assert env_name not in os.environ
@@ -731,9 +751,7 @@ def test_environment_only_provider_key_is_handed_without_plan_or_artifact_leak(
     assert dict(os.environ) == environment_before
 
 
-def test_provider_run_persists_real_plan_without_credential(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_provider_run_persists_real_plan_without_credential(monkeypatch, tmp_path: Path) -> None:
     """A real provider run persists ``plan.json`` and the handed-off credential
     must not appear in that persisted file (the prior ``test_plan_file_*``
     assertion was vacuous because the secret never reached the plan)."""

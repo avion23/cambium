@@ -145,7 +145,11 @@ def _git_toplevel(cwd: Path) -> Path | None:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            cwd=cwd, capture_output=True, text=True, check=True, timeout=10,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -157,7 +161,7 @@ def _parse_worktrees(porcelain: str) -> list[Path]:
     for entry in porcelain.split("\n\n"):
         for line in entry.splitlines():
             if line.startswith("worktree "):
-                paths.append(Path(line[len("worktree "):]))
+                paths.append(Path(line[len("worktree ") :]))
     return paths
 
 
@@ -168,7 +172,11 @@ def check_worktrees(cwd: Path) -> tuple[Status, str]:
     try:
         output = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            cwd=cwd, capture_output=True, text=True, check=True, timeout=30,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
         ).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         return Status.FAIL, f"`git worktree list --porcelain` failed: {exc}"
@@ -237,9 +245,8 @@ def _oauth_session_present(store: OAuthStore, name: str) -> bool:
     record = store.read_provider(name)
     if record is None or record.disabled:
         return False
-    return (
-        record.doc.expires_at - time.time() > DEFAULT_REFRESH_MARGIN_S
-        or bool(record.doc.refresh_token)
+    return record.doc.expires_at - time.time() > DEFAULT_REFRESH_MARGIN_S or bool(
+        record.doc.refresh_token
     )
 
 
@@ -319,19 +326,11 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
         return Status.FAIL, f"{source}: OAuth store unavailable: {exc}"
     states = ", ".join(
         f"{p.name}(model={p.model})={'set' if presence[p.name] else 'missing'}"
-        + (
-            f" (disabled: {disable_reasons[p.name]})"
-            if p.name in disable_reasons
-            else ""
-        )
+        + (f" (disabled: {disable_reasons[p.name]})" if p.name in disable_reasons else "")
         for p in providers
     )
-    missing_required = [
-        p.name for p in providers if p.required and not presence[p.name]
-    ]
-    missing_optional = [
-        p.name for p in providers if not p.required and not presence[p.name]
-    ]
+    missing_required = [p.name for p in providers if p.required and not presence[p.name]]
+    missing_optional = [p.name for p in providers if not p.required and not presence[p.name]]
     if missing_required:
         return Status.FAIL, (
             f"{source}: {states}; required provider credential missing for "
@@ -448,9 +447,7 @@ def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, st
     configured_names = {p.name for p in providers}
     extra = sorted(name for name in auth_names if name not in configured_names)
 
-    states = ", ".join(
-        f"{p.name}={'covered' if covered(p) else 'missing'}" for p in providers
-    )
+    states = ", ".join(f"{p.name}={'covered' if covered(p) else 'missing'}" for p in providers)
     if missing_required:
         detail = (
             f"{source}: {states}; required provider credential missing for "
@@ -491,9 +488,7 @@ def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status
     try:
         source, providers = _doctor_provider_specs(cwd)
     except (OSError, ValueError) as exc:
-        return Status.SKIP, (
-            f"provider runnable skipped: provider config validation failed: {exc}"
-        )
+        return Status.SKIP, (f"provider runnable skipped: provider config validation failed: {exc}")
     if not providers:
         return Status.PASS, f"{source}: no configured providers"
 
@@ -561,9 +556,7 @@ def _conversation_schema_problems(db: Path) -> list[str]:
         ).fetchone()
         if table is None:
             return ["missing conversations table"]
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(conversations)")
-        }
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
     finally:
         conn.close()
     missing = sorted(_CONVERSATION_REQUIRED_COLUMNS - columns)
@@ -638,9 +631,7 @@ def _dataset_jsonl_files() -> list[Path]:
         if dataset_entries is None:
             continue
         files.extend(
-            path
-            for path in dataset_entries
-            if path.suffix == ".jsonl" and _is_regular_file(path)
+            path for path in dataset_entries if path.suffix == ".jsonl" and _is_regular_file(path)
         )
     return sorted(files)
 
@@ -656,9 +647,7 @@ def _jsonl_record_count(path: Path) -> int:
             except json.JSONDecodeError as exc:
                 raise DatasetIntegrityError(f"{path}:{line_number}: invalid JSON") from exc
             if not isinstance(value, dict):
-                raise DatasetIntegrityError(
-                    f"{path}:{line_number}: record is not a JSON object"
-                )
+                raise DatasetIntegrityError(f"{path}:{line_number}: record is not a JSON object")
             records += 1
     return records
 
@@ -689,13 +678,17 @@ def _git_tracked(repo: Path, relative: str) -> bool:
     try:
         inside = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=repo, capture_output=True, timeout=10,
+            cwd=repo,
+            capture_output=True,
+            timeout=10,
         )
         if inside.returncode != 0:
             return False
         listed = subprocess.run(
             ["git", "ls-files", "--error-unmatch", relative],
-            cwd=repo, capture_output=True, timeout=10,
+            cwd=repo,
+            capture_output=True,
+            timeout=10,
         )
     except OSError:
         return False
@@ -709,8 +702,7 @@ def check_secrets() -> tuple[Status, str]:
         return Status.PASS, f"{models} not present"
     if _git_tracked(models.parent, models.name):
         return Status.WARN, (
-            f"{models} is git-tracked — plaintext API keys "
-            "(credential safety invariant)"
+            f"{models} is git-tracked — plaintext API keys (credential safety invariant)"
         )
     return Status.PASS, f"{models} present but not git-tracked"
 
@@ -758,9 +750,7 @@ def check_oauth_live(
     store = OAuthStore() if oauth_store is None else oauth_store
     effective_issuer = DEFAULT_ISSUER if issuer is None else issuer
     effective_client_id = resolve_codex_client_id(
-        client_id
-        if client_id is not None
-        else os.environ.get("CAMBIUM_CODEX_CLIENT_ID")
+        client_id if client_id is not None else os.environ.get("CAMBIUM_CODEX_CLIENT_ID")
     )
     reachable, reachability = _issuer_reachable(effective_issuer, timeout_s)
 
@@ -804,9 +794,7 @@ def check_oauth_live(
     return Status.PASS, detail
 
 
-def run_checks(
-    session_dir: Path | None, cwd: Path, *, oauth_live: bool = False
-) -> list[Check]:
+def run_checks(session_dir: Path | None, cwd: Path, *, oauth_live: bool = False) -> list[Check]:
     checks = [
         (1, "Python version", check_python()),
         (2, "uv", check_uv()),
@@ -852,11 +840,7 @@ def _redact_report_detail(detail: str) -> str:
     environment = dict(os.environ)
     safe_environment = auth.scrub_environment(environment)
     secret_values = sorted(
-        {
-            value
-            for name, value in environment.items()
-            if name not in safe_environment and value
-        },
+        {value for name, value in environment.items() if name not in safe_environment and value},
         key=lambda value: (-len(value), value),
     )
     for value in secret_values:

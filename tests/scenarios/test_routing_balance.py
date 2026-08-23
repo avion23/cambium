@@ -65,9 +65,7 @@ _SUMMARY_CONTROL_OPEN = "<cambium-summary-control>\n"
 _SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
 
 
-def _summary_completion(
-    body: dict[str, Any], *, default_model: str
-) -> dict[str, Any] | None:
+def _summary_completion(body: dict[str, Any], *, default_model: str) -> dict[str, Any] | None:
     """Return a strict synthetic summary response without consuming actions."""
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -78,9 +76,7 @@ def _summary_completion(
         return None
     try:
         control = json.loads(
-            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(
-                _SUMMARY_CONTROL_CLOSE
-            )
+            content.removeprefix(_SUMMARY_CONTROL_OPEN).removesuffix(_SUMMARY_CONTROL_CLOSE)
         )
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -121,9 +117,7 @@ def _summary_completion(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": json.dumps(
-                        summary, sort_keys=True, separators=(",", ":")
-                    ),
+                    "content": json.dumps(summary, sort_keys=True, separators=(",", ":")),
                 },
                 "finish_reason": "stop",
             }
@@ -149,8 +143,7 @@ class FakeServer:
     def __init__(
         self,
         behaviors: list[
-            tuple[int, dict[str, Any], float]
-            | tuple[int, dict[str, Any], float, dict[str, str]]
+            tuple[int, dict[str, Any], float] | tuple[int, dict[str, Any], float, dict[str, str]]
         ],
         *,
         host: str = "127.0.0.1",
@@ -176,9 +169,7 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(
-        self, index: int
-    ) -> tuple[int, dict[str, Any], float, dict[str, str]]:
+    def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior
@@ -235,9 +226,7 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-def _finish_payload(
-    summary: str, *, model: str, total_tokens: int
-) -> dict[str, Any]:
+def _finish_payload(summary: str, *, model: str, total_tokens: int) -> dict[str, Any]:
     """One strict ``finish`` agent action; ``total_tokens`` sizes the usage so
     the task's single call dominates the provider's debt utilization."""
     content = json.dumps({"type": "finish", "summary": summary})
@@ -292,9 +281,7 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base: dict[str, Any] = dict(
-        timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model
-    )
+    base: dict[str, Any] = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
     base.update(overrides)
     return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
 
@@ -356,16 +343,20 @@ def test_select_primary_max_min_utilization_tie_break_and_allowance() -> None:
 def test_debt_store_round_trip_and_corrupt_tolerance(tmp_path) -> None:
     path = tmp_path / "routing-state.json"
     store = DebtStore(path)
-    store.record({
-        "provider": "p1",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        "estimated_cost_usd": 0.01,
-    })
-    store.record({
-        "provider": "p1",
-        "failure_reason": "quota: HTTP 429: rate limited",
-        "request_rate_status": "cooldown",
-    })
+    store.record(
+        {
+            "provider": "p1",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "estimated_cost_usd": 0.01,
+        }
+    )
+    store.record(
+        {
+            "provider": "p1",
+            "failure_reason": "quota: HTTP 429: rate limited",
+            "request_rate_status": "cooldown",
+        }
+    )
     store.record({"provider": "p2", "usage": {"total_tokens": 7}})
     assert store.dirty is True
     store.save()
@@ -492,9 +483,7 @@ def _make_repo(repo: Path) -> str:
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.name", "routing-balance-test"], check=True
     )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "routing@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "routing@test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     (repo / "target.txt").write_text("fixture\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
@@ -509,9 +498,7 @@ def _make_repo(repo: Path) -> str:
     ).stdout.strip()
 
 
-def _provider_config_file(
-    path: Path, servers: list[tuple[str, FakeServer, str, str]]
-) -> Path:
+def _provider_config_file(path: Path, servers: list[tuple[str, FakeServer, str, str]]) -> Path:
     """Write a provider config; entries are (name, server, env_key, model)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -582,9 +569,7 @@ def _provider_task(
 
 
 @pytest.mark.slow
-def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
-    tmp_path, monkeypatch
-) -> None:
+def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, monkeypatch) -> None:
     """Two providers serve two candidate models; the ledger favours B, so the
     batch pre-assignment pass (H1) assigns every task in the wave to A (the
     lowest-utilization provider) in one pass from the persisted snapshot, and
@@ -634,12 +619,20 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
         plan = {
             "tasks": [
                 _provider_task(
-                    session_dir, repo, base, "t-balance-1",
-                    worktree="wt-b1", branch="wt-b1",
+                    session_dir,
+                    repo,
+                    base,
+                    "t-balance-1",
+                    worktree="wt-b1",
+                    branch="wt-b1",
                 ),
                 _provider_task(
-                    session_dir, repo, base, "t-balance-2",
-                    worktree="wt-b2", branch="wt-b2",
+                    session_dir,
+                    repo,
+                    base,
+                    "t-balance-2",
+                    worktree="wt-b2",
+                    branch="wt-b2",
                 ),
             ]
         }
@@ -648,7 +641,9 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
         # so every task in the wave is pre-assigned to A
         result = asyncio.run(
             run_plan(
-                session_dir, plan, max_concurrent_tasks=1,
+                session_dir,
+                plan,
+                max_concurrent_tasks=1,
                 routing_state_path=state_path,
             )
         )
@@ -664,7 +659,8 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(
             if event["kind"] == "task_assigned" and "assigned_provider" in event["payload"]
         ]
         assert [payload["assigned_provider"] for payload in assigned] == [
-            "provider-a", "provider-a",
+            "provider-a",
+            "provider-a",
         ]
         assert {payload["model"] for payload in assigned} == {"m1"}
 
@@ -706,7 +702,10 @@ class _WorkerRunner:
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", "-m", "cambium.worker",
+            sys.executable,
+            "-u",
+            "-m",
+            "cambium.worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -732,9 +731,7 @@ class _WorkerRunner:
     async def recv(self, timeout: float = 30.0) -> dict[str, Any] | None:
         assert self.proc is not None
         return await asyncio.wait_for(
-            read_message(
-                cast(asyncio.StreamReader, self.proc.stdout), limit=MAX_LINE_BYTES
-            ),
+            read_message(cast(asyncio.StreamReader, self.proc.stdout), limit=MAX_LINE_BYTES),
             timeout,
         )
 
@@ -780,8 +777,7 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
             (
                 200,
                 _ok_payload(
-                    '{"type":"tool_call","name":"read_batch",'
-                    '"arguments":{"paths":["target.txt"]}}',
+                    '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}',
                     model="m1",
                 ),
                 0.0,
@@ -814,23 +810,34 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
             runner = _WorkerRunner(_worker_env(config_path, session_dir))
             await runner.start()
             try:
-                await runner.send({
-                    "type": "init", "request_id": "init-1", "task_id": "agent-sticky",
-                    "generation": 1,
-                    "fanout_config": {"tier": "fast", "model": "m1"},
-                    "assigned_provider": "provider-b",
-                    "heartbeat": {"interval_s": 0.05},
-                    "spec": TASK_TEXT,
-                })
+                await runner.send(
+                    {
+                        "type": "init",
+                        "request_id": "init-1",
+                        "task_id": "agent-sticky",
+                        "generation": 1,
+                        "fanout_config": {"tier": "fast", "model": "m1"},
+                        "assigned_provider": "provider-b",
+                        "heartbeat": {"interval_s": 0.05},
+                        "spec": TASK_TEXT,
+                    }
+                )
                 ready = await runner.recv()
                 assert ready is not None and ready["type"] == "ready", (
                     f"stderr={runner.stderr_lines!r}"
                 )
-                await runner.send({
-                    "type": "run_task", "request_id": "run-1", "task_id": "agent-sticky",
-                    "scratch_repo": str(repo), "worktree_path": str(worktree),
-                    "branch": "sticky", "generation": 1, "task": TASK_TEXT,
-                })
+                await runner.send(
+                    {
+                        "type": "run_task",
+                        "request_id": "run-1",
+                        "task_id": "agent-sticky",
+                        "scratch_repo": str(repo),
+                        "worktree_path": str(worktree),
+                        "branch": "sticky",
+                        "generation": 1,
+                        "task": TASK_TEXT,
+                    }
+                )
                 messages: list[dict[str, Any]] = []
                 while True:
                     msg = await runner.recv()
@@ -930,14 +937,20 @@ def test_ledger_save_failure_does_not_block_session_result(tmp_path, monkeypatch
         plan = {
             "tasks": [
                 _provider_task(
-                    session_dir, repo, base, "t-save-fail",
-                    worktree="wt-sf", branch="wt-sf",
+                    session_dir,
+                    repo,
+                    base,
+                    "t-save-fail",
+                    worktree="wt-sf",
+                    branch="wt-sf",
                 )
             ]
         }
         result = asyncio.run(
             run_plan(
-                session_dir, plan, max_concurrent_tasks=1,
+                session_dir,
+                plan,
+                max_concurrent_tasks=1,
                 routing_state_path=blocked_state,
             )
         )

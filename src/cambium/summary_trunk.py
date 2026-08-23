@@ -129,8 +129,7 @@ def _copy_message(value: Any, location: str) -> dict[str, str]:
 def raw_tail_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
     """Content identity of the exact ordered raw tail being summarized."""
     copied = [
-        _copy_message(message, f"raw_tail[{index}]")
-        for index, message in enumerate(messages)
+        _copy_message(message, f"raw_tail[{index}]") for index, message in enumerate(messages)
     ]
     return hashlib.sha256(_canonical_json_bytes(copied)).hexdigest()
 
@@ -219,19 +218,12 @@ def render_summary_message(entry: SummaryEntry) -> dict[str, str]:
     content = _canonical_json_bytes(entry_mapping(entry)).decode("utf-8")
     return {
         "role": "user",
-        "content": (
-            SUMMARY_ENTRY_OPEN
-            + SUMMARY_ENTRY_PROVENANCE
-            + content
-            + SUMMARY_ENTRY_CLOSE
-        ),
+        "content": (SUMMARY_ENTRY_OPEN + SUMMARY_ENTRY_PROVENANCE + content + SUMMARY_ENTRY_CLOSE),
     }
 
 
 def _summary_payload(content: str) -> str | None:
-    if not content.startswith(SUMMARY_ENTRY_OPEN) or not content.endswith(
-        SUMMARY_ENTRY_CLOSE
-    ):
+    if not content.startswith(SUMMARY_ENTRY_OPEN) or not content.endswith(SUMMARY_ENTRY_CLOSE):
         return None
     payload = content[len(SUMMARY_ENTRY_OPEN) : -len(SUMMARY_ENTRY_CLOSE)]
     if not payload.startswith(SUMMARY_ENTRY_PROVENANCE):
@@ -268,8 +260,7 @@ def partition_summary_trunk(
     if stable_head_messages < 1:
         raise SummaryTrunkError("stable_head_messages must be positive")
     copied = [
-        _copy_message(message, f"messages[{index}]")
-        for index, message in enumerate(messages)
+        _copy_message(message, f"messages[{index}]") for index, message in enumerate(messages)
     ]
     if len(copied) < stable_head_messages:
         raise SummaryTrunkError("context is shorter than its stable head")
@@ -277,9 +268,7 @@ def partition_summary_trunk(
         raise SummaryTrunkError("summary trunk must start with a system message")
     for index, message in enumerate(copied[:stable_head_messages]):
         if parse_summary_message(message) is not None:
-            raise SummaryTrunkError(
-                f"stable head message {index} must not be a summary entry"
-            )
+            raise SummaryTrunkError(f"stable head message {index} must not be a summary entry")
 
     trunk = list(copied[:stable_head_messages])
     expected_sequence = 1
@@ -296,16 +285,9 @@ def partition_summary_trunk(
                 f"expected {expected_sequence}, got {entry.sequence}"
             )
         if entry.source_sha256 in seen_digests:
-            raise SummaryTrunkError(
-                "summary entry source_sha256 must be unique"
-            )
-        if (
-            previous_through_turn is not None
-            and entry.through_turn <= previous_through_turn
-        ):
-            raise SummaryTrunkError(
-                "summary entry through_turn must increase monotonically"
-            )
+            raise SummaryTrunkError("summary entry source_sha256 must be unique")
+        if previous_through_turn is not None and entry.through_turn <= previous_through_turn:
+            raise SummaryTrunkError("summary entry through_turn must increase monotonically")
         seen_digests.add(entry.source_sha256)
         previous_through_turn = entry.through_turn
         trunk.append(copied[index])
@@ -366,10 +348,7 @@ def build_summary_request(
     )
     if unexpected_tail:
         raise SummaryTrunkError("build_summary_request requires a summary-only trunk")
-    raw = [
-        _copy_message(message, f"raw_tail[{index}]")
-        for index, message in enumerate(raw_tail)
-    ]
+    raw = [_copy_message(message, f"raw_tail[{index}]") for index, message in enumerate(raw_tail)]
     if not raw:
         raise SummaryTrunkError("cannot summarize an empty raw tail")
     entries = summary_entries(trunk, stable_head_messages=stable_head_messages)
@@ -378,9 +357,7 @@ def build_summary_request(
         raise SummaryTrunkError("summary request source_sha256 is a duplicate")
     validated_through_turn = _positive_int(through_turn, "through_turn")
     if entries and validated_through_turn <= entries[-1].through_turn:
-        raise SummaryTrunkError(
-            "summary request through_turn must increase monotonically"
-        )
+        raise SummaryTrunkError("summary request through_turn must increase monotonically")
     expectation = SummaryExpectation(
         sequence=len(entries) + 1,
         source_sha256=source_sha256,
@@ -425,10 +402,7 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
         raise SummaryTrunkError("summary response must be exactly one JSON object")
     unknown = set(decoded) - SUMMARY_ENTRY_FIELDS
     if unknown:
-        raise SummaryTrunkError(
-            "summary response field set is invalid: "
-            f"unknown={sorted(unknown)}"
-        )
+        raise SummaryTrunkError(f"summary response field set is invalid: unknown={sorted(unknown)}")
     if decoded.get("type", "summary_entry") != "summary_entry":
         raise SummaryTrunkError("summary entry type must be 'summary_entry'")
 
@@ -440,9 +414,7 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
             "source_sha256": expected.source_sha256,
             "source_message_count": expected.source_message_count,
             "through_turn": expected.through_turn,
-            "objective": _bounded_text(
-                decoded.get("objective"), "objective"
-            ).strip(),
+            "objective": _bounded_text(decoded.get("objective"), "objective").strip(),
             "outcome": _bounded_text(decoded.get("outcome"), "outcome").strip(),
         }
     )
@@ -464,17 +436,12 @@ def append_summary_entry(
     expected_sequence = len(entries) + 1
     if validated_entry.sequence != expected_sequence:
         raise SummaryTrunkError(
-            f"summary append expected sequence {expected_sequence}, "
-            f"got {validated_entry.sequence}"
+            f"summary append expected sequence {expected_sequence}, got {validated_entry.sequence}"
         )
-    if any(
-        existing.source_sha256 == validated_entry.source_sha256 for existing in entries
-    ):
+    if any(existing.source_sha256 == validated_entry.source_sha256 for existing in entries):
         raise SummaryTrunkError("summary append source_sha256 is a duplicate")
     if entries and validated_entry.through_turn <= entries[-1].through_turn:
-        raise SummaryTrunkError(
-            "summary append through_turn must increase monotonically"
-        )
+        raise SummaryTrunkError("summary append through_turn must increase monotonically")
     appended = [*trunk, render_summary_message(validated_entry)]
     summary_entries(appended)
     return appended

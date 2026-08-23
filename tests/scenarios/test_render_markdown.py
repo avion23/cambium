@@ -37,9 +37,7 @@ def test_fenced_block_is_verbatim_dim_cyan_and_suppresses_inline() -> None:
 
 
 def test_inline_code_bold_and_italic_styles() -> None:
-    assert render_markdown("run `make test` now\n") == (
-        "run \x1b[33mmake test\x1b[0m now\n"
-    )
+    assert render_markdown("run `make test` now\n") == ("run \x1b[33mmake test\x1b[0m now\n")
     assert render_markdown("**big** deal *soft*\n") == (
         "\x1b[1mbig\x1b[0m deal \x1b[2msoft\x1b[0m\n"
     )
@@ -54,9 +52,7 @@ def test_lists_preserve_layout_verbatim() -> None:
 
 
 def test_blockquote_gets_dim_italic_prefix_and_inline_body() -> None:
-    assert render_markdown("> quoted **b**\n") == (
-        "\x1b[2;3m>\x1b[0m quoted \x1b[1mb\x1b[0m\n"
-    )
+    assert render_markdown("> quoted **b**\n") == ("\x1b[2;3m>\x1b[0m quoted \x1b[1mb\x1b[0m\n")
 
 
 def test_paragraphs_and_blank_lines_pass_through_verbatim() -> None:
@@ -134,19 +130,29 @@ def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
     monkeypatch.setenv("TERM", "xterm-256color")
     config = OneShotConfig()
     tty_out = _Tty()
-    assert asyncio.run(repl.run_repl(
-        config,
-        input_stream=StringIO("go\n/exit\n"),
-        output_stream=tty_out,
-        error_stream=StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                config,
+                input_stream=StringIO("go\n/exit\n"),
+                output_stream=tty_out,
+                error_stream=StringIO(),
+            )
+        )
+        == 0
+    )
     plain_out = StringIO()
-    assert asyncio.run(repl.run_repl(
-        config,
-        input_stream=StringIO("go\n/exit\n"),
-        output_stream=plain_out,
-        error_stream=StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                config,
+                input_stream=StringIO("go\n/exit\n"),
+                output_stream=plain_out,
+                error_stream=StringIO(),
+            )
+        )
+        == 0
+    )
 
     value = tty_out.getvalue()
     assert "\x1b[1;97mDone\x1b[0m" in value

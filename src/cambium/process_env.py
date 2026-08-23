@@ -50,7 +50,7 @@ _PROTECTED_NAMES = _OVERRIDE_NAMES | _FIXED_NAMES
 def _names(names: Iterable[str] | None) -> tuple[str, ...]:
     if names is None:
         return ()
-    if isinstance(names, (str, bytes)):
+    if isinstance(names, str | bytes):
         raise TypeError("environment allowlist must be an iterable of names")
 
     result: list[str] = []

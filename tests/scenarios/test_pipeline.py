@@ -20,18 +20,14 @@ WORKER = str(ROOT / "scripts" / "fake_worker.py")
 
 def _pythonpath_env() -> dict[str, str]:
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        filter(None, [SRC_DIR, env.get("PYTHONPATH")])
-    )
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
     return env
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "pipeline-test"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "pipeline@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "pipeline@test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "gc.auto", "0"], check=True)
     for name, content in files.items():
         (repo / name).write_text(content)
@@ -83,9 +79,7 @@ def _task(
 def _protocol(events: list[dict], task_id: str) -> list[str]:
     wanted = {"init", "ready", "run_task", "result", "exit"}
     return [
-        event["kind"]
-        for event in events
-        if event["task_id"] == task_id and event["kind"] in wanted
+        event["kind"] for event in events if event["task_id"] == task_id and event["kind"] in wanted
     ]
 
 
@@ -181,9 +175,7 @@ def test_tasktree_plan_runs_supervisor_subprocess_to_three_merges(tmp_path) -> N
             for kind in ("task_assigned", "merge_started", "merge_committed")
         }
         assert (
-            positions["task_assigned"]
-            < positions["merge_started"]
-            < positions["merge_committed"]
+            positions["task_assigned"] < positions["merge_started"] < positions["merge_committed"]
         )
     assert events[-1]["kind"] == "session_ended"
 

@@ -23,10 +23,20 @@ except ImportError:  # pragma: no cover - exercised on Windows
 FENCE_FILE = ".cambium/generation"
 GENERATION_LOCK_FILE = ".cambium/.generation.lock"
 
-_CACHE_ARTIFACT_COMPONENTS = frozenset({
-    ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", ".tox",
-    ".coverage", ".cache", ".venv", ".mise", ".python-version",
-})
+_CACHE_ARTIFACT_COMPONENTS = frozenset(
+    {
+        ".pytest_cache",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".coverage",
+        ".cache",
+        ".venv",
+        ".mise",
+        ".python-version",
+    }
+)
 
 
 def is_cache_artifact_path(path: str) -> bool:
@@ -91,9 +101,7 @@ def _read_generation_path(path: Path) -> int:
 
 def _write_generation_unlocked(fence_dir: Path, generation: int) -> None:
     fence_path = fence_dir / "generation"
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=".generation.", suffix=".tmp", dir=fence_dir
-    )
+    fd, temporary_name = tempfile.mkstemp(prefix=".generation.", suffix=".tmp", dir=fence_dir)
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="ascii", newline="\n") as temporary:

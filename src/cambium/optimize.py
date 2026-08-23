@@ -87,7 +87,7 @@ class _CostLedger:
             )
 
     def record(self, value: object) -> None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int | float):
             return
         if math.isfinite(value) and value >= 0:
             self.spent_usd += float(value)
@@ -186,9 +186,7 @@ def load_program_class(manifest) -> type:
     class_name = _program_class_name(getattr(manifest, "module_name", ""))
     program_class = getattr(mod, class_name, None)
     if not isinstance(program_class, type):
-        raise OptimizeError(
-            f"DSPy program module {target!r} has no class {class_name!r}"
-        )
+        raise OptimizeError(f"DSPy program module {target!r} has no class {class_name!r}")
     return program_class
 
 
@@ -293,9 +291,7 @@ def _prediction_output(raw: object, program: object) -> object | None:
                 return None
         if isinstance(raw, list) and len(raw) == 1:
             raw = raw[0]
-        decision = _parse_decision(
-            _read_field(raw, "decision"), decision_type
-        )
+        decision = _parse_decision(_read_field(raw, "decision"), decision_type)
         if decision is None:
             decision = _parse_decision(_read_field(raw, "decompose"), decision_type)
         reason = _read_field(raw, "reason")
@@ -309,7 +305,7 @@ def _prediction_output(raw: object, program: object) -> object | None:
         reason = ""
     if not isinstance(reason, str):
         return None
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+    if isinstance(confidence, bool) or not isinstance(confidence, int | float):
         return None
     if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
         return None
@@ -421,7 +417,7 @@ def _fuse_jlens(
     prompt position, averaged over the requested layers.  Any jlens failure
     leaves the exact-match score unchanged.
     """
-    if not isinstance(trace, (list, tuple)) or not trace:
+    if not isinstance(trace, list | tuple) or not trace:
         return score
     expected_strings, alt_strings = _decision_strings(expected)
     if not expected_strings:
@@ -435,7 +431,7 @@ def _fuse_jlens(
             jlens_score = jlens_client.signal(result, expected_strings)
         except (JlenError, TypeError, ValueError, OSError):
             return score
-        if not isinstance(jlens_score, (int, float)) or not math.isfinite(jlens_score):
+        if not isinstance(jlens_score, int | float) or not math.isfinite(jlens_score):
             return score
         return weight * max(0.0, min(1.0, jlens_score)) + (1.0 - weight) * score
     return score
@@ -487,7 +483,7 @@ def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callabl
                 prediction=prediction,
             )
             score = scorer(example)
-            if isinstance(score, bool) or not isinstance(score, (int, float)):
+            if isinstance(score, bool) or not isinstance(score, int | float):
                 return 0.0
             if not math.isfinite(score) or not 0.0 <= score <= 1.0:
                 return 0.0
@@ -576,9 +572,7 @@ def _reviewed_transcript_records(candidate_path: Path) -> list[dict[str, Any]]:
                 f"transcript candidate {candidate_path}:{line_no} is invalid JSON"
             ) from exc
         if not isinstance(record, dict):
-            raise OptimizeError(
-                f"transcript candidate {candidate_path}:{line_no} is not an object"
-            )
+            raise OptimizeError(f"transcript candidate {candidate_path}:{line_no} is not an object")
         status = record.get("review_status")
         if status in {"rejected", "excluded"}:
             continue
@@ -607,9 +601,7 @@ def _load_transcript_candidates(
     """Load explicitly reviewed transcript candidates with the module loader."""
 
     if candidate_path is None:
-        candidate_path = (
-            _loader_datasets_dir(loader) / _TRANSCRIPT_CANDIDATES_FILENAME
-        )
+        candidate_path = _loader_datasets_dir(loader) / _TRANSCRIPT_CANDIDATES_FILENAME
     candidate_path = Path(candidate_path)
     if not candidate_path.is_file():
         raise OptimizeError(
@@ -643,14 +635,11 @@ def _load_transcript_candidates(
             candidate_loader = loader_class(temporary_path)
         except (OSError, ValueError) as exc:
             raise OptimizeError(
-                "could not construct the dataset loader for transcript candidates: "
-                f"{exc}"
+                f"could not construct the dataset loader for transcript candidates: {exc}"
             ) from exc
         load = getattr(candidate_loader, "load", None)
         if not callable(load):
-            raise OptimizeError(
-                "dataset loader does not provide load for transcript candidates"
-            )
+            raise OptimizeError("dataset loader does not provide load for transcript candidates")
         load = cast(Callable[[], Iterable[Example]], load)
         try:
             candidates = list(load())
@@ -671,6 +660,7 @@ def _load_transcript_candidates(
     if any(getattr(candidate, "canary", False) for candidate in candidates):
         raise OptimizeError("transcript candidate file contains a canary record")
     return candidates
+
 
 def _canonical_input_pair(example: object) -> tuple[str, str]:
     """Return the exact canonical ``(task, context)`` pair for one example."""
@@ -719,7 +709,7 @@ def _augment_training_pool(
 
 def build_trainsets(loader, seed=0, val_fraction=0.2) -> tuple[list, list]:
     """Load train records and deterministically carve a validation subset."""
-    if isinstance(val_fraction, bool) or not isinstance(val_fraction, (int, float)):
+    if isinstance(val_fraction, bool) or not isinstance(val_fraction, int | float):
         raise OptimizeError("val_fraction must be a number in [0, 1)")
     if not math.isfinite(val_fraction) or not 0.0 <= val_fraction < 1.0:
         raise OptimizeError("val_fraction must be a number in [0, 1)")
@@ -756,9 +746,9 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
     scores: list[float] = []
     for example in examples:
         try:
-            raw_prediction = await cast(
-                Callable[[Any], Any], cast(Any, program).decide
-            )(example.input)
+            raw_prediction = await cast(Callable[[Any], Any], cast(Any, program).decide)(
+                example.input
+            )
         except _BudgetExhausted:
             raise
         except (AdapterParseError, ValueError) as exc:
@@ -772,7 +762,7 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
             score = scorer(example.with_prediction(prediction))
         except (KeyError, ValueError):
             score = 0.0
-        if isinstance(score, bool) or not isinstance(score, (int, float)):
+        if isinstance(score, bool) or not isinstance(score, int | float):
             score = 0.0
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             score = 0.0
@@ -1025,9 +1015,7 @@ def _baseline_means(manifest: object) -> dict[str, float]:
         if isinstance(expected_schema, bool) or not isinstance(expected_schema, int):
             raise OptimizeError("manifest dataset_schema_version is not an integer")
         if isinstance(current_schema, bool) or not isinstance(current_schema, int):
-            raise OptimizeError(
-                f"dataset metadata {meta_path} schema_version is not an integer"
-            )
+            raise OptimizeError(f"dataset metadata {meta_path} schema_version is not an integer")
         if current_schema != expected_schema:
             raise OptimizeError(
                 f"dataset metadata {meta_path} schema_version {current_schema!r} "
@@ -1071,7 +1059,7 @@ def _baseline_means(manifest: object) -> dict[str, float]:
             value = data["metric"][split]["mean"]
         except (KeyError, TypeError) as exc:
             raise OptimizeError(f"baseline {path} has no metric.{split}.mean") from exc
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int | float):
             raise OptimizeError(f"baseline {path} metric.{split}.mean is not numeric")
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise OptimizeError(f"baseline {path} metric.{split}.mean is outside [0, 1]")
@@ -1235,8 +1223,7 @@ def _run(argv=None) -> int:
     try:
         candidate_records: list[Example] | None = None
         use_transcript_candidates = (
-            args.include_transcript_candidates
-            or args.transcript_candidates is not None
+            args.include_transcript_candidates or args.transcript_candidates is not None
         )
         if use_transcript_candidates:
             loader = _load_dataset_loader(manifest)

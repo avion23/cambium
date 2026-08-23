@@ -193,9 +193,7 @@ def test_malformed_plan_inputs_raise_task_plan_error(plan: Any) -> None:
         ({"max_width": "8"}, "max_width"),
     ],
 )
-def test_invalid_bound_types_raise_task_plan_error(
-    kwargs: dict[str, Any], message: str
-) -> None:
+def test_invalid_bound_types_raise_task_plan_error(kwargs: dict[str, Any], message: str) -> None:
     with pytest.raises(TaskPlanError, match=message):
         build_tree(_plan(["root"]), **kwargs)
 
