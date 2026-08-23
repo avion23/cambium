@@ -120,6 +120,7 @@ import tempfile
 import threading
 import time
 import zlib
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import IntEnum, StrEnum
@@ -166,9 +167,12 @@ HEARTBEAT_INTERVAL_S = 1.0
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
-# Consecutive non-progress actions (valid plans AND invalid/unparseable
-# actions) before the agent loop fails fast.
-MAX_CONSECUTIVE_PLANS = 2
+# Consecutive non-novel actions (valid plans, tool calls, and
+# invalid/unparseable actions) before the agent loop fails fast.  The legacy
+# name is retained as an alias because a few in-process callers import it.
+MAX_NO_PROGRESS_ACTIONS = 2
+MAX_CONSECUTIVE_PLANS = MAX_NO_PROGRESS_ACTIONS
+DEFAULT_PROGRESS_WINDOW = 3
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB bounded upward diff envelope.
 DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_TOKENS = 200_000
@@ -1042,6 +1046,21 @@ def _positive_int(value: Any, name: str, default: int) -> int:
     return value
 
 
+def _progress_limits(values: Mapping[str, Any], source: str) -> tuple[int, int]:
+    """Parse the no-progress threshold and its recent-action window."""
+    max_no_progress_actions = _positive_int(
+        values.get("max_no_progress_actions"),
+        f"{source} max_no_progress_actions",
+        MAX_NO_PROGRESS_ACTIONS,
+    )
+    progress_window = _positive_int(
+        values.get("progress_window"),
+        f"{source} progress_window",
+        max(DEFAULT_PROGRESS_WINDOW, max_no_progress_actions + 1),
+    )
+    return max_no_progress_actions, progress_window
+
+
 def _strict_bool(value: Any, name: str) -> bool:
     if value is None:
         return False
@@ -1140,9 +1159,14 @@ class AgentConfig:
     # Provider-neutral summary history used when an exact cache fork is illegal.
     summary_trunk_ref: str | None = None
     resume: dict[str, Any] | None = None
+    # Stall detection is based on repeated/empty assistant output rather than
+    # whether a turn happened to invoke a tool.  The window is the number of
+    # recent action signatures retained for novelty checks.
+    max_no_progress_actions: int = MAX_NO_PROGRESS_ACTIONS
+    progress_window: int = 0
 
     def __post_init__(self) -> None:
-        """Derive threshold defaults for direct in-process configurations."""
+        """Derive and validate threshold defaults for direct configurations."""
         threshold_high = self.rolling_compact_threshold_high
         if threshold_high == 0:
             threshold_high = self.max_transcript_chars
@@ -1153,6 +1177,22 @@ class AgentConfig:
             raise ValueError("invalid rolling compaction thresholds")
         object.__setattr__(self, "rolling_compact_threshold_high", threshold_high)
         object.__setattr__(self, "rolling_compact_threshold_low", threshold_low)
+        if (
+            isinstance(self.max_no_progress_actions, bool)
+            or not isinstance(self.max_no_progress_actions, int)
+            or self.max_no_progress_actions <= 0
+        ):
+            raise ValueError("invalid no-progress threshold")
+        progress_window = self.progress_window
+        if progress_window == 0:
+            progress_window = max(DEFAULT_PROGRESS_WINDOW, self.max_no_progress_actions + 1)
+        if (
+            isinstance(progress_window, bool)
+            or not isinstance(progress_window, int)
+            or progress_window <= 0
+        ):
+            raise ValueError("invalid progress window")
+        object.__setattr__(self, "progress_window", progress_window)
 
     @classmethod
     def from_init(cls, init: dict[str, Any]) -> AgentConfig:
@@ -1205,6 +1245,7 @@ class AgentConfig:
         rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
             init, max_transcript_chars, "init"
         )
+        max_no_progress_actions, progress_window = _progress_limits(init, "init")
         return cls(
             task_id=task_id,
             generation=_positive_int(init.get("generation"), "init generation", 1),
@@ -1237,6 +1278,8 @@ class AgentConfig:
             rolling_compact_threshold_low=rolling_threshold_low,
             context_fork=_validate_context_fork(init.get("context_fork")),
             summary_trunk_ref=_validate_summary_trunk_ref(init.get("summary_trunk_ref")),
+            max_no_progress_actions=max_no_progress_actions,
+            progress_window=progress_window,
         )
 
 
@@ -1289,6 +1332,20 @@ def _merge_task_config(
     rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
         threshold_values, config.max_transcript_chars, "run_task"
     )
+    max_no_progress_actions = config.max_no_progress_actions
+    if "max_no_progress_actions" not in init:
+        max_no_progress_actions = _positive_int(
+            run.get("max_no_progress_actions"),
+            "run_task max_no_progress_actions",
+            MAX_NO_PROGRESS_ACTIONS,
+        )
+    progress_window = config.progress_window
+    if "progress_window" not in init:
+        progress_window = _positive_int(
+            run.get("progress_window"),
+            "run_task progress_window",
+            max(DEFAULT_PROGRESS_WINDOW, max_no_progress_actions + 1),
+        )
     return AgentConfig(
         task_id=config.task_id,
         generation=config.generation,
@@ -1320,6 +1377,8 @@ def _merge_task_config(
         context_fork=config.context_fork,
         summary_trunk_ref=summary_trunk_ref,
         resume=resume,
+        max_no_progress_actions=max_no_progress_actions,
+        progress_window=progress_window,
     )
 
 
@@ -1342,6 +1401,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
     rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
         run, max_transcript_chars, "run_task"
     )
+    max_no_progress_actions, progress_window = _progress_limits(run, "run_task")
     return AgentConfig(
         task_id=task_id,
         generation=_positive_int(run.get("generation"), "run_task generation", 1),
@@ -1377,6 +1437,8 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         context_fork=_validate_context_fork(run.get("context_fork")),
         summary_trunk_ref=_validate_summary_trunk_ref(run.get("summary_trunk_ref")),
         resume=_validate_resume(run.get("resume")),
+        max_no_progress_actions=max_no_progress_actions,
+        progress_window=progress_window,
     )
 
 
@@ -2486,6 +2548,58 @@ def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
         "role": "assistant",
         "content": json.dumps(action, sort_keys=True, separators=(",", ":")),
     }
+
+
+def _progress_signature(
+    content: str | None, action: Mapping[str, Any] | None = None
+) -> str:
+    """Return bounded state content used to decide whether an action is novel.
+
+    Parsed actions intentionally omit the optional ``thought`` field: a model
+    retrying the same failed call with a different scratchpad has not changed
+    the work state.  Unparseable responses use their text, which lets normal
+    conversational replies count as progress even though they are not worker
+    actions.
+    """
+    if action is not None:
+        value = json.dumps(dict(action), sort_keys=True, separators=(",", ":"))
+    elif isinstance(content, str):
+        value = content.strip()
+    else:
+        value = ""
+    return _cap_utf8(value, MAX_ACTION_CONTENT_BYTES)
+
+
+class _ProgressDetector:
+    """Detect repeated/empty output without treating tool use as progress."""
+
+    __slots__ = (
+        "max_no_progress_actions",
+        "progress_window",
+        "_recent_signatures",
+        "no_progress_actions",
+    )
+
+    def __init__(self, max_no_progress_actions: int, progress_window: int) -> None:
+        if max_no_progress_actions <= 0 or progress_window <= 0:
+            raise ValueError("progress detector limits must be positive")
+        self.max_no_progress_actions = max_no_progress_actions
+        self.progress_window = progress_window
+        self._recent_signatures: deque[str] = deque(maxlen=progress_window)
+        self.no_progress_actions = 0
+
+    def observe(
+        self, content: str | None = None, action: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Record one assistant result and return whether the loop is stalled."""
+        signature = _progress_signature(content, action)
+        novel = bool(signature) and signature not in self._recent_signatures
+        self.no_progress_actions = 0 if novel else self.no_progress_actions + 1
+        self._recent_signatures.append(signature)
+        return (
+            len(self._recent_signatures) >= self.progress_window
+            and self.no_progress_actions >= self.max_no_progress_actions
+        )
 
 
 def _context_state_message(
@@ -3753,6 +3867,10 @@ async def _run_agent_loop(
     tools = _exposed_tool_schemas(config)
     lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
+    progress_detector = _ProgressDetector(
+        config.max_no_progress_actions,
+        config.progress_window,
+    )
     no_progress_actions = 0
     verified_after_change = False
     verification_failed = False
@@ -3773,6 +3891,25 @@ async def _run_agent_loop(
         nonlocal transcript
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
+
+    def _observe_progress(
+        content: str | None = None, action: Mapping[str, Any] | None = None
+    ) -> bool:
+        nonlocal no_progress_actions
+        stalled = progress_detector.observe(content, action)
+        no_progress_actions = progress_detector.no_progress_actions
+        return stalled
+
+    def _no_progress_failure(turn: int) -> dict[str, Any]:
+        return _loop_result(
+            outcome,
+            "failed",
+            f"agent made no progress: {no_progress_actions} consecutive actions "
+            "with no novel content",
+            turn,
+            cumulative_usage,
+            transcript,
+        )
 
     async def _bound_context_continuation(
         turn: int, *, force: bool = False
@@ -4024,6 +4161,7 @@ async def _run_agent_loop(
         verified_after_change = resume_checkpoint.verified_after_change
         verification_failed = resume_checkpoint.verification_failed
         no_progress_actions = resume_checkpoint.no_progress_actions
+        progress_detector.no_progress_actions = no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
         previous_prompt_tokens = resume_checkpoint.previous_prompt_tokens
         cumulative_usage = dict(resume_checkpoint.cumulative_usage)
@@ -4257,8 +4395,12 @@ async def _run_agent_loop(
             try:
                 action = _native_tool_action(result) or _parse_agent_action(result.content)
             except ValueError as exc:
+                response_content = result.content if isinstance(result.content, str) else ""
+                assistant_content = _bounded_text(response_content, MAX_ACTION_CONTENT_BYTES)
+                if not assistant_content:
+                    assistant_content = "[invalid action omitted]"
                 invalid_messages = [
-                    {"role": "assistant", "content": "[invalid action omitted]"},
+                    {"role": "assistant", "content": assistant_content},
                     {
                         "role": "user",
                         "content": _bounded_text(f"invalid action: {exc}", MAX_OBSERVATION_BYTES),
@@ -4269,32 +4411,14 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(invalid_messages)
                     _sync_context_transcript()
-                no_progress_actions += 1
-                if no_progress_actions > MAX_CONSECUTIVE_PLANS:
-                    return _loop_result(
-                        outcome,
-                        "failed",
-                        f"agent made no progress: {no_progress_actions} consecutive "
-                        "actions without a tool call",
-                        turn,
-                        cumulative_usage,
-                        transcript,
-                    )
+                if _observe_progress(response_content):
+                    return _no_progress_failure(turn)
                 continue
             trailing = _action_trailing(result.content)
             action_message = _canonical_action_message(action)
+            if _observe_progress(action=action):
+                return _no_progress_failure(turn)
             if action["type"] == "plan":
-                no_progress_actions += 1
-                if no_progress_actions > MAX_CONSECUTIVE_PLANS:
-                    return _loop_result(
-                        outcome,
-                        "failed",
-                        f"agent made no progress: {no_progress_actions} consecutive "
-                        "actions without a tool call",
-                        turn,
-                        cumulative_usage,
-                        transcript,
-                    )
                 if base_messages is None:
                     transcript.append(action_message)
                     if trailing:
@@ -4309,7 +4433,6 @@ async def _run_agent_loop(
                     _sync_context_transcript()
                 progress.tool = "plan"
                 continue
-            no_progress_actions = 0
             if action["type"] == "finish":
                 if base_messages is None:
                     transcript.append(action_message)
