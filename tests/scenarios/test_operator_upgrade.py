@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from cambium import cli, oauth, optimize
+from cambium import cli, oauth
 from cambium.modules.base import Example
 from cambium.oauth import OAuthDoc, OAuthStore, RefreshedTokens, TokenManager
 from cambium.provider_config import CODEX_CHATGPT_PROFILE
@@ -83,6 +83,10 @@ def _candidate(identifier: str, status: str) -> dict[str, Any]:
 def test_transcript_candidates_fail_closed_while_review_is_pending(
     tmp_path: Path,
 ) -> None:
+    # Deferred: optimize pulls in dspy (~2s import) and only these two tests
+    # need it; keeping it out of collection time for the other cases.
+    from cambium import optimize
+
     path = tmp_path / "transcript_candidates.jsonl"
     path.write_text(json.dumps(_candidate("pending", "needs_review")) + "\n")
     loader = _CandidateLoader(tmp_path)
@@ -104,6 +108,8 @@ def test_transcript_candidates_load_only_approved_records(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     loader = _CandidateLoader(tmp_path)
+
+    from cambium import optimize
 
     records = optimize._load_transcript_candidates(loader, path)
 
