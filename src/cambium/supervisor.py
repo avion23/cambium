@@ -3743,7 +3743,10 @@ class _Runtime:
                                 task_id,
                                 outcome.proposals,
                                 reason="ParentJoinInvariantFailed",
-                                message="parent worktree was not at the accepted child integration head",
+                                message=(
+                                    "parent worktree was not at the accepted "
+                                    "child integration head"
+                                ),
                             )
                             self._results[task_id] = TaskResult(
                                 task_id=task_id,
