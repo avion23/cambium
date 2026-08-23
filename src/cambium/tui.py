@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import builtins
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 from dataclasses import dataclass, replace
@@ -16,6 +19,11 @@ from .interactive import InteractiveSession, InteractiveSessionError
 from .monitor import AnsiDashboard, render_agent_lines, render_dashboard
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
+
+try:
+    import readline as _readline
+except ImportError:  # pragma: no cover - platform dependent
+    _readline = None
 
 _RESET = "\033[0m"
 _CYAN = "\033[1;36m"
@@ -47,6 +55,14 @@ def _color_line(line: str) -> str:
     return f"{_DIM}{line}{_RESET}" if "waiting for events" in lowered else line
 
 
+def _use_color(stream: TextIO) -> bool:
+    return (
+        _is_tty(stream)
+        and not os.environ.get("NO_COLOR")
+        and os.environ.get("TERM", "") != "dumb"
+    )
+
+
 class _ColorDashboard(AnsiDashboard):
     """The existing event dashboard with semantic terminal colors."""
 
@@ -60,8 +76,7 @@ class _ColorDashboard(AnsiDashboard):
             width=size.columns,
             height=size.lines,
         )
-        use_color = not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
-        if use_color:
+        if _use_color(self.stream):
             lines = [_color_line(line) for line in lines]
         self.stream.write("\033[H\033[2J")
         self.stream.write("\n".join(lines))
@@ -116,9 +131,15 @@ _HELP = """Commands:
   /agents     main/sub-agent lifecycle and provider/model rows
   /context    current trunk, raw tail, checkpoint, and epoch
   /session    persistent interactive-session identity and provider lease
+  /model      current provider/model lease and branch generation
+  /dashboard  render the latest full dashboard into normal scrollback
+  /events     recent durable event summaries
   /new        start a fresh semantic branch; old turn artifacts remain
   /clear      clear the terminal
   /exit       leave Cambium
+
+During a running turn, Ctrl-C cancels that turn and returns to this prompt. The
+last successfully published context checkpoint remains the branch head.
 
 Multiline input:
   enter <<< on its own line, write the prompt, then enter >>> on its own line.
@@ -139,26 +160,60 @@ def _write_line(out: TextIO, line: str) -> None:
             out.write("\n")
 
 
-def _read_prompt(source: TextIO, out: TextIO) -> str | None:
-    out.write(_PROMPT)
+def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> str | None:
+    if native:
+        try:
+            return builtins.input(prompt)
+        except EOFError:
+            return None
+    out.write(prompt)
     out.flush()
     line = source.readline()
     if line == "":
         return None
-    prompt = line.rstrip("\r\n")
-    if prompt.strip() != "<<<":
-        return prompt
+    return line.rstrip("\r\n")
+
+
+def _read_prompt(source: TextIO, out: TextIO, *, native: bool = False) -> str | None:
+    value = _input_line(source, out, _PROMPT, native=native)
+    if value is None:
+        return None
+    if value.strip() != "<<<":
+        return value
     lines: list[str] = []
     while True:
-        out.write(_CONTINUATION_PROMPT)
-        out.flush()
-        line = source.readline()
-        if line == "":
+        value = _input_line(source, out, _CONTINUATION_PROMPT, native=native)
+        if value is None:
             return "\n".join(lines)
-        value = line.rstrip("\r\n")
         if value.strip() == ">>>":
             return "\n".join(lines)
         lines.append(value)
+
+
+def _history_path(session: InteractiveSession) -> Path:
+    return session.root / ".cambium" / "tui_history"
+
+
+def _load_history(path: Path) -> None:
+    if _readline is None or not path.is_file():
+        return
+    try:
+        _readline.read_history_file(path)
+        _readline.set_history_length(1000)
+    except (OSError, ValueError):
+        pass
+
+
+def _save_history(path: Path) -> None:
+    if _readline is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _readline.set_history_length(1000)
+        _readline.write_history_file(path)
+        os.chmod(path, 0o600)
+    except (OSError, ValueError):
+        pass
 
 
 def _branch_line(session: InteractiveSession) -> str:
@@ -224,6 +279,36 @@ def _write_result(out: TextIO, render: Any, response: Any) -> None:
         _write_line(out, rendered)
 
 
+def _write_static_dashboard(
+    out: TextIO,
+    snapshot: SessionSnapshot,
+    *,
+    session_dir: Path,
+) -> None:
+    size = shutil.get_terminal_size((120, 40))
+    height = max(18, min(size.lines - 2, 40))
+    lines = render_dashboard(
+        snapshot,
+        session_dir=session_dir,
+        width=size.columns,
+        height=height,
+    )
+    if _use_color(out):
+        lines = [_color_line(line) for line in lines]
+    _write_line(out, "\n".join(lines))
+
+
+def _event_lines(snapshot: SessionSnapshot) -> str:
+    if not snapshot.recent_events:
+        return "events: none"
+    lines = ["events:"]
+    for event in snapshot.recent_events:
+        task = event.task_id or "-"
+        detail = f"  {event.detail}" if event.detail else ""
+        lines.append(f"  #{event.seq:<6} {event.kind:<28} {task}{detail}")
+    return "\n".join(lines)
+
+
 async def _run_legacy(
     config: Any,
     *,
@@ -247,7 +332,7 @@ async def _run_legacy(
                 out.write("\n")
                 out.flush()
                 return ExitCode.FAILURE if failed else ExitCode.SUCCESS
-            if prompt == "/exit":
+            if prompt in {"/exit", "/quit"}:
                 return ExitCode.FAILURE if failed else ExitCode.SUCCESS
             if not prompt.strip():
                 continue
@@ -345,18 +430,27 @@ async def _run_interactive(
     state = ObservabilityState(recent_limit=16)
     sequence = 0
     failed = False
+    native_input = source is sys.stdin and out is sys.stdout
+    history_path = _history_path(session)
+    if native_input:
+        _load_history(history_path)
+
     _write_line(out, "Cambium interactive session")
     _write_line(out, session.describe())
     if cumulative.calls:
         _write_line(out, cumulative.line())
         _write_line(out, _context_line(last_snapshot))
-    _write_line(out, "Type /help for commands; use <<< ... >>> for multiline prompts.")
+    _write_line(
+        out,
+        "Type /help for commands; use <<< ... >>> for multiline prompts. "
+        "Ctrl-C cancels an active turn.",
+    )
     out.flush()
 
     try:
         while True:
-            prompt = _read_prompt(source, out)
-            if prompt is None or prompt == "/exit":
+            prompt = _read_prompt(source, out, native=native_input)
+            if prompt is None or prompt in {"/exit", "/quit"}:
                 out.write("\n")
                 out.flush()
                 return ExitCode.FAILURE if failed else ExitCode.SUCCESS
@@ -375,8 +469,26 @@ async def _run_interactive(
             if command == "/context":
                 _write_line(out, _context_line(last_snapshot))
                 continue
-            if command == "/session":
+            if command in {"/session", "/model"}:
                 _write_line(out, session.describe())
+                continue
+            if command == "/dashboard":
+                session_dir = (
+                    session.seed.source_session
+                    if session.seed is not None
+                    else session.root
+                )
+                _write_static_dashboard(
+                    out,
+                    last_snapshot,
+                    session_dir=session_dir,
+                )
+                continue
+            if command in {"/events", "/tail"}:
+                _write_line(out, _event_lines(last_snapshot))
+                continue
+            if command == "/cancel":
+                _write_line(out, "no turn is active; press Ctrl-C while a turn is running")
                 continue
             if command == "/new":
                 session.reset()
@@ -412,25 +524,61 @@ async def _run_interactive(
                 enabled=not quiet,
             )
             completed = False
+            cancel_requested = False
 
             def _live_sink(record: dict[str, Any]) -> None:
                 nonlocal sequence
-                session.observe_event(turn, record)  # noqa: B023
+                session.observe_event(turn, record)
                 sequence += 1
                 normalized = dict(record)
                 normalized["seq"] = sequence
-                state.apply(normalized)  # noqa: B023
-                if dashboard.enabled:  # noqa: B023
-                    dashboard.draw(state.snapshot(session_dir=turn.session_dir))  # noqa: B023
+                state.apply(normalized)
+                if dashboard.enabled:
+                    dashboard.draw(state.snapshot(session_dir=turn.session_dir))
                 elif not quiet:
                     _write_line(out, render.render_event_line(record, stream=out))
                 out.flush()
 
+            loop = asyncio.get_running_loop()
+            turn_task = loop.create_task(session.run_turn(turn, on_event=_live_sink))
+
+            def _request_cancel() -> None:
+                nonlocal cancel_requested
+                if not turn_task.done():
+                    cancel_requested = True
+                    turn_task.cancel()
+
+            signal_installed = False
             try:
-                with dashboard:
-                    response = await session.run_turn(turn, on_event=_live_sink)
-                    if dashboard.enabled:
-                        dashboard.draw(state.snapshot(session_dir=turn.session_dir))
+                try:
+                    loop.add_signal_handler(signal.SIGINT, _request_cancel)
+                    signal_installed = True
+                except (NotImplementedError, RuntimeError, ValueError):
+                    pass
+
+                try:
+                    with dashboard:
+                        response = await turn_task
+                        if dashboard.enabled:
+                            dashboard.draw(state.snapshot(session_dir=turn.session_dir))
+                except asyncio.CancelledError:
+                    if not cancel_requested:
+                        raise
+                    session.complete_turn(turn, succeeded=False)
+                    completed = True
+                    snapshot = state.snapshot(session_dir=turn.session_dir)
+                    last_snapshot = snapshot
+                    cumulative.add(snapshot)
+                    _write_line(
+                        out,
+                        "turn cancelled; the previous successful checkpoint remains "
+                        "the branch head",
+                    )
+                    _write_line(out, cumulative.line())
+                    _write_line(out, _branch_line(session))
+                    out.flush()
+                    continue
+
                 succeeded = response.exit_code == 0
                 session.complete_turn(turn, succeeded=succeeded)
                 completed = True
@@ -457,6 +605,9 @@ async def _run_interactive(
                 if not completed:
                     session.complete_turn(turn, succeeded=False)
                 raise
+            finally:
+                if signal_installed:
+                    loop.remove_signal_handler(signal.SIGINT)
 
             _write_result(out, render, response)
             snapshot = state.snapshot(session_dir=turn.session_dir)
@@ -472,6 +623,9 @@ async def _run_interactive(
         return ExitCode.INTERRUPTED
     except BrokenPipeError:
         return ExitCode.SUCCESS
+    finally:
+        if native_input:
+            _save_history(history_path)
 
 
 async def run_tui(
