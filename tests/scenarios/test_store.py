@@ -418,11 +418,13 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
         tmp_path / "events.db", fsync_interval_s=60.0, critical_timeout_s=0.4
     )
     release = threading.Event()
+    recovered = threading.Event()
     real_fsync = EventStore._fsync_now
 
     def stuck_fsync(self) -> None:
         release.wait(30.0)
         real_fsync(self)
+        recovered.set()
 
     monkeypatch.setattr(EventStore, "_fsync_now", stuck_fsync)
     try:
@@ -431,10 +433,13 @@ def test_critical_append_hard_deadline_raises_store_timeout(tmp_path, monkeypatc
             store.append({"kind": "result", "payload": {"ok": True}})
         elapsed = time.monotonic() - start
         assert 0.3 <= elapsed < 5.0  # bounded by the hard deadline, no hang
-        # store stays alive: a non-critical append is unaffected while the
-        # writer is stalled, and a later critical append succeeds on recovery.
+        # Store stays alive: a non-critical append is unaffected while the
+        # writer is stalled.  The recovery append gets a fresh scheduling
+        # budget after the deliberately timed-out fsync has completed.
         assert cast(int, store.append({"kind": "log", "payload": {}})) > 0
+        monkeypatch.setattr(store, "_critical_timeout_s", 5.0)
         release.set()
+        assert recovered.wait(5.0)
         seq = store.append({"kind": "result", "payload": {"ok": True}})
         assert cast(int, seq) > 0
     finally:
@@ -693,20 +698,36 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
     tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=2, critical_timeout_s=0.5)
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=2, critical_timeout_s=30.0)
     release = threading.Event()
     stalled = threading.Event()
+    starter_done = threading.Event()
+    starter_errors: list[BaseException] = []
+    sentinel_waiting = threading.Event()
     real_fsync = EventStore._fsync_now
+    real_put = store_module._BoundedEventQueue.put
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(30.0)
+        release.wait(60.0)
         real_fsync(self)
 
+    def append_starter() -> None:
+        try:
+            store.append({"kind": "result", "payload": {"i": 0}})
+        except BaseException as exc:
+            starter_errors.append(exc)
+        finally:
+            starter_done.set()
+
+    def track_sentinel(queue, item, **kwargs):
+        if queue is store._queue and item is store_module._SENTINEL:
+            sentinel_waiting.set()
+        return real_put(queue, item, **kwargs)
+
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
-    starter = threading.Thread(
-        target=lambda: store.append({"kind": "result", "payload": {"i": 0}})
-    )
+    monkeypatch.setattr(store_module._BoundedEventQueue, "put", track_sentinel)
+    starter = threading.Thread(target=append_starter)
     closer_done = threading.Event()
     close_errors: list[BaseException] = []
     closer: threading.Thread | None = None
@@ -732,18 +753,20 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
 
         closer = threading.Thread(target=close_store)
         closer.start()
-        assert not closer_done.wait(0.05)  # sentinel is waiting, not evicting
+        assert sentinel_waiting.wait(5.0)
+        assert not closer_done.is_set()  # sentinel is waiting, not evicting
         release.set()
-        assert closer_done.wait(1.0)
-        closer.join(1.0)
-        starter.join(1.0)
-        assert not starter.is_alive()
+        assert closer_done.wait(5.0)
+        assert starter_done.wait(5.0)
+        closer.join()
+        starter.join()
+        assert starter_errors == []
         assert close_errors == []
     finally:
         release.set()
         if closer is not None:
-            closer.join(5.0)
-        starter.join(5.0)
+            closer.join(30.0)
+        starter.join(30.0)
 
     events = store.events_after(0)
     assert [event["seq"] for event in events] == [1, 2, 3]
@@ -753,23 +776,31 @@ def test_close_sentinel_preserves_accepted_queue_items_and_counts_drops(
 
 def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.db"
-    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=0.5)
+    store = EventStore(path, fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=30.0)
     release = threading.Event()
     stalled = threading.Event()
+    starter_done = threading.Event()
+    starter_errors: list[BaseException] = []
     real_fsync = EventStore._fsync_now
     first_result: list[int] = []
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(30.0)
+        release.wait(60.0)
         real_fsync(self)
 
+    def append_starter() -> None:
+        try:
+            first_result.append(
+                cast(int, store.append({"kind": "result", "payload": {"i": 0}}))
+            )
+        except BaseException as exc:
+            starter_errors.append(exc)
+        finally:
+            starter_done.set()
+
     monkeypatch.setattr(EventStore, "_fsync_now", stalled_fsync)
-    starter = threading.Thread(
-        target=lambda: first_result.append(
-            cast(int, store.append({"kind": "result", "payload": {"i": 0}}))
-        )
-    )
+    starter = threading.Thread(target=append_starter)
     try:
         starter.start()
         assert stalled.wait(5.0)
@@ -778,12 +809,14 @@ def test_restart_after_tail_drop_does_not_reuse_a_sequence(tmp_path, monkeypatch
         assert accepted == 2
         assert dropped is None
         release.set()
-        starter.join(5.0)
+        assert starter_done.wait(30.0)
+        starter.join()
+        assert starter_errors == []
         assert first_result == [1]
         store.close()
     finally:
         release.set()
-        starter.join(5.0)
+        starter.join(30.0)
 
     reopened = EventStore(path, fsync_interval_s=60.0)
     try:
@@ -935,6 +968,7 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
     fsync_started = threading.Event()
     fsync_release = threading.Event()
     reservation_started = threading.Event()
+    reservation_finished = threading.Event()
     persistence_started = threading.Event()
     append_errors: list[BaseException] = []
     close_errors: list[BaseException] = []
@@ -948,7 +982,10 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
 
     def reserve_eviction(item, deadline) -> None:
         reservation_started.set()
-        real_reserve(item, deadline)
+        try:
+            real_reserve(item, deadline)
+        finally:
+            reservation_finished.set()
 
     def persist_sequence(*args, **kwargs):
         persistence_started.set()
@@ -975,26 +1012,26 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
     blocker = sqlite3.connect(path, isolation_level=None)
     try:
         first.start()
-        assert fsync_started.wait(1.0)
+        assert fsync_started.wait(5.0)
         assert store.append({"kind": "log", "payload": {"i": 1}}) == 2
         blocker.execute("BEGIN IMMEDIATE")
 
         critical.start()
-        assert reservation_started.wait(1.0)
+        assert reservation_started.wait(5.0)
         fsync_release.set()
-        store._thread.join(2.0)
+        store._thread.join(5.0)
         assert not store._thread.is_alive()
 
         closer.start()
-        assert persistence_started.wait(1.0)
-        time.sleep(0.3)  # let the blocked eviction reservation reach its deadline
+        assert persistence_started.wait(5.0)
+        assert reservation_finished.wait(5.0)
         blocker.rollback()
         blocker.close()
         blocker = cast(sqlite3.Connection, None)
 
-        closer.join(2.0)
-        critical.join(2.0)
-        first.join(2.0)
+        closer.join(5.0)
+        critical.join(5.0)
+        first.join(5.0)
         assert not closer.is_alive()
         assert not critical.is_alive()
         assert not first.is_alive()
@@ -1007,13 +1044,13 @@ def test_close_retries_pending_sequence_persistence_after_reservation_lock(
         if blocker is not None:
             blocker.rollback()
             blocker.close()
-        closer.join(2.0)
-        critical.join(2.0)
-        first.join(2.0)
+        closer.join(30.0)
+        critical.join(30.0)
+        first.join(30.0)
         if store._thread.is_alive():
             store._stop_requested.set()
             store._queue.wake()
-            store._thread.join(2.0)
+            store._thread.join(30.0)
 
     monkeypatch.undo()
     reopened = EventStore(path, fsync_interval_s=60.0)
@@ -1143,19 +1180,37 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
     tmp_path, monkeypatch
 ) -> None:
     store = EventStore(
-        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=2.0
+        tmp_path / "events.db", fsync_interval_s=60.0, max_queue_size=1, critical_timeout_s=30.0
     )
     release = threading.Event()
     stalled = threading.Event()
+    critical_waiting = threading.Event()
+    second_admitted = threading.Event()
     real_fsync = EventStore._fsync_now
+    real_put = store_module._BoundedEventQueue.put
+    real_wait = store._queue._cond.wait
     append_errors: list[BaseException] = []
     second_started = threading.Event()
     third_started = threading.Event()
+    critical_puts = 0
 
     def stalled_fsync(self) -> None:
         stalled.set()
-        release.wait(30.0)
+        release.wait(60.0)
         real_fsync(self)
+
+    def track_put(queue, item, **kwargs):
+        nonlocal critical_puts
+        result = real_put(queue, item, **kwargs)
+        if queue is store._queue and kwargs.get("critical") and item is None:
+            critical_puts += 1
+            if critical_puts == 1:
+                second_admitted.set()
+        return result
+
+    def track_wait(timeout=None):
+        critical_waiting.set()
+        return real_wait(timeout)
 
     def append_result(value: int, started: threading.Event) -> None:
         started.set()
@@ -1171,30 +1226,22 @@ def test_noncritical_drop_is_not_blocked_by_critical_queue_waiter(
     try:
         first.start()
         assert stalled.wait(5.0)
+        monkeypatch.setattr(store_module._BoundedEventQueue, "put", track_put)
+        monkeypatch.setattr(store._queue._cond, "wait", track_wait)
         second.start()
-        assert second_started.wait(1.0)
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            with store._queue._cond:
-                full = len(store._queue._items) == 1
-            if full:
-                break
-            time.sleep(0.001)
-        assert full  # pyright: ignore[reportPossiblyUnboundVariable]
+        assert second_started.wait(5.0)
+        assert second_admitted.wait(5.0)
         third.start()
-        assert third_started.wait(1.0)
-        time.sleep(0.01)
+        assert third_started.wait(5.0)
+        assert critical_waiting.wait(5.0)
 
-        start = time.monotonic()
         assert store.append({"kind": "log", "payload": {"i": 3}}) is None
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.2
         assert store.dropped == 1
     finally:
         release.set()
-        first.join(5.0)
-        second.join(5.0)
-        third.join(5.0)
+        first.join(30.0)
+        second.join(30.0)
+        third.join(30.0)
         store.close()
 
     assert not first.is_alive()

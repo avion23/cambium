@@ -908,14 +908,14 @@ class EventStore:
         else:
             try:
                 # A close sentinel is not an event. It must wait for space and
-                # never evict an accepted event from the bounded queue.
+                # never evict an accepted event from the bounded queue. Its
+                # admission is governed by close's deadline, not the producer
+                # deadline for a critical append: the writer may need to drain
+                # accepted items after a long fsync stall.
                 self._queue.put(
                     _SENTINEL,
                     critical=True,
-                    timeout=max(
-                        min(self._critical_timeout_s, close_deadline - time.monotonic()),
-                        0.0,
-                    ),
+                    timeout=max(close_deadline - time.monotonic(), 0.0),
                     evict_noncritical=False,
                 )
             except queue.Full:
