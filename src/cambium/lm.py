@@ -929,7 +929,11 @@ class _CambiumLMMixin(_DspyLMType):
                 }
                 for part in tool_calls
             ]
-        elif message.role == "tool" and len(message.parts) == 1 and message.parts[0].type == "tool_result":
+        elif (
+            message.role == "tool"
+            and len(message.parts) == 1
+            and message.parts[0].type == "tool_result"
+        ):
             result = message.parts[0]
             if all(part.type == "text" for part in result.content):
                 content = "".join(part.text for part in result.content)
