@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from .store import read_events_file
 
@@ -46,7 +46,7 @@ class IncrementalEventTail:
         return tuple(self._events[-limit:])
 
 
-class IncrementalSnapshotCache(Generic[T]):
+class IncrementalSnapshotCache[T]:
     """Rebuild an immutable projection only when a new durable event arrives."""
 
     def __init__(
