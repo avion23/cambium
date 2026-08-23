@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .provider_scheduler import QuotaLedger, quota_snapshot_json
+from .provider_scheduler import QuotaLedger, QuotaLedgerError, quota_snapshot_json
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return run_namespace(args)
-    except (OSError, ValueError) as exc:
+    except (OSError, QuotaLedgerError, ValueError) as exc:
         print(f"cambium quota: {exc}")
         return 2
 

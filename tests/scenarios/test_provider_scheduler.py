@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
@@ -10,9 +12,35 @@ import cambium.provider_scheduler as provider_state
 from cambium.provider_scheduler import (
     ProviderLease,
     QuotaLedger,
+    QuotaLedgerBusyError,
     QuotaWindowSpec,
     quota_snapshot_json,
 )
+
+
+def _reserve_from_process(path: str, index: int) -> bool:
+    ledger = QuotaLedger(path)
+    window = QuotaWindowSpec("process-window", 3600, request_allowance=12)
+    return ledger.reserve("zai", (window,), index, now=100.0) is not None
+
+
+class _ExecuteFaultConnection:
+    def __init__(self, connection: sqlite3.Connection, failures: dict[str, int]) -> None:
+        self._connection = connection
+        self._failures = failures
+
+    def execute(self, sql: str, *parameters):
+        for marker, remaining in tuple(self._failures.items()):
+            if remaining and marker in sql:
+                self._failures[marker] = remaining - 1
+                raise sqlite3.OperationalError("database is locked")
+        return self._connection.execute(sql, *parameters)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
 
 
 def test_module_has_one_state_role_and_no_competing_scheduler() -> None:
@@ -22,6 +50,9 @@ def test_module_has_one_state_role_and_no_competing_scheduler() -> None:
         "BillingMode",
         "ProviderLease",
         "QuotaLedger",
+        "QuotaLedgerBusyError",
+        "QuotaLedgerDiskFullError",
+        "QuotaLedgerError",
         "QuotaReservation",
         "QuotaWindowSnapshot",
         "QuotaWindowSpec",
@@ -67,6 +98,86 @@ def test_quota_ledger_reservation_is_atomic_across_threads(tmp_path: Path) -> No
         reservations = list(pool.map(reserve, range(20)))
     assert sum(item is not None for item in reservations) == 10
     assert ledger.snapshots("zai")[0].used_requests == 10
+
+
+@pytest.mark.slow
+def test_quota_ledger_reservations_are_atomic_across_processes(tmp_path: Path) -> None:
+    path = tmp_path / "quota.db"
+    context = get_context("spawn")
+    with ProcessPoolExecutor(max_workers=8, mp_context=context) as pool:
+        reservations = list(pool.map(_reserve_from_process, [str(path)] * 24, range(24)))
+
+    assert sum(reservations) == 12
+    ledger = QuotaLedger(path)
+    assert ledger.snapshots("zai")[0].used_requests == 12
+
+
+def test_busy_reservation_retries_with_backoff_and_commits_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("tokens", 300, token_allowance=100)
+    real_connect = ledger._connect
+    failures = {"INSERT INTO quota_reservations": 1}
+    sleeps: list[float] = []
+
+    def connect_with_one_busy() -> _ExecuteFaultConnection:
+        return _ExecuteFaultConnection(real_connect(), failures)
+
+    monkeypatch.setattr(ledger, "_connect", connect_with_one_busy)
+    monkeypatch.setattr(provider_state, "_BUSY_RETRY_S", 0.5)
+    monkeypatch.setattr(provider_state.time, "sleep", lambda delay: sleeps.append(delay))
+
+    reservation = ledger.reserve("p", (window,), 20, requests=0, now=1.0)
+
+    assert reservation is not None
+    assert sleeps == [provider_state._BUSY_RETRY_INITIAL_SLEEP_S]
+    assert ledger.snapshots("p")[0].used_tokens == 20
+    with sqlite3.connect(tmp_path / "quota.db") as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 1
+
+
+def test_busy_reservation_fails_structured_after_bounded_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    real_connect = ledger._connect
+    failures = {"BEGIN IMMEDIATE": 1_000_000}
+    sleeps: list[float] = []
+
+    def connect_always_busy() -> _ExecuteFaultConnection:
+        return _ExecuteFaultConnection(real_connect(), failures)
+
+    monkeypatch.setattr(ledger, "_connect", connect_always_busy)
+    monkeypatch.setattr(provider_state, "_BUSY_RETRY_S", 0.08)
+    monkeypatch.setattr(provider_state, "_BUSY_RETRY_INITIAL_SLEEP_S", 0.01)
+    monkeypatch.setattr(provider_state, "_BUSY_RETRY_MAX_SLEEP_S", 0.02)
+    real_sleep = provider_state.time.sleep
+
+    def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        real_sleep(delay)
+
+    monkeypatch.setattr(
+        provider_state.time,
+        "sleep", record_sleep,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(QuotaLedgerBusyError, match="remained busy") as excinfo:
+        ledger.reserve("p", (QuotaWindowSpec("requests", 60, request_allowance=1),), 0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert sleeps
+    assert sleeps[0] == pytest.approx(0.01)
+    assert max(sleeps) == pytest.approx(0.02)
+    assert sum(sleeps) <= 0.08
+    assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
+    with sqlite3.connect(tmp_path / "quota.db") as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
 
 
 def test_observe_preserves_pending_reservations(tmp_path: Path) -> None:

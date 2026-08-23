@@ -22,13 +22,26 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 _RESERVATION_RETENTION_S = 24 * 60 * 60
+
+# SQLite's built-in busy timeout is deliberately kept short.  The ledger
+# retries the *whole transaction* instead of allowing one connection to sleep
+# inside SQLite for an unbounded amount of the caller's time budget.  Retrying
+# the transaction (rather than an individual statement) is important: a
+# writer may have already changed one quota window before a later statement
+# reports SQLITE_BUSY.
+_SQLITE_CONNECT_TIMEOUT_S = 0.1
+_BUSY_RETRY_S = 2.0
+_BUSY_RETRY_INITIAL_SLEEP_S = 0.01
+_BUSY_RETRY_MAX_SLEEP_S = 0.25
+
+_ResultT = TypeVar("_ResultT")
 
 # CAST scheduling defaults are deliberately conservative.  A zero rollover
 # threshold disables automatic rollover, preserving the flat trunk behavior
@@ -695,6 +708,18 @@ class QuotaReservation:
     requests: int
 
 
+class QuotaLedgerError(RuntimeError):
+    """The durable quota ledger could not complete an operation."""
+
+
+class QuotaLedgerBusyError(QuotaLedgerError):
+    """The quota database stayed locked after bounded transaction retries."""
+
+
+class QuotaLedgerDiskFullError(QuotaLedgerError):
+    """The quota database could not persist state because storage is full."""
+
+
 def _state_path() -> Path:
     configured = os.environ.get("CAMBIUM_QUOTA_DB")
     if configured:
@@ -717,17 +742,99 @@ class QuotaLedger:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA journal_mode=WAL")
+        connection = sqlite3.connect(
+            self.path, timeout=_SQLITE_CONNECT_TIMEOUT_S, isolation_level=None
+        )
+        connection.execute("PRAGMA busy_timeout=0")
+        journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            raise QuotaLedgerError(f"SQLite did not enable WAL mode: {journal_mode!r}")
         connection.execute("PRAGMA synchronous=FULL")
         return connection
 
+    @staticmethod
+    def _is_busy(exc: BaseException) -> bool:
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int) and code & 0xFF == getattr(sqlite3, "SQLITE_BUSY", 5):
+            return True
+        if not isinstance(exc, sqlite3.Error):
+            return False
+        message = str(exc).lower()
+        return "database is locked" in message or "database table is locked" in message
+
+    @staticmethod
+    def _is_disk_full(exc: BaseException) -> bool:
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int) and code & 0xFF == getattr(sqlite3, "SQLITE_FULL", 13):
+            return True
+        message = str(exc).lower()
+        return (
+            "database or disk is full" in message
+            or "database is full" in message
+            or "no space left on device" in message
+        )
+
+    @classmethod
+    def _storage_failure(cls, operation: str, exc: BaseException) -> QuotaLedgerError:
+        if cls._is_disk_full(exc):
+            return QuotaLedgerDiskFullError(
+                f"quota ledger {operation} failed: database or disk is full"
+            )
+        return QuotaLedgerError(f"quota ledger {operation} failed: {exc}")
+
+    def _run_with_retry(
+        self,
+        operation: str,
+        action: Callable[[sqlite3.Connection], _ResultT],
+    ) -> _ResultT:
+        """Run one SQLite action with bounded, whole-operation busy retries."""
+        deadline = time.monotonic() + _BUSY_RETRY_S
+        delay = _BUSY_RETRY_INITIAL_SLEEP_S
+        while True:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                return action(connection)
+            except (sqlite3.Error, OSError) as exc:
+                if self._is_busy(exc):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise QuotaLedgerBusyError(
+                            f"quota ledger {operation} remained busy for "
+                            f"{_BUSY_RETRY_S}s"
+                        ) from exc
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, _BUSY_RETRY_MAX_SLEEP_S)
+                    continue
+                raise self._storage_failure(operation, exc) from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    def _run_transaction(
+        self,
+        operation: str,
+        action: Callable[[sqlite3.Connection], _ResultT],
+    ) -> _ResultT:
+        """Run ``action`` in a retryable ``BEGIN IMMEDIATE`` transaction."""
+
+        def transactional(connection: sqlite3.Connection) -> _ResultT:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = action(connection)
+                connection.commit()
+                return result
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+
+        return self._run_with_retry(operation, transactional)
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS quota_windows (
+        def initialize(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS quota_windows (
                     provider TEXT NOT NULL,
                     name TEXT NOT NULL,
                     reset_at REAL NOT NULL,
@@ -738,25 +845,30 @@ class QuotaLedger:
                     reserve_fraction REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(provider, name)
-                );
-                CREATE TABLE IF NOT EXISTS quota_reservations (
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS quota_reservations (
                     reservation_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
                     estimated_tokens INTEGER NOT NULL,
                     requests INTEGER NOT NULL,
                     reconciled INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS quota_reservation_windows (
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS quota_reservation_windows (
                     reservation_id TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     name TEXT NOT NULL,
                     reset_at REAL NOT NULL,
                     PRIMARY KEY(reservation_id, provider, name)
-                );
-                """
+                )"""
             )
             self._prune_reconciled(connection, time.time() - _RESERVATION_RETENTION_S)
+
+        self._run_transaction("initialization", initialize)
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -814,9 +926,7 @@ class QuotaLedger:
         if not math.isfinite(timestamp):
             raise ValueError("quota reservation time must be finite")
         reservation_id = uuid.uuid4().hex
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        def reserve_transaction(connection: sqlite3.Connection) -> QuotaReservation | None:
             self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
             normalized: list[tuple[QuotaWindowSpec, float, int, int]] = []
             for spec in windows:
@@ -879,13 +989,9 @@ class QuotaLedger:
                     for spec, reset_at, _, _ in normalized
                 ],
             )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-        return QuotaReservation(reservation_id, provider, estimated_tokens, requests)
+            return QuotaReservation(reservation_id, provider, estimated_tokens, requests)
+
+        return self._run_transaction("reserve", reserve_transaction)
 
     def reconcile(
         self,
@@ -902,16 +1008,13 @@ class QuotaLedger:
         timestamp = time.time() if now is None else float(now)
         if not math.isfinite(timestamp):
             raise ValueError("quota reconciliation time must be finite")
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        def reconcile_transaction(connection: sqlite3.Connection) -> None:
             row = connection.execute(
                 "SELECT estimated_tokens,reconciled FROM quota_reservations "
                 "WHERE reservation_id=? AND provider=?",
                 (reservation.reservation_id, reservation.provider),
             ).fetchone()
             if row is None or int(row[1]) != 0:
-                connection.commit()
                 return
             delta = actual_tokens - int(row[0])
             if delta:
@@ -931,12 +1034,8 @@ class QuotaLedger:
                 (reservation.reservation_id,),
             )
             self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+
+        self._run_transaction("reconcile", reconcile_transaction)
 
     def observe(
         self,
@@ -968,13 +1067,14 @@ class QuotaLedger:
             raise ValueError("remaining_requests must be non-negative")
         if not 0 <= reserve_fraction < 1:
             raise ValueError("reserve_fraction must be in [0, 1)")
-        used_tokens = 0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
-        used_requests = (
+        observed_tokens = (
+            0 if remaining_tokens is None else max(0, allowance_tokens - remaining_tokens)
+        )
+        observed_requests = (
             0 if remaining_requests is None else max(0, allowance_requests - remaining_requests)
         )
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+
+        def observe_transaction(connection: sqlite3.Connection) -> None:
             self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
             pending = connection.execute(
                 "SELECT COALESCE(SUM(reservation.estimated_tokens),0), "
@@ -987,8 +1087,8 @@ class QuotaLedger:
                 "AND reservation_window.reset_at=? AND reservation.reconciled=0",
                 (provider, name, reset_at),
             ).fetchone()
-            used_tokens += int(pending[0])
-            used_requests += int(pending[1])
+            used_tokens = observed_tokens + int(pending[0])
+            used_requests = observed_requests + int(pending[1])
             connection.execute(
                 "INSERT INTO quota_windows(provider,name,reset_at,allowance_tokens,used_tokens,"
                 "allowance_requests,used_requests,reserve_fraction,updated_at) "
@@ -1009,12 +1109,7 @@ class QuotaLedger:
                     timestamp,
                 ),
             )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        self._run_transaction("observe", observe_transaction)
 
     def snapshots(self, provider: str | None = None) -> tuple[QuotaWindowSnapshot, ...]:
         sql = (
@@ -1026,8 +1121,10 @@ class QuotaLedger:
             sql += " WHERE provider=?"
             params = (provider,)
         sql += " ORDER BY provider,name"
-        with self._connect() as connection:
-            rows = connection.execute(sql, params).fetchall()
+        rows = self._run_with_retry(
+            "snapshot",
+            lambda connection: connection.execute(sql, params).fetchall(),
+        )
         return tuple(QuotaWindowSnapshot(*row) for row in rows)
 
 
@@ -1044,6 +1141,9 @@ __all__ = [
     "BillingMode",
     "ProviderLease",
     "QuotaLedger",
+    "QuotaLedgerBusyError",
+    "QuotaLedgerDiskFullError",
+    "QuotaLedgerError",
     "QuotaReservation",
     "QuotaWindowSnapshot",
     "QuotaWindowSpec",
