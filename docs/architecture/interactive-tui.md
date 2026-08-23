@@ -3,13 +3,13 @@
 **Status:** implemented operator contract.
 
 `cambium tui` owns one user-visible CAST lineage across many prompts and keeps
-one full-screen operator cockpit alive for the complete terminal session.
-Each prompt still receives an isolated supervisor transaction and worktree, but
-the newest immutable context checkpoint becomes the next prompt's branch head.
-The frontend is a single writer: a successful turn advances that head, while a
-failed or cancelled leaf remains durable without becoming the next seed.  The
-interactive root is also locked, so two frontends cannot steer the same branch
-at once.
+one append-only operator transcript in the terminal's primary buffer for the
+complete terminal session. Each prompt still receives an isolated supervisor
+transaction and worktree, but the newest immutable context checkpoint becomes
+the next prompt's branch head. The frontend is a single writer: a successful
+turn advances that head, while a failed or cancelled leaf remains durable
+without becoming the next seed. The interactive root is also locked, so two
+frontends cannot steer the same branch at once.
 
 ```text
 interactive root
@@ -67,33 +67,47 @@ turn leaves. A corrupt or missing checkpoint fails closed instead of silently
 starting an unrelated context. Reconnect requires durable events or a
 checkpoint, so an abandoned empty allocation is not mistaken for a session.
 
-## Cockpit layout
+## Scrollback design
 
-On a normal wide terminal, the persistent alternate screen has two main panes:
+The live path deliberately chooses **design A: primary-buffer append mode**.
+Each draw appends only transcript rows that have not already been emitted and a
+compact status row:
 
 ```text
-┌ Cambium · running ───────────────────────────────────────────────────────┐
-│ session / branch / provider-model lease                                 │
-├ transcript and Markdown ───────────────────┬ agents / context / usage ──┤
-│ YOU                                        │ M root active               │
-│   inspect the routing code                 │   codex/gpt-5.6             │
-│                                            │   42k tok · 51 out/s        │
-│ CAMBIUM                                    ├ CONTEXT                     │
-│   ## Findings                              │ epoch 7 · segments 5        │
-│   - ...                                    │ trunk ≈18k · raw ≈900       │
-│ ⠹ responding… 1.2s                         │                              │
-│ ✓ read_batch ×3 · last 12ms                ├ SESSION USAGE               │
-│                                            │ calls / in / out / cache    │
-│                                            │ cost / throughput           │
-├────────────────────────────────────────────┴─────────────────────────────┤
-│ /help commands · <<< multiline >>> · Ctrl-C cancels turn · /exit        │
-│ ›                                                                         │
-└──────────────────────────────────────────────────────────────────────────┘
+YOU
+  inspect the routing code
+CAMBIUM
+  ## Findings
+  - ...
+TOOL
+  ✓ read_batch ×3 · last 12ms
+┌ Cambium · status=running · provider=codex model=gpt-5.6 · tokens=42k · ...
+›
 ```
 
-Narrow terminals use a compact stacked view. Both layouts are pure renderings of
-immutable frontend state and the event-sourced `ObservabilityState` projection.
-The TUI never reaches into live workers.
+The status row is emitted after changed content rather than painted over a
+fixed viewport. The terminal therefore keeps the complete interaction in its
+normal scrollback; PageUp/PageDown and the terminal's own search work without
+an application-specific history mode. While readline owns the prompt, live
+draws are coalesced and flushed after the read so asynchronous events cannot
+overwrite the line being edited. `/clear` clears Cambium's bounded local
+transcript for future draws; it intentionally cannot erase scrollback already
+owned by the terminal.
+
+Design B (retaining the fixed frame and adding an internal PageUp/PageDown or
+Ctrl-B/Ctrl-F history) was rejected for this iteration. It would preserve the
+existing rich two-pane viewport, but would require a second key-reading/input
+state machine alongside readline and would still hide output from the
+terminal's native scrollback. The primary-buffer change removes the
+alternate-screen and full-frame repaint controls, provides the higher-value
+operator behavior, and has a smaller failure surface. The trade-off is that the
+live view is a compact log rather than a continuously updated side panel; the
+immutable snapshots and bounded transcript remain the source of truth.
+
+The former framed renderer remains as a pure presentation helper for bounded
+snapshot tests and non-live callers. Both renderers are pure renderings of
+immutable frontend state and the event-sourced `ObservabilityState` projection;
+the TUI never reaches into live workers.
 
 The cockpit displays:
 
@@ -109,8 +123,6 @@ The cockpit displays:
   estimated cost;
 - streamed assistant/tool text as bounded Markdown-safe output while a turn is
   in flight, followed by the final Markdown response;
-- an activity spinner with elapsed `thinking`, `responding`, or running-tool
-  state;
 - successful consecutive calls to the same tool as one compact line with a
   repeat count and last duration. `v` expands command/output details for all
   tool entries; failed tools retain their detail instead of collapsing;
@@ -138,7 +150,7 @@ before rendering.
 /usage      cumulative tokens, throughput, calls, and cost
 /agents     main/sub-agent lifecycle table
 /new        begin a fresh context lineage; old artifacts remain durable
-/clear      clear only the visible cockpit transcript
+/clear      clear only the local transcript (terminal scrollback remains)
 /cancel     report whether a turn is active (active cancellation uses `!cancel`)
 /exit       close the frontend
 
@@ -148,7 +160,8 @@ v           toggle expanded command/output details for tool entries
 Multiline prompts start with `<<<` on a line by itself and end with `>>>`.
 Native terminals retain readline editing and private history at
 `<interactive-root>/.cambium/tui_history` (1,000 entries, mode `0600`). Cambium
-owns only the screen layout and submitted immutable prompt.
+owns only the appended presentation rows and the submitted immutable prompt;
+the terminal owns the scrollback buffer.
 
 ## Cancellation
 
@@ -192,5 +205,5 @@ presentation concern rather than a second runtime.
 8. `/fork` changes only the visible branch generation; `/branches` discovers
    durable checkpoint heads; `/model` validates and persists a configured
    preference for subsequent turns.
-9. Closing the TUI restores the terminal and leaves completed durable session
-   data intact.
+9. Closing the TUI leaves completed durable session data and native terminal
+   scrollback intact without entering or leaving an alternate screen.

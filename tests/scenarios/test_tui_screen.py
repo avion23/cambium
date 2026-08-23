@@ -1,10 +1,18 @@
 """Pure presentation tests for the persistent terminal cockpit."""
 
+import io
 from types import SimpleNamespace
 
 import pytest
 
-from cambium.tui_screen import Transcript, _side_sections, _transcript_lines, render_cockpit
+from cambium.tui_screen import (
+    Cockpit,
+    Transcript,
+    _side_sections,
+    _transcript_lines,
+    render_cockpit,
+    render_primary,
+)
 
 
 def _snapshot():
@@ -82,6 +90,103 @@ def test_compact_cockpit_stays_bounded() -> None:
     assert all(len(line) == 72 for line in lines)
     assert "agents=1 active" in "\n".join(lines)
     assert lines[-1].startswith("└")
+
+
+def test_primary_renderer_ends_with_compact_status_row() -> None:
+    transcript = Transcript()
+    transcript.user("Inspect the provider router")
+    transcript.assistant("The append-only view keeps terminal scrollback.")
+
+    lines = render_primary(
+        _snapshot(),
+        transcript,
+        session_description="session=/tmp/run",
+        branch_line="branch: turn=2 provider=codex model=gpt-5.6 epoch=4",
+        cumulative_line="usage: calls=3 tokens=12345",
+        width=96,
+    )
+
+    assert "YOU" in "\n".join(lines)
+    assert "CAMBIUM" in "\n".join(lines)
+    assert lines[-1].startswith("┌ Cambium · status=running")
+    assert "provider=codex model=gpt-5.6" in lines[-1]
+
+
+def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.system("ready")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        assert stream.getvalue() == first
+
+        transcript.assistant("new output")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+        )
+
+    text = stream.getvalue()
+    assert "new output" in text
+    assert text.count("┌ Cambium") == 2
+    assert "\x1b[?1049h" not in text
+    assert "\x1b[H" not in text
+    assert "\x1b[2J" not in text
+
+
+def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        transcript.assistant("deferred output")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+        )
+        assert "deferred output" not in stream.getvalue()
+        cockpit.hide_cursor(commit=True)
+        cockpit.flush()
+
+    assert "deferred output" in stream.getvalue()
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:

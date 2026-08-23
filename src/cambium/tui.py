@@ -98,6 +98,8 @@ _HELP = """Commands:
 
 Transcript view:
   v           toggle full command/output details for every tool entry.
+  Live output is appended to the terminal's native scrollback; use the
+  terminal's normal PageUp/PageDown or search controls to review it.
 
 During a running turn, !cancel or Ctrl-C cancels that turn and returns to this cockpit.
 The last successfully published context checkpoint remains the branch head.
@@ -220,14 +222,18 @@ def _read_prompt(
 def _read_cockpit_prompt(
     source: TextIO, cockpit: Cockpit, *, native: bool
 ) -> str | None:
-    """Read input on the cockpit footer while preserving native line editing."""
+    """Read input on the primary-buffer prompt line with native editing."""
 
     def read_one(label: str) -> str | None:
         cockpit.move_to_input(label=label)
         try:
             return _input_line(source, cockpit.stream, "", native=native)
         finally:
-            cockpit.hide_cursor()
+            # Injected streams do not echo the line terminator themselves;
+            # native readline does.  Commit only the former so the append-only
+            # primary buffer does not acquire an extra blank line on a real
+            # terminal.
+            cockpit.hide_cursor(commit=not native)
 
     value = read_one("›")
     if value is None:
@@ -667,6 +673,7 @@ async def _run_interactive(
         """Return queued input first, then wait for the next line source value."""
         nonlocal input_task, input_eof
         if pending_prompts:
+            cockpit.flush()
             return pending_prompts.popleft()
         _start_input_read()
         if input_task is None:
@@ -674,6 +681,7 @@ async def _run_interactive(
         task = input_task
         input_task = None
         prompt = await task
+        cockpit.flush()
         if prompt is None:
             input_eof = True
         return prompt
@@ -809,6 +817,7 @@ async def _run_interactive(
                                 task = input_task
                                 input_task = None
                                 queued_prompt = task.result()
+                                cockpit.flush()
                                 if queued_prompt is None:
                                     input_eof = True
                                 elif (
