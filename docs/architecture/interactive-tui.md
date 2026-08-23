@@ -1,16 +1,16 @@
-# Persistent interactive TUI
+# Persistent interactive terminal cockpit
 
-**Status:** implemented operator slice.
+**Status:** implemented operator contract.
 
-`cambium tui` owns one user-visible context lineage across many submitted
-prompts. It does not reopen a completed supervisor session directory. Instead,
-each prompt receives an isolated turn leaf while the newest immutable context
-checkpoint is carried forward.
+`cambium tui` owns one user-visible CAST lineage across many prompts and keeps
+one full-screen operator cockpit alive for the complete terminal session.
+Each prompt still receives an isolated supervisor transaction and worktree, but
+the newest immutable context checkpoint becomes the next prompt's branch head.
 
 ```text
 interactive root
 │
-├── first turn/session leaf
+├── turn-0001
 │      └── checkpoint C1  (provider/model lease + CAST trunk)
 │
 ├── turn-0002
@@ -21,14 +21,14 @@ interactive root
        ├── copied C2
        └── checkpoint C3
 
-Visible branch: C1 ──fork──> C2 ──fork──> C3
+Visible semantic branch: C1 ──fork──> C2 ──fork──> C3
 ```
 
 The exact checkpoint fork is attempted first. The same checkpoint is also
-supplied as a semantic-summary fallback. Therefore a compatible provider/model
-continues with the byte-stable cached trunk, while a compatibility change can
-still reconstruct the semantic trunk under a fresh provider-specific head.
-The adapter never mutates an old checkpoint.
+supplied as a semantic-summary fallback. A compatible provider/model continues
+with the byte-stable cached trunk. An incompatible provider can reconstruct the
+semantic trunk under a fresh provider-specific head without claiming a KV-cache
+hit.
 
 ## Running
 
@@ -36,96 +36,117 @@ The adapter never mutates an old checkpoint.
 PYTHONPATH=src python -m cambium tui --repo . --auto
 ```
 
-Use an explicit root to reopen the same interactive lineage later:
+Use a stable root to reopen the same lineage:
 
 ```bash
 PYTHONPATH=src python -m cambium tui \
   --repo . \
-  --session-dir .cambium/my-interactive-session \
+  --session-dir ~/.local/state/cambium/my-project \
   --auto
 ```
 
-The frontend stores only content-free lineage metadata at:
+The frontend stores content-free lineage metadata at:
 
 ```text
 <interactive-root>/.cambium/interactive.json
 ```
 
-Raw events, results, worktrees, and checkpoints stay inside the individual turn
-leaves. A corrupted or missing checkpoint fails closed rather than silently
-starting from an unrelated prompt.
+Raw events, results, worktrees, and checkpoints remain inside the individual
+turn leaves. A corrupt or missing checkpoint fails closed instead of silently
+starting an unrelated context.
+
+## Cockpit layout
+
+On a normal wide terminal, the persistent alternate screen has two main panes:
+
+```text
+┌ Cambium · running ───────────────────────────────────────────────────────┐
+│ session / branch / provider-model lease                                 │
+├ transcript and Markdown ───────────────────┬ agents / context / usage ──┤
+│ YOU                                        │ M root active               │
+│   inspect the routing code                 │   codex/gpt-5.6             │
+│                                            │   42k tok · 51 out/s        │
+│ CAMBIUM                                    ├ CONTEXT                     │
+│   ## Findings                              │ epoch 7 · segments 5        │
+│   - ...                                    │ trunk ≈18k · raw ≈900       │
+│                                            ├ SESSION USAGE               │
+│ TOOL                                       │ calls / in / out / cache    │
+│   read_batch: ok · 12ms                    │ cost / throughput           │
+├────────────────────────────────────────────┴─────────────────────────────┤
+│ /help commands · <<< multiline >>> · Ctrl-C cancels turn · /exit        │
+│ ›                                                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Narrow terminals use a compact stacked view. Both layouts are pure renderings of
+immutable frontend state and the event-sourced `ObservabilityState` projection.
+The TUI never reaches into live workers.
+
+The cockpit displays:
+
+- the persistent branch generation, turn, provider/model lease, and epoch;
+- user prompts and final model Markdown;
+- selected tool, child, checkpoint, merge, and failure events;
+- main and sub-agent state, provider/model, tokens, output tokens/second, and
+  current tool;
+- exact prompt tokens when reported by the provider;
+- approximate serialized trunk and raw-tail token sizes otherwise;
+- immutable summary-segment count and checkpoint identity;
+- current-turn and cumulative calls, input/output/cache tokens, throughput, and
+  estimated cost.
+
+Semantic colors distinguish user, model, tool, system, active, successful, and
+failed state. Color is disabled for `NO_COLOR`, `TERM=dumb`, non-TTY output, and
+machine-readable interfaces. Provider-controlled escape sequences are stripped
+before rendering.
 
 ## Commands
 
 ```text
 /help       command help
-/session    persistent root path and branch identity
-/model      current provider/model lease
-/context    current lineage/checkpoint/provider and trunk shape
-/usage      cumulative frontend usage
-/agents     latest main/sub-agent table
-/dashboard  copy the latest full dashboard into normal scrollback
+/status     branch, context, agents, and usage
+/dashboard  explain the visible live cockpit
 /events     recent durable event summaries
-/new        fresh context lineage; old artifacts remain durable
-/clear      clear the terminal
+/model      current provider/model lease
+/session    persistent root and lease
+/context    trunk, tail, checkpoint, and epoch
+/usage      cumulative tokens, throughput, calls, and cost
+/agents     main/sub-agent lifecycle table
+/new        begin a fresh context lineage; old artifacts remain durable
+/clear      clear only the visible cockpit transcript
 /exit       close the frontend
 ```
 
 Multiline prompts start with `<<<` on a line by itself and end with `>>>`.
-Native terminals use the system readline implementation for editing and history.
-History is stored privately at
-`<interactive-root>/.cambium/tui_history`, limited to 1,000 entries and mode
-`0600`.
+Native terminals retain readline editing and private history at
+`<interactive-root>/.cambium/tui_history` (1,000 entries, mode `0600`). Cambium
+owns only the screen layout and submitted immutable prompt.
 
 ## Cancellation
 
-While a turn is active, Ctrl-C cancels only that turn and returns to the input
-prompt. Cancellation propagates through the canonical supervisor task, so its
-worker processes and child tasks receive normal structured cancellation. The
-cancelled leaf remains auditable, but it cannot advance the interactive branch
-head. The next prompt therefore resumes from the last successfully published
-checkpoint rather than from a partial response.
+While a turn is active, Ctrl-C cancels that turn and returns to the cockpit.
+Cancellation propagates through the canonical supervisor task. The cancelled
+leaf remains auditable but cannot advance the branch head, so the next prompt
+resumes from the last successfully published checkpoint. Ctrl-C while waiting
+for input retains ordinary terminal interrupt behavior.
 
-Ctrl-C while the frontend is waiting for input retains the ordinary terminal
-interrupt behavior. `/cancel` at an idle prompt explains the active-turn
-shortcut rather than pretending that an operation is running.
+## Non-TTY behavior
 
-## TUI contents
-
-While a turn is active the alternate-screen dashboard displays:
-
-- main and sub-agent lifecycle;
-- provider and model per agent;
-- input, output, cached, and total tokens;
-- output tokens per second;
-- summary-call count and estimated cost;
-- context epoch, immutable summary-trunk size, and raw-tail size;
-- current tool and recent durable events.
-
-Semantic colors distinguish active, successful, failed, main-agent, and
-sub-agent rows. `NO_COLOR`, `TERM=dumb`, pipes, and machine-readable output
-remain free of ANSI decoration.
-
-After a turn, Cambium leaves the alternate screen, renders the final model
-summary as terminal Markdown, prints turn usage, and prints cumulative usage for
-the interactive frontend. Normal terminal scrollback is therefore retained for
-completed results. `/dashboard` provides a static copy of the latest dashboard
-when the operator wants the complete view in scrollback.
+Pipes, redirected output, and injected test streams use the deterministic
+line-oriented adapter. They do not receive cursor movement, colors, or an
+alternate screen. This preserves scripting compatibility and keeps the TUI a
+presentation concern rather than a second runtime.
 
 ## Correctness boundary
 
-The adapter is deliberately thin:
-
-1. first turns use the ordinary one-shot provider-resolution and supervisor path;
-2. continuation turns use the same plan builder and execution path;
-3. the adapter adds only the already-validated `context_fork` and
-   `summary_trunk_ref` descriptors;
-4. execution still belongs to the canonical supervisor;
-5. every turn has its own event store and publication transaction;
-6. only a successful turn with a durable context event may publish the next
-   interactive branch head;
-7. cancelled and failed turns leave the previous branch head unchanged.
-
-This avoids weakening the existing session-reuse guard merely to obtain a chat
-loop. The user sees one long branch, while the supervisor retains isolated,
-replayable turn transactions.
+1. `InteractiveSession` is the single writer for the user-visible branch head.
+2. Every prompt is one isolated supervisor leaf and publication transaction.
+3. The adapter adds only validated `context_fork` and `summary_trunk_ref`
+   descriptors.
+4. Provider resolution, OAuth, quotas, workers, tools, events, and Git
+   publication remain owned by the canonical runtime.
+5. The cockpit folds events and snapshots; it cannot mutate runtime state.
+6. `/new` advances the frontend branch generation but does not delete old
+   artifacts.
+7. Closing the TUI restores the terminal and leaves completed durable session
+   data intact.

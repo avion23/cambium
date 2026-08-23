@@ -87,7 +87,7 @@ Start a line-oriented interactive session:
 PYTHONPATH=src python -m cambium repl --repo . --auto
 ```
 
-Start the persistent live terminal interface:
+Start the persistent full-screen terminal cockpit:
 
 ```bash
 PYTHONPATH=src python -m cambium tui --repo . --auto
@@ -102,27 +102,30 @@ PYTHONPATH=src python -m cambium tui \
   --auto
 ```
 
+The cockpit remains active across the complete interactive session. Its left
+pane shows user prompts, model Markdown, and important tool/runtime events. Its
+right pane shows main and sub-agent state, provider/model, per-agent tokens,
+output tokens/second, CAST trunk size, summary segments, raw-tail size, epoch,
+checkpoint, cumulative usage, and recent durable events. Native terminals keep
+readline editing and private history. Ctrl-C cancels an active turn and returns
+to the cockpit without advancing the last successful branch checkpoint.
+
 The TUI carries the newest immutable context checkpoint into the next prompt,
 keeps the provider/model lease when exact cache reuse is compatible, and falls
 back to the provider-neutral semantic trunk when it is not. Each prompt still
-runs in an isolated supervisor leaf and worktree. Completed Markdown responses
-remain in normal terminal scrollback; the alternate-screen dashboard is used
-only while work is active.
-
-Native terminals provide line editing and private persistent history. Press
-Ctrl-C during an active turn to cancel that turn and return to the prompt; the
-last successful checkpoint remains the semantic branch head.
+runs in an isolated supervisor leaf and worktree. Non-TTY output remains
+line-oriented and receives no cursor controls or ANSI colors.
 
 Useful commands inside the TUI:
 
 ```text
-/help  /usage  /agents  /context  /session  /model
-/dashboard  /events  /new  /clear  /exit
+/help  /status  /dashboard  /events  /model  /usage  /agents
+/context  /session  /new  /clear  /exit
 ```
 
 Use `<<<` and `>>>` on their own lines for multiline prompts. See
 [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
-for the frontend and cancellation contract.
+for the layout and correctness boundary.
 
 Attach a read-only monitor to an existing supervisor leaf:
 
