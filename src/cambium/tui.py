@@ -8,6 +8,7 @@ import os
 import signal
 import sqlite3
 import sys
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -90,7 +91,7 @@ _HELP = """Commands:
 Transcript view:
   v           toggle full command/output details for every tool entry.
 
-During a running turn, Ctrl-C cancels that turn and returns to this cockpit.
+During a running turn, !cancel or Ctrl-C cancels that turn and returns to this cockpit.
 The last successfully published context checkpoint remains the branch head.
 
 Multiline input:
@@ -508,6 +509,55 @@ async def _run_interactive(
     if native_input:
         _load_history(history_path)
 
+    loop = asyncio.get_running_loop()
+    pending_prompts: deque[str] = deque()
+    input_task: asyncio.Task[str | None] | None = None
+    input_eof = False
+    input_closing = False
+
+    async def _read_line_source() -> str | None:
+        """Read a prompt without stopping live turn events or input steering."""
+        return await asyncio.to_thread(
+            _read_cockpit_prompt,
+            source,
+            cockpit,
+            native=native_input,
+        )
+
+    def _start_input_read() -> None:
+        nonlocal input_task
+        if input_task is None and not input_eof and not input_closing:
+            input_task = loop.create_task(_read_line_source())
+
+    async def _next_prompt() -> str | None:
+        """Return queued input first, then wait for the next line source value."""
+        nonlocal input_task, input_eof
+        if pending_prompts:
+            return pending_prompts.popleft()
+        _start_input_read()
+        if input_task is None:
+            return None
+        task = input_task
+        input_task = None
+        prompt = await task
+        if prompt is None:
+            input_eof = True
+        return prompt
+
+    async def _close_input_reader() -> None:
+        """Cancel a pending input read when the cockpit is shutting down."""
+        nonlocal input_task
+        task = input_task
+        input_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
     try:
         with cockpit:
             while True:
@@ -518,9 +568,7 @@ async def _run_interactive(
                     branch_line=_branch_line(session),
                     cumulative_line=cumulative.line(),
                 )
-                prompt = _read_cockpit_prompt(
-                    source, cockpit, native=native_input
-                )
+                prompt = await _next_prompt()
                 if prompt is None or prompt in {"/exit", "/quit"}:
                     return ExitCode.FAILURE if failed else ExitCode.SUCCESS
                 command = prompt.strip()
@@ -528,6 +576,11 @@ async def _run_interactive(
                     continue
                 if command == "v":
                     transcript.toggle_tool_details()
+                    continue
+                if command == "!cancel":
+                    transcript.system(
+                        "No turn is active; press !cancel or Ctrl-C while a turn is running."
+                    )
                     continue
                 if command == "/clear":
                     transcript.clear()
@@ -590,7 +643,7 @@ async def _run_interactive(
                         cumulative_line=cumulative.line(),  # noqa: B023
                     )
 
-                loop = asyncio.get_running_loop()
+                _start_input_read()
                 turn_task = loop.create_task(
                     session.run_turn(turn, on_event=_live_sink)
                 )
@@ -609,7 +662,43 @@ async def _run_interactive(
                     except (NotImplementedError, RuntimeError, ValueError):
                         pass
                     try:
-                        response = await turn_task
+                        while True:
+                            wait_tasks: set[asyncio.Task[Any]] = {turn_task}
+                            if input_task is not None:
+                                wait_tasks.add(input_task)
+                            done, _ = await asyncio.wait(
+                                wait_tasks,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+
+                            if input_task is not None and input_task in done:
+                                task = input_task
+                                input_task = None
+                                queued_prompt = task.result()
+                                if queued_prompt is None:
+                                    input_eof = True
+                                elif (
+                                    queued_prompt.strip() == "!cancel"
+                                    and not turn_task.done()
+                                ):
+                                    _request_cancel()
+                                else:
+                                    pending_prompts.append(queued_prompt)
+                                    if queued_prompt in {"/exit", "/quit"}:
+                                        input_closing = True
+                                    transcript.system(f"queued: {queued_prompt}")
+                                    cockpit.draw(
+                                        state.snapshot(session_dir=turn.session_dir),
+                                        transcript,
+                                        session_description=session.describe(),
+                                        branch_line=_branch_line(session),
+                                        cumulative_line=cumulative.line(),
+                                    )
+                                _start_input_read()
+
+                            if turn_task in done:
+                                response = await turn_task
+                                break
                     except asyncio.CancelledError:
                         if not cancel_requested:
                             raise
@@ -672,6 +761,7 @@ async def _run_interactive(
     except BrokenPipeError:
         return ExitCode.SUCCESS
     finally:
+        await _close_input_reader()
         if native_input:
             _save_history(history_path)
 

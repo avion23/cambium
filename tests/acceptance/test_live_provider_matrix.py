@@ -1,10 +1,13 @@
 """Opt-in live-provider acceptance checks.
 
 The tests in this module deliberately have no credential fixtures.  A test
-skips until its named provider configuration, credential environment variable,
-and (for Codex) OAuth-store path are supplied explicitly by the operator.  The
-OAuth mutation cases additionally require a disposable-account confirmation.
-No token value is constructed, printed, or placed in a test constant.
+skips until its named provider configuration and credential are available. API
+keys may be supplied through the provider's configured environment variable or
+read-only from the local OpenCode and pi auth stores. Codex still requires an
+explicit OAuth-store path because its mutation cases must never touch a
+developer's normal session. The OAuth mutation cases additionally require a
+disposable-account confirmation. No token value is constructed, printed, or
+placed in a test constant.
 
 Run the suite with ``python -m pytest -m acceptance tests/acceptance -s``.
 The ``-s`` is useful only for an operator-supplied interactive fresh-login
@@ -21,7 +24,7 @@ import shlex
 import subprocess
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty
 from typing import Any
@@ -29,7 +32,7 @@ from typing import Any
 import pytest
 
 from cambium import supervisor
-from cambium.auth import oauth_env_suffix
+from cambium.auth import effective_home, oauth_env_suffix
 from cambium.diffundo import CredentialSource, Diffundo, ProviderConfig
 from cambium.oauth import (
     DEFAULT_REFRESH_MARGIN_S,
@@ -39,7 +42,13 @@ from cambium.oauth import (
     TokenManager,
     oauth_store_path,
 )
-from cambium.provider_config import AuthMode, Protocol, load_providers
+from cambium.provider_config import (
+    DEFAULT_PROVIDER_PATH,
+    AuthMode,
+    Protocol,
+    load_providers,
+)
+from cambium.provider_scheduler import BillingMode
 
 CODEX_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_CODEX_CONFIG"
 CODEX_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_CODEX_PROVIDER"
@@ -65,6 +74,26 @@ OPENCODE_ZEN_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_OPENCODE_ZEN_CONFIG"
 OPENCODE_ZEN_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_OPENCODE_ZEN_PROVIDER"
 CACHE_CONFIG_ENV = "CAMBIUM_ACCEPTANCE_CACHE_CONFIG"
 CACHE_PROVIDER_ENV = "CAMBIUM_ACCEPTANCE_CACHE_PROVIDER"
+OPENCODE_AUTH_ENV = "CAMBIUM_ACCEPTANCE_OPENCODE_AUTH"
+PI_AUTH_ENV = "CAMBIUM_ACCEPTANCE_PI_AUTH"
+
+_AUTH_SOURCE_NAMES = ("OpenCode", "pi")
+_AUTH_SOURCE_ENV = (OPENCODE_AUTH_ENV, PI_AUTH_ENV)
+_AUTH_SOURCE_RELATIVE_PATHS = (
+    Path(".local/share/opencode/auth.json"),
+    Path(".pi/agent/auth.json"),
+)
+_PROVIDER_AUTH_ALIASES: dict[str, tuple[str, ...]] = {
+    # OpenCode's credential store calls the Zen API key ``opencode-go`` while
+    # Cambium's provider profile is named ``opencode-zen``. Keep the alias
+    # here, at the acceptance boundary, rather than changing the production
+    # provider identifiers.
+    "opencode": ("opencode-zen", "opencode-go"),
+    "opencode-go": ("opencode-zen", "opencode"),
+    "opencode-zen": ("opencode-go", "opencode"),
+    "zai": ("zai-coding-plan",),
+    "zai-coding-plan": ("zai",),
+}
 
 _PROBE_PROMPT = {
     "messages": [
@@ -81,6 +110,7 @@ class _ProviderContext:
     config_path: Path
     provider: ProviderConfig
     config_entry: dict[str, object]
+    using_default_config: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +135,78 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _auth_source_paths() -> tuple[Path, ...]:
+    """Return the supported local auth paths without reading their contents."""
+
+    try:
+        home = effective_home()
+    except OSError:
+        home = Path.home()
+    paths: list[Path] = []
+    for environment_name, relative_path in zip(
+        _AUTH_SOURCE_ENV, _AUTH_SOURCE_RELATIVE_PATHS, strict=True
+    ):
+        configured = os.environ.get(environment_name, "").strip()
+        paths.append(Path(configured).expanduser() if configured else home / relative_path)
+    return tuple(paths)
+
+
+def _read_api_key_entries(path: Path) -> Mapping[str, object]:
+    """Read provider metadata from one auth store without exposing key values.
+
+    The OpenCode store uses ``{"type": "api", "key": ...}``, while the pi
+    store uses ``{"type": "api_key", "key": ...}``. The acceptance harness
+    needs only the common ``key`` field and intentionally ignores OAuth-shaped
+    ``access``/``refresh`` records. Missing or malformed optional sources act
+    like an unavailable credential and therefore preserve skip-gating.
+    """
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    entries: dict[str, object] = {}
+    for provider, entry in raw.items():
+        if not isinstance(provider, str) or not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if isinstance(key, str) and key:
+            entries[provider] = key
+    return entries
+
+
+def _auth_provider_names(provider_name: str) -> tuple[str, ...]:
+    """Return exact and compatibility names used by local auth stores."""
+
+    names = (provider_name, *_PROVIDER_AUTH_ALIASES.get(provider_name.casefold(), ()))
+    return tuple(dict.fromkeys(names))
+
+
+def _api_key_from_auth_sources(provider_name: str) -> str | None:
+    """Find one API key for ``provider_name`` in the supported auth stores."""
+
+    names = _auth_provider_names(provider_name)
+    for path in _auth_source_paths():
+        entries = _read_api_key_entries(path)
+        for name in names:
+            value = entries.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _api_key_for_provider(provider: ProviderConfig) -> str | None:
+    """Resolve a configured API key from the environment or local auth stores."""
+
+    if provider.api_key_env:
+        configured = os.environ.get(provider.api_key_env, "")
+        if configured:
+            return configured
+    return _api_key_from_auth_sources(provider.name)
+
+
 def _required_file(name: str) -> Path:
     path = Path(_required_env(name)).expanduser()
     if not path.is_file():
@@ -112,7 +214,18 @@ def _required_file(name: str) -> Path:
     return path
 
 
-def _load_config_entry(path: Path, provider_name: str) -> dict[str, object]:
+def _config_file(name: str) -> Path:
+    """Use an explicit acceptance config or the normal local provider file."""
+
+    configured = os.environ.get(name, "").strip()
+    if configured:
+        return _required_file(name)
+    if not DEFAULT_PROVIDER_PATH.is_file():
+        pytest.skip(f"set {name} or create the default provider config")
+    return DEFAULT_PROVIDER_PATH
+
+
+def _load_config_entries(path: Path) -> list[dict[str, object]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -120,15 +233,74 @@ def _load_config_entry(path: Path, provider_name: str) -> dict[str, object]:
     entries = raw.get("providers") if isinstance(raw, dict) else None
     if not isinstance(entries, list):
         pytest.fail("provider config does not contain a providers list")
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("name") == provider_name:
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _load_config_entry(path: Path, provider_name: str) -> dict[str, object]:
+    for entry in _load_config_entries(path):
+        if entry.get("name") == provider_name:
             return entry
     pytest.fail("provider config does not contain the requested acceptance provider")
 
 
+def _default_provider_name(provider_env: str, entries: list[dict[str, object]]) -> str | None:
+    """Choose a conservative default provider from a local config.
+
+    Explicit provider variables remain authoritative. These defaults only
+    remove boilerplate for the checked-in family names and never invent a
+    paid/cache lane when the config does not describe one.
+    """
+
+    if provider_env == CODEX_PROVIDER_ENV:
+        return "codex"
+    if provider_env == ZAI_PROVIDER_ENV:
+        return "zai"
+    if provider_env == OPENCODE_ZEN_PROVIDER_ENV:
+        return "opencode-zen"
+    if provider_env == CACHE_PROVIDER_ENV:
+        for entry in entries:
+            name = entry.get("name")
+            if (
+                isinstance(name, str)
+                and "price_per_1m_cached_in" in entry
+                and entry.get("pricing_known") is True
+            ):
+                return name
+        return "opencode-zen"
+    if provider_env in (OPENROUTER_FREE_PROVIDER_ENV, OPENROUTER_PAID_PROVIDER_ENV):
+        candidates: list[dict[str, object]] = []
+        for entry in entries:
+            name = entry.get("name")
+            if not isinstance(name, str) or "openrouter" not in name.casefold():
+                continue
+            billing = entry.get("billing_mode")
+            model = entry.get("model")
+            is_free = billing == "free" or (
+                isinstance(model, str) and model.casefold().endswith(":free")
+            )
+            if provider_env == OPENROUTER_FREE_PROVIDER_ENV and is_free:
+                candidates.append(entry)
+            elif provider_env == OPENROUTER_PAID_PROVIDER_ENV and billing in {
+                "metered",
+                "subscription",
+            } and not is_free:
+                candidates.append(entry)
+        if candidates:
+            name = candidates[0].get("name")
+            return name if isinstance(name, str) else None
+        return None
+    return None
+
+
 def _provider_context(config_env: str, provider_env: str) -> _ProviderContext:
-    config_path = _required_file(config_env)
-    provider_name = _required_env(provider_env)
+    using_default_config = not os.environ.get(config_env, "").strip()
+    config_path = _config_file(config_env)
+    entries = _load_config_entries(config_path)
+    provider_name = os.environ.get(provider_env, "").strip()
+    if not provider_name:
+        provider_name = _default_provider_name(provider_env, entries) or ""
+    if not provider_name:
+        pytest.skip(f"set {provider_env} to select a configured acceptance provider")
     try:
         providers = load_providers(config_path)
     except (OSError, ValueError) as exc:
@@ -140,6 +312,7 @@ def _provider_context(config_env: str, provider_env: str) -> _ProviderContext:
         config_path=config_path,
         provider=provider,
         config_entry=_load_config_entry(config_path, provider_name),
+        using_default_config=using_default_config,
     )
 
 
@@ -147,8 +320,27 @@ def _api_provider_context(config_env: str, provider_env: str) -> _ProviderContex
     context = _provider_context(config_env, provider_env)
     if context.provider.auth is not AuthMode.API_KEY:
         pytest.fail("live provider skeletons require an api_key provider entry")
-    if not context.provider.api_key_env or not os.environ.get(context.provider.api_key_env):
-        pytest.skip(f"set {context.provider.api_key_env} for the configured provider")
+    if not _api_key_for_provider(context.provider):
+        pytest.skip(
+            f"set {context.provider.api_key_env} or add {context.provider.name} "
+            "to the supported OpenCode/pi auth stores"
+        )
+    if context.using_default_config and provider_env == ZAI_PROVIDER_ENV:
+        if not context.provider.quota_windows:
+            pytest.skip("default z.ai provider config does not declare quota_windows")
+    if (
+        context.using_default_config
+        and provider_env == OPENROUTER_FREE_PROVIDER_ENV
+        and context.provider.model.casefold().endswith(":free")
+        and context.provider.billing_mode is BillingMode.METERED
+    ):
+        # Older local provider files predate the billing metadata used by the
+        # routing requirements. A :free model is an unambiguous compatibility
+        # signal, but only infer it for the implicit local config; an explicit
+        # acceptance config remains strict and fails if its metadata is wrong.
+        context = replace(
+            context, provider=replace(context.provider, billing_mode=BillingMode.FREE)
+        )
     return context
 
 
@@ -245,6 +437,16 @@ def _codex_probe(
 
 
 def _api_router(context: _ProviderContext, monkeypatch: pytest.MonkeyPatch) -> Diffundo:
+    api_key = _api_key_for_provider(context.provider)
+    if not api_key:
+        pytest.skip(
+            f"set {context.provider.api_key_env} or add {context.provider.name} "
+            "to the supported OpenCode/pi auth stores"
+        )
+    # Diffundo intentionally resolves API keys from the environment at call
+    # time. Keep the source-file read in this test process only; monkeypatch
+    # removes the derived environment value when the test returns.
+    monkeypatch.setenv(context.provider.api_key_env, api_key)
     quota_db = os.environ.get(QUOTA_DB_ENV)
     if context.provider.quota_windows and not quota_db:
         pytest.skip(f"set {QUOTA_DB_ENV} to an isolated quota database path")

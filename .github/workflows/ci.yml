@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install locked development environment
+        run: uv sync --locked --extra dev
+      - name: Ruff
+        run: uv run ruff check src tests
+      - name: Compile
+        run: uv run python -m compileall -q src tests
+      - name: Fast tests
+        run: uv run pytest -n auto -q
+      - name: Slow tests
+        run: uv run pytest -n auto -m slow -q
+      - name: Archive exact checkout for diagnostics
+        if: always()
+        run: tar --exclude=.git -czf /tmp/cambium-source.tar.gz .
+      - name: Upload exact checkout
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cambium-source-${{ github.run_id }}
+          path: /tmp/cambium-source.tar.gz
+          retention-days: 1
