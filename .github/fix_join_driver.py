@@ -49,5 +49,13 @@ new = '''replace_once(
 '''
 if text.count(old) != 1:
     raise RuntimeError("transactional dispatch patch block changed")
-path.write_text(text.replace(old, new, 1), encoding="utf-8")
+text = text.replace(old, new, 1)
+for source, escaped in (
+    (r'"parent\n"', r'"parent\\n"'),
+    (r'"child\n"', r'"child\\n"'),
+):
+    if text.count(source) != 1:
+        raise RuntimeError(f"expected one generated test literal {source!r}")
+    text = text.replace(source, escaped, 1)
+path.write_text(text, encoding="utf-8")
 runpy.run_path(str(path), run_name="__main__")
