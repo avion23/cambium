@@ -83,6 +83,7 @@ _PROVIDER_FIELDS = frozenset(
         "timeout_s",
         "max_retries",
         "rpm",
+        "requests_per_minute",
         "enabled",
         "model",
         "priority",
@@ -94,6 +95,7 @@ _PROVIDER_FIELDS = frozenset(
         "context_window",
         "reasoning_effort",
         "max_concurrency",
+        "max_in_flight",
         "billing_mode",
         "quota_windows",
         "price_per_1m_in",
@@ -101,6 +103,7 @@ _PROVIDER_FIELDS = frozenset(
         "price_per_1m_out",
         "pricing_known",
         "throughput_hint_tps",
+        "tokens_per_s",
         "quality_weight",
         "supports_native_tools",
         "supports_python_tool",
@@ -111,6 +114,8 @@ _DEFAULTS: dict[str, object] = {
     "timeout_s": 30.0,
     "max_retries": 2,
     "rpm": 60,
+    # New routing spelling; ``None`` means use the legacy rpm value.
+    "requests_per_minute": None,
     "enabled": True,
     "required": False,
     "model": "",
@@ -124,6 +129,9 @@ _DEFAULTS: dict[str, object] = {
     # provider declares no capacity, so min_context_window tasks exclude it.
     "context_window": 0,
     "max_concurrency": 1,
+    # New independent concurrency dimension; ``None`` preserves the
+    # conservative legacy derivation in ProviderConfig.__post_init__.
+    "max_in_flight": None,
     "billing_mode": "metered",
     "quota_windows": (),
     "price_per_1m_in": 0.0,
@@ -131,6 +139,7 @@ _DEFAULTS: dict[str, object] = {
     "price_per_1m_out": 0.0,
     "pricing_known": False,
     "throughput_hint_tps": 0.0,
+    "tokens_per_s": None,
     "quality_weight": 1.0,
     "supports_native_tools": True,
     "supports_python_tool": True,
@@ -147,6 +156,7 @@ class _ProviderMapping(TypedDict):
     timeout_s: float
     max_retries: int
     rpm: int
+    requests_per_minute: int | None
     enabled: bool
     model: str
     priority: int
@@ -158,6 +168,7 @@ class _ProviderMapping(TypedDict):
     context_window: int
     reasoning_effort: str | None
     max_concurrency: int
+    max_in_flight: int | None
     billing_mode: BillingMode
     quota_windows: tuple[QuotaWindowSpec, ...]
     price_per_1m_in: float
@@ -165,6 +176,7 @@ class _ProviderMapping(TypedDict):
     price_per_1m_out: float
     pricing_known: bool
     throughput_hint_tps: float
+    tokens_per_s: float | None
     quality_weight: float
     supports_native_tools: bool
     supports_python_tool: bool
@@ -433,6 +445,25 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     if rpm <= 0:
         raise _error(f"{location}.rpm", "must be greater than 0")
 
+    raw_requests_per_minute = raw.get("requests_per_minute")
+    requests_per_minute: int | None
+    if raw_requests_per_minute is None:
+        # An rpm-only provider stays on the legacy path.  ProviderConfig
+        # derives its conservative in-flight default while retaining rpm for
+        # the transport token bucket.
+        requests_per_minute = None
+    else:
+        requests_per_minute = _require_integer(
+            raw_requests_per_minute, f"{location}.requests_per_minute"
+        )
+        if requests_per_minute <= 0:
+            raise _error(f"{location}.requests_per_minute", "must be greater than 0")
+        if "rpm" in raw and requests_per_minute != rpm:
+            raise _error(
+                location,
+                "rpm and requests_per_minute must agree when both are declared",
+            )
+
     enabled = values["enabled"]
     if not isinstance(enabled, bool):
         raise _error(f"{location}.enabled", "must be a boolean")
@@ -466,6 +497,19 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     max_concurrency = _require_integer(values["max_concurrency"], f"{location}.max_concurrency")
     if max_concurrency <= 0:
         raise _error(f"{location}.max_concurrency", "must be greater than 0")
+    raw_max_in_flight = raw.get("max_in_flight")
+    max_in_flight: int | None
+    if raw_max_in_flight is None:
+        max_in_flight = None
+    else:
+        max_in_flight = _require_integer(raw_max_in_flight, f"{location}.max_in_flight")
+        if max_in_flight <= 0:
+            raise _error(f"{location}.max_in_flight", "must be greater than 0")
+        if "max_concurrency" in raw and max_concurrency != max_in_flight:
+            raise _error(
+                location,
+                "max_concurrency and max_in_flight must agree when both are declared",
+            )
     billing_mode = _parse_billing_mode(values["billing_mode"], f"{location}.billing_mode")
     quota_windows = _parse_quota_windows(raw.get("quota_windows", []), f"{location}.quota_windows")
     legacy_price = price
@@ -504,6 +548,19 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     throughput_hint_tps = _require_number(
         values["throughput_hint_tps"], f"{location}.throughput_hint_tps"
     )
+    raw_tokens_per_s = raw.get("tokens_per_s")
+    tokens_per_s: float | None
+    if raw_tokens_per_s is None:
+        tokens_per_s = None
+    else:
+        tokens_per_s = _require_number(raw_tokens_per_s, f"{location}.tokens_per_s")
+        if tokens_per_s < 0:
+            raise _error(f"{location}.tokens_per_s", "must be non-negative")
+        if "throughput_hint_tps" in raw and throughput_hint_tps not in (0, tokens_per_s):
+            raise _error(
+                location,
+                "throughput_hint_tps and tokens_per_s must agree when both are declared",
+            )
     quality_weight = _require_number(values["quality_weight"], f"{location}.quality_weight")
     if throughput_hint_tps < 0 or quality_weight < 0:
         raise _error(location, "throughput_hint_tps and quality_weight must be non-negative")
@@ -539,6 +596,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "timeout_s": timeout_s,
         "max_retries": max_retries,
         "rpm": rpm,
+        "requests_per_minute": requests_per_minute,
         "enabled": enabled,
         "model": model,
         "priority": priority,
@@ -550,6 +608,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "context_window": context_window,
         "reasoning_effort": reasoning_effort,
         "max_concurrency": max_concurrency,
+        "max_in_flight": max_in_flight,
         "billing_mode": billing_mode,
         "quota_windows": quota_windows,
         "price_per_1m_in": price_per_1m_in,
@@ -557,6 +616,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "price_per_1m_out": price_per_1m_out,
         "pricing_known": pricing_known,
         "throughput_hint_tps": throughput_hint_tps,
+        "tokens_per_s": tokens_per_s,
         "quality_weight": quality_weight,
         "supports_native_tools": supports_native_tools,
         "supports_python_tool": supports_python_tool,
@@ -639,6 +699,7 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "timeout_s": values["timeout_s"],
         "max_retries": values["max_retries"],
         "rpm": values["rpm"],
+        "requests_per_minute": values["requests_per_minute"],
         "enabled": values["enabled"],
         "model": values["model"],
         "priority": values["priority"],
@@ -649,11 +710,13 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "context_window": values["context_window"],
         "reasoning_effort": values["reasoning_effort"],
         "max_concurrency": values["max_concurrency"],
+        "max_in_flight": values["max_in_flight"],
         "billing_mode": values["billing_mode"],
         "quota_windows": values["quota_windows"],
         "price_per_1m_cached_in": values["price_per_1m_cached_in"],
         "pricing_known": values["pricing_known"],
         "throughput_hint_tps": values["throughput_hint_tps"],
+        "tokens_per_s": values["tokens_per_s"],
         "quality_weight": values["quality_weight"],
         "supports_native_tools": values["supports_native_tools"],
         "supports_python_tool": values["supports_python_tool"],

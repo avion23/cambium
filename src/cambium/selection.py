@@ -39,7 +39,12 @@ def _field(entry: Any, name: str, default: Any) -> Any:
 
 def _number(value: Any, default: float = 0.0) -> float:
     if isinstance(value, int | float) and not isinstance(value, bool):
-        return max(0.0, float(value))
+        try:
+            parsed = float(value)
+        except (OverflowError, ValueError):
+            return default
+        if math.isfinite(parsed):
+            return max(0.0, parsed)
     return default
 
 
@@ -53,9 +58,9 @@ def quality_score(
 
     The key orders empirical failure probability first, then latency SLO
     compliance, expected cost per successful turn, and finally a normalized
-    latency/cache tie-break. The last component is only reached after the hard
-    statistical and SLO comparisons. Missing and stale evidence returns
-    ``None`` so it cannot move a provider from its configured position.
+    throughput/latency/cache tie-break. The last component is only reached
+    after the hard statistical and SLO comparisons. Missing and stale evidence
+    returns ``None`` so it cannot move a provider from its configured position.
     """
     if entry is None:
         return None
@@ -86,7 +91,18 @@ def quality_score(
     expected_cost = cost / successes if cost > 0.0 and successes else float("inf")
     cache_hits = min(requests, int(_number(_field(entry, "cache_hit_count", 0))))
     cache_fraction = cache_hits / requests
-    tie_break = weights.latency_weight * latency_ratio - weights.cache_weight * cache_fraction
+    # ``tokens_per_s`` is folded by routing.ProviderDebt from the existing
+    # usage-event output-token and latency fields.  Keep it in the final
+    # tie-break dimension so configured priority, failure/SLO evidence, and
+    # equal-cost ordering retain their existing precedence while equal
+    # candidates prefer the measured-faster provider.  Missing evidence is
+    # neutral (zero) and therefore cannot demote a provider by itself.
+    throughput = _number(_field(entry, "tokens_per_s", 0.0))
+    tie_break = (
+        weights.latency_weight * latency_ratio
+        - weights.cache_weight * cache_fraction
+        - throughput
+    )
     return (failure_probability, slo_miss, expected_cost, tie_break)
 
 
@@ -98,7 +114,23 @@ def _quality_entry(
     weights: QualityWeights,
 ) -> QualityScore | None:
     entry = debt.get(candidate.name) if debt else None
-    return quality_score(entry, now=now, weights=weights)
+    measured = quality_score(entry, now=now, weights=weights)
+    if measured is not None:
+        return measured
+
+    # A declared hint is only a fallback for providers without fresh usage
+    # evidence. Observed DebtStore evidence always wins and remains the source
+    # of truth for measured routing quality.
+    hint = _number(
+        _field(candidate, "tokens_per_s", _field(candidate, "throughput_hint_tps", 0.0))
+    )
+    if hint <= 0:
+        return None
+    return quality_score(
+        {"requests": 1, "last_seen": now, "tokens_per_s": hint},
+        now=now,
+        weights=weights,
+    )
 
 
 def order_candidates[T: Candidate](

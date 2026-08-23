@@ -108,7 +108,7 @@ import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from enum import Enum
@@ -325,6 +325,10 @@ class ProviderConfig:
     ``api_key_env`` (the transport derives the endpoint from the profile).
     ``reasoning_effort`` is a normal (non-secret) config field emitted as the
     Responses-API ``reasoning: {effort}`` body field on the codex path.
+    ``requests_per_minute`` and ``max_in_flight`` are independent admission
+    dimensions; ``rpm`` and ``max_concurrency`` remain accepted aliases for
+    older provider files. ``tokens_per_s`` is only a configured hint—measured
+    throughput comes from routing.ProviderDebt usage evidence.
     """
 
     name: str
@@ -333,7 +337,12 @@ class ProviderConfig:
     api_key_env: str
     timeout_s: float = 30.0
     max_retries: int = 2
+    # ``rpm`` is the legacy transport-rate spelling.  New routing code uses
+    # ``requests_per_minute`` so request rate cannot be mistaken for a
+    # concurrency limit.  ``__post_init__`` keeps the two values in sync for
+    # the transport while accepting either spelling from callers.
     rpm: int = 60
+    requests_per_minute: int | None = None
     enabled: bool = True
     model: str = ""
     priority: int = 0
@@ -354,16 +363,82 @@ class ProviderConfig:
     # absent -> the request body carries no reasoning field; the pinned codex
     # provider entry sets "max".
     reasoning_effort: str | None = None
+    # ``max_concurrency`` is the historical spelling.  ``max_in_flight`` is
+    # the independent admission capacity; legacy configurations derive it
+    # conservatively from the old field (normally one slot).
     max_concurrency: int = 1
+    max_in_flight: int | None = None
     billing_mode: BillingMode = BillingMode.METERED
     quota_windows: tuple[QuotaWindowSpec, ...] = ()
     price_per_1m_cached_in: float = 0.0
     pricing_known: bool = False
     throughput_hint_tps: float = 0.0
+    # Optional configured throughput hint.  Measured throughput is folded
+    # from usage events into routing.ProviderDebt and takes precedence over
+    # this hint during quality ordering.
+    tokens_per_s: float | None = None
     quality_weight: float = 1.0
     supports_native_tools: bool = True
     supports_python_tool: bool = True
     allow_model_substitution: bool = False
+    # This marker lets routing distinguish an explicitly separated capacity
+    # declaration from an rpm-only legacy provider without changing the
+    # public dataclass shape or equality of existing provider values.
+    _independent_capacity_model: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Normalize legacy aliases without coupling rate to concurrency.
+
+        A provider file that only declares ``rpm`` remains valid.  Its
+        effective in-flight capacity is conservatively one (or the explicitly
+        supplied legacy ``max_concurrency``), while a provider that declares
+        either new capacity field opts into the independent lane model.
+        """
+        explicit_rate = self.requests_per_minute is not None
+        rate = self.rpm if self.requests_per_minute is None else self.requests_per_minute
+        if isinstance(rate, bool) or not isinstance(rate, int) or rate <= 0:
+            raise ValueError("requests_per_minute must be a positive integer")
+        object.__setattr__(self, "requests_per_minute", rate)
+        # The HTTP token bucket still reads ``rpm``.  Make its rate agree with
+        # the canonical field when a new-style config is used.
+        object.__setattr__(self, "rpm", rate)
+
+        explicit_in_flight = self.max_in_flight is not None
+        in_flight = self.max_in_flight
+        if in_flight is None:
+            legacy = self.max_concurrency
+            if isinstance(legacy, bool) or not isinstance(legacy, int) or legacy <= 0:
+                raise ValueError("max_in_flight must be a positive integer")
+            in_flight = max(1, legacy)
+        elif isinstance(in_flight, bool) or not isinstance(in_flight, int) or in_flight <= 0:
+            raise ValueError("max_in_flight must be a positive integer")
+        object.__setattr__(self, "max_in_flight", in_flight)
+        # Keep the old attribute useful to integrations that still inspect it.
+        object.__setattr__(self, "max_concurrency", in_flight)
+
+        configured_tps = self.tokens_per_s
+        if configured_tps is None:
+            configured_tps = self.throughput_hint_tps
+        elif (
+            isinstance(self.throughput_hint_tps, int | float)
+            and not isinstance(self.throughput_hint_tps, bool)
+            and self.throughput_hint_tps not in (0, configured_tps)
+        ):
+            raise ValueError("tokens_per_s and throughput_hint_tps disagree")
+        if (
+            isinstance(configured_tps, bool)
+            or not isinstance(configured_tps, int | float)
+            or not math.isfinite(float(configured_tps))
+            or configured_tps < 0
+        ):
+            raise ValueError("tokens_per_s must be a finite non-negative number")
+        object.__setattr__(self, "tokens_per_s", float(configured_tps))
+        object.__setattr__(self, "throughput_hint_tps", float(configured_tps))
+        object.__setattr__(
+            self,
+            "_independent_capacity_model",
+            explicit_rate or explicit_in_flight or self.max_concurrency != 1,
+        )
 
 
 @dataclass(frozen=True, slots=True)
