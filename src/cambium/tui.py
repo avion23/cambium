@@ -526,15 +526,21 @@ async def _run_interactive(
             completed = False
             cancel_requested = False
 
-            def _live_sink(record: dict[str, Any]) -> None:
+            def _live_sink(
+                record: dict[str, Any],
+                _turn=turn,
+                _state: ObservabilityState = state,
+                _dashboard: _ColorDashboard = dashboard,
+                _session: InteractiveSession = session,
+            ) -> None:
                 nonlocal sequence
-                session.observe_event(turn, record)
+                _session.observe_event(_turn, record)
                 sequence += 1
                 normalized = dict(record)
                 normalized["seq"] = sequence
-                state.apply(normalized)
-                if dashboard.enabled:
-                    dashboard.draw(state.snapshot(session_dir=turn.session_dir))
+                _state.apply(normalized)
+                if _dashboard.enabled:
+                    _dashboard.draw(_state.snapshot(session_dir=_turn.session_dir))
                 elif not quiet:
                     _write_line(out, render.render_event_line(record, stream=out))
                 out.flush()
@@ -542,11 +548,11 @@ async def _run_interactive(
             loop = asyncio.get_running_loop()
             turn_task = loop.create_task(session.run_turn(turn, on_event=_live_sink))
 
-            def _request_cancel() -> None:
+            def _request_cancel(_turn_task=turn_task) -> None:
                 nonlocal cancel_requested
-                if not turn_task.done():
+                if not _turn_task.done():
                     cancel_requested = True
-                    turn_task.cancel()
+                    _turn_task.cancel()
 
             signal_installed = False
             try:
