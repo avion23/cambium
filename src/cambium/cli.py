@@ -1246,6 +1246,8 @@ def _run_optimize(args: argparse.Namespace) -> int:
         delegated.append("--include-transcript-candidates")
     if args.transcript_candidates is not None:
         delegated.extend(["--transcript-candidates", str(args.transcript_candidates)])
+    if args.dataset is not None:
+        delegated.extend(["--dataset", str(args.dataset)])
     return optimize.main(delegated)
 
 
