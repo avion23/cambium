@@ -370,7 +370,11 @@ def test_mixed_storm_policy_refusal_is_terminal_but_health_neutral(monkeypatch, 
         cooldown_s=0.0,
         quota_windows=_quota_window(),
     )
-    router = Diffundo((provider,), call_budget_s=0.6, pause_timeout_s=0.0)
+    # call_budget_s must stay far above the per-attempt timeouts: under xdist
+    # load a tight wall budget fires the pre-attempt deadline check and turns
+    # the expected REFUSAL into budget-exhaustion TIMEOUT.  The refusal, not
+    # the budget, is the behavior under test.
+    router = Diffundo((provider,), call_budget_s=30.0, pause_timeout_s=0.0)
     sleeps: list[float] = []
 
     async def record_sleep(delay: float) -> None:
