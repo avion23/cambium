@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import sys
@@ -144,7 +145,7 @@ CREDENTIAL_ASSIGNMENT_RE = re.compile(
     r"(?i)(?<!\w)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
     r"id[_-]?token|auth(?:orization)?|bearer|password|passwd|pwd|secret(?:[_-]?key)?|"
     r"private[_-]?key|client[_-]?secret|cookie|session[_-]?id|credential|username|"
-    r"email)\s*[:=]\s*(?!\[REDACTED[^\]]*\])"
+    r"email)\s*[:=]\s*(?!\[REDACTED[^\]]*\]|<redacted:base64>)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;)}\]]+)",
 )
 HEADER_SECRET_RE = re.compile(
@@ -155,6 +156,83 @@ USER_AT_HOST_RE = re.compile(r"(?<![\w./%+-])[A-Za-z0-9_.%+-]+@[A-Za-z0-9.-]+")
 UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
+)
+BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{20,}={0,}(?![A-Za-z0-9+/_-])")
+
+_REDACTION_CONTROL_RE = re.compile(r"[\u200b-\u200f\u2060-\u206f\ufeff]")
+_CONFUSABLE_TRANSLATION = str.maketrans(
+    {
+        # Common Cyrillic lookalikes.
+        "А": "A",
+        "В": "B",
+        "С": "C",
+        "Е": "E",
+        "Н": "H",
+        "І": "I",
+        "Ј": "J",
+        "К": "K",
+        "М": "M",
+        "О": "O",
+        "Р": "P",
+        "Ѕ": "S",
+        "Т": "T",
+        "Х": "X",
+        "У": "Y",
+        "а": "a",
+        "в": "b",
+        "с": "c",
+        "е": "e",
+        "н": "h",
+        "і": "i",
+        "ј": "j",
+        "к": "k",
+        "м": "m",
+        "о": "o",
+        "р": "p",
+        "ѕ": "s",
+        "т": "t",
+        "х": "x",
+        "у": "y",
+        # Common Greek lookalikes.
+        "Α": "A",
+        "Β": "B",
+        "Ε": "E",
+        "Ζ": "Z",
+        "Η": "H",
+        "Ι": "I",
+        "Κ": "K",
+        "Μ": "M",
+        "Ν": "N",
+        "Ο": "O",
+        "Ρ": "P",
+        "Τ": "T",
+        "Χ": "X",
+        "Υ": "Y",
+        "α": "a",
+        "β": "b",
+        "ε": "e",
+        "ζ": "z",
+        "η": "h",
+        "ι": "i",
+        "κ": "k",
+        "μ": "m",
+        "ν": "n",
+        "ο": "o",
+        "ρ": "p",
+        "τ": "t",
+        "υ": "y",
+        "ϲ": "c",
+        "ϱ": "p",
+        "σ": "s",
+        "ς": "s",
+    }
+)
+_BASE64_REPLACEMENT = "<redacted:base64>"
+_COMPACT_REDACTION_PASSES = (
+    (PRIVATE_KEY_RE, "[REDACTED_PRIVATE_KEY]", False),
+    (KNOWN_TOKEN_RE, "[REDACTED_TOKEN]", False),
+    (BASE64_RE, _BASE64_REPLACEMENT, True),
+    (CREDENTIAL_ASSIGNMENT_RE, "[REDACTED_CREDENTIAL]", False),
 )
 
 UNSAFE_OUTPUT_PATTERNS = (
@@ -174,6 +252,94 @@ def _normalise_text(value: str) -> str:
 
 def _canonical(value: str) -> str:
     return _normalise_text(value).casefold()
+
+
+def _redaction_normalise(value: str) -> str:
+    """Return a comparison-safe form before any secret pattern is applied.
+
+    Session text can contain wire-format entities, invisible directionality
+    controls, or visually confusable Unicode characters.  The extractor is a
+    training-data boundary, so it prefers a normalized copy (and some
+    deliberate over-redaction) over preserving an ambiguous original form.
+    """
+
+    text = value
+    # A second pass handles the common ``&amp;#x73;`` representation without
+    # making entity expansion an unbounded operation.
+    for _ in range(3):
+        unfolded = html.unescape(text)
+        if unfolded == text:
+            break
+        text = unfolded
+    text = _REDACTION_CONTROL_RE.sub("", text)
+    text = unicodedata.normalize("NFKC", text).translate(_CONFUSABLE_TRANSLATION)
+    return text.strip()
+
+
+def _replace_compact_spans(
+    text: str,
+    pattern: re.Pattern[str],
+    replacement: str,
+    *,
+    require_newline: bool = False,
+) -> str:
+    """Apply a pattern after removing whitespace, mapping spans back to text.
+
+    A key copied from a wrapped terminal line may have a newline between any
+    two characters.  Matching a whitespace-free normalized copy catches that
+    form; the index list puts the replacement over the corresponding span in
+    the readable normalized text, including the intervening whitespace.
+    """
+
+    compact_characters: list[str] = []
+    compact_to_text: list[int] = []
+    for index, character in enumerate(text):
+        if character.isspace():
+            continue
+        compact_characters.append(character)
+        compact_to_text.append(index)
+    compact = "".join(compact_characters)
+    matches = list(pattern.finditer(compact))
+    if not matches:
+        return text
+
+    spans: list[tuple[int, int]] = []
+    for match in matches:
+        if match.start() >= len(compact_to_text) or match.end() <= match.start():
+            continue
+        start = compact_to_text[match.start()]
+        end = compact_to_text[match.end() - 1] + 1
+        if require_newline and not any(character in "\r\n" for character in text[start:end]):
+            continue
+        spans.append((start, end))
+    if not spans:
+        return text
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+
+    parts: list[str] = []
+    position = 0
+    for start, end in merged:
+        parts.append(text[position:start])
+        parts.append(replacement)
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
+
+
+def _redact_compact_key_runs(value: str) -> str:
+    """Redact known key-shaped runs that were split by whitespace/newlines."""
+
+    text = value
+    for pattern, replacement, require_newline in _COMPACT_REDACTION_PASSES:
+        text = _replace_compact_spans(text, pattern, replacement, require_newline=require_newline)
+    return text
 
 
 def _digest(value: str, length: int = 16) -> str:
@@ -253,13 +419,22 @@ def _iter_strings(value: object, *, _depth: int = 0) -> Iterator[str]:
 
 
 def _redact_text(value: str, redactor: Redactor) -> str:
-    """Apply the shared redactor plus path/token sweeps to free text."""
+    """Apply normalized secret, path, token, and base64 sweeps to free text."""
 
-    text = redactor.redact(value)
+    # Match only after decoding/normalizing.  We emit this conservative
+    # normalized copy rather than risk carrying an obfuscated original into a
+    # training record.
+    text = _redaction_normalise(value)
+    text = redactor.redact(text)
+    text = _redact_compact_key_runs(text)
     text = PRIVATE_KEY_RE.sub("[REDACTED_PRIVATE_KEY]", text)
     text = HEADER_SECRET_RE.sub("[REDACTED_HEADER]", text)
     text = CREDENTIAL_ASSIGNMENT_RE.sub("[REDACTED_CREDENTIAL]", text)
     text = KNOWN_TOKEN_RE.sub("[REDACTED_TOKEN]", text)
+    # Run this before the broad legacy token expressions so a generic base64
+    # run receives its explicit marker instead of a less informative token
+    # marker.  False positives are intentional at this data-extraction gate.
+    text = BASE64_RE.sub(_BASE64_REPLACEMENT, text)
     text = LONG_ALNUM_RE.sub("[REDACTED_TOKEN]", text)
     text = LONG_TOKEN_RE.sub("[REDACTED_TOKEN]", text)
     text = USER_AT_HOST_RE.sub("[REDACTED_IDENTITY]", text)
