@@ -1003,7 +1003,7 @@ def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
 
     def unavailable_timing_run(args, *run_args, **run_kwargs):
         if (
-            isinstance(args, (list, tuple))
+            isinstance(args, list | tuple)
             and len(args) >= 3
             and tuple(args[1:3]) == ("-m", "pytest")
         ):

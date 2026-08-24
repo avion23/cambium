@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from cambium.tui_screen import (
+    ActivityState,
     Cockpit,
     Transcript,
     _side_sections,
@@ -13,8 +14,6 @@ from cambium.tui_screen import (
     render_cockpit,
     render_primary,
 )
-
-from cambium.tui_screen import ActivityState, Cockpit, Transcript, render_cockpit
 
 
 def _snapshot():

@@ -1,5 +1,8 @@
 # Cambium
 
+> **License status:** No `LICENSE` file is included yet. A license must be
+> chosen and added before publishing a redistributable release.
+
 Cambium is a stdlib-first multi-agent coding harness. It supervises isolated
 worker processes, records durable session events, routes model calls across
 configured providers, and publishes successful worker commits through a fenced
@@ -18,28 +21,43 @@ The current runtime is intentionally small:
 
 ## Status
 
-Cambium runs directly from source and currently requires Python 3.12+.
-The persistent cockpit TUI is now the primary operator interface: it keeps one
+Cambium currently requires Python 3.12 or newer, matching the authoritative
+`project.requires-python = ">=3.12"` declaration in `pyproject.toml`.
+The persistent cockpit TUI is the primary operator interface: it keeps one
 durable interactive branch alive across prompts, reconnects to the latest
 interactive session, supports steering with `!cancel` or Ctrl-C and queued
 follow-ups, and streams model output into the cockpit.
-The project metadata keeps `requires-python = ">=3.12"`.
-`pyproject.toml` declares package metadata, dependencies, test extras, and the
-`cambium` / `cambium-monitor` entry points, but a checked-out repository does
-not need an editable install.
+
+From a checkout, run commands with `PYTHONPATH=src`. After installation, use
+the `cambium` console script or `python -m cambium` without `PYTHONPATH`.
 
 ```bash
 PYTHONPATH=src python -m cambium version
 PYTHONPATH=src python -m cambium --help
 ```
 
-Use [`agents.md`](agents.md) as the operating contract for coding agents.
-Current architecture is documented in
-[`docs/architecture/architecture.md`](docs/architecture/architecture.md), with
-the single provider-routing ownership model in
-[`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md).
 Research documents under `docs/research/` are design evidence, not additional
 runtime implementations.
+
+## Installation
+
+Cambium supports Python 3.12+ and declares no mandatory third-party runtime
+dependencies. Install the published/runtime package with:
+
+```bash
+python -m pip install .
+```
+
+For local development and tests, install the optional `test` extra. Quote the
+requirement so shells do not expand the brackets:
+
+```bash
+python -m pip install -e '.[test]'
+```
+
+The `test` extra is declared in `pyproject.toml` and supplies the dependencies
+used by the local test suite. An editable install is optional when running
+straight from a checkout.
 
 ## Architecture boundaries
 
@@ -58,9 +76,40 @@ The worker uses `cambium.schemas` as the schema source of truth and
 `cambium.tools` as the sole executable tool dispatcher. There is no parallel
 plugin registry.
 
-## Quick start
+## Quickstart
 
-Start the persistent full-screen terminal cockpit:
+Install Cambium, define one provider profile, export its API key, and start the
+persistent full-screen terminal cockpit. Provider files contain environment
+variable names, not secret values:
+
+```bash
+python -m pip install .
+mkdir -p "$HOME/.config/cambium"
+cat > "$HOME/.config/cambium/providers.json" <<'JSON'
+{
+  "providers": [
+    {
+      "name": "openai",
+      "tier": "strong",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
+      "model": "gpt-5.6",
+      "enabled": true
+    }
+  ]
+}
+JSON
+export CAMBIUM_PROVIDER_OPENAI_API_KEY='replace-with-your-provider-key'
+cambium tui --repo . --provider openai:gpt-5.6
+```
+
+Replace the example key with a real key in your shell environment; never commit
+it or put it in `providers.json`. The same profile can be selected
+automatically with `cambium tui --repo . --auto`.
+
+## Interactive usage
+
+Start the persistent full-screen terminal cockpit from a checkout:
 
 ```bash
 PYTHONPATH=src python -m cambium tui --repo . --auto
@@ -155,7 +204,7 @@ for the layout and correctness boundary.
 Attach a read-only monitor to an existing supervisor leaf:
 
 ```bash
-PYTHONPATH=src python -m cambium monitor --session /path/to/session
+PYTHONPATH=src python -m cambium monitor /path/to/session
 ```
 
 Inspect or record provider quota windows:
@@ -245,6 +294,10 @@ PYTHONPATH=src python -m ruff check src tests
 PYTHONPATH=src python -m cambium doctor
 ```
 
+`doctor` reports local environment, provider, and worktree state; it returns
+nonzero when a required diagnostic fails, so its output is the useful result
+rather than a universal smoke-test status.
+
 The default pytest invocation excludes tests marked `slow`. Run the
 process-boundary tier explicitly when needed:
 
@@ -254,9 +307,8 @@ PYTHONPATH=src python -m pytest -m slow -q
 
 ## Acceptance testing
 
-The opt-in live-provider suite reads API keys read-only from the local OpenCode
-and pi credential stores (`~/.local/share/opencode/auth.json` and
-`~/.pi/agent/auth.json`) when they are available; missing credentials skip the
+The opt-in live-provider suite reads API keys read-only from supported local
+credential stores when they are available; missing credentials skip the
 corresponding checks. Run it with:
 
 ```bash
@@ -281,13 +333,12 @@ GEPA; the top-level `cambium optimize` wrapper currently accepts only
 `zero`/`bootstrap`.
 
 Extract redacted, deduplicated decision trajectories from one or more explicit
-OpenCode SQLite databases or storage directories. `--database` and
-`--session-dir` are repeatable; the extractor is read-only and requires a
-source path explicitly:
+SQLite databases or storage directories. `--database` and `--session-dir` are
+repeatable; the extractor is read-only and requires a source path explicitly:
 
 ```bash
 PYTHONPATH=src python -m cambium optimize extract \
-  --session-dir /path/to/opencode/storage \
+  --session-dir /path/to/provider-storage \
   --repo . \
   --output /tmp/cambium-trajectories.jsonl
 ```
@@ -298,30 +349,36 @@ Review-gated rows are `candidate: true`, `redacted: true`, and
 changes every admitted row to `review_status: "approved"`. The optimizer fails
 closed on pending or unknown statuses and ignores rejected/excluded rows.
 
-For pi session JSONL logs, use the repository extractor separately. It scans
-recursively, infers a review-required label from task/session signals, and
-keeps assistant/tool output out of the candidate records:
-
-```bash
-PYTHONPATH=src python scripts/extract_pi.py \
-  --sessions-dir /path/to/pi/sessions \
-  --output artifacts/optimization/first-real-extraction/candidates-pi.jsonl
-```
-
-The current reviewed snapshot is
-`artifacts/optimization/first-real-extraction/train_queue_v2.jsonl`: 34
-approved records, with 24 `train` and 10 `val` entries. It is not loaded
-implicitly; pass a reviewed candidate file with
+Reviewed candidate files are not loaded implicitly; pass one with
 `--include-transcript-candidates` or `--transcript-candidates PATH` when
 augmenting a module's training pool. See
 [`docs/architecture/optimization.md`](docs/architecture/optimization.md) for
 the broader schema and approval gate.
+
+## Documentation
+
+- [Architecture overview](docs/architecture/architecture.md)
+- [Acceptance testing](docs/architecture/acceptance.md)
+- [CAST context trunking](docs/architecture/cast.md)
+- [Context engine](docs/architecture/context-engine.md)
+- [Interactive TUI](docs/architecture/interactive-tui.md)
+- [Optimization](docs/architecture/optimization.md)
+- [Profiling baseline](docs/architecture/profiling-baseline.md)
+- [Provider routing](docs/architecture/provider-routing.md)
+- [Terminal interface](docs/architecture/terminal-interface.md)
+- [User CLI](docs/architecture/user-cli.md)
+- [Changelog](CHANGELOG.md)
 
 ## Profiling baseline
 
 The measured runtime-overhead baseline and its reproducible profiling harness
 are documented in
 [`docs/architecture/profiling-baseline.md`](docs/architecture/profiling-baseline.md).
+
+## License
+
+**No license has been chosen yet.** This repository currently has no `LICENSE`
+file. Add an explicit license before publishing or inviting redistribution.
 
 ## Session artifacts
 

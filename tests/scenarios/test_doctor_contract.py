@@ -32,7 +32,7 @@ def _forced_failure(*args: object, **kwargs: object) -> tuple[doctor.Status, str
 def test_each_check_failure_has_stable_report_contract(
     target: str, name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(doctor, "check_python", lambda: (doctor.Status.PASS, "3.14.0 (>= 3.14)"))
+    monkeypatch.setattr(doctor, "check_python", lambda: (doctor.Status.PASS, "3.12.0 (>= 3.12)"))
     monkeypatch.setattr(doctor, target, _forced_failure)
 
     checks = doctor.run_checks(None, tmp_path)
@@ -46,6 +46,15 @@ def test_each_check_failure_has_stable_report_contract(
     assert lines[-1].startswith("Summary:")
     assert f"{name:<22}" in report
     assert "1 fail" in report
+
+
+def test_check_python_passes_on_packaging_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.sys, "version_info", (3, 12, 0))
+
+    status, detail = doctor.check_python()
+
+    assert status is doctor.Status.PASS
+    assert detail.endswith("(>= 3.12)")
 
 
 def test_system_health_failure_is_advisory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
