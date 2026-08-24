@@ -1,7 +1,7 @@
 # Cambium
 
-> **License status:** No `LICENSE` file is included yet. A license must be
-> chosen and added before publishing a redistributable release.
+> **License:** All rights reserved. No open-source license is included;
+> redistribution requires the author's permission.
 
 Cambium is a stdlib-first multi-agent coding harness. It supervises isolated
 worker processes, records durable session events, routes model calls across
@@ -393,8 +393,9 @@ are documented in
 
 ## License
 
-**No license has been chosen yet.** This repository currently has no `LICENSE`
-file. Add an explicit license before publishing or inviting redistribution.
+**All rights reserved.** This project is published without an open-source
+license: you may read and reference the code, but redistribution, derivative
+works, and commercial use require the author's explicit permission.
 
 ## Session artifacts
 
