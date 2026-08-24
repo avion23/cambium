@@ -685,9 +685,11 @@ def _resolve_provider(
             f"model {effective_model!r} is not configured for provider {selected.name!r}"
         )
 
-    # Same-tier authorized siblings remain as fallback candidates behind the
-    # assigned primary. The env-key whitelist must match: a sibling without
-    # its key in the worker environment can only fail with AUTH_ERROR.
+    # The selected provider is the pinned primary. Keep every enabled,
+    # credential-ready provider in the authorization carrier: Diffundo uses
+    # that bounded set to substitute only after terminal endpoint-death
+    # evidence, with same-tier candidates before other tiers. A sibling
+    # without its credential is never handed to the worker.
     if len(codex_authorized) > 1:
         raise ValueError(
             "multiple codex_chatgpt providers have stored oauth sessions; "
@@ -714,7 +716,9 @@ def _resolve_provider(
         ),
         fanout_config=fanout_config,
     )
-    return _apply_interactive_wall_budget(resolved, [selected]), environment
+    # Interactive budgeting should account for the ready fallback pool too;
+    # the selected provider remains the pinned primary in ``assigned_provider``.
+    return _apply_interactive_wall_budget(resolved, authorized), environment
 
 
 def allocate_session_dir(repo: str | Path) -> Path:
