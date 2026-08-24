@@ -236,10 +236,13 @@ def _bounded_items(value: Any, field: str) -> tuple[str, ...]:
     """
     if isinstance(value, tuple | list):
         items_raw: list[Any] = list(value)
-    elif isinstance(value, str) or not isinstance(value, Mapping):
-        items_raw = [value]
+    elif value is None:
+        items_raw = []
     else:
-        raise SummaryTrunkError(f"summary entry {field} must be a list")
+        # Strings, numbers, dicts — every scalar/object shape gets wrapped and
+        # coerced below.  Live failures arrived as list-items-not-strings,
+        # then bare strings, then objects; normalize all shapes uniformly.
+        items_raw = [value]
     if len(items_raw) > SUMMARY_MAX_ITEMS:
         raise SummaryTrunkError(f"summary entry {field} exceeds the item cap")
     items: list[str] = []
