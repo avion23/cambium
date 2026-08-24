@@ -8,13 +8,14 @@ import os
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from cambium.architectus import ArchitectusCore
-from cambium.diffundo import CallResult, ProviderTier
+from cambium.diffundo import CallResult, Diffundo, ProviderConfig, ProviderTier, _RawResponse
 from cambium.lm import ArchitectusLM, CambiumLM
 from cambium.tasktree import build_tree
 
@@ -134,6 +135,59 @@ def test_identical_calls_are_not_cached() -> None:
     assert lm.num_retries == 0
     assert lm.history == []
     assert all("cache" not in call["prompt"] for call in diffundo.calls)
+
+
+def test_sync_lm_calls_can_cross_event_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The synchronous DSPy seam may run one LM on many GEPA loops."""
+    _require_dspy()
+    payload = {
+        "id": "chatcmpl-loop-local",
+        "object": "chat.completion",
+        "model": "m-loop-local",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "completion text"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+    }
+    provider = ProviderConfig(
+        name="p-loop-local",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_LOOP_LOCAL",
+        model="m-loop-local",
+        timeout_s=1.0,
+        max_retries=0,
+    )
+    router = Diffundo((provider,), call_budget_s=1.0)
+
+    def fake_post_sync(self, provider, prompt, timeout_s):
+        del self, provider, prompt, timeout_s
+        import time
+
+        time.sleep(0.02)
+        return _RawResponse(payload, 0.02)
+
+    monkeypatch.setattr(Diffundo, "_post_sync", fake_post_sync)
+    lm = CambiumLM(router, ProviderTier.FAST, model="m-loop-local")
+
+    # Each synchronous call enters CambiumLM.forward, which creates its own
+    # asyncio.run loop.  The sequential calls prove closed loops can be
+    # discarded and recreated without retaining a loop-bound primitive.
+    assert _call(lm, "sequential one") == ["completion text"]
+    assert _call(lm, "sequential two") == ["completion text"]
+
+    # GEPA can invoke the same synchronous LM from concurrent worker threads;
+    # each worker creates another independent asyncio.run loop.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_call, lm, f"concurrent {index}") for index in range(2)]
+        assert [future.result(timeout=5.0) for future in futures] == [
+            ["completion text"],
+            ["completion text"],
+        ]
 
 
 def test_session_context_is_isolated_and_retains_no_prompt() -> None:
