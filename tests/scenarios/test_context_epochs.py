@@ -21,9 +21,11 @@ from typing import Any, cast
 import pytest
 
 from cambium import worker
+from cambium.context_policy import CastPolicy
 from cambium.diffundo import ProviderTier
 from cambium.fencing import write_generation
 from cambium.redact import Redactor
+from cambium.summary_trunk import is_k0_entry, summary_entries
 from cambium.supervisor import (
     TaskResult,
     _bounded_resume_envelope,
@@ -324,6 +326,7 @@ def test_validate_resume_strict() -> None:
         "epoch": 1,
         "child_results": [_strict_child_envelope()],
         "child_results_truncated": False,
+        "workspace_changed": False,
     }
     assert worker._validate_resume(payload) == payload
     assert worker._validate_resume(None) is None
@@ -578,6 +581,51 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
     assert usage and all("epoch" not in message for message in usage)
 
 
+def test_cast_rollover_is_durable_before_epoch_publication(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "ckpts"
+    config = _agent_config(
+        worktree,
+        checkpoint_root=checkpoint_root,
+        context_reuse=True,
+        rolling_compact_threshold_high=1,
+        rolling_compact_threshold_low=1,
+        cast_policy=CastPolicy(max_segments=1),
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["inspect"]}',
+            '{"type":"finish","summary":"done"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
+
+    assert outcome["status"] == "succeeded"
+    advanced = [
+        message
+        for message in writer.messages()
+        if message["type"] == "context_epoch_advanced"
+        and message.get("reason") == "cast_k0_rollover"
+    ]
+    assert advanced
+    checkpoint = worker._load_epoch_checkpoint(
+        config,
+        advanced[-1]["checkpoint_ref"],
+        expect_task_id=True,
+    )
+    entries = summary_entries(checkpoint.provider_messages)
+    assert len(entries) == 1
+    assert is_k0_entry(entries[0])
+    manifests = list((checkpoint_root / config.task_id / "rollovers").glob("k0-*.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["schema"] == "cambium.cast-rollover.v1"
+    assert manifest["source_sha256"] == entries[0].source_sha256
+    assert len(manifest["entries"]) == 2
+
+
 def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=False)
@@ -615,6 +663,7 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
             "epoch": checkpoint.epoch,
             "child_results": [_strict_child_envelope()],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
     )
     writer = _FakeWriter()
@@ -653,6 +702,7 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
             "epoch": checkpoint.epoch,
             "child_results": [_strict_child_envelope()],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
     )
     writer = _FakeWriter()
@@ -709,6 +759,7 @@ def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
             "epoch": 1,
             "child_results": [],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
     )
     writer = _FakeWriter()
@@ -757,6 +808,7 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
             _strict_child_envelope(summary="b" * 140),
         ],
         "child_results_truncated": False,
+        "workspace_changed": False,
     }
     config = _agent_config(
         worktree,
@@ -819,6 +871,7 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
             "epoch": folded.epoch,
             "child_results": [],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
         max_turns=4,
     )
@@ -841,6 +894,7 @@ def test_rolling_compact_rewrites_active_context_before_publication(
         "epoch": checkpoint.epoch,
         "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
         "child_results_truncated": False,
+        "workspace_changed": False,
     }
     config = _agent_config(
         worktree,
@@ -883,6 +937,7 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
             _strict_child_envelope(summary="b" * 500),
         ],
         "child_results_truncated": False,
+        "workspace_changed": False,
     }
     config = _agent_config(
         worktree,
@@ -931,6 +986,7 @@ def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
         "epoch": checkpoint.epoch,
         "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
         "child_results_truncated": False,
+        "workspace_changed": False,
     }
     config = _agent_config(
         worktree,
@@ -987,6 +1043,7 @@ def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
         "epoch": checkpoint.epoch,
         "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
         "child_results_truncated": False,
+        "workspace_changed": False,
     }
     config = _agent_config(
         worktree,
@@ -1161,6 +1218,7 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
             "epoch": checkpoint.epoch,
             "child_results": [_strict_child_envelope()],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
     )
     writer = _FakeWriter()

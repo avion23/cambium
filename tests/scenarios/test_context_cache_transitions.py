@@ -253,6 +253,7 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
             "epoch": checkpoint.epoch,
             "child_results": [child],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
         max_turns=3,
     )
@@ -329,6 +330,7 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
                 _strict_child_envelope("y" * 300),
             ],
             "child_results_truncated": False,
+            "workspace_changed": False,
         },
         max_turns=3,
     )

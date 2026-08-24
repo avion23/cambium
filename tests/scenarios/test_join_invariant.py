@@ -195,6 +195,56 @@ def test_clean_child_join_satisfies_head_invariant(tmp_path: Path) -> None:
     assert not [record for record in store.records if record["kind"] == "join_invariant_failed"]
 
 
+def test_private_child_waits_for_parent_publication(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    parent_worktree = tmp_path / "parent"
+    _git(repo, "worktree", "add", "-b", "parent", str(parent_worktree), base)
+    (parent_worktree / "parent.txt").write_text("parent\n", encoding="utf-8")
+    _git(parent_worktree, "add", "parent.txt")
+    _git(parent_worktree, "commit", "-m", "parent suspension snapshot")
+    snapshot = _rev(parent_worktree)
+    child_worktree = tmp_path / "child"
+    child_tip = _branch_commit(
+        repo, snapshot, "child", child_worktree, "child.txt", "child\n"
+    )
+
+    store = _Store()
+    runtime = _runtime(session, store)
+    parent_spec = {
+        "task_id": "parent",
+        "kind": "test",
+        "repo": str(repo),
+        "worktree_path": str(parent_worktree),
+        "branch": "parent",
+        "base_commit": snapshot,
+        "_base_is_published": False,
+    }
+    runtime.set_session_tasks([parent_spec])
+    child_spec = {
+        "task_id": "child",
+        "repo": str(repo),
+        "branch": "child",
+        "parent_task_id": "parent",
+        "_private_parent_integration": True,
+    }
+
+    accepted = asyncio.run(runtime._merge_task(child_spec, WorkerHandle("child", 1)))
+
+    assert accepted == child_tip
+    assert _rev(repo, "main") == base
+    assert _rev(parent_worktree) == child_tip
+    assert parent_spec["base_commit"] == child_tip
+    assert parent_spec["_base_is_published"] is False
+    assert asyncio.run(runtime._assert_parent_join_invariant(parent_spec, ["child"], 1))
+    assert [record for record in store.records if record["kind"] == "child_integrated"]
+
+    published = asyncio.run(runtime._merge_task(parent_spec, WorkerHandle("parent", 2)))
+    assert published == child_tip
+    assert _rev(repo, "main") == child_tip
+
+
 def test_conflict_emits_bounded_structured_envelope(tmp_path: Path) -> None:
     session = tmp_path / "session"
     repo = tmp_path / "repo"
