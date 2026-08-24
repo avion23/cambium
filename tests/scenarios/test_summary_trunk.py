@@ -10,6 +10,12 @@ import pytest
 from cambium.summary_trunk import (
     SUMMARY_ENTRY_CLOSE,
     SUMMARY_ENTRY_OPEN,
+    SUMMARY_ENTRY_PROVENANCE,
+    SUMMARY_LIST_FIELDS,
+    SUMMARY_MAX_ENTRY_BYTES,
+    SUMMARY_MAX_ITEMS,
+    SUMMARY_MAX_TEXT_BYTES,
+    SUMMARY_TRUNCATION_MARKER,
     SummaryExpectation,
     SummaryTrunkError,
     append_summary_entry,
@@ -145,8 +151,9 @@ def test_summary_response_is_strict_and_bounded() -> None:
 
     payload = json.loads(_response(expectation, label="one"))
     payload["objective"] = "x" * 2_001
-    with pytest.raises(SummaryTrunkError, match="objective.*byte cap"):
-        parse_summary_response(json.dumps(payload), expectation)
+    entry = parse_summary_response(json.dumps(payload), expectation)
+    assert SUMMARY_TRUNCATION_MARKER in entry.objective
+    assert len(entry.objective.encode("utf-8")) <= SUMMARY_MAX_TEXT_BYTES
 
     payload = json.loads(_response(expectation, label="one"))
     payload.pop("objective")
@@ -241,3 +248,80 @@ def test_scalar_list_field_is_wrapped_not_fatal() -> None:
     entry = parse_summary_response(json.dumps(decoded), expectation)
 
     assert entry.verification_results == ("all checks green",)
+
+
+def test_oversize_list_item_is_truncated_with_a_visible_marker() -> None:
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded["verification_results"] = ["😀" * 1_000]
+
+    entry = parse_summary_response(json.dumps(decoded), expectation)
+
+    item = entry.verification_results[0]
+    assert SUMMARY_TRUNCATION_MARKER in item
+    assert len(item.encode("utf-8")) <= SUMMARY_MAX_TEXT_BYTES
+    assert len(
+        json.dumps(
+            entry_mapping(entry),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) <= SUMMARY_MAX_ENTRY_BYTES
+
+
+def test_oversize_total_trims_low_priority_lists_before_core_fields() -> None:
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded["open_items"] = [f"open {index} " + "o" * 1_980 for index in range(32)]
+    decoded["relevant_failed_approaches"] = [
+        f"failed {index} " + "f" * 1_980 for index in range(32)
+    ]
+
+    entry = parse_summary_response(json.dumps(decoded), expectation)
+
+    assert len(entry.open_items) == 1
+    assert 1 < len(entry.relevant_failed_approaches) < SUMMARY_MAX_ITEMS
+    assert entry.decisions_added == ("decision one",)
+    assert entry.objective == "objective one"
+    assert entry.outcome == "outcome one"
+    assert len(
+        json.dumps(
+            entry_mapping(entry),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) <= SUMMARY_MAX_ENTRY_BYTES
+
+
+def test_rendered_entry_revalidation_uses_tolerant_field_bounds() -> None:
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded["objective"] = "o" * (SUMMARY_MAX_TEXT_BYTES * 2)
+    message = {
+        "role": "user",
+        "content": (
+            SUMMARY_ENTRY_OPEN
+            + SUMMARY_ENTRY_PROVENANCE
+            + json.dumps(decoded, sort_keys=True, separators=(",", ":"))
+            + SUMMARY_ENTRY_CLOSE
+        ),
+    }
+
+    entry = parse_summary_message(message)
+
+    assert entry is not None
+    assert SUMMARY_TRUNCATION_MARKER in entry.objective
+
+
+def test_pathological_huge_everything_fails_with_a_clean_bound_error() -> None:
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded["objective"] = "o" * (SUMMARY_MAX_TEXT_BYTES * 2)
+    decoded["outcome"] = "u" * (SUMMARY_MAX_TEXT_BYTES * 2)
+    for field in SUMMARY_LIST_FIELDS:
+        decoded[field] = ["x" * SUMMARY_MAX_TEXT_BYTES] * (SUMMARY_MAX_ITEMS + 1)
+
+    with pytest.raises(SummaryTrunkError, match="item cap"):
+        parse_summary_response(json.dumps(decoded), expectation)
