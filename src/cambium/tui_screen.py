@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .provider_scheduler import QuotaLedger
+from .terminal import sanitize_terminal_text
 
 _RESET = "\x1b[0m"
 _DIM = "\x1b[2m"
@@ -41,9 +42,6 @@ _GREEN = "\x1b[1;32m"
 _YELLOW = "\x1b[1;33m"
 _RED = "\x1b[1;31m"
 _WHITE = "\x1b[1;37m"
-
-_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 _ROLE_COLORS = {
     "user": _BLUE,
@@ -193,9 +191,7 @@ def _is_tty(stream: Any) -> bool:
 
 
 def _sanitize(value: Any) -> str:
-    text = str(value)
-    text = _ANSI.sub("", text)
-    return _CONTROLS.sub("", text).replace("\r", "")
+    return sanitize_terminal_text(value)
 
 
 def _clip(text: str, width: int) -> str:

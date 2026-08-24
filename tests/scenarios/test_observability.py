@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from cambium.monitor import render_agent_lines, render_dashboard
 from cambium.observability import (
     ObservabilityState,
+    RecentEvent,
     _checkpoint_path,
     snapshot_from_events,
 )
@@ -204,3 +206,46 @@ def test_dashboard_and_status_render_core_introspection(tmp_path: Path) -> None:
     assert "out/s=2.0" in dashboard
     assert "main" in status
     assert "tokens=14" in status
+
+
+def test_dashboard_sanitizes_provider_derived_text_at_render_boundary(tmp_path: Path) -> None:
+    hostile_provider = "codex\x1b[31m-live\x1b]52;c;clipboard\x07\x00"
+    hostile_model = "gpt\x1b[?25l-5\x9b31m\x9c"
+    hostile_error = "HTTP 503 \x1b[31mbody\x1b]52;c;clipboard\x07 next\x01"
+    hostile_fallback = "primary\x1b]0;title\x1b\\-fallback\x02"
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "spawned", task_id="root"),
+            _event(
+                2,
+                "usage_event",
+                task_id="root",
+                provider=hostile_provider,
+                model=hostile_model,
+                failure_reason=hostile_error,
+                usage={"total_tokens": 1},
+            ),
+        ]
+    )
+    # A fallback origin is a provider-derived value carried by result/event
+    # projections.  Include it as a recent rendered detail to exercise the
+    # same dashboard boundary as the provider error text.
+    snapshot = replace(
+        snapshot,
+        recent_events=(
+            *snapshot.recent_events,
+            RecentEvent(seq=3, kind="fallback", task_id="root", detail=hostile_fallback),
+        ),
+    )
+
+    dashboard = "\n".join(render_dashboard(snapshot, session_dir=tmp_path, width=120, height=24))
+    status = "\n".join(render_agent_lines(snapshot))
+    rendered = dashboard + "\n" + status
+
+    for control in ("\x00", "\x01", "\x02", "\x07", "\x1b", "\x9b", "\x9c"):
+        assert control not in rendered
+    for sequence_payload in ("[31m", "[?25l", "52;c;clipboard", "0;title"):
+        assert sequence_payload not in rendered
+    assert "codex-live/gpt-5" in rendered
+    assert "HTTP 503 body next" in rendered
+    assert "primary-fallback" in rendered

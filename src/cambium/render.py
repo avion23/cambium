@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import shutil
 import sys
 import unicodedata
@@ -32,6 +31,7 @@ from typing import Any
 
 from .results import CHILD_RESULT_KEYS, ROOT_RESULT_KEYS, Result, result_to_dict
 from .stats import usage_stats_from_events
+from .terminal import sanitize_terminal_text
 
 _SUPERVISOR_RESULT_FIELDS = frozenset(
     {
@@ -363,20 +363,14 @@ def render_usage_breakdown(breakdown: Any) -> str:
     return "\n".join(lines)
 
 
-_EVENT_FIELD_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
-_EVENT_FIELD_WHITESPACE = re.compile(r"[\t\n\r]+")
-
-
 def _sanitize_field(text: str) -> str:
     """Make one interpolated field safe for single-line terminal output.
 
-    Removes ESC (0x1b), the 8-bit C1 CSI introducer (0x9b), DEL, and the
-    remaining C0/C1 controls; collapses tab/newline runs to one space so a
-    model-controlled value can neither emit escape sequences nor break the
-    line.
+    Remove ANSI CSI/OSC sequences and the remaining C0/C1 controls; collapse
+    tab/newline runs to one space so a model-controlled value can neither emit
+    escape sequences nor break the line.
     """
-    cleaned = _EVENT_FIELD_CONTROLS.sub("", text)
-    return _EVENT_FIELD_WHITESPACE.sub(" ", cleaned)
+    return sanitize_terminal_text(text, single_line=True)
 
 
 def _display_width(text: str) -> int:
