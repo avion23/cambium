@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from .provider_scheduler import (
@@ -32,6 +32,7 @@ SUMMARY_MAX_ITEMS = 32
 SUMMARY_MAX_TEXT_BYTES = 2_000
 SUMMARY_MAX_ENTRY_BYTES = 24 * 1024
 SUMMARY_MAX_COERCE_DEPTH = 64
+SUMMARY_TRUNCATION_MARKER = "…[truncated]"
 _SUMMARY_DIGEST_LENGTH = 64
 _SUMMARY_DEEP_PLACEHOLDER = "<deep:unrepresentable>"
 
@@ -195,6 +196,41 @@ _SUMMARY_FORBIDDEN_MARKERS = (
     SUMMARY_CONTROL_CLOSE.strip(),
 )
 
+_SUMMARY_LIST_TRIM_ORDER = (
+    "open_items",
+    "relevant_failed_approaches",
+    "verification_results",
+    "files_and_symbols_changed",
+    "facts_invalidated",
+    "facts_added",
+    "decisions_superseded",
+    "decisions_added",
+)
+_SUMMARY_TEXT_TRIM_ORDER = (
+    *SUMMARY_LIST_FIELDS,
+    "objective",
+    "outcome",
+)
+
+
+def _truncate_text(value: str, field: str, *, max_bytes: int) -> str:
+    """Keep a visible, UTF-8-safe prefix of one model-owned text field."""
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SummaryTrunkError(f"summary entry {field} must be valid UTF-8") from exc
+    if len(encoded) <= max_bytes:
+        return value
+
+    marker = SUMMARY_TRUNCATION_MARKER
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes < len(marker_bytes):
+        raise SummaryTrunkError(
+            f"summary entry {field} cannot fit the truncation marker within the byte cap"
+        )
+    prefix = encoded[: max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix + marker
+
 
 def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
@@ -210,14 +246,12 @@ def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
         encoded = value.encode("utf-8")
     if not allow_empty and not value.strip():
         raise SummaryTrunkError(f"summary entry {field} must be non-empty")
-    if len(encoded) > SUMMARY_MAX_TEXT_BYTES:
-        raise SummaryTrunkError(f"summary entry {field} exceeds the byte cap")
     for marker in _SUMMARY_FORBIDDEN_MARKERS:
         if marker and marker in value:
             raise SummaryTrunkError(
                 f"summary entry {field} must not contain the reserved marker {marker!r}"
             )
-    return value
+    return _truncate_text(value, field, max_bytes=SUMMARY_MAX_TEXT_BYTES)
 
 
 def _coerced_summary_text(item: Any) -> Any:
@@ -337,9 +371,88 @@ def _entry_from_mapping(value: Any) -> SummaryEntry:
     for field in SUMMARY_LIST_FIELDS:
         kwargs[field] = _bounded_items(value.get(field), field)
     entry = SummaryEntry(**kwargs)
-    if len(_canonical_json_bytes(entry_mapping(entry))) > SUMMARY_MAX_ENTRY_BYTES:
+    return _fit_entry_size(entry)
+
+
+def _entry_size_bytes(entry: SummaryEntry) -> int:
+    return len(_canonical_json_bytes(entry_mapping(entry)))
+
+
+def _replace_entry_field(entry: SummaryEntry, field: str, value: Any) -> SummaryEntry:
+    return replace(entry, **{field: value})
+
+
+def _shrink_entry_text_field(entry: SummaryEntry, field: str, index: int | None) -> SummaryEntry:
+    """Shrink one already-bounded text field to its smallest visible form."""
+    current = getattr(entry, field)
+    current_field = f"{field}[{index}]" if index is not None else field
+    if index is not None:
+        current_value = current[index]
+    else:
+        current_value = current
+    marker_bytes = len(SUMMARY_TRUNCATION_MARKER.encode("utf-8"))
+    if len(current_value.encode("utf-8")) <= marker_bytes:
+        return entry
+
+    minimum = _truncate_text(current_value, current_field, max_bytes=marker_bytes)
+    if index is not None:
+        minimum_values = list(current)
+        minimum_values[index] = minimum
+        candidate = _replace_entry_field(entry, field, tuple(minimum_values))
+    else:
+        candidate = _replace_entry_field(entry, field, minimum)
+    if _entry_size_bytes(candidate) > SUMMARY_MAX_ENTRY_BYTES:
+        return candidate
+
+    low = marker_bytes
+    high = len(current_value.encode("utf-8"))
+    best = candidate
+    while low <= high:
+        limit = (low + high) // 2
+        shortened = _truncate_text(current_value, current_field, max_bytes=limit)
+        if index is not None:
+            values = list(current)
+            values[index] = shortened
+            candidate = _replace_entry_field(entry, field, tuple(values))
+        else:
+            candidate = _replace_entry_field(entry, field, shortened)
+        if _entry_size_bytes(candidate) <= SUMMARY_MAX_ENTRY_BYTES:
+            best = candidate
+            low = limit + 1
+        else:
+            high = limit - 1
+    return best
+
+
+def _fit_entry_size(entry: SummaryEntry) -> SummaryEntry:
+    """Trim low-priority list items before shortening core summary text."""
+    if _entry_size_bytes(entry) <= SUMMARY_MAX_ENTRY_BYTES:
+        return entry
+
+    fitted = entry
+    for field in _SUMMARY_LIST_TRIM_ORDER:
+        items = getattr(fitted, field)
+        while len(items) > 1 and _entry_size_bytes(fitted) > SUMMARY_MAX_ENTRY_BYTES:
+            fitted = _replace_entry_field(fitted, field, items[:-1])
+            items = getattr(fitted, field)
+        if _entry_size_bytes(fitted) <= SUMMARY_MAX_ENTRY_BYTES:
+            return fitted
+
+    for field in _SUMMARY_TEXT_TRIM_ORDER:
+        values = getattr(fitted, field)
+        if field in SUMMARY_LIST_FIELDS:
+            for index in range(len(values)):
+                fitted = _shrink_entry_text_field(fitted, field, index)
+                if _entry_size_bytes(fitted) <= SUMMARY_MAX_ENTRY_BYTES:
+                    return fitted
+        else:
+            fitted = _shrink_entry_text_field(fitted, field, None)
+            if _entry_size_bytes(fitted) <= SUMMARY_MAX_ENTRY_BYTES:
+                return fitted
+
+    if _entry_size_bytes(fitted) > SUMMARY_MAX_ENTRY_BYTES:
         raise SummaryTrunkError("summary entry exceeds the total byte cap")
-    return entry
+    return fitted
 
 
 def entry_mapping(entry: SummaryEntry) -> dict[str, Any]:
