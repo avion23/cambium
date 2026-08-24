@@ -64,6 +64,18 @@ Non-critical store records can be dropped under the store overflow policy.
 
 ### Worker and providers
 
+`provider_config.load_providers` keeps the provider document boundary strict but
+quarantines an invalid entry instead of discarding the whole file. Each dropped
+entry is recorded as `{"entry", "reason", "quarantined_at"}` in the
+`<config>.quarantine` JSON sidecar; writes merge-deduplicate by canonical entry
+and reason, and the loader emits a warning (the one-shot path prints it to
+stderr). Valid entries continue to load.
+Malformed JSON, invalid root structure, unknown root fields, duplicate provider
+names, and provider-environment collisions remain fatal structural errors. If
+every entry is quarantined, the loader returns a list-compatible empty provider
+set; `select_provider` and the one-shot resolver fail with the sidecar path so
+the operator gets a repairable error rather than an unexplained empty cascade.
+
 `worker.do_work` selects one of two explicit modes:
 
 1. Without `fanout_config`, the deterministic marker worker edits and fences
