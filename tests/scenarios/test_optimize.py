@@ -99,9 +99,15 @@ class OfflineProgram(dspy.Module):
 
 
 class MemoryLoader:
-    def __init__(self, train: list[Example], canaries: list[Example] | None = None) -> None:
+    def __init__(
+        self,
+        train: list[Example],
+        canaries: list[Example] | None = None,
+        eval_examples: list[Example] | None = None,
+    ) -> None:
         self._splits = {
             Split.TRAIN: list(train),
+            Split.EVAL: list(eval_examples or []),
             Split.CANARIES: list(canaries or []),
         }
 
@@ -120,6 +126,122 @@ def _examples(count: int = 6) -> list[Example]:
         )
         for index in range(count)
     ]
+
+
+def _eval_manifest() -> SimpleNamespace:
+    return SimpleNamespace(
+        package_name="example",
+        module_name="should_decompose",
+        dspy_program="cambium.modules.example.dspy_program",
+    )
+
+
+def _patch_eval(monkeypatch, loader: MemoryLoader) -> None:
+    monkeypatch.setattr(optimize, "_load_manifest", lambda _name: _eval_manifest())
+    monkeypatch.setattr(optimize, "load_program_class", lambda _manifest: OfflineProgram)
+    monkeypatch.setattr(
+        optimize,
+        "_load_dataset_loader",
+        lambda _manifest, _dataset_path: loader,
+    )
+    monkeypatch.setattr(optimize, "_construct_lm", lambda *_args: OfflineLM())
+
+
+def test_eval_fresh_module_scores_every_split(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    loader = MemoryLoader(_examples(2), _examples(1), _examples(3))
+    _patch_eval(monkeypatch, loader)
+
+    assert (
+        optimize.main(
+            [
+                "eval",
+                "should_decompose",
+                "--dataset",
+                str(tmp_path / "reviewed-dataset"),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["program"] == "fresh"
+    assert set(report["splits"]) == {"train", "eval", "canaries"}
+    assert [report["splits"][split]["count"] for split in ("train", "eval", "canaries")] == [
+        2,
+        3,
+        1,
+    ]
+    assert all(
+        outcome["score"] == 1.0
+        for split in report["splits"].values()
+        for outcome in split["records"]
+    )
+
+
+def test_eval_loads_saved_program_state(monkeypatch, tmp_path: Path, capsys) -> None:
+    loader = MemoryLoader(_examples(1), _examples(1), _examples(1))
+    _patch_eval(monkeypatch, loader)
+    program_dir = tmp_path / "optimized" / "should_decompose"
+    program_dir.mkdir(parents=True)
+    program_dir.joinpath("program.json").write_text(
+        json.dumps(OfflineProgram(OfflineLM()).dump_state()),
+        encoding="utf-8",
+    )
+    loaded_states: list[dict] = []
+    original_load_state = OfflineProgram.load_state
+
+    def observe_load_state(program, state):
+        loaded_states.append(state)
+        return original_load_state(program, state)
+
+    monkeypatch.setattr(OfflineProgram, "load_state", observe_load_state)
+
+    assert (
+        optimize.main(
+            [
+                "eval",
+                "should_decompose",
+                "--dataset",
+                str(tmp_path / "reviewed-dataset"),
+                "--program-dir",
+                str(program_dir),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["program"] == "optimized"
+    assert loaded_states and loaded_states[0]
+
+
+def test_eval_json_shape_is_stable(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    _patch_eval(monkeypatch, MemoryLoader(_examples(1), _examples(1), _examples(1)))
+
+    assert (
+        optimize.main(
+            [
+                "eval",
+                "should_decompose",
+                "--dataset",
+                str(tmp_path / "reviewed-dataset"),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert set(report) == {"dataset", "module", "program", "splits"}
+    assert all(
+        set(summary) == {"count", "mean", "records", "std"}
+        for summary in report["splits"].values()
+    )
+    assert set(report["splits"]["train"]["records"][0]) == {"index", "score"}
 
 
 def test_load_program_class_rejects_empty_manifest_field() -> None:

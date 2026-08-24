@@ -504,7 +504,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "or report an extracted dataset."
         ),
     )
-    optimize_command.add_argument("module_name", metavar="MODULE|extract|stats")
+    optimize_command.add_argument("module_name", metavar="MODULE|extract|stats|eval")
     optimize_command.add_argument("source", nargs="?", type=Path, metavar="PATH")
     optimize_command.add_argument("--optimizer", choices=("zero", "bootstrap"), default="zero")
     optimize_command.add_argument("--budget-usd", type=float, default=2.0)
@@ -581,7 +581,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dataset",
         type=Path,
         metavar="PATH",
-        help="dataset path for optimize stats/report",
+        help="dataset path for optimize stats/report/eval",
+    )
+    optimize_command.add_argument(
+        "--program-dir",
+        type=Path,
+        metavar="PATH",
+        help="optimized program directory for optimize eval",
     )
     optimize_command.add_argument(
         "--json",
@@ -1201,6 +1207,28 @@ def _run_optimize(args: argparse.Namespace) -> int:
             )
             return 1
         raise
+    if args.module_name == "eval":
+        if args.source is None:
+            print("cambium optimize eval: MODULE is required", file=sys.stderr)
+            return 2
+        if args.dataset is None:
+            print("cambium optimize eval: --dataset PATH is required", file=sys.stderr)
+            return 2
+        delegated = [
+            "eval",
+            str(args.source),
+            "--dataset",
+            str(args.dataset),
+            "--budget-usd",
+            str(args.budget_usd),
+            "--tier",
+            args.tier,
+        ]
+        if args.program_dir is not None:
+            delegated.extend(["--program-dir", str(args.program_dir)])
+        if args.json:
+            delegated.append("--json")
+        return optimize.main(delegated)
     delegated = [
         args.module_name,
         "--optimizer",
