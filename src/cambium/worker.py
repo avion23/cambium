@@ -4091,6 +4091,11 @@ async def _run_agent_loop(
                         summary_prompt,
                         model=model,
                         budget_usd=budget_usd,
+                        # Summary entries are provider-neutral semantic state;
+                        # unlike the agent transcript, they may be generated
+                        # by a configured sibling when the pinned endpoint is
+                        # unavailable.
+                        allow_model_substitution=True,
                     )
                 else:
                     summary_result = await router.call(
@@ -4098,6 +4103,7 @@ async def _run_agent_loop(
                         summary_prompt,
                         model=model,
                         budget_usd=budget_usd,
+                        allow_model_substitution=True,
                     )
             except Exception as exc:
                 if writer is not None:
