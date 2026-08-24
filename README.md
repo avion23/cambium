@@ -23,10 +23,12 @@ The current runtime is intentionally small:
 
 Cambium currently requires Python 3.12 or newer, matching the authoritative
 `project.requires-python = ">=3.12"` declaration in `pyproject.toml`.
-The persistent cockpit TUI is the primary operator interface: it keeps one
-durable interactive branch alive across prompts, reconnects to the latest
-interactive session, supports steering with `!cancel` or Ctrl-C and queued
-follow-ups, and streams model output into the cockpit.
+On a real TTY, the `tui` command provides an interactive terminal cockpit: one
+invocation accepts multiple prompts on a durable branch, and a later
+invocation can reconnect to the newest reconnectable branch. It supports
+steering with `!cancel` or Ctrl-C and queued follow-ups, and streams model
+output into the cockpit. Redirected or `--quiet` output uses the line-oriented
+adapter instead.
 
 From a checkout, run commands with `PYTHONPATH=src`. After installation, use
 the `cambium` console script or `python -m cambium` without `PYTHONPATH`.
@@ -79,8 +81,8 @@ plugin registry.
 ## Quickstart
 
 Install Cambium, define one provider profile, export its API key, and start the
-persistent full-screen terminal cockpit. Provider files contain environment
-variable names, not secret values:
+interactive terminal cockpit. Provider files contain environment variable
+names, not secret values:
 
 ```bash
 python -m pip install .
@@ -109,16 +111,18 @@ automatically with `cambium tui --repo . --auto`.
 
 ## Interactive usage
 
-Start the persistent full-screen terminal cockpit from a checkout:
+Start the interactive terminal cockpit from a checkout:
 
 ```bash
 PYTHONPATH=src python -m cambium tui --repo . --auto
 ```
 
-The cockpit stays alive across turns, reconnects to durable interactive state,
-streams model Markdown while a turn is running, and accepts `!cancel` or
-Ctrl-C to cancel the active turn. Prompts entered while a turn is active are
-queued as follow-ups.
+One `tui` invocation stays at its prompt across turns. It streams model
+Markdown while a turn is running, accepts `!cancel` or Ctrl-C to cancel the
+active turn, and queues prompts entered while a turn is active as follow-ups.
+An exit command (`/exit`, `/quit`, or exact `q`), EOF, or an input interrupt
+while waiting for input ends the frontend process; its durable branch and turn
+artifacts remain available to a later invocation.
 
 To reopen the same semantic branch later, give it a stable interactive root:
 
@@ -161,13 +165,15 @@ PYTHONPATH=src python -m cambium supervisor \
   --demo
 ```
 
-The cockpit remains active across the complete interactive session. Its left
-pane shows user prompts, model Markdown, and important tool/runtime events. Its
-right pane shows main and sub-agent state, provider/model, per-agent tokens,
-output tokens/second, CAST trunk size, summary segments, raw-tail size, epoch,
-checkpoint, cumulative usage, and recent durable events. Native terminals keep
-readline editing and private history. Ctrl-C cancels an active turn and returns
-to the cockpit without advancing the last successful branch checkpoint.
+Within one invocation, the cockpit appends user prompts, model Markdown,
+important tool/runtime events, and compact status rows to the terminal's normal
+scrollback. It does not enter an alternate screen or maintain fixed
+full-screen panes. Status rows include main and sub-agent state, provider/model,
+per-agent tokens, output tokens/second, CAST trunk size, summary segments,
+raw-tail size, epoch, checkpoint, cumulative usage, and recent durable events.
+Native terminals keep readline editing and private history. Ctrl-C cancels an
+active turn and returns to the cockpit without advancing the last successful
+branch checkpoint; Ctrl-C while waiting for input ends the invocation.
 
 The TUI carries the newest immutable context checkpoint into the next prompt,
 keeps the provider/model lease when exact cache reuse is compatible, and falls
@@ -182,20 +188,26 @@ Enter these commands in the cockpit prompt:
 | Command | Action |
 | --- | --- |
 | `/help` | Show the command reference. |
+| `/status` | Show branch, context, agent, and usage details in one view. |
 | `/usage` | Show cumulative calls, tokens, throughput, and cost. |
 | `/agents` | Show main and sub-agent lifecycle state. |
 | `/context` | Show the active trunk, raw tail, checkpoint, and epoch. |
-| `/session` | Show the persistent session and provider lease. |
+| `/session` | Show the interactive session identity and provider lease. |
 | `/new` | Start a fresh semantic branch without deleting old artifacts. |
-| `/clear` | Clear only the visible cockpit transcript. |
-| `/fork` | Fork the current context branch. |
-| `/branches` | List available persistent branches. |
-| `/compact` | Compact the active context. |
+| `/clear` | Clear only the local cockpit transcript; terminal scrollback remains. |
+| `/fork` | Fork the current branch from its successful checkpoint. |
+| `/branches` | List durable branch heads and checkpoint references. |
+| `/compact` | Flush semantic context and roll over when a CAST K0 checkpoint is eligible. |
+| `/dashboard` | Explain the visible live cockpit. |
+| `/events` / `/tail` | Show recent durable event summaries. |
 | `/model` | List enabled, credential-ready provider/model targets and mark the current one. |
 | `/model PROVIDER` / `/model PROVIDER:MODEL` | Select an eligible routing target for subsequent turns. |
-| `/quota` | Show provider quota state. |
-| `/exit` / `/quit` | Close the cockpit. |
+| `/cancel` | Explain that active-turn cancellation uses `!cancel` or Ctrl-C. |
+| `/exit` / `/quit` | Close this TUI invocation. |
 | `q` | Close the cockpit when the submitted prompt is exactly `q` after trimming whitespace. |
+
+`!cancel` cancels an active turn; `v` toggles full command/output details for
+tool entries. These are input controls rather than slash commands.
 
 Use `<<<` and `>>>` on their own lines for multiline prompts. See
 [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
@@ -207,7 +219,8 @@ Attach a read-only monitor to an existing supervisor leaf:
 PYTHONPATH=src python -m cambium monitor /path/to/session
 ```
 
-Inspect or record provider quota windows:
+Inspect or record provider quota windows with the top-level `cambium quota`
+command (there is no `/quota` TUI command):
 
 ```bash
 PYTHONPATH=src python -m cambium quota status
@@ -406,9 +419,11 @@ A supervisor leaf records its state below `<session-dir>/.cambium/`, including:
 - `conversations.db` — optional revision-boundary conversation history,
 - `checkpoints/` — worker checkpoints and immutable context epochs.
 
-A persistent TUI root additionally contains `turn-NNNN/` supervisor leaves and
-`.cambium/interactive.json`, the atomic single-writer branch manifest. Native
-terminal history is stored at `.cambium/tui_history` with mode `0600`.
+An interactive TUI root additionally contains `turn-NNNN/` supervisor leaves
+and `.cambium/interactive.json`, the atomic single-writer branch manifest. The
+root remains durable after the TUI process exits, and reopening it restores
+the branch. Native terminal history is stored at `.cambium/tui_history` with
+mode `0600`.
 
 The supervisor publishes through Git references. It does not refresh the
 caller's working tree or index after advancing `main`.
