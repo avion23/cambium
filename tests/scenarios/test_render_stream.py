@@ -277,7 +277,7 @@ def test_spawned_worker_cmd_is_truncated_to_60_chars() -> None:
 def test_unknown_result_status_is_sanitized() -> None:
     line = _line("result", {"status": "paused\x1b[31m\x9b\nnext"}, seq=1)
 
-    assert line.endswith("  status=paused[31m next")
+    assert line.endswith("  status=paused next")
     assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
 
 
@@ -358,7 +358,7 @@ def test_tool_event_cmd_control_characters_are_neutralized() -> None:
     assert "\x1b" not in line
     assert "\n" not in line
     assert "\x9b" not in line
-    assert body == "run_shell echo [31mINJECTED[0m rm -rf / OK 5ms"
+    assert body == "run_shell echo INJECTED rm -rf / OK 5ms"
 
 
 def test_tool_event_c1_csi_introducer_is_removed() -> None:
@@ -369,7 +369,7 @@ def test_tool_event_c1_csi_introducer_is_removed() -> None:
         task_id="t",
     )
 
-    assert line.endswith("  edit a31mb FAIL ?")
+    assert line.endswith("  edit ab FAIL ?")
     assert "\x9b" not in line
 
 
@@ -391,7 +391,7 @@ def test_failure_and_diagnostic_message_fields_are_neutralized() -> None:
     )
 
     assert "\x1b" not in failure and "\n" not in failure
-    assert failure.endswith("  provider p FAILED boom[2Jboom second")
+    assert failure.endswith("  provider p FAILED boomboom second")
 
     rejected = _line(
         "child_rejected",
@@ -401,7 +401,7 @@ def test_failure_and_diagnostic_message_fields_are_neutralized() -> None:
     )
 
     assert "\x1b" not in rejected and "\x9b" not in rejected and "\n" not in rejected
-    assert rejected.endswith("  child=c reason=r x msg=mm")
+    assert rejected.endswith("  child=c reason=r x msg=m")
 
 
 def test_unknown_kind_json_fallback_stays_escaped_single_line() -> None:
@@ -480,8 +480,8 @@ def test_status_bar_sanitizes_label_and_task_id(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
-    assert line.startswith("session=se[2ms s · ")
-    assert " task=t[31mi x" in line
+    assert line.startswith("session=se2ms s · ")
+    assert " task=ti x" in line
 
 
 def test_status_bar_drops_absent_segments() -> None:
@@ -782,7 +782,7 @@ def test_hostile_kind_is_sanitized_before_padding() -> None:
     _assert_terminal_safe(line)
     assert "\n" not in line
     body = json.dumps({"a": 1}, sort_keys=True, separators=(",", ":"))
-    assert line == f"{1:>6} {'ki[31mnd secondk':>16}  {body}"
+    assert line == f"{1:>6} {'kind second':>16}  {body}"
 
 
 def test_hostile_task_id_is_sanitized_in_prefix() -> None:
@@ -797,7 +797,7 @@ def test_hostile_task_id_is_sanitized_in_prefix() -> None:
 
     _assert_terminal_safe(line)
     assert "\n" not in line
-    assert line == f"{2:>6} {'ready':>16} t[31mi d  pid=7"
+    assert line == f"{2:>6} {'ready':>16} ti   pid=7"
 
 
 def test_nested_container_dump_escapes_c1_controls() -> None:

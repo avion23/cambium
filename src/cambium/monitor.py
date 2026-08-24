@@ -24,6 +24,7 @@ from .observability import (
     SessionSnapshot,
 )
 from .store import StoreError, read_events_file
+from .terminal import sanitize_terminal_text
 
 _ALT_ENTER = "\x1b[?1049h\x1b[?25l"
 _ALT_EXIT = "\x1b[?25h\x1b[?1049l"
@@ -38,6 +39,7 @@ def _is_tty(stream: Any) -> bool:
 
 
 def _clip(value: str, width: int) -> str:
+    value = sanitize_terminal_text(value, single_line=True)
     if width <= 0:
         return ""
     if len(value) <= width:
@@ -81,9 +83,13 @@ def _duration(value: float | None) -> str:
 
 
 def _model(agent: AgentSnapshot) -> str:
-    if agent.provider and agent.model:
-        return f"{agent.provider}/{agent.model}"
-    return agent.model or agent.provider or "?"
+    provider = (
+        sanitize_terminal_text(agent.provider, single_line=True) if agent.provider else ""
+    )
+    model = sanitize_terminal_text(agent.model, single_line=True) if agent.model else ""
+    if provider and model:
+        return f"{provider}/{model}"
+    return model or provider or "?"
 
 
 def _rate(agent: AgentSnapshot) -> str:
@@ -127,12 +133,15 @@ def render_agent_lines(snapshot: SessionSnapshot) -> list[str]:
             "succeeded": "done",
         }.get(agent.state, agent.state)
         lines.append(
-            f"{agent.task_id:<24} {state:<9} role={agent.role} "
-            f"parent={parent} gen={agent.generation} turn={agent.turn} "
-            f"epoch={agent.epoch} model={_model(agent)} calls={agent.calls} "
-            f"tokens={agent.total_tokens} in={agent.input_tokens} "
-            f"out={agent.output_tokens} cached={agent.cached_tokens} "
-            f"out/s={_rate(agent)} cost=${agent.estimated_cost_usd:.6f}"
+            sanitize_terminal_text(
+                f"{agent.task_id:<24} {state:<9} role={agent.role} "
+                f"parent={parent} gen={agent.generation} turn={agent.turn} "
+                f"epoch={agent.epoch} model={_model(agent)} calls={agent.calls} "
+                f"tokens={agent.total_tokens} in={agent.input_tokens} "
+                f"out={agent.output_tokens} cached={agent.cached_tokens} "
+                f"out/s={_rate(agent)} cost=${agent.estimated_cost_usd:.6f}",
+                single_line=True,
+            )
         )
     lines.append(
         f"totals: tokens={snapshot.total_tokens} in={snapshot.input_tokens} "
