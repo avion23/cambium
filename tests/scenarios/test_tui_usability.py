@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 from pathlib import Path
 
 from cambium import tui
+from cambium.interactive import InteractiveSession
 from cambium.oneshot import OneShotConfig
 from cambium.supervisor import PlanResult, TaskResult
 
@@ -32,6 +34,58 @@ class _History:
 
     def set_history_length(self, length: int) -> None:
         self.length = length
+
+
+def _provider_config(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "ready-a",
+                        "tier": "balanced",
+                        "base_url": "http://127.0.0.1:9999/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_READY_A_API_KEY",
+                        "model": "model-a",
+                    },
+                    {
+                        "name": "ready-b",
+                        "tier": "strong",
+                        "base_url": "http://127.0.0.1:9999/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_READY_B_API_KEY",
+                        "model": "model-b",
+                    },
+                    {
+                        "name": "missing",
+                        "tier": "fast",
+                        "base_url": "http://127.0.0.1:9999/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_MISSING_API_KEY",
+                        "model": "model-missing",
+                    },
+                    {
+                        "name": "disabled",
+                        "tier": "fast",
+                        "base_url": "http://127.0.0.1:9999/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_DISABLED_API_KEY",
+                        "model": "model-disabled",
+                        "enabled": False,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _model_config(tmp_path: Path, provider_config: Path) -> OneShotConfig:
+    return OneShotConfig(
+        repo=tmp_path,
+        session_root=tmp_path / "interactive",
+        provider="ready-a",
+        model="model-a",
+        provider_config_path=provider_config,
+    )
 
 
 def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> None:
@@ -59,6 +113,112 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert "provider=auto model=auto" in text
     assert "press Ctrl-C while a turn is running" in text
     assert "┌ Cambium" in text
+
+
+def test_model_lists_ready_targets_and_marks_current(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider_config = _provider_config(tmp_path / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_A_API_KEY", "test-key-a-not-output")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_B_API_KEY", "test-key-b-not-output")
+    monkeypatch.delenv("CAMBIUM_PROVIDER_MISSING_API_KEY", raising=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDER_DISABLED_API_KEY", raising=False)
+    output = _Tty()
+    error = io.StringIO()
+
+    code = asyncio.run(
+        tui.run_tui(
+            _model_config(tmp_path, provider_config),
+            input_stream=_Tty("/model\n/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    text = output.getvalue()
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "eligible provider/model targets (enabled + credential-ready):" in text
+    assert "ready-a:model-a (current)" in text
+    assert "ready-b:model-b" in text
+    assert "model-missing" not in text
+    assert "model-disabled" not in text
+    assert "test-key-" not in text
+
+
+def test_model_switch_persists_for_subsequent_turns(monkeypatch, tmp_path: Path) -> None:
+    provider_config = _provider_config(tmp_path / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_A_API_KEY", "test-key-a-not-output")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_B_API_KEY", "test-key-b-not-output")
+    config = _model_config(tmp_path, provider_config)
+
+    output = _Tty()
+    error = io.StringIO()
+    code = asyncio.run(
+        tui.run_tui(
+            config,
+            input_stream=_Tty("/model ready-b:model-b\n/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "model preference set: provider=ready-b model=model-b" in output.getvalue()
+
+    reloaded = InteractiveSession(config)
+    assert reloaded.provider == "ready-b"
+    assert reloaded.model == "model-b"
+    manifest = json.loads(
+        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["provider_preference"] == "ready-b"
+    assert manifest["model_preference"] == "model-b"
+
+    turn = reloaded.prepare_turn("continue")
+    assert turn.config.provider == "ready-b"
+    assert turn.config.model == "model-b"
+    assert turn.config.assigned_provider == "ready-b"
+
+
+def test_trimmed_q_exits_without_submitting_a_turn(tmp_path: Path) -> None:
+    output = _Tty()
+    error = io.StringIO()
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=_Tty("  q  \n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "Unknown command" not in output.getvalue()
+    assert not tuple((tmp_path / "interactive").glob("turn-*"))
+
+
+def test_exit_command_still_exits_without_submitting_a_turn(tmp_path: Path) -> None:
+    output = _Tty()
+    error = io.StringIO()
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=_Tty("/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    assert code == 0
+    assert error.getvalue() == ""
+    assert not tuple((tmp_path / "interactive").glob("turn-*"))
 
 
 def test_tui_history_is_private_and_bounded(monkeypatch, tmp_path: Path) -> None:

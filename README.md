@@ -142,9 +142,11 @@ Enter these commands in the cockpit prompt:
 | `/fork` | Fork the current context branch. |
 | `/branches` | List available persistent branches. |
 | `/compact` | Compact the active context. |
-| `/model` | Show the current provider/model lease. |
+| `/model` | List enabled, credential-ready provider/model targets and mark the current one. |
+| `/model PROVIDER` / `/model PROVIDER:MODEL` | Select an eligible routing target for subsequent turns. |
 | `/quota` | Show provider quota state. |
-| `/exit` | Close the cockpit. |
+| `/exit` / `/quit` | Close the cockpit. |
+| `q` | Close the cockpit when the submitted prompt is exactly `q` after trimming whitespace. |
 
 Use `<<<` and `>>>` on their own lines for multiline prompts. See
 [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
