@@ -1,8 +1,10 @@
-"""Scenario tests for the strict Diffundo provider-config loader."""
+"""Scenario tests for the Diffundo provider-config loader and quarantine policy."""
 
 from __future__ import annotations
 
 import json
+import logging
+import re
 from pathlib import Path
 from typing import cast
 
@@ -44,6 +46,32 @@ def _provider(name: object = "openai", **overrides: object) -> dict[str, object]
 def _write(path: Path, providers: list[dict[str, object]]) -> Path:
     path.write_text(json.dumps({"providers": providers}), encoding="utf-8")
     return path
+
+
+def _assert_quarantined(
+    path: Path, match: str, caplog: pytest.LogCaptureFixture
+) -> list[dict[str, object]]:
+    """Assert the invalid entry is dropped, recorded, and warned about."""
+
+    caplog.set_level(logging.WARNING, logger=provider_config.__name__)
+    providers = load_providers(path)
+
+    assert providers == []
+    sidecar = path.with_name(path.name + ".quarantine")
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert isinstance(records, list)
+    assert len(records) == 1
+    record = records[0]
+    assert isinstance(record, dict)
+    assert {"entry", "reason", "quarantined_at"} <= set(record)
+    assert re.search(match, str(record["reason"]))
+    assert any(
+        item.name == provider_config.__name__
+        and item.levelno == logging.WARNING
+        and getattr(item, "event", None) == "provider_config_quarantined"
+        for item in caplog.records
+    )
+    return records
 
 
 def test_default_path_uses_effective_home_not_home_env(
@@ -88,11 +116,12 @@ def test_environment_path_overrides_default(
     assert [provider.name for provider in providers] == ["environment"]
 
 
-def test_generic_api_key_environment_name_is_rejected(tmp_path: Path) -> None:
+def test_generic_api_key_environment_name_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(tmp_path / "providers.json", [_provider(api_key_env="OPENAI_API_KEY")])
 
-    with pytest.raises(ValueError, match="derived CAMBIUM"):
-        load_providers(path)
+    _assert_quarantined(path, "derived CAMBIUM", caplog)
 
 
 def test_env_report_only_returns_presence_booleans(
@@ -162,11 +191,12 @@ def test_loopback_http_base_url_is_accepted(tmp_path: Path) -> None:
         assert providers[0].base_url == base_url
 
 
-def test_remote_http_base_url_is_rejected(tmp_path: Path) -> None:
+def test_remote_http_base_url_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(tmp_path / "providers.json", [_provider(base_url="http://api.example.test/v1")])
 
-    with pytest.raises(ValueError, match="http transport is allowed only for loopback hosts"):
-        load_providers(path)
+    _assert_quarantined(path, "http transport is allowed only for loopback hosts", caplog)
 
 
 def test_remote_https_base_url_is_accepted(tmp_path: Path) -> None:
@@ -178,14 +208,15 @@ def test_remote_https_base_url_is_accepted(tmp_path: Path) -> None:
     assert providers[0].base_url == "https://api.example.test/v1"
 
 
-def test_url_credentials_in_base_url_are_rejected(tmp_path: Path) -> None:
+def test_url_credentials_in_base_url_are_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_provider(base_url="https://user:pass@api.example.test/v1")],
     )
 
-    with pytest.raises(ValueError, match="must not contain URL credentials"):
-        load_providers(path)
+    _assert_quarantined(path, "must not contain URL credentials", caplog)
 
 
 def test_non_finite_numeric_field_is_rejected(tmp_path: Path) -> None:
@@ -282,31 +313,31 @@ def test_auth_protocol_round_trip_from_providers_json(tmp_path: Path) -> None:
     assert providers[0].api_key_env == ""
 
 
-def test_codex_chatgpt_without_codex_responses_protocol_is_rejected(
-    tmp_path: Path,
+def test_codex_chatgpt_without_codex_responses_protocol_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_codex_provider(protocol="chat_completions")],
     )
 
-    with pytest.raises(ValueError, match="requires protocol 'codex_responses'"):
-        load_providers(path)
+    _assert_quarantined(path, "requires protocol 'codex_responses'", caplog)
 
 
-def test_codex_responses_without_codex_chatgpt_auth_is_rejected(
-    tmp_path: Path,
+def test_codex_responses_without_codex_chatgpt_auth_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_provider(protocol="codex_responses")],
     )
 
-    with pytest.raises(ValueError, match="requires auth 'codex_chatgpt'"):
-        load_providers(path)
+    _assert_quarantined(path, "requires auth 'codex_chatgpt'", caplog)
 
 
-def test_codex_chatgpt_base_url_in_file_is_rejected(tmp_path: Path) -> None:
+def test_codex_chatgpt_base_url_in_file_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     # Token-exfiltration guard: a modified provider file must never redirect
     # the bearer token away from the pinned profile endpoint.
     path = _write(
@@ -314,35 +345,37 @@ def test_codex_chatgpt_base_url_in_file_is_rejected(tmp_path: Path) -> None:
         [_codex_provider(base_url="https://attacker.example.test/v1")],
     )
 
-    with pytest.raises(ValueError, match="must not be set with auth 'codex_chatgpt'"):
-        load_providers(path)
+    _assert_quarantined(path, "must not be set with auth 'codex_chatgpt'", caplog)
 
 
-def test_codex_chatgpt_api_key_env_in_file_is_rejected(tmp_path: Path) -> None:
+def test_codex_chatgpt_api_key_env_in_file_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_codex_provider(api_key_env="CAMBIUM_PROVIDER_CODEX_API_KEY")],
     )
 
-    with pytest.raises(ValueError, match="must not be set with auth 'codex_chatgpt'"):
-        load_providers(path)
+    _assert_quarantined(path, "must not be set with auth 'codex_chatgpt'", caplog)
 
 
-def test_api_key_provider_without_api_key_env_is_rejected(tmp_path: Path) -> None:
+def test_api_key_provider_without_api_key_env_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     value = _provider()
     del value["api_key_env"]
     path = _write(tmp_path / "providers.json", [value])
 
-    with pytest.raises(ValueError, match=r"missing required field\(s\).*api_key_env"):
-        load_providers(path)
+    _assert_quarantined(path, r"missing required field\(s\).*api_key_env", caplog)
 
 
 @pytest.mark.parametrize("model", ["", "   ", "\t\n"])
-def test_blank_model_is_rejected(tmp_path: Path, model: str) -> None:
+def test_blank_model_is_quarantined(
+    tmp_path: Path, model: str, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(tmp_path / "providers.json", [_provider(model=model)])
 
-    with pytest.raises(ValueError, match=r"providers\[0\]\.model: must not be blank"):
-        load_providers(path)
+    _assert_quarantined(path, r"providers\[0\]\.model: must not be blank", caplog)
 
 
 @pytest.mark.parametrize(
@@ -356,14 +389,16 @@ def test_blank_model_is_rejected(tmp_path: Path, model: str) -> None:
         ({"protocol": None}, "must be a protocol name"),
     ],
 )
-def test_malformed_auth_protocol_values_fail_closed(
-    tmp_path: Path, overrides: dict[str, object], match: str
+def test_malformed_auth_protocol_values_are_quarantined(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    match: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # An explicit malformed tag is an error, never a silent default.
     path = _write(tmp_path / "providers.json", [_provider(**overrides)])
 
-    with pytest.raises(ValueError, match=match):
-        load_providers(path)
+    _assert_quarantined(path, match, caplog)
 
 
 def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> None:
@@ -387,24 +422,26 @@ def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> No
     "value",
     [5, "", "   ", True],
 )
-def test_malformed_reasoning_effort_fails_closed(tmp_path: Path, value: object) -> None:
+def test_malformed_reasoning_effort_is_quarantined(
+    tmp_path: Path, value: object, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_codex_provider(reasoning_effort=value)],
     )
 
-    with pytest.raises(ValueError, match="reasoning_effort"):
-        load_providers(path)
+    _assert_quarantined(path, "reasoning_effort", caplog)
 
 
-def test_reasoning_effort_requires_codex_responses_protocol(tmp_path: Path) -> None:
+def test_reasoning_effort_requires_codex_responses_protocol_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _write(
         tmp_path / "providers.json",
         [_provider(reasoning_effort="high")],
     )
 
-    with pytest.raises(ValueError, match="only supported with protocol 'codex_responses'"):
-        load_providers(path)
+    _assert_quarantined(path, "only supported with protocol 'codex_responses'", caplog)
 
 
 def test_cached_input_price_round_trips_independently(tmp_path: Path) -> None:
@@ -422,3 +459,67 @@ def test_cached_input_price_round_trips_independently(tmp_path: Path) -> None:
     assert providers[0].price_per_1m_in == 0.30
     assert providers[0].price_per_1m_cached_in == 0.05
     assert providers[0].price_per_1m_out == 0.80
+
+
+def test_valid_entries_continue_after_invalid_entry_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    invalid = _provider("broken", api_key_env="OPENAI_API_KEY")
+    path = _write(tmp_path / "providers.json", [_provider("healthy"), invalid])
+
+    caplog.set_level(logging.WARNING, logger=provider_config.__name__)
+    providers = load_providers(path)
+
+    assert [provider.name for provider in providers] == ["healthy"]
+    records = json.loads(path.with_name(path.name + ".quarantine").read_text(encoding="utf-8"))
+    assert records[0]["entry"] == invalid
+    assert records[0]["reason"] == (
+        "provider config providers[1].api_key_env: "
+        "must be the derived CAMBIUM provider environment name"
+    )
+    assert records[0]["quarantined_at"].endswith("Z")
+    assert any(
+        item.name == provider_config.__name__
+        and item.levelno == logging.WARNING
+        and getattr(item, "event", None) == "provider_config_quarantined"
+        for item in caplog.records
+    )
+
+
+def test_quarantine_sidecar_merge_appends_existing_records(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(api_key_env="OPENAI_API_KEY")])
+    sidecar = path.with_name(path.name + ".quarantine")
+    existing = [
+        {"entry": {"name": "previous"}, "reason": "previous reason", "quarantined_at": "old"}
+    ]
+    sidecar.write_text(json.dumps(existing), encoding="utf-8")
+
+    caplog.set_level(logging.WARNING, logger=provider_config.__name__)
+    assert load_providers(path) == []
+
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert records[0] == existing[0]
+    assert len(records) == 2
+    assert records[1]["entry"]["name"] == "openai"
+    assert re.search("derived CAMBIUM", records[1]["reason"])
+    assert any(
+        item.name == provider_config.__name__
+        and item.levelno == logging.WARNING
+        and getattr(item, "event", None) == "provider_config_quarantined"
+        for item in caplog.records
+    )
+
+
+def test_all_quarantined_loads_zero_and_selection_names_sidecar(tmp_path: Path) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(api_key_env="OPENAI_API_KEY")])
+
+    providers = load_providers(path)
+
+    assert providers == []
+    with pytest.raises(
+        ValueError,
+        match=r"all providers quarantined to .*providers\.json\.quarantine; fix or remove entries",
+    ):
+        select_provider(providers)
