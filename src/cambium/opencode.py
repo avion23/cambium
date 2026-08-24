@@ -833,7 +833,12 @@ def _session_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def _record(candidate: Candidate, *, review_gate: bool = False) -> dict[str, object]:
+def _record(
+    candidate: Candidate,
+    *,
+    review_gate: bool = False,
+    extracted_at: str | None = None,
+) -> dict[str, object]:
     digest = hashlib.sha256(
         json.dumps(
             [candidate.task, candidate.context, candidate.decompose],
@@ -843,10 +848,12 @@ def _record(candidate: Candidate, *, review_gate: bool = False) -> dict[str, obj
     ).hexdigest()[:16]
     status = "needs_review" if review_gate else "approved"
     split = "review_queue" if review_gate else "accepted"
+    extraction_time = extracted_at or datetime.now(UTC).isoformat()
     provenance = {
         "database": candidate.database or "unknown",
         "session": _session_digest(candidate.session_id) if candidate.session_id else "unknown",
         "repo": candidate.repo or "unknown",
+        "extracted_at": extraction_time,
         "time_created_ms": candidate.time_created_ms,
         "time_created": (
             datetime.fromtimestamp(candidate.time_created_ms / 1000, tz=UTC).isoformat()
@@ -949,8 +956,12 @@ def write_dataset(
     review_gate: bool = False,
 ) -> tuple[Path, Path]:
     """Write JSONL records and a sidecar containing versioned provenance."""
+    extracted_at = datetime.now(UTC).isoformat()
     records = sorted(
-        (_record(candidate, review_gate=review_gate) for candidate in result.candidates),
+        (
+            _record(candidate, review_gate=review_gate, extracted_at=extracted_at)
+            for candidate in result.candidates
+        ),
         key=lambda record: str(record["id"]),
     )
     text = "".join(
@@ -974,8 +985,12 @@ def write_dataset(
 def write_records(path: Path, result: ExtractionResult) -> None:
     """Legacy script writer: preserve its review-queue default."""
     output = Path(path)
+    extracted_at = datetime.now(UTC).isoformat()
     records = sorted(
-        (_record(candidate, review_gate=True) for candidate in result.candidates),
+        (
+            _record(candidate, review_gate=True, extracted_at=extracted_at)
+            for candidate in result.candidates
+        ),
         key=lambda record: str(record["id"]),
     )
     _atomic_write_text(
