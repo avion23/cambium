@@ -1,7 +1,7 @@
 # First real trajectory extraction
 
 **Run date:** 2026-08-23 UTC  
-**Status:** review queue only; optimization was intentionally not run.
+**Status:** review complete: 2 approved, 1 rejected, and 20 collapsed; optimization was intentionally not run.
 
 ## Source discovery
 
@@ -60,38 +60,58 @@ PYTHONPATH=src python -m cambium optimize stats \
 
 The resulting `stats.json` reports:
 
-- 23 records, all `review_status: needs_review` and `split: review_queue`;
-- labels: 18 `false`, 5 `true`;
-- repository: 23 `cambium`, 0 polymarket candidates;
-- UTC days: 16 on 2026-08-09, 5 on 2026-08-11, and 2 on 2026-08-18;
-- tool vocabulary: 23 `bash`.
+- 2 records, all `review_status: approved` and `split: accepted`;
+- labels: 2 `false`, 0 `true`;
+- repository: 2 `cambium`, 0 polymarket candidates;
+- UTC days: 1 on 2026-08-09 and 1 on 2026-08-11;
+- tool vocabulary: 2 `bash`.
 
-## Redaction and spot review
+## Redaction and decision review
 
-All 23 records have `candidate: true`, `redacted: true`, and
-`review_status: needs_review`; none is in the accepted set. An independent
-scan of the 69 candidate input/expected text fields found zero private keys,
-credential assignments or URLs, authorization/cookie headers, known tokens,
-long token-like strings, email addresses, phone numbers, IP addresses, or
-home paths.
+The extraction-time scan of all 69 candidate input/expected text fields found
+zero private keys, credential assignments or URLs, authorization/cookie
+headers, known tokens, long token-like strings, email addresses, phone
+numbers, IP addresses, or home paths. Review also checked the retained records
+for sensitivity and found only generic engineering terms and the repository
+name `cambium`; no private repository content, credentials, or keys were
+retained.
 
-Five records were manually spot-reviewed for label sanity:
+The decision manifest below is the audit record for every extracted candidate.
+The final JSONL contains approved payloads only; rejected and collapsed
+payloads are represented here by their IDs and one-line reasons, not copied
+into the final artifact.
 
-| candidate | label | finding |
+| candidate | verdict | one-line reason |
 | --- | --- | --- |
-| `...01f526d8920748bd` | false | sane: one focused auth-module change |
-| `...3d736a43599c941a` | true | sane: independent per-provider adapters and tests |
-| `...5b24a2950b9edf91` | false | sane: context already lists the subtasks |
-| `...85d53eedc33635be` | true | sane: four independent scheduler/API/migration/rollout workstreams |
-| `...381dc7c64cfea43e` | false | borderline: multiple services and deployment settings conflict with the atomic rationale; adjudicate before approval |
+| `should_decompose-transcript-01f526d8920748bd` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` auth-refactor record. |
+| `should_decompose-transcript-0b58b32bf5438585` | collapse | Exact duplicate of active train record `should_decompose-0002`. |
+| `should_decompose-transcript-127fdfeb64668cf4` | collapse | Near-duplicate of retained candidate `should_decompose-transcript-959f370dbe690ab8`; keep the stronger explicit one-feature boundary. |
+| `should_decompose-transcript-15dd2612b159ecd5` | collapse | Exact duplicate of active eval record `should_decompose-0203`. |
+| `should_decompose-transcript-381dc7c64cfea43e` | collapse | Exact duplicate of active canary `should_decompose-canary-01`; no second payload is useful. |
+| `should_decompose-transcript-3d736a43599c941a` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` multi-provider record. |
+| `should_decompose-transcript-46892a95d789a20f` | collapse | Exact duplicate of active train record `should_decompose-0004`. |
+| `should_decompose-transcript-468e53090e277ffa` | approve | Coherent atomic retry-backoff task with an explicit low-risk outcome; unique in the active decompose splits. |
+| `should_decompose-transcript-4750573baa058df2` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` four-workstream payment record. |
+| `should_decompose-transcript-544962bed7001d71` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` keyword-heavy atomic canary. |
+| `should_decompose-transcript-5b24a2950b9edf91` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` context-suppression record. |
+| `should_decompose-transcript-5eba9cde59c25f63` | reject | Result-only fragment rather than an actionable decomposition task, so its triple is not useful training signal. |
+| `should_decompose-transcript-604a91aa316701c8` | collapse | Exact duplicate of active train record `should_decompose-0003`. |
+| `should_decompose-transcript-67d10ea10066c9b3` | collapse | Exact duplicate of active eval record `should_decompose-0202`. |
+| `should_decompose-transcript-6a2502962dd30234` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` itemized migration record. |
+| `should_decompose-transcript-8060da8a4ab8b06c` | collapse | Near-duplicate of active train record `should_decompose-0063` with no distinct signal. |
+| `should_decompose-transcript-83a70c24607eb80a` | collapse | Exact duplicate of active train record `should_decompose-0005`. |
+| `should_decompose-transcript-85d53eedc33635be` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` four-workstream scheduler record. |
+| `should_decompose-transcript-959f370dbe690ab8` | approve | Retained stronger member of the shared-config near-duplicate pair; explicit one-feature deployment supports the atomic label. |
+| `should_decompose-transcript-95a7f468445b205c` | collapse | Exact duplicate of the legacy `example_pairs.jsonl` atomic-edit record. |
+| `should_decompose-transcript-9cf8983055b3f5c0` | collapse | Exact duplicate of active canary `should_decompose-canary-02`. |
+| `should_decompose-transcript-b7ecd4776e83c279` | collapse | Exact duplicate of active eval record `should_decompose-0201`. |
+| `should_decompose-transcript-e3c851c65dac2727` | collapse | Exact duplicate of active train record `should_decompose-0001`. |
 
-The formal queue count is therefore **23 pending, 0 approved, 0 rejected**.
-For the five-record spot sample, four are provisionally label-sane and one is
-recommended for rejection or human adjudication. The 89 duplicate source
-records were rejected by deduplication, not silently promoted. There are zero
-optimization-usable approved trajectories until a reviewer explicitly labels
-the queue; no optimization run was attempted.
-
-The only committed data under this report is the small derived, redacted
-23-record JSONL queue, its provenance sidecar, and the stats report. Raw
-OpenCode or pi transcripts remain outside the repository.
+The final artifact is
+`artifacts/optimization/first-real-extraction/review_queue.jsonl` and contains
+2 approved records. Fewer than approximately eight records survive; this is
+intentional, because padding the set would reintroduce duplicates or weak
+signals. A final redaction sweep of the retained artifact found zero common
+credential-prefix or 67-plus-character alphanumeric key-shaped matches. The
+89 duplicate source records remain represented only by the extraction
+metadata; raw OpenCode or pi transcripts remain outside the repository.
