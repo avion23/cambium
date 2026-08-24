@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "dataset_version": "1.2.0",
+  "dataset_kind": "opencode-trajectory",
+  "split": "review_queue",
+  "created_at": "2026-08-24T18:33:21.721614+00:00",
+  "provenance": {
+    "extractor": "cambium optimize extract",
+    "source": "opencode-transcript",
+    "database_files": [
+      {
+        "name": "opencode-update-upstream.db",
+        "sha256": "3af4aac3a0fc7a8d996ce94f8f84a347ba7315335094818c29f87713cafbcc22"
+      }
+    ],
+    "repo_filter": [],
+    "time_range": {
+      "from": null,
+      "to": null
+    },
+    "review_gate": true
+  },
+  "counts": {
+    "records": 0,
+    "duplicates": 0,
+    "conflicts": 0,
+    "excluded": 0,
+    "unsafe": 0
+  },
+  "database_summaries": [
+    {
+      "database": "opencode-update-upstream.db",
+      "sessions": 1,
+      "selected_sessions": 0,
+      "explicit_records": 0,
+      "safe_records": 0,
+      "unsafe_records": 0,
+      "repo_counts": {},
+      "tool_counts": {},
+      "time_counts": {}
+    }
+  ]
+}
