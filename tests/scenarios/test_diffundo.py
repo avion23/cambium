@@ -644,9 +644,13 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
 def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> None:
     server = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
     _set_keys(monkeypatch, "K_RETRY_LONG")
+    # Budget must sit comfortably ABOVE one attempt yet BELOW the 60s
+    # Retry-After: under xdist load a tight wall budget starves the first
+    # attempt itself, which is starvation noise rather than the behavior
+    # under test (no retry when the reset lands beyond the budget).
     router = Diffundo(
         (_config("p_retry_long", server, "K_RETRY_LONG", max_retries=1),),
-        call_budget_s=0.1,
+        call_budget_s=30.0,
     )
 
     async def fail_sleep(delay: float) -> None:
