@@ -371,6 +371,59 @@ def test_pinned_endpoint_death_without_alternative_remains_fatal(monkeypatch) ->
         dead.close()
 
 
+def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> None:
+    dead = FakeServer(
+        [
+            (503, _error_payload("endpoint is unavailable"), 0.0),
+            (200, _ok_payload("fresh router"), 0.0),
+        ]
+    )
+    healthy = FakeServer([(200, _ok_payload("healthy sibling"), 0.0)])
+    _set_keys(monkeypatch, "K_TERMINAL_DEAD", "K_TERMINAL_HEALTHY")
+    providers = (
+        _config("p_terminal_dead", dead, "K_TERMINAL_DEAD", model="m"),
+        _config("p_terminal_healthy", healthy, "K_TERMINAL_HEALTHY", model="m"),
+    )
+    router = Diffundo(
+        providers,
+        primary_provider="p_terminal_dead",
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert first.provider == "p_terminal_healthy"
+        assert router.health("p_terminal_dead") is HealthState.COOLDOWN
+
+        # Once ordinary cooldown has elapsed, terminal-death memory still
+        # excludes the dead lane while a healthy sibling can serve.
+        router._runtime("p_terminal_dead").cooldown_until = time.monotonic() - 1.0
+        assert [
+            provider.name for provider in router._candidates(ProviderTier.FAST, None)
+        ] == ["p_terminal_healthy"]
+        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert second.provider == "p_terminal_healthy"
+        assert len(dead.calls) == 1
+        assert len(healthy.calls) == 2
+
+        # The memory is router-local: a new Diffundo instance considers the
+        # endpoint again, and the scripted recovery response can win.
+        fresh = Diffundo(
+            providers,
+            primary_provider="p_terminal_dead",
+            pause_timeout_s=0.01,
+        )
+        assert [
+            provider.name for provider in fresh._candidates(ProviderTier.FAST, None)
+        ][0] == "p_terminal_dead"
+        recovered = asyncio.run(fresh.call(ProviderTier.FAST, PROMPT))
+        assert recovered.provider == "p_terminal_dead"
+        assert recovered.content == "fresh router"
+        assert len(dead.calls) == 2
+    finally:
+        dead.close()
+        healthy.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. tier filtering + model pin
 # --------------------------------------------------------------------------- #
