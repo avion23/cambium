@@ -86,7 +86,8 @@ _HELP = """Commands:
   /agents     main/sub-agent lifecycle and provider/model rows
   /context    current trunk, raw tail, checkpoint, and epoch
   /session    persistent interactive-session identity and provider lease
-  /model [M]  show the provider/model lease or set a configured model preference
+  /model      list eligible provider/model targets
+  /model P    select provider P (or P:M) for subsequent turns
   /branches   list durable branch heads with epoch/checkpoint references
   /fork       fork a new branch from the current checkpoint
   /compact    flush semantic context and check for a K0 rollover
@@ -94,7 +95,7 @@ _HELP = """Commands:
   /events     recent durable event summaries
   /new        start a fresh semantic branch; old turn artifacts remain
   /clear      clear the visible cockpit transcript
-  /exit       leave Cambium
+  /exit       leave Cambium (also /quit or a prompt containing only q)
 
 Transcript view:
   v           toggle full command/output details for every tool entry.
@@ -231,6 +232,11 @@ def _read_cockpit_prompt(source: TextIO, cockpit: Cockpit, *, native: bool) -> s
     if value is None:
         return None
     return _read_multiline(value, lambda: read_one("…"))
+
+
+def _is_quit_prompt(prompt: str) -> bool:
+    """Return whether one submitted prompt unambiguously requests exit."""
+    return prompt in {"/exit", "/quit"} or prompt.strip() == "q"
 
 
 def _history_path(session: InteractiveSession) -> Path:
@@ -436,7 +442,7 @@ async def _run_legacy(
                 out.write("\n")
                 out.flush()
                 return ExitCode.FAILURE if failed else ExitCode.SUCCESS
-            if prompt in {"/exit", "/quit"}:
+            if _is_quit_prompt(prompt):
                 return ExitCode.FAILURE if failed else ExitCode.SUCCESS
             if not prompt.strip():
                 continue
@@ -537,7 +543,23 @@ def _command_output(
         return session.describe()
     if name == "/model":
         if not argument:
-            return session.describe()
+            try:
+                options = session.eligible_provider_models()
+            except (OSError, ValueError, InteractiveSessionError) as exc:
+                return f"model: provider config/auth unavailable ({exc})"
+            if not options:
+                return "model: no eligible provider/model targets (enabled + credential-ready)"
+            current_provider = session.provider
+            current_model = session.model
+            lines = ["eligible provider/model targets (enabled + credential-ready):"]
+            for provider, model in options:
+                current = provider == current_provider and (
+                    current_model in {None, "auto"} or model == current_model
+                )
+                marker = "* " if current else "  "
+                suffix = " (current)" if current else ""
+                lines.append(f"{marker}{provider}:{model}{suffix}")
+            return "\n".join(lines)
         return session.set_model_preference(argument)
     if name == "/branches" and not argument:
         heads = session.branch_heads()
@@ -701,7 +723,7 @@ async def _run_interactive(
                     cumulative_line=cumulative.line(),
                 )
                 prompt = await _next_prompt()
-                if prompt is None or prompt in {"/exit", "/quit"}:
+                if prompt is None or _is_quit_prompt(prompt):
                     return ExitCode.FAILURE if failed else ExitCode.SUCCESS
                 command = prompt.strip()
                 if not command:
@@ -839,7 +861,7 @@ async def _run_interactive(
                                     _request_cancel()
                                 else:
                                     pending_prompts.append(queued_prompt)
-                                    if queued_prompt in {"/exit", "/quit"}:
+                                    if _is_quit_prompt(queued_prompt):
                                         input_closing = True
                                     transcript.system(f"queued: {queued_prompt}")
                                     cockpit.draw(

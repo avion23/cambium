@@ -401,6 +401,7 @@ class InteractiveSession:
         self._pending_seed: ContextSeed | None = None
         self._last_epoch = 0
         self._last_checkpoint: str | None = None
+        self._provider_preference: str | None = None
         self._model_preference: str | None = None
         self._load_manifest()
         self._load_durable_head()
@@ -513,6 +514,8 @@ class InteractiveSession:
 
     @property
     def provider(self) -> str | None:
+        if self._provider_preference is not None:
+            return self._provider_preference
         return self._seed.provider if self._seed is not None else self._base_config.provider
 
     @property
@@ -539,6 +542,7 @@ class InteractiveSession:
             "branch_generation": self._branch_generation,
             "branch_start_turn": self._branch_start_turn,
             "seed": seed,
+            "provider_preference": self._provider_preference,
             "model_preference": self._model_preference,
         }
 
@@ -571,6 +575,12 @@ class InteractiveSession:
         self._turn = turn
         self._branch_generation = generation
         self._branch_start_turn = branch_start
+        provider_preference = document.get("provider_preference")
+        if provider_preference is not None and (
+            not isinstance(provider_preference, str) or not provider_preference.strip()
+        ):
+            raise InteractiveSessionError("interactive provider preference is invalid")
+        self._provider_preference = provider_preference
         model_preference = document.get("model_preference")
         if model_preference is not None and (
             not isinstance(model_preference, str) or not model_preference.strip()
@@ -727,52 +737,108 @@ class InteractiveSession:
             )
         return tuple(heads)
 
-    def set_model_preference(self, value: str) -> str:
-        """Validate and persist a model preference for subsequent turns."""
-        model = value.strip()
-        if not model or any(character.isspace() for character in model):
-            return "model: expected one configured model name"
-        provider = self.provider
-        if provider is None:
-            return "model: read-only while provider routing is automatic"
-        if model == self.model:
-            return f"model preference unchanged: provider={provider} model={model}"
+    def eligible_provider_models(self) -> tuple[tuple[str, str], ...]:
+        """Return enabled, credential-ready provider/model pairs.
 
-        configured_model: str | None = None
-        fanout = self._base_config.fanout_config
-        if isinstance(fanout, Mapping):
-            candidate = fanout.get("model")
-            if isinstance(candidate, str) and candidate:
-                configured_model = candidate
+        Credential readiness delegates to the same helper used by
+        :func:`oneshot._resolve_provider`. This method only exposes provider
+        names and configured model ids, never credential values or environment
+        variable names.
+        """
+        from .auth import AuthStore
+        from .provider_config import load_providers
+
+        provider_path = oneshot._provider_config_path(self._base_config, self.repo)
+        providers = load_providers(provider_path)
+        authorized = oneshot._authorized_provider_names(providers, AuthStore())
+        return tuple(
+            (candidate.name, candidate.model)
+            for candidate in authorized
+            if isinstance(candidate.name, str)
+            and candidate.name
+            and isinstance(candidate.model, str)
+            and candidate.model
+        )
+
+    def set_model_preference(self, value: str) -> str:
+        """Validate and persist a provider/model preference for later turns."""
+        target = value.strip()
+        if not target or any(character.isspace() for character in target):
+            return "model: expected PROVIDER or PROVIDER:MODEL"
+
+        requested_provider: str | None = None
+        requested_model: str | None = None
+        if ":" in target:
+            requested_provider, requested_model = target.split(":", 1)
+            if not requested_provider or not requested_model:
+                return "model: expected PROVIDER or PROVIDER:MODEL"
+        else:
+            requested_provider = target
+
         try:
+            options = self.eligible_provider_models()
             from .provider_config import load_providers
 
             provider_path = oneshot._provider_config_path(self._base_config, self.repo)
-            providers = load_providers(provider_path)
-            selected = next(
-                (
-                    candidate
-                    for candidate in providers
-                    if candidate.enabled and candidate.name == provider
-                ),
-                None,
+            configured = tuple(
+                (candidate.name, candidate.model)
+                for candidate in load_providers(provider_path)
+                if candidate.enabled
+                and isinstance(candidate.name, str)
+                and candidate.name
+                and isinstance(candidate.model, str)
+                and candidate.model
             )
-            if selected is None:
-                return f"model: provider {provider!r} is not configured or enabled"
-            configured_model = selected.model
         except (OSError, ValueError) as exc:
-            if configured_model is None:
-                return f"model: read-only; provider config unavailable ({exc})"
+            return f"model: provider config/auth unavailable ({exc})"
 
-        if configured_model != model:
+        if requested_model is None:
+            provider_options = [
+                (provider, model) for provider, model in options if provider == requested_provider
+            ]
+            if provider_options:
+                requested_model = provider_options[0][1]
+            else:
+                current_provider = self.provider
+                if current_provider is None:
+                    if any(provider == requested_provider for provider, _model in configured):
+                        return (
+                            f"model: provider {requested_provider!r} is not eligible "
+                            "(disabled or credential unavailable)"
+                        )
+                    return (
+                        "model: expected an eligible provider or PROVIDER:MODEL "
+                        "(routing is currently automatic)"
+                    )
+                requested_provider = current_provider
+                requested_model = target
+
+                if (requested_provider, requested_model) in configured:
+                    options = configured
+
+        if (requested_provider, requested_model) not in options:
+            if not any(provider == requested_provider for provider, _model in options):
+                return (
+                    f"model: provider {requested_provider!r} is not eligible "
+                    "(disabled or credential unavailable)"
+                )
             return (
-                f"model: {model!r} is not configured for provider {provider!r}"
+                f"model: {requested_model!r} is not configured for provider "
+                f"{requested_provider!r}"
             )
-        self._model_preference = model
+
+        if self.provider == requested_provider and self.model == requested_model:
+            return (
+                f"model preference unchanged: provider={requested_provider} "
+                f"model={requested_model}"
+            )
+
+        self._provider_preference = requested_provider
+        self._model_preference = requested_model
         self._write_manifest()
         return (
-            f"model preference set: provider={provider} model={model} "
-            "(subsequent turns)"
+            f"model preference set: provider={requested_provider} model={requested_model} "
+            "(subsequent turns; existing context may use the semantic-trunk fallback)"
         )
 
     def compact(self) -> str:
@@ -937,18 +1003,19 @@ class InteractiveSession:
                 changes["model"] = self._seed.model
             if changes:
                 config = replace(config, **changes)
+        changes: dict[str, Any] = {}
+        if self._provider_preference is not None:
+            changes.update(
+                {
+                    "provider": self._provider_preference,
+                    "assigned_provider": self._provider_preference,
+                    "routing_mode": RoutingMode.CASCADE,
+                    "auto": False,
+                }
+            )
         if self._model_preference is not None:
-            changes = {"model": self._model_preference}
-            provider = self.provider
-            if provider is not None:
-                changes.update(
-                    {
-                        "provider": provider,
-                        "assigned_provider": provider,
-                        "routing_mode": RoutingMode.CASCADE,
-                        "auto": False,
-                    }
-                )
+            changes["model"] = self._model_preference
+        if changes:
             config = replace(config, **changes)
         self._pending_seed = None
         return InteractiveTurn(
