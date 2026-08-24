@@ -1852,6 +1852,10 @@ class Diffundo:
         )
         if configured is None:
             raise ValueError("provider lease does not match an enabled configured lane")
+        if self._pinned_provider is None:
+            # A caller that binds after an unassigned first call still makes
+            # this incumbent the origin for terminal-death fallback.
+            self._pinned_provider = provider
         self._provider_lease = (
             lease
             if lease is not None

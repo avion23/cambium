@@ -385,7 +385,6 @@ def test_leased_provider_death_releases_lease_for_healthy_sibling(monkeypatch) -
             _config("p_incumbent", incumbent, "K_LEASE_INCUMBENT", model="m-incumbent"),
             _config("p_sibling", sibling, "K_LEASE_SIBLING", model="m-sibling"),
         ),
-        primary_provider="p_incumbent",
         pause_timeout_s=0.01,
     )
     try:
