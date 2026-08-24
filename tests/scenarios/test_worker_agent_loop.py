@@ -185,7 +185,7 @@ def _make_worktree(repo: Path, branch: str = "agent-loop") -> Path:
 
 
 def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
-    return worker.AgentConfig(
+    values: dict[str, Any] = dict(
         task_id="loop-agent",
         generation=1,
         task="read the files and finish",
@@ -199,8 +199,9 @@ def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
         heartbeat_interval_s=0.05,
         max_wall_s=60.0,
         checkpoint_root=None,
-        **overrides,
     )
+    values.update(overrides)
+    return worker.AgentConfig(**values)
 
 
 async def _drive_loop(
