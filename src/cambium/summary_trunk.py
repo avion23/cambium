@@ -226,12 +226,24 @@ def _coerced_summary_text(item: Any) -> Any:
 
 
 def _bounded_items(value: Any, field: str) -> tuple[str, ...]:
-    if not isinstance(value, list):
+    """Normalize one untrusted summary list field.
+
+    Models occasionally emit a bare scalar where a list belongs (live:
+    'summary entry verification_results must be a list') or embed objects in
+    the list ('...[0] must be a string').  Compaction is recovery
+    infrastructure, so scalars are wrapped and non-string items are coerced
+    to canonical JSON text rather than killing the session.
+    """
+    if isinstance(value, tuple | list):
+        items_raw: list[Any] = list(value)
+    elif isinstance(value, str) or not isinstance(value, Mapping):
+        items_raw = [value]
+    else:
         raise SummaryTrunkError(f"summary entry {field} must be a list")
-    if len(value) > SUMMARY_MAX_ITEMS:
+    if len(items_raw) > SUMMARY_MAX_ITEMS:
         raise SummaryTrunkError(f"summary entry {field} exceeds the item cap")
     items: list[str] = []
-    for index, item in enumerate(value):
+    for index, item in enumerate(items_raw):
         coerced = _coerced_summary_text(item)
         items.append(_bounded_text(coerced, f"{field}[{index}]"))
     return tuple(items)

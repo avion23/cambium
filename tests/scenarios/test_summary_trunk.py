@@ -231,3 +231,13 @@ def test_non_string_list_items_are_coerced_not_fatal() -> None:
 
     assert entry.verification_results[0] == '{"check": "unit tests", "ok": true}'
     assert entry.verification_results[1] == "42"
+
+
+def test_scalar_list_field_is_wrapped_not_fatal() -> None:
+    """Regression: bare string where a list belongs killed compaction (live)."""
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded["verification_results"] = "all checks green"
+    entry = parse_summary_response(json.dumps(decoded), expectation)
+
+    assert entry.verification_results == ("all checks green",)
