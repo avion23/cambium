@@ -742,9 +742,17 @@ def _is_parse_failure(exc: Exception) -> bool:
 
 
 async def _score_examples_async(program: object, examples: list[Example]) -> list[float]:
+    outcomes = await _evaluate_examples_async(program, examples)
+    return [cast(float, outcome["score"]) for outcome in outcomes]
+
+
+async def _evaluate_examples_async(
+    program: object, examples: list[Example]
+) -> list[dict[str, float | int]]:
+    """Run the program and retain one normalized metric outcome per example."""
     scorer = _metric_function(program)
-    scores: list[float] = []
-    for example in examples:
+    outcomes: list[dict[str, float | int]] = []
+    for index, example in enumerate(examples):
         try:
             raw_prediction = await cast(Callable[[Any], Any], cast(Any, program).decide)(
                 example.input
@@ -766,8 +774,40 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
             score = 0.0
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             score = 0.0
-        scores.append(float(score))
-    return scores
+        outcomes.append({"index": index, "score": float(score)})
+    return outcomes
+
+
+async def _evaluate_splits_async(
+    program: object, split_examples: Mapping[str, list[Example]]
+) -> dict[str, list[dict[str, float | int]]]:
+    """Evaluate each named split without changing the program or metric seam."""
+    return {
+        split: await _evaluate_examples_async(program, examples)
+        for split, examples in split_examples.items()
+    }
+
+
+def _score_outcomes(outcomes: list[dict[str, float | int]]) -> dict[str, Any]:
+    scores = [cast(float, outcome["score"]) for outcome in outcomes]
+    if not scores:
+        return {"mean": 0.0, "std": 0.0, "count": 0, "records": outcomes}
+    return {
+        "mean": float(statistics.fmean(scores)),
+        "std": float(statistics.pstdev(scores)),
+        "count": len(scores),
+        "records": outcomes,
+    }
+
+
+def evaluate_dataset(program: object, loader: object) -> dict[str, dict[str, Any]]:
+    """Evaluate all three reviewed dataset splits with the program's metric."""
+    split_examples = {
+        split: _load_split(loader, split.upper())
+        for split in ("train", "eval", "canaries")
+    }
+    outcomes = asyncio.run(_evaluate_splits_async(program, split_examples))
+    return {split: _score_outcomes(outcomes[split]) for split in split_examples}
 
 
 def score_split(program, examples) -> dict:
@@ -1052,7 +1092,8 @@ def write_artifact(module_name, program, lm, report) -> Path:
     return module_dir
 
 
-def _load_dataset_loader(manifest: object) -> object:
+def _load_dataset_loader(manifest: object, dataset_path: Path | None = None) -> object:
+    """Construct the module's loader for its packaged or an explicit dataset."""
     package_target = getattr(manifest, "cli_module", "")
     if not isinstance(package_target, str) or not package_target:
         raise OptimizeError("manifest cli_module is required to load the dataset")
@@ -1073,8 +1114,10 @@ def _load_dataset_loader(manifest: object) -> object:
         (candidate for candidate in candidates if candidate.__name__ == "ExampleDatasetLoader"),
         candidates[0],
     )
+    if dataset_path is None:
+        dataset_path = Path(cast(ModuleManifest, manifest).package_dir) / "datasets"
     try:
-        return loader_class(Path(cast(ModuleManifest, manifest).package_dir) / "datasets")
+        return loader_class(dataset_path)
     except (OSError, ValueError) as exc:
         raise OptimizeError(f"could not construct dataset loader: {exc}") from exc
 
@@ -1235,6 +1278,98 @@ def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any
         tier,
         budget_usd=budget_usd,
     )
+
+
+def _load_program_state(program: object, program_dir: Path, *, required: bool = False) -> bool:
+    """Load ``program.json`` into a fresh program, if an artifact is present."""
+    if not program_dir.is_dir():
+        if required:
+            raise OptimizeError(f"program directory is missing: {program_dir}")
+        return False
+    state_path = program_dir / "program.json"
+    if not state_path.is_file():
+        if required:
+            raise OptimizeError(f"program state is missing: {state_path}")
+        return False
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise OptimizeError(f"could not read program state {state_path}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise OptimizeError(f"program state {state_path} must contain an object")
+
+    load_state = getattr(program, "load_state", None)
+    if not callable(load_state):
+        raise OptimizeError("DSPy program does not provide load_state()")
+    try:
+        load_state(state)
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise OptimizeError(f"could not load program state {state_path}: {exc}") from exc
+    return True
+
+
+def _eval_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cambium optimize eval",
+        description="Evaluate a fresh or optimized DSPy program on every dataset split.",
+    )
+    parser.add_argument("module_name", metavar="MODULE")
+    parser.add_argument("--dataset", type=Path, required=True, metavar="PATH")
+    parser.add_argument("--program-dir", type=Path, metavar="PATH")
+    parser.add_argument("--budget-usd", type=float, default=2.0)
+    parser.add_argument("--tier", default="fast")
+    parser.add_argument("--json", action="store_true", help="emit one JSON report")
+    return parser
+
+
+def _run_eval(args: argparse.Namespace) -> int:
+    if isinstance(args.budget_usd, bool) or not math.isfinite(args.budget_usd):
+        print("cambium optimize eval: --budget-usd must be finite", file=sys.stderr)
+        return 2
+    if args.budget_usd < 0:
+        print("cambium optimize eval: --budget-usd must be non-negative", file=sys.stderr)
+        return 2
+
+    manifest = _load_manifest(args.module_name)
+    program_class = load_program_class(manifest)
+    loader = _load_dataset_loader(manifest, args.dataset)
+    ledger = _CostLedger(args.budget_usd)
+    lm = _construct_lm(args.tier, args.budget_usd, ledger)
+    program = program_class(lm)
+
+    module_name = getattr(manifest, "module_name", args.module_name)
+    if args.program_dir is None:
+        program_dir = Path("optimized") / _safe_component(module_name, "module_name")
+        required_state = False
+    else:
+        program_dir = args.program_dir
+        required_state = True
+    optimized = _load_program_state(program, program_dir, required=required_state)
+    report = {
+        "module": module_name,
+        "program": "optimized" if optimized else "fresh",
+        "dataset": str(args.dataset),
+        "splits": evaluate_dataset(program, loader),
+    }
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, sort_keys=True))
+    else:
+        print(f"module={report['module']} program={report['program']} dataset={report['dataset']}")
+        for split, summary in report["splits"].items():
+            print(f"{split}: mean={summary['mean']:.6f} count={summary['count']}")
+            for outcome in summary["records"]:
+                print(f"  record={outcome['index']} score={outcome['score']:.6f}")
+    return 0
+
+
+def eval_main(argv: list[str] | None = None) -> int:
+    """Evaluate a fresh or saved DSPy program against all reviewed splits."""
+    args = _eval_parser().parse_args(argv)
+    try:
+        return _run_eval(args)
+    except (ModuleContractError, OptimizeError, OSError) as exc:
+        print(f"cambium optimize eval: {exc}", file=sys.stderr)
+        return 1
 
 
 def extract_candidates(*args: Any, **kwargs: Any) -> Any:
@@ -1527,6 +1662,8 @@ def main(argv=None) -> int:
     if command_line and command_line[0] in {"stats", "report"}:
         return stats_main(command_line[1:])
     try:
+        if command_line and command_line[0] == "eval":
+            return eval_main(command_line[1:])
         return _run(command_line)
     except Exception as exc:
         print(f"cambium optimize: ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
