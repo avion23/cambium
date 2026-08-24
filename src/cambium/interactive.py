@@ -745,12 +745,11 @@ class InteractiveSession:
         names and configured model ids, never credential values or environment
         variable names.
         """
-        from .auth import AuthStore
         from .provider_config import load_providers
 
         provider_path = oneshot._provider_config_path(self._base_config, self.repo)
         providers = load_providers(provider_path)
-        authorized = oneshot._authorized_provider_names(providers, AuthStore())
+        authorized = oneshot._authorized_provider_names(providers, oneshot.AuthStore())
         return tuple(
             (candidate.name, candidate.model)
             for candidate in authorized
