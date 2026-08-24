@@ -142,6 +142,33 @@ def test_summary_response_identity_is_stamped_not_echoed() -> None:
     assert entry.sequence == expectation.sequence
 
 
+def test_summary_response_missing_type_is_normalized() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    payload = json.loads(_response(expectation, label="one"))
+    payload.pop("type")
+
+    entry = parse_summary_response(json.dumps(payload), expectation)
+
+    assert entry.type == "summary_entry"
+
+
+def test_summary_response_wrong_type_is_normalized() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    payload = json.loads(_response(expectation, label="one"))
+    payload["type"] = "not-a-summary-entry"
+
+    entry = parse_summary_response(json.dumps(payload), expectation)
+
+    assert entry.type == "summary_entry"
+
+
+def test_summary_response_non_object_is_rejected_cleanly() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+
+    with pytest.raises(SummaryTrunkError, match="exactly one JSON object"):
+        parse_summary_response("[\"not an object\"]", expectation)
+
+
 def test_summary_response_is_strict_and_bounded() -> None:
     _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
     payload = json.loads(_response(expectation, label="one"))
