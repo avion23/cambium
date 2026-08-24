@@ -119,8 +119,9 @@ def test_unified_supervisor_forwards_demo_and_warm_pool(monkeypatch, tmp_path: P
     ]
 
 
+@pytest.mark.parametrize("optimizer", ["bootstrap", "gepa"])
 def test_unified_optimize_forwards_dataset_and_optimizer_options(
-    monkeypatch, tmp_path: Path
+    optimizer, monkeypatch, tmp_path: Path
 ) -> None:
     from cambium import optimize
 
@@ -138,7 +139,7 @@ def test_unified_optimize_forwards_dataset_and_optimizer_options(
                 "optimize",
                 "should_decompose",
                 "--optimizer",
-                "bootstrap",
+                optimizer,
                 "--budget-usd",
                 "5.00",
                 "--seed",
@@ -156,7 +157,7 @@ def test_unified_optimize_forwards_dataset_and_optimizer_options(
         [
             "should_decompose",
             "--optimizer",
-            "bootstrap",
+            optimizer,
             "--budget-usd",
             "5.0",
             "--seed",
