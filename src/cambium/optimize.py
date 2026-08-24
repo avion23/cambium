@@ -220,6 +220,53 @@ def _domain_module(program: object):
         return _import_target(target)
 
 
+def _output_type(domain: object) -> type | None:
+    """Find the domain's ``*Output`` type without naming a module variant."""
+    candidates = [
+        value
+        for name, value in vars(domain).items()
+        if name.endswith("Output") and isinstance(value, type)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _label_field(program: object, domain: object | None = None) -> str:
+    """Return the module-declared expected-label key.
+
+    A DSPy program may expose the field directly, while packaged modules
+    declare it in ``module.json``.  The output compatibility property is a
+    final metadata fallback for lightweight test programs that do not have a
+    manifest.  The default keeps the v1 example module's behavior unchanged.
+    """
+    if domain is None:
+        domain = _domain_module(program)
+    for owner in (program, type(program), domain):
+        value = getattr(owner, "label_field", _MISSING)
+        if isinstance(value, str) and value:
+            return value
+
+    domain_path = getattr(domain, "__file__", None)
+    if isinstance(domain_path, str):
+        try:
+            manifest = load_module_manifest(Path(domain_path).parent)
+        except (ModuleContractError, OSError):
+            pass
+        else:
+            if isinstance(manifest.label_field, str) and manifest.label_field:
+                return manifest.label_field
+
+    output_type = _output_type(domain)
+    if output_type is not None:
+        properties = [
+            name
+            for name, value in vars(output_type).items()
+            if isinstance(value, property) and name not in {"decision", "reason", "confidence"}
+        ]
+        if len(properties) == 1:
+            return properties[0]
+    return "decompose"
+
+
 def _metric_function(program: object) -> Callable[[Example], float]:
     metric = getattr(program, "metric", None)
     if callable(metric):
@@ -231,19 +278,21 @@ def _metric_function(program: object) -> Callable[[Example], float]:
     except ImportError:
         target = _EXAMPLE_METRIC_TARGET
         mod = _import_target(target)
-    metric = getattr(mod, "should_decompose_metric", None)
+    metric = getattr(mod, f"should_{_label_field(program)}_metric", None)
     if not callable(metric):
         raise OptimizeError(f"metric module {target!r} has no usable metric")
     return cast(Callable[[Example], float], metric)
 
 
-def _parse_decision(raw: object, decision_type: type) -> object | None:
+def _parse_decision(raw: object, decision_type: type, label_field: str = "decompose") -> object | None:
     members = tuple(cast(Iterable[object], decision_type))
     if isinstance(raw, decision_type):
         return raw
     if isinstance(raw, bool):
         for member in members:
-            if getattr(member, "value", None) == ("decompose" if raw else "do_not_decompose"):
+            if getattr(member, "value", None) == (
+                label_field if raw else f"do_not_{label_field}"
+            ):
                 return member
         return None
     if not isinstance(raw, str):
@@ -274,13 +323,16 @@ def _task_input(value: object, task_input_type: type) -> object | None:
 def _prediction_output(raw: object, program: object) -> object | None:
     domain = _domain_module(program)
     decision_type = getattr(domain, "Decision", None)
-    output_type = getattr(domain, "DecomposeOutput", None)
+    output_type = _output_type(domain)
     if not isinstance(decision_type, type) or not isinstance(output_type, type):
         return None
+    label_field = _label_field(program, domain)
 
     if isinstance(raw, output_type):
         value = raw
-        decision = _parse_decision(getattr(value, "decision", _MISSING), decision_type)
+        decision = _parse_decision(
+            getattr(value, "decision", _MISSING), decision_type, label_field
+        )
         reason = getattr(value, "reason", _MISSING)
         confidence = getattr(value, "confidence", 1.0)
     else:
@@ -291,9 +343,11 @@ def _prediction_output(raw: object, program: object) -> object | None:
                 return None
         if isinstance(raw, list) and len(raw) == 1:
             raw = raw[0]
-        decision = _parse_decision(_read_field(raw, "decision"), decision_type)
-        if decision is None:
-            decision = _parse_decision(_read_field(raw, "decompose"), decision_type)
+        decision = None
+        for field in dict.fromkeys(("decision", label_field, "decompose")):
+            decision = _parse_decision(_read_field(raw, field), decision_type, label_field)
+            if decision is not None:
+                break
         reason = _read_field(raw, "reason")
         confidence = _read_field(raw, "confidence")
         if confidence is _MISSING:
@@ -315,12 +369,17 @@ def _prediction_output(raw: object, program: object) -> object | None:
 def _fallback_prediction(program: object) -> object:
     domain = _domain_module(program)
     decision_type = getattr(domain, "Decision", None)
-    output_type = getattr(domain, "DecomposeOutput", None)
+    output_type = _output_type(domain)
     if not isinstance(decision_type, type) or not isinstance(output_type, type):
-        raise OptimizeError("decision module does not expose Decision and DecomposeOutput")
-    decision = _parse_decision("do_not_decompose", decision_type)
+        raise OptimizeError("decision module does not expose Decision and an output type")
+    label_field = _label_field(program, domain)
+    fallback = getattr(program, "fallback_decision", _MISSING)
+    if fallback is _MISSING:
+        fallback = f"do_not_{label_field}"
+    decision = _parse_decision(fallback, decision_type, label_field)
     if decision is None:
-        raise OptimizeError("decision module has no DO_NOT_DECOMPOSE decision")
+        fallback_value = getattr(fallback, "value", fallback)
+        raise OptimizeError(f"decision module has no {str(fallback_value).upper()} decision")
     return output_type(
         decision=decision,
         reason="unparseable model output",
@@ -334,25 +393,29 @@ def _gold_parts(gold: object, program: object) -> tuple[object, dict[str, object
     decision_type = getattr(domain, "Decision", None)
     if not isinstance(task_input_type, type) or not isinstance(decision_type, type):
         return None
+    label_field = _label_field(program, domain)
 
     if isinstance(gold, Example):
         input_value = _task_input(gold.input, task_input_type)
         expected_source = gold.expected
-        raw_decision = expected_source.get("decompose", _MISSING)
+        raw_decision = expected_source.get(label_field, _MISSING)
         reason = expected_source.get("reason", "")
     else:
         input_value = _task_input(gold, task_input_type)
         raw_decision = _read_field(gold, "decision")
         if raw_decision is _MISSING:
-            raw_decision = _read_field(gold, "decompose")
+            for field in dict.fromkeys((label_field, "decompose")):
+                raw_decision = _read_field(gold, field)
+                if raw_decision is not _MISSING:
+                    break
         reason = _read_field(gold, "reason")
         if reason is _MISSING:
             reason = ""
 
-    decision = _parse_decision(raw_decision, decision_type)
+    decision = _parse_decision(raw_decision, decision_type, label_field)
     if input_value is None or decision is None or not isinstance(reason, str):
         return None
-    return input_value, {"decompose": decision, "reason": reason}
+    return input_value, {label_field: decision, "reason": reason}
 
 
 def _jlens_client_from_env() -> JlenClient | None:
@@ -839,13 +902,14 @@ def _to_dspy_example(example: Example, program: object) -> dspy.Example:
     decision_type = getattr(domain, "Decision", None)
     if not isinstance(decision_type, type):
         raise OptimizeError("decision module does not expose Decision")
+    label_field = _label_field(program, domain)
     input_value = example.input
     task = _read_field(input_value, "task")
     context = _read_field(input_value, "context")
     if not isinstance(task, str) or not isinstance(context, str):
         raise OptimizeError("train example input must contain task and context strings")
-    raw_decision = example.expected.get("decompose", _MISSING)
-    decision = _parse_decision(raw_decision, decision_type)
+    raw_decision = example.expected.get(label_field, _MISSING)
+    decision = _parse_decision(raw_decision, decision_type, label_field)
     reason = example.expected.get("reason", "")
     if decision is None or not isinstance(reason, str):
         raise OptimizeError("train example expected value is not parseable")

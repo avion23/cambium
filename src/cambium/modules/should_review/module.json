@@ -4,5 +4,6 @@
   "cli_module": "cambium.modules.should_review",
   "protocol": "json-v1",
   "dataset_schema_version": 1,
-  "label_field": "review"
+  "label_field": "review",
+  "dspy_program": "cambium.modules.should_review.dspy_program"
 }
