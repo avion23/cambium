@@ -476,3 +476,90 @@ def test_main_dry_run_does_not_construct_an_lm(monkeypatch) -> None:
 def test_main_tiny_budget_fails_without_crashing() -> None:
     result = optimize.main(["should_decompose", "--optimizer", "zero", "--budget-usd", "0.000001"])
     assert result != 0
+
+
+def test_gepa_is_available_in_parser_and_dry_run(capsys) -> None:
+    args = optimize._parser().parse_args(["should_decompose", "--optimizer", "gepa"])
+
+    assert args.optimizer == "gepa"
+    assert optimize.main(
+        ["--dry-run", "should_decompose", "--optimizer", "gepa", "--seed", "23"]
+    ) == 0
+    assert "optimizer=gepa" in capsys.readouterr().err
+
+
+def test_run_stage_gepa_requires_four_reviewed_records() -> None:
+    with pytest.raises(optimize.OptimizeError, match="GEPA requires more reviewed data"):
+        optimize.run_stage_gepa(OfflineProgram(OfflineLM()), _examples(2), [], seed=7)
+
+
+def test_run_stage_gepa_uses_same_reflection_lm_and_reports_scores(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+
+    class FakeGEPA:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.update(kwargs)
+
+        def compile(self, student, *, trainset, valset):
+            assert len(trainset) == 4
+            assert len(valset) == 2
+            student.detailed_results = SimpleNamespace(
+                total_metric_calls=9,
+                candidates=[object(), object(), object()],
+                num_full_val_evals=2,
+            )
+            return student
+
+    monkeypatch.setattr(optimize.dspy, "GEPA", FakeGEPA)
+    lm = OfflineLM()
+    compiled, report = optimize.run_stage_gepa(
+        OfflineProgram(lm),
+        _examples(4),
+        _examples(2),
+        seed=19,
+        budget_usd=0.20,
+    )
+
+    assert compiled is not None
+    assert seen["reflection_lm"] is lm
+    assert seen["max_metric_calls"] == 20
+    assert report["eval_mean"] == 1.0
+    assert report["train_mean"] == 1.0
+    assert report["calls"] == 9
+    assert report["iterations"] == 2
+    assert report["full_evals"] == 2
+
+
+def test_gepa_report_schema_records_stage_and_optimizer() -> None:
+    args = SimpleNamespace(
+        module_name="should_decompose",
+        optimizer="gepa",
+        seed=3,
+        tier="fast",
+        budget_usd=1.0,
+    )
+    report = optimize._partial_report(
+        SimpleNamespace(module_name="should_decompose"),
+        args,
+        optimize._CostLedger(1.0),
+        stage_gepa={"eval_mean": 0.9, "train_mean": 1.0},
+    )
+
+    assert report["optimizer"] == "gepa"
+    assert report["stage_gepa"] == {"eval_mean": 0.9, "train_mean": 1.0}
+
+
+def test_gepa_budget_enforcement_raises_before_optimizer() -> None:
+    ledger = optimize._CostLedger(0.10)
+    ledger.spent_usd = 0.10
+
+    with pytest.raises(optimize._BudgetExhausted, match="optimization budget exhausted"):
+        optimize.run_stage_gepa(
+            OfflineProgram(OfflineLM()),
+            _examples(4),
+            _examples(2),
+            seed=0,
+            budget_usd=0.10,
+            ledger=ledger,
+            reflection_lm=OfflineLM(),
+        )
