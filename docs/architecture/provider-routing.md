@@ -99,6 +99,49 @@ existing same-provider retry/cooldown, disable, or untouched-health behavior;
 they cannot cause a pinned provider to be replaced merely because a request
 failed.
 
+### Provider leases
+
+`provider_scheduler.ProviderLease` is the immutable provider/model ownership
+record for one semantic trunk. After a successful result,
+`worker._bind_router_provider` calls `Diffundo.bind_provider`, which validates
+the enabled configured provider/model and stores a lease (or reuses an
+inherited lease, preserving its `root_task_id` and `cache_identity`). With a
+lease, `Diffundo._routing_request` carries it into `routing.RoutingRequest`;
+`Diffundo._candidates` and `routing.provider_satisfies_request` therefore
+admit only the exact leased provider/model. A healthy, eligible incumbent is
+sticky: ordinary ordering, a sibling's better score, and transient health
+pressure do not move the branch. `bind_provider` also rejects a live bind to a
+different provider/model.
+
+The terminal-death branch in `Diffundo.call` uses
+`ProviderError.is_real_death`. When the failed lane matches the lease, it
+clears `_provider_lease` before calling `_real_death_fallback_candidates`;
+`_pinned_provider`, `_fallback_origin`, and `_terminal_death_providers` remain
+so provenance and dead-lane avoidance survive. The explicit
+`clear_provider_lease` remains the warm-worker task reset, not a
+failure-triggered fallback.
+
+Once the incumbent has real-death evidence, `_real_death_fallback_candidates`
+clones the request with `lease=None`, an empty model, and model substitution
+enabled before asking `_candidates_unleased` for candidates. This deliberately
+drops the strict lease/model filter while retaining
+`routing.provider_satisfies_request`'s capability, billing, tool, and context
+checks, `_candidates_unleased`'s live health/bucket checks, the router's
+authorized provider set, and tried-provider exclusions. It walks the original
+tier first and then other tiers. If a candidate serves, `Diffundo.call`
+records `_fallback_origin` and `fell_back_from`, and the worker binds the
+successful provider/model as the new lease. If no `primary_provider` was
+assigned initially, `bind_provider` first sets `_pinned_provider` to that
+incumbent, so a later real death still has a fallback origin.
+
+A 429, including one carrying `Retry-After`, is `ProviderOutcome.QUOTA`, not
+`ProviderError.is_real_death`; `_record_failure` applies cooldown and preserves
+the lease. A timeout is `ProviderOutcome.TIMEOUT` and follows the same
+failure/cooldown path without being real death. Thus neither transient case
+admits the fallback candidates or releases a lease; a live but cooling
+incumbent may leave the call with `AllProvidersFailed` rather than silently
+switching providers.
+
 ## Ordering
 
 Configured `priority` is the first policy class and is never crossed by
