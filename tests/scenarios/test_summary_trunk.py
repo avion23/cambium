@@ -241,3 +241,43 @@ def test_scalar_list_field_is_wrapped_not_fatal() -> None:
     entry = parse_summary_response(json.dumps(decoded), expectation)
 
     assert entry.verification_results == ("all checks green",)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("objective", "\ud800"),
+        ("facts_added", ["\ud800"]),
+        ("verification_results", [{"nested": "\ud800"}]),
+    ],
+)
+def test_summary_response_lone_surrogates_are_backslash_escaped(
+    field: str, value: object
+) -> None:
+    """Model-owned surrogate text must not escape the SummaryTrunkError boundary."""
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded[field] = value
+
+    entry = parse_summary_response(json.dumps(decoded, ensure_ascii=False), expectation)
+
+    if field == "objective":
+        assert entry.objective == r"\ud800"
+    else:
+        assert r"\ud800" in entry_mapping(entry)[field][0]
+
+
+def test_summary_response_ten_thousand_nested_objects_is_bounded_or_rejected() -> None:
+    """A fuzz-depth response becomes a bounded error, never a raw RecursionError."""
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    deep_object = '{"nested":' * 10_000 + "0" + "}" * 10_000
+    response = _response(expectation, label="one").replace(
+        '"verification_results":["test one"]', f'"verification_results":[{deep_object}]'
+    )
+
+    try:
+        entry = parse_summary_response(response, expectation)
+    except SummaryTrunkError:
+        return
+
+    assert entry.verification_results == ("<deep:unrepresentable>",)
