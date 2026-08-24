@@ -15,6 +15,7 @@ import pytest
 
 from cambium import optimize
 from cambium.modules.base import Example
+from cambium.modules.should_review.decide import should_review
 
 if TYPE_CHECKING:
     from cambium.modules.example.dataset import Split as SplitType
@@ -49,6 +50,37 @@ class OfflineLM(dspy.LM):
                 }
             )
         ]
+
+
+class ReviewRuleLM(dspy.LM):
+    """Offline LM that mirrors the packaged review labels without network I/O."""
+
+    def __init__(self) -> None:
+        super().__init__("offline/review-rule", cache=False, num_retries=0)
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs) -> list[dict[str, Any] | str]:
+        del args
+        self.calls += 1
+        content = kwargs["messages"][-1]["content"]
+        task = content.split("[[ ## task ## ]]\n", 1)[1].split(
+            "\n\n[[ ## context ## ]]", 1
+        )[0]
+        context = content.split("[[ ## context ## ]]\n", 1)[1].split(
+            "\n\nRespond", 1
+        )[0]
+        output = should_review(task, context)
+        return [
+            json.dumps(
+                {
+                    "decision": output.decision.value,
+                    "reason": output.reason,
+                }
+            )
+        ]
+
+    async def acall(self, *args, **kwargs) -> list[dict[str, Any] | str]:
+        return self(*args, **kwargs)
 
 
 def test_parser_defaults_to_fast_tier() -> None:
@@ -593,6 +625,23 @@ def test_main_dry_run_does_not_construct_an_lm(monkeypatch) -> None:
         )
         == 0
     )
+
+
+def test_should_review_zero_optimizer_uses_packaged_dataset_with_mocked_lm(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    lm = ReviewRuleLM()
+    monkeypatch.setattr(optimize, "_construct_lm", lambda *_args: lm)
+
+    result = optimize.main(["should_review", "--optimizer", "zero", "--budget-usd", "0.10"])
+
+    assert result == 0
+    assert lm.calls > 0
+    report = json.loads((tmp_path / "optimized" / "should_review" / "report.json").read_text())
+    assert report["stage_zero"] == {"eval_mean": 1.0, "train_mean": 1.0}
+    assert report["canaries"] == {"count": 5, "mean": 1.0, "std": 0.0}
+    assert report["gate_passed"] is True
 
 
 def test_main_tiny_budget_fails_without_crashing() -> None:
