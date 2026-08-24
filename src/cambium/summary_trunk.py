@@ -464,8 +464,7 @@ def estimate_message_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
     hint, not provider accounting.
     """
     copied = [
-        _copy_message(message, f"messages[{index}]")
-        for index, message in enumerate(messages)
+        _copy_message(message, f"messages[{index}]") for index, message in enumerate(messages)
     ]
     if not copied:
         return 0
