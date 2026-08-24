@@ -47,12 +47,14 @@ class _FakeCallResult:
         usage: dict[str, int] | None = None,
         provider: str = "loopback-provider",
         latency_s: float = 0.01,
+        fell_back_from: str | None = None,
     ) -> None:
         self.content = content
         self.model = model
         self.usage = usage or {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
         self.provider = provider
         self.latency_s = latency_s
+        self.fell_back_from = fell_back_from
 
 
 class _ScriptedRouter:
@@ -70,11 +72,83 @@ class _ScriptedRouter:
         *,
         model: str | None = None,
         budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
     ) -> _FakeCallResult:
         self.prompts.append(prompt)
         if not self.responses:
             raise AssertionError("router call with no scripted response")
         return _FakeCallResult(self.responses.pop(0))
+
+
+class _SummaryFlushRouter:
+    """Router double that requires substitution authorization for summaries."""
+
+    def __init__(self, *, all_providers_dead: bool = False) -> None:
+        self.all_providers_dead = all_providers_dead
+        self.prompts: list[dict[str, Any]] = []
+        self.allow_model_substitution: list[bool] = []
+
+    def declared_model(self, name: str) -> str:
+        return ""
+
+    async def call(
+        self,
+        tier: ProviderTier,
+        prompt: dict[str, Any],
+        *,
+        model: str | None = None,
+        budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
+    ) -> _FakeCallResult:
+        del tier, model, budget_usd
+        self.prompts.append(prompt)
+        self.allow_model_substitution.append(allow_model_substitution)
+        messages = prompt.get("messages")
+        last_content = (
+            messages[-1].get("content")
+            if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
+            else None
+        )
+        if isinstance(last_content, str) and last_content.startswith(
+            "<cambium-summary-control>\n"
+        ):
+            if not allow_model_substitution:
+                raise AssertionError("summary calls must authorize model substitution")
+            if self.all_providers_dead:
+                raise RuntimeError("all summary providers failed")
+            control = json.loads(
+                last_content.removeprefix("<cambium-summary-control>\n").removesuffix(
+                    "\n</cambium-summary-control>"
+                )
+            )
+            summary = {
+                "type": "summary_entry",
+                "sequence": control["sequence"],
+                "source_sha256": control["source_sha256"],
+                "source_message_count": control["source_message_count"],
+                "through_turn": control["through_turn"],
+                "objective": "preserve the current coding objective",
+                "outcome": "captured the completed work segment",
+                "decisions_added": [],
+                "decisions_superseded": [],
+                "facts_added": [],
+                "facts_invalidated": [],
+                "files_and_symbols_changed": [],
+                "verification_results": [],
+                "relevant_failed_approaches": [],
+                "open_items": [],
+            }
+            return _FakeCallResult(
+                json.dumps(summary, sort_keys=True, separators=(",", ":")),
+                model="healthy-model",
+                provider="healthy-substitute",
+                fell_back_from="dead-primary",
+            )
+        return _FakeCallResult(
+            '{"type":"finish","summary":"done"}',
+            model="dead-model",
+            provider="dead-primary",
+        )
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
@@ -111,7 +185,7 @@ def _make_worktree(repo: Path, branch: str = "agent-loop") -> Path:
 
 
 def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
-    return worker.AgentConfig(
+    values: dict[str, Any] = dict(
         task_id="loop-agent",
         generation=1,
         task="read the files and finish",
@@ -125,8 +199,9 @@ def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
         heartbeat_interval_s=0.05,
         max_wall_s=60.0,
         checkpoint_root=None,
-        **overrides,
     )
+    values.update(overrides)
+    return worker.AgentConfig(**values)
 
 
 async def _drive_loop(
@@ -142,6 +217,49 @@ async def _drive_loop(
         stop=threading.Event(),
         progress=worker.AgentProgress(),
     )
+
+
+def test_summary_flush_authorizes_substitution_and_preserves_provenance(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=1,
+    )
+    router = _SummaryFlushRouter()
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))  # type: ignore[arg-type]
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["provider"] == "healthy-substitute"
+    assert outcome["fell_back_from"] == "dead-primary"
+    assert router.allow_model_substitution == [False, True]
+    metadata = worker._cumulative_provider_metadata(outcome)
+    assert metadata is not None
+    assert metadata["provider"] == "healthy-substitute"
+    assert metadata["fell_back_from"] == "dead-primary"
+
+
+def test_summary_flush_all_providers_dead_fails_cleanly(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=1,
+    )
+    router = _SummaryFlushRouter(all_providers_dead=True)
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))  # type: ignore[arg-type]
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == (
+        "compaction_failed: summary provider call failed: RuntimeError"
+    )
+    assert router.allow_model_substitution == [False, True]
 
 
 # ---------------------------------------------------------------------------

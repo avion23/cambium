@@ -106,6 +106,7 @@ class _ScriptedRouter:
         *,
         model: str | None = None,
         budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
     ) -> _FakeCallResult:
         self.prompts.append(prompt)
         messages = prompt.get("messages")
