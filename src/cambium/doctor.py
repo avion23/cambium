@@ -27,11 +27,13 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 from types import SimpleNamespace
@@ -61,7 +63,38 @@ from .provider_config import (
 from .routing import DebtStore
 from .system_health import format_health, health
 
-MIN_PYTHON = (3, 14)
+
+def _minimum_python() -> tuple[int, int]:
+    """Read the supported Python floor from project or installed metadata.
+
+    Source checkouts use the authoritative ``project.requires-python`` value
+    from the repository's ``pyproject.toml``. A wheel does not need to carry
+    that file, so installed distributions use their ``Requires-Python``
+    metadata instead. The fallback keeps the diagnostic usable from an
+    unusual stripped-down source install while matching the package contract.
+    """
+    project_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    requires_python: object = None
+    try:
+        with project_path.open("rb") as stream:
+            requires_python = tomllib.load(stream)["project"]["requires-python"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
+        try:
+            requires_python = metadata("cambium").get("Requires-Python")
+        except PackageNotFoundError:
+            requires_python = None
+
+    if isinstance(requires_python, str):
+        match = re.search(r"(?:^|,)\s*>=\s*(\d+)\.(\d+)", requires_python)
+        if match is not None:
+            return int(match.group(1)), int(match.group(2))
+
+    # Keep doctor usable even when invoked from a stripped-down source bundle.
+    # This mirrors pyproject.toml's current package declaration.
+    return (3, 12)
+
+
+MIN_PYTHON = _minimum_python()
 MIN_GIT = (2, 40)
 EVENTS_DB_REL = ".cambium/events.db"
 CONVERSATIONS_DB_REL = ".cambium/conversations.db"
