@@ -317,7 +317,8 @@ PYTHONPATH=src python -m pytest tests/acceptance/ -q
 
 ## DSPy trajectory extraction
 
-The direct optimizer driver supports `zero`, `bootstrap`, and `gepa`:
+The optimizer supports `zero`, `bootstrap`, and `gepa` from both the direct
+module command and the top-level `cambium optimize` wrapper:
 
 ```bash
 PYTHONPATH=src python -m cambium.optimize should_decompose \
@@ -328,9 +329,24 @@ PYTHONPATH=src python -m cambium.optimize should_decompose \
 
 GEPA uses the seeded 70/30 train/validation policy, requires at least four
 reviewed non-canary records, spends through the per-run ledger, and records
-its scores under `stage_gepa` in the report. Use the direct module command for
-GEPA; the top-level `cambium optimize` wrapper currently accepts only
-`zero`/`bootstrap`.
+its scores under `stage_gepa` in the report.
+
+Evaluate a fresh or saved program against the train, eval, and canary splits:
+
+```bash
+PYTHONPATH=src python -m cambium optimize eval should_review \
+  --dataset /path/to/reviewed-dataset \
+  --program-dir optimized/should_review \
+  --json
+```
+
+`MODULE` and `--dataset PATH` are required. `--program-dir PATH` loads
+`program.json` from an explicit artifact directory; when omitted, the command
+checks `optimized/<MODULE>/program.json` and evaluates a fresh program when no
+saved state is present. The `--json` report has `module`, `program`
+(`"fresh"` or `"optimized"`), `dataset`, and `splits`; each split contains
+`mean`, `std`, `count`, and `records`, whose entries contain `index` and
+`score`.
 
 Extract redacted, deduplicated decision trajectories from one or more explicit
 SQLite databases or storage directories. `--database` and `--session-dir` are

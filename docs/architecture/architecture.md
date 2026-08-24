@@ -74,7 +74,16 @@ quarantines an invalid entry instead of discarding the whole file. Each dropped
 entry is recorded as `{"entry", "reason", "quarantined_at"}` in the
 `<config>.quarantine` JSON sidecar; writes merge-deduplicate by canonical entry
 and reason, and the loader emits a warning (the one-shot path prints it to
-stderr). Valid entries continue to load.
+stderr). Before an entry is persisted, secret-key or secret-shaped string
+values in its `entry` copy become `<redacted:N>` markers. The serialized entry
+copy is capped at 64 KiB (`MAX_QUARANTINE_RECORD_BYTES`), with an oversized
+copy replaced by an `<oversized: ... bytes>` marker, and new sidecar payloads
+are capped at 1 MiB (`MAX_QUARANTINE_SIDECAR_BYTES`); records that do not fit
+are not appended. An existing sidecar over the limit is left unchanged. The
+loader refuses a symlink at the final sidecar path rather than following it.
+Accepted appends are written to a same-directory temporary file, flushed and
+`fsync`ed, then published with `os.replace`, so the sidecar replacement is
+atomic. Valid entries continue to load.
 Malformed JSON, invalid root structure, unknown root fields, duplicate provider
 names, and provider-environment collisions remain fatal structural errors. If
 every entry is quarantined, the loader returns a list-compatible empty provider
@@ -186,7 +195,8 @@ Do not use those names as current architecture components.
 ### Optimization
 
 The direct `python -m cambium.optimize` driver offers the three optimizer
-choices `zero`, `bootstrap`, and `gepa`. GEPA calls `build_trainsets` with a
+choices `zero`, `bootstrap`, and `gepa`; the top-level `cambium optimize`
+wrapper exposes the same choices. GEPA calls `build_trainsets` with a
 seeded shuffle and `_GEPA_VAL_FRACTION = 0.3`, producing a deterministic
 approximately 70/30 train/held-out validation split while leaving at least one
 training record. It requires at least four reviewed, non-canary records and
@@ -200,8 +210,24 @@ recorded by `_TrackingDiffundo`, and budget exhaustion writes the partial
 report with `budget_exhausted`. Completed reports include a `stage_gepa`
 section with train/evaluation means and any GEPA call, iteration, and full
 validation-evaluation counters exposed by the installed DSPy version. The
-top-level `cambium` wrapper currently advertises only `zero` and `bootstrap`,
-so the GEPA-capable entry point is the direct module command above.
+The direct and wrapper commands share the module manifest and optimizer
+label-resolution logic.
+
+The `eval` subcommand is `cambium optimize eval MODULE --dataset PATH`, with
+optional `--program-dir PATH`, `--budget-usd N`, `--tier TIER`, and `--json`.
+Without `--program-dir`, it loads `optimized/<MODULE>/program.json` when that
+state is present and otherwise evaluates a fresh program. Its JSON report has
+`module`, `program` (`fresh` or `optimized`), `dataset`, and `splits`; each
+split has `mean`, `std`, `count`, and per-record `records` with `index` and
+`score`.
+
+An optimizable module declares its package-local DSPy module in the manifest's
+`dspy_program` field. `should_review` sets that field to
+`cambium.modules.should_review.dspy_program` and its `label_field` to
+`review`; `_label_field` carries that name through optimizer metric lookup,
+prediction parsing, fallback decisions, gold labels, and DSPy training-example
+conversion. This keeps the second module's `review` labels distinct from the
+default `decompose` label.
 
 Training data has two read-only extraction paths. `cambium.opencode` accepts
 explicit OpenCode SQLite databases or storage directories, discovers only
@@ -351,7 +377,7 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
 | Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `src/cambium/code_index.py`, `src/cambium/lsp_query.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `search_symbols` (symbol search), `find_references` (references), `read_symbol` (bounded source window), and `query_lsp` (LSP queries) are wired into `TOOL_SCHEMAS` and `run_tool`; `run_python` holds a `python` permission key separate from shell; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
-| Optimization/training data | `src/cambium/optimize.py`, `src/cambium/opencode.py`, `scripts/extract_pi.py`, `artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` | Zero-shot/bootstrap/GEPA driver, read-only OpenCode/pi extraction, review-gated candidate admission, and the 34-record reviewed snapshot |
+| Optimization/training data | `src/cambium/optimize.py`, `src/cambium/cli.py`, `src/cambium/modules/base.py`, `src/cambium/modules/example/`, `src/cambium/modules/should_review/`, `src/cambium/opencode.py`, `scripts/extract_pi.py`, `artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` | Zero-shot/bootstrap/GEPA and `eval` driver, manifest-selected DSPy programs with label-aware evaluation, read-only OpenCode/pi extraction, review-gated candidate admission, and the 34-record reviewed snapshot |
 
 Any target moves to current only after a caller and focused failure test
 demonstrate it. Keep public names and status mappings stable once a host API is
