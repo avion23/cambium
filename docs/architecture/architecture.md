@@ -57,6 +57,11 @@ one-task `run_session` adapter remains for compatibility. `EventStore` is
 the current event boundary; there is no current `events.py` or dead-letter
 queue module.
 
+The canonical root result written to `.cambium/result.json` is
+`results.Result`. Its JSON record includes the serving `provider` and the
+optional `fell_back_from` origin, so a terminal-death provider substitution is
+visible in the durable result rather than only in the event stream.
+
 The supervisor gives each worker a bounded decoded-stdout `asyncio.Queue` and
 routes worker and runtime records through `EventStore`'s bounded writer queue.
 Worker stdout remains protocol-only NDJSON; diagnostics use stderr/logging.
@@ -117,6 +122,16 @@ defaults to `~/.config/cambium/routing-state.json` when no path is supplied.
 Interactive wall budgets use explicit configuration when supplied and can
 otherwise scale from provider throughput hints and measured branch usage with a
 safety factor.
+
+A pinned one-shot provider remains the task's primary association until
+`Diffundo.ProviderError.is_real_death` reports terminal evidence: key-level
+HTTP 401/403 authentication failure, HTTP 5xx endpoint failure, or a terminal
+connection, DNS, or TLS/SSL transport failure. 429/quota pressure and other
+transient outcomes retain their retry, cooldown, disable, or refusal semantics
+and do not trigger this pinned-provider fallback. When terminal death is
+established, authorized fallback candidates are tried in the same tier before
+other tiers; once one serves, the router records the original provider and
+stays with the serving association rather than bouncing back.
 
 `provider_scheduler.py` owns the provider-neutral `CacheHorizonConfig` and
 `CastConfig` values. `summary_trunk.py` compiles immutable semantic history into
