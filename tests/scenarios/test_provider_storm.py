@@ -323,8 +323,9 @@ def test_429_storm_respects_wall_and_retry_budgets(
                 quota_windows=_quota_window(),
             ),
         ),
-        # Keep the 60s reset hint beyond this generous wall budget while
-        # allowing several seconds of worker scheduling jitter.
+        # Generous wall budget: the 60s reset hint stays far beyond it (so
+        # Retry-After skips retries), and the margin survives xdist CPU
+        # contention where a tight budget expired during the first attempt.
         call_budget_s=5.0,
         pause_timeout_s=0.0,
     )
