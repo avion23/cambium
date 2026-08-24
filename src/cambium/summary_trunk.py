@@ -31,7 +31,9 @@ SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
 SUMMARY_MAX_ITEMS = 32
 SUMMARY_MAX_TEXT_BYTES = 2_000
 SUMMARY_MAX_ENTRY_BYTES = 24 * 1024
+SUMMARY_MAX_COERCE_DEPTH = 64
 _SUMMARY_DIGEST_LENGTH = 64
+_SUMMARY_DEEP_PLACEHOLDER = "<deep:unrepresentable>"
 
 SUMMARY_LIST_FIELDS = (
     "decisions_added",
@@ -161,7 +163,7 @@ def _canonical_json_bytes(value: Any) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
         raise SummaryTrunkError("summary data is not canonical JSON") from exc
 
 
@@ -197,9 +199,18 @@ _SUMMARY_FORBIDDEN_MARKERS = (
 def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise SummaryTrunkError(f"summary entry {field} must be a string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        # Model-owned JSON can contain lone UTF-16 surrogates even though the
+        # surrounding response is otherwise valid.  Keep compaction alive by
+        # retaining the code point's printable escape rather than letting the
+        # filesystem/provider boundary see an unencodable string.
+        value = value.encode("utf-8", errors="backslashreplace").decode("ascii")
+        encoded = value.encode("utf-8")
     if not allow_empty and not value.strip():
         raise SummaryTrunkError(f"summary entry {field} must be non-empty")
-    if len(value.encode("utf-8")) > SUMMARY_MAX_TEXT_BYTES:
+    if len(encoded) > SUMMARY_MAX_TEXT_BYTES:
         raise SummaryTrunkError(f"summary entry {field} exceeds the byte cap")
     for marker in _SUMMARY_FORBIDDEN_MARKERS:
         if marker and marker in value:
@@ -216,13 +227,42 @@ def _coerced_summary_text(item: Any) -> Any:
     emitted as objects or numbers.  Compaction is recovery infrastructure:
     coerce such items to their canonical JSON spelling instead of killing
     the session.  Bounds and forbidden-marker checks still apply afterwards.
+    Objects deeper than :data:`SUMMARY_MAX_COERCE_DEPTH` are represented by a
+    bounded placeholder so recovery never recurses through attacker-shaped
+    data.
     """
     if isinstance(item, str):
         return item
+
+    # Walk containers iteratively.  ``json.dumps`` has its own recursion
+    # guard, but checking first keeps a deeply nested JSON value out of that
+    # implementation-specific limit and also handles cyclic values supplied
+    # by direct callers of this recovery helper.
+    pending: list[tuple[Any, int]] = [(item, 0)]
+    seen_containers: set[int] = set()
+    while pending:
+        candidate, depth = pending.pop()
+        if depth > SUMMARY_MAX_COERCE_DEPTH:
+            return _SUMMARY_DEEP_PLACEHOLDER
+        if isinstance(candidate, Mapping):
+            identity = id(candidate)
+            if identity in seen_containers:
+                return _SUMMARY_DEEP_PLACEHOLDER
+            seen_containers.add(identity)
+            pending.extend((child, depth + 1) for child in candidate.values())
+        elif isinstance(candidate, list | tuple):
+            identity = id(candidate)
+            if identity in seen_containers:
+                return _SUMMARY_DEEP_PLACEHOLDER
+            seen_containers.add(identity)
+            pending.extend((child, depth + 1) for child in candidate)
     try:
         return json.dumps(item, sort_keys=True, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError):
-        return str(item)
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        try:
+            return str(item)
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+            return _SUMMARY_DEEP_PLACEHOLDER
 
 
 def _bounded_items(value: Any, field: str) -> tuple[str, ...]:
@@ -757,33 +797,43 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
     if not isinstance(content, str) or not content.strip():
         raise SummaryTrunkError("summary response must be non-empty JSON")
     try:
-        decoded = json.loads(content)
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise SummaryTrunkError("summary response must be exactly one JSON object") from exc
-    if not isinstance(decoded, dict):
-        raise SummaryTrunkError("summary response must be exactly one JSON object")
-    unknown = set(decoded) - SUMMARY_ENTRY_FIELDS
-    if unknown:
-        raise SummaryTrunkError(f"summary response field set is invalid: unknown={sorted(unknown)}")
-    if decoded.get("type", "summary_entry") != "summary_entry":
-        raise SummaryTrunkError("summary entry type must be 'summary_entry'")
+        try:
+            decoded = json.loads(content)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise SummaryTrunkError("summary response must be exactly one JSON object") from exc
+        if not isinstance(decoded, dict):
+            raise SummaryTrunkError("summary response must be exactly one JSON object")
+        unknown = set(decoded) - SUMMARY_ENTRY_FIELDS
+        if unknown:
+            raise SummaryTrunkError(
+                f"summary response field set is invalid: unknown={sorted(unknown)}"
+            )
+        if decoded.get("type", "summary_entry") != "summary_entry":
+            raise SummaryTrunkError("summary entry type must be 'summary_entry'")
 
-    normalized = dict(decoded)
-    normalized.update(
-        {
-            "type": "summary_entry",
-            "sequence": expected.sequence,
-            "source_sha256": expected.source_sha256,
-            "source_message_count": expected.source_message_count,
-            "through_turn": expected.through_turn,
-            "objective": _bounded_text(decoded.get("objective"), "objective").strip(),
-            "outcome": _bounded_text(decoded.get("outcome"), "outcome").strip(),
-        }
-    )
-    for field in SUMMARY_LIST_FIELDS:
-        value = decoded[field] if field in decoded else []
-        normalized[field] = list(_bounded_items(value, field))
-    return _entry_from_mapping(normalized)
+        normalized = dict(decoded)
+        normalized.update(
+            {
+                "type": "summary_entry",
+                "sequence": expected.sequence,
+                "source_sha256": expected.source_sha256,
+                "source_message_count": expected.source_message_count,
+                "through_turn": expected.through_turn,
+                "objective": _bounded_text(decoded.get("objective"), "objective").strip(),
+                "outcome": _bounded_text(decoded.get("outcome"), "outcome").strip(),
+            }
+        )
+        for field in SUMMARY_LIST_FIELDS:
+            value = decoded[field] if field in decoded else []
+            normalized[field] = list(_bounded_items(value, field))
+        return _entry_from_mapping(normalized)
+    except SummaryTrunkError:
+        raise
+    except Exception as exc:
+        # This is an untrusted model boundary.  Keep the public contract
+        # closed even if a future normalizer or the JSON implementation adds a
+        # new data-dependent failure mode.
+        raise SummaryTrunkError("summary response could not be normalized") from exc
 
 
 def append_summary_entry(
