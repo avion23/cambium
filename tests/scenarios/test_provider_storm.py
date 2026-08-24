@@ -317,7 +317,10 @@ def test_429_storm_respects_wall_and_retry_budgets(
                 quota_windows=_quota_window(),
             ),
         ),
-        call_budget_s=0.2,
+        # Generous wall budget: the behavior under test is that Retry-After
+        # beyond the budget skips retries, not that a starved first HTTP
+        # attempt flips the outcome.  0.2s expired during xdist contention.
+        call_budget_s=5.0,
         pause_timeout_s=0.0,
     )
 
