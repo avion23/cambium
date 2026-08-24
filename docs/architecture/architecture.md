@@ -156,6 +156,24 @@ train/eval/canary data, split metrics, and a JSON CLI with `decide` and
 The tracked source does not contain `worker_pool.py`, `events.py`, or `dlq.py`.
 Do not use those names as current architecture components.
 
+### 1.1 Bounded CAST context policy and transactional fork joins
+
+`src/cambium/context_policy.py` defines `CastPolicy`, a bounded CAST/K0
+context policy: token ceilings for prompt, transcript, and cache trunk plus
+epoch rollover thresholds. Interactive sessions consult it when deciding
+whether the next turn fits the bounded window or must roll over into a new
+K0 epoch (see §CAST in `cast.md`).
+
+Fork joins are transactional: a worker's integration is accepted only if
+the parent session head still matches the head observed at fork time, and
+`supervisor._assert_parent_join_invariant` enforces
+`post_join_parent_HEAD == accepted_integration_HEAD` durably. A failed
+invariant produces a structured conflict envelope instead of silent
+overwrite; conflicting work lands on a side branch for manual reconciliation.
+Context epochs are published per rollover so resumed sessions rebuild from
+the correct epoch boundary (`tests/scenarios/test_context_epochs.py`,
+`test_join_invariant.py`).
+
 ## 2. Ownership and invariants
 
 1. The caller owns the session directory and supplies plan records.
