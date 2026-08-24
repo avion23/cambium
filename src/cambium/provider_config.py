@@ -271,6 +271,18 @@ _VALID_TIERS = frozenset({"fast", "balanced", "strong", "reasoning"})
 # provider must use https so the Authorization: Bearer key stays encrypted.
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
+# Quarantine files are diagnostics, not a second configuration store.  Keep
+# them bounded and make the copy of an invalid entry safe to retain.
+MAX_QUARANTINE_RECORD_BYTES = 64 * 1024
+MAX_QUARANTINE_SIDECAR_BYTES = 1024 * 1024
+_MAX_QUARANTINE_ENTRY_DEPTH = 128
+_MAX_QUARANTINE_ENTRY_NODES = 100_000
+_QUARANTINE_SECRET_KEY_RE = re.compile(
+    r"(?:key|token|secret|credential)", re.IGNORECASE
+)
+_QUARANTINE_LONG_ALNUM_RE = re.compile(r"[A-Za-z0-9]{60,}")
+_QUARANTINE_SECRET_PREFIXES = ("sk-", "ghp_", "AKIA")
+
 
 def is_loopback_host(hostname: str) -> bool:
     """True for the loopback host names that may use plaintext http transport."""
@@ -304,9 +316,171 @@ def provider_quarantine_path(source: str | Path) -> Path:
     return path.with_name(path.name + ".quarantine")
 
 
+def _quarantine_byte_length(value: str) -> int:
+    """Measure text without allowing lone surrogates to escape the boundary."""
+
+    return len(value.encode("utf-8", errors="surrogatepass"))
+
+
+def _quarantine_string(value: str, key: str | None) -> str:
+    secret_key = key is not None and _QUARANTINE_SECRET_KEY_RE.search(key) is not None
+    secret_shape = value.startswith(_QUARANTINE_SECRET_PREFIXES) or (
+        _QUARANTINE_LONG_ALNUM_RE.search(value) is not None
+    )
+    if secret_key or secret_shape:
+        return f"<redacted:{_quarantine_byte_length(value)}>"
+    return value
+
+
+def _quarantine_size_hint(value: object) -> int:
+    """Return a bounded, non-sensitive byte-size estimate for a deep value."""
+
+    pending: list[object] = [value]
+    seen: set[int] = set()
+    total = 0
+    nodes = 0
+    while pending and nodes < _MAX_QUARANTINE_ENTRY_NODES:
+        candidate = pending.pop()
+        nodes += 1
+        if isinstance(candidate, str):
+            total += _quarantine_byte_length(candidate)
+        elif isinstance(candidate, dict):
+            identity = id(candidate)
+            if identity in seen:
+                total += 9  # len(json.dumps("<cyclic>"))
+                continue
+            seen.add(identity)
+            total += 2
+            for key, child in candidate.items():
+                if isinstance(key, str):
+                    total += _quarantine_byte_length(key) + 3
+                pending.append(child)
+        elif isinstance(candidate, list):
+            identity = id(candidate)
+            if identity in seen:
+                total += 9
+                continue
+            seen.add(identity)
+            total += 2
+            pending.extend(candidate)
+        else:
+            total += 8
+    if pending:
+        total += len(pending) * 8
+    return max(total, 1)
+
+
+def _sanitize_quarantine_entry(entry: object) -> object:
+    """Copy an entry iteratively, redacting secret-shaped string values."""
+
+    def scalar(value: object, key: str | None) -> object:
+        if isinstance(value, str):
+            return _quarantine_string(value, key)
+        if value is None or isinstance(value, bool | int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else "<non-finite>"
+        return "<unserializable>"
+
+    if not isinstance(entry, dict | list):
+        return scalar(entry, None)
+
+    root: object = {} if isinstance(entry, dict) else []
+    active = {id(entry)}
+    frames: list[tuple[object, object, Any, int, int]] = [
+        (
+            entry,
+            root,
+            iter(entry.items()) if isinstance(entry, dict) else iter(enumerate(entry)),
+            0,
+            id(entry),
+        )
+    ]
+    nodes = 1
+    while frames:
+        original, output, iterator, depth, identity = frames[-1]
+        try:
+            raw_key, child = next(iterator)
+        except StopIteration:
+            active.discard(identity)
+            frames.pop()
+            continue
+
+        key: str | None
+        if isinstance(original, dict):
+            key = raw_key if isinstance(raw_key, str) else None
+            safe_key = (
+                _quarantine_string(raw_key, None)
+                if isinstance(raw_key, str)
+                else f"<key:{type(raw_key).__name__}>"
+            )
+        else:
+            key = None
+            safe_key = None
+
+        safe_child: object
+        if isinstance(child, dict | list):
+            if depth >= _MAX_QUARANTINE_ENTRY_DEPTH or nodes >= _MAX_QUARANTINE_ENTRY_NODES:
+                safe_child = f"<oversized: {_quarantine_size_hint(child)} bytes>"
+            elif id(child) in active:
+                safe_child = "<cyclic>"
+            else:
+                safe_child = {} if isinstance(child, dict) else []
+                if isinstance(output, dict):
+                    output[safe_key] = safe_child
+                else:
+                    output.append(safe_child)
+                active.add(id(child))
+                nodes += 1
+                frames.append(
+                    (
+                        child,
+                        safe_child,
+                        iter(child.items())
+                        if isinstance(child, dict)
+                        else iter(enumerate(child)),
+                        depth + 1,
+                        id(child),
+                    )
+                )
+                continue
+        else:
+            safe_child = scalar(child, key)
+
+        if isinstance(output, dict):
+            output[safe_key] = safe_child
+        else:
+            output.append(safe_child)
+    return root
+
+
+def _quarantine_json_bytes(value: object, *, indent: int | None = None) -> bytes:
+    """Serialize quarantine data as ASCII-safe, finite JSON bytes."""
+
+    if indent is None:
+        rendered = json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        rendered = json.dumps(value, ensure_ascii=True, allow_nan=False, indent=indent)
+    return rendered.encode("ascii")
+
+
 def _quarantine_record(entry: object, reason: str) -> dict[str, object]:
+    safe_entry = _sanitize_quarantine_entry(entry)
+    try:
+        serialized_entry = _quarantine_json_bytes(safe_entry)
+    except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError):
+        safe_entry = "<unserializable>"
+        serialized_entry = _quarantine_json_bytes(safe_entry)
+    if len(serialized_entry) > MAX_QUARANTINE_RECORD_BYTES:
+        safe_entry = f"<oversized: {len(serialized_entry)} bytes>"
     return {
-        "entry": entry,
+        "entry": safe_entry,
         "reason": reason,
         "quarantined_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
@@ -319,10 +493,8 @@ def _quarantine_record_key(record: object) -> tuple[str, str] | None:
     if not isinstance(reason, str):
         return None
     try:
-        entry = json.dumps(
-            record.get("entry"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-    except (TypeError, ValueError):
+        entry = _quarantine_json_bytes(record.get("entry")).decode("ascii")
+    except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError):
         return None
     return entry, reason
 
@@ -360,7 +532,7 @@ def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Pa
     if not additions:
         return path
 
-    payload = json.dumps([*existing, *additions], ensure_ascii=False, indent=2) + "\n"
+    payload = _quarantine_json_bytes([*existing, *additions], indent=2).decode("ascii") + "\n"
     temporary_name: str | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(

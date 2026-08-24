@@ -472,7 +472,8 @@ def test_valid_entries_continue_after_invalid_entry_is_quarantined(
 
     assert [provider.name for provider in providers] == ["healthy"]
     records = json.loads(path.with_name(path.name + ".quarantine").read_text(encoding="utf-8"))
-    assert records[0]["entry"] == invalid
+    expected_entry = {**invalid, "api_key_env": "<redacted:14>"}
+    assert records[0]["entry"] == expected_entry
     assert records[0]["reason"] == (
         "provider config providers[1].api_key_env: "
         "must be the derived CAMBIUM provider environment name"
