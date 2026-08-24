@@ -278,9 +278,10 @@ its scores under `stage_gepa` in the report. Use the direct module command for
 GEPA; the top-level `cambium optimize` wrapper currently accepts only
 `zero`/`bootstrap`.
 
-Extract redacted, deduplicated decision trajectories from an OpenCode SQLite
-database or storage directory. Point `--session-dir` at the OpenCode storage;
-the extractor is read-only and requires the source path explicitly:
+Extract redacted, deduplicated decision trajectories from one or more explicit
+OpenCode SQLite databases or storage directories. `--database` and
+`--session-dir` are repeatable; the extractor is read-only and requires a
+source path explicitly:
 
 ```bash
 PYTHONPATH=src python -m cambium optimize extract \
@@ -290,8 +291,29 @@ PYTHONPATH=src python -m cambium optimize extract \
 ```
 
 Use `--review-gate` to write a review queue instead of the accepted dataset.
-See [`docs/architecture/optimization.md`](docs/architecture/optimization.md)
-for the schema and approval gate.
+Review-gated rows are `candidate: true`, `redacted: true`, and
+`review_status: "needs_review"`; they are not training data until a reviewer
+changes every admitted row to `review_status: "approved"`. The optimizer fails
+closed on pending or unknown statuses and ignores rejected/excluded rows.
+
+For pi session JSONL logs, use the repository extractor separately. It scans
+recursively, infers a review-required label from task/session signals, and
+keeps assistant/tool output out of the candidate records:
+
+```bash
+PYTHONPATH=src python scripts/extract_pi.py \
+  --sessions-dir /path/to/pi/sessions \
+  --output artifacts/optimization/first-real-extraction/candidates-pi.jsonl
+```
+
+The current reviewed snapshot is
+`artifacts/optimization/first-real-extraction/train_queue_v2.jsonl`: 34
+approved records, with 24 `train` and 10 `val` entries. It is not loaded
+implicitly; pass a reviewed candidate file with
+`--include-transcript-candidates` or `--transcript-candidates PATH` when
+augmenting a module's training pool. See
+[`docs/architecture/optimization.md`](docs/architecture/optimization.md) for
+the broader schema and approval gate.
 
 ## Profiling baseline
 

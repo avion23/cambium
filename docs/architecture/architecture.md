@@ -203,6 +203,27 @@ validation-evaluation counters exposed by the installed DSPy version. The
 top-level `cambium` wrapper currently advertises only `zero` and `bootstrap`,
 so the GEPA-capable entry point is the direct module command above.
 
+Training data has two read-only extraction paths. `cambium.opencode` accepts
+explicit OpenCode SQLite databases or storage directories, discovers only
+databases with the `session`/`project`/`message`/`part` schema, and extracts
+explicit visible decision/rationale pairs after redaction and canonical-pair
+deduplication. `scripts/extract_pi.py` recursively scans pi session `*.jsonl`
+files and emits redacted, inferred candidates with count-only outcome evidence;
+the inferred label is always review-required and the script does not copy
+assistant or tool output into the candidate record.
+
+The OpenCode `--review-gate` output and every pi candidate file are queues, not
+training data: their records carry `candidate: true`, `redacted: true`, and
+`review_status: "needs_review"`. `_reviewed_transcript_records` admits only
+explicitly approved records, ignores `rejected`/`excluded` records, and fails
+closed on pending or unknown statuses; transcript candidates are opt-in via
+`--include-transcript-candidates` or `--transcript-candidates PATH`, and a
+candidate file may not contain a canary. The committed reviewed snapshot
+`artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` contains
+34 approved records: 24 marked `train` and 10 marked `val`. It is pipeline
+state, not an implicit module dataset; the optimizer consumes a candidate file
+only when one of those opt-in flags is supplied.
+
 ### 1.1 Bounded CAST context policy and transactional fork joins
 
 `src/cambium/context_policy.py` defines `CastPolicy`, a bounded CAST/K0
@@ -330,6 +351,7 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
 | Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `src/cambium/code_index.py`, `src/cambium/lsp_query.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `search_symbols` (symbol search), `find_references` (references), `read_symbol` (bounded source window), and `query_lsp` (LSP queries) are wired into `TOOL_SCHEMAS` and `run_tool`; `run_python` holds a `python` permission key separate from shell; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
+| Optimization/training data | `src/cambium/optimize.py`, `src/cambium/opencode.py`, `scripts/extract_pi.py`, `artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` | Zero-shot/bootstrap/GEPA driver, read-only OpenCode/pi extraction, review-gated candidate admission, and the 34-record reviewed snapshot |
 
 Any target moves to current only after a caller and focused failure test
 demonstrate it. Keep public names and status mappings stable once a host API is
