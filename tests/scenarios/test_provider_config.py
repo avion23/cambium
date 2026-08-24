@@ -524,3 +524,102 @@ def test_all_quarantined_loads_zero_and_selection_names_sidecar(tmp_path: Path) 
         match=r"all providers quarantined to .*providers\.json\.quarantine; fix or remove entries",
     ):
         select_provider(providers)
+
+
+def test_quarantine_redacts_secret_shaped_values_but_keeps_reason_and_structure(
+    tmp_path: Path,
+) -> None:
+    sentinel = "sk-audit-sentinel-that-must-not-be-persisted"
+    invalid = _provider(
+        "broken",
+        api_key_env="OPENAI_API_KEY",
+        annotations={
+            "apiToken": sentinel,
+            "benign": "keep this field",
+        },
+    )
+    path = _write(tmp_path / "providers.json", [invalid])
+
+    assert load_providers(path) == []
+
+    sidecar = path.with_name(path.name + ".quarantine")
+    text = sidecar.read_text(encoding="utf-8")
+    assert sentinel not in text
+    records = json.loads(text)
+    entry = records[0]["entry"]
+    assert entry["name"] == "broken"
+    assert entry["annotations"]["benign"] == "keep this field"
+    assert entry["annotations"]["apiToken"].startswith("<redacted:")
+    assert records[0]["reason"] == (
+        "provider config providers[0]: unknown field(s): 'annotations'"
+    )
+
+
+def test_symlinked_quarantine_sidecar_is_not_followed(
+    tmp_path: Path,
+) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(api_key_env="OPENAI_API_KEY")])
+    target = tmp_path / "target.json"
+    target.write_text('{"must": "remain untouched"}', encoding="utf-8")
+    sidecar = path.with_name(path.name + ".quarantine")
+    sidecar.symlink_to(target)
+
+    with pytest.raises(OSError, match="must not be a symlink"):
+        load_providers(path)
+
+    assert target.read_text(encoding="utf-8") == '{"must": "remain untouched"}'
+    assert sidecar.is_symlink()
+
+
+def test_oversized_quarantine_entry_is_stubbed(tmp_path: Path) -> None:
+    invalid = _provider("broken", notes="x " * 40_000)
+    path = _write(tmp_path / "providers.json", [invalid])
+
+    assert load_providers(path) == []
+
+    sidecar = path.with_name(path.name + ".quarantine")
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert records[0]["entry"].startswith("<oversized: ")
+    assert records[0]["entry"].endswith(" bytes>")
+    assert sidecar.stat().st_size < provider_config.MAX_QUARANTINE_RECORD_BYTES
+
+
+def test_quarantine_sidecar_limit_stops_append_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _write(tmp_path / "providers.json", [_provider(api_key_env="OPENAI_API_KEY")])
+    monkeypatch.setattr(provider_config, "MAX_QUARANTINE_SIDECAR_BYTES", 200)
+    caplog.set_level(logging.WARNING, logger=provider_config.__name__)
+
+    assert load_providers(path) == []
+
+    sidecar = path.with_name(path.name + ".quarantine")
+    assert not sidecar.exists()
+    assert any("byte limit" in record.getMessage() for record in caplog.records)
+
+
+def test_quarantine_surrogates_and_deep_entries_are_cleanly_encoded(tmp_path: Path) -> None:
+    surrogate_entry = {"name": "\ud800", "tier": "strong"}
+    source = tmp_path / "surrogate.json"
+    source.write_text("{}", encoding="utf-8")
+    sidecar = source.with_name(source.name + ".quarantine")
+
+    provider_config._append_quarantine(
+        source, [provider_config._quarantine_record(surrogate_entry, "surrogate reason")]
+    )
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert records[0]["entry"]["name"] == "\ud800"
+    assert records[0]["reason"] == "surrogate reason"
+
+    deep: object = {"leaf": "depth sentinel"}
+    for _ in range(1_100):
+        deep = {"nested": deep}
+    deep_record = provider_config._quarantine_record(deep, "deep reason")
+    deep_source = tmp_path / "deep.json"
+    deep_source.write_text("{}", encoding="utf-8")
+    deep_sidecar = deep_source.with_name(deep_source.name + ".quarantine")
+    provider_config._append_quarantine(deep_source, [deep_record])
+
+    deep_text = deep_sidecar.read_text(encoding="utf-8")
+    assert "depth sentinel" not in deep_text
+    assert json.loads(deep_text)[0]["reason"] == "deep reason"

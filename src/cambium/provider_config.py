@@ -22,11 +22,13 @@ never reads the environment or a key value.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
@@ -499,46 +501,138 @@ def _quarantine_record_key(record: object) -> tuple[str, str] | None:
     return entry, reason
 
 
+def _read_quarantine_sidecar(path: Path) -> tuple[list[object], bool]:
+    """Read a regular sidecar without following a replaceable final symlink."""
+
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return [], False
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(f"provider quarantine path must not be a symlink: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise OSError(f"provider quarantine path is not a file: {path}")
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            # A concurrent remover is equivalent to an absent sidecar.
+            return [], False
+        except OSError as exc:
+            if exc.errno == getattr(errno, "ELOOP", 40):
+                raise OSError(f"provider quarantine path must not be a symlink: {path}") from exc
+            raise
+
+        sidecar_stat = os.fstat(descriptor)
+        if stat.S_ISLNK(sidecar_stat.st_mode):
+            raise OSError(f"provider quarantine path must not be a symlink: {path}")
+        if not stat.S_ISREG(sidecar_stat.st_mode):
+            raise OSError(f"provider quarantine path is not a file: {path}")
+        if sidecar_stat.st_size > MAX_QUARANTINE_SIDECAR_BYTES:
+            logger.warning(
+                "provider quarantine sidecar %s exceeds the %d-byte limit; "
+                "new records were not appended",
+                path,
+                MAX_QUARANTINE_SIDECAR_BYTES,
+            )
+            return [], True
+
+        sidecar = os.fdopen(descriptor, "rb")
+        descriptor = None
+        with sidecar:
+            raw = sidecar.read(MAX_QUARANTINE_SIDECAR_BYTES + 1)
+        if len(raw) > MAX_QUARANTINE_SIDECAR_BYTES:
+            logger.warning(
+                "provider quarantine sidecar %s exceeds the %d-byte limit; "
+                "new records were not appended",
+                path,
+                MAX_QUARANTINE_SIDECAR_BYTES,
+            )
+            return [], True
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    try:
+        existing_raw = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_non_standard_constant,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
+    if not isinstance(existing_raw, list):
+        raise ValueError(f"provider quarantine file {path}: must be a list")
+    return existing_raw, False
+
+
 def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Path | None:
     """Merge newly quarantined entries into the source's JSON-list sidecar."""
 
     if not records:
         return None
     path = provider_quarantine_path(source)
-    existing: list[object] = []
-    if path.exists():
-        if not path.is_file():
-            raise OSError(f"provider quarantine path is not a file: {path}")
-        try:
-            existing_raw = json.loads(
-                path.read_text(encoding="utf-8"),
-                object_pairs_hook=_reject_duplicate_pairs,
-                parse_constant=_reject_non_standard_constant,
-            )
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
-        if not isinstance(existing_raw, list):
-            raise ValueError(f"provider quarantine file {path}: must be a list")
-        existing = existing_raw
+    existing, sidecar_limited = _read_quarantine_sidecar(path)
+    if sidecar_limited:
+        return path
 
     existing_keys = {key for item in existing if (key := _quarantine_record_key(item)) is not None}
     # Loading provider specs and then full providers is common (doctor does
     # both). Avoid repeating records already persisted by the earlier load.
-    additions = [
-        record
-        for record in records
-        if (key := _quarantine_record_key(record)) is None or key not in existing_keys
-    ]
+    additions: list[dict[str, object]] = []
+    for record in records:
+        key = _quarantine_record_key(record)
+        if key is None or key not in existing_keys:
+            additions.append(record)
+            if key is not None:
+                existing_keys.add(key)
     if not additions:
         return path
 
-    payload = _quarantine_json_bytes([*existing, *additions], indent=2).decode("ascii") + "\n"
+    accepted: list[dict[str, object]] = []
+    payload: bytes | None = None
+    for index, record in enumerate(additions):
+        try:
+            candidate = _quarantine_json_bytes([*existing, *accepted, record], indent=2) + b"\n"
+        except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError):
+            logger.warning(
+                "provider quarantine sidecar %s could not safely serialize %d new record(s); "
+                "remaining records were not appended",
+                path,
+                len(additions) - index,
+            )
+            break
+        if len(candidate) > MAX_QUARANTINE_SIDECAR_BYTES:
+            logger.warning(
+                "provider quarantine sidecar %s reached the %d-byte limit; "
+                "%d new record(s) were not appended",
+                path,
+                MAX_QUARANTINE_SIDECAR_BYTES,
+                len(additions) - index,
+            )
+            break
+        accepted.append(record)
+        payload = candidate
+    if not accepted or payload is None:
+        return path
+
     temporary_name: str | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+        with os.fdopen(descriptor, "wb") as temporary:
             temporary.write(payload)
             temporary.flush()
             os.fsync(temporary.fileno())
