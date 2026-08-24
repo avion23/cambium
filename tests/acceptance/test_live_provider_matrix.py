@@ -33,7 +33,14 @@ import pytest
 
 from cambium import supervisor
 from cambium.auth import effective_home, oauth_env_suffix
-from cambium.diffundo import CredentialSource, Diffundo, ProviderConfig
+from cambium.diffundo import (
+    AllProvidersFailed,
+    CredentialSource,
+    Diffundo,
+    ProviderConfig,
+    ProviderError,
+    ProviderOutcome,
+)
 from cambium.oauth import (
     DEFAULT_REFRESH_MARGIN_S,
     InvalidGrantError,
@@ -494,6 +501,32 @@ def _live_prompt() -> dict[str, object]:
     return json.loads(json.dumps(_PROBE_PROMPT))
 
 
+def _skip_if_provider_unavailable(error: BaseException) -> None:
+    """Skip live probes only when the provider infrastructure is unavailable."""
+
+    provider_error: BaseException | None = error
+    if isinstance(error, AllProvidersFailed):
+        provider_error = error.last_error
+    if not isinstance(provider_error, ProviderError):
+        return
+
+    status = provider_error.http_status
+    if status is not None:
+        if not 500 <= status <= 599:
+            return
+        detail = f"HTTP {status}"
+    elif provider_error.outcome is ProviderOutcome.TIMEOUT:
+        detail = "request timeout"
+    elif provider_error.outcome is ProviderOutcome.ERROR and provider_error.is_real_death:
+        detail = "connection failure"
+    else:
+        return
+    pytest.skip(
+        f"live acceptance skipped: provider {provider_error.provider!r} "
+        f"endpoint unavailable ({detail})"
+    )
+
+
 def _codex_probe(
     context: _CodexContext,
     access_token: str,
@@ -505,13 +538,17 @@ def _codex_probe(
         pause_timeout_s=min(5.0, _probe_timeout()),
         credential_source=CredentialSource(access_token, account_id),
     )
-    return asyncio.run(
-        router.call(
-            context.provider.tier,
-            _live_prompt(),
-            model=context.provider.model,
+    try:
+        return asyncio.run(
+            router.call(
+                context.provider.tier,
+                _live_prompt(),
+                model=context.provider.model,
+            )
         )
-    )
+    except (AllProvidersFailed, ProviderError) as exc:
+        _skip_if_provider_unavailable(exc)
+        raise
 
 
 def _api_router(context: _ProviderContext, monkeypatch: pytest.MonkeyPatch) -> Diffundo:
@@ -545,14 +582,18 @@ def _api_probe(
     requirements: Mapping[str, object] | None = None,
 ) -> Any:
     router = _api_router(context, monkeypatch)
-    return asyncio.run(
-        router.call(
-            context.provider.tier,
-            _live_prompt(),
-            model=context.provider.model,
-            requirements=requirements,
+    try:
+        return asyncio.run(
+            router.call(
+                context.provider.tier,
+                _live_prompt(),
+                model=context.provider.model,
+                requirements=requirements,
+            )
         )
-    )
+    except (AllProvidersFailed, ProviderError) as exc:
+        _skip_if_provider_unavailable(exc)
+        raise
 
 
 def _assert_provider_result(result: Any, provider: ProviderConfig) -> None:
