@@ -460,6 +460,7 @@ def test_terminal_dead_lane_does_not_starve_optimizer_style_burst(monkeypatch) -
         call_budget_s=2.0,
     )
     try:
+
         async def run_burst() -> list[str]:
             first = await router.call(ProviderTier.FAST, PROMPT)
             assert first.provider == "burst-healthy"

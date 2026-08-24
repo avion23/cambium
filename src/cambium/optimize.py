@@ -284,15 +284,15 @@ def _metric_function(program: object) -> Callable[[Example], float]:
     return cast(Callable[[Example], float], metric)
 
 
-def _parse_decision(raw: object, decision_type: type, label_field: str = "decompose") -> object | None:
+def _parse_decision(
+    raw: object, decision_type: type, label_field: str = "decompose"
+) -> object | None:
     members = tuple(cast(Iterable[object], decision_type))
     if isinstance(raw, decision_type):
         return raw
     if isinstance(raw, bool):
         for member in members:
-            if getattr(member, "value", None) == (
-                label_field if raw else f"do_not_{label_field}"
-            ):
+            if getattr(member, "value", None) == (label_field if raw else f"do_not_{label_field}"):
                 return member
         return None
     if not isinstance(raw, str):
@@ -330,9 +330,7 @@ def _prediction_output(raw: object, program: object) -> object | None:
 
     if isinstance(raw, output_type):
         value = raw
-        decision = _parse_decision(
-            getattr(value, "decision", _MISSING), decision_type, label_field
-        )
+        decision = _parse_decision(getattr(value, "decision", _MISSING), decision_type, label_field)
         reason = getattr(value, "reason", _MISSING)
         confidence = getattr(value, "confidence", 1.0)
     else:
@@ -866,8 +864,7 @@ def _score_outcomes(outcomes: list[dict[str, float | int]]) -> dict[str, Any]:
 def evaluate_dataset(program: object, loader: object) -> dict[str, dict[str, Any]]:
     """Evaluate all three reviewed dataset splits with the program's metric."""
     split_examples = {
-        split: _load_split(loader, split.upper())
-        for split in ("train", "eval", "canaries")
+        split: _load_split(loader, split.upper()) for split in ("train", "eval", "canaries")
     }
     outcomes = asyncio.run(_evaluate_splits_async(program, split_examples))
     return {split: _score_outcomes(outcomes[split]) for split in split_examples}
@@ -1056,8 +1053,7 @@ def run_stage_gepa(
         reflection_lm = getattr(program, "_lm", None)
     if reflection_lm is None or not callable(reflection_lm):
         raise OptimizeError(
-            "GEPA requires a reflection LM; the program must expose the "
-            "Diffundo-backed CambiumLM"
+            "GEPA requires a reflection LM; the program must expose the Diffundo-backed CambiumLM"
         )
     gepa_class = getattr(dspy, "GEPA", None)
     if not callable(gepa_class):
