@@ -24,6 +24,7 @@ ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
 # the CambiumLM scenarios instead of skipping 113 tests.
 test = [
     "pytest>=9",
+    "pytest-xdist>=3.6",
     "tree-sitter>=0.26",
     "tree-sitter-python>=0.25",
     "dspy>=3.3.0,<3.4",
@@ -50,10 +51,16 @@ testpaths = ["tests", "src"]
 pythonpath = ["src"]
 # Default run is the fast tier: subprocess/process-boundary integration
 # scenarios opt out via the `slow` marker and run with `pytest -m slow`.
-addopts = "-m 'not slow'"
+# The suite uses tmp_path for filesystem state and ephemeral loopback ports.
+# The two provider timing modules are kept together by the root conftest hook:
+# their sub-second deadline assertions can be starved by load scheduling even
+# though their state is otherwise hermetic.  loadgroup preserves that boundary
+# while keeping the remaining tests distributed across workers.
+addopts = "-m 'not slow' -n auto --dist=loadgroup"
 markers = [
     "slow: subprocess/process-boundary integration scenario; run with -m slow",
     "acceptance: opt-in live-provider acceptance; requires explicit credentials and config",
+    "xdist_group(name): keep timing-sensitive provider scenarios on one worker",
 ]
 
 [tool.ruff]
