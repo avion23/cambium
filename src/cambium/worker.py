@@ -3695,12 +3695,16 @@ def _cumulative_provider_metadata(loop_outcome: dict[str, Any]) -> dict[str, Any
         or not math.isfinite(float(latency))
     ):
         return None
-    return {
+    metadata = {
         "provider": provider,
         "model": model,
         "usage": usage,
         "latency_s": max(0.0, float(latency)),
     }
+    fell_back_from = loop_outcome.get("fell_back_from")
+    if isinstance(fell_back_from, str) and fell_back_from:
+        metadata["fell_back_from"] = fell_back_from
+    return metadata
 
 
 def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
@@ -4128,6 +4132,10 @@ async def _run_agent_loop(
             if declared_summary_model and summary_result.model != declared_summary_model:
                 raise ContextForkError("summary response model mismatch")
             _bind_router_provider(router, summary_result, config.task_id)
+            fallback_origin = getattr(summary_result, "fell_back_from", None)
+            if isinstance(fallback_origin, str):
+                outcome["fell_back_from"] = fallback_origin
+                outcome["model"] = summary_result.model
             invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
             if invalid_usage_fields:
                 raise ContextForkError("summary usage contains invalid token counts")
@@ -4480,6 +4488,10 @@ async def _run_agent_loop(
                     transcript,
                 )
             _bind_router_provider(router, result, config.task_id)
+            fallback_origin = getattr(result, "fell_back_from", None)
+            if isinstance(fallback_origin, str):
+                outcome["fell_back_from"] = fallback_origin
+                outcome["model"] = result.model
             invalid_usage_fields = _invalid_usage_fields(result.usage)
             if invalid_usage_fields:
                 return _loop_result(

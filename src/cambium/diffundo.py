@@ -96,12 +96,15 @@ from the request shape. The worker bounds transcript growth directly instead.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import math
 import os
 import random
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -248,6 +251,18 @@ _HTTP_403_REFUSAL_MARKERS = (
     "moderation",
     "responsible ai",
     "acceptable use",
+)
+_REAL_DEATH_ENDPOINT_RE = re.compile(
+    r"(?:endpoint\s*(?:is\s*)?unavailable|service\s*unavailable|"
+    r"server[_ -]?error|temporarily\s+unavailable)",
+    re.IGNORECASE,
+)
+_REAL_DEATH_TRANSPORT_RE = re.compile(
+    r"(?:connection\s+refused|name\s+or\s+service\s+not\s+known|"
+    r"temporary\s+failure\s+in\s+name\s+resolution|"
+    r"nodename\s+nor\s+servname|certificate\s+verify\s+failed|"
+    r"tls\s+(?:handshake|error)|ssl\s+(?:error|handshake))",
+    re.IGNORECASE,
 )
 USER_AGENT = f"cambium/{__version__}"
 # Codex-ChatGPT transport identity headers, matching the codex CLI wire shape:
@@ -486,6 +501,7 @@ class CallResult:
     prompt_prefix_tokens_estimate: int | None = None
     provider_cache_hit: bool | None = None
     quota_windows: tuple[dict[str, Any], ...] | None = None
+    fell_back_from: str | None = None
 
 
 class DiffundoError(Exception):
@@ -522,6 +538,7 @@ class ProviderError(DiffundoError):
         request_rate_status: str | None = None,
         account_quota_owner: str | None = None,
         probe_already_in_flight: bool = False,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
@@ -532,9 +549,66 @@ class ProviderError(DiffundoError):
         self.retry_after_s = retry_after_s
         self.request_rate_status = request_rate_status
         self.account_quota_owner = account_quota_owner
+        if http_status is None:
+            match = re.search(r"\bHTTP\s+(\d{3})\b", message, re.IGNORECASE)
+            http_status = int(match.group(1)) if match is not None else None
+        self.http_status = http_status
         # A stale candidate list can race with another HALF_OPEN probe. This
         # rejection is admission control, not provider health evidence.
         self.probe_already_in_flight = probe_already_in_flight
+
+    @property
+    def is_real_death(self) -> bool:
+        """Whether this run has terminal evidence that the endpoint is dead."""
+        status = self.http_status
+        cause: BaseException | None = self.cause
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if status is None:
+                candidate_status = getattr(cause, "status", getattr(cause, "code", None))
+                if type(candidate_status) is int:
+                    status = candidate_status
+            if isinstance(cause, urllib.error.URLError):
+                reason = cause.reason
+                if isinstance(reason, BaseException):
+                    cause = reason
+                    continue
+            cause = cause.__cause__
+        if self.outcome is ProviderOutcome.AUTH_ERROR and status in (401, 403):
+            return True
+        if type(status) is int and 500 <= status <= 599:
+            return True
+        if self.outcome is not ProviderOutcome.ERROR:
+            return False
+        if "malformed response" in self.message.casefold():
+            return False
+        if _REAL_DEATH_ENDPOINT_RE.search(self.message):
+            return True
+        cause = self.cause
+        seen.clear()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if isinstance(cause, ConnectionRefusedError | socket.gaierror | ssl.SSLError):
+                return True
+            if isinstance(cause, OSError) and getattr(cause, "errno", None) in {
+                errno.ECONNREFUSED,
+                errno.ENETUNREACH,
+                errno.EHOSTUNREACH,
+            }:
+                return True
+            if isinstance(cause, urllib.error.URLError):
+                reason = cause.reason
+                if isinstance(reason, BaseException):
+                    cause = reason
+                    continue
+            cause = cause.__cause__
+        return bool(_REAL_DEATH_TRANSPORT_RE.search(self.message))
+
+
+def is_real_death(error: BaseException | None) -> bool:
+    """Return the narrow endpoint-death verdict for a provider failure."""
+    return isinstance(error, ProviderError) and error.is_real_death
 
 
 class CostBudgetExceeded(DiffundoError):
@@ -1494,6 +1568,9 @@ class Diffundo:
                 if provider.name == primary_provider:
                     self._primary_provider = provider.name
                     break
+        self._pinned_provider = self._primary_provider
+        self._fallback_origin: str | None = None
+        self._active_tier: ProviderTier | None = None
         self._call_budget_s = call_budget_s
         if summary_call_budget_s is None:
             self._summary_call_budget_s = max(
@@ -1567,19 +1644,22 @@ class Diffundo:
             or effective_call_budget_s <= 0
         ):
             raise ValueError("call_budget_s must be a finite positive number")
+        routing_model = None if self._fallback_origin is not None else model
         request = self._routing_request(
             prompt,
-            model,
+            routing_model,
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
         )
         deadline = time.monotonic() + float(effective_call_budget_s)
         tried: list[str] = []
         last_error: BaseException | None = None
+        selection_tier = self._active_tier or tier
+        selection_model = None if self._fallback_origin is not None else model
         while True:
             candidates = await self._await_candidates(
-                tier,
-                model,
+                selection_tier,
+                selection_model,
                 deadline,
                 allow_model_substitution=allow_model_substitution,
                 request=request,
@@ -1587,30 +1667,47 @@ class Diffundo:
             if not candidates:
                 raise AllProvidersFailed(tried, last_error)
             probe_rejected = False
-            for provider in candidates:
+            pending = list(candidates)
+            fallback_triggered = False
+            while pending:
+                provider = pending.pop(0)
                 try:
                     result = await self._attempt(provider, prompt, deadline=deadline)
                 except ProviderError as exc:
                     if exc.probe_already_in_flight:
-                        # A concurrent caller owns the HALF_OPEN probe. Do not
-                        # count this stale-candidate rejection as a provider
-                        # failure or make it the terminal cascade error.
                         probe_rejected = True
                         continue
                     tried.append(provider.name)
                     last_error = exc
-                    if exc.budget_exhausted:
+                    if (
+                        self._pinned_provider is not None
+                        and provider.name == self._pinned_provider
+                        and exc.is_real_death
+                    ):
+                        existing = {item.name for item in pending}
+                        if existing:
+                            fallback_triggered = True
+                        fallback_candidates = self._real_death_fallback_candidates(
+                            selection_tier,
+                            request=request,
+                            excluded={*tried, *existing},
+                        )
+                        if fallback_candidates:
+                            pending.extend(fallback_candidates)
+                            fallback_triggered = True
+                    if exc.budget_exhausted and not fallback_triggered:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
-                # The provider that served owns the task's context from here
-                # on (prompt-prefix caching locality).
                 self._primary_provider = provider.name
+                if fallback_triggered:
+                    self._fallback_origin = self._pinned_provider
+                    self._active_tier = provider.tier
+                if self._fallback_origin is not None:
+                    result = replace(result, fell_back_from=self._fallback_origin)
                 return result
             if probe_rejected and not tried:
-                # Let the active probe finish and re-evaluate health rather
-                # than returning an artificial all-providers failure.
                 continue
             raise AllProvidersFailed(tried, last_error)
 
@@ -1751,6 +1848,9 @@ class Diffundo:
 
         self._provider_lease = None
         self._primary_provider = None
+        self._pinned_provider = None
+        self._fallback_origin = None
+        self._active_tier = None
 
     def _routing_request(
         self,
@@ -1888,6 +1988,35 @@ class Diffundo:
             now=time.time(),
         )
         return cast(list[ProviderConfig], ordered)
+
+    def _real_death_fallback_candidates(
+        self,
+        tier: ProviderTier,
+        *,
+        request: Any,
+        excluded: set[str],
+    ) -> list[ProviderConfig]:
+        """Return enabled substitutes, same tier first, then other tiers."""
+        tiers = [tier, *(candidate for candidate in ProviderTier if candidate is not tier)]
+        result: list[ProviderConfig] = []
+        seen = set(excluded)
+        candidate_request = request
+        if request is not None:
+            try:
+                candidate_request = replace(
+                    request, model="", allow_model_substitution=True
+                )
+            except TypeError:
+                candidate_request = request
+        for candidate_tier in tiers:
+            for provider in self._candidates_unleased(
+                candidate_tier, None, request=candidate_request
+            ):
+                if provider.name in seen:
+                    continue
+                seen.add(provider.name)
+                result.append(provider)
+        return result
 
     async def _await_candidates(
         self,

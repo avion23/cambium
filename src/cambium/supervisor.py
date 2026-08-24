@@ -1377,12 +1377,16 @@ def _redacted_provider_metadata(value: Any) -> dict[str, Any] | None:
         for key, count in usage.items()
         if key in _PROVIDER_METADATA_USAGE_FIELDS and _valid_usage_count(count)
     }
-    return {
+    metadata = {
         "provider": provider,
         "model": model,
         "usage": usage_counts,
         "latency_s": max(0.0, float(latency)),
     }
+    fell_back_from = value.get("fell_back_from")
+    if isinstance(fell_back_from, str) and fell_back_from:
+        metadata["fell_back_from"] = fell_back_from
+    return metadata
 
 
 def _strip_sensitive_env(
@@ -1456,6 +1460,8 @@ class TaskResult:
     merge_sha: str | None = None
     restarts: int = 0
     summary: str | None = None
+    provider: str | None = None
+    fell_back_from: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2270,7 +2276,25 @@ class _Runtime:
             await asyncio.to_thread(self._conversations.close)
 
     def plan_result(self) -> PlanResult:
-        return PlanResult(results=tuple(self._results.values()))
+        results: list[TaskResult] = []
+        for task_id, result in self._results.items():
+            envelope = self._task_envelopes.get(task_id)
+            metadata = envelope.get("provider_metadata") if isinstance(envelope, dict) else None
+            if isinstance(metadata, dict):
+                provider = metadata.get("provider")
+                fell_back_from = metadata.get("fell_back_from")
+                if isinstance(provider, str) or isinstance(fell_back_from, str):
+                    result = replace(
+                        result,
+                        provider=provider if isinstance(provider, str) else result.provider,
+                        fell_back_from=(
+                            fell_back_from
+                            if isinstance(fell_back_from, str)
+                            else result.fell_back_from
+                        ),
+                    )
+            results.append(result)
+        return PlanResult(results=tuple(results))
 
     # -- git plumbing (off the loop) -----------------------------------------
 
@@ -7195,12 +7219,20 @@ def _build_session_result(
             status = "done"
         failure_reason = None if status == "done" else _aggregate_reason(results)
         envelope = None
+    provider: str | None = None
+    fell_back_from: str | None = None
     if envelope is not None:
         commits = envelope.get("commits", ())
         files_changed = envelope.get("files_changed", ())
         unified_diff = envelope.get("diff", "")
         diff_truncated = envelope.get("diff_truncated", False)
         summary = envelope.get("summary", "")
+        metadata = envelope.get("provider_metadata")
+        if isinstance(metadata, dict):
+            raw_provider = metadata.get("provider")
+            raw_origin = metadata.get("fell_back_from")
+            provider = raw_provider if isinstance(raw_provider, str) else None
+            fell_back_from = raw_origin if isinstance(raw_origin, str) else None
     else:
         commits = ()
         files_changed = ()
@@ -7223,6 +7255,8 @@ def _build_session_result(
         started_at=started_at,
         ended_at=ended_at,
         failure_reason=failure_reason,
+        provider=provider,
+        fell_back_from=fell_back_from,
     )
 
 

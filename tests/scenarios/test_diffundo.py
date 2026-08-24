@@ -302,6 +302,75 @@ def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> No
         good.close()
 
 
+def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin(monkeypatch) -> None:
+    pinned = FakeServer([(503, _error_payload("Endpoint is unavailable"), 0.0)])
+    same_tier = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
+    other_tier = FakeServer([(200, _ok_payload("must not be reached", model="m-strong"), 0.0)])
+    _set_keys(monkeypatch, "K_PINNED_DEAD", "K_SIBLING", "K_STRONG")
+    router = Diffundo(
+        (
+            _config("p_pinned", pinned, "K_PINNED_DEAD", model="m-pinned"),
+            _config("p_sibling", same_tier, "K_SIBLING", model="m-sibling"),
+            _config("p_strong", other_tier, "K_STRONG", tier=ProviderTier.STRONG, model="m-strong"),
+        ),
+        primary_provider="p_pinned",
+        pause_timeout_s=0.01,
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        assert result.provider == "p_sibling"
+        assert result.fell_back_from == "p_pinned"
+        assert len(pinned.calls) == 1
+        assert len(same_tier.calls) == 1
+        assert other_tier.calls == []
+    finally:
+        pinned.close()
+        same_tier.close()
+        other_tier.close()
+
+
+def test_pinned_429_retry_after_does_not_trigger_fallback(monkeypatch) -> None:
+    limited = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
+    sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
+    _set_keys(monkeypatch, "K_LIMITED_PIN", "K_429_SIBLING")
+    router = Diffundo(
+        (
+            _config("p_limited", limited, "K_LIMITED_PIN", model="m-pinned"),
+            _config("p_sibling", sibling, "K_429_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_limited",
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.retry_after_s == 60.0
+        assert error.is_real_death is False
+        assert sibling.calls == []
+    finally:
+        limited.close()
+        sibling.close()
+
+
+def test_pinned_endpoint_death_without_alternative_remains_fatal(monkeypatch) -> None:
+    dead = FakeServer([(503, _error_payload("server_error"), 0.0)])
+    _set_keys(monkeypatch, "K_ONLY_PIN")
+    router = Diffundo(
+        (_config("p_only", dead, "K_ONLY_PIN", model="m-pinned"),),
+        primary_provider="p_only",
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        assert raised.value.providers_tried == ("p_only",)
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.is_real_death is True
+    finally:
+        dead.close()
+
+
 # --------------------------------------------------------------------------- #
 # 2. tier filtering + model pin
 # --------------------------------------------------------------------------- #

@@ -5,7 +5,7 @@ boundaries explicit:
 
 * :func:`wire_to_child_result` creates the strict nine-key message that can
   travel from a child to its parent.
-* :class:`Result` is the fifteen-field, root/session-level record.  Only a
+* :class:`Result` is the seventeen-field, root/session-level record.  Only a
   :class:`Result` can cross the JSON file boundary.
 
 The functions in this module are deterministic apart from the optional
@@ -48,6 +48,8 @@ ROOT_RESULT_KEYS: tuple[str, ...] = (
     "unified_diff",
     "diff_truncated",
     "summary",
+    "provider",
+    "fell_back_from",
     "metric_score",
     "metric_breakdown",
     "parent_task_id",
@@ -579,7 +581,7 @@ def _final_sequence(value: Any) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class Result:
-    """The canonical fifteen-field root/session result.
+    """The canonical seventeen-field root/session result.
 
     This is intentionally separate from ``TaskResult``, worker outcomes, and
     event records.  Its constructor enforces the root invariants so a caller
@@ -601,6 +603,8 @@ class Result:
     started_at: float
     ended_at: float
     failure_reason: str | None
+    provider: str | None = None
+    fell_back_from: str | None = None
 
     def __post_init__(self) -> None:
         status = _token(self.status)
@@ -626,6 +630,12 @@ class Result:
             raise TypeError("summary must be a string")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise TypeError("failure_reason must be a string or None")
+        for field_name, value in (
+            ("provider", self.provider),
+            ("fell_back_from", self.fell_back_from),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string or None")
         if status == "done" and self.failure_reason is not None:
             raise ValueError("done results must not have a failure_reason")
         if not isinstance(self.diff_truncated, bool):
@@ -696,6 +706,8 @@ def _root_from_child(
     started_at: float | None,
     ended_at: float | None,
     failure_reason: str | None,
+    provider: str | None = None,
+    fell_back_from: str | None = None,
 ) -> Result:
     if not isinstance(child, Mapping):
         raise TypeError("child result must be a mapping")
@@ -728,6 +740,8 @@ def _root_from_child(
         failure_reason=(
             failure_reason if failure_reason is not None else _failure_reason(child, status)
         ),
+        provider=provider,
+        fell_back_from=fell_back_from,
     )
 
 
@@ -746,6 +760,11 @@ def root_result_from_wire(
     started = started_at if started_at is not None else _wire_value(wire, "started_at")
     ended = ended_at if ended_at is not None else _wire_value(wire, "ended_at")
     status = child["status"]
+    metadata = wire.get("provider_metadata")
+    if not isinstance(metadata, Mapping):
+        metadata = wire
+    provider = metadata.get("provider")
+    fell_back_from = metadata.get("fell_back_from")
     return _root_from_child(
         child,
         session_dir=session_dir,
@@ -753,6 +772,8 @@ def root_result_from_wire(
         started_at=started,
         ended_at=ended,
         failure_reason=_failure_reason(wire, status),
+        provider=provider if isinstance(provider, str) else None,
+        fell_back_from=fell_back_from if isinstance(fell_back_from, str) else None,
     )
 
 

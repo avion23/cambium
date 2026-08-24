@@ -43,6 +43,8 @@ _SUPERVISOR_RESULT_FIELDS = frozenset(
         "worker_status",
         "timed_out",
         "timeout_phase",
+        "provider",
+        "fell_back_from",
         "results",
     }
 )
