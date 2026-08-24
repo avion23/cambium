@@ -147,6 +147,7 @@ def _config(
     max_retries: int = 0,
     timeout_s: float = 0.2,
     cooldown_s: float = 1.0,
+    rpm: int = 600,
     quota_windows: tuple[QuotaWindowSpec, ...] = (),
 ) -> ProviderConfig:
     return ProviderConfig(
@@ -156,7 +157,7 @@ def _config(
         api_key_env=env_name,
         timeout_s=timeout_s,
         max_retries=max_retries,
-        rpm=600,
+        rpm=rpm,
         enabled=True,
         model="storm-model",
         cooldown_s=cooldown_s,
@@ -423,3 +424,48 @@ def test_mixed_storm_policy_refusal_is_terminal_but_health_neutral(monkeypatch, 
         assert all(request == server.requests[0] for request in server.requests)
     finally:
         server.close()
+
+
+def test_terminal_dead_lane_does_not_starve_optimizer_style_burst(monkeypatch) -> None:
+    """A dead incumbent is not retried ahead of a healthy burst lane."""
+    dead = _StormServer([_Behavior(503, _error_payload("endpoint unavailable"))])
+    healthy = _StormServer([_Behavior(200, _ok_payload("healthy"))])
+    _set_key(monkeypatch, "K_BURST_DEAD")
+    _set_key(monkeypatch, "K_BURST_HEALTHY")
+    dead_provider = _config(
+        "burst-dead",
+        dead,
+        "K_BURST_DEAD",
+        cooldown_s=0.0,
+        rpm=3,
+    )
+    healthy_provider = _config("burst-healthy", healthy, "K_BURST_HEALTHY", rpm=60)
+    router = Diffundo(
+        (dead_provider, healthy_provider),
+        primary_provider="burst-dead",
+        pause_timeout_s=0.0,
+        call_budget_s=2.0,
+    )
+    try:
+        async def run_burst() -> list[str]:
+            first = await router.call(ProviderTier.FAST, PROMPT)
+            assert first.provider == "burst-healthy"
+
+            # The captured production failure had a dead sticky incumbent. A
+            # zero cooldown keeps this probe on the live candidate path while
+            # the small dead bucket makes repeated probes observable.
+            router._primary_provider = "burst-dead"
+            names = [first.provider]
+            for _ in range(23):
+                result = await router.call(ProviderTier.FAST, PROMPT)
+                names.append(result.provider)
+            return names
+
+        names = asyncio.run(run_burst())
+        assert names == ["burst-healthy"] * 24
+        assert len(dead.requests) == 1
+        assert len(healthy.requests) == 24
+        assert router.status("burst-healthy") is ProviderStatus.AVAILABLE
+    finally:
+        dead.close()
+        healthy.close()
