@@ -1,7 +1,7 @@
 # First real trajectory extraction
 
 **Run date:** 2026-08-24 UTC
-**Status:** final pool review complete: 34 approved training records (24 train, 10 val); 2 prior approvals and 32 pi candidates retained; all 21 OpenCode candidates were collapsed or rejected. GEPA/bootstrap optimization was intentionally not run.
+**Status:** final pool review and small-candidate review complete: 34 approved training records (24 train, 10 val), plus 23 manually labelled boundary approvals; 2 prior approvals and 32 pi candidates retained; all 21 OpenCode candidates were collapsed or rejected. GEPA/bootstrap optimization was intentionally not run.
 
 ## Source discovery
 
@@ -184,3 +184,159 @@ PYTHONPATH=src python -m cambium optimize stats \
 It reported 34 records, schema version 1, dataset version 1.2.0, and the
 24/10 train/val split. A separate envelope, provenance, normalized-task,
 redaction, and reference-engine consistency check passed with 34/34 records.
+
+## Small-candidate review manifest
+
+**Review date:** 2026-08-24 UTC
+**Reviewer:** manual task-level review after the strengthened redaction pass
+
+The boundary file was reviewed record-by-record. A label was admitted only
+when the complete task supported a defensible task-level judgment: multiple
+separable deliverables are `decompose: true`; one bounded/coherent audit,
+fix, design, or finalization task is `false`. Truncated prompts,
+feedback-only/meta prompts, and duplicate payloads were not admitted. The
+OpenCode files were also reviewed record-by-record; they duplicate the
+committed redacted transcript baseline except for one result-only fragment.
+
+| source | input | accepted | rejected (non-duplicate) | duplicate/collapsed |
+| --- | ---: | ---: | ---: | ---: |
+| `candidates-boundary.jsonl` | 50 | 23 (4 true, 19 false) | 24 (21 truncated, 3 meta/unlabelable) | 3 |
+| `candidates-opencode-opencode.jsonl` | 7 | 0 | 0 | 7 |
+| `candidates-opencode-opencode-dev.jsonl` | 14 | 0 | 1 | 13 |
+| **small output** | **71** | **23** | **25** | **23** |
+
+The output `accepted-boundary-opencode.jsonl` contains the 23 admitted
+boundary records. No OpenCode record was copied: all seven `opencode` rows
+and thirteen `opencode-dev` rows collapse to existing committed redacted
+baseline candidates, while the remaining `opencode-dev` row is a result-only
+fragment. Exact canonical `(task, context)` dedupe against approved
+`train_queue_v2.jsonl` records found no boundary collision; the keyword-dense
+OpenCode rollout is also a near-duplicate of approved record
+`should_decompose-transcript-959f370dbe690ab8`.
+
+### Boundary verdicts
+
+| candidate | verdict | label/confidence | reason |
+| --- | --- | --- | --- |
+| `should_decompose-boundary-pi-03afffb29b1a5aaa` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-106baf33cb71f7b6` | approve | `do_not_decompose` / 0.88 | single bounded read-only audit; the checked categories are evidence for one review |
+| `should_decompose-boundary-pi-1459bf9d55ec03ba` | approve | `decompose` / 0.86 | host replacement, cross-host benchmarking, and disk-image feasibility are separable operational workstreams |
+| `should_decompose-boundary-pi-190931e7b09fbc7f` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-1a769ea3aa1417eb` | approve | `do_not_decompose` / 0.97 | single minimal compile-error fix with a constrained file scope |
+| `should_decompose-boundary-pi-2163818404b7e6ef` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-23b34e2fc7ba1138` | approve | `do_not_decompose` / 0.97 | single one-line deduplication fix plus validation |
+| `should_decompose-boundary-pi-243b1fd1805311c5` | approve | `do_not_decompose` / 0.72 | one compatibility check/documentation task for a single backtest mode interaction |
+| `should_decompose-boundary-pi-25beb50236b463ba` | approve | `decompose` / 0.82 | algorithm switch, benchmark cleanup, memory-policy review, and alternative comparison are distinct tuning asks |
+| `should_decompose-boundary-pi-33e215b756a1ac99` | approve | `do_not_decompose` / 0.82 | one ownership/recycling design audit with one proposed RAII slice |
+| `should_decompose-boundary-pi-3e3458f1b9e9e37c` | approve | `decompose` / 0.78 | provider-selection investigation and repository cleanup are unrelated requested actions |
+| `should_decompose-boundary-pi-3ead7cb9a4036b64` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-3f4c9a36ad1c75f6` | approve | `do_not_decompose` / 0.82 | one bounded model-v6/config audit with a conditional narrow fix |
+| `should_decompose-boundary-pi-447146aa182d8b56` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-483a0c0fa977a524` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-4b8456a9bae0b46b` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-4edf380e2454c6fc` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-4f93d68fa0277d23` | approve | `do_not_decompose` / 0.76 | one cost-reduction investigation centered on host state and resource usage |
+| `should_decompose-boundary-pi-5b420daefc89bc33` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-5bf929b6a720539d` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-5d70cefb6e700340` | approve | `do_not_decompose` / 0.86 | one read-only implementation-diff review |
+| `should_decompose-boundary-pi-600a4426a7faaff3` | approve | `do_not_decompose` / 0.90 | one known-failure diagnosis/fix and its focused validation |
+| `should_decompose-boundary-pi-63e6bfe3859ecc2a` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-6973420232dd7c82` | approve | `do_not_decompose` / 0.84 | one semantic episode-ID consistency fix across related initializers |
+| `should_decompose-boundary-pi-6bf649ab4972cb75` | approve | `decompose` / 0.82 | ingestor contract audit and Kalman-interface redesign are separate analysis workstreams |
+| `should_decompose-boundary-pi-76b189e682062e45` | approve | `do_not_decompose` / 0.88 | one pytest collection-performance diagnosis |
+| `should_decompose-boundary-pi-7f3417f1090eab00` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-82e1e0230e7c88e9` | approve | `do_not_decompose` / 0.90 | one remote validation/test-run operation |
+| `should_decompose-boundary-pi-8551b34636b0857c` | approve | `do_not_decompose` / 0.80 | one observability-export design with coupled metrics and acceptance criteria |
+| `should_decompose-boundary-pi-85a3e78ae6da6868` | reject | — | open-ended optimization/orchestration prompt; no bounded task boundary is stated |
+| `should_decompose-boundary-pi-898e44f922fd6e38` | approve | `do_not_decompose` / 0.86 | one source-only anchor integration/finalization task |
+| `should_decompose-boundary-pi-8b2b464fbfb36bd6` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-8b82901726aeea67` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-9ab970c496cf5ed2` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-9ea991855d2a904a` | approve | `do_not_decompose` / 0.84 | one warning-cleanup pass confined to one strategy subsystem |
+| `should_decompose-boundary-pi-b41415a38b08916a` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-bbef5ed28af94383` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-bf3def673592d268` | collapse | — | near-duplicate of the complete known-failure task retained as should_decompose-boundary-pi-600a4426a7faaff3 |
+| `should_decompose-boundary-pi-c11a91cfe0e99863` | approve | `do_not_decompose` / 0.88 | one scoped assertion/verification finalization task |
+| `should_decompose-boundary-pi-c6eb0b264b093540` | approve | `do_not_decompose` / 0.90 | one history-curation operation |
+| `should_decompose-boundary-pi-cccf3f53b855f722` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-dbebe0ae04bcfcf0` | reject | — | feedback-only/meta prompt with no actionable task to label |
+| `should_decompose-boundary-pi-df654b201b290977` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-dfbdea6da4760aef` | approve | `do_not_decompose` / 0.80 | one system-memory tuning/health comparison |
+| `should_decompose-boundary-pi-e8bb0d78fb678f12` | reject | — | meta/orchestration prompt rather than a domain task |
+| `should_decompose-boundary-pi-ea994115d17d002a` | collapse | — | near-duplicate finalization of the source-only anchor task retained as should_decompose-boundary-pi-898e44f922fd6e38 |
+| `should_decompose-boundary-pi-eb1b253551750ea6` | collapse | — | near-duplicate of the read-only allocation audit retained as should_decompose-boundary-pi-106baf33cb71f7b6 |
+| `should_decompose-boundary-pi-f4b87be915341362` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+| `should_decompose-boundary-pi-f9725f5a715b8b3b` | approve | `do_not_decompose` / 0.92 | one fee-calculation investigation/fix explicitly constrained to that issue |
+| `should_decompose-boundary-pi-fdaf3c478172099f` | reject | — | task is truncated; the missing tail prevents a defensible task-level label |
+
+Notable boundary judgments: the host migration/benchmark/feasibility prompt,
+the compression-and-memory tuning prompt, the provider-selection plus repo
+cleanup prompt, and the ingestor-plus-Kalman interface prompt were the four
+admitted positive labels. Long Rust lifecycle/config audits, test runs,
+history cleanup, and one-feature source changes stayed `do_not_decompose`;
+surface area and observed session size were not treated as task-level
+workstreams.
+
+### OpenCode verdicts
+
+| candidate | verdict | reason |
+| --- | --- | --- |
+| `should_decompose-transcript-0b58b32bf5438585` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-381dc7c64cfea43e` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-46892a95d789a20f` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-604a91aa316701c8` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-83a70c24607eb80a` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-9cf8983055b3f5c0` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-e3c851c65dac2727` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-01f526d8920748bd` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-127fdfeb64668cf4` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-15dd2612b159ecd5` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-3d736a43599c941a` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-4750573baa058df2` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-544962bed7001d71` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-5b24a2950b9edf91` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-5eba9cde59c25f63` | reject | result-only fragment; no actionable task |
+| `should_decompose-transcript-67d10ea10066c9b3` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-6a2502962dd30234` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-8060da8a4ab8b06c` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-85d53eedc33635be` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-95a7f468445b205c` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+| `should_decompose-transcript-b7ecd4776e83c279` | collapse | duplicate of the committed redacted transcript candidate/baseline |
+
+### Old weak-redaction pi spot-check
+
+The old `candidates-pi.jsonl` file was not an admission source. A
+deterministic 20-record spot-check used seed `20260824`; each sampled
+record matched a strengthened-redaction-era `candidates-pi-v2.jsonl` row by
+session/message provenance. Four retained the same ID and sixteen were
+regenerated IDs. All 20 labels remained `decompose: true`; zero verdicts
+changed. One sampled row was already in `train_queue_v2.jsonl`. No old-pi
+record was added to the output.
+
+| old candidate | strengthened-redaction v2 candidate | verdict |
+| --- | --- | --- |
+| `should_decompose-pi-938fa9114cc8b4ea` | `should_decompose-pi-bb60838e46b749c5` | unchanged `decompose: true` |
+| `should_decompose-pi-6a60d04cbf415472` | `should_decompose-pi-50d866ad8f43c278` | unchanged `decompose: true` |
+| `should_decompose-pi-e1c2ef9d856c4278` | `should_decompose-pi-d88fb3c27dca0308` | unchanged `decompose: true` |
+| `should_decompose-pi-092bd823e182593f` | `should_decompose-pi-7fcee73fb7adec95` | unchanged `decompose: true` |
+| `should_decompose-pi-7f0f7b0f61f9cf3a` | `should_decompose-pi-7f0f7b0f61f9cf3a` | unchanged `decompose: true` |
+| `should_decompose-pi-214ef0a6ef0c7ad6` | `should_decompose-pi-ae55a97472f57344` | unchanged `decompose: true` |
+| `should_decompose-pi-92edb61eb018718e` | `should_decompose-pi-92edb61eb018718e` | unchanged `decompose: true` |
+| `should_decompose-pi-a1d766a1253ef412` | `should_decompose-pi-5514ff0e9d06e2ff` | unchanged `decompose: true` |
+| `should_decompose-pi-0792eed8204361f3` | `should_decompose-pi-39d3aac9d79e7dd2` | unchanged `decompose: true` |
+| `should_decompose-pi-c0609c93af154682` | `should_decompose-pi-9c5c7c45a9e163bd` | unchanged `decompose: true` |
+| `should_decompose-pi-e8d94c2184b33d45` | `should_decompose-pi-ab9a564aa987c3e0` | unchanged `decompose: true` |
+| `should_decompose-pi-3fc621ba2eda0078` | `should_decompose-pi-8cfe60876728763b` | unchanged `decompose: true` |
+| `should_decompose-pi-8ab71bfe8a247b3f` | `should_decompose-pi-8ab71bfe8a247b3f` | unchanged `decompose: true` |
+| `should_decompose-pi-93a7f4916e7286c0` | `should_decompose-pi-3a191c187609372b` | unchanged `decompose: true` |
+| `should_decompose-pi-491637cd825c20a9` | `should_decompose-pi-8dc365540868dc61` | unchanged `decompose: true` |
+| `should_decompose-pi-12b9ce3c02b0a8f8` | `should_decompose-pi-bbea533680bfc1d7` | unchanged `decompose: true` |
+| `should_decompose-pi-c6a7c701153014cf` | `should_decompose-pi-0062ddcc59bee069` | unchanged `decompose: true` |
+| `should_decompose-pi-69256d7fa3005f20` | `should_decompose-pi-da3e06eaa199b37e` | unchanged `decompose: true` |
+| `should_decompose-pi-97878ce26efa6a8a` | `should_decompose-pi-97878ce26efa6a8a` | unchanged `decompose: true` |
+| `should_decompose-pi-97ca2f8d31bf4870` | `should_decompose-pi-a14325ea02602bdb` | unchanged `decompose: true` |
+
+The final all-string redaction sweep over the accepted artifact and this
+manifest found zero known-token, private-key, credential-assignment, email,
+home-path, or truncation-marker matches. No key material is reproduced in
+this manifest.
