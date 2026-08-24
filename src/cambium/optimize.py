@@ -874,6 +874,131 @@ def run_stage_bootstrap(program, train_examples, val_examples, seed=0) -> tuple[
     }
 
 
+_GEPA_MIN_DATASET_SIZE = 4
+_GEPA_VAL_FRACTION = 0.3
+
+
+def _gepa_metric_call_budget(
+    train_examples: Iterable[Example],
+    val_examples: Iterable[Example],
+    *,
+    budget_usd: float | None,
+    ledger: _CostLedger | None,
+) -> int:
+    """Translate the dollar budget into GEPA's metric-call budget."""
+    if ledger is not None:
+        remaining_usd = ledger.remaining_usd
+    elif budget_usd is not None:
+        remaining_usd = budget_usd
+    else:
+        remaining_usd = None
+
+    if remaining_usd is None:
+        return max(1, len(list(train_examples)) + len(list(val_examples)))
+    if remaining_usd < _MIN_CALL_BUDGET_USD:
+        if ledger is not None:
+            ledger.check_available()
+        raise _BudgetExhausted(
+            f"optimization budget exhausted: only ${remaining_usd:.6f} remains for GEPA "
+            f"(minimum provider call is ${_MIN_CALL_BUDGET_USD:.2f})"
+        )
+    return max(1, math.floor(remaining_usd / _MIN_CALL_BUDGET_USD))
+
+
+def _gepa_report_details(compiled: object) -> dict[str, int]:
+    """Extract optional GEPA run counters without depending on one version."""
+    details = getattr(compiled, "detailed_results", None)
+    if details is None:
+        return {}
+    report: dict[str, int] = {}
+    total_calls = getattr(details, "total_metric_calls", None)
+    if isinstance(total_calls, int) and not isinstance(total_calls, bool) and total_calls >= 0:
+        report["calls"] = total_calls
+    candidates = getattr(details, "candidates", None)
+    if isinstance(candidates, list) and candidates:
+        report["iterations"] = max(0, len(candidates) - 1)
+    full_evals = getattr(details, "num_full_val_evals", None)
+    if isinstance(full_evals, int) and not isinstance(full_evals, bool) and full_evals >= 0:
+        report["full_evals"] = full_evals
+    return report
+
+
+def run_stage_gepa(
+    program,
+    train_examples,
+    val_examples,
+    seed=0,
+    *,
+    budget_usd: float | None = None,
+    ledger: _CostLedger | None = None,
+    reflection_lm: object | None = None,
+) -> tuple[object, dict]:
+    """Reflectively optimize a DSPy program with a deterministic held-out set."""
+    train_examples = list(train_examples)
+    val_examples = list(val_examples)
+    if len(train_examples) + len(val_examples) < _GEPA_MIN_DATASET_SIZE:
+        raise OptimizeError(
+            "GEPA requires more reviewed data: at least 4 non-canary records are "
+            "required for a train/validation split"
+        )
+    if not train_examples or not val_examples:
+        raise OptimizeError(
+            "GEPA requires more reviewed data: both train and held-out validation "
+            "records are required"
+        )
+
+    _ensure_bootstrap_forward(program)
+    if reflection_lm is None:
+        reflection_lm = getattr(program, "_lm", None)
+    if reflection_lm is None or not callable(reflection_lm):
+        raise OptimizeError(
+            "GEPA requires a reflection LM; the program must expose the "
+            "Diffundo-backed CambiumLM"
+        )
+    gepa_class = getattr(dspy, "GEPA", None)
+    if not callable(gepa_class):
+        raise OptimizeError("installed DSPy does not expose dspy.GEPA")
+
+    max_metric_calls = _gepa_metric_call_budget(
+        train_examples,
+        val_examples,
+        budget_usd=budget_usd,
+        ledger=ledger,
+    )
+    try:
+        optimizer = gepa_class(
+            metric=make_dspy_metric(program),
+            max_metric_calls=max_metric_calls,
+            reflection_lm=reflection_lm,
+            seed=seed,
+            track_stats=True,
+        )
+    except _BudgetExhausted:
+        raise
+    except (DiffundoError, DSPyError, AssertionError, TypeError, ValueError) as exc:
+        raise OptimizeError(f"could not create GEPA: {exc}") from exc
+
+    trainset = [_to_dspy_example(example, program) for example in train_examples]
+    valset = [_to_dspy_example(example, program) for example in val_examples]
+    try:
+        compiled = optimizer.compile(program, trainset=trainset, valset=valset)
+    except _BudgetExhausted:
+        raise
+    except (DiffundoError, DSPyError, AssertionError, RuntimeError, TypeError, ValueError) as exc:
+        raise OptimizeError(f"GEPA compilation failed: {exc}") from exc
+
+    if compiled is None:
+        raise OptimizeError("GEPA returned no compiled program")
+    eval_score = score_split(compiled, val_examples)
+    train_score = score_split(compiled, train_examples)
+    report = {
+        "eval_mean": eval_score["mean"],
+        "train_mean": train_score["mean"],
+    }
+    report.update(_gepa_report_details(compiled))
+    return compiled, report
+
+
 def _atomic_json_write(path: Path, value: object) -> None:
     temporary_path: Path | None = None
     try:
@@ -1139,7 +1264,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the Cambium DSPy optimizer spike.",
     )
     parser.add_argument("module_name")
-    parser.add_argument("--optimizer", choices=("zero", "bootstrap"), default="zero")
+    parser.add_argument("--optimizer", choices=("zero", "bootstrap", "gepa"), default="zero")
     parser.add_argument("--budget-usd", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tier", default="fast")
@@ -1167,6 +1292,7 @@ def _partial_report(
     baseline_means: dict[str, float] | None = None,
     stage_zero: dict | None = None,
     stage_bootstrap: dict | None = None,
+    stage_gepa: dict | None = None,
     final: dict | None = None,
     canaries: dict | None = None,
     budget_exhausted: bool = False,
@@ -1182,6 +1308,7 @@ def _partial_report(
         "baseline": baseline_means,
         "stage_zero": stage_zero,
         "stage_bootstrap": stage_bootstrap,
+        "stage_gepa": stage_gepa,
         "final": final,
         "canaries": canaries,
         "budget_exhausted": budget_exhausted,
@@ -1244,6 +1371,7 @@ def _run(argv=None) -> int:
     baseline_means: dict[str, float] | None = None
     stage_zero: dict | None = None
     stage_bootstrap: dict | None = None
+    stage_gepa: dict | None = None
     final: dict | None = None
     canaries: dict | None = None
     transcript_candidates: dict[str, int] | None = None
@@ -1264,7 +1392,19 @@ def _run(argv=None) -> int:
         baseline_means = _baseline_means(manifest)
         lm = _construct_lm(args.tier, args.budget_usd, ledger)
         program = program_class(lm)
-        train_examples, val_examples = build_trainsets(loader, seed=args.seed)
+        if args.optimizer == "gepa":
+            train_examples, val_examples = build_trainsets(
+                loader,
+                seed=args.seed,
+                val_fraction=_GEPA_VAL_FRACTION,
+            )
+            if len(train_examples) + len(val_examples) < _GEPA_MIN_DATASET_SIZE:
+                raise OptimizeError(
+                    "GEPA requires more reviewed data: at least 4 non-canary records "
+                    "are required for a train/validation split"
+                )
+        else:
+            train_examples, val_examples = build_trainsets(loader, seed=args.seed)
         if use_transcript_candidates:
             frozen_examples = [
                 *train_examples,
@@ -1293,6 +1433,17 @@ def _run(argv=None) -> int:
                 seed=args.seed,
             )
             final = stage_bootstrap
+        elif args.optimizer == "gepa":
+            program, stage_gepa = run_stage_gepa(
+                program,
+                train_examples,
+                val_examples,
+                seed=args.seed,
+                budget_usd=args.budget_usd,
+                ledger=ledger,
+                reflection_lm=lm,
+            )
+            final = stage_gepa
         canaries = score_split(program, _load_split(loader, "CANARIES"))
         gate_passed = (
             ledger.spent_usd <= ledger.budget_usd
@@ -1308,6 +1459,7 @@ def _run(argv=None) -> int:
             baseline_means=baseline_means,
             stage_zero=stage_zero,
             stage_bootstrap=stage_bootstrap,
+            stage_gepa=stage_gepa,
             final=final,
             canaries=canaries,
             transcript_candidates=transcript_candidates,
@@ -1340,6 +1492,7 @@ def _run(argv=None) -> int:
                 baseline_means=baseline_means,
                 stage_zero=stage_zero,
                 stage_bootstrap=stage_bootstrap,
+                stage_gepa=stage_gepa,
                 final=final,
                 canaries=canaries,
                 budget_exhausted=True,
