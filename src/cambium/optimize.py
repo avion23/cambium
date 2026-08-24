@@ -1422,7 +1422,15 @@ def _eval_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("module_name", metavar="MODULE")
     parser.add_argument("--dataset", type=Path, required=True, metavar="PATH")
-    parser.add_argument("--program-dir", type=Path, metavar="PATH")
+    parser.add_argument(
+        "--program-dir",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "load optimized program state from PATH; if omitted, auto-loads "
+            "optimized/<MODULE> when present"
+        ),
+    )
     parser.add_argument("--budget-usd", type=float, default=2.0)
     parser.add_argument("--tier", default="fast")
     parser.add_argument("--json", action="store_true", help="emit one JSON report")

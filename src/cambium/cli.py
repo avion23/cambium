@@ -506,7 +506,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     optimize_command.add_argument("module_name", metavar="MODULE|extract|stats|eval")
     optimize_command.add_argument("source", nargs="?", type=Path, metavar="PATH")
-    optimize_command.add_argument("--optimizer", choices=("zero", "bootstrap"), default="zero")
+    optimize_command.add_argument(
+        "--optimizer", choices=("zero", "bootstrap", "gepa"), default="zero"
+    )
     optimize_command.add_argument("--budget-usd", type=float, default=2.0)
     optimize_command.add_argument("--seed", type=int, default=0)
     optimize_command.add_argument("--tier", default="fast")
@@ -587,7 +589,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--program-dir",
         type=Path,
         metavar="PATH",
-        help="optimized program directory for optimize eval",
+        help=(
+            "optimized program directory for optimize eval; if omitted, "
+            "auto-loads optimized/<MODULE> when present"
+        ),
     )
     optimize_command.add_argument(
         "--json",
