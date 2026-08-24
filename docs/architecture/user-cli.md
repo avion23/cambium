@@ -46,15 +46,22 @@ persisted `plan.json`.
 ## DSPy
 
 ```sh
-cambium optimize MODULE [--optimizer zero|bootstrap]
+cambium optimize MODULE [--optimizer zero|bootstrap|gepa]
                         [--budget-usd N] [--seed N] [--tier TIER]
                         [--dry-run]
                         [--include-transcript-candidates |
                          --transcript-candidates PATH]
+
+cambium optimize eval MODULE --dataset PATH
+                        [--program-dir PATH] [--budget-usd N]
+                        [--tier TIER] [--json]
 ```
 
 Transcript candidates must pass the explicit approval/redaction gate described
-in `optimization.md`.
+in `optimization.md`. The `eval` form evaluates every dataset split; without
+`--program-dir`, it checks `optimized/<MODULE>/program.json` and otherwise
+uses a fresh program. Its JSON report shape is documented in
+[`optimization.md`](optimization.md).
 
 ## Authentication
 

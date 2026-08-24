@@ -21,6 +21,61 @@ optimized/<module>/
 
 A failed gate does not become a runtime default.
 
+## Program evaluation
+
+Evaluate a module's fresh or saved DSPy program against all three reviewed
+splits:
+
+```sh
+uv run cambium optimize eval should_review \
+  --dataset /path/to/reviewed-dataset \
+  --json
+```
+
+`MODULE` and `--dataset PATH` are required. `--program-dir PATH` explicitly
+loads `program.json` from that artifact directory. When it is omitted, the
+command checks `optimized/<MODULE>/program.json` in the current directory and
+uses a fresh program when that state is absent. `--budget-usd` defaults to
+`2.0`, `--tier` defaults to `fast`, and `--json` emits one JSON object with
+this shape:
+
+```json
+{
+  "module": "should_review",
+  "program": "fresh",
+  "dataset": "/path/to/reviewed-dataset",
+  "splits": {
+    "train": {
+      "mean": 1.0,
+      "std": 0.0,
+      "count": 40,
+      "records": [{"index": 0, "score": 1.0}]
+    },
+    "eval": {"mean": 1.0, "std": 0.0, "count": 10, "records": []},
+    "canaries": {"mean": 1.0, "std": 0.0, "count": 5, "records": []}
+  }
+}
+```
+
+The example counts above are illustrative; the command reports the actual
+counts from the supplied dataset. Each split summary always contains
+`mean`, `std`, `count`, and `records`; each record contains its zero-based
+`index` and normalized `score`.
+
+## Module program and label wiring
+
+An optimizable module must set the manifest's `dspy_program` field to its
+package-local DSPy program module. The optimizer derives the conventional
+`<ModuleName>ModuleDSPy` class name from the logical module name and fails
+closed when the field or class is unavailable. The `label_field` manifest
+field selects the expected decision key instead of assuming the v1
+`decompose` name. `should_review` sets `label_field` to `review` and points
+`dspy_program` at `cambium.modules.should_review.dspy_program`; its
+`ShouldReviewModuleDSPy` also declares `label_field = "review"`. The
+label-aware optimizer uses that field for metric lookup, prediction parsing,
+fallbacks, gold labels, and DSPy training examples, so the second module does
+not get coerced through the `decompose` label.
+
 ## OpenCode extraction
 
 The installed CLI reads one or more local OpenCode SQLite databases, or a
