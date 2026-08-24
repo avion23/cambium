@@ -6,11 +6,13 @@ import asyncio
 import io
 import json
 import os
+import time
 from pathlib import Path
 
 from cambium import tui
 from cambium.interactive import InteractiveSession
 from cambium.oneshot import OneShotConfig
+from cambium.provider_scheduler import QuotaLedger
 from cambium.supervisor import PlanResult, TaskResult
 
 
@@ -113,6 +115,38 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert "provider=auto model=auto" in text
     assert "press Ctrl-C while a turn is running" in text
     assert "┌ Cambium" in text
+
+
+def test_tui_quota_command_renders_seeded_ledger_rows(monkeypatch, tmp_path: Path) -> None:
+    quota_db = tmp_path / "provider-quota.db"
+    monkeypatch.setenv("CAMBIUM_QUOTA_DB", str(quota_db))
+    QuotaLedger(quota_db).observe(
+        "zai",
+        "five-hour",
+        reset_at=time.time() + 3600,
+        allowance_tokens=1000,
+        remaining_tokens=700,
+        allowance_requests=10,
+        remaining_requests=8,
+    )
+
+    output = _Tty()
+    error = io.StringIO()
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=_Tty("/quota\n/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    text = output.getvalue()
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "Unknown command: /quota" not in text
+    assert "quota:" in text
+    assert "zai/five-hour: 700/1000 tok, 8/10 req" in text
 
 
 def test_model_lists_ready_targets_and_marks_current(

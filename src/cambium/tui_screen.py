@@ -1661,6 +1661,11 @@ def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
     return rows
 
 
+def render_quota_rows(snapshot: Any, width: int = 44) -> list[str]:
+    """Return quota rows in the compact format used by the side panel."""
+    return [text for _, text in _quota_rows(snapshot, width)]
+
+
 def _side_sections(
     snapshot: Any, cumulative_line: str, width: int, capacity: int
 ) -> list[tuple[str, str]]:
@@ -2087,6 +2092,7 @@ __all__ = [
     "Cockpit",
     "Transcript",
     "TranscriptEntry",
+    "render_quota_rows",
     "render_primary",
     "render_cockpit",
 ]

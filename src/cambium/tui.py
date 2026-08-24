@@ -26,7 +26,7 @@ from .interactive import (
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
-from .tui_screen import ActivityState, Cockpit, Transcript
+from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
 
 try:
     import readline as _readline
@@ -90,6 +90,7 @@ _HELP = """Commands:
   /model P    select provider P (or P:M) for subsequent turns
   /branches   list durable branch heads with epoch/checkpoint references
   /fork       fork a new branch from the current checkpoint
+  /quota      show provider quota-window state
   /compact    flush semantic context and check for a K0 rollover
   /dashboard  explain the visible live cockpit
   /events     recent durable event summaries
@@ -541,6 +542,11 @@ def _command_output(
         return _context_line(snapshot)
     if name == "/session" and not argument:
         return session.describe()
+    if name == "/quota" and not argument:
+        rows = render_quota_rows(snapshot)
+        if not rows:
+            return "quota: no provider quota observations"
+        return "\n".join(("quota:", *rows))
     if name == "/model":
         if not argument:
             try:
