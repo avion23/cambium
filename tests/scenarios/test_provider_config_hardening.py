@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -31,14 +32,26 @@ def _assert_config_error(path: Path, match: str) -> None:
     assert type(raised.value) is ValueError
 
 
-def _assert_quarantined(path: Path, match: str) -> None:
-    # Policy change: entry schema failures no longer take down the whole
-    # config; the offending entry is retained in the sidecar for repair.
+def _assert_quarantined(
+    path: Path, match: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Assert an invalid provider entry is dropped, recorded, and warned about."""
+
+    caplog.set_level(logging.WARNING, logger="cambium.provider_config")
     assert load_providers(path) == []
     sidecar = path.with_name(path.name + ".quarantine")
     records = json.loads(sidecar.read_text(encoding="utf-8"))
     assert isinstance(records, list) and len(records) == 1
-    assert re.search(match, str(records[0]["reason"]))
+    record = records[0]
+    assert isinstance(record, dict)
+    assert {"entry", "reason", "quarantined_at"} <= set(record)
+    assert re.search(match, str(record["reason"]))
+    assert any(
+        item.name == "cambium.provider_config"
+        and item.levelno == logging.WARNING
+        and getattr(item, "event", None) == "provider_config_quarantined"
+        for item in caplog.records
+    )
 
 
 @pytest.mark.parametrize(
@@ -51,12 +64,14 @@ def _assert_quarantined(path: Path, match: str) -> None:
     ],
 )
 def test_missing_required_provider_fields_are_quarantined(
-    tmp_path: Path, missing: str, match: str
+    tmp_path: Path, missing: str, match: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     value = _provider()
     del value[missing]
 
-    _assert_quarantined(_write(tmp_path / "providers.json", {"providers": [value]}), match)
+    _assert_quarantined(
+        _write(tmp_path / "providers.json", {"providers": [value]}), match, caplog
+    )
 
 
 def test_missing_root_providers_field_fails_closed(tmp_path: Path) -> None:
@@ -83,10 +98,20 @@ def test_invalid_json_remains_structural_failure(tmp_path: Path) -> None:
     _assert_config_error(path, r"invalid provider config JSON")
 
 
-def test_unknown_auth_mode_is_quarantined(tmp_path: Path) -> None:
+def test_unknown_top_level_fields_remain_structural_failure(tmp_path: Path) -> None:
+    _assert_config_error(
+        _write(tmp_path / "providers.json", {"providers": [_provider()], "unexpected": True}),
+        r"root: unknown field\(s\): 'unexpected'",
+    )
+
+
+def test_unknown_auth_mode_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     _assert_quarantined(
         _write(tmp_path / "providers.json", {"providers": [_provider(auth="unknown")]}),
         r"providers\[0\]\.auth: invalid auth mode 'unknown'; expected api_key, codex_chatgpt",
+        caplog,
     )
 
 
@@ -100,6 +125,16 @@ def test_duplicate_provider_names_fail_closed(tmp_path: Path) -> None:
     )
 
 
+def test_provider_env_name_collisions_fail_closed(tmp_path: Path) -> None:
+    first = _provider("first.one")
+    second = _provider("first-one")
+
+    _assert_config_error(
+        _write(tmp_path / "providers.json", {"providers": [first, second]}),
+        r"providers\[1\]\.name: provider mapping collides with provider 'first.one'",
+    )
+
+
 @pytest.mark.parametrize("document", [None, [], "providers", 1])
 def test_non_object_root_fails_closed(tmp_path: Path, document: object) -> None:
     _assert_config_error(
@@ -108,13 +143,16 @@ def test_non_object_root_fails_closed(tmp_path: Path, document: object) -> None:
     )
 
 
-def test_empty_provider_name_is_quarantined(tmp_path: Path) -> None:
+def test_empty_provider_name_is_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     value = _provider()
     value["name"] = ""
 
     _assert_quarantined(
         _write(tmp_path / "providers.json", {"providers": [value]}),
         r"providers\[0\]\.name: must be a valid provider id",
+        caplog,
     )
 
 
@@ -131,13 +169,16 @@ def test_empty_provider_name_is_quarantined(tmp_path: Path) -> None:
         "https://[::1",
     ],
 )
-def test_bad_base_url_shapes_are_quarantined(tmp_path: Path, base_url: str) -> None:
+def test_bad_base_url_shapes_are_quarantined(
+    tmp_path: Path, base_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
     _assert_quarantined(
         _write(
             tmp_path / "providers.json",
             {"providers": [_provider(base_url=base_url)]},
         ),
         r"providers\[0\]\.base_url: must be an absolute http\(s\) URL",
+        caplog,
     )
 
 
@@ -148,23 +189,29 @@ def test_bad_base_url_shapes_are_quarantined(tmp_path: Path, base_url: str) -> N
         "https://api.example.test/v1#fragment",
     ],
 )
-def test_base_url_query_and_fragment_are_quarantined(tmp_path: Path, base_url: str) -> None:
+def test_base_url_query_and_fragment_are_quarantined(
+    tmp_path: Path, base_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
     _assert_quarantined(
         _write(
             tmp_path / "providers.json",
             {"providers": [_provider(base_url=base_url)]},
         ),
         r"providers\[0\]\.base_url: must not contain query parameters or a fragment",
+        caplog,
     )
 
 
-def test_unknown_provider_fields_are_quarantined(tmp_path: Path) -> None:
+def test_unknown_provider_fields_are_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     _assert_quarantined(
         _write(
             tmp_path / "providers.json",
             {"providers": [_provider(unexpected="reject-me")]},
         ),
         r"providers\[0\]: unknown field\(s\): 'unexpected'",
+        caplog,
     )
 
 
