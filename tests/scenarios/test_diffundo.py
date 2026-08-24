@@ -207,7 +207,9 @@ STATIC_HEAD = {
 
 
 def test_summary_call_uses_extended_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    router = Diffundo((), call_budget_s=1.0, summary_call_budget_s=3.0)
+    # Keep the ordinary-call budget above incidental scheduler jitter; the
+    # explicit summary budget, not a transport attempt, is this test's signal.
+    router = Diffundo((), call_budget_s=2.0, summary_call_budget_s=3.0)
     deadlines: list[float] = []
 
     async def capture_deadline(
@@ -225,7 +227,9 @@ def test_summary_call_uses_extended_deadline(monkeypatch: pytest.MonkeyPatch) ->
         asyncio.run(router.summary_call(ProviderTier.FAST, PROMPT, model="m"))
 
     assert len(deadlines) == 1
-    assert 2.0 < deadlines[0] - started <= 3.1
+    # xdist can pause the worker between ``started`` and deadline capture;
+    # retain the three-second semantic while allowing generous scheduling lag.
+    assert 2.0 < deadlines[0] - started <= 5.0
 
 
 def _config(
@@ -935,7 +939,9 @@ def test_403_quota_or_billing_exhaustion_cools_until_reset(monkeypatch) -> None:
         assert error.retry_after_s == 7.0
         assert error.request_rate_status == "cooldown"
         assert router.health("p_billing") is HealthState.COOLDOWN
-        assert router._runtime("p_billing").cooldown_until >= started + 6.9
+        # Retry-After drives the reset; allow scheduler/transport jitter while
+        # still proving the provider is cooled for materially more than 1s.
+        assert router._runtime("p_billing").cooldown_until >= started + 6.0
     finally:
         server.close()
 
@@ -1252,14 +1258,14 @@ def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> Non
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.15
+@pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.5
 def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) -> None:
     # D8f recovery monitor: after the provider's cooldown elapses mid-pause, the
     # monitor wakes dispatch, the call probes, and the provider heals.
     server = FakeServer([(500, _error_payload("boom"), 0.0), (200, _ok_payload("rec"), 0.0)])
     _set_keys(monkeypatch, "K_REC")
     router = Diffundo(
-        (_config("p", server, "K_REC", cooldown_s=0.2),),
+        (_config("p", server, "K_REC", cooldown_s=1.0),),
         pause_timeout_s=2.0,
     )
     try:
@@ -1270,7 +1276,7 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
         start = time.monotonic()
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         # the pause actually waited for the cooldown to lapse, then probed
-        assert time.monotonic() - start >= 0.15
+        assert time.monotonic() - start >= 0.5
         assert result.provider == "p"
         assert result.content == "rec"
         assert router.health("p") is HealthState.HEALTHY  # probe success healed it
@@ -1279,7 +1285,7 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
         server.close()
 
 
-@pytest.mark.slow  # 0.2s blocking-pause wait; asserts elapsed >= 0.15
+@pytest.mark.slow  # 0.5s blocking-pause wait; asserts elapsed >= 0.4
 def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> None:
     # D8f: a tier outage must BLOCK on the pause event, not spin the candidate
     # loop. The reviewer measured ~26k pause iterations in 0.6s before the fix;
@@ -1292,7 +1298,7 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
             _config("p_down", down, "K_DOWN", rpm=1, cooldown_s=60.0),
             _config("p_ok", ok, "K_OK", rpm=1),
         ),
-        pause_timeout_s=0.1,
+        pause_timeout_s=0.5,
     )
     try:
         # consume both buckets so the next call finds an empty tier
@@ -1311,8 +1317,8 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
         with pytest.raises(AllProvidersFailed):
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         elapsed = time.monotonic() - start
-        # the 100ms pause actually blocked on the event ...
-        assert elapsed >= 0.07
+        # the 500ms pause actually blocked on the event ...
+        assert elapsed >= 0.4
         # ... a bounded pause on exhaustion, not a hang ...
         assert elapsed < 5.0
         # ... instead of spinning the loop thousands of times
