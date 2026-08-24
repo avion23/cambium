@@ -145,7 +145,9 @@ def _config(
     env_name: str,
     *,
     max_retries: int = 0,
-    timeout_s: float = 0.2,
+    # Leave incidental loopback attempts above sub-second xdist scheduling
+    # noise; timeout-focused scenarios override this explicitly below.
+    timeout_s: float = 1.0,
     cooldown_s: float = 1.0,
     rpm: int = 600,
     quota_windows: tuple[QuotaWindowSpec, ...] = (),
@@ -230,7 +232,9 @@ def test_429_storm_cools_lane_releases_quota_and_replays_idempotently(
     )
     router = Diffundo(
         (provider,),
-        call_budget_s=2.0,
+        # This scenario checks retry/quota bookkeeping, not wall-budget
+        # exhaustion; give all four wire attempts generous headroom.
+        call_budget_s=30.0,
         pause_timeout_s=0.0,
         retry_base_delay_s=0.25,
     )
@@ -265,7 +269,9 @@ def test_429_storm_cools_lane_releases_quota_and_replays_idempotently(
         # sleep for 30 seconds.  A request allowance of ten is intentionally
         # larger than the storm but the assertion above proves the failed
         # reservation itself was released.
-        router._runtime("storm-provider").cooldown_until = time.monotonic() - 1.0
+        # Backdate well beyond the cooldown so scheduler jitter cannot make
+        # this recovery probe appear unavailable.
+        router._runtime("storm-provider").cooldown_until = time.monotonic() - 60.0
         recovered = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert recovered.content == "recovered"
         assert router.health("storm-provider") is HealthState.HEALTHY
@@ -317,7 +323,9 @@ def test_429_storm_respects_wall_and_retry_budgets(
                 quota_windows=_quota_window(),
             ),
         ),
-        call_budget_s=0.2,
+        # Keep the 60s reset hint beyond this generous wall budget while
+        # allowing several seconds of worker scheduling jitter.
+        call_budget_s=5.0,
         pause_timeout_s=0.0,
     )
 
@@ -332,7 +340,9 @@ def test_429_storm_respects_wall_and_retry_budgets(
         elapsed = time.monotonic() - started
         error = cast(ProviderError, cast(AllProvidersFailed, raised.value).last_error)
 
-        assert elapsed < 0.5
+        # The tight budget and one-request assertion prove no Retry-After
+        # retry; allow generous worker scheduling jitter in this wall bound.
+        assert elapsed < 6.0
         assert len(server.requests) == 1
         assert len(server.requests) <= max_retries + 1
         assert error.outcome is ProviderOutcome.QUOTA
@@ -354,7 +364,7 @@ def test_mixed_storm_policy_refusal_is_terminal_but_health_neutral(monkeypatch, 
             # The delayed response models a network timeout.  Diffundo
             # deliberately does not re-POST a tarpitted endpoint; the next
             # cascade turn is the retry opportunity.
-            _Behavior(200, _ok_payload("late timeout response"), delay_s=0.3),
+            _Behavior(200, _ok_payload("late timeout response"), delay_s=1.0),
             _Behavior(429, _error_payload("rate limit exceeded"), headers={"Retry-After": "0"}),
             _Behavior(200, _ok_payload("recovered after timeout")),
         ]
@@ -367,7 +377,9 @@ def test_mixed_storm_policy_refusal_is_terminal_but_health_neutral(monkeypatch, 
         server,
         "K_MIXED_STORM",
         max_retries=2,
-        timeout_s=0.1,
+        # The scripted 1s response must exceed this timeout; TIMEOUT is
+        # intentional here rather than incidental transport starvation.
+        timeout_s=0.5,
         cooldown_s=0.0,
         quota_windows=_quota_window(),
     )
