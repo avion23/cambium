@@ -1685,6 +1685,18 @@ class Diffundo:
                         self._terminal_death_providers = (
                             self._terminal_death_providers | {provider.name}
                         )
+                        lease = self._provider_lease
+                        if (
+                            lease is not None
+                            and lease.provider == provider.name
+                            and lease.model == provider.model
+                        ):
+                            # A lease keeps a healthy incumbent sticky, but a
+                            # terminally dead holder no longer owns the
+                            # semantic branch. Release only this lease state;
+                            # the pinned/fallback history remains needed for
+                            # provenance and dead-provider avoidance.
+                            self._provider_lease = None
                     tried.append(provider.name)
                     last_error = exc
                     if (
@@ -2020,7 +2032,10 @@ class Diffundo:
         if request is not None:
             try:
                 candidate_request = replace(
-                    request, model="", allow_model_substitution=True
+                    request,
+                    model="",
+                    allow_model_substitution=True,
+                    lease=None,
                 )
             except TypeError:
                 candidate_request = request

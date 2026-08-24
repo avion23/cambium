@@ -371,6 +371,115 @@ def test_pinned_endpoint_death_without_alternative_remains_fatal(monkeypatch) ->
         dead.close()
 
 
+def test_leased_provider_death_releases_lease_for_healthy_sibling(monkeypatch) -> None:
+    incumbent = FakeServer(
+        [
+            (200, _ok_payload("incumbent", model="m-incumbent"), 0.0),
+            (503, _error_payload("endpoint unavailable"), 0.0),
+        ]
+    )
+    sibling = FakeServer([(200, _ok_payload("sibling", model="m-sibling"), 0.0)])
+    _set_keys(monkeypatch, "K_LEASE_INCUMBENT", "K_LEASE_SIBLING")
+    router = Diffundo(
+        (
+            _config("p_incumbent", incumbent, "K_LEASE_INCUMBENT", model="m-incumbent"),
+            _config("p_sibling", sibling, "K_LEASE_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_incumbent",
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-incumbent"))
+        router.bind_provider(first.provider, first.model, root_task_id="lease-task")
+        assert router.provider_lease is not None
+
+        fallback = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-incumbent"))
+
+        assert fallback.provider == "p_sibling"
+        assert fallback.fell_back_from == "p_incumbent"
+        assert router.provider_lease is None
+        assert len(incumbent.calls) == 2
+        assert len(sibling.calls) == 1
+
+        # The caller can bind the successful replacement after the old lease
+        # was released, preserving stickiness for the next turn.
+        router.bind_provider(fallback.provider, fallback.model, root_task_id="lease-task")
+        assert router.provider_lease is not None
+        assert router.provider_lease.provider == "p_sibling"
+    finally:
+        incumbent.close()
+        sibling.close()
+
+
+def test_healthy_incumbent_keeps_lease_sticky(monkeypatch) -> None:
+    incumbent = FakeServer(
+        [
+            (200, _ok_payload("first", model="m-incumbent"), 0.0),
+            (200, _ok_payload("second", model="m-incumbent"), 0.0),
+        ]
+    )
+    sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
+    _set_keys(monkeypatch, "K_STICKY_INCUMBENT", "K_STICKY_SIBLING")
+    router = Diffundo(
+        (
+            _config("p_incumbent", incumbent, "K_STICKY_INCUMBENT", model="m-incumbent"),
+            _config("p_sibling", sibling, "K_STICKY_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_incumbent",
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-incumbent"))
+        router.bind_provider(first.provider, first.model, root_task_id="sticky-task")
+        lease = router.provider_lease
+
+        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-incumbent"))
+
+        assert second.provider == "p_incumbent"
+        assert router.provider_lease is lease
+        assert len(incumbent.calls) == 2
+        assert sibling.calls == []
+    finally:
+        incumbent.close()
+        sibling.close()
+
+
+def test_transient_429_keeps_lease_through_cooldown(monkeypatch) -> None:
+    incumbent = FakeServer(
+        [
+            (200, _ok_payload("first", model="m-incumbent"), 0.0),
+            (429, _error_payload("busy"), 0.0, {"Retry-After": "60"}),
+        ]
+    )
+    sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
+    _set_keys(monkeypatch, "K_TRANSIENT_INCUMBENT", "K_TRANSIENT_SIBLING")
+    router = Diffundo(
+        (
+            _config("p_incumbent", incumbent, "K_TRANSIENT_INCUMBENT", model="m-incumbent"),
+            _config("p_sibling", sibling, "K_TRANSIENT_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_incumbent",
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-incumbent"))
+        router.bind_provider(first.provider, first.model, root_task_id="transient-task")
+        lease = router.provider_lease
+
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-incumbent"))
+
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.retry_after_s == 60.0
+        assert error.is_real_death is False
+        assert router.health("p_incumbent") is HealthState.COOLDOWN
+        assert router.provider_lease is lease
+        assert sibling.calls == []
+    finally:
+        incumbent.close()
+        sibling.close()
+
+
 def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> None:
     dead = FakeServer(
         [
