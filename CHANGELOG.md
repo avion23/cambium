@@ -37,6 +37,17 @@ unselected.
 - **Trajectory extraction pipeline.** Added read-only, review-gated pi-session
   and OpenCode trajectory extraction with provenance/redaction metadata. The
   reviewed `train_queue_v2.jsonl` contains 34 records (24 train, 10 val).
+- **Saved-program evaluation.** Added `cambium optimize eval` to score fresh
+  or saved DSPy program state across train, eval, and canary splits, with
+  explicit dataset loading and JSON reports.
+- **Should-review optimization.** Added the second trainable DSPy decision
+  module for `should_review` and generalized optimizer label and metric
+  resolution beyond the example module.
+- **Codex activation guide.** Added operator documentation for Codex OAuth
+  login/import, credential eligibility, verification, acceptance, and rollback.
+- **Provider lease semantics guide.** Added architecture documentation for
+  sticky provider/model leases, terminal-death release, and transient quota
+  and timeout behavior.
 
 ### Changed
 
@@ -56,6 +67,20 @@ unselected.
 - **Test execution.** Enabled pytest-xdist by default with `-n auto` and a
   timing-safe load group, and removed avoidable scenario waits, reducing the
   targeted scenario run from roughly 108 seconds to roughly 40 seconds.
+- **GEPA CLI exposure.** The unified `cambium optimize` command now accepts
+  the `gepa` optimizer choice.
+- **Interactive model controls.** `/model` now lists eligible,
+  credential-ready provider/model targets and persists provider/model
+  selection; a submitted `q` exits without creating a turn.
+- **Public-release readiness.** Reworked the README around installation,
+  quickstart, documentation, and license status, and made `doctor` derive its
+  Python floor from project or installed package metadata.
+- **Scenario timing margins.** Widened diffundo and provider-storm timing
+  margins so xdist contention does not obscure retry, cooldown, and wall-budget
+  assertions.
+- **Profiling baseline refresh.** Refreshed the profiling results and added
+  historical comparisons and hot-path probes while documenting host-load
+  confounding.
 
 ### Fixed
 
@@ -68,6 +93,21 @@ unselected.
 - **Ruff corruption guard.** Added a syntax-hygiene guard for corrupted
   multiple-exception handlers and pinned development Ruff below 0.15 after the
   formatter regression was reproduced.
+- **Terminal-death lease routing.** Prevented terminally dead incumbent lanes
+  from starving healthy siblings, released matching provider leases before
+  fallback, and preserved the bound incumbent as fallback provenance.
+- **Summary-provider fallback.** Authorized model substitution during semantic
+  summary flushes, preserving fallback provenance instead of failing the
+  compaction path when the pinned provider dies.
+- **Summary degradation.** Kept model-owned summary recovery bounded for
+  oversized, surrogate-containing, and deeply nested values by coercing safely,
+  truncating text, and trimming lower-priority lists within byte caps.
+- **Pi-session extraction redaction.** Strengthened the training-data boundary
+  against base64-like, Unicode-confusable, entity-encoded, zero-width, and
+  whitespace-split credential forms.
+- **Provider quarantine hardening.** Bounded and sanitized quarantine records
+  and sidecars, redacted secret-shaped values, refused symlinked paths, and
+  handled deep or invalidly encoded entries safely.
 
 ### Removed
 
@@ -100,6 +140,26 @@ from origin/main):
 - Orphaned-worktree reclamation: 558e15a, 53f474f.
 - Ruff corruption guard and version cap: bbf9034, 7d24a15, ffa1f15.
 - Removed CI workflows: e6a40b5.
+- Saved-program evaluation and explicit datasets: a3e130e, 4fff27e, 5bb4003,
+  a89c4f1.
+- should_review DSPy module and generic optimizer labels: 8844b2d, 7606da3,
+  af0b0e4, e0112a2.
+- Codex activation guide: e05b9eb, b35916a.
+- Provider lease semantics guide: eeaf295, 634ef3d.
+- GEPA CLI exposure: 1f850fb, 57e4cef.
+- TUI model listing/switching and q-exit: 41aa98e, ca740f5, d176418.
+- README publish readiness and dynamic doctor Python floor: bf3b450, 3f2b8fc.
+- Storm/diffundo timing-margin widenings: 523359e, 6d8d30f, 3c99244,
+  777cc7f.
+- Profiling refresh: 7472df5, f56a210.
+- Terminal-death starvation and lease release: 83e0892, a7670f9, 05b28e9,
+  e3a969e, 37a1a99, 054408d.
+- Summary-provider substitution during compaction: f1f3aef, 32e090c,
+  bbabe8d.
+- Summary coercion and oversized-entry degradation: 99a751d, 39698f8,
+  96b9269, 2b33cf5.
+- Pi extraction redaction strengthening: 32f000f, e33b5fd.
+- Provider quarantine hardening B: c0c7199, 8b2617d, d049c5d, a268bc3.
 -->
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
