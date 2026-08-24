@@ -903,8 +903,12 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
     range WE chose to summarize — bookkeeping the caller already knows.
     Requiring the model to echo them verbatim added no integrity (a prompt
     injection could copy them too) while failing small models constantly.
-    Identity therefore comes from ``expected``; the model owns only the
-    semantic delta, and content bounds are still enforced.
+    Identity therefore comes from ``expected``; the echoed ``type`` marker is
+    likewise ignored and normalized to ``"summary_entry"`` whether it is
+    missing or malformed.  The model owns only the semantic delta, and
+    content bounds are still enforced.  Unknown fields remain rejected so
+    arbitrary model content cannot cross the summary schema boundary as
+    prompt-injection text.
     """
     if not isinstance(content, str) or not content.strip():
         raise SummaryTrunkError("summary response must be non-empty JSON")
@@ -915,13 +919,14 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
             raise SummaryTrunkError("summary response must be exactly one JSON object") from exc
         if not isinstance(decoded, dict):
             raise SummaryTrunkError("summary response must be exactly one JSON object")
+        # Unlike the echoed type marker, unknown fields are model-owned content
+        # outside the schema.  Reject them rather than silently carrying
+        # arbitrary prompt-injection text into durable summary history.
         unknown = set(decoded) - SUMMARY_ENTRY_FIELDS
         if unknown:
             raise SummaryTrunkError(
                 f"summary response field set is invalid: unknown={sorted(unknown)}"
             )
-        if decoded.get("type", "summary_entry") != "summary_entry":
-            raise SummaryTrunkError("summary entry type must be 'summary_entry'")
 
         normalized = dict(decoded)
         normalized.update(
