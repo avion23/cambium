@@ -992,6 +992,30 @@ def test_standalone_cli_fails_closed_when_timing_subprocess_unavailable(
     (modules_dir / "fixture" / "tests" / "test_failing.py").write_text(
         "def test_always_fails():\n    assert False\n"
     )
+
+    # This test targets the standalone CLI's fail-closed handling of a timing
+    # subprocess that exits nonzero.  Return that failed result directly
+    # instead of launching the nested pytest process: the child would load the
+    # repository's full bench plugin and run unrelated module scoring before
+    # reporting this fixture failure.  Other subprocesses (git and the module
+    # evaluation CLI) still run normally, so report/gate setup remains covered.
+    real_run = subprocess.run
+
+    def unavailable_timing_run(args, *run_args, **run_kwargs):
+        if (
+            isinstance(args, (list, tuple))
+            and len(args) >= 3
+            and tuple(args[1:3]) == ("-m", "pytest")
+        ):
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout=b"",
+                stderr=b"simulated timing subprocess unavailable",
+            )
+        return real_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(bench.subprocess, "run", unavailable_timing_run)
     bench_root = tmp_path / "baselines"
 
     assert bench.main(["report", "--bench-root", str(bench_root)]) == 1

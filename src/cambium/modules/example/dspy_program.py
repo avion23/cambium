@@ -43,7 +43,7 @@ class ShouldDecomposeModuleDSPy(_LazyDSPyBase):
             with dspy.context(lm=self._lm):
                 pred = await self._predict.acall(task=input.task, context=input.context)
             decision = Decision(str(pred.decision))
-        except ValueError:
+        except (ValueError, dspy.AdapterParseError):
             return DecomposeOutput(
                 decision=Decision.DO_NOT_DECOMPOSE,
                 reason="DSPy output unparseable",

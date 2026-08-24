@@ -99,7 +99,15 @@ The task is atomic.
 
 
 def test_unparseable_decision_uses_conservative_fallback() -> None:
-    response = '{"decision": "garbage", "reason": "not a domain value"}'
+    # Keep the DSPy wire format valid so the adapter does not spend time trying
+    # its JSON fallback before the domain enum rejects the decision value.
+    response = """[[ ## decision ## ]]
+garbage
+
+[[ ## reason ## ]]
+not a domain value
+
+[[ ## completed ## ]]"""
     output = _decide(ShouldDecomposeModuleDSPy(_fake_lm(response)))
 
     assert output == DecomposeOutput(

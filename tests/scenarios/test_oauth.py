@@ -18,6 +18,7 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -232,7 +233,17 @@ def _fake_issuer():
     try:
         yield server
     finally:
-        server.close()
+            server.close()
+
+
+def _use_fast_device_polling(flow: DeviceFlow, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep real device-flow polling while shortening the fake issuer interval."""
+    request_user_code = flow.request_user_code
+
+    def request() -> Any:
+        return replace(request_user_code(), interval=0.005)
+
+    monkeypatch.setattr(flow, "request_user_code", request)
 
 
 # --------------------------------------------------------------------------- #
@@ -683,7 +694,10 @@ def test_refresh_multiprocess_rotating_race(tmp_path: Path) -> None:
     rotation.
     """
     with _fake_issuer() as server:
-        server.fake.refresh_sleep_s = 0.5
+        # Hold the first refresh long enough for the other process to contend
+        # for the real flock, without spending half a second in the fake HTTP
+        # handler on every run.
+        server.fake.refresh_sleep_s = 0.1
         path = _store_path(tmp_path)
         store = OAuthStore(path)
         store.save_provider(_stale_doc())
@@ -806,11 +820,12 @@ def test_mark_invalid_grant_disables_until_relogin(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_device_flow_happy_path(tmp_path: Path) -> None:
+def test_device_flow_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with _fake_issuer() as server:
         store = OAuthStore(_store_path(tmp_path))
         shown: list[tuple[str, str]] = []
         flow = DeviceFlow("codex", client_id=FAKE_CLIENT_ID, issuer=server.issuer, store=store)
+        _use_fast_device_polling(flow, monkeypatch)
 
         doc = flow.run(max_wait_s=10.0, on_code=lambda url, code: shown.append((url, code)))
 
@@ -826,14 +841,17 @@ def test_device_flow_happy_path(tmp_path: Path) -> None:
         assert record.doc.access_token == "flow-access"
 
 
-def test_device_flow_poll_expiry_persists_nothing(tmp_path: Path) -> None:
+def test_device_flow_poll_expiry_persists_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with _fake_issuer() as server:
         server.fake.poll_mode = "pending_forever"
         store = OAuthStore(_store_path(tmp_path))
         flow = DeviceFlow("codex", client_id=FAKE_CLIENT_ID, issuer=server.issuer, store=store)
+        _use_fast_device_polling(flow, monkeypatch)
 
         with pytest.raises(DeviceFlowExpired):
-            flow.run(max_wait_s=0.2)
+            flow.run(max_wait_s=0.05)
 
         assert store.read().records == ()
 
@@ -912,11 +930,14 @@ def test_oauth_response_larger_than_cap_is_rejected() -> None:
         thread.join()
 
 
-def test_transient_secrets_never_appear_in_reprs_or_errors(tmp_path: Path) -> None:
+def test_transient_secrets_never_appear_in_reprs_or_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with _fake_issuer() as server:
         server.fake.exchange_status = 500
         store = OAuthStore(_store_path(tmp_path))
         flow = DeviceFlow("codex", client_id=FAKE_CLIENT_ID, issuer=server.issuer, store=store)
+        _use_fast_device_polling(flow, monkeypatch)
 
         code = flow.request_user_code()
         assert USER_CODE not in repr(code)
