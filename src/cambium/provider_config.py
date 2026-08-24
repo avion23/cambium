@@ -22,11 +22,13 @@ never reads the environment or a key value.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
@@ -271,6 +273,19 @@ _VALID_TIERS = frozenset({"fast", "balanced", "strong", "reasoning"})
 # provider must use https so the Authorization: Bearer key stays encrypted.
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
+# Quarantine files are diagnostics, not a second configuration store.  Keep
+# them bounded and make the copy of an invalid entry safe to retain.
+MAX_QUARANTINE_RECORD_BYTES = 64 * 1024
+MAX_QUARANTINE_SIDECAR_BYTES = 1024 * 1024
+_MAX_QUARANTINE_ENTRY_DEPTH = 128
+_MAX_QUARANTINE_ENTRY_NODES = 100_000
+_QUARANTINE_SECRET_KEY_RE = re.compile(
+    r"(?:key|token|secret|credential)", re.IGNORECASE
+)
+_QUARANTINE_LONG_ALNUM_RE = re.compile(r"[A-Za-z0-9]{60,}")
+_QUARANTINE_SECRET_PREFIXES = ("sk-", "ghp_", "AKIA")
+_QUARANTINE_MARKER_RE = re.compile(r"<(?:redacted:\d+|oversized: \d+ bytes)>")
+
 
 def is_loopback_host(hostname: str) -> bool:
     """True for the loopback host names that may use plaintext http transport."""
@@ -304,12 +319,193 @@ def provider_quarantine_path(source: str | Path) -> Path:
     return path.with_name(path.name + ".quarantine")
 
 
+def _quarantine_byte_length(value: str) -> int:
+    """Measure text without allowing lone surrogates to escape the boundary."""
+
+    return len(value.encode("utf-8", errors="surrogatepass"))
+
+
+def _quarantine_string(value: str, key: str | None) -> str:
+    if _QUARANTINE_MARKER_RE.fullmatch(value) is not None:
+        return value
+    secret_key = key is not None and _QUARANTINE_SECRET_KEY_RE.search(key) is not None
+    secret_shape = value.startswith(_QUARANTINE_SECRET_PREFIXES) or (
+        _QUARANTINE_LONG_ALNUM_RE.search(value) is not None
+    )
+    if secret_key or secret_shape:
+        return f"<redacted:{_quarantine_byte_length(value)}>"
+    return value
+
+
+def _quarantine_size_hint(value: object) -> int:
+    """Return a bounded, non-sensitive byte-size estimate for a deep value."""
+
+    pending: list[object] = [value]
+    seen: set[int] = set()
+    total = 0
+    nodes = 0
+    while pending and nodes < _MAX_QUARANTINE_ENTRY_NODES:
+        candidate = pending.pop()
+        nodes += 1
+        if isinstance(candidate, str):
+            total += _quarantine_byte_length(candidate)
+        elif isinstance(candidate, dict):
+            identity = id(candidate)
+            if identity in seen:
+                total += 9  # len(json.dumps("<cyclic>"))
+                continue
+            seen.add(identity)
+            total += 2
+            for key, child in candidate.items():
+                if isinstance(key, str):
+                    total += _quarantine_byte_length(key) + 3
+                pending.append(child)
+        elif isinstance(candidate, list):
+            identity = id(candidate)
+            if identity in seen:
+                total += 9
+                continue
+            seen.add(identity)
+            total += 2
+            pending.extend(candidate)
+        else:
+            total += 8
+    if pending:
+        total += len(pending) * 8
+    return max(total, 1)
+
+
+def _sanitize_quarantine_entry(entry: object) -> object:
+    """Copy an entry iteratively, redacting secret-shaped string values."""
+
+    def scalar(value: object, key: str | None) -> object:
+        if isinstance(value, str):
+            return _quarantine_string(value, key)
+        if value is None or isinstance(value, bool | int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else "<non-finite>"
+        return "<unserializable>"
+
+    if not isinstance(entry, dict | list):
+        return scalar(entry, None)
+
+    root: object = {} if isinstance(entry, dict) else []
+    active = {id(entry)}
+    frames: list[tuple[object, object, Any, int, int]] = [
+        (
+            entry,
+            root,
+            iter(entry.items()) if isinstance(entry, dict) else iter(enumerate(entry)),
+            0,
+            id(entry),
+        )
+    ]
+    nodes = 1
+    while frames:
+        original, output, iterator, depth, identity = frames[-1]
+        try:
+            raw_key, child = next(iterator)
+        except StopIteration:
+            active.discard(identity)
+            frames.pop()
+            continue
+
+        key: str | None
+        if isinstance(original, dict):
+            key = raw_key if isinstance(raw_key, str) else None
+            safe_key = (
+                _quarantine_string(raw_key, None)
+                if isinstance(raw_key, str)
+                else f"<key:{type(raw_key).__name__}>"
+            )
+        else:
+            key = None
+            safe_key = None
+
+        safe_child: object
+        if isinstance(child, dict | list):
+            if depth >= _MAX_QUARANTINE_ENTRY_DEPTH or nodes >= _MAX_QUARANTINE_ENTRY_NODES:
+                safe_child = f"<oversized: {_quarantine_size_hint(child)} bytes>"
+            elif id(child) in active:
+                safe_child = "<cyclic>"
+            else:
+                safe_child = {} if isinstance(child, dict) else []
+                if isinstance(output, dict):
+                    output[safe_key] = safe_child
+                else:
+                    output.append(safe_child)
+                active.add(id(child))
+                nodes += 1
+                frames.append(
+                    (
+                        child,
+                        safe_child,
+                        iter(child.items())
+                        if isinstance(child, dict)
+                        else iter(enumerate(child)),
+                        depth + 1,
+                        id(child),
+                    )
+                )
+                continue
+        else:
+            safe_child = scalar(child, key)
+
+        if isinstance(output, dict):
+            output[safe_key] = safe_child
+        else:
+            output.append(safe_child)
+    return root
+
+
+def _quarantine_json_bytes(value: object, *, indent: int | None = None) -> bytes:
+    """Serialize quarantine data as ASCII-safe, finite JSON bytes."""
+
+    if indent is None:
+        rendered = json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        rendered = json.dumps(value, ensure_ascii=True, allow_nan=False, indent=indent)
+    return rendered.encode("ascii")
+
+
 def _quarantine_record(entry: object, reason: str) -> dict[str, object]:
+    safe_entry = _bounded_quarantine_entry(entry)
     return {
-        "entry": entry,
+        "entry": safe_entry,
         "reason": reason,
         "quarantined_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
+
+
+def _bounded_quarantine_entry(entry: object) -> object:
+    """Sanitize an entry and replace an over-large serialized copy with a stub."""
+
+    safe_entry = _sanitize_quarantine_entry(entry)
+    try:
+        serialized_entry = _quarantine_json_bytes(safe_entry)
+    except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError):
+        safe_entry = "<unserializable>"
+        serialized_entry = _quarantine_json_bytes(safe_entry)
+    if len(serialized_entry) > MAX_QUARANTINE_RECORD_BYTES:
+        safe_entry = f"<oversized: {len(serialized_entry)} bytes>"
+    return safe_entry
+
+
+def _sanitize_quarantine_record(record: dict[str, object]) -> dict[str, object]:
+    """Return a safe copy of a record while preserving its reason verbatim."""
+
+    if "entry" not in record:
+        return dict(record)
+    safe_record = dict(record)
+    safe_record["entry"] = _bounded_quarantine_entry(record["entry"])
+    return safe_record
 
 
 def _quarantine_record_key(record: object) -> tuple[str, str] | None:
@@ -319,12 +515,86 @@ def _quarantine_record_key(record: object) -> tuple[str, str] | None:
     if not isinstance(reason, str):
         return None
     try:
-        entry = json.dumps(
-            record.get("entry"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-    except (TypeError, ValueError):
+        entry = _quarantine_json_bytes(record.get("entry")).decode("ascii")
+    except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError):
         return None
     return entry, reason
+
+
+def _read_quarantine_sidecar(path: Path) -> tuple[list[object], bool]:
+    """Read a regular sidecar without following a replaceable final symlink."""
+
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return [], False
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(f"provider quarantine path must not be a symlink: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise OSError(f"provider quarantine path is not a file: {path}")
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            # A concurrent remover is equivalent to an absent sidecar.
+            return [], False
+        except OSError as exc:
+            if exc.errno == getattr(errno, "ELOOP", 40):
+                raise OSError(f"provider quarantine path must not be a symlink: {path}") from exc
+            raise
+
+        sidecar_stat = os.fstat(descriptor)
+        if stat.S_ISLNK(sidecar_stat.st_mode):
+            raise OSError(f"provider quarantine path must not be a symlink: {path}")
+        if not stat.S_ISREG(sidecar_stat.st_mode):
+            raise OSError(f"provider quarantine path is not a file: {path}")
+        if sidecar_stat.st_size > MAX_QUARANTINE_SIDECAR_BYTES:
+            logger.warning(
+                "provider quarantine sidecar %s exceeds the %d-byte limit; "
+                "new records were not appended",
+                path,
+                MAX_QUARANTINE_SIDECAR_BYTES,
+            )
+            return [], True
+
+        sidecar = os.fdopen(descriptor, "rb")
+        descriptor = None
+        with sidecar:
+            raw = sidecar.read(MAX_QUARANTINE_SIDECAR_BYTES + 1)
+        if len(raw) > MAX_QUARANTINE_SIDECAR_BYTES:
+            logger.warning(
+                "provider quarantine sidecar %s exceeds the %d-byte limit; "
+                "new records were not appended",
+                path,
+                MAX_QUARANTINE_SIDECAR_BYTES,
+            )
+            return [], True
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    try:
+        existing_raw = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_non_standard_constant,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
+    if not isinstance(existing_raw, list):
+        raise ValueError(f"provider quarantine file {path}: must be a list")
+    return existing_raw, False
 
 
 def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Path | None:
@@ -333,40 +603,61 @@ def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Pa
     if not records:
         return None
     path = provider_quarantine_path(source)
-    existing: list[object] = []
-    if path.exists():
-        if not path.is_file():
-            raise OSError(f"provider quarantine path is not a file: {path}")
-        try:
-            existing_raw = json.loads(
-                path.read_text(encoding="utf-8"),
-                object_pairs_hook=_reject_duplicate_pairs,
-                parse_constant=_reject_non_standard_constant,
-            )
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
-        if not isinstance(existing_raw, list):
-            raise ValueError(f"provider quarantine file {path}: must be a list")
-        existing = existing_raw
+    existing, sidecar_limited = _read_quarantine_sidecar(path)
+    if sidecar_limited:
+        return path
+    existing = [
+        _sanitize_quarantine_record(item) if isinstance(item, dict) else item
+        for item in existing
+    ]
+    safe_records = tuple(_sanitize_quarantine_record(record) for record in records)
 
     existing_keys = {key for item in existing if (key := _quarantine_record_key(item)) is not None}
     # Loading provider specs and then full providers is common (doctor does
     # both). Avoid repeating records already persisted by the earlier load.
-    additions = [
-        record
-        for record in records
-        if (key := _quarantine_record_key(record)) is None or key not in existing_keys
-    ]
+    additions: list[dict[str, object]] = []
+    for record in safe_records:
+        key = _quarantine_record_key(record)
+        if key is None or key not in existing_keys:
+            additions.append(record)
+            if key is not None:
+                existing_keys.add(key)
     if not additions:
         return path
 
-    payload = json.dumps([*existing, *additions], ensure_ascii=False, indent=2) + "\n"
+    accepted: list[dict[str, object]] = []
+    payload: bytes | None = None
+    for index, record in enumerate(additions):
+        try:
+            candidate = _quarantine_json_bytes([*existing, *accepted, record], indent=2) + b"\n"
+        except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError):
+            logger.warning(
+                "provider quarantine sidecar %s could not safely serialize %d new record(s); "
+                "remaining records were not appended",
+                path,
+                len(additions) - index,
+            )
+            break
+        if len(candidate) > MAX_QUARANTINE_SIDECAR_BYTES:
+            logger.warning(
+                "provider quarantine sidecar %s reached the %d-byte limit; "
+                "%d new record(s) were not appended",
+                path,
+                MAX_QUARANTINE_SIDECAR_BYTES,
+                len(additions) - index,
+            )
+            break
+        accepted.append(record)
+        payload = candidate
+    if not accepted or payload is None:
+        return path
+
     temporary_name: str | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+        with os.fdopen(descriptor, "wb") as temporary:
             temporary.write(payload)
             temporary.flush()
             os.fsync(temporary.fileno())
