@@ -105,12 +105,14 @@ import random
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+import weakref
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC
 from email.utils import parsedate_to_datetime
@@ -731,6 +733,36 @@ def _read_provider_response(response: Any, provider: str) -> bytes:
 # --------------------------------------------------------------------------- #
 
 
+class _LoopLocal:
+    """Keep an asyncio primitive separate for every running event loop.
+
+    ``CambiumLM.forward`` is a synchronous DSPy seam and uses ``asyncio.run``
+    when GEPA invokes it.  A single ``Diffundo`` can therefore serve many
+    short-lived loops, including loops running concurrently in GEPA worker
+    threads.  asyncio synchronization primitives cannot be shared between
+    those loops once they have waiters, so the lookup itself is protected by a
+    small thread lock while the returned primitive remains loop-local.
+    """
+
+    __slots__ = ("_factory", "_guard", "_values")
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self._guard = threading.Lock()
+        self._values: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def get(self) -> Any:
+        loop = asyncio.get_running_loop()
+        with self._guard:
+            primitive = self._values.get(loop)
+            if primitive is None:
+                primitive = self._factory()
+                self._values[loop] = primitive
+            return primitive
+
+
 class _TokenBucket:
     """Leaky token bucket refilled at ``rpm`` tokens per minute (D8f)."""
 
@@ -782,7 +814,7 @@ class _ProviderRuntime:
         self.cooldown_until = 0.0
         self.open_until = 0.0
         self.bucket = _TokenBucket(provider.rpm)
-        self.lock = asyncio.Lock()
+        self.lock = _LoopLocal(asyncio.Lock)
         self.outcomes: deque[bool] = deque(maxlen=window_size)
         self.probe_in_flight = False
         # An auth failure is quarantined for this credential identity. A
@@ -791,15 +823,27 @@ class _ProviderRuntime:
         self.auth_quarantine_fingerprint: str | None = None
 
 
-class _PauseTracker:
-    """Per-tier pause state: the dispatch-pause Event plus its waiter count."""
+class _PauseState:
+    """One loop's dispatch-pause event and recovery monitor state."""
 
-    __slots__ = ("event", "waiters", "monitor")
+    __slots__ = ("event", "monitor", "waiters")
 
     def __init__(self) -> None:
         self.event = asyncio.Event()
         self.waiters = 0
         self.monitor: asyncio.Task | None = None
+
+
+class _PauseTracker:
+    """Per-tier pause state, isolated by the loop that owns each Event."""
+
+    __slots__ = ("_state",)
+
+    def __init__(self) -> None:
+        self._state = _LoopLocal(_PauseState)
+
+    def current(self) -> _PauseState:
+        return cast(_PauseState, self._state.get())
 
 
 class _RawResponse:
@@ -2119,38 +2163,38 @@ class Diffundo:
         busy-spinning.
         """
         start = time.monotonic()
-        tracker = self._pauses[self._tier_index(tier)]
-        tracker.waiters += 1
+        state = self._pauses[self._tier_index(tier)].current()
+        state.waiters += 1
         try:
-            if tracker.monitor is None or tracker.monitor.done():
-                tracker.monitor = asyncio.create_task(self._recovery_monitor(tier))
+            if state.monitor is None or state.monitor.done():
+                state.monitor = asyncio.create_task(self._recovery_monitor(tier))
             try:
-                tracker.event.clear()
-                await asyncio.wait_for(tracker.event.wait(), timeout=max(0.0, max_wait))
+                state.event.clear()
+                await asyncio.wait_for(state.event.wait(), timeout=max(0.0, max_wait))
             except TimeoutError:
                 pass
         finally:
-            tracker.waiters -= 1
-            if tracker.waiters == 0:
-                tracker.event.clear()
-                monitor = tracker.monitor
+            state.waiters -= 1
+            if state.waiters == 0:
+                state.event.clear()
+                monitor = state.monitor
                 if monitor is not None and not monitor.done():
                     monitor.cancel()
-                tracker.monitor = None
+                state.monitor = None
         return time.monotonic() - start
 
     async def _recovery_monitor(self, tier: ProviderTier) -> None:
         """Wake the paused dispatch of ``tier`` when any provider recovers."""
         while True:
-            tracker = self._pauses[self._tier_index(tier)]
-            if tracker.waiters == 0:
+            state = self._pauses[self._tier_index(tier)].current()
+            if state.waiters == 0:
                 return
             if any(
                 self._is_available(runtime.provider.name)
                 for runtime in self._runtimes
                 if runtime.provider.tier is tier and runtime.provider.enabled
             ):
-                tracker.event.set()
+                state.event.set()
                 return
             await asyncio.sleep(0.05)
 
@@ -2238,7 +2282,7 @@ class Diffundo:
         ``ProviderError`` so the cascade aborts (cascade-design §2.2).
         """
         runtime = self._runtime(provider.name)
-        async with runtime.lock:
+        async with runtime.lock.get():
             probing = runtime.health in (HealthState.HALF_OPEN, HealthState.COOLDOWN)
             if probing and runtime.probe_in_flight:
                 raise ProviderError(
