@@ -13,6 +13,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -30,7 +31,14 @@ from .auth import (
     scrub_environment,
 )
 from .ipc import MAX_LINE_BYTES
-from .provider_config import AuthMode, ProviderSelectionError, load_providers, select_provider
+from .provider_config import (
+    AuthMode,
+    ProviderSelectionError,
+    all_providers_quarantined_path,
+    load_providers,
+    provider_quarantine_notice,
+    select_provider,
+)
 from .session import session_root
 from .supervisor import (
     DEFAULT_MAX_TOKENS,
@@ -560,6 +568,15 @@ def _authorized_provider_names(providers: list[Any], auth_store: AuthStore) -> l
     ]
 
 
+def _report_provider_quarantine(providers: list[Any]) -> None:
+    notice = provider_quarantine_notice(providers)
+    if notice is not None:
+        print(f"cambium: WARNING: {notice}", file=sys.stderr)
+    quarantine_path = all_providers_quarantined_path(providers)
+    if quarantine_path is not None:
+        raise ValueError(f"all providers quarantined to {quarantine_path}; fix or remove entries")
+
+
 def _resolve_provider(
     config: OneShotConfig,
     repo: Path,
@@ -594,6 +611,7 @@ def _resolve_provider(
             providers = load_providers(config_path)
         except (OSError, ProviderSelectionError, ValueError) as exc:
             raise ValueError(f"provider selection failed: {exc}") from exc
+        _report_provider_quarantine(providers)
         store = auth_store if auth_store is not None else AuthStore()
         authorized = _authorized_provider_names(providers, store)
         codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
@@ -647,6 +665,7 @@ def _resolve_provider(
     config_path = _provider_config_path(config, repo)
     try:
         providers = load_providers(config_path)
+        _report_provider_quarantine(providers)
         if config.provider is None and config.model is not None:
             matching = [
                 candidate

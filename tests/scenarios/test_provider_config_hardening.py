@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,16 @@ def _assert_config_error(path: Path, match: str) -> None:
     assert type(raised.value) is ValueError
 
 
+def _assert_quarantined(path: Path, match: str) -> None:
+    # Policy change: entry schema failures no longer take down the whole
+    # config; the offending entry is retained in the sidecar for repair.
+    assert load_providers(path) == []
+    sidecar = path.with_name(path.name + ".quarantine")
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert isinstance(records, list) and len(records) == 1
+    assert re.search(match, str(records[0]["reason"]))
+
+
 @pytest.mark.parametrize(
     ("missing", "match"),
     [
@@ -39,13 +50,13 @@ def _assert_config_error(path: Path, match: str) -> None:
         ("api_key_env", r"providers\[0\]: missing required field\(s\): api_key_env"),
     ],
 )
-def test_missing_required_provider_fields_fail_closed(
+def test_missing_required_provider_fields_are_quarantined(
     tmp_path: Path, missing: str, match: str
 ) -> None:
     value = _provider()
     del value[missing]
 
-    _assert_config_error(_write(tmp_path / "providers.json", {"providers": [value]}), match)
+    _assert_quarantined(_write(tmp_path / "providers.json", {"providers": [value]}), match)
 
 
 def test_missing_root_providers_field_fails_closed(tmp_path: Path) -> None:
@@ -55,8 +66,25 @@ def test_missing_root_providers_field_fails_closed(tmp_path: Path) -> None:
     )
 
 
-def test_unknown_auth_mode_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("providers", [None, {}, "not-a-list", 1])
+def test_providers_field_not_list_remains_structural_failure(
+    tmp_path: Path, providers: object
+) -> None:
     _assert_config_error(
+        _write(tmp_path / "providers.json", {"providers": providers}),
+        r"providers: must be a list",
+    )
+
+
+def test_invalid_json_remains_structural_failure(tmp_path: Path) -> None:
+    path = tmp_path / "providers.json"
+    path.write_text("{not-json", encoding="utf-8")
+
+    _assert_config_error(path, r"invalid provider config JSON")
+
+
+def test_unknown_auth_mode_is_quarantined(tmp_path: Path) -> None:
+    _assert_quarantined(
         _write(tmp_path / "providers.json", {"providers": [_provider(auth="unknown")]}),
         r"providers\[0\]\.auth: invalid auth mode 'unknown'; expected api_key, codex_chatgpt",
     )
@@ -80,11 +108,11 @@ def test_non_object_root_fails_closed(tmp_path: Path, document: object) -> None:
     )
 
 
-def test_empty_provider_name_fails_closed(tmp_path: Path) -> None:
+def test_empty_provider_name_is_quarantined(tmp_path: Path) -> None:
     value = _provider()
     value["name"] = ""
 
-    _assert_config_error(
+    _assert_quarantined(
         _write(tmp_path / "providers.json", {"providers": [value]}),
         r"providers\[0\]\.name: must be a valid provider id",
     )
@@ -103,8 +131,8 @@ def test_empty_provider_name_fails_closed(tmp_path: Path) -> None:
         "https://[::1",
     ],
 )
-def test_bad_base_url_shapes_fail_closed(tmp_path: Path, base_url: str) -> None:
-    _assert_config_error(
+def test_bad_base_url_shapes_are_quarantined(tmp_path: Path, base_url: str) -> None:
+    _assert_quarantined(
         _write(
             tmp_path / "providers.json",
             {"providers": [_provider(base_url=base_url)]},
@@ -120,8 +148,8 @@ def test_bad_base_url_shapes_fail_closed(tmp_path: Path, base_url: str) -> None:
         "https://api.example.test/v1#fragment",
     ],
 )
-def test_base_url_query_and_fragment_fail_closed(tmp_path: Path, base_url: str) -> None:
-    _assert_config_error(
+def test_base_url_query_and_fragment_are_quarantined(tmp_path: Path, base_url: str) -> None:
+    _assert_quarantined(
         _write(
             tmp_path / "providers.json",
             {"providers": [_provider(base_url=base_url)]},
@@ -130,8 +158,8 @@ def test_base_url_query_and_fragment_fail_closed(tmp_path: Path, base_url: str) 
     )
 
 
-def test_unknown_provider_fields_are_rejected(tmp_path: Path) -> None:
-    _assert_config_error(
+def test_unknown_provider_fields_are_quarantined(tmp_path: Path) -> None:
+    _assert_quarantined(
         _write(
             tmp_path / "providers.json",
             {"providers": [_provider(unexpected="reject-me")]},

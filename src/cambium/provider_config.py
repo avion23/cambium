@@ -1,4 +1,8 @@
-"""Strict, env-keyed provider configuration loading for Diffundo.
+"""Env-keyed provider configuration loading for Diffundo.
+
+File/document structure remains strict, while individual invalid provider
+entries are quarantined to a sidecar so one typo does not disable every
+provider.
 
 Provider entries carry a tagged ``auth``/``protocol`` mode: the legacy
 ``api_key`` + ``chat_completions`` pair is unchanged, and ``codex_chatgpt``
@@ -19,14 +23,17 @@ never reads the environment or a key value.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 from urllib.parse import urlparse
 
 from .auth import effective_home, validate_derived_env_name, validate_provider_id
@@ -34,6 +41,9 @@ from .provider_scheduler import BillingMode, CacheCapability, QuotaWindowSpec
 
 if TYPE_CHECKING:
     from .diffundo import ProviderConfig, ProviderTier
+
+
+logger = logging.getLogger(__name__)
 
 
 class AuthMode(Enum):
@@ -206,6 +216,21 @@ class _ProviderMapping(TypedDict):
     cache_capability: CacheCapability
 
 
+class _LoadedProviders(list[Any]):
+    """List-compatible provider result carrying quarantine metadata."""
+
+    def __init__(
+        self,
+        providers: Sequence[object],
+        *,
+        quarantine_path: Path | None,
+        quarantined_count: int,
+    ) -> None:
+        super().__init__(providers)
+        self._quarantine_path = quarantine_path
+        self._quarantined_count = quarantined_count
+
+
 DEFAULT_SAMPLE: dict[str, list[dict[str, object]]] = {
     "providers": [
         {
@@ -263,6 +288,141 @@ class ProviderEnvSpec:
 
 def _error(location: str, message: str) -> ValueError:
     return ValueError(f"provider config {location}: {message}")
+
+
+def _config_path(source: str | Path | None) -> Path:
+    if source is None:
+        configured = os.environ.get("CAMBIUM_PROVIDERS")
+        return Path(configured) if configured else DEFAULT_PROVIDER_PATH
+    return Path(source)
+
+
+def provider_quarantine_path(source: str | Path) -> Path:
+    """Return the sidecar path used for invalid entries from ``source``."""
+
+    path = Path(source)
+    return path.with_name(path.name + ".quarantine")
+
+
+def _quarantine_record(entry: object, reason: str) -> dict[str, object]:
+    return {
+        "entry": entry,
+        "reason": reason,
+        "quarantined_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _quarantine_record_key(record: object) -> tuple[str, str] | None:
+    if not isinstance(record, dict):
+        return None
+    reason = record.get("reason")
+    if not isinstance(reason, str):
+        return None
+    try:
+        entry = json.dumps(
+            record.get("entry"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        return None
+    return entry, reason
+
+
+def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Path | None:
+    """Merge newly quarantined entries into the source's JSON-list sidecar."""
+
+    if not records:
+        return None
+    path = provider_quarantine_path(source)
+    existing: list[object] = []
+    if path.exists():
+        if not path.is_file():
+            raise OSError(f"provider quarantine path is not a file: {path}")
+        try:
+            existing_raw = json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_pairs,
+                parse_constant=_reject_non_standard_constant,
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid provider quarantine JSON in {path}: {exc}") from exc
+        if not isinstance(existing_raw, list):
+            raise ValueError(f"provider quarantine file {path}: must be a list")
+        existing = existing_raw
+
+    existing_keys = {key for item in existing if (key := _quarantine_record_key(item)) is not None}
+    # Loading provider specs and then full providers is common (doctor does
+    # both). Avoid repeating records already persisted by the earlier load.
+    additions = [
+        record
+        for record in records
+        if (key := _quarantine_record_key(record)) is None or key not in existing_keys
+    ]
+    if not additions:
+        return path
+
+    payload = json.dumps([*existing, *additions], ensure_ascii=False, indent=2) + "\n"
+    temporary_name: str | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+    return path
+
+
+def _log_quarantine(
+    source: Path, quarantine_path: Path, records: Sequence[dict[str, object]]
+) -> None:
+    logger.warning(
+        "provider config warning: quarantined %d invalid provider entr%s to %s",
+        len(records),
+        "y" if len(records) == 1 else "ies",
+        quarantine_path,
+        extra={
+            "event": "provider_config_quarantined",
+            "config_path": str(source),
+            "quarantine_path": str(quarantine_path),
+            "quarantined_count": len(records),
+            "reasons": tuple(
+                reason for record in records if isinstance(reason := record.get("reason"), str)
+            ),
+        },
+    )
+
+
+def provider_quarantine_notice(providers: Sequence[object]) -> str | None:
+    """Return a content-free warning for a load that quarantined entries."""
+
+    count = getattr(providers, "_quarantined_count", 0)
+    path = getattr(providers, "_quarantine_path", None)
+    if not isinstance(count, int) or count <= 0 or not isinstance(path, Path):
+        return None
+    noun = "entry" if count == 1 else "entries"
+    return (
+        f"quarantined {count} invalid provider {noun} to {path}; "
+        "valid provider entries remain available"
+    )
+
+
+def all_providers_quarantined_path(providers: Sequence[object]) -> Path | None:
+    """Return the sidecar path when a load produced no live providers."""
+
+    path = getattr(providers, "_quarantine_path", None)
+    count = getattr(providers, "_quarantined_count", 0)
+    if not providers and isinstance(count, int) and count > 0 and isinstance(path, Path):
+        return path
+    return None
 
 
 def _require_string(value: object, location: str) -> str:
@@ -654,9 +814,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
             interactive_wall_budget_value, f"{location}.interactive_wall_budget_s"
         )
         if interactive_wall_budget_s <= 0:
-            raise _error(
-                f"{location}.interactive_wall_budget_s", "must be greater than 0"
-            )
+            raise _error(f"{location}.interactive_wall_budget_s", "must be greater than 0")
     quality_weight = _require_number(values["quality_weight"], f"{location}.quality_weight")
     if throughput_hint_tps < 0 or quality_weight < 0:
         raise _error(location, "throughput_hint_tps and quality_weight must be non-negative")
@@ -753,7 +911,12 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
     }
 
 
-def _validated_provider_mappings(raw: object) -> list[_ProviderMapping]:
+def _validated_provider_mappings(
+    raw: object,
+    *,
+    source: Path | None = None,
+    quarantined: list[dict[str, object]] | None = None,
+) -> list[_ProviderMapping]:
     if not isinstance(raw, dict):
         raise _error("root", "must be an object with a 'providers' field")
 
@@ -767,11 +930,31 @@ def _validated_provider_mappings(raw: object) -> list[_ProviderMapping]:
     if not isinstance(entries, list):
         raise _error("providers", "must be a list")
 
+    # Duplicate names are a document-level invariant and remain fatal even if
+    # one of the duplicate entries would otherwise be quarantined.
+    names_by_value: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        if name in names_by_value:
+            raise _error(f"providers[{index}].name", f"duplicate provider name {name!r}")
+        names_by_value[name] = index
+
     mappings: list[_ProviderMapping] = []
     names: set[str] = set()
     env_names: dict[str, str] = {}
+    records = quarantined if quarantined is not None else []
     for index, entry in enumerate(entries):
-        mapping = _validate_provider_mapping(entry, index)
+        try:
+            mapping = _validate_provider_mapping(entry, index)
+        except ValueError as exc:
+            if source is None:
+                raise
+            records.append(_quarantine_record(entry, str(exc)))
+            continue
         name = mapping["name"]
         if not isinstance(name, str):  # _validate_provider_mapping guarantees this.
             raise TypeError("validated provider name is not a string")
@@ -792,6 +975,10 @@ def _validated_provider_mappings(raw: object) -> list[_ProviderMapping]:
                 )
             env_names[env_name] = name
         mappings.append(mapping)
+    if source is not None and records:
+        quarantine_path = _append_quarantine(source, records)
+        if quarantine_path is not None:
+            _log_quarantine(source, quarantine_path, records)
     return mappings
 
 
@@ -868,11 +1055,7 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
 
 
 def _read_config(source: str | Path | None) -> object:
-    if source is None:
-        configured = os.environ.get("CAMBIUM_PROVIDERS")
-        path = Path(configured) if configured else DEFAULT_PROVIDER_PATH
-    else:
-        path = Path(source)
+    path = _config_path(source)
 
     if not path.is_file():
         raise FileNotFoundError(
@@ -913,23 +1096,41 @@ def _reject_non_standard_constant(value: object) -> object:
 def load_provider_specs(source: str | Path | None = None) -> tuple[ProviderEnvSpec, ...]:
     """Load and validate provider environment metadata without Diffundo."""
 
-    return validate_provider_specs(_read_config(source))
+    path = _config_path(source)
+    records: list[dict[str, object]] = []
+    mappings = _validated_provider_mappings(_read_config(path), source=path, quarantined=records)
+    return tuple(
+        ProviderEnvSpec(
+            name=mapping["name"],
+            api_key_env=mapping["api_key_env"],
+            required=mapping["required"],
+        )
+        for mapping in mappings
+    )
 
 
 def load_providers(source: str | Path | None = None) -> list[ProviderConfig]:
-    """Load and strictly validate providers from a JSON configuration file.
+    """Load providers, quarantining invalid entries from a JSON config file.
 
     ``source`` overrides ``CAMBIUM_PROVIDERS``. With neither set, the loader
     reads :data:`DEFAULT_PROVIDER_PATH`, under the effective user's home. The
     presence of each ``api_key_env`` variable is intentionally not checked;
-    Diffundo resolves key values at call time.
+    Diffundo resolves key values at call time. File-level and document-level
+    structural errors remain fatal; individual provider schema errors are
+    recorded in ``<source>.quarantine`` and omitted from the returned list.
     """
-    mappings = _validated_provider_mappings(_read_config(source))
+    path = _config_path(source)
+    records: list[dict[str, object]] = []
+    mappings = _validated_provider_mappings(_read_config(path), source=path, quarantined=records)
     providers: list[ProviderConfig] = []
     for index, mapping in enumerate(mappings):
         providers.append(_provider_from_values(mapping, index))
 
-    return providers
+    return _LoadedProviders(
+        providers,
+        quarantine_path=provider_quarantine_path(path) if records else None,
+        quarantined_count=len(records),
+    )
 
 
 class ProviderSelectionError(ValueError):
@@ -952,6 +1153,11 @@ def select_provider(
     decision is pure: it reads only validated config fields and never the
     environment or a secret value.
     """
+    quarantine_path = all_providers_quarantined_path(providers)
+    if quarantine_path is not None:
+        raise ProviderSelectionError(
+            f"all providers quarantined to {quarantine_path}; fix or remove entries"
+        )
     if name is not None:
         for provider in providers:
             if provider.name != name:
@@ -1001,10 +1207,13 @@ __all__ = [
     "Protocol",
     "ProviderEnvSpec",
     "ProviderSelectionError",
+    "all_providers_quarantined_path",
     "env_report",
     "is_loopback_host",
     "load_provider_specs",
     "load_providers",
+    "provider_quarantine_notice",
+    "provider_quarantine_path",
     "select_provider",
     "validate_provider_specs",
 ]

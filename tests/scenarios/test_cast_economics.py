@@ -75,14 +75,19 @@ def test_provider_config_loads_nested_cache_capability(tmp_path: Path) -> None:
     )
 
 
-def test_provider_config_rejects_unknown_cache_capability_field(tmp_path: Path) -> None:
+def test_provider_config_quarantines_unknown_cache_capability_field(tmp_path: Path) -> None:
     path = _write(
         tmp_path / "providers.json",
         _provider(cache={"minimum_cacheable_tokens": 1, "unexpected": True}),
     )
 
-    with pytest.raises(ValueError, match="unknown cache-capability field"):
-        load_providers(path)
+    # Policy change: an invalid provider entry is quarantined while unrelated
+    # provider entries remain loadable; the validator rule is unchanged.
+    assert load_providers(path) == []
+    sidecar = path.with_name(path.name + ".quarantine")
+    records = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert len(records) == 1
+    assert "unknown cache-capability field" in records[0]["reason"]
 
 
 def test_rollover_decision_compares_write_with_expired_cache_reads() -> None:
