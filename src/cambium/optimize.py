@@ -1082,6 +1082,10 @@ def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any
         raise OptimizeError(f"provider selection failed: {exc}") from exc
 
     options: dict[str, Any] = {"primary_provider": selected.name}
+    # Deliberately NO model pin on the LM: pinning selected.model collapses
+    # Diffundo candidates to exactly that provider (strict-model match), so a
+    # dead primary kills optimization even when same-tier alternatives are
+    # healthy. Selection still drives the primary hint and OAuth credentials.
     if selected.auth is AuthMode.CODEX_CHATGPT:
         from cambium.oauth import OAuthError, TokenManager
 
@@ -1098,10 +1102,12 @@ def _construct_lm(tier_name: str, budget_usd: float, ledger: _CostLedger) -> Any
 
     router = Diffundo(providers, **options)
     tracked = _TrackingDiffundo(router, ledger)
+    # No model pin: pinning selected.model collapses Diffundo candidates to
+    # exactly that provider (strict-model match), so a dead primary kills
+    # optimization even when same-tier alternatives are healthy.
     return CambiumLM(
         tracked,
         tier,
-        model=selected.model or None,
         budget_usd=budget_usd,
     )
 
