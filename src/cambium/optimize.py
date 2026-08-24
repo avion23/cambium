@@ -1052,7 +1052,52 @@ def write_artifact(module_name, program, lm, report) -> Path:
     return module_dir
 
 
-def _load_dataset_loader(manifest: object) -> object:
+class _SingleFileDatasetLoader:
+    """Expose a reviewed JSONL queue as the module loader's split interface."""
+
+    def __init__(self, loader: object, path: Path) -> None:
+        self.path = path
+        self.datasets_dir = path.parent
+        load = getattr(loader, "load", None)
+        if not callable(load):
+            raise OptimizeError("explicit dataset loader does not provide load()")
+        examples = list(load())
+        try:
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError) as exc:
+            raise OptimizeError(f"could not read explicit dataset {path}: {exc}") from exc
+        if len(records) != len(examples):
+            raise OptimizeError(f"explicit dataset {path} changed while it was being read")
+        self._splits: dict[str, list[Example]] = {"train": [], "eval": [], "canaries": []}
+        for record, example in zip(records, examples, strict=True):
+            if not isinstance(record, dict):
+                raise OptimizeError(f"explicit dataset {path} contains a non-object record")
+            split = record.get("split", "train")
+            if not isinstance(split, str):
+                raise OptimizeError(f"explicit dataset {path} has a non-string split")
+            split = split.casefold()
+            if split == "val":
+                split = "eval"
+            if split not in self._splits:
+                raise OptimizeError(f"explicit dataset {path} has unknown split {split!r}")
+            if getattr(example, "canary", False):
+                split = "canaries"
+            self._splits[split].append(example)
+
+    def load_split(self, split: object) -> list[Example]:
+        name = getattr(split, "value", getattr(split, "name", ""))
+        name = str(name).casefold()
+        if name not in self._splits:
+            raise DatasetError(f"explicit dataset loader has no split {name!r}")
+        return list(self._splits[name])
+
+
+def _load_dataset_loader(manifest: object, dataset_path: Path | None = None) -> object:
+    """Construct the module loader for its packaged or explicit dataset."""
     package_target = getattr(manifest, "cli_module", "")
     if not isinstance(package_target, str) or not package_target:
         raise OptimizeError("manifest cli_module is required to load the dataset")
@@ -1073,8 +1118,13 @@ def _load_dataset_loader(manifest: object) -> object:
         (candidate for candidate in candidates if candidate.__name__ == "ExampleDatasetLoader"),
         candidates[0],
     )
+    if dataset_path is None:
+        dataset_path = Path(cast(ModuleManifest, manifest).package_dir) / "datasets"
     try:
-        return loader_class(Path(cast(ModuleManifest, manifest).package_dir) / "datasets")
+        loader = loader_class(dataset_path)
+        if dataset_path.is_file():
+            return _SingleFileDatasetLoader(loader, dataset_path)
+        return loader
     except (OSError, ValueError) as exc:
         raise OptimizeError(f"could not construct dataset loader: {exc}") from exc
 
@@ -1269,6 +1319,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tier", default="fast")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dataset", type=Path, metavar="PATH")
     candidate_source = parser.add_mutually_exclusive_group()
     candidate_source.add_argument(
         "--include-transcript-candidates",
@@ -1388,23 +1439,30 @@ def _run(argv=None) -> int:
             )
         program_class = load_program_class(manifest)
         if not use_transcript_candidates:
-            loader = _load_dataset_loader(manifest)
+            if args.dataset is None:
+                loader = _load_dataset_loader(manifest)
+            else:
+                loader = _load_dataset_loader(manifest, args.dataset)
         baseline_means = _baseline_means(manifest)
         lm = _construct_lm(args.tier, args.budget_usd, ledger)
         program = program_class(lm)
-        if args.optimizer == "gepa":
-            train_examples, val_examples = build_trainsets(
-                loader,
-                seed=args.seed,
-                val_fraction=_GEPA_VAL_FRACTION,
-            )
-            if len(train_examples) + len(val_examples) < _GEPA_MIN_DATASET_SIZE:
-                raise OptimizeError(
-                    "GEPA requires more reviewed data: at least 4 non-canary records "
-                    "are required for a train/validation split"
-                )
+        if args.dataset is not None:
+            train_examples = _load_split(loader, "TRAIN")
+            val_examples = _load_split(loader, "EVAL")
         else:
-            train_examples, val_examples = build_trainsets(loader, seed=args.seed)
+            if args.optimizer == "gepa":
+                train_examples, val_examples = build_trainsets(
+                    loader,
+                    seed=args.seed,
+                    val_fraction=_GEPA_VAL_FRACTION,
+                )
+                if len(train_examples) + len(val_examples) < _GEPA_MIN_DATASET_SIZE:
+                    raise OptimizeError(
+                        "GEPA requires more reviewed data: at least 4 non-canary records "
+                        "are required for a train/validation split"
+                    )
+            else:
+                train_examples, val_examples = build_trainsets(loader, seed=args.seed)
         if use_transcript_candidates:
             frozen_examples = [
                 *train_examples,

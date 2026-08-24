@@ -119,6 +119,57 @@ def test_unified_supervisor_forwards_demo_and_warm_pool(monkeypatch, tmp_path: P
     ]
 
 
+def test_unified_optimize_forwards_dataset_and_optimizer_options(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from cambium import optimize
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        optimize,
+        "main",
+        lambda argv=None: calls.append(list(argv or [])) or 23,
+    )
+    dataset = tmp_path / "train_queue.jsonl"
+
+    assert (
+        cli.main(
+            [
+                "optimize",
+                "should_decompose",
+                "--optimizer",
+                "bootstrap",
+                "--budget-usd",
+                "5.00",
+                "--seed",
+                "7",
+                "--tier",
+                "fast",
+                "--dry-run",
+                "--dataset",
+                str(dataset),
+            ]
+        )
+        == 23
+    )
+    assert calls == [
+        [
+            "should_decompose",
+            "--optimizer",
+            "bootstrap",
+            "--budget-usd",
+            "5.0",
+            "--seed",
+            "7",
+            "--tier",
+            "fast",
+            "--dry-run",
+            "--dataset",
+            str(dataset),
+        ]
+    ]
+
+
 def test_removed_context_reuse_option_is_not_in_run_help(capsys) -> None:
     with pytest.raises(SystemExit) as raised:
         cli.main(["run", "--help"])
