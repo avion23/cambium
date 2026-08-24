@@ -284,6 +284,7 @@ _QUARANTINE_SECRET_KEY_RE = re.compile(
 )
 _QUARANTINE_LONG_ALNUM_RE = re.compile(r"[A-Za-z0-9]{60,}")
 _QUARANTINE_SECRET_PREFIXES = ("sk-", "ghp_", "AKIA")
+_QUARANTINE_MARKER_RE = re.compile(r"<(?:redacted:\d+|oversized: \d+ bytes)>")
 
 
 def is_loopback_host(hostname: str) -> bool:
@@ -325,6 +326,8 @@ def _quarantine_byte_length(value: str) -> int:
 
 
 def _quarantine_string(value: str, key: str | None) -> str:
+    if _QUARANTINE_MARKER_RE.fullmatch(value) is not None:
+        return value
     secret_key = key is not None and _QUARANTINE_SECRET_KEY_RE.search(key) is not None
     secret_shape = value.startswith(_QUARANTINE_SECRET_PREFIXES) or (
         _QUARANTINE_LONG_ALNUM_RE.search(value) is not None
@@ -473,6 +476,17 @@ def _quarantine_json_bytes(value: object, *, indent: int | None = None) -> bytes
 
 
 def _quarantine_record(entry: object, reason: str) -> dict[str, object]:
+    safe_entry = _bounded_quarantine_entry(entry)
+    return {
+        "entry": safe_entry,
+        "reason": reason,
+        "quarantined_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _bounded_quarantine_entry(entry: object) -> object:
+    """Sanitize an entry and replace an over-large serialized copy with a stub."""
+
     safe_entry = _sanitize_quarantine_entry(entry)
     try:
         serialized_entry = _quarantine_json_bytes(safe_entry)
@@ -481,11 +495,17 @@ def _quarantine_record(entry: object, reason: str) -> dict[str, object]:
         serialized_entry = _quarantine_json_bytes(safe_entry)
     if len(serialized_entry) > MAX_QUARANTINE_RECORD_BYTES:
         safe_entry = f"<oversized: {len(serialized_entry)} bytes>"
-    return {
-        "entry": safe_entry,
-        "reason": reason,
-        "quarantined_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-    }
+    return safe_entry
+
+
+def _sanitize_quarantine_record(record: dict[str, object]) -> dict[str, object]:
+    """Return a safe copy of a record while preserving its reason verbatim."""
+
+    if "entry" not in record:
+        return dict(record)
+    safe_record = dict(record)
+    safe_record["entry"] = _bounded_quarantine_entry(record["entry"])
+    return safe_record
 
 
 def _quarantine_record_key(record: object) -> tuple[str, str] | None:
@@ -586,12 +606,17 @@ def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Pa
     existing, sidecar_limited = _read_quarantine_sidecar(path)
     if sidecar_limited:
         return path
+    existing = [
+        _sanitize_quarantine_record(item) if isinstance(item, dict) else item
+        for item in existing
+    ]
+    safe_records = tuple(_sanitize_quarantine_record(record) for record in records)
 
     existing_keys = {key for item in existing if (key := _quarantine_record_key(item)) is not None}
     # Loading provider specs and then full providers is common (doctor does
     # both). Avoid repeating records already persisted by the earlier load.
     additions: list[dict[str, object]] = []
-    for record in records:
+    for record in safe_records:
         key = _quarantine_record_key(record)
         if key is None or key not in existing_keys:
             additions.append(record)
