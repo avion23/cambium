@@ -183,6 +183,26 @@ train/eval/canary data, split metrics, and a JSON CLI with `decide` and
 The tracked source does not contain `worker_pool.py`, `events.py`, or `dlq.py`.
 Do not use those names as current architecture components.
 
+### Optimization
+
+The direct `python -m cambium.optimize` driver offers the three optimizer
+choices `zero`, `bootstrap`, and `gepa`. GEPA calls `build_trainsets` with a
+seeded shuffle and `_GEPA_VAL_FRACTION = 0.3`, producing a deterministic
+approximately 70/30 train/held-out validation split while leaving at least one
+training record. It requires at least four reviewed, non-canary records and
+both resulting splits; otherwise `run_stage_gepa` raises the clear
+`OptimizeError` data error before compilation.
+
+`run_stage_gepa` passes the same Diffundo-backed reflection LM used by the
+program to `dspy.GEPA`, and `_CostLedger` bounds provider spending. The
+remaining ledger dollars become GEPA's `max_metric_calls`; every LM call is
+recorded by `_TrackingDiffundo`, and budget exhaustion writes the partial
+report with `budget_exhausted`. Completed reports include a `stage_gepa`
+section with train/evaluation means and any GEPA call, iteration, and full
+validation-evaluation counters exposed by the installed DSPy version. The
+top-level `cambium` wrapper currently advertises only `zero` and `bootstrap`,
+so the GEPA-capable entry point is the direct module command above.
+
 ### 1.1 Bounded CAST context policy and transactional fork joins
 
 `src/cambium/context_policy.py` defines `CastPolicy`, a bounded CAST/K0

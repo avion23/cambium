@@ -263,6 +263,21 @@ PYTHONPATH=src python -m pytest tests/acceptance/ -q
 
 ## DSPy trajectory extraction
 
+The direct optimizer driver supports `zero`, `bootstrap`, and `gepa`:
+
+```bash
+PYTHONPATH=src python -m cambium.optimize should_decompose \
+  --optimizer gepa \
+  --budget-usd 2 \
+  --seed 20260824
+```
+
+GEPA uses the seeded 70/30 train/validation policy, requires at least four
+reviewed non-canary records, spends through the per-run ledger, and records
+its scores under `stage_gepa` in the report. Use the direct module command for
+GEPA; the top-level `cambium optimize` wrapper currently accepts only
+`zero`/`bootstrap`.
+
 Extract redacted, deduplicated decision trajectories from an OpenCode SQLite
 database or storage directory. Point `--session-dir` at the OpenCode storage;
 the extractor is read-only and requires the source path explicitly:
