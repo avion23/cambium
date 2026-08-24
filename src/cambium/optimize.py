@@ -947,6 +947,7 @@ def run_stage_gepa(
             "records are required"
         )
 
+    _ensure_bootstrap_forward(program)
     if reflection_lm is None:
         reflection_lm = getattr(program, "_lm", None)
     if reflection_lm is None or not callable(reflection_lm):
