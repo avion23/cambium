@@ -1506,13 +1506,13 @@ class Diffundo:
     """Tiered provider router with a per-subagent primary association (D1).
 
     Per-instance state is limited to per-provider cooldown timers, circuit
-    breaker health, token buckets, per-tier pause events (architecture
-    §8.1/§9, D8f), and the task's primary provider association: one worker
-    process runs one task, so the router binds to one provider and keeps
-    sending the task's growing context to it, preserving per-provider
-    prompt-prefix caching. The association moves only when that provider
-    fails and a fallback serves. No attribute is a mutable mapping; there is
-    no response store anywhere.
+    breaker health, token buckets, terminal-death routing memory, per-tier
+    pause events (architecture §8.1/§9, D8f), and the task's primary provider
+    association: one worker process runs one task, so the router binds to one
+    provider and keeps sending the task's growing context to it, preserving
+    per-provider prompt-prefix caching. The association moves only when that
+    provider fails and a fallback serves. No attribute is a mutable mapping;
+    there is no response store anywhere.
     """
 
     def __init__(
@@ -1571,6 +1571,10 @@ class Diffundo:
         self._pinned_provider = self._primary_provider
         self._fallback_origin: str | None = None
         self._active_tier: ProviderTier | None = None
+        # Endpoint-death evidence is stronger than ordinary cooldown state for
+        # routing order. Keep it local to this router/process: a fresh Diffundo
+        # instance is the explicit recovery/probe boundary.
+        self._terminal_death_providers: frozenset[str] = frozenset()
         self._call_budget_s = call_budget_s
         if summary_call_budget_s is None:
             self._summary_call_budget_s = max(
@@ -1677,6 +1681,10 @@ class Diffundo:
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
+                    if exc.is_real_death:
+                        self._terminal_death_providers = (
+                            self._terminal_death_providers | {provider.name}
+                        )
                     tried.append(provider.name)
                     last_error = exc
                     if (
@@ -1851,6 +1859,7 @@ class Diffundo:
         self._pinned_provider = None
         self._fallback_origin = None
         self._active_tier = None
+        self._terminal_death_providers = frozenset()
 
     def _routing_request(
         self,
@@ -1969,6 +1978,13 @@ class Diffundo:
             if not runtime.bucket.has_token():
                 continue
             eligible.append(provider)
+        live = [
+            provider
+            for provider in eligible
+            if provider.name not in self._terminal_death_providers
+        ]
+        if live:
+            eligible = live
         if model is None:
             return self._order_candidates(eligible)
         strict = [provider for provider in eligible if provider.model == model]
