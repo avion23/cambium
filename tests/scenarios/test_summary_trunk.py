@@ -215,3 +215,19 @@ def test_summary_append_enforces_source_identity_and_progress() -> None:
     regressed = replace(entry, sequence=2, source_sha256="0" * 64, through_turn=2)
     with pytest.raises(SummaryTrunkError, match="through_turn.*monotonically"):
         append_summary_entry(trunk, regressed)
+
+
+def test_non_string_list_items_are_coerced_not_fatal() -> None:
+    """Regression: a model emitting an object in a list field killed compaction.
+
+    Live failure: 'summary entry verification_results[0] must be a string'
+    aborted the run.  Summary content is model-owned untrusted JSON; coerce
+    non-string items to canonical JSON text instead of failing recovery.
+    """
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    decoded = json.loads(_response(expectation, label="one"))
+    decoded["verification_results"] = [{"check": "unit tests", "ok": True}, 42]
+    entry = parse_summary_response(json.dumps(decoded), expectation)
+
+    assert entry.verification_results[0] == '{"check": "unit tests", "ok": true}'
+    assert entry.verification_results[1] == "42"

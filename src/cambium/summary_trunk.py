@@ -209,6 +209,22 @@ def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _coerced_summary_text(item: Any) -> Any:
+    """Coerce one untrusted summary item to text without losing information.
+
+    Summary CONTENT is model-owned JSON, so list items are occasionally
+    emitted as objects or numbers.  Compaction is recovery infrastructure:
+    coerce such items to their canonical JSON spelling instead of killing
+    the session.  Bounds and forbidden-marker checks still apply afterwards.
+    """
+    if isinstance(item, str):
+        return item
+    try:
+        return json.dumps(item, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return str(item)
+
+
 def _bounded_items(value: Any, field: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise SummaryTrunkError(f"summary entry {field} must be a list")
@@ -216,7 +232,8 @@ def _bounded_items(value: Any, field: str) -> tuple[str, ...]:
         raise SummaryTrunkError(f"summary entry {field} exceeds the item cap")
     items: list[str] = []
     for index, item in enumerate(value):
-        items.append(_bounded_text(item, f"{field}[{index}]"))
+        coerced = _coerced_summary_text(item)
+        items.append(_bounded_text(coerced, f"{field}[{index}]"))
     return tuple(items)
 
 
