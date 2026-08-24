@@ -15,7 +15,7 @@ provider-policy stack.
 | Per-call health, retry, cooldown, and cascade execution | `cambium.diffundo` | One router instance owns transport health and request-rate buckets |
 | Provider/model trunk affinity | `cambium.provider_scheduler.ProviderLease` | Immutable value bound once per semantic trunk |
 | Token/request quota reservations | `cambium.provider_scheduler.QuotaLedger` | SQLite transactions shared safely across processes |
-| Provider configuration | `cambium.provider_config` | Immutable validated records; secrets remain environment references |
+| Provider configuration | `cambium.provider_config` | Validated records with per-entry schema quarantine; document structure stays fatal; secrets remain environment references |
 | Cache/CAST policy | `cambium.provider_scheduler.CacheHorizonConfig` / `CastConfig` | Provider-neutral breakpoint and K0 rollover thresholds |
 | Supervisor lane reservations | `cambium.supervisor` | Session-owned counters around admitted tasks |
 
@@ -39,9 +39,11 @@ mailbox, or concurrency ownership. Admission belongs only to `routing.py`.
    to `selection.order_candidates`.
 5. The supervisor writes the chosen provider, model, and tier into the task
    specification and increments exactly that provider's lane.
-6. The worker receives a pinned assignment. Diffundo may order attempts only
-   inside that assignment's allowed provider set; a live root lease cannot move
-   to another provider or model.
+6. The worker receives a pinned assignment. Diffundo keeps that primary
+   association while it is live. Only terminal provider death can open a
+   fallback, and then only inside the authorized provider set; same-tier
+   candidates precede other tiers and the serving provider becomes the new
+   sticky association.
 7. Every provider call emits redacted usage evidence. The supervisor folds that
    evidence into `DebtStore`, and later admissions see the updated snapshot.
 8. The lane is released when the task leaves the worker phase, including
@@ -67,6 +69,35 @@ The following are feasibility checks, not weighted preferences:
 - malformed or unknown requirement fields fail closed.
 
 No score may reintroduce a provider removed by those checks.
+
+## Pinned-provider fallback
+
+One-shot resolution in `oneshot._resolve_provider` carries the selected
+provider as the pinned primary and hands the worker only the enabled,
+credential-ready authorization set. `Diffundo.call` may leave that pin only
+after the attempt has terminal endpoint-death evidence. The decision is the
+narrow `diffundo.ProviderError.is_real_death` predicate, not the broad
+"request failed" outcome:
+
+- `AUTH_ERROR` with HTTP 401, or with HTTP 403 after the classifier identifies
+  a key-level credential failure, is terminal for the pinned endpoint;
+- any HTTP 5xx response is terminal endpoint-unavailable evidence;
+- connection refusal/unreachable errors, DNS resolution failures, and TLS/SSL
+  handshake or certificate failures are terminal transport evidence.
+
+After terminal death, `_real_death_fallback_candidates` searches enabled,
+capability-compatible providers in the original tier first and then the other
+tiers, excluding providers already tried. A successful substitution records
+the serving provider and `fell_back_from` in the call/result provenance and
+keeps the new association for later calls; it does not bounce back to the
+dead pin or preserve the old model as an implicit requirement.
+
+429/quota pressure, including `Retry-After`, does not qualify. Neither do
+WAF/network-block 403s, model-entitlement/configuration 403s, policy/content
+refusals, malformed responses, or an ordinary timeout. Those paths retain the
+existing same-provider retry/cooldown, disable, or untouched-health behavior;
+they cannot cause a pinned provider to be replaced merely because a request
+failed.
 
 ## Ordering
 
@@ -122,7 +153,8 @@ classes:
 
 - invalid credentials -> `AUTH_ERROR`; disable the provider and quarantine the
   credential fingerprint. It is re-admitted only after the credential identity
-  changes;
+  changes, and a pinned run may use a fallback because 401/key-level 403 is
+  terminal endpoint evidence;
 - missing model entitlement -> `CONFIG_ERROR`; disable that provider/model
   configuration without treating it as bad credentials;
 - quota or billing exhaustion -> `QUOTA`; honor bounded reset/`Retry-After`
@@ -130,12 +162,18 @@ classes:
 - policy/content refusal -> `REFUSAL`; fail the request and leave provider
   health untouched;
 - WAF/browser/network block -> transient `ERROR` with bounded retry/cooldown;
-  it does not quarantine the credential.
+  it does not quarantine the credential or trigger pinned fallback;
+- HTTP 5xx -> `ERROR` with the response status retained as terminal
+  endpoint-unavailable evidence after the provider attempt's retry sequence;
+  this is the other HTTP class that can open pinned fallback.
 
-An unlabelled `403` remains fail-closed as authentication. `401` also
-quarantines authentication; network and 5xx failures receive bounded transient
-treatment, and malformed responses fail closed. The classification is retained
-in redacted usage/failure evidence, never in prompt or credential material.
+An unlabelled `403` remains fail-closed as authentication and therefore is
+terminal for pinned fallback. Network connection/DNS/TLS errors remain
+retryable `ERROR` attempts until their configured retry sequence is exhausted,
+then qualify as terminal transport evidence; ordinary timeouts instead retain
+the timeout/cooldown path. Malformed responses fail closed but are not terminal
+death. The classification is retained in redacted usage/failure evidence,
+never in prompt or credential material.
 
 ## Removed alternatives
 

@@ -57,12 +57,29 @@ one-task `run_session` adapter remains for compatibility. `EventStore` is
 the current event boundary; there is no current `events.py` or dead-letter
 queue module.
 
+The canonical root result written to `.cambium/result.json` is
+`results.Result`. Its JSON record includes the serving `provider` and the
+optional `fell_back_from` origin, so a terminal-death provider substitution is
+visible in the durable result rather than only in the event stream.
+
 The supervisor gives each worker a bounded decoded-stdout `asyncio.Queue` and
 routes worker and runtime records through `EventStore`'s bounded writer queue.
 Worker stdout remains protocol-only NDJSON; diagnostics use stderr/logging.
 Non-critical store records can be dropped under the store overflow policy.
 
 ### Worker and providers
+
+`provider_config.load_providers` keeps the provider document boundary strict but
+quarantines an invalid entry instead of discarding the whole file. Each dropped
+entry is recorded as `{"entry", "reason", "quarantined_at"}` in the
+`<config>.quarantine` JSON sidecar; writes merge-deduplicate by canonical entry
+and reason, and the loader emits a warning (the one-shot path prints it to
+stderr). Valid entries continue to load.
+Malformed JSON, invalid root structure, unknown root fields, duplicate provider
+names, and provider-environment collisions remain fatal structural errors. If
+every entry is quarantined, the loader returns a list-compatible empty provider
+set; `select_provider` and the one-shot resolver fail with the sidecar path so
+the operator gets a repairable error rather than an unexplained empty cascade.
 
 `worker.do_work` selects one of two explicit modes:
 
@@ -105,6 +122,16 @@ defaults to `~/.config/cambium/routing-state.json` when no path is supplied.
 Interactive wall budgets use explicit configuration when supplied and can
 otherwise scale from provider throughput hints and measured branch usage with a
 safety factor.
+
+A pinned one-shot provider remains the task's primary association until
+`Diffundo.ProviderError.is_real_death` reports terminal evidence: key-level
+HTTP 401/403 authentication failure, HTTP 5xx endpoint failure, or a terminal
+connection, DNS, or TLS/SSL transport failure. 429/quota pressure and other
+transient outcomes retain their retry, cooldown, disable, or refusal semantics
+and do not trigger this pinned-provider fallback. When terminal death is
+established, authorized fallback candidates are tried in the same tier before
+other tiers; once one serves, the router records the original provider and
+stays with the serving association rather than bouncing back.
 
 `provider_scheduler.py` owns the provider-neutral `CacheHorizonConfig` and
 `CastConfig` values. `summary_trunk.py` compiles immutable semantic history into
@@ -155,6 +182,47 @@ train/eval/canary data, split metrics, and a JSON CLI with `decide` and
 
 The tracked source does not contain `worker_pool.py`, `events.py`, or `dlq.py`.
 Do not use those names as current architecture components.
+
+### Optimization
+
+The direct `python -m cambium.optimize` driver offers the three optimizer
+choices `zero`, `bootstrap`, and `gepa`. GEPA calls `build_trainsets` with a
+seeded shuffle and `_GEPA_VAL_FRACTION = 0.3`, producing a deterministic
+approximately 70/30 train/held-out validation split while leaving at least one
+training record. It requires at least four reviewed, non-canary records and
+both resulting splits; otherwise `run_stage_gepa` raises the clear
+`OptimizeError` data error before compilation.
+
+`run_stage_gepa` passes the same Diffundo-backed reflection LM used by the
+program to `dspy.GEPA`, and `_CostLedger` bounds provider spending. The
+remaining ledger dollars become GEPA's `max_metric_calls`; every LM call is
+recorded by `_TrackingDiffundo`, and budget exhaustion writes the partial
+report with `budget_exhausted`. Completed reports include a `stage_gepa`
+section with train/evaluation means and any GEPA call, iteration, and full
+validation-evaluation counters exposed by the installed DSPy version. The
+top-level `cambium` wrapper currently advertises only `zero` and `bootstrap`,
+so the GEPA-capable entry point is the direct module command above.
+
+Training data has two read-only extraction paths. `cambium.opencode` accepts
+explicit OpenCode SQLite databases or storage directories, discovers only
+databases with the `session`/`project`/`message`/`part` schema, and extracts
+explicit visible decision/rationale pairs after redaction and canonical-pair
+deduplication. `scripts/extract_pi.py` recursively scans pi session `*.jsonl`
+files and emits redacted, inferred candidates with count-only outcome evidence;
+the inferred label is always review-required and the script does not copy
+assistant or tool output into the candidate record.
+
+The OpenCode `--review-gate` output and every pi candidate file are queues, not
+training data: their records carry `candidate: true`, `redacted: true`, and
+`review_status: "needs_review"`. `_reviewed_transcript_records` admits only
+explicitly approved records, ignores `rejected`/`excluded` records, and fails
+closed on pending or unknown statuses; transcript candidates are opt-in via
+`--include-transcript-candidates` or `--transcript-candidates PATH`, and a
+candidate file may not contain a canary. The committed reviewed snapshot
+`artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` contains
+34 approved records: 24 marked `train` and 10 marked `val`. It is pipeline
+state, not an implicit module dataset; the optimizer consumes a candidate file
+only when one of those opt-in flags is supplied.
 
 ### 1.1 Bounded CAST context policy and transactional fork joins
 
@@ -283,6 +351,7 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
 | Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `src/cambium/code_index.py`, `src/cambium/lsp_query.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `search_symbols` (symbol search), `find_references` (references), `read_symbol` (bounded source window), and `query_lsp` (LSP queries) are wired into `TOOL_SCHEMAS` and `run_tool`; `run_python` holds a `python` permission key separate from shell; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
+| Optimization/training data | `src/cambium/optimize.py`, `src/cambium/opencode.py`, `scripts/extract_pi.py`, `artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` | Zero-shot/bootstrap/GEPA driver, read-only OpenCode/pi extraction, review-gated candidate admission, and the 34-record reviewed snapshot |
 
 Any target moves to current only after a caller and focused failure test
 demonstrate it. Keep public names and status mappings stable once a host API is
