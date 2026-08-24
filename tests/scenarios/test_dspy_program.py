@@ -11,11 +11,9 @@ from typing import Any
 from cambium.modules.base import Example
 from cambium.modules.example.decide import Decision, DecomposeOutput, TaskInput
 from cambium.modules.example.dspy_program import ShouldDecomposeModuleDSPy
-from cambium.modules.should_review.decide import (
-    Decision as ReviewDecision,
-    ReviewOutput,
-    TaskInput as ReviewTaskInput,
-)
+from cambium.modules.should_review.decide import Decision as ReviewDecision
+from cambium.modules.should_review.decide import ReviewOutput
+from cambium.modules.should_review.decide import TaskInput as ReviewTaskInput
 from cambium.modules.should_review.dspy_program import ShouldReviewModuleDSPy
 
 PROGRAM_PATH = (

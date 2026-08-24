@@ -236,14 +236,13 @@ def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise SummaryTrunkError(f"summary entry {field} must be a string")
     try:
-        encoded = value.encode("utf-8")
+        value.encode("utf-8")
     except UnicodeEncodeError:
         # Model-owned JSON can contain lone UTF-16 surrogates even though the
         # surrounding response is otherwise valid.  Keep compaction alive by
         # retaining the code point's printable escape rather than letting the
         # filesystem/provider boundary see an unencodable string.
         value = value.encode("utf-8", errors="backslashreplace").decode("ascii")
-        encoded = value.encode("utf-8")
     if not allow_empty and not value.strip():
         raise SummaryTrunkError(f"summary entry {field} must be non-empty")
     for marker in _SUMMARY_FORBIDDEN_MARKERS:
