@@ -2723,6 +2723,8 @@ class _Runtime:
         parent_spec: dict[str, Any],
         proposal: dict[str, Any],
         parent_envelope: dict[str, Any],
+        *,
+        private_integration_base: str | None = None,
     ) -> list[str]:
         """Validate one child revision, record it durably, then spawn it.
 
@@ -2776,6 +2778,11 @@ class _Runtime:
             return []
         try:
             child_spec = _child_spec(self._session_dir, parent_spec, proposal, parent_envelope)
+            if private_integration_base is not None:
+                if Path(child_spec["repo"]).resolve() != Path(parent_spec["repo"]).resolve():
+                    raise ValueError("a suspended parent and its child must share one repository")
+                child_spec["base_commit"] = private_integration_base
+                child_spec["_private_parent_integration"] = True
         except ValueError as exc:
             await self.emit(
                 "child_rejected",
@@ -2987,7 +2994,18 @@ class _Runtime:
         """
         child_results: list[dict[str, Any]] = []
         truncated = False
+        workspace_changed = False
         for child_id in child_ids:
+            child_spec = self._session_spec(child_id)
+            result = self._results.get(child_id)
+            if (
+                child_spec is not None
+                and child_spec.get("_private_parent_integration") is True
+                and result is not None
+                and result.status == "succeeded"
+                and result.merge_sha is not None
+            ):
+                workspace_changed = True
             envelope = self._child_result_by_task.get(child_id)
             if envelope is None:
                 result = self._results.get(child_id)
@@ -3016,6 +3034,7 @@ class _Runtime:
             "epoch": epoch,
             "child_results": child_results,
             "child_results_truncated": truncated,
+            "workspace_changed": workspace_changed,
         }
 
     async def _await_suspend_children(
@@ -3300,11 +3319,19 @@ class _Runtime:
         proposals: Sequence[dict[str, Any]],
         *,
         include_port: bool,
+        private_integration_base: str | None = None,
     ) -> list[str]:
         """Admit proposals after the permitted parent lifecycle verdict."""
         admitted: list[str] = []
         for proposal in proposals:
-            admitted.extend(await self._admit_child(parent_spec, proposal, parent_envelope))
+            admitted.extend(
+                await self._admit_child(
+                    parent_spec,
+                    proposal,
+                    parent_envelope,
+                    private_integration_base=private_integration_base,
+                )
+            )
         if include_port and self._admission_port is not None:
             admitted.extend(await self._admit_port_proposals(parent_spec, parent_envelope))
         return admitted
@@ -3912,13 +3939,43 @@ class _Runtime:
                         )
                         envelope_status = None
                     if envelope_status == "suspended":
-                        # A suspended generation is not a publishable success;
-                        # its children may run before the bounded resume wait.
+                        # Snapshot isolation: the worker owns the suspension
+                        # commit; children integrate privately; only the
+                        # resumed and verified parent may publish to main.
+                        snapshot_head, snapshot_error = (
+                            await self._accept_parent_suspension_snapshot(
+                                spec, worktree, generation
+                            )
+                        )
+                        if snapshot_error is not None or snapshot_head is None:
+                            reason = snapshot_error or "parent_snapshot_failed"
+                            await self.emit(
+                                "worker_failed",
+                                task_id=task_id,
+                                generation=generation,
+                                reason=reason,
+                            )
+                            await self._reject_child_proposals(
+                                task_id,
+                                outcome.proposals,
+                                reason="ParentSnapshotFailed",
+                                message="parent suspension snapshot failed integrity checks",
+                            )
+                            self._results[task_id] = TaskResult(
+                                task_id=task_id,
+                                status="failed",
+                                exit_code=1,
+                                reason=reason,
+                                restarts=restarts,
+                                summary=worker_summary,
+                            )
+                            return
                         child_ids = await self._admit_generation_children(
                             spec,
                             parent_envelope,
                             outcome.proposals,
                             include_port=False,
+                            private_integration_base=snapshot_head,
                         )
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -3979,6 +4036,7 @@ class _Runtime:
                                 "checkpoint_ref"
                             ),
                             child_count=len(child_ids),
+                            workspace_changed=resume_payload["workspace_changed"],
                         )
                         spec["resume"] = resume_payload
                         spec.pop("context_fork", None)
@@ -4061,7 +4119,9 @@ class _Runtime:
                             summary=worker_summary,
                         )
                         return
-                    if head == spec["base_commit"]:
+                    if head == spec["base_commit"] and bool(
+                        spec.get("_base_is_published", True)
+                    ):
                         await self._admit_generation_children(
                             spec,
                             parent_envelope,
@@ -4097,6 +4157,8 @@ class _Runtime:
                                 sanitized_envelope,
                             )
                     if merged is not None:
+                        spec["base_commit"] = merged
+                        spec["_base_is_published"] = True
                         await self._admit_generation_children(
                             spec,
                             parent_envelope,
@@ -5474,6 +5536,45 @@ class _Runtime:
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             return
 
+    async def _accept_parent_suspension_snapshot(
+        self,
+        spec: dict[str, Any],
+        worktree: Path,
+        generation: int,
+    ) -> tuple[str | None, str | None]:
+        """Accept one worker-owned suspension commit as a private base.
+
+        The worker has already exited and fenced every dirty file into at most
+        one commit.  The supervisor verifies a clean attached branch, records
+        the transition durably, and only then allows children to branch from
+        that immutable snapshot.  The snapshot is not considered published.
+        """
+        integrity = await self._worker_success_integrity(spec, worktree)
+        if integrity is not None:
+            return None, integrity
+        head = await self._git_stdout(
+            worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
+        )
+        if head is None:
+            return None, "worker_head_failed"
+        prior_base = str(spec["base_commit"])
+        base_was_published = bool(spec.get("_base_is_published", True))
+        base_is_published = base_was_published and head == prior_base
+        await self.emit(
+            "parent_snapshot",
+            task_id=spec["task_id"],
+            generation=generation,
+            old=prior_base,
+            new=head,
+            changed=head != prior_base,
+            base_is_published=base_is_published,
+            branch=spec["branch"],
+            repo=spec["repo"],
+        )
+        spec["base_commit"] = head
+        spec["_base_is_published"] = base_is_published
+        return head, None
+
     async def _assert_parent_join_invariant(
         self,
         parent_spec: dict[str, Any],
@@ -5497,9 +5598,11 @@ class _Runtime:
             worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
         )
         if parent_head == integration_head:
-            if consume:
-                self._accepted_integration_heads.pop(parent_task_id, None)
-            return True
+            integrity = await self._worker_success_integrity(parent_spec, worktree)
+            if integrity is None:
+                if consume:
+                    self._accepted_integration_heads.pop(parent_task_id, None)
+                return True
         summary = "parent worktree HEAD does not match accepted integration head"
         await self.emit(
             "join_invariant_failed",
@@ -5983,6 +6086,196 @@ class _Runtime:
             elif attempt == max_attempts:
                 self._resolver_failures[spec["task_id"]] = "resolver_attempts_exhausted"
         return None
+    async def _integrate_child_into_suspended_parent(
+        self, spec: dict[str, Any], handle: WorkerHandle
+    ) -> str | None:
+        """Integrate a child into its suspended parent without publishing main.
+
+        ``prepare_staging`` rebases the child onto the parent's current private
+        base.  A critical prepared event is the write-ahead record; then one
+        fast-forward updates the clean parent branch and worktree; finally a
+        critical committed event makes the new private base visible to resume.
+        The staging ref is retained when the second barrier is not reached.
+        """
+        task_id = spec["task_id"]
+        parent_task_id = spec.get("parent_task_id")
+        if not isinstance(parent_task_id, str):
+            return None
+        parent_spec = self._session_spec(parent_task_id)
+        if parent_spec is None:
+            return None
+        repo = Path(spec["repo"])
+        if repo.resolve() != Path(parent_spec["repo"]).resolve():
+            return None
+        branch = spec["branch"]
+        parent_worktree = Path(parent_spec["worktree_path"])
+        await self.emit(
+            "merge_started",
+            task_id=task_id,
+            branch=branch,
+            generation=handle.generation,
+            target="suspended_parent",
+            parent_task_id=parent_task_id,
+        )
+        task_key = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+        throwaway = self._session_dir / ".cambium" / "merge-wt" / f"task-{task_key}"
+        deferred: list[tuple[dict[str, Any], bool]] = []
+        seq = self._make_sequencer(task_id, deferred)
+        prepared_persisted = False
+        integrated_persisted = False
+        cleanup_failed = False
+        merge_failed = False
+        staging_tip: str | None = None
+        parent_head: str | None = None
+        try:
+            async with self._merge_lock:
+                integrity = await self._worker_success_integrity(parent_spec, parent_worktree)
+                if integrity is not None:
+                    raise RuntimeError(f"parent integration precondition failed: {integrity}")
+                parent_head = await self._git_stdout(
+                    parent_worktree,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                    check=False,
+                )
+                if parent_head is None or parent_head != parent_spec.get("base_commit"):
+                    raise RuntimeError("parent private base changed before child integration")
+                staging_tip = await asyncio.to_thread(
+                    seq.prepare_staging, repo, throwaway, branch, parent_head
+                )
+                await self._flush_sequencer_events(seq, deferred_observers=deferred)
+                if hasattr(seq, "ensure_staging_clean"):
+                    await asyncio.to_thread(seq.ensure_staging_clean, repo)
+                    await self._flush_sequencer_events(seq, deferred_observers=deferred)
+                await self.emit(
+                    "child_integration_prepared",
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                    old=parent_head,
+                    new=staging_tip,
+                    repo=str(repo),
+                    parent_branch=parent_spec["branch"],
+                    child_branch=branch,
+                    staging_ref=seq.staging_ref,
+                    staging_branch=seq.staging_branch,
+                    staging_worktree=str(throwaway),
+                    generation=handle.generation,
+                    _deferred_observers=deferred,
+                )
+                prepared_persisted = True
+                advanced = await self._git(
+                    parent_worktree,
+                    "merge",
+                    "--ff-only",
+                    "--no-edit",
+                    staging_tip,
+                    check=False,
+                )
+                if advanced.returncode != 0:
+                    raise RuntimeError("parent private integration fast-forward failed")
+                accepted = await self._git_stdout(
+                    parent_worktree,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                    check=False,
+                )
+                if accepted != staging_tip:
+                    raise RuntimeError("parent private integration head mismatch")
+                integrity = await self._worker_success_integrity(parent_spec, parent_worktree)
+                if integrity is not None:
+                    raise RuntimeError(f"parent integration postcondition failed: {integrity}")
+                await self.emit(
+                    "child_integrated",
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                    old=parent_head,
+                    new=staging_tip,
+                    repo=str(repo),
+                    parent_branch=parent_spec["branch"],
+                    child_branch=branch,
+                    generation=handle.generation,
+                    recovered=False,
+                    _deferred_observers=deferred,
+                )
+                integrated_persisted = True
+                parent_spec["base_commit"] = staging_tip
+                parent_spec["_base_is_published"] = False
+                self._accepted_integration_heads[parent_task_id] = staging_tip
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            merge_failed = True
+            error_type = exc.__class__.__name__
+            if isinstance(exc, MergeConflictError):
+                summary = str(exc)[:512]
+                diff_evidence = exc.diff_evidence
+                await self.emit(
+                    "merge_failed",
+                    task_id=task_id,
+                    merge_error=error_type,
+                    message=summary,
+                    status="merge_conflict",
+                    conflicted_files=exc.conflicted_files,
+                    summary=summary,
+                    diff_evidence=diff_evidence,
+                    evidence=diff_evidence,
+                    diff=diff_evidence,
+                    unified_diff=diff_evidence,
+                    diff_truncated=exc.diff_truncated,
+                    integration_head=exc.integration_head or parent_head,
+                    generation=handle.generation,
+                )
+            else:
+                await self.emit(
+                    "merge_failed",
+                    task_id=task_id,
+                    merge_error=error_type,
+                    message=str(exc)[:512],
+                    generation=handle.generation,
+                    internal=True,
+                )
+        finally:
+            try:
+                if hasattr(seq, "cleanup_staging") and not (
+                    prepared_persisted and not integrated_persisted
+                ):
+                    await asyncio.to_thread(seq.cleanup_staging, repo)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                cleanup_failed = True
+                emitted = await self._flush_sequencer_events(
+                    seq, deferred_observers=deferred
+                )
+                if integrated_persisted and "merge_staging_cleanup_failed" not in emitted:
+                    await self.emit(
+                        "merge_staging_cleanup_failed",
+                        task_id=task_id,
+                        staging_sha=staging_tip,
+                        reason=exc.__class__.__name__,
+                    )
+            else:
+                await self._flush_sequencer_events(seq, deferred_observers=deferred)
+        try:
+            await self._notify_deferred_observers(deferred)
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            subprocess.SubprocessError,
+        ) as exc:
+            await self.emit(
+                "merge_failed",
+                task_id=task_id,
+                merge_error=exc.__class__.__name__,
+                message=str(exc)[:512],
+                generation=handle.generation,
+                internal=True,
+            )
+            if not integrated_persisted:
+                return None
+        if merge_failed or (cleanup_failed and not integrated_persisted):
+            return None
+        return staging_tip
 
     async def _merge_task(self, spec: dict[str, Any], handle: WorkerHandle) -> str | None:
         """Stage and atomically publish the worker branch onto refs/heads/main.
@@ -5994,6 +6287,8 @@ class _Runtime:
         dedicated resolver child without changing this method's ``None``
         return contract.
         """
+        if spec.get("_private_parent_integration") is True:
+            return await self._integrate_child_into_suspended_parent(spec, handle)
         task_id = spec["task_id"]
         repo = Path(spec["repo"])
         branch = spec["branch"]
