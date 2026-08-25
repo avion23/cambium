@@ -368,6 +368,10 @@ def _event_text(payload: Mapping[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _queued_prompt_notice(prompt: str) -> str | None:
+    return f"queued: {prompt}" if prompt.strip() else None
+
+
 def _restore_result_summary(turn_dir: Path) -> str | None:
     result_path = turn_dir / ".cambium" / "result.json"
     try:
@@ -970,19 +974,21 @@ async def _run_interactive(
                                 elif queued_prompt.strip() == "!cancel" and not turn_task.done():
                                     _request_cancel()
                                 else:
-                                    pending_prompts.append(queued_prompt)
-                                    if _is_quit_prompt(queued_prompt):
-                                        input_closing = True
-                                    transcript.system(f"queued: {queued_prompt}")
-                                    cockpit.draw(
-                                        state.snapshot(session_dir=turn.session_dir),
-                                        transcript,
-                                        session_description=session.describe(),
-                                        branch_line=_branch_line(session),
-                                        cumulative_line=cumulative.line(
-                                            snapshot=state.snapshot(session_dir=turn.session_dir)
-                                        ),
-                                    )
+                                    notice = _queued_prompt_notice(queued_prompt)
+                                    if notice is not None:
+                                        pending_prompts.append(queued_prompt)
+                                        if _is_quit_prompt(queued_prompt):
+                                            input_closing = True
+                                        transcript.system(notice)
+                                        cockpit.draw(
+                                            state.snapshot(session_dir=turn.session_dir),
+                                            transcript,
+                                            session_description=session.describe(),
+                                            branch_line=_branch_line(session),
+                                            cumulative_line=cumulative.line(
+                                                snapshot=state.snapshot(session_dir=turn.session_dir)
+                                            ),
+                                        )
                                 _start_input_read()
 
                             if turn_task in done:
