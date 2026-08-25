@@ -226,6 +226,32 @@ def test_interactive_read_events_merges_turn_stores(tmp_path: Path) -> None:
     assert [event["kind"] for event in read_events(root, after_seq=2)] == ["result"]
 
 
+def test_interactive_read_events_skips_symlinked_turn_store(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    (root / ".cambium").mkdir(parents=True)
+    (root / ".cambium" / "events.db").touch()
+
+    external = tmp_path / "external.db"
+    store = EventStore(external)
+    try:
+        store.append({"kind": "outside", "payload": {}})
+    finally:
+        store.close()
+    linked = root / "turn-0001" / ".cambium" / "events.db"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(external)
+
+    available = root / "turn-0002" / ".cambium" / "events.db"
+    available.parent.mkdir(parents=True)
+    store = EventStore(available)
+    try:
+        store.append({"kind": "available", "payload": {}})
+    finally:
+        store.close()
+
+    assert [event["kind"] for event in read_events(root)] == ["available"]
+
+
 def test_interactive_read_events_skips_locked_turn_until_next_poll(tmp_path: Path) -> None:
     root = tmp_path / "interactive"
     locked_db = root / "turn-0001" / ".cambium" / "events.db"

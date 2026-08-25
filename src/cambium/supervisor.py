@@ -1449,10 +1449,10 @@ def _interactive_turn_event_stores(session_dir: Path) -> list[tuple[int, Path]]:
         return stores
     for child in children:
         match = re.fullmatch(r"turn-(\d+)", child.name)
-        if match is None or not child.is_dir():
+        if match is None or child.is_symlink() or not child.is_dir():
             continue
         event_db = child / ".cambium" / "events.db"
-        if event_db.is_file():
+        if not event_db.is_symlink() and event_db.is_file():
             stores.append((int(match.group(1)), event_db))
     stores.sort(key=lambda item: item[0])
     return stores

@@ -86,6 +86,39 @@ def test_same_path_event_store_has_one_process_owner(tmp_path) -> None:
         reopened.close()
 
 
+def test_event_store_rejects_symlinked_db_without_touching_target(tmp_path) -> None:
+    target = tmp_path / "external.db"
+    store = _open(target)
+    try:
+        store.append({"kind": "result", "payload": {"before": True}})
+    finally:
+        store.close()
+
+    linked = tmp_path / "events.db"
+    linked.symlink_to(target)
+    with pytest.raises(StoreInitError, match="must not be a symlink"):
+        EventStore(linked, fsync_interval_s=60.0)
+
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("suffix", ("-wal", "-shm"))
+def test_event_store_rejects_symlinked_sidecar(tmp_path, suffix: str) -> None:
+    db = tmp_path / "events.db"
+    store = _open(db)
+    store.close()
+    target = tmp_path / f"external{suffix}"
+    target.write_bytes(b"sidecar target")
+    sidecar = Path(f"{db}{suffix}")
+    sidecar.symlink_to(target)
+
+    with pytest.raises(StoreInitError, match="sidecar must not be a symlink"):
+        EventStore(db, fsync_interval_s=60.0)
+
+    assert target.read_bytes() == b"sidecar target"
+
+
 def test_append_rejects_records_replay_would_reject(tmp_path) -> None:
     store = _open(tmp_path / "events.db")
     invalid = [
@@ -155,6 +188,37 @@ def test_append_read_back_fields_and_monotonic_seq(tmp_path) -> None:
         assert events[2]["monotonic_ms"] == 481234580700
     finally:
         store.close()
+
+
+def test_read_events_file_applies_sql_cursor_before_payload_decode(tmp_path) -> None:
+    path = tmp_path / "events.db"
+    store = _open(path)
+    try:
+        for index in range(3):
+            store.append({"kind": "log", "payload": {"index": index}})
+    finally:
+        store.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE events SET payload = '{broken:' WHERE seq = 1")
+        connection.commit()
+
+    assert [event["seq"] for event in read_events_file(path, after_seq=2)] == [3]
+
+
+def test_event_store_read_row_cap_fails_closed(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    store = _open(path)
+    try:
+        for index in range(3):
+            store.append({"kind": "log", "payload": {"index": index}})
+    finally:
+        store.close()
+
+    monkeypatch.setattr(store_module, "MAX_EVENT_ROWS_PER_READ", 2)
+    with pytest.raises(StoreError, match="2-row read cap"):
+        read_events_file(path)
+    assert read_events_file(path, after_seq=3) == []
 
 
 @pytest.mark.slow

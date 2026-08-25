@@ -57,16 +57,18 @@ redactor.
 from __future__ import annotations
 
 import collections
+import errno
 import fcntl
 import json
 import logging
 import os
 import queue
 import sqlite3
+import stat
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, cast
 
@@ -146,9 +148,16 @@ _CLOSE_STOP_JOIN_TIMEOUT_S = 0.1
 _SENTINEL = object()
 _TIMER = object()
 _SQLITE_HEADER = b"SQLite format 3\x00"
-_SELECT_ALL = (
+MAX_EVENT_ROWS_PER_READ = 100_000
+"""Maximum rows materialized by one event-store read.
+
+The cap is deliberately high enough for a large real session, while keeping a
+single untrusted store from forcing an unbounded replay allocation.  Readers
+fail closed when the cap is exceeded instead of silently dropping events.
+"""
+_SELECT_AFTER = (
     "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
-    "generation, request_id FROM events ORDER BY seq"
+    "generation, request_id FROM events WHERE seq > ? ORDER BY seq LIMIT ?"
 )
 _REQUIRED_EVENT_FIELDS = frozenset({"seq", "kind", "payload"})
 
@@ -158,11 +167,25 @@ def read_events_file(
     after_seq: int = 0,
     *,
     busy_timeout_ms: int = _READER_BUSY_TIMEOUT_MS,
+    max_rows: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Read durable events without creating or modifying store state."""
+    """Read durable events without creating or modifying store state.
+
+    SQLite reads apply ``after_seq`` in SQL and stop at ``max_rows`` (or
+    ``MAX_EVENT_ROWS_PER_READ``) before materializing the result list.
+    """
     path = Path(db_path)
-    if not path.is_file():
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        raise StoreError(f"cannot inspect event store {path}: {exc}") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise StoreError(f"event store path must not be a symlink: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        return []
+    row_limit = _event_row_limit(max_rows)
     try:
         with path.open("rb") as handle:
             header = handle.read(len(_SQLITE_HEADER))
@@ -170,9 +193,8 @@ def read_events_file(
         raise StoreError(f"cannot read event store {path}: {exc}") from exc
 
     if header == _SQLITE_HEADER:
-        events = _read_sqlite_events(path, busy_timeout_ms)
-    else:
-        events = _read_jsonl_events(path)
+        return _read_sqlite_events(path, busy_timeout_ms, after_seq, row_limit)
+    events = _read_jsonl_events(path, row_limit)
     return [event for event in events if event["seq"] > after_seq]
 
 
@@ -193,18 +215,42 @@ def _make_private_db_file(path: Path) -> None:
     when it already exists, so creating the DB privately before ``connect``
     keeps all three files private under a normal 0022 umask.
     """
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    create_flags = os.O_RDWR | os.O_CLOEXEC | nofollow | os.O_CREAT | os.O_EXCL
+    open_flags = os.O_RDWR | os.O_CLOEXEC | nofollow
     try:
+        try:
+            fd = os.open(path, create_flags, 0o600)
+        except FileExistsError:
+            fd = os.open(path, open_flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise StoreInitError(f"event store path must not be a symlink: {path}") from exc
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise StoreInitError(f"event store path must be a regular file: {path}")
         os.fchmod(fd, 0o600)
     finally:
         os.close(fd)
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{path}{suffix}")
-        if sidecar.exists():
-            try:
-                os.chmod(sidecar, 0o600)
-            except OSError:
-                pass
+        try:
+            sidecar_fd = os.open(sidecar, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise StoreInitError(
+                    f"event store sidecar must not be a symlink: {sidecar}"
+                ) from exc
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(sidecar_fd).st_mode):
+                raise StoreInitError(f"event store sidecar must be a regular file: {sidecar}")
+            os.fchmod(sidecar_fd, 0o600)
+        finally:
+            os.close(sidecar_fd)
 
 
 class _AdmissionCancelled(Exception):
@@ -283,7 +329,14 @@ def _validate_event_order(events: list[dict[str, Any]], path: Path) -> None:
             event_ids.add(event_id)
 
 
-def _read_jsonl_events(path: Path) -> list[dict[str, Any]]:
+def _event_row_limit(max_rows: int | None) -> int:
+    limit = MAX_EVENT_ROWS_PER_READ if max_rows is None else max_rows
+    if type(limit) is not int or limit < 1:
+        raise ValueError("max_rows must be a positive integer")
+    return limit
+
+
+def _read_jsonl_events(path: Path, max_rows: int) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     try:
         with path.open("rb") as handle:
@@ -302,6 +355,10 @@ def _read_jsonl_events(path: Path) -> list[dict[str, Any]]:
                     event = _validate_event_record(value)
                 except (TypeError, ValueError) as exc:
                     raise _event_store_error(path, str(exc), line_no) from exc
+                if len(events) >= max_rows:
+                    raise StoreError(
+                        f"event store {path} exceeds the {max_rows}-row read cap"
+                    )
                 events.append(event)
     except OSError as exc:
         raise StoreError(f"cannot read event store {path}: {exc}") from exc
@@ -309,27 +366,42 @@ def _read_jsonl_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _read_sqlite_events(path: Path, busy_timeout_ms: int) -> list[dict[str, Any]]:
+def _read_sqlite_events(
+    path: Path,
+    busy_timeout_ms: int,
+    after_seq: int = 0,
+    max_rows: int | None = None,
+) -> list[dict[str, Any]]:
+    row_limit = _event_row_limit(max_rows)
     conn = None
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-        rows = conn.execute(_SELECT_ALL).fetchall()
+        rows = conn.execute(_SELECT_AFTER, (after_seq, row_limit + 1))
+        events = _events_from_rows(rows, path, row_limit)
     except (OSError, sqlite3.Error) as exc:
         raise _event_store_error(path, str(exc)) from exc
     finally:
         if conn is not None:
             conn.close()
-    return _events_from_rows(rows, path)
+    return events
 
 
-def _events_from_rows(rows: list[tuple], path: Path) -> list[dict[str, Any]]:
+def _events_from_rows(
+    rows: Iterable[tuple], path: Path, max_rows: int | None = None
+) -> list[dict[str, Any]]:
+    row_limit = _event_row_limit(max_rows)
     events: list[dict[str, Any]] = []
-    for index, row in enumerate(rows):
+    rows_iterator = iter(rows)
+    for index, row in enumerate(rows_iterator):
+        if index >= row_limit:
+            raise StoreError(f"event store {path} exceeds the {row_limit}-row read cap")
         try:
             event = EventStore._row_to_event(row)
         except json.JSONDecodeError as exc:
-            if index == len(rows) - 1:
+            try:
+                next(rows_iterator)
+            except StopIteration:
                 continue
             raise _event_store_error(path, "invalid JSON payload") from exc
         except (IndexError, TypeError, ValueError) as exc:
@@ -729,18 +801,7 @@ class EventStore:
         return seq
 
     def events_after(self, seq: int) -> list[dict[str, Any]]:
-        conn = None
-        try:
-            conn = sqlite3.connect(self._path)
-            conn.execute("PRAGMA busy_timeout=5000")
-            rows = conn.execute(_SELECT_ALL).fetchall()
-        except (OSError, sqlite3.Error) as exc:
-            raise _event_store_error(self._path, str(exc)) from exc
-        finally:
-            if conn is not None:
-                conn.close()
-        events = _events_from_rows(rows, self._path)
-        return [event for event in events if event["seq"] > seq]
+        return _read_sqlite_events(self._path, _READER_BUSY_TIMEOUT_MS, seq)
 
     def _redact_row(self, row: tuple) -> tuple:
         if self._redactor is None:
@@ -1026,8 +1087,9 @@ class EventStore:
             conn.execute("PRAGMA wal_autocheckpoint=0").fetchall()
             conn.execute(_SCHEMA)
             conn.execute(_SEQUENCE_SCHEMA)
-            db_fd = os.open(self._path, os.O_RDWR)
-            wal_fd = os.open(f"{self._path}-wal", os.O_RDWR)
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            db_fd = os.open(self._path, os.O_RDWR | os.O_CLOEXEC | nofollow)
+            wal_fd = os.open(f"{self._path}-wal", os.O_RDWR | os.O_CLOEXEC | nofollow)
             self._conn = conn
             self._db_fd = db_fd
             self._wal_fd = wal_fd
