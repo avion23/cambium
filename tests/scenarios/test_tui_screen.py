@@ -368,6 +368,150 @@ def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     assert "deferred output" in stream.getvalue()
 
 
+def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {"tool": "run_shell", "ok": True, "duration_ms": 118215},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="⠋ WAITING",
+            turn_active=True,
+        )
+
+        live_output = stream.getvalue()
+        assert "✓ run_shell 118215ms" in live_output
+        assert live_output.endswith("› ")
+        assert cockpit._input_active
+
+
+def test_cockpit_throttles_active_turn_frames(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    now = [10.0]
+    monkeypatch.setattr("cambium.tui_screen.time.monotonic", lambda: now[0])
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        for tool in ("run_shell", "read_batch"):
+            transcript.observe_event(
+                {"kind": "tool_event", "payload": {"tool": tool, "ok": True}}
+            )
+            cockpit.draw(
+                _snapshot(),
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=2",
+                activity_line="⠋ WAITING",
+                turn_active=True,
+            )
+            if tool == "run_shell":
+                now[0] = 10.05
+
+        assert "✓ read_batch" not in stream.getvalue()
+        now[0] = 10.11
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=2",
+            activity_line="⠋ WAITING",
+            turn_active=True,
+        )
+
+    assert "✓ read_batch" in stream.getvalue()
+
+
+def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    snapshot = _snapshot()
+    snapshot.agents[0].state = "failed"
+    snapshot.active_agents = 0
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        transcript.error("turn failed")
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="✗ ERROR",
+            turn_active=True,
+        )
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="✗ ERROR",
+            force=True,
+        )
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.hide_cursor()
+        cockpit.flush()
+
+    agent_rows = [row for row in cockpit._last_status_rows if row.startswith(" agents=")]
+    assert len(agent_rows) == 1
+    assert agent_rows[0].endswith("state=IDLE")
+    assert stream.getvalue().count("┌ Cambium · conversation") == 2
+
+
 def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
     class _Tty(io.StringIO):
         flush_count = 0
@@ -446,7 +590,7 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
 
     delta = stream.getvalue()[len(first) :]
     assert "\x1b[s" in delta
-    assert "\x1b[5A" in delta
+    assert "\x1b[4A" in delta
     assert "running run_shell" in delta
     assert "┌ Cambium · conversation" not in delta
 

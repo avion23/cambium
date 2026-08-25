@@ -33,6 +33,11 @@ from typing import Any, TextIO
 from .provider_scheduler import QuotaLedger
 from .terminal import sanitize_terminal_text
 
+try:
+    import readline as _readline
+except ImportError:  # pragma: no cover - platform dependent
+    _readline = None
+
 _RESET = "\x1b[0m"
 _DIM = "\x1b[2m"
 _CYAN = "\x1b[1;36m"
@@ -168,6 +173,7 @@ _FAILURE_EVENT_KINDS = frozenset(
 )
 _FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
 _TOOL_ERROR_PREFIX = "tool errors:"
+_LIVE_DRAW_INTERVAL = 0.1
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _FIRST_TOKEN_KINDS = frozenset(
@@ -2626,9 +2632,9 @@ class Cockpit:
     Unlike a conventional full-screen dashboard, a draw never homes the
     cursor or clears the terminal.  New transcript rows and changed status
     rows are appended to the terminal's normal buffer, which gives the
-    operator native terminal scrollback for free.  While readline owns the
-    input line, the newest draw is retained and flushed after that read ends;
-    asynchronous event output therefore cannot overwrite text being edited.
+    operator native terminal scrollback for free.  Idle redraws coalesce while
+    readline owns the input line; active-turn redraws preserve that line and
+    stream event output at a bounded rate.
     """
 
     def __init__(self, stream: TextIO, *, enabled: bool = True) -> None:
@@ -2639,7 +2645,12 @@ class Cockpit:
         self._previous_sigterm_handler: Any = None
         self._last_size = os.terminal_size((120, 40))
         self._input_active = False
+        self._native_input = False
+        self._input_prompt_label = "›"
         self._pending_draw: tuple[Any, Transcript, str, str, str, str, str] | None = None
+        self._turn_active = False
+        self._last_live_draw_at = 0.0
+        self._draw_in_flight = False
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
         self._last_status_line = ""
         self._last_status_fields: dict[str, str] | None = None
@@ -2700,9 +2711,10 @@ class Cockpit:
         cumulative_line: str,
         input_label: str = "›",
         activity_line: str = "",
+        turn_active: bool = False,
         force: bool = False,
     ) -> None:
-        """Draw the conversation, bypassing input coalescing for final frames."""
+        """Draw a frame, streaming active-turn events around pending input."""
         if not self.enabled:
             return
         self._last_size = shutil.get_terminal_size((120, 40))
@@ -2715,14 +2727,78 @@ class Cockpit:
             _clip(_sanitize(input_label).replace(chr(10), " "), 8),
             _sanitize(activity_line).replace(chr(10), " "),
         )
+        live_turn = turn_active or bool(activity_line)
+        self._turn_active = live_turn and not force
+        if self._draw_in_flight:
+            self._pending_draw = request
+            return
         if self._input_active and not force:
             self._pending_draw = request
+            if not live_turn:
+                return
+            now = time.monotonic()
+            if now - self._last_live_draw_at < _LIVE_DRAW_INTERVAL:
+                return
+            self._pending_draw = None
+            self._draw_live_now(request)
+            self._last_live_draw_at = now
             return
         if force:
             self._pending_draw = None
-        self._draw_now(request, force=force)
+        if self._input_active and force:
+            self._draw_live_now(request, force=True)
+        else:
+            self._paint_now(request, force=force)
+        if live_turn and not force:
+            self._last_live_draw_at = time.monotonic()
         if force:
             self.stream.flush()
+
+    def _paint_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        force: bool = False,
+    ) -> None:
+        if self._draw_in_flight:
+            self._pending_draw = request
+            return
+        self._draw_in_flight = True
+        try:
+            self._draw_now(request, force=force)
+        finally:
+            self._draw_in_flight = False
+
+    def _input_line_text(self) -> str:
+        if not self._native_input or _readline is None:
+            return ""
+        try:
+            value = _readline.get_line_buffer()
+        except (AttributeError, OSError, RuntimeError):
+            return ""
+        return _sanitize(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+    def _restore_input_line(self, text: str) -> None:
+        if not self._input_active:
+            return
+        self.stream.write(f"\r{_CLEAR_LINE}{self._input_prompt_label} {text}")
+
+    def _draw_live_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        force: bool = False,
+    ) -> None:
+        input_text = self._input_line_text()
+        if self._input_active and not self._fixed_frame:
+            self.stream.write("\r\n")
+        self._draw_in_flight = True
+        try:
+            self._draw_now(request, force=force)
+        finally:
+            self._draw_in_flight = False
+        self._restore_input_line(input_text)
+        self.stream.flush()
 
     def _draw_now(
         self,
@@ -2748,11 +2824,6 @@ class Cockpit:
             self._draw_stream_now(request)
             return
 
-        if self._fixed_frame and (force or self._frame_size != self._last_size):
-            # Leave the current input/status row before appending a fresh frame.
-            self.stream.write("\x1b[1B\r\n")
-            self._fixed_frame = False
-
         rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
         status_rows = tuple(
             _status_rows(
@@ -2765,6 +2836,13 @@ class Cockpit:
                 activity_line=activity_line,
             )
         )
+        if self._fixed_frame and (
+            self._frame_size != self._last_size
+            or (force and rows != self._last_primary_rows)
+        ):
+            # Leave the current input/status row before appending a fresh frame.
+            self.stream.write("\x1b[1B\r\n")
+            self._fixed_frame = False
         if not self._fixed_frame:
             lines = _cockpit_frame_lines(
                 snapshot,
@@ -2848,39 +2926,49 @@ class Cockpit:
         status_rows: tuple[str, ...],
     ) -> None:
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
-        inner = max(1, self._last_size.columns - 2)
-        bottom = [
-            "├" + "─" * inner + "┤",
-            *(
-                _paint(_frame_inside(row, self._last_size.columns), _DIM_CYAN, self.color)
-                for row in status_rows
-            ),
-        ]
+        rendered_rows = tuple(
+            _paint(_frame_inside(row, self._last_size.columns), _DIM_CYAN, self.color)
+            for row in status_rows
+        )
         del snapshot, transcript, session_description, branch_line, cumulative_line
-        self.stream.write(f"\x1b[s\x1b[{_BOTTOM_RESERVED_ROWS - 1}A\r")
-        for index, line in enumerate(bottom):
-            changed = index > 0 and (
-                index - 1 >= len(self._last_status_rows)
-                or status_rows[index - 1] != self._last_status_rows[index - 1]
+        # The cursor is on the input row; rewrite the fixed status rows in place.
+        self.stream.write(f"\x1b[s\x1b[{len(rendered_rows)}A\r")
+        for index, line in enumerate(rendered_rows):
+            changed = index >= len(self._last_status_rows) or (
+                status_rows[index] != self._last_status_rows[index]
             )
             if changed:
                 self.stream.write(f"\r{_CLEAR_LINE}{line}")
-            if index < len(bottom) - 1:
+            if index < len(rendered_rows) - 1:
                 self.stream.write("\n")
         self.stream.write("\x1b[u")
         self.stream.flush()
 
     def flush(self) -> None:
         """Flush the newest draw once the input line is no longer active."""
-        if not self.enabled or self._input_active or self._pending_draw is None:
+        if (
+            not self.enabled
+            or self._input_active
+            or self._pending_draw is None
+            or self._draw_in_flight
+        ):
             return
         request = self._pending_draw
         self._pending_draw = None
-        self._draw_now(request)
+        self._paint_now(request)
 
     def draw_activity(self, activity_line: str) -> None:
         """Update only the fixed status pane while readline owns the input."""
-        if not self.enabled or not self._fixed_frame or self._last_request is None:
+        if not self.enabled or self._last_request is None or self._draw_in_flight:
+            return
+        if self._turn_active and self._input_active and self._pending_draw is not None:
+            now = time.monotonic()
+            if now - self._last_live_draw_at >= _LIVE_DRAW_INTERVAL:
+                request = self._pending_draw
+                self._pending_draw = None
+                self._draw_live_now(request)
+                self._last_live_draw_at = now
+        if not self._fixed_frame:
             return
         self._activity_line = _sanitize(activity_line).replace(chr(10), " ")
         request = (*self._last_request[:6], self._activity_line)
@@ -2900,11 +2988,13 @@ class Cockpit:
         self._last_request = request
         self._last_status_rows = status_rows
 
-    def move_to_input(self, *, label: str = "›") -> None:
+    def move_to_input(self, *, label: str = "›", native: bool = False) -> None:
         if not self.enabled:
             return
         self._input_active = True
+        self._native_input = native
         label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
+        self._input_prompt_label = label_text
         if self._fixed_frame:
             self.stream.write(f"\r{_CLEAR_LINE}{label_text} ")
         else:
