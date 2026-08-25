@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import cambium.tui_screen as tui_screen
 from cambium.tui import _queued_prompt_notice
 from cambium.tui_screen import (
     ActivityState,
@@ -86,10 +87,10 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
         "# Heading\n\n**bold** *italic* `code`\n\n"
         "- a long list item that hangs on continuation\n\n"
         "> quote\n\n---\n\n```py\nprint('ok')\n```\n\n"
-        "| a | b |\n|---|---|",
+        "| a | b |\n|---|---|\n| one | two |",
         36,
     )
-    visible = [_visible(line) for line in lines]
+    visible = [_visible(line).rstrip() for line in lines]
     rendered = "\n".join(lines)
 
     assert visible[0].startswith("Heading")
@@ -98,7 +99,11 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     assert any(line.startswith("  ") for line in visible)
     assert any(line.startswith("  │") for line in visible)
     assert any("─" in line for line in visible)
-    assert any("| a | b |" in line for line in visible)
+    assert any(line.startswith("│ quote") for line in visible)
+    table_header = next(line for line in visible if line.strip().startswith("a"))
+    table_row = next(line for line in visible if line.strip().startswith("one"))
+    assert table_header.index("a") == table_row.index("one")
+    assert table_header.index("b") == table_row.index("two")
     assert "\x1b[1m" in rendered
     assert "\x1b[33m" in rendered
     assert "\x1b[2;36m" in rendered
@@ -106,6 +111,31 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     hostile = render_markdown_lines("safe\x1b[31m\x1b]2;secret\x07 text", 36)
     assert "secret" not in "\n".join(hostile)
     assert "\x1b[31m" not in "\n".join(hostile)
+
+
+def test_rich_markdown_sanitizes_before_the_parser_sees_text(monkeypatch) -> None:
+    seen: list[str] = []
+    rich_renderer = tui_screen._render_markdown_lines_rich
+
+    def capture(text: str, width: int, color: bool) -> list[str]:
+        seen.append(text)
+        return rich_renderer(text, width, color)
+
+    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", capture)
+    render_markdown_lines("safe\x1b[31m injected\x00\x1b]2;secret\x07 text", 36)
+
+    assert seen == ["safe injected text"]
+
+
+def test_markdown_falls_back_when_rich_import_is_unavailable(monkeypatch) -> None:
+    text = "# Heading\n\n**bold** `code`\n\nvalue_with_underscores"
+    expected = tui_screen._render_markdown_lines_fallback(text, 36, color=False)
+
+    def unavailable(*args, **kwargs):
+        raise ImportError("rich unavailable")
+
+    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", unavailable)
+    assert render_markdown_lines(text, 36, color=False) == expected
 
 
 def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:

@@ -1708,6 +1708,23 @@ def _bounded_render_lines(lines: list[str], limit: int) -> list[str]:
     return [f"… {hidden} lines hidden", *lines[-max(1, limit - 1) :]]
 
 
+def _bounded_markdown_lines(
+    text: str,
+    width: int,
+    limit: int,
+    *,
+    color: bool,
+) -> list[str]:
+    """Bound multiline detail before CommonMark soft breaks collapse it."""
+    source_lines = text.splitlines()
+    if len(source_lines) > limit:
+        keep = max(1, limit - 1)
+        hidden = len(source_lines) - keep
+        text = "\n".join(source_lines[-keep:])
+        return [f"… {hidden} lines hidden", *render_markdown_lines(text, width, color=color)]
+    return _bounded_render_lines(render_markdown_lines(text, width, color=color), limit)
+
+
 def _entry_lines(
     entry: TranscriptEntry,
     width: int,
@@ -1738,16 +1755,20 @@ def _entry_lines(
         if detail.startswith(summary):
             detail = detail.split("\n", 1)[1] if "\n" in detail else ""
         if detail:
-            detail_lines = render_markdown_lines(detail, body_width, color=color)
-            if detail_limit is not None:
-                detail_lines = _bounded_render_lines(detail_lines, detail_limit)
+            detail_lines = (
+                _bounded_markdown_lines(detail, body_width, detail_limit, color=color)
+                if detail_limit is not None
+                else render_markdown_lines(detail, body_width, color=color)
+            )
             rendered.extend(
                 (entry.role, _clip(body_prefix + line, width)) for line in detail_lines
             )
     else:
-        lines = render_markdown_lines(entry.text, body_width, color=color)
-        if detail_limit is not None:
-            lines = _bounded_render_lines(lines, detail_limit)
+        lines = (
+            _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
+            if detail_limit is not None
+            else render_markdown_lines(entry.text, body_width, color=color)
+        )
         for line in lines:
             role = (
                 "dim"
