@@ -2030,7 +2030,6 @@ def _transcript_lines(
                 history.append(("system", ""))
             history.extend(block)
             previous_kind = kind
-            history.extend(block)
         while len(history) > remaining:
             try:
                 history.remove(next(row for row in history if not row[1]))
