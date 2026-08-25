@@ -44,6 +44,34 @@ _YELLOW = "\x1b[1;33m"
 _RED = "\x1b[1;31m"
 _WHITE = "\x1b[1;37m"
 
+# Markdown styles are deliberately a closed set.  Model text is sanitized
+# before one of these wrappers is added; the renderer below never forwards
+# provider-supplied escape sequences.
+_MD_HEADING = "\x1b[1;36m"
+_MD_CODE = "\x1b[33m"
+_MD_BOLD = "\x1b[1m"
+_MD_ITALIC = "\x1b[3m"
+_MD_RULE = "\x1b[2;36m"
+_CONTROLLED_ANSI = frozenset(
+    {
+        _RESET,
+        _DIM,
+        _CYAN,
+        _DIM_CYAN,
+        _BLUE,
+        _GREEN,
+        _YELLOW,
+        _RED,
+        _WHITE,
+        _MD_HEADING,
+        _MD_CODE,
+        _MD_BOLD,
+        _MD_ITALIC,
+        _MD_RULE,
+    }
+)
+_ANSI_STYLE = re.compile(r"\x1b\[[0-9;]*m")
+
 _ROLE_COLORS = {
     "user": _BLUE,
     "assistant": _WHITE,
@@ -196,6 +224,21 @@ def _sanitize(value: Any) -> str:
     return sanitize_terminal_text(value)
 
 
+def _safe_rendered(text: Any) -> str:
+    """Sanitize text while retaining only ANSI codes emitted by this module."""
+    parts: list[str] = []
+    for part in re.split(r"(\x1b\[[0-9;]*m)", str(text)):
+        if part in _CONTROLLED_ANSI:
+            parts.append(part)
+        else:
+            parts.append(_sanitize(part))
+    return "".join(parts)
+
+
+def _visible(text: str) -> str:
+    return _ANSI_STYLE.sub("", _safe_rendered(text))
+
+
 def _char_width(char: str) -> int:
     if unicodedata.combining(char) or unicodedata.category(char) == "Cf":
         return 0
@@ -203,7 +246,7 @@ def _char_width(char: str) -> int:
 
 
 def _display_width(text: str) -> int:
-    return sum(_char_width(char) for char in text)
+    return sum(_char_width(char) for char in _visible(text))
 
 
 def _take_display_width(text: str, width: int) -> tuple[str, str]:
@@ -211,26 +254,39 @@ def _take_display_width(text: str, width: int) -> tuple[str, str]:
     if width <= 0:
         return "", text
     used = 0
-    for index, char in enumerate(text):
+    rendered = _safe_rendered(text)
+    left: list[str] = []
+    index = 0
+    while index < len(rendered):
+        match = _ANSI_STYLE.match(rendered, index)
+        if match is not None:
+            code = match.group(0)
+            if code in _CONTROLLED_ANSI:
+                left.append(code)
+                index = match.end()
+                continue
+        char = rendered[index]
         char_width = _char_width(char)
         if used and used + char_width > width:
-            return text[:index], text[index:]
+            return "".join(left), rendered[index:]
         if not used and char_width > width:
-            return "", text
+            return "", rendered[index:]
+        left.append(char)
         used += char_width
-    return text, ""
+        index += 1
+    return rendered, ""
 
 
 def _clip(text: str, width: int) -> str:
-    clean = _sanitize(text)
+    clean = _safe_rendered(text)
     if width <= 0:
         return ""
     if _display_width(clean) <= width:
         return clean
     if width == 1:
-        return "…"
+        return _sanitize("…")
     head, _ = _take_display_width(clean, width - 1)
-    return head + "…"
+    return head + _sanitize("…") + (_RESET if head.endswith(tuple(_CONTROLLED_ANSI)) else "")
 
 
 def _pad(text: str, width: int) -> str:
@@ -1115,16 +1171,193 @@ class ActivityState:
             tool_name, tool_started_at = tool
             tool_name = _sanitize(tool_name)
             tool_elapsed = max(0.0, current - tool_started_at)
-            label = f"running {tool_name} {tool_elapsed:.1f}s · turn {turn_elapsed:.1f}s"
-        elif self._responding:
-            label = f"responding… {turn_elapsed:.1f}s"
+            label = (
+                f"{self._state} · running {tool_name} {tool_elapsed:.1f}s "
+                f"· turn {turn_elapsed:.1f}s · out/s={self._stream_rate:.1f}"
+            )
+        elif self._cooldown is not None:
+            provider, retry_after = self._cooldown
+            suffix = f" · {retry_after:.1f}s" if retry_after is not None else ""
+            owner = f" · {provider}" if provider else ""
+            label = f"COOLDOWN{owner}{suffix} · turn {turn_elapsed:.1f}s"
+        elif self._state == "STREAMING" or self._responding:
+            elapsed = max(0.001, current - self._turn_started_at)
+            rate = self._stream_rate or self._stream_tokens / elapsed
+            label = f"STREAMING · responding… {turn_elapsed:.1f}s · out/s={rate:.1f}"
+        elif self._state == "DONE":
+            return "✓ DONE"
+        elif self._state == "ERROR":
+            return "✗ ERROR"
         else:
-            label = f"thinking… {turn_elapsed:.1f}s"
+            label = f"WAITING · thinking… {turn_elapsed:.1f}s"
         return f"{_SPINNER_FRAMES[self._frame]} {label}"
 
     def tick(self, *, now: float | None = None) -> str:
         """Advance the spinner once and return the resulting row."""
         return self.render(now=now, advance=True)
+
+
+_MD_HEADING_RE = re.compile(r"^(\s*)(#{1,6})[ \t]+(.+?)\s*#*\s*$")
+_MD_UL_RE = re.compile(r"^(\s*)([-+*])[ \t]+(.*)$")
+_MD_OL_RE = re.compile(r"^(\s*)(\d+[.)])[ \t]+(.*)$")
+_MD_FENCE_RE = re.compile(r"^\s*```([^`]*)\s*$")
+_MD_HRULE_RE = re.compile(r"^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$")
+_MD_INLINE_RE = re.compile(
+    r"`([^`\n]+)`"
+    r"|\*\*(\S(?:[^*\n]*\S)?)\*\*"
+    r"|__(\S(?:[^_\n]*\S)?)__"
+    r"|(?<!\*)\*(\S(?:[^*\n]*\S)?)\*(?!\*)"
+    r"|(?<!_)_(\S(?:[^_\n]*\S)?)_(?!_)"
+)
+
+
+def _md_style(text: str, style: str, color: bool) -> str:
+    clean = _sanitize(text)
+    return f"{style}{clean}{_RESET}" if color and clean else clean
+
+
+def _render_inline_markdown(text: str, color: bool) -> str:
+    clean = _sanitize(text)
+
+    def replace(match: re.Match[str]) -> str:
+        code, bold, bold_alt, italic, italic_alt = match.groups()
+        if code is not None:
+            return _md_style(code, _MD_CODE, color)
+        if bold is not None or bold_alt is not None:
+            return _md_style(bold or bold_alt or "", _MD_BOLD, color)
+        return _md_style(italic or italic_alt or "", _MD_ITALIC, color)
+
+    return _MD_INLINE_RE.sub(replace, clean)
+
+
+def _wrap_plain_markdown(line: str, width: int) -> list[str]:
+    width = max(1, width)
+    if not line:
+        return [""]
+    chunks = textwrap.wrap(
+        _sanitize(line),
+        width=width,
+        replace_whitespace=False,
+        drop_whitespace=True,
+        break_long_words=True,
+        break_on_hyphens=False,
+    ) or [""]
+    output: list[str] = []
+    for chunk in chunks:
+        while _display_width(chunk) > width:
+            head, tail = _take_display_width(chunk, width)
+            if not head:
+                head, tail = "?", chunk[1:]
+            output.append(head)
+            chunk = tail
+        output.append(chunk)
+    return output
+
+
+def _md_rule(width: int, closing: bool, color: bool) -> str:
+    glyph = "└" if closing else "┌"
+    return _md_style("  " + glyph + "─" * max(3, width - 4), _MD_RULE, color)
+
+
+def render_markdown_lines(
+    text: str,
+    width: int = 80,
+    *,
+    color: bool = True,
+) -> list[str]:
+    """Render a small, safe Markdown subset to width-bounded terminal lines."""
+    width = max(1, width)
+    clean = _sanitize(text)
+    if not clean:
+        return []
+    output: list[str] = []
+    in_fence = False
+    fence_width = max(1, width - 4)
+
+    def add_blank() -> None:
+        if output and output[-1] != "":
+            output.append("")
+
+    for raw_line in clean.splitlines():
+        fence = _MD_FENCE_RE.match(raw_line)
+        if in_fence:
+            if fence is not None:
+                output.append(_md_rule(width, True, color))
+                in_fence = False
+            else:
+                for part in _wrap_plain_markdown(raw_line, fence_width):
+                    output.append(_md_style("  │ " + part, _MD_RULE, color))
+            continue
+        if fence is not None:
+            language = fence.group(1).strip()
+            header = "  ┌─" + (f" {language}" if language else "")
+            output.append(_md_style(_clip(header, width), _MD_RULE, color))
+            in_fence = True
+            continue
+        if not raw_line.strip():
+            add_blank()
+            continue
+
+        heading = _MD_HEADING_RE.match(raw_line)
+        if heading is not None:
+            leading, marks, body = heading.groups()
+            indent = leading + "  " * (len(marks) - 1)
+            for index, part in enumerate(_wrap_plain_markdown(body, width - len(indent))):
+                prefix = indent if index == 0 else " " * _display_width(indent)
+                inline = _render_inline_markdown(part, color)
+                output.append(
+                    f"{_MD_HEADING}{_sanitize(prefix)}{inline}{_RESET}"
+                    if color
+                    else prefix + inline
+                )
+            continue
+
+        if _MD_HRULE_RE.match(raw_line):
+            output.append(_md_rule(width, False, color))
+            continue
+
+        list_match = _MD_UL_RE.match(raw_line) or _MD_OL_RE.match(raw_line)
+        if list_match is not None:
+            leading, marker, body = list_match.groups()
+            prefix = f"{leading}{marker} "
+            for index, part in enumerate(
+                _wrap_plain_markdown(body, width - _display_width(prefix))
+            ):
+                hanging = prefix if index == 0 else " " * _display_width(prefix)
+                output.append(hanging + _render_inline_markdown(part, color))
+            continue
+
+        stripped = raw_line.lstrip()
+        if stripped.startswith(">"):
+            body = stripped[1:].lstrip()
+            prefix = "│ "
+            for index, part in enumerate(
+                _wrap_plain_markdown(body, width - _display_width(prefix))
+            ):
+                hanging = prefix if index == 0 else " " * _display_width(prefix)
+                output.append(
+                    _md_style(hanging, _MD_RULE, color)
+                    + _render_inline_markdown(part, color)
+                )
+            continue
+
+        # Pipe-delimited tables remain deliberately preformatted; styling each
+        # cell is more code and less useful than preserving the source layout.
+        table = raw_line.strip().count("|") >= 2
+        for part in _wrap_plain_markdown(raw_line, width - 2 if table else width):
+            output.append(
+                ("  " if table else "") + _sanitize(part)
+                if table
+                else _render_inline_markdown(part, color)
+            )
+
+    while output and output[-1] == "":
+        output.pop()
+    return output
+
+
+# Keep the private name convenient for presentation tests and old callers.
+_render_markdown_lines = render_markdown_lines
 
 
 def _wrap_markdown(text: str, width: int) -> list[str]:
@@ -1196,6 +1429,7 @@ def _entry_lines(
     width: int,
     *,
     detail_limit: int | None = None,
+    color: bool = False,
 ) -> list[tuple[str, str]]:
     width = max(1, width)
     if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
@@ -1220,14 +1454,14 @@ def _entry_lines(
         if detail.startswith(summary):
             detail = detail.split("\n", 1)[1] if "\n" in detail else ""
         if detail:
-            detail_lines = _wrap_markdown(detail, body_width)
+            detail_lines = render_markdown_lines(detail, body_width, color=color)
             if detail_limit is not None:
                 detail_lines = _bounded_render_lines(detail_lines, detail_limit)
             rendered.extend(
                 (entry.role, _clip(body_prefix + line, width)) for line in detail_lines
             )
     else:
-        lines = _wrap_markdown(entry.text, body_width)
+        lines = render_markdown_lines(entry.text, body_width, color=color)
         if detail_limit is not None:
             lines = _bounded_render_lines(lines, detail_limit)
         for line in lines:
@@ -1259,6 +1493,7 @@ def _transcript_blocks(
     width: int,
     *,
     expanded: bool = False,
+    color: bool = False,
 ) -> list[list[tuple[str, str]]]:
     blocks: list[list[tuple[str, str]]] = []
     index = 0
@@ -1266,7 +1501,7 @@ def _transcript_blocks(
         entry = entries[index]
         if entry.role != "tool" or entry.tool_name is None:
             detail_limit = _TOOL_DETAIL_RENDER_LIMIT if entry.role == "error" else None
-            blocks.append(_entry_lines(entry, width, detail_limit=detail_limit))
+            blocks.append(_entry_lines(entry, width, detail_limit=detail_limit, color=color))
             index += 1
             continue
 
@@ -1276,13 +1511,14 @@ def _transcript_blocks(
                     entry,
                     width,
                     detail_limit=_TOOL_DETAIL_RENDER_LIMIT,
+                    color=color,
                 )
             )
             index += 1
             continue
 
         if entry.tool_ok is not True:
-            blocks.append(_entry_lines(entry, width))
+            blocks.append(_entry_lines(entry, width, color=color))
             index += 1
             continue
 
@@ -1307,7 +1543,13 @@ def _transcript_blocks(
     return blocks
 
 
-def _stream_lines(transcript: Transcript, width: int, capacity: int) -> list[tuple[str, str]]:
+def _stream_lines(
+    transcript: Transcript,
+    width: int,
+    capacity: int,
+    *,
+    color: bool = False,
+) -> list[tuple[str, str]]:
     if not transcript.streaming_text or transcript.streaming_role is None:
         return []
     width = max(1, width)
@@ -1321,26 +1563,33 @@ def _stream_lines(transcript: Transcript, width: int, capacity: int) -> list[tup
     ]
     rendered.extend(
         (transcript.streaming_role, _clip("   " + line, width))
-        for line in _wrap_markdown(text, body_width)
+        for line in render_markdown_lines(text, body_width, color=color)
     )
     return rendered[-max(1, capacity) :]
 
 
-def _transcript_lines(transcript: Transcript, width: int, capacity: int) -> list[tuple[str, str]]:
+def _transcript_lines(
+    transcript: Transcript,
+    width: int,
+    capacity: int,
+    *,
+    color: bool = False,
+) -> list[tuple[str, str]]:
     capacity = max(1, capacity)
-    active = _stream_lines(transcript, width, capacity)
+    active = _stream_lines(transcript, width, capacity, color=color)
     remaining = max(0, capacity - len(active))
     rendered: list[tuple[str, str]] = []
     if remaining:
-        history = [
-            line
-            for block in _transcript_blocks(
-                transcript.entries,
-                width,
-                expanded=transcript.tool_details_expanded,
-            )
-            for line in block
-        ]
+        history: list[tuple[str, str]] = []
+        for block in _transcript_blocks(
+            transcript.entries,
+            width,
+            expanded=transcript.tool_details_expanded,
+            color=color,
+        ):
+            if history:
+                history.append(("system", ""))
+            history.extend(block)
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
@@ -1797,14 +2046,19 @@ def _style_kind(kind: str) -> str:
     return ""
 
 
-def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
+def _primary_rows(
+    transcript: Transcript,
+    width: int,
+    *,
+    color: bool = False,
+) -> list[tuple[str, str]]:
     """Return safe, labelled transcript rows for the append-only view."""
     width = max(8, width)
     # The transcript itself is bounded, but a large Markdown entry may occupy
     # many wrapped rows.  Leave enough capacity to render the complete local
     # view so the Cockpit can append only the suffix it has not emitted yet.
     capacity = max(64, len(transcript.entries) * 16 + 64)
-    rows = _transcript_lines(transcript, width, capacity)
+    rows = _transcript_lines(transcript, width, capacity, color=color)
     rendered: list[tuple[str, str]] = []
     for role, text in rows:
         rendered.append((role, _clip(_sanitize(text), width)))
@@ -2044,6 +2298,8 @@ def _status_rows(
         context_row.append(f"checkpoint={_compact_checkpoint(checkpoint)}")
     tool_errors = transcript.tool_error_count
     context_row.insert(0, f"tool errors={tool_errors}")
+    if activity_line:
+        context_row.insert(0, _side_clean(activity_line))
 
     return [
         _status_row(identity, width),
@@ -2055,7 +2311,8 @@ def _status_rows(
 
 def _frame_inside(text: str, width: int) -> str:
     inner = max(1, width - 2)
-    return "│" + _pad(sanitize_terminal_text(text, single_line=True), inner) + "│"
+    clean = _safe_rendered(text).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    return "│" + _pad(clean, inner) + "│"
 
 
 def _cockpit_frame_lines(
@@ -2077,7 +2334,12 @@ def _cockpit_frame_lines(
     conversation_capacity = max(1, height - _FRAME_OVERHEAD)
     status = _sanitize(getattr(snapshot, "session_status", "idle"))
     lines = [_paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)]
-    conversation = _transcript_lines(transcript, inner, conversation_capacity)
+    conversation = _transcript_lines(
+        transcript,
+        inner,
+        conversation_capacity,
+        color=color,
+    )
     for role, text in conversation[:conversation_capacity]:
         lines.append(
             _paint(
@@ -2115,12 +2377,13 @@ def render_primary(
     cumulative_line: str,
     width: int,
     color: bool = False,
+    activity_line: str = "",
 ) -> list[str]:
     """Render conversation rows followed by the deterministic status pane."""
     width = max(8, width)
     lines = [
         _paint(text, _ROLE_COLORS.get(role, ""), color)
-        for role, text in _primary_rows(transcript, width)
+        for role, text in _primary_rows(transcript, width, color=color)
     ]
     lines.extend(_paint(text, _DIM_CYAN, color) for text in _status_rows(
         snapshot,
@@ -2129,6 +2392,7 @@ def render_primary(
         branch_line=branch_line,
         cumulative_line=cumulative_line,
         width=width,
+        activity_line=activity_line,
     ))
     return lines
 
@@ -2162,6 +2426,7 @@ def render_cockpit(
             cumulative_line=cumulative_line,
             width=width,
             color=color,
+            activity_line=activity_line,
         )
     return _cockpit_frame_lines(
         snapshot,
@@ -2310,7 +2575,7 @@ class Cockpit:
             self.stream.write("\x1b[1B\r\n")
             self._fixed_frame = False
 
-        rows = tuple(_primary_rows(transcript, self._last_size.columns))
+        rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
         status_rows = tuple(
             _status_rows(
                 snapshot,
@@ -2361,7 +2626,7 @@ class Cockpit:
         request: tuple[Any, Transcript, str, str, str, str, str],
     ) -> None:
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
-        rows = tuple(_primary_rows(transcript, self._last_size.columns))
+        rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
         current_status_fields = _status_fields(
             snapshot,
             session_description=session_description,
@@ -2486,6 +2751,7 @@ __all__ = [
     "Transcript",
     "TranscriptEntry",
     "render_quota_rows",
+    "render_markdown_lines",
     "render_primary",
     "render_cockpit",
 ]
