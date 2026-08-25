@@ -18,15 +18,21 @@ tooling; the default operation is one module decision.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
+import statistics
 import subprocess
 import sys
 from abc import ABC, abstractmethod
+from asyncio import get_running_loop, run
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, ClassVar, Literal, NoReturn, Protocol, cast
 
 from cambium.auth import is_provider_env_name
 from cambium.redact import Redactor, is_secret_name
@@ -499,3 +505,596 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
             raise DatasetError(f"{dataset_path}:{line_no}: record must be a JSON object")
         records.append(record)
     return records
+
+
+# The two shipped decision modules deliberately keep their rules in their own
+# packages.  Everything below is the boring contract plumbing those packages
+# share: split loading, exact-match evaluation, the neutral JSON adapter, and
+# the lazy DSPy seam.
+
+
+class Split(Enum):
+    """The three v1 dataset splits (dataset-format.md §4)."""
+
+    TRAIN = "train"
+    EVAL = "eval"
+    CANARIES = "canaries"
+
+
+def _reject_dataset_json_constant(value: str) -> NoReturn:
+    """Reject non-standard JSON constants in module metadata."""
+    raise ValueError(f"invalid JSON constant {value}")
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetBundle:
+    """All three splits plus the dataset version from ``meta.json``."""
+
+    train: tuple[Example, ...]
+    eval: tuple[Example, ...]
+    canaries: tuple[Example, ...]
+    dataset_version: str
+
+
+class SharedDatasetLoader(DatasetLoader):
+    """Load the common v1 split contract for a module-specific decision type."""
+
+    supported_schema_version = 1
+    input_type: ClassVar[type]
+    label_field: ClassVar[str]
+    positive_decision: ClassVar[Enum]
+    negative_decision: ClassVar[Enum]
+    require_decompose_mirror: ClassVar[bool] = False
+
+    def load(self) -> list[Example]:
+        meta = self._check_schema_version()
+        return self._load_path(self.path, meta=meta)
+
+    def load_split(self, split: Split) -> list[Example]:
+        """Load one split from ``datasets/<split>.jsonl``."""
+        meta = self._check_schema_version()
+        return self._load_split(split, meta)
+
+    def _load_split(self, split: Split, meta: dict) -> list[Example]:
+        """Load one split using metadata captured by the public entry point."""
+        split_path = self.datasets_dir / f"{split.value}.jsonl"
+        if not split_path.is_file():
+            raise DatasetError(f"dataset split file is missing: {split_path}")
+        examples = self._load_path(split_path, meta=meta, require_envelope=True)
+        if split is Split.CANARIES:
+            examples = [ex for ex in examples if ex.canary]
+        else:
+            examples = [ex for ex in examples if not ex.canary]
+        return examples
+
+    def load_all(self) -> DatasetBundle:
+        """Load the full three-split dataset as a frozen bundle."""
+        meta = self._check_schema_version()
+        train = tuple(self._load_split(Split.TRAIN, meta))
+        eval_ = tuple(self._load_split(Split.EVAL, meta))
+        canaries = tuple(self._load_split(Split.CANARIES, meta))
+        self._check_no_cross_split_collisions(
+            [("train", train), ("eval", eval_), ("canaries", canaries)]
+        )
+        return DatasetBundle(
+            train=train,
+            eval=eval_,
+            canaries=canaries,
+            dataset_version=self._dataset_version_from_meta(meta),
+        )
+
+    @property
+    def datasets_dir(self) -> Path:
+        """The module's dataset directory (a directory path, or a file's parent)."""
+        return self.path if self.path.is_dir() else self.path.parent
+
+    @property
+    def dataset_version(self) -> str:
+        """Dataset version from ``meta.json``; ``"0.1.0"`` when absent."""
+        return self._dataset_version_from_meta(self._read_meta())
+
+    @staticmethod
+    def _dataset_version_from_meta(data: dict) -> str:
+        """Return the dataset version represented by already-read metadata."""
+        version = data.get("dataset_version")
+        return version if isinstance(version, str) else "0.1.0"
+
+    def _read_meta(self) -> dict:
+        """Read ``meta.json``; ``{}`` when absent. DatasetError on bad content."""
+        meta = self.datasets_dir / "meta.json"
+        try:
+            text = meta.read_text()
+        except FileNotFoundError as exc:
+            if not meta.is_symlink():
+                return {}
+            raise DatasetError(f"{meta}: cannot read metadata: {exc}") from exc
+        except OSError as exc:
+            raise DatasetError(f"{meta}: cannot read metadata: {exc}") from exc
+        except UnicodeError as exc:
+            raise DatasetError(f"{meta}: invalid text: {exc}") from exc
+        try:
+            data = json.loads(text, parse_constant=_reject_dataset_json_constant)
+        except ValueError as exc:
+            raise DatasetError(f"{meta}: invalid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise DatasetError(
+                f"{meta}: meta.json must be a JSON object, got {type(data).__name__}"
+            )
+        return data
+
+    def _check_schema_version(self) -> dict:
+        data = self._read_meta()
+        schema_version = data.get("schema_version")
+        if schema_version is None:
+            return data
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise DatasetError(
+                f"{self.datasets_dir / 'meta.json'}: schema_version must be an integer"
+            )
+        if schema_version != self.supported_schema_version:
+            raise DatasetError(
+                f"{self.datasets_dir / 'meta.json'}: schema_version {schema_version} "
+                f"unsupported; loader supports {self.supported_schema_version}"
+            )
+        return data
+
+    def _load_path(
+        self, path: Path, *, meta: dict, require_envelope: bool = False
+    ) -> list[Example]:
+        records = load_jsonl(path)
+        require_versions = (
+            require_envelope or path.stem in {split.value for split in Split}
+        ) and bool(
+            meta.get("schema_version") is not None or meta.get("dataset_version") is not None
+        )
+        examples: list[Example] = []
+        seen_ids: dict[str, int] = {}
+        for line_no, record in enumerate(records, start=1):
+            self._validate_record_versions(record, line_no, path, meta, require_versions)
+            self._validate(record, line_no, path)
+            record_id = record.get("id")
+            if require_envelope:
+                if not isinstance(record_id, str) or not record_id:
+                    raise DatasetError(
+                        f"{path}:{line_no}: record must have a non-empty string 'id'"
+                    )
+            if isinstance(record_id, str):
+                if record_id in seen_ids:
+                    raise DatasetError(
+                        f"{path}:{line_no}: duplicate id {record_id!r} "
+                        f"(first at line {seen_ids[record_id]})"
+                    )
+                seen_ids[record_id] = line_no
+            try:
+                task_input = self.input_type(**record["input"])
+            except TypeError as exc:
+                raise DatasetError(f"{path}:{line_no}: invalid input fields: {exc}") from exc
+            expected = dict(record["expected"])
+            expected[self.label_field] = (
+                self.positive_decision if expected[self.label_field] else self.negative_decision
+            )
+            examples.append(
+                Example(
+                    input=task_input,
+                    expected=expected,
+                    canary=bool(record.get("canary", False)),
+                )
+            )
+        return examples
+
+    def _validate_record_versions(
+        self,
+        record: dict,
+        line_no: int,
+        path: Path,
+        meta: dict,
+        require_versions: bool,
+    ) -> None:
+        expected_schema_version = meta.get("schema_version")
+        expected_dataset_version = meta.get("dataset_version")
+        if expected_schema_version is None and expected_dataset_version is None:
+            return
+
+        has_versions = "schema_version" in record or "dataset_version" in record
+        if not has_versions:
+            if require_versions:
+                raise DatasetError(
+                    f"{path}:{line_no}: record must have schema_version and "
+                    "dataset_version matching meta.json"
+                )
+            return
+
+        mismatches: list[str] = []
+        record_schema_version = record.get("schema_version")
+        if expected_schema_version is not None:
+            if (
+                not isinstance(record_schema_version, int)
+                or isinstance(record_schema_version, bool)
+                or record_schema_version != expected_schema_version
+            ):
+                mismatches.append(
+                    f"schema_version {record_schema_version!r} != "
+                    f"meta.json {expected_schema_version!r}"
+                )
+
+        record_dataset_version = record.get("dataset_version")
+        if expected_dataset_version is not None:
+            if (
+                not isinstance(record_dataset_version, str)
+                or record_dataset_version != expected_dataset_version
+            ):
+                mismatches.append(
+                    f"dataset_version {record_dataset_version!r} != "
+                    f"meta.json {expected_dataset_version!r}"
+                )
+
+        if mismatches:
+            raise DatasetError(f"{path}:{line_no}: version drift: {', '.join(mismatches)}")
+
+    def _check_no_cross_split_collisions(self, splits: list[tuple[str, Sequence[Example]]]) -> None:
+        seen: dict[str, tuple[str, str]] = {}
+        for split_name, examples in splits:
+            for example in examples:
+                digest = self._canonical_digest(example)
+                if digest in seen:
+                    first_split, first_task = seen[digest]
+                    raise DatasetError(
+                        f"cross-split collision: (task, context) "
+                        f"from {first_split} ({first_task!r}) "
+                        f"also in {split_name} ({example.input.task!r})"
+                    )
+                seen[digest] = (split_name, example.input.task)
+
+    @staticmethod
+    def _canonical_digest(example: Example) -> str:
+        payload = (example.input.task, example.input.context)
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _validate(self, record: dict, line_no: int, path: Path) -> None:
+        if not {"input", "expected"} <= record.keys():
+            raise DatasetError(f"{path}:{line_no}: record must have 'input' and 'expected'")
+        for key in ("input", "expected"):
+            if not isinstance(record[key], dict):
+                raise DatasetError(f"{path}:{line_no}: {key} must be an object")
+        if not isinstance(record["input"].get("task"), str):
+            raise DatasetError(f"{path}:{line_no}: input.task must be a string")
+        if not isinstance(record["input"].get("context"), str):
+            raise DatasetError(f"{path}:{line_no}: input.context must be a string")
+        expected = record["expected"]
+        if not isinstance(expected.get(self.label_field), bool):
+            raise DatasetError(
+                f"{path}:{line_no}: expected.{self.label_field} must be a boolean"
+            )
+        if self.require_decompose_mirror:
+            decompose = expected.get("decompose")
+            if not isinstance(decompose, bool) or decompose != expected[self.label_field]:
+                raise DatasetError(
+                    f"{path}:{line_no}: expected.decompose must mirror "
+                    f"expected.{self.label_field} (generic v1 class-balance field)"
+                )
+        if not isinstance(expected.get("reason"), str):
+            raise DatasetError(f"{path}:{line_no}: expected.reason must be a string")
+        canary = record.get("canary", False)
+        if not isinstance(canary, bool):
+            raise DatasetError(f"{path}:{line_no}: canary must be a boolean")
+
+
+def score_decision(example: Example, *, label_field: str, decision_type: type[Enum]) -> float:
+    """Score one example in [0, 1] by exact match on its decision enum."""
+    prediction = example.prediction
+    if prediction is None:
+        return 0.0
+    expected = example.expected.get(label_field)
+    if not isinstance(expected, decision_type) or not isinstance(
+        prediction.decision, decision_type
+    ):
+        return 0.0
+    return 1.0 if prediction.decision == expected else 0.0
+
+
+async def evaluate_split_async(module: Module, loader, split) -> dict:
+    """Score one dataset split with the module metric (async form)."""
+    scores: list[float] = []
+    for example in loader.load_split(split):
+        prediction = await module.decide(example.input)
+        scores.append(module.metric(example.with_prediction(prediction)))
+    if not scores:
+        return {"mean": float("nan"), "std": float("nan"), "count": 0}
+    return {
+        "mean": statistics.fmean(scores),
+        "std": statistics.pstdev(scores),
+        "count": len(scores),
+    }
+
+
+def evaluate_split(module: Module, loader, split) -> dict:
+    """Score one dataset split outside a running event loop."""
+    try:
+        get_running_loop()
+    except RuntimeError:
+        return run(evaluate_split_async(module, loader, split))
+    raise RuntimeError(
+        "evaluate_split must not be called from a running event loop; "
+        "use evaluate_split_async in async contexts"
+    )
+
+
+class InputValidationError(ValueError):
+    """Raised when a JSON request does not match a module wire schema."""
+
+
+class SchemaInvalidError(ValueError):
+    """Raised when a dataset record does not match a module dataset schema."""
+
+
+_MODULE_INPUT_FIELDS = frozenset({"task", "context"})
+
+
+def _parse_module_input(payload: Any, input_type: type) -> Any:
+    """Validate one decoded JSON value and build a typed module input."""
+    if not isinstance(payload, dict):
+        raise InputValidationError("input must be a JSON object")
+
+    unknown_fields = sorted(set(payload) - _MODULE_INPUT_FIELDS)
+    if unknown_fields:
+        names = ", ".join(repr(field) for field in unknown_fields)
+        raise InputValidationError(f"unknown input field(s): {names}")
+    if "task" not in payload:
+        raise InputValidationError("input.task is required")
+    task = payload["task"]
+    if not isinstance(task, str):
+        raise InputValidationError("input.task must be a string")
+    if not task.strip():
+        raise InputValidationError("input.task must not be empty")
+
+    context = payload.get("context", "")
+    if not isinstance(context, str):
+        raise InputValidationError("input.context must be a string")
+
+    return input_type(task=task, context=context)
+
+
+def _reject_duplicate_module_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate JSON fields with the CLI's historical error type."""
+    fields: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in fields:
+            raise json.JSONDecodeError(f"duplicate JSON object field: {name!r}", "", 0)
+        fields[name] = value
+    return fields
+
+
+def _serialize_module_output(
+    output: Any, output_type: type, decision_type: type[Enum], label_field: str
+) -> dict[str, bool | float | str]:
+    """Convert a typed domain output to its stable JSON wire shape."""
+    if not isinstance(output, output_type):
+        raise TypeError("module returned an invalid output type")
+    if not isinstance(output.decision, decision_type):
+        raise TypeError("module returned an invalid decision")
+    if not isinstance(output.reason, str):
+        raise TypeError("module returned an invalid reason")
+    if isinstance(output.confidence, bool) or not isinstance(output.confidence, int | float):
+        raise TypeError("module returned an invalid confidence")
+    if not math.isfinite(output.confidence) or not 0.0 <= output.confidence <= 1.0:
+        raise ValueError("module returned confidence outside [0.0, 1.0]")
+    return {
+        "confidence": output.confidence,
+        label_field: getattr(output, label_field),
+        "reason": output.reason,
+    }
+
+
+async def _module_decide(
+    module: Module,
+    inputs: list[Any],
+    output_type: type,
+    decision_type: type[Enum],
+    label_field: str,
+) -> list[dict]:
+    return [
+        _serialize_module_output(
+            await module.decide(task_input), output_type, decision_type, label_field
+        )
+        for task_input in inputs
+    ]
+
+
+async def _module_evaluate(
+    module: Module,
+    records: list[dict[str, Any]],
+    input_type: type,
+    output_type: type,
+    decision_type: type[Enum],
+    label_field: str,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise SchemaInvalidError(f"record {index} must be a JSON object")
+        try:
+            task_input = _parse_module_input(record.get("input"), input_type)
+        except InputValidationError as exc:
+            raise SchemaInvalidError(f"record {index}.input: {exc}") from exc
+        expected = record.get("expected")
+        if not isinstance(expected, dict):
+            raise SchemaInvalidError(f"record {index}.expected must be a JSON object")
+        expected_label = expected.get(label_field)
+        if not isinstance(expected_label, bool):
+            raise SchemaInvalidError(
+                f"record {index}.expected.{label_field} must be a boolean"
+            )
+        if not isinstance(expected.get("reason"), str):
+            raise SchemaInvalidError(f"record {index}.expected.reason must be a string")
+        canary = record.get("canary", False)
+        if not isinstance(canary, bool):
+            raise SchemaInvalidError(f"record {index}.canary must be a boolean")
+        prediction = await module.decide(task_input)
+        prediction_wire = _serialize_module_output(
+            prediction, output_type, decision_type, label_field
+        )
+        expected_typed = dict(expected)
+        expected_typed[label_field] = (
+            next(member for member in decision_type if member.value == label_field)
+            if expected_label
+            else next(member for member in decision_type if member.value == f"do_not_{label_field}")
+        )
+        score = module.metric(
+            Example(
+                input=task_input,
+                expected=expected_typed,
+                prediction=prediction,
+                canary=canary,
+            )
+        )
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise TypeError(f"record {index}: module metric is not numeric")
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError(f"record {index}: module metric is outside [0.0, 1.0]")
+        results.append({"prediction": prediction_wire, "score": score})
+    return results
+
+
+def run_module_entrypoint(
+    module_type: type[Module],
+    input_type: type,
+    output_type: type,
+    decision_type: type[Enum],
+    label_field: str,
+    module_name: str,
+) -> int:
+    """Run one module's neutral JSON stdin/stdout adapter."""
+    def write_json(payload: object) -> None:
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def write_error(exc: Exception) -> int:
+        error: dict[str, Any] = {
+            "message": str(exc) or "module CLI failed",
+            "type": type(exc).__name__,
+        }
+        if isinstance(exc, SchemaInvalidError):
+            error["code"] = "SCHEMA_INVALID"
+        write_json({"error": error})
+        print(f"{module_name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        payload = json.loads(
+            sys.stdin.buffer.read(), object_pairs_hook=_reject_duplicate_module_fields
+        )
+        module = module_type()
+        if isinstance(payload, dict) and "operation" in payload:
+            operation = payload.get("operation")
+            if operation == "decide":
+                inputs = payload.get("inputs")
+                if not isinstance(inputs, list):
+                    raise InputValidationError("decide.inputs must be a JSON array")
+                decisions = run(
+                    _module_decide(
+                        module,
+                        [_parse_module_input(item, input_type) for item in inputs],
+                        output_type,
+                        decision_type,
+                        label_field,
+                    )
+                )
+                result = {"results": decisions}
+            elif operation == "evaluate":
+                records = payload.get("records")
+                if not isinstance(records, list):
+                    raise InputValidationError("evaluate.records must be a JSON array")
+                result = {
+                    "results": run(
+                        _module_evaluate(
+                            module,
+                            records,
+                            input_type,
+                            output_type,
+                            decision_type,
+                            label_field,
+                        )
+                    )
+                }
+            else:
+                raise InputValidationError(f"unknown operation: {operation!r}")
+        else:
+            result = run(
+                _module_decide(
+                    module,
+                    [_parse_module_input(payload, input_type)],
+                    output_type,
+                    decision_type,
+                    label_field,
+                )
+            )[0]
+        write_json(result)
+    except Exception as exc:
+        return write_error(exc)
+    return 0
+
+
+class DSPyModuleBase:
+    """Lazy DSPy classifier base shared by the shipped module programs."""
+
+    name: ClassVar[str]
+    label_field: ClassVar[str]
+    fallback_decision: ClassVar[Enum]
+    output_type: ClassVar[type]
+    decision_type: ClassVar[type[Enum]]
+    signature_name: ClassVar[str]
+
+    def __init__(self, lm) -> None:
+        import dspy  # type: ignore[import-untyped]
+
+        cls = type(self)
+        if DSPyModuleBase in cls.__bases__:
+            cls.__init__ = DSPyModuleBase.__init__
+            cls.decide = DSPyModuleBase.decide
+            cls.metric = DSPyModuleBase.metric
+            cls.__bases__ = (dspy.Module,)
+        dspy.Module.__init__(cast(Any, self))
+
+        decision_values = tuple(member.value for member in self.decision_type)
+        signature = type(
+            self.signature_name,
+            (dspy.Signature,),
+            {
+                "__module__": cls.__module__,
+                "__annotations__": {
+                    "task": str,
+                    "context": str,
+                    "decision": Literal[decision_values],
+                    "reason": str,
+                },
+                "task": dspy.InputField(),
+                "context": dspy.InputField(),
+                "decision": dspy.OutputField(),
+                "reason": dspy.OutputField(),
+            },
+        )
+        self._predict = dspy.Predict(signature)
+        self._lm = lm
+
+    async def decide(self, input: Any) -> Any:
+        """Run the DSPy predictor and map its output to the domain enum."""
+        import dspy  # type: ignore[import-untyped]
+
+        try:
+            with dspy.context(lm=self._lm):
+                pred = await self._predict.acall(task=input.task, context=input.context)
+            decision = self.decision_type(str(pred.decision))
+        except (ValueError, dspy.AdapterParseError):
+            return self.output_type(
+                decision=self.fallback_decision,
+                reason="DSPy output unparseable",
+                confidence=0.0,
+            )
+        return self.output_type(decision=decision, reason=str(pred.reason), confidence=0.5)
+
+    def metric(self, example: Example) -> float:
+        """Score a prediction with the module's exact decision metric."""
+        return score_decision(
+            example, label_field=self.label_field, decision_type=self.decision_type
+        )
