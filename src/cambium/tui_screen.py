@@ -1895,6 +1895,11 @@ def _transcript_lines(
             if history:
                 history.append(("system", ""))
             history.extend(block)
+        while len(history) > remaining:
+            try:
+                history.remove(next(row for row in history if not row[1]))
+            except StopIteration:
+                break
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
