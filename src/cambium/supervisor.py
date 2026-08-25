@@ -1439,9 +1439,99 @@ def _session_redactor(
     return build_session_redactor(secret_values)
 
 
+def _interactive_turn_event_stores(session_dir: Path) -> list[tuple[int, Path]]:
+    """Return durable event stores for an interactive root, oldest first."""
+    stores: list[tuple[int, Path]] = []
+    try:
+        children = tuple(session_dir.iterdir())
+    except OSError:
+        return stores
+    for child in children:
+        match = re.fullmatch(r"turn-(\d+)", child.name)
+        if match is None or not child.is_dir():
+            continue
+        event_db = child / ".cambium" / "events.db"
+        if event_db.is_file():
+            stores.append((int(match.group(1)), event_db))
+    stores.sort(key=lambda item: item[0])
+    return stores
+
+
+def _interactive_event_timestamp(event: Mapping[str, Any]) -> float | None:
+    value = event.get("ts")
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        timestamp = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return timestamp if math.isfinite(timestamp) else None
+
+
+def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str, Any]]:
+    """Replay immutable turn stores as one logical session event stream.
+
+    InteractiveSession deliberately gives every prompt its own supervisor
+    leaf, so each ``turn-NNNN`` has a local sequence space.  Option (b) keeps
+    those stores immutable and treats the parent ``events.db`` URI used by
+    archived results as the logical session log: turn number and local ``seq``
+    provide stable ordering, with ``ts`` breaking local ties.  The returned
+    sequence is renumbered only at this read boundary so monitor polling can
+    use one ``after_seq`` cursor without rewriting history.
+    """
+    turn_stores = _interactive_turn_event_stores(session_dir)
+    if not turn_stores:
+        return read_events_file(session_dir / ".cambium" / "events.db", after_seq)
+
+    records: list[tuple[int, int, float | None, int, dict[str, Any]]] = []
+    for turn, event_db in turn_stores:
+        for event in read_events_file(event_db):
+            records.append(
+                (
+                    turn,
+                    event["seq"],
+                    _interactive_event_timestamp(event),
+                    0,
+                    event,
+                )
+            )
+
+    # ``/compact`` is the one legacy path that can write the parent store;
+    # retain those records after the turn leaves rather than dropping them.
+    root_event_db = session_dir / ".cambium" / "events.db"
+    for event in read_events_file(root_event_db):
+        payload = event.get("payload")
+        event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
+        turn = event_turn if type(event_turn) is int and event_turn >= 0 else turn_stores[-1][0] + 1
+        records.append(
+            (
+                turn,
+                event["seq"],
+                _interactive_event_timestamp(event),
+                1,
+                event,
+            )
+        )
+    records.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            item[2] is None,
+            item[2] if item[2] is not None else 0.0,
+            item[3],
+        )
+    )
+    merged: list[dict[str, Any]] = []
+    for sequence, (_turn, _local_seq, _timestamp, _source, event) in enumerate(records, 1):
+        normalized = dict(event)
+        normalized["seq"] = sequence
+        merged.append(normalized)
+    return [event for event in merged if event["seq"] > after_seq]
+
+
 def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
-    """Replay the session's durable event log from ``after_seq`` (arch §6.3)."""
-    return read_events_file(Path(session_dir) / ".cambium" / "events.db", after_seq)
+    """Replay a session's durable event log from ``after_seq`` (arch §6.3)."""
+    return _read_interactive_events(Path(session_dir), after_seq)
 
 
 @dataclass(frozen=True, slots=True)

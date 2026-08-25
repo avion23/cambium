@@ -701,6 +701,9 @@ def _root_from_child(
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("session_id must be an explicit non-empty string")
     session_root = Path(session_dir).resolve()
+    # Interactive turns keep immutable per-turn stores. The session-root URI
+    # remains the logical event-log reference; supervisor.read_events merges
+    # those leaves without rewriting archived result history.
     event_log_ref = f"sqlite:{session_root / '.cambium' / 'events.db'}"
     status = status_from_wire(child)
     unified_diff = child.get("unified_diff", "")
