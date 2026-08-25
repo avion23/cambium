@@ -31,10 +31,12 @@ from cambium.diffundo import Diffundo, DiffundoError, ProviderTier
 from cambium.jlens import JlenClient, JlenError, render_messages
 from cambium.lm import CambiumLM
 from cambium.modules.base import (
+    PARSE_FAILURE_REASON,
     DatasetError,
     Example,
     ModuleContractError,
     ModuleManifest,
+    is_parse_failure_prediction,
     load_module_manifest,
 )
 
@@ -43,6 +45,7 @@ AdapterParseError = cast(type[Exception], _DSPY_EXCEPTIONS.__dict__["AdapterPars
 DSPyError = cast(type[Exception], _DSPY_EXCEPTIONS.__dict__["DSPyError"])
 
 MODULES_DIR = module_conformance.MODULES_DIR
+_ARTIFACT_ROOT = module_conformance.REPO_ROOT / "optimized"
 
 _MISSING = object()
 _MODULES_PREFIX = ".".join(("cambium", "modules"))
@@ -63,12 +66,38 @@ class _BudgetExhausted(OptimizeError):
 _MIN_CALL_BUDGET_USD = 0.01
 
 
+def _price_source(provider: object | None) -> str:
+    """Describe why a provider's reported USD cost may be zero."""
+    if provider is None:
+        return "unknown"
+    billing_value = getattr(provider, "billing_mode", None)
+    billing = getattr(billing_value, "value", billing_value)
+    if billing in {"subscription", "free", "local"}:
+        return billing
+    if getattr(provider, "pricing_known", False) is True:
+        return "provider_config"
+    for name in ("price_per_1m_in", "price_per_1m_cached_in", "price_per_1m_out"):
+        value = getattr(provider, name, 0.0)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            if math.isfinite(float(value)) and value > 0:
+                return "provider_config"
+    return "unknown"
+
+
 class _CostLedger:
-    """Small per-run cost ledger used by the Diffundo adapter."""
+    """Per-run spend ledger with token evidence when tariffs are zero."""
 
     def __init__(self, budget_usd: float) -> None:
         self.budget_usd = budget_usd
         self.spent_usd = 0.0
+        self._usage = {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "total_tokens": 0,
+        }
+        self._price_sources: dict[str, str] = {}
 
     @property
     def remaining_usd(self) -> float:
@@ -86,11 +115,54 @@ class _CostLedger:
                 f"of ${self.budget_usd:.6f}; only ${self.remaining_usd:.6f} remains"
             )
 
-    def record(self, value: object) -> None:
-        if isinstance(value, bool) or not isinstance(value, int | float):
+    @property
+    def usage(self) -> dict[str, int]:
+        return dict(self._usage)
+
+    @property
+    def price_source(self) -> str:
+        sources = set(self._price_sources.values())
+        if len(sources) == 1:
+            return next(iter(sources))
+        if sources:
+            return "mixed"
+        return "unavailable"
+
+    @property
+    def price_sources(self) -> dict[str, str]:
+        return dict(self._price_sources)
+
+    def record(self, value: object, *, provider: object | None = None) -> None:
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            if math.isfinite(value) and value >= 0:
+                self.spent_usd += float(value)
             return
-        if math.isfinite(value) and value >= 0:
-            self.spent_usd += float(value)
+
+        self._usage["calls"] += 1
+        cost = getattr(value, "estimated_cost_usd", None)
+        if isinstance(cost, int | float) and not isinstance(cost, bool):
+            if math.isfinite(cost) and cost >= 0:
+                self.spent_usd += float(cost)
+
+        usage = getattr(value, "usage", None)
+        if isinstance(usage, Mapping):
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            cached_tokens = usage.get("cached_tokens", 0)
+            token_values = (prompt_tokens, completion_tokens, cached_tokens)
+            if all(type(token) is int and token >= 0 for token in token_values):
+                self._usage["prompt_tokens"] += prompt_tokens
+                self._usage["completion_tokens"] += completion_tokens
+                self._usage["cached_tokens"] += cached_tokens
+                total_tokens = usage.get("total_tokens")
+                if type(total_tokens) is int and total_tokens >= 0:
+                    self._usage["total_tokens"] += total_tokens
+                else:
+                    self._usage["total_tokens"] += prompt_tokens + completion_tokens
+
+        provider_name = getattr(value, "provider", None)
+        if isinstance(provider_name, str) and provider_name:
+            self._price_sources[provider_name] = _price_source(provider)
 
 
 def _import_target(target: str) -> Any:
@@ -130,6 +202,7 @@ class _TrackingDiffundo(Diffundo):
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
+        **kwargs: Any,
     ) -> Any:
         self._ledger.check_available()
         call_budget = self._ledger.remaining_usd
@@ -143,7 +216,15 @@ class _TrackingDiffundo(Diffundo):
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
         )
-        self._ledger.record(getattr(result, "estimated_cost_usd", 0.0))
+        provider_config = next(
+            (
+                item
+                for item in getattr(self._delegate, "_providers", ())
+                if getattr(item, "name", None) == getattr(result, "provider", None)
+            ),
+            None,
+        )
+        self._ledger.record(result, provider=provider_config)
         if self._ledger.spent_usd > self._ledger.budget_usd:
             raise _BudgetExhausted(
                 f"optimization budget exceeded: spent ${self._ledger.spent_usd:.6f} "
@@ -380,7 +461,7 @@ def _fallback_prediction(program: object) -> object:
         raise OptimizeError(f"decision module has no {str(fallback_value).upper()} decision")
     return output_type(
         decision=decision,
-        reason="unparseable model output",
+        reason=PARSE_FAILURE_REASON,
         confidence=0.0,
     )
 
@@ -536,6 +617,8 @@ def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callabl
             parts = _gold_parts(gold, program)
             prediction = _prediction_output(pred, program)
             if parts is None or prediction is None:
+                return 0.0
+            if is_parse_failure_prediction(prediction):
                 return 0.0
             input_value, expected = parts
             example = Example(
@@ -809,11 +892,17 @@ async def _score_examples_async(program: object, examples: list[Example]) -> lis
 
 async def _evaluate_examples_async(
     program: object, examples: list[Example]
-) -> list[dict[str, float | int]]:
-    """Run the program and retain one normalized metric outcome per example."""
+) -> list[dict[str, float | int | bool]]:
+    """Run the program and retain one normalized metric outcome per example.
+
+    Parse failures keep the conservative production fallback, but are marked
+    so aggregate scores can exclude them instead of treating them as model
+    quality zeros.
+    """
     scorer = _metric_function(program)
-    outcomes: list[dict[str, float | int]] = []
+    outcomes: list[dict[str, float | int | bool]] = []
     for index, example in enumerate(examples):
+        parse_failure = False
         try:
             raw_prediction = await cast(Callable[[Any], Any], cast(Any, program).decide)(
                 example.input
@@ -824,9 +913,13 @@ async def _evaluate_examples_async(
             if not _is_parse_failure(exc):
                 raise
             raw_prediction = None
+            parse_failure = True
         prediction = _prediction_output(raw_prediction, program)
         if prediction is None:
             prediction = _fallback_prediction(program)
+            parse_failure = True
+        elif is_parse_failure_prediction(prediction):
+            parse_failure = True
         try:
             score = scorer(example.with_prediction(prediction))
         except (KeyError, ValueError):
@@ -835,13 +928,15 @@ async def _evaluate_examples_async(
             score = 0.0
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             score = 0.0
-        outcomes.append({"index": index, "score": float(score)})
+        outcomes.append(
+            {"index": index, "score": float(score), "parse_failure": parse_failure}
+        )
     return outcomes
 
 
 async def _evaluate_splits_async(
     program: object, split_examples: Mapping[str, list[Example]]
-) -> dict[str, list[dict[str, float | int]]]:
+) -> dict[str, list[dict[str, float | int | bool]]]:
     """Evaluate each named split without changing the program or metric seam."""
     return {
         split: await _evaluate_examples_async(program, examples)
@@ -849,14 +944,25 @@ async def _evaluate_splits_async(
     }
 
 
-def _score_outcomes(outcomes: list[dict[str, float | int]]) -> dict[str, Any]:
-    scores = [cast(float, outcome["score"]) for outcome in outcomes]
+def _score_outcomes(outcomes: list[dict[str, float | int | bool]]) -> dict[str, Any]:
+    scored = [outcome for outcome in outcomes if not outcome.get("parse_failure", False)]
+    scores = [cast(float, outcome["score"]) for outcome in scored]
+    parse_failures = len(outcomes) - len(scored)
     if not scores:
-        return {"mean": 0.0, "std": 0.0, "count": 0, "records": outcomes}
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "count": len(outcomes),
+            "scored_count": 0,
+            "parse_failures": parse_failures,
+            "records": outcomes,
+        }
     return {
         "mean": float(statistics.fmean(scores)),
         "std": float(statistics.pstdev(scores)),
-        "count": len(scores),
+        "count": len(outcomes),
+        "scored_count": len(scores),
+        "parse_failures": parse_failures,
         "records": outcomes,
     }
 
@@ -873,14 +979,10 @@ def evaluate_dataset(program: object, loader: object) -> dict[str, dict[str, Any
 def score_split(program, examples) -> dict:
     """Run and score one split through the program's async decision port."""
     records = list(examples)
-    scores = asyncio.run(_score_examples_async(program, records))
-    if not scores:
-        return {"mean": 0.0, "std": 0.0, "count": 0}
-    return {
-        "mean": float(statistics.fmean(scores)),
-        "std": float(statistics.pstdev(scores)),
-        "count": len(scores),
-    }
+    outcomes = asyncio.run(_evaluate_examples_async(program, records))
+    summary = _score_outcomes(outcomes)
+    summary.pop("records", None)
+    return summary
 
 
 def run_stage_zero(program, train_examples, val_examples, seed=0) -> tuple[object, dict]:
@@ -891,6 +993,8 @@ def run_stage_zero(program, train_examples, val_examples, seed=0) -> tuple[objec
     return program, {
         "eval_mean": eval_score["mean"],
         "train_mean": train_score["mean"],
+        "eval_parse_failures": eval_score["parse_failures"],
+        "train_parse_failures": train_score["parse_failures"],
     }
 
 
@@ -972,6 +1076,8 @@ def run_stage_bootstrap(program, train_examples, val_examples, seed=0) -> tuple[
     return compiled, {
         "eval_mean": eval_score["mean"],
         "train_mean": train_score["mean"],
+        "eval_parse_failures": eval_score["parse_failures"],
+        "train_parse_failures": train_score["parse_failures"],
     }
 
 
@@ -1094,6 +1200,8 @@ def run_stage_gepa(
     report = {
         "eval_mean": eval_score["mean"],
         "train_mean": train_score["mean"],
+        "eval_parse_failures": eval_score["parse_failures"],
+        "train_parse_failures": train_score["parse_failures"],
     }
     report.update(_gepa_report_details(compiled))
     return compiled, report
@@ -1135,10 +1243,12 @@ def write_artifact(module_name, program, lm, report) -> Path:
     Each member is atomically replaced, but the directory is not transactional.
     ``program.json`` and ``lm.json`` are written before ``report.json``; the
     report is the commit marker that readers should require before consuming
-    the other two files after an interrupted write.
+    the other two files after an interrupted write. The root is tied to the
+    checkout rather than the caller's current directory so a nested optimizer
+    invocation cannot silently write artifacts into a transient cwd.
     """
     module_component = _safe_component(module_name, "module_name")
-    module_dir = Path("optimized") / module_component
+    module_dir = _ARTIFACT_ROOT / module_component
     module_dir.mkdir(parents=True, exist_ok=True)
 
     program_dump = getattr(program, "dump_state", None)
@@ -1454,17 +1564,21 @@ def _run_eval(args: argparse.Namespace) -> int:
 
     module_name = getattr(manifest, "module_name", args.module_name)
     if args.program_dir is None:
-        program_dir = Path("optimized") / _safe_component(module_name, "module_name")
+        program_dir = _ARTIFACT_ROOT / _safe_component(module_name, "module_name")
         required_state = False
     else:
         program_dir = args.program_dir
         required_state = True
     optimized = _load_program_state(program, program_dir, required=required_state)
+    splits = evaluate_dataset(program, loader)
     report = {
         "module": module_name,
         "program": "optimized" if optimized else "fresh",
         "dataset": str(args.dataset),
-        "splits": evaluate_dataset(program, loader),
+        "splits": splits,
+        "parse_failures": {
+            split: summary["parse_failures"] for split, summary in splits.items()
+        },
     }
     if args.json:
         print(json.dumps(report, ensure_ascii=True, sort_keys=True))
@@ -1542,6 +1656,8 @@ def _partial_report(
     budget_exhausted: bool = False,
     transcript_candidates: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    final_report = final if isinstance(final, Mapping) else {}
+    canary_report = canaries if isinstance(canaries, Mapping) else {}
     report = {
         "module": getattr(manifest, "module_name", args.module_name),
         "optimizer": args.optimizer,
@@ -1549,12 +1665,20 @@ def _partial_report(
         "tier": args.tier,
         "budget_usd": args.budget_usd,
         "spent_usd": ledger.spent_usd,
+        "usage": ledger.usage,
+        "price_source": ledger.price_source,
+        "price_sources": ledger.price_sources,
         "baseline": baseline_means,
         "stage_zero": stage_zero,
         "stage_bootstrap": stage_bootstrap,
         "stage_gepa": stage_gepa,
         "final": final,
         "canaries": canaries,
+        "parse_failures": {
+            "train": final_report.get("train_parse_failures", 0),
+            "eval": final_report.get("eval_parse_failures", 0),
+            "canaries": canary_report.get("parse_failures", 0),
+        },
         "budget_exhausted": budget_exhausted,
         "gate_passed": False,
     }
@@ -1702,6 +1826,8 @@ def _run(argv=None) -> int:
             and final["eval_mean"] >= baseline_means["eval"] - 0.05
             and canaries["count"] > 0
             and canaries["mean"] == 1.0
+            and final.get("eval_parse_failures", 0) == 0
+            and canaries.get("parse_failures", 0) == 0
         )
         report = _partial_report(
             manifest,

@@ -60,8 +60,7 @@ class _Cumulative:
         return {
             provider
             for agent in getattr(snapshot, "agents", ())
-            if (provider := getattr(agent, "provider", None))
-            and isinstance(provider, str)
+            if (provider := getattr(agent, "provider", None)) and isinstance(provider, str)
         }
 
     def add(self, snapshot: SessionSnapshot) -> None:
@@ -988,7 +987,9 @@ async def _run_interactive(
                                             session_description=session.describe(),
                                             branch_line=_branch_line(session),
                                             cumulative_line=cumulative.line(
-                                                snapshot=state.snapshot(session_dir=turn.session_dir)
+                                                snapshot=state.snapshot(
+                                                    session_dir=turn.session_dir
+                                                )
                                             ),
                                             turn_active=True,
                                         )

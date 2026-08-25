@@ -1511,8 +1511,7 @@ def _render_markdown_lines_fallback(
             ):
                 hanging = prefix if index == 0 else " " * _display_width(prefix)
                 output.append(
-                    _md_style(hanging, _MD_RULE, color)
-                    + _render_inline_markdown(part, color)
+                    _md_style(hanging, _MD_RULE, color) + _render_inline_markdown(part, color)
                 )
             continue
 
@@ -1566,8 +1565,7 @@ def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
             or delimiter is None
             or len(header) != len(delimiter)
             or not all(
-                _MD_TABLE_DELIMITER_RE.fullmatch(cell.replace(" ", ""))
-                for cell in delimiter
+                _MD_TABLE_DELIMITER_RE.fullmatch(cell.replace(" ", "")) for cell in delimiter
             )
         ):
             index += 1
@@ -1861,13 +1859,7 @@ def _entry_lines(
     if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
         return [("dim", _clip(" " + entry.text, width))]
     label = "· SYSTEM" if entry.role == "system" else _ROLE_LABELS[entry.role]
-    body_prefix = (
-        "   │ "
-        if entry.role == "system"
-        else "   ↳ "
-        if entry.role == "user"
-        else "   "
-    )
+    body_prefix = "   │ " if entry.role == "system" else "   ↳ " if entry.role == "user" else "   "
     body_width = max(1, width - _display_width(body_prefix))
     rendered = [(entry.role, _clip(f" {label}", width))]
     if entry.tool_name is not None:
@@ -1885,9 +1877,7 @@ def _entry_lines(
                 if detail_limit is not None
                 else render_markdown_lines(detail, body_width, color=color)
             )
-            rendered.extend(
-                (entry.role, _clip(body_prefix + line, width)) for line in detail_lines
-            )
+            rendered.extend((entry.role, _clip(body_prefix + line, width)) for line in detail_lines)
     else:
         lines = (
             _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
@@ -1995,9 +1985,7 @@ def _stream_lines(
     if len(text) > _STREAM_RENDER_LIMIT:
         text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
     label = _ROLE_LABELS[transcript.streaming_role]
-    rendered = [
-        (transcript.streaming_role, _clip(f" {label} · generating", width))
-    ]
+    rendered = [(transcript.streaming_role, _clip(f" {label} · generating", width))]
     rendered.extend(
         (transcript.streaming_role, _clip("   " + line, width))
         for line in render_markdown_lines(text, body_width, color=color)
@@ -2593,6 +2581,7 @@ def _status_parts(fields: Mapping[str, str], previous: Mapping[str, str] | None)
 
     def changed(key: str) -> bool:
         return previous is None or fields.get(key) != previous.get(key)
+
     if fields.get("branch") and changed("branch"):
         parts.append(f"b={fields['branch']}")
     if fields.get("generation") and changed("generation"):
@@ -2831,15 +2820,18 @@ def render_primary(
         _paint(text, _ROLE_COLORS.get(role, ""), color)
         for role, text in _primary_rows(transcript, width, color=color)
     ]
-    lines.extend(_paint(text, _DIM_CYAN, color) for text in _status_rows(
-        snapshot,
-        transcript,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-        width=width,
-        activity_line=activity_line,
-    ))
+    lines.extend(
+        _paint(text, _DIM_CYAN, color)
+        for text in _status_rows(
+            snapshot,
+            transcript,
+            session_description=session_description,
+            branch_line=branch_line,
+            cumulative_line=cumulative_line,
+            width=width,
+            activity_line=activity_line,
+        )
+    )
     return lines
 
 
@@ -3099,8 +3091,7 @@ class Cockpit:
             )
         )
         if self._fixed_frame and (
-            self._frame_size != self._last_size
-            or (force and rows != self._last_primary_rows)
+            self._frame_size != self._last_size or (force and rows != self._last_primary_rows)
         ):
             # Leave the current input/status row before appending a fresh frame.
             self.stream.write("\x1b[1B\r\n")

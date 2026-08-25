@@ -54,9 +54,7 @@ def _snapshot():
         total_tokens=12345,
         output_tokens_per_s=47.5,
         context=context,
-        recent_events=(
-            SimpleNamespace(kind="usage_event", detail="tokens=12345"),
-        ),
+        recent_events=(SimpleNamespace(kind="usage_event", detail="tokens=12345"),),
     )
 
 
@@ -206,7 +204,8 @@ def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -
     summary = (
         "Detected prior interactive session; resuming durable state: "
         "turns=1 last_epoch=7 last_checkpoint=interactive-main/epoch-7-"
-        + "c" * 64
+        + "c"
+        * 64
         + ".json. session=/tmp/interactive_session turn=1 branch=1 "
         "provider=provider-a model=model-a epoch=7"
     )
@@ -247,10 +246,13 @@ def test_transcript_blocks_are_dense_with_one_separator_and_no_trailing_blank() 
     rows = _transcript_lines(transcript, 60, 100)
     values = [value for _, value in rows]
     assert values[-1].strip()
-    assert max(
-        sum(not value.strip() for value in values[index : index + 3])
-        for index in range(max(1, len(values) - 2))
-    ) <= 1
+    assert (
+        max(
+            sum(not value.strip() for value in values[index : index + 3])
+            for index in range(max(1, len(values) - 2))
+        )
+        <= 1
+    )
     assert values.count("") <= 1
 
 
@@ -547,9 +549,7 @@ def test_cockpit_throttles_active_turn_frames(monkeypatch) -> None:
         )
         cockpit.move_to_input()
         for tool in ("run_shell", "read_batch"):
-            transcript.observe_event(
-                {"kind": "tool_event", "payload": {"tool": tool, "ok": True}}
-            )
+            transcript.observe_event({"kind": "tool_event", "payload": {"tool": tool, "ok": True}})
             cockpit.draw(
                 _snapshot(),
                 transcript,
@@ -657,9 +657,7 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
             cumulative_line="usage: calls=0",
         )
         cockpit.move_to_input()
-        transcript.observe_event(
-            {"kind": "assistant_delta", "payload": {"delta": "partial"}}
-        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "partial"}})
         cockpit.draw(
             _snapshot(),
             transcript,
@@ -787,9 +785,7 @@ def test_transcript_is_bounded() -> None:
 
 def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> None:
     transcript = Transcript()
-    transcript.observe_event(
-        {"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}}
-    )
+    transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}})
     first = render_cockpit(
         _snapshot(),
         transcript,
@@ -841,9 +837,7 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
         }
     )
     for _ in range(20_000):
-        transcript.observe_event(
-            {"kind": "assistant_delta", "payload": {"delta": "x"}}
-        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "x"}})
 
     assert any(entry.role == "tool" and "old" in entry.text for entry in transcript.entries)
     assert transcript.streaming_role == "assistant"
@@ -1088,9 +1082,7 @@ def test_adjacent_tool_ticks_have_no_blank_separator() -> None:
         )
 
     rows = _transcript_lines(transcript, 80, 20)
-    tick_rows = [
-        index for index, (_, value) in enumerate(rows) if value.lstrip().startswith("✓ ")
-    ]
+    tick_rows = [index for index, (_, value) in enumerate(rows) if value.lstrip().startswith("✓ ")]
 
     assert len(tick_rows) == 3
     assert tick_rows[1] == tick_rows[0] + 1
@@ -1124,8 +1116,7 @@ def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
         transcript.observe_event(event)
 
     transcript.finish_stream(
-        "plan=tasks:1 plan_status={failed} "
-        "plan_failures={task-timeout:'max_restarts (0): wall'}"
+        "plan=tasks:1 plan_status={failed} plan_failures={task-timeout:'max_restarts (0): wall'}"
     )
 
     failures = [entry for entry in transcript.entries if entry.role == "error"]
@@ -1149,9 +1140,7 @@ def test_empty_queued_prompt_has_no_dangling_system_label() -> None:
     if notice is not None:
         transcript.system(notice)
     assert not any("queued:" in entry.text for entry in transcript.entries)
-    assert "queued:" not in "\n".join(
-        value for _, value in _transcript_lines(transcript, 80, 20)
-    )
+    assert "queued:" not in "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
 
     notice = _queued_prompt_notice("follow-up")
     assert notice == "queued: follow-up"
@@ -1237,7 +1226,6 @@ def test_side_sections_are_width_safe(width: int) -> None:
     stats_line = next(line for line in text.splitlines() if line.startswith("   12.3k"))
     assert task_line.index("M") == 1
     assert task_line.index("a-") == model_line.index("codex") == stats_line.index("12.3k")
-
 
 
 def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:

@@ -40,6 +40,7 @@ from cambium.redact import Redactor, is_secret_name
 MODULE_CONTRACT_VERSION = 1
 MODULE_MANIFEST_FILENAME = "module.json"
 MODULE_PROTOCOL = "json-v1"
+PARSE_FAILURE_REASON = "DSPy output unparseable"
 _REQUIRED_MANIFEST_FIELDS = (
     "contract_version",
     "module_name",
@@ -429,6 +430,11 @@ class Example:
         )
 
 
+def is_parse_failure_prediction(prediction: object) -> bool:
+    """Return whether a prediction is the conservative DSPy parse fallback."""
+    return getattr(prediction, "reason", None) == PARSE_FAILURE_REASON
+
+
 class Metric(Protocol):
     """Scores one example (with prediction attached) as a float in [0, 1]."""
 
@@ -782,9 +788,15 @@ class SharedDatasetLoader(DatasetLoader):
 
 
 def score_decision(example: Example, *, label_field: str, decision_type: type[Enum]) -> float:
-    """Score one example in [0, 1] by exact match on its decision enum."""
+    """Score one example in [0, 1] by exact match on its decision enum.
+
+    The production DSPy fallback deliberately scores as an ordinary
+    per-example zero here. Optimizer aggregates identify that fallback with
+    :func:`is_parse_failure_prediction` and exclude it from their means while
+    reporting its count separately.
+    """
     prediction = example.prediction
-    if prediction is None:
+    if prediction is None or is_parse_failure_prediction(prediction):
         return 0.0
     expected = example.expected.get(label_field)
     if not isinstance(expected, decision_type) or not isinstance(
@@ -795,17 +807,32 @@ def score_decision(example: Example, *, label_field: str, decision_type: type[En
 
 
 async def evaluate_split_async(module: Module, loader, split) -> dict:
-    """Score one dataset split with the module metric (async form)."""
+    """Score one dataset split and report parse fallbacks separately."""
     scores: list[float] = []
+    parse_failures = 0
+    count = 0
     for example in loader.load_split(split):
+        count += 1
         prediction = await module.decide(example.input)
+        if is_parse_failure_prediction(prediction):
+            parse_failures += 1
+            continue
         scores.append(module.metric(example.with_prediction(prediction)))
     if not scores:
-        return {"mean": float("nan"), "std": float("nan"), "count": 0}
+        empty = count == 0
+        return {
+            "mean": float("nan") if empty else 0.0,
+            "std": float("nan") if empty else 0.0,
+            "count": count,
+            "scored_count": 0,
+            "parse_failures": parse_failures,
+        }
     return {
         "mean": statistics.fmean(scores),
         "std": statistics.pstdev(scores),
-        "count": len(scores),
+        "count": count,
+        "scored_count": len(scores),
+        "parse_failures": parse_failures,
     }
 
 
@@ -1088,7 +1115,7 @@ class DSPyModuleBase:
         except (ValueError, dspy.AdapterParseError):
             return self.output_type(
                 decision=self.fallback_decision,
-                reason="DSPy output unparseable",
+                reason=PARSE_FAILURE_REASON,
                 confidence=0.0,
             )
         return self.output_type(decision=decision, reason=str(pred.reason), confidence=0.5)
