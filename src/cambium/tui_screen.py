@@ -3015,6 +3015,19 @@ class Cockpit:
             )
         )
         if not self._fixed_frame:
+            conversation_capacity = max(1, self._last_size.lines - _FRAME_OVERHEAD)
+            hidden_rows = rows[:-conversation_capacity]
+            if self._last_primary_rows:
+                if rows[: len(self._last_primary_rows)] != self._last_primary_rows:
+                    hidden_rows = ()
+                else:
+                    hidden_rows = hidden_rows[len(self._last_primary_rows) :]
+            if hidden_rows:
+                # The fixed frame keeps only the tail; flush newly hidden rows
+                # so restored history and large live entries reach scrollback.
+                for role, text in hidden_rows:
+                    self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
+                    self.stream.write("\n")
             lines = _cockpit_frame_lines(
                 snapshot,
                 transcript,

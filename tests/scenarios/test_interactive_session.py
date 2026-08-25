@@ -556,7 +556,12 @@ def test_restore_history_folds_completed_current_branch(monkeypatch, tmp_path: P
     assert cumulative.total_tokens == 15
 
 
-def test_tui_reconnects_to_explicit_durable_interactive_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize("columns", [80, 60])
+def test_tui_reconnects_to_explicit_durable_interactive_session(
+    tmp_path: Path, monkeypatch, columns: int
+) -> None:
+    monkeypatch.setenv("COLUMNS", str(columns))
+    monkeypatch.setenv("LINES", "24")
     root = default_session_root(tmp_path) / "prior"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("durable prompt")
@@ -641,6 +646,7 @@ def test_tui_reconnects_to_explicit_durable_interactive_session(tmp_path: Path) 
     assert "last_epoch=7" in rendered
     assert "last_checkpoint=interactive-main/epoch-7-" in rendered
     assert "durable prompt" in rendered
+    assert "durable answer" in rendered
     assert "tokens=125" in rendered
 
 

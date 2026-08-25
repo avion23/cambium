@@ -424,6 +424,38 @@ def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
     assert "\x1b[2J" not in text
 
 
+def test_cockpit_flushes_overflow_history_once() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    for index in range(20):
+        transcript.system(f"restored-{index}")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        assert all(f"restored-{index}" in first for index in range(20))
+
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        assert stream.getvalue() == first
+
+
 def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
@@ -554,6 +586,34 @@ def test_short_terminal_falls_back_to_stream_rows() -> None:
     assert not any(line.startswith("┌") for line in lines)
     assert not any("─" in line for line in lines)
     assert any("provider=codex" in line for line in lines)
+
+
+def test_live_cockpit_keeps_short_terminal_fallback(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((80, 11)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.system("restored history")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+
+    assert "restored history" in stream.getvalue()
+    assert "conversation ·" not in stream.getvalue()
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:
