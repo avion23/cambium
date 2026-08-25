@@ -678,6 +678,33 @@ def test_lock_acquisition_refreshes_state_before_contender_can_publish(
         contender.release()
 
 
+def test_hostile_manifest_turn_is_rejected_without_sequential_probe(tmp_path: Path) -> None:
+    root = default_session_root(tmp_path) / "hostile"
+    state = root / ".cambium"
+    state.mkdir(parents=True)
+    (root / "turn-0001" / ".cambium").mkdir(parents=True)
+    (root / "turn-0001" / ".cambium" / "events.db").touch()
+    (state / "interactive.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo": str(tmp_path.resolve()),
+                "turn": 200_000,
+                "branch_generation": 1,
+                "branch_start_turn": 0,
+                "seed": None,
+                "provider_preference": None,
+                "model_preference": None,
+                "model_preferences": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InteractiveSessionError, match="implausibly ahead"):
+        InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+
+
 def test_stale_interactive_lock_is_detected_and_reclaimed(tmp_path: Path) -> None:
     session = InteractiveSession(
         OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive")
