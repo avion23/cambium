@@ -131,8 +131,18 @@ class OfflineProgram(dspy.Module):
 
 
 class ParseFailureProgram(OfflineProgram):
+    def __init__(
+        self, lm: dspy.LM, parse_failure_tasks: set[str] | None = None
+    ) -> None:
+        super().__init__(lm)
+        self.parse_failure_tasks = parse_failure_tasks
+
     async def decide(self, input: TaskInputType) -> DecomposeOutputType:
-        del input
+        if (
+            self.parse_failure_tasks is not None
+            and input.task not in self.parse_failure_tasks
+        ):
+            return await super().decide(input)
         return DecomposeOutput(
             decision=Decision.DO_NOT_DECOMPOSE,
             reason=optimize.PARSE_FAILURE_REASON,
@@ -745,6 +755,17 @@ def test_parse_failures_are_excluded_from_aggregate_means() -> None:
         "scored_count": 0,
         "std": 0.0,
     }
+
+
+def test_eval_mean_excludes_parse_failures_and_reports_bucket() -> None:
+    summary = optimize.score_split(
+        ParseFailureProgram(OfflineLM(), {"Atomic task 1"}), _examples(2)
+    )
+
+    assert summary["mean"] == 1.0
+    assert summary["count"] == 2
+    assert summary["scored_count"] == 1
+    assert summary["parse_failures"] == 1
 
 
 def test_main_tiny_budget_fails_without_crashing() -> None:
