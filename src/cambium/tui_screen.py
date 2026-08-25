@@ -1758,8 +1758,8 @@ def _style_kind(kind: str) -> str:
 
 def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
     """Return safe, labelled transcript rows for the append-only view."""
-    width = max(64, width)
-    body_width = max(20, width - 9)
+    width = max(8, width)
+    body_width = max(8, width - 9)
     # The transcript itself is bounded, but a large Markdown entry may occupy
     # many wrapped rows.  Leave enough capacity to render the complete local
     # view so the Cockpit can append only the suffix it has not emitted yet.
@@ -1771,6 +1771,104 @@ def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
     return rendered
 
 
+_STATUS_KEYS = frozenset(
+    {
+        "session",
+        "turn",
+        "branch",
+        "generation",
+        "provider",
+        "model",
+        "epoch",
+        "checkpoint",
+        "calls",
+        "tokens",
+        "out/s",
+    }
+)
+
+
+def _status_fields(
+    snapshot: Any,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+) -> dict[str, str]:
+    """Collect status facts once instead of rendering three verbose source rows."""
+    fields: dict[str, str] = {}
+    for source in (session_description, branch_line, cumulative_line):
+        clean = _sanitize(source).replace("\n", " ")
+        for match in re.finditer(r"(?<![\w/])([\w/]+)=([^\s·]+)", clean):
+            key, value = match.groups()
+            if key in _STATUS_KEYS:
+                fields.setdefault(key, value)
+
+    agents = tuple(getattr(snapshot, "agents", ()))
+    main = next((agent for agent in agents if getattr(agent, "role", "") == "main"), None)
+    provider = getattr(main, "provider", None) if main is not None else None
+    model = getattr(main, "model", None) if main is not None else None
+    if isinstance(provider, str) and provider:
+        fields.setdefault("provider", _sanitize(provider))
+    if isinstance(model, str) and model:
+        fields.setdefault("model", _sanitize(model))
+
+    context = getattr(snapshot, "context", None)
+    if context is not None:
+        fields.setdefault("epoch", str(getattr(context, "epoch", 0)))
+        checkpoint = getattr(context, "checkpoint_ref", None)
+        if isinstance(checkpoint, str) and checkpoint:
+            fields.setdefault("checkpoint", checkpoint)
+    fields.setdefault("tokens", _human_count(_usage_int(getattr(snapshot, "total_tokens", 0))))
+    rate = _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0))
+    fields.setdefault("out/s", f"{rate:.1f}")
+    return fields
+
+
+def _compact_checkpoint(value: str) -> str:
+    """Show a checkpoint filename and keep each content hash to eight chars."""
+    clean = _side_clean(value).strip().rstrip("/")
+    if not clean or clean == "none":
+        return "none"
+    filename = clean.rsplit("/", 1)[-1]
+    hashes = re.findall(r"(?i)(?<![a-z0-9])[0-9a-f]{9,}(?![a-z0-9])", filename)
+    return hashes[0][:8] if hashes else filename
+
+
+def _status_parts(fields: Mapping[str, str], previous: Mapping[str, str] | None) -> list[str]:
+    status = fields.get("status", "idle")
+    parts = ["┌ Cambium", f"status={status}"]
+    provider = fields.get("provider")
+    model = fields.get("model")
+    if provider or model:
+        parts.append(f"provider={provider or '?'} model={model or '?'}")
+    if session := fields.get("session"):
+        parts.append(f"session={_clip(session, 28)}")
+    if turn := fields.get("turn"):
+        parts.append(f"t={turn}")
+
+    changed = lambda key: previous is None or fields.get(key) != previous.get(key)
+    if fields.get("branch") and changed("branch"):
+        parts.append(f"b={fields['branch']}")
+    if fields.get("generation") and changed("generation"):
+        parts.append(f"g={fields['generation']}")
+    if fields.get("epoch") and changed("epoch"):
+        parts.append(f"e={fields['epoch']}")
+    if checkpoint := fields.get("checkpoint"):
+        parts.append(f"ckpt={_compact_checkpoint(checkpoint)}")
+
+    usage = []
+    if calls := fields.get("calls"):
+        usage.append(f"calls={calls}")
+    if tokens := fields.get("tokens"):
+        usage.append(f"{tokens} tok")
+    if rate := fields.get("out/s"):
+        usage.append(f"{rate}/s")
+    if usage:
+        parts.append(" ".join(usage))
+    return parts
+
+
 def _primary_status_line(
     snapshot: Any,
     *,
@@ -1778,34 +1876,38 @@ def _primary_status_line(
     branch_line: str,
     cumulative_line: str,
     width: int,
+    previous: Mapping[str, str] | None = None,
 ) -> str:
     """Build the compact status row appended after each changed draw."""
-    status = _sanitize(getattr(snapshot, "session_status", "idle"))
-    agents = getattr(snapshot, "active_agents", 0)
-    tokens = _human_count(getattr(snapshot, "total_tokens", 0))
-    rate = getattr(snapshot, "output_tokens_per_s", 0.0)
-    epoch = getattr(getattr(snapshot, "context", None), "epoch", 0)
-    branch = _sanitize(branch_line)
-    provider_model = ""
-    match = re.search(r"(provider=\S+\s+model=\S+)", branch)
-    if match is not None:
-        provider_model = match.group(1)
-    checkpoint = ""
-    checkpoint_match = re.search(r"(?:last_checkpoint|checkpoint)=(\S+)", session_description)
-    if checkpoint_match is not None:
-        checkpoint = f"last_checkpoint={_clip(checkpoint_match.group(1), 40)}"
-    priority = " · ".join(part for part in (f"status={status}", checkpoint, provider_model) if part)
-    details = (
-        f"{priority} · agents={agents} · tokens={tokens} · out/s={rate:.1f}"
-        f" · epoch={epoch} · {_sanitize(cumulative_line)}"
-        f" · {branch if not provider_model else branch.replace(provider_model, '').strip(' ·')}"
-        f" · {_sanitize(session_description)}"
+    fields = _status_fields(
+        snapshot,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
     )
-    line = f"┌ Cambium · {details}"
-    # A checkpoint reference is content-addressed and can be much longer than
-    # a terminal row.  Keep it intact in native scrollback instead of clipping
-    # the durable identity; the terminal will wrap this one logical status row.
-    return line if checkpoint else _clip(line, max(64, width))
+    fields["status"] = _sanitize(getattr(snapshot, "session_status", "idle"))
+    parts = _status_parts(fields, previous)
+    line = " · ".join(parts)
+    width = max(8, width)
+    if len(line) <= width:
+        return line
+
+    # Usage is useful, but never earns a wrapped status row.  Keep the
+    # identity fields first and retry without the trailing usage group.
+    if len(parts) > 2:
+        compact = " · ".join(parts[:-1])
+        if len(compact) <= width:
+            return compact
+        line = compact
+
+    # Session roots and checkpoint names are the unbounded inputs.  Shorten
+    # those fields before applying the final width guard and ellipsis.
+    for index, part in enumerate(parts):
+        if part.startswith("session="):
+            parts[index] = f"session={_clip(part[8:], 20)}"
+        elif part.startswith("ckpt="):
+            parts[index] = f"ckpt={_clip(part[5:], 16)}"
+    return _clip(" · ".join(parts), width)
 
 
 def render_primary(
@@ -1819,7 +1921,7 @@ def render_primary(
     color: bool = False,
 ) -> list[str]:
     """Render an append-only transcript followed by one compact status row."""
-    width = max(64, width)
+    width = max(8, width)
     lines = [
         _paint(text, _ROLE_COLORS.get(role, ""), color)
         for role, text in _primary_rows(transcript, width)
@@ -1859,21 +1961,23 @@ def render_cockpit(
     activity_line: str = "",
 ) -> list[str]:
     """Render one deterministic full-screen frame without cursor controls."""
-    width = max(64, width)
+    width = max(20, width)
     height = max(20, height)
     inner = width - 2
     lines: list[str] = []
 
-    status = str(getattr(snapshot, "session_status", "idle"))
-    title = f" Cambium · {status} "
+    status = _primary_status_line(
+        snapshot,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+        width=inner,
+    )
+    title = status[2:] if status.startswith("┌ ") else status
     lines.append(_paint("┌" + _pad(title, inner) + "┐", _CYAN, color))
-    meta = _clip(f" {_sanitize(session_description)}", inner)
-    lines.append("│" + _pad(meta, inner) + "│")
-    branch = _clip(" " + _sanitize(branch_line), inner)
-    lines.append("│" + _pad(branch, inner) + "│")
     lines.append(_activity_row(activity_line, inner, color))
 
-    body_height = height - 9
+    body_height = height - 7
     wide = width >= 104
     if wide:
         side_width = min(44, max(34, width // 3))
@@ -1909,16 +2013,8 @@ def render_cockpit(
             )
         )
     else:
-        summary = (
-            f" agents={getattr(snapshot, 'active_agents', 0)} active "
-            f"tokens={_human_count(getattr(snapshot, 'total_tokens', 0))} "
-            f"out/s={getattr(snapshot, 'output_tokens_per_s', 0.0):.1f} "
-            f"epoch={getattr(getattr(snapshot, 'context', None), 'epoch', 0)} "
-            f"segments={getattr(getattr(snapshot, 'context', None), 'summary_segments', 0)}"
-        )
         lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
-        lines.append("│" + _pad(summary, inner) + "│")
-        transcript_capacity = max(1, body_height - 1)
+        transcript_capacity = max(1, body_height)
         for role, text in _transcript_lines(transcript, inner, transcript_capacity):
             plain = _pad(text, inner)
             lines.append("│" + _paint(plain, _ROLE_COLORS.get(role, ""), color) + "│")
@@ -1959,6 +2055,7 @@ class Cockpit:
         self._pending_draw: tuple[Any, Transcript, str, str, str] | None = None
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
         self._last_status_line = ""
+        self._last_status_fields: dict[str, str] | None = None
 
     @property
     def size(self) -> os.terminal_size:
@@ -2028,13 +2125,22 @@ class Cockpit:
     ) -> None:
         snapshot, transcript, session_description, branch_line, cumulative_line = request
         rows = tuple(_primary_rows(transcript, self._last_size.columns))
+        current_status_fields = _status_fields(
+            snapshot,
+            session_description=session_description,
+            branch_line=branch_line,
+            cumulative_line=cumulative_line,
+        )
         status_line = _primary_status_line(
             snapshot,
             session_description=session_description,
             branch_line=branch_line,
             cumulative_line=cumulative_line,
             width=self._last_size.columns,
+            previous=self._last_status_fields,
         )
+        if current_status_fields == self._last_status_fields and self._last_status_line:
+            status_line = self._last_status_line
 
         if rows[: len(self._last_primary_rows)] == self._last_primary_rows:
             new_rows = rows[len(self._last_primary_rows) :]
@@ -2054,6 +2160,7 @@ class Cockpit:
 
         self._last_primary_rows = rows
         self._last_status_line = status_line
+        self._last_status_fields = current_status_fields
 
     def flush(self) -> None:
         """Flush the newest draw once the input line is no longer active."""
@@ -2076,7 +2183,8 @@ class Cockpit:
         if not self.enabled:
             return
         self._input_active = True
-        self.stream.write(f"{label} ")
+        label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
+        self.stream.write(f"{label_text} ")
         self.stream.flush()
 
     def hide_cursor(self, *, commit: bool = False) -> None:

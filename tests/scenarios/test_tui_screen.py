@@ -89,8 +89,30 @@ def test_compact_cockpit_stays_bounded() -> None:
     )
     assert len(lines) == 22
     assert all(len(line) == 72 for line in lines)
-    assert "agents=1 active" in "\n".join(lines)
+    assert "status=running" in "\n".join(lines)
+    assert "agents=1 active" not in "\n".join(lines)
     assert lines[-1].startswith("└")
+
+
+def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:
+    snapshot = _snapshot()
+    checkpoint = "task/epoch-001-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb.json"
+    line = render_primary(
+        snapshot,
+        Transcript(),
+        session_description=(
+            "session=/tmp/run turn=2 branch=1 provider=codex model=gpt-5.6 "
+            f"epoch=4 checkpoint={checkpoint}"
+        ),
+        branch_line="branch: generation=3 turn=2 provider=codex model=gpt-5.6 epoch=4",
+        cumulative_line="usage: calls=3 tokens=12345 out/s=47.5",
+        width=120,
+    )[-1]
+
+    assert len(line) <= 120
+    assert line.count("provider=codex model=gpt-5.6") == 1
+    assert "ckpt=aaaaaaaa" in line
+    assert "aaaaaaaaaaaaaaaa" not in line
 
 
 def test_primary_renderer_ends_with_compact_status_row() -> None:
