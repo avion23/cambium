@@ -271,17 +271,6 @@ USER_AGENT = f"cambium/{__version__}"
 # the backend expects the CLI originator tag and a codex-shaped User-Agent.
 CODEX_ORIGINATOR = "codex_cli_rs"
 CODEX_USER_AGENT = "codex_cli_rs/1.0 (cambium; cambium)"
-# Light content scan for model refusals returned as a 200 completion (issue 4).
-# Documented heuristic: exact refusal phrases in the completion text are treated
-# as a REFUSAL fall-through so a refusing model never wins the cascade.
-# Bare "sorry" is deliberately NOT a refusal: legitimate coding responses
-# ("sorry for the confusion, the fix is...") would otherwise be discarded.
-# Refusal requires an explicit refusal verb; "sorry" alone is not one.
-_CONTENT_REFUSAL_RE = re.compile(
-    r"\b(?:i can'?t|cannot|can'?t)\s+(?:assist|help|comply|complete|answer)\b"
-    r"|\b(?:refus(?:e|es|ed|ing|al))\b",
-    re.IGNORECASE,
-)
 
 
 class ProviderTier(Enum):
@@ -845,6 +834,7 @@ class _PauseTracker:
         return cast(_PauseState, self._state.get())
 
 
+# Providers without structural refusal fields pass refusal-like prose through as valid content.
 class _RawResponse:
     """Parsed /chat/completions response before it becomes a CallResult."""
 
@@ -864,7 +854,14 @@ class _RawResponse:
     ) -> CallResult:
         try:
             choices = self.payload["choices"]
-            message = choices[0]["message"]
+            choice = choices[0]
+            if not isinstance(choice, Mapping):
+                raise TypeError("choice must be an object")
+            if choice.get("finish_reason") == "content_filter":
+                raise ProviderError(
+                    provider.name, ProviderOutcome.REFUSAL, "provider content filter refusal"
+                )
+            message = choice["message"]
             if not isinstance(message, Mapping):
                 raise TypeError("message must be an object")
             if message.get("refusal"):
@@ -897,15 +894,6 @@ class _RawResponse:
                         provider.name, ProviderOutcome.ERROR, "malformed response: content missing"
                     )
                 content = ""
-            if _CONTENT_REFUSAL_RE.search(content):
-                # A 200 completion whose text is a model refusal: fall through to the
-                # next provider (documented heuristic, see module docstring). Like any
-                # refusal it never drives a health transition.
-                raise ProviderError(
-                    provider.name,
-                    ProviderOutcome.REFUSAL,
-                    f"completion content carries refusal markers: {content[:80]!r}",
-                )
             usage = self.payload.get("usage")
             if not isinstance(usage, dict):
                 usage = None
@@ -961,15 +949,6 @@ class _CodexRawResponse(_RawResponse):
         retry_after_s: float | None = None,
         account_quota_owner: str | None = None,
     ) -> CallResult:
-        if _CONTENT_REFUSAL_RE.search(self.text):
-            # A completed stream whose assembled text is a model refusal:
-            # fall through to the next provider, never a health transition
-            # (mirrors the chat path's 200-completion heuristic).
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.REFUSAL,
-                f"completion content carries refusal markers: {self.text[:80]!r}",
-            )
         try:
             usage = _codex_usage(self.payload)
             response = self.payload.get("response")

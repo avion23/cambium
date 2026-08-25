@@ -479,16 +479,40 @@ def test_codex_stream_model_not_found_quarantines_provider() -> None:
         server.close()
 
 
-def test_codex_completed_stream_with_refusal_text_falls_through() -> None:
-    server = CodexServer([(200, _ok_stream(text="I can't assist with that."), 0.0)])
+def test_codex_completed_stream_with_refusal_like_text_passes_through() -> None:
+    content = (
+        "A policy guide explains when to refuse; a provider cannot assist with "
+        "prohibited work."
+    )
+    server = CodexServer([(200, _ok_stream(text=content), 0.0)])
+    router = _router(server)
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == content
+        assert router.health("p_codex") is HealthState.HEALTHY
+        assert len(server.calls) == 1
+    finally:
+        server.close()
+
+
+def test_codex_stream_policy_refusal_falls_through() -> None:
+    stream = _stream(
+        {
+            "type": "error",
+            "error": {
+                "type": "content_policy_error",
+                "code": "content_policy",
+                "message": "The request was blocked by the content policy",
+            },
+        }
+    )
+    server = CodexServer([(200, stream, 0.0)])
     router = _router(server)
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert exc.value.last_error is not None
         assert _provider_error(exc.value).outcome is ProviderOutcome.REFUSAL
-        assert "refusal" in _provider_error(exc.value).message
-        # a refusal never drives a health transition
         assert router.health("p_codex") is HealthState.UNKNOWN
         assert len(server.calls) == 1
     finally:
