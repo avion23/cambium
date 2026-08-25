@@ -4073,9 +4073,11 @@ class _Runtime:
                         spec.pop("context_fork", None)
                         continue
                     if envelope_status != "succeeded":
-                        failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
-                        if failure_reason is None:
-                            failure_reason = outcome.reason or "worker_verdict_failed"
+                        failure_reason = (
+                            outcome.reason
+                            or _envelope_text(sanitized_envelope, "failure_reason")
+                            or "worker_verdict_failed"
+                        )
                         await self._reject_child_proposals(
                             task_id,
                             outcome.proposals,

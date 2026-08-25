@@ -145,7 +145,49 @@ def test_early_worker_failure_preserves_exit_code_and_stderr_tail(tmp_path, monk
     assert root_result["failure_reason"] == reason
     failed_events = [event for event in read_events(session_dir) if event["kind"] == "worker_failed"]
     assert failed_events
-    assert failed_events[-1]["payload"]["reason"] == reason
+    assert reason.endswith(failed_events[-1]["payload"]["reason"])
+
+
+def test_failed_worker_stderr_tail_is_redacted_in_failure_reason(tmp_path, monkeypatch) -> None:
+    provider_key = "CAMBIUM_TEST_PROVIDER_KEY"
+    secret = "correct horse battery staple"
+    monkeypatch.setenv(provider_key, secret)
+    worker = tmp_path / "failed_worker.py"
+    worker.write_text(
+        "import json, os, sys\n"
+        "init = json.loads(sys.stdin.readline())\n"
+        f"print(os.environ[{provider_key!r}], file=sys.stderr, flush=True)\n"
+        "generation = init.get('generation', 1)\n"
+        "print(json.dumps({'type': 'ready', 'request_id': init['request_id'], "
+        "'task_id': init['task_id'], 'generation': generation, 'proto': 1}), flush=True)\n"
+        "run = json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type': 'result_envelope', 'request_id': run['request_id'], "
+        "'task_id': init['task_id'], 'generation': generation, 'status': 'failed', "
+        "'failure_reason': 'worker rejected task'}), flush=True)\n"
+        "print(json.dumps({'type': 'exit_message', 'task_id': init['task_id'], "
+        "'generation': generation, 'reason': 'done'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+    spec["worker"] = str(worker)
+    spec["provider_env_keys"] = [provider_key]
+
+    from cambium.supervisor import _slice_to_plan_task, run_plan
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [_slice_to_plan_task(spec)]}))
+
+    assert result.results[0].status == "failed"
+    reason = result.results[0].reason or ""
+    assert reason == "worker rejected task; stderr: ***"
+    assert secret not in reason
+    root_result = json.loads(
+        (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
+    )
+    assert root_result["failure_reason"] == reason
+    assert secret not in json.dumps(root_result)
 
 
 def test_missing_exit_message_fails(tmp_path, monkeypatch) -> None:
