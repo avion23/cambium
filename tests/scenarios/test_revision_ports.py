@@ -24,8 +24,6 @@ Scenarios:
       behaves exactly as before (no conversation db, no child events).
   RP5 a conversation store open failure raises (no silent success).
   RP6 a conversation store append failure surfaces visibly (no silent success).
-  RP7 the public ``Orchestrator`` caller forwards the port and conversation
-      flag to ``run_plan`` (production caller wiring).
 """
 
 from __future__ import annotations
@@ -435,53 +433,3 @@ def test_rp6_conversation_append_failure_is_visible(tmp_path, monkeypatch) -> No
     events = read_events(session_dir)
     worker_failed = _kinds(events, "worker_failed")
     assert any(e["task_id"] == "t-root" for e in worker_failed)
-
-
-# ---------------------------------------------------------------------------
-# RP7: the public Orchestrator caller forwards the decision port and the
-# conversation flag to run_plan (production caller for the revision path).
-# ---------------------------------------------------------------------------
-
-
-def test_rp7_orchestrator_forwards_port_and_conversations(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-    root = _task(
-        session_dir,
-        repo,
-        base,
-        "t-root",
-        worktree="wt-root",
-        branch="wt-root",
-        target_file="a.txt",
-        marker="// root-marker",
-    )
-    child = _task(
-        session_dir,
-        repo,
-        base,
-        "c1",
-        worktree="wt-c1",
-        branch="wt-c1",
-        target_file="b.txt",
-        marker="// child-marker",
-    )
-    core = ArchitectusCore(
-        ScriptedLLM([{"action": "spawn", "task_id": "c1"}]),
-        tree=_core_tree(root, child),
-    )
-    from cambium.orchestrator import Orchestrator
-
-    result = asyncio.run(
-        Orchestrator(architectus=core, conversations=True).run(str(session_dir), {"tasks": [root]})
-    )
-
-    assert result.exit_code == 0
-    assert {r.task_id for r in result.results} == {"t-root", "c1"}
-    assert all(r.status == "succeeded" for r in result.results)
-    events = read_events(session_dir)
-    assert len(_kinds(events, "child_admitted")) == 1
-    assert not _kinds(events, "child_rejected")
-    assert _conversation_records(session_dir, "c1")
-    assert (session_dir / ".cambium" / "conversations.db").exists()

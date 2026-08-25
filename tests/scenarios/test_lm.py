@@ -243,7 +243,6 @@ import cambium
 import cambium.architectus
 import cambium.diffundo
 import cambium.lm
-import cambium.orchestrator
 assert 'dspy' not in sys.modules
 """
     completed = subprocess.run(

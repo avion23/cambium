@@ -414,32 +414,6 @@ def _freeze_content_changed(previous: bytes, current: bytes) -> bool:
         return True
 
 
-def _baseline_parent(spec: ModuleSpec) -> str | None:
-    """Return the latest commit that updated a module baseline (compatibility helper)."""
-    if not spec.baseline_files or not _repository_available():
-        return None
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "log",
-                "-1",
-                "--format=%H",
-                "--",
-                *(path.as_posix() for path in spec.baseline_files),
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else None
-
-
 def _frozen_content_findings(spec: ModuleSpec, meta: dict[str, Any]) -> list[AuditFinding]:
     """Reject eval/canary edits without a dataset-version bump."""
     if not _repository_available():

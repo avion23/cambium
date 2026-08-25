@@ -751,52 +751,6 @@ def _redact_cookie_body(body: str, replacement: str, *, set_cookie: bool) -> str
     return ";".join(result)
 
 
-def _context_replacement(match: re.Match[str], replacement: str) -> str:
-    name = match.group("name")
-    normalised = _normalise_name(name)
-    prefix = match.group("prefix")
-    double = match.group("double")
-    single = match.group("single")
-    bare = match.group("bare")
-
-    if normalised in _COOKIE_FIELD_NAMES:
-        if double is not None:
-            value = _redact_cookie_body(
-                double, replacement, set_cookie=normalised.startswith("set_")
-            )
-            return f'{prefix}"{value}"'
-        if single is not None:
-            value = _redact_cookie_body(
-                single, replacement, set_cookie=normalised.startswith("set_")
-            )
-            return f"{prefix}'{value}'"
-        value = _redact_cookie_body(
-            bare or "", replacement, set_cookie=normalised.startswith("set_")
-        )
-        return prefix + value
-
-    if not is_secret_name(name):
-        return match.group(0)
-
-    if double is not None:
-        return f'{prefix}"{replacement}"'
-    if single is not None:
-        return f"{prefix}'{replacement}'"
-
-    value = (bare or "").rstrip(" \t")
-    trailing = (bare or "")[len(value) :]
-    if not value:
-        return prefix + replacement + trailing
-
-    # Keep another same-line field if it is clearly delimited by a key/colon
-    # or key/equal pair.  This avoids turning a compact log record into one
-    # opaque marker while still replacing the complete first secret value.
-    next_field = _NEXT_FIELD_RE.search(value)
-    if next_field is None:
-        return prefix + replacement + trailing
-    return prefix + replacement + value[next_field.start() :] + trailing
-
-
 _FIELD_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _VALUE_STOP_CHARS = frozenset(" \t\r\n,;{}[])")
 _HEADER_VALUE_STOP_CHARS = frozenset("\r\n,;{}[])")

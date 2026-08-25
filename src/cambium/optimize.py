@@ -1487,13 +1487,6 @@ def eval_main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def extract_candidates(*args: Any, **kwargs: Any) -> Any:
-    """Load the packaged OpenCode extractor without duplicating its policy."""
-    from cambium.opencode import extract_candidates as extractor
-
-    return extractor(*args, **kwargs)
-
-
 def extract_main(argv: list[str] | None = None) -> int:
     """Run the end-to-end trajectory extraction command."""
     from cambium.opencode import extract_main as runner

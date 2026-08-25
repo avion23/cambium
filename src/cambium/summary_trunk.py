@@ -698,11 +698,6 @@ def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
     )
 
 
-def compile_k0(entries: Sequence[SummaryEntry]) -> K0Projection:
-    """Short alias for :func:`compile_k0_projection`."""
-    return compile_k0_projection(entries)
-
-
 def _k0_source_sha256(entries: Sequence[SummaryEntry]) -> str:
     return hashlib.sha256(
         _canonical_json_bytes([entry_mapping(entry) for entry in entries])
@@ -821,11 +816,6 @@ def k0_rollover_decision(
         else:
             raise TypeError("event_sink must be callable or appendable")
     return decision
-
-
-def evaluate_k0_rollover(*args: Any, **kwargs: Any) -> RolloverDecision:
-    """Compatibility alias for :func:`k0_rollover_decision`."""
-    return k0_rollover_decision(*args, **kwargs)
 
 
 def semantic_summary_messages(
@@ -989,10 +979,8 @@ __all__ = [
     "SummaryTrunkError",
     "append_summary_entry",
     "build_summary_request",
-    "compile_k0",
     "compile_k0_projection",
     "entry_mapping",
-    "evaluate_k0_rollover",
     "estimate_message_tokens",
     "is_k0_entry",
     "k0_rollover_decision",

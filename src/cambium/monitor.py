@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import shutil
 import signal
@@ -486,7 +487,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if not math_is_positive(args.interval):
+    if not (math.isfinite(args.interval) and args.interval > 0):
         print("cambium monitor: --interval must be a positive finite number", file=sys.stderr)
         return 2
     try:
@@ -500,14 +501,6 @@ def main(argv: list[str] | None = None) -> int:
         once=args.once,
         json_output=args.json,
     )
-
-
-def math_is_positive(value: Any) -> bool:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return number > 0 and number < float("inf")
 
 
 if __name__ == "__main__":

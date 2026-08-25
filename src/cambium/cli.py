@@ -1139,7 +1139,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
 async def _run_monitor(args: argparse.Namespace) -> int:
     from . import monitor
 
-    if not monitor.math_is_positive(args.interval):
+    if not (math.isfinite(args.interval) and args.interval > 0):
         print(
             "cambium monitor: --interval must be a positive finite number",
             file=sys.stderr,
