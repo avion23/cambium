@@ -123,6 +123,31 @@ def test_worker_nonzero_exit_fails(tmp_path, monkeypatch) -> None:
     assert tip == base  # no merge
 
 
+def test_early_worker_failure_preserves_exit_code_and_stderr_tail(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FAKE_MODE", "early_crash")
+    monkeypatch.setattr(supervisor_module, "EOF_GRACE_S", 0.01)
+    session_dir = tmp_path / "session"
+    scratch = session_dir / "scratch"
+    _make_scratch(scratch)
+    spec = _spec(session_dir, write_marker=True)
+
+    from cambium.supervisor import _slice_to_plan_task, run_plan
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [_slice_to_plan_task(spec)]}))
+
+    assert result.results[0].status == "failed"
+    reason = result.results[0].reason or ""
+    assert "worker_exit_7" in reason
+    assert "stderr: worker bootstrap failed: provider setup exploded" in reason
+    root_result = json.loads(
+        (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
+    )
+    assert root_result["failure_reason"] == reason
+    failed_events = [event for event in read_events(session_dir) if event["kind"] == "worker_failed"]
+    assert failed_events
+    assert failed_events[-1]["payload"]["reason"] == reason
+
+
 def test_missing_exit_message_fails(tmp_path, monkeypatch) -> None:
     # Reviewer case worker_noexit.py: envelope succeeded, exit_message omitted.
     monkeypatch.setenv("FAKE_MODE", "noexit")

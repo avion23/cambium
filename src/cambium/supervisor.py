@@ -1478,6 +1478,19 @@ def _envelope_text(envelope: Mapping[str, Any] | None, key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _worker_failure_reason(
+    envelope: Mapping[str, Any] | None,
+    fallback: str | None,
+    stderr_tail: str | None,
+) -> str | None:
+    """Prefer the worker's reason and retain the last redacted stderr line."""
+    reason = _envelope_text(envelope, "failure_reason") or fallback
+    if not stderr_tail:
+        return reason
+    detail = f"stderr: {stderr_tail}"
+    return f"{reason}; {detail}" if reason else detail
+
+
 def _finite_metric_score(value: Any) -> int | float | None:
     """Return a JSON-safe metric score, never a non-finite number."""
     if isinstance(value, bool):
@@ -4062,7 +4075,7 @@ class _Runtime:
                     if envelope_status != "succeeded":
                         failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
                         if failure_reason is None:
-                            failure_reason = "worker_verdict_failed"
+                            failure_reason = outcome.reason or "worker_verdict_failed"
                         await self._reject_child_proposals(
                             task_id,
                             outcome.proposals,
@@ -4515,6 +4528,7 @@ class _Runtime:
 
         stdout = cast(asyncio.StreamReader, proc.stdout)
         stderr = cast(asyncio.StreamReader, proc.stderr)
+        stderr_tail: str | None = None
 
         async def _read_stdout() -> None:
             nonlocal parse_errors, message_too_long
@@ -4575,11 +4589,13 @@ class _Runtime:
                     await messages.put(None)
 
         async def _read_stderr() -> None:
+            nonlocal stderr_tail
             async for raw in stderr:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 if line.strip():
                     if self._redactor is not None:
                         line = self._redactor.redact_escaped(line)
+                    stderr_tail = line[:512]
                     await self.emit(
                         "log",
                         task_id=task_id,
@@ -5270,7 +5286,15 @@ class _Runtime:
             clean = False
             reason = "message_too_long"
         elif clean:
-            reason = None
+            reason = (
+                _worker_failure_reason(
+                    self._redact_envelope(envelope) if envelope is not None else None,
+                    None,
+                    stderr_tail,
+                )
+                if envelope is not None and envelope.get("status") != "succeeded"
+                else None
+            )
         elif timeout_phase is not None:
             reason = timeout_phase
         elif protocol_reason is not None:
@@ -5283,6 +5307,12 @@ class _Runtime:
             reason = "missing_result_envelope"
         else:
             reason = "result_request_id_mismatch"
+        if not clean:
+            reason = _worker_failure_reason(
+                self._redact_envelope(envelope) if envelope is not None else None,
+                reason,
+                stderr_tail,
+            )
         return _GenOutcome(
             clean=clean,
             fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",

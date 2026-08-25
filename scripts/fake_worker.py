@@ -16,7 +16,8 @@ Behavior variants for scenario tests, selected by env ``FAKE_MODE``:
 healthy (default), exit5, noexit, noresult, badrid, noready,
 garbage (garbage lines interleaved with a healthy protocol run),
 garbage_only (pure garbage; never ready), overwrite (replace the first
-'// replace-me' line instead of appending the marker),
+'// replace-me' line instead of appending the marker), early_crash (exit
+before ready after writing one stderr reason),
 valid_non_object (valid JSON lines that are not objects, interleaved
 with a healthy protocol run).
 """
@@ -119,6 +120,10 @@ def main() -> int:
 
     if MODE == "noready":
         time.sleep(1e9)  # never send ready — the supervisor's ready_timeout kills us
+
+    if MODE == "early_crash":
+        print("worker bootstrap failed: provider setup exploded", file=sys.stderr, flush=True)
+        return 7
 
     if MODE == "garbage":
         for _ in range(3):
