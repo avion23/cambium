@@ -691,6 +691,43 @@ def test_continue_resolves_latest_and_specific_interactive_sessions(tmp_path: Pa
     assert InteractiveSession.resolve_continue_session(tmp_path, prior) == prior.resolve()
 
 
+def test_continue_rejects_paths_outside_repo_sessions_and_symlink_components(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path.parent / f"cambium-outside-{tmp_path.name}"
+    outside.mkdir()
+    _write_manifest = {
+        "schema": 1,
+        "repo": str(repo.resolve()),
+        "turn": 1,
+        "branch_generation": 1,
+        "branch_start_turn": 0,
+        "seed": None,
+        "provider_preference": None,
+        "model_preference": None,
+        "model_preferences": {},
+    }
+    state = outside / ".cambium"
+    state.mkdir()
+    (state / "interactive.json").write_text(json.dumps(_write_manifest), encoding="utf-8")
+    (outside / "turn-0001" / ".cambium").mkdir(parents=True)
+    (outside / "turn-0001" / ".cambium" / "events.db").touch()
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    with pytest.raises(InteractiveSessionError, match="must stay under"):
+        InteractiveSession.resolve_continue_session(repo, f"../../{outside.name}")
+
+    sessions = default_session_root(repo)
+    sessions.mkdir(parents=True)
+    (sessions / "escape").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(InteractiveSessionError, match="symlinked components"):
+        InteractiveSession.resolve_continue_session(repo, sessions / "escape")
+
+
 def test_continue_missing_interactive_session_fails_clearly(tmp_path: Path) -> None:
     with pytest.raises(
         InteractiveSessionError,

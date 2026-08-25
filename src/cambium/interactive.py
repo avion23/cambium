@@ -452,7 +452,33 @@ class InteractiveSession:
             and not requested.is_dir()
         ):
             requested = oneshot.default_session_root(repo_path) / requested
-        candidate = requested.resolve()
+        sessions_root = oneshot.default_session_root(repo_path)
+        if sessions_root.parent.is_symlink() or sessions_root.is_symlink():
+            raise InteractiveSessionError(
+                "repository session root contains a symlink; refusing continuation"
+            )
+        sessions_root = sessions_root.resolve()
+        lexical = Path(os.path.abspath(os.fspath(requested)))
+        try:
+            relative = lexical.relative_to(sessions_root)
+        except ValueError as exc:
+            raise InteractiveSessionError(
+                "interactive session path must stay under the repository session root"
+            ) from exc
+        current = sessions_root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                raise InteractiveSessionError(
+                    "interactive session path must not contain symlinked components"
+                )
+        candidate = lexical.resolve()
+        try:
+            candidate.relative_to(sessions_root)
+        except ValueError as exc:
+            raise InteractiveSessionError(
+                "interactive session path must stay under the repository session root"
+            ) from exc
         if not cls._is_reconnectable(candidate, repo_path):
             raise InteractiveSessionError(
                 f"no resumable interactive session found at {candidate}"
@@ -462,6 +488,25 @@ class InteractiveSession:
     @classmethod
     def _is_reconnectable(cls, root: Path, repo: Path) -> bool:
         if not root.is_dir():
+            return False
+        sessions_root = oneshot.default_session_root(repo)
+        if sessions_root.parent.is_symlink() or sessions_root.is_symlink():
+            return False
+        sessions_root = sessions_root.resolve()
+        lexical = Path(os.path.abspath(os.fspath(root)))
+        try:
+            relative = lexical.relative_to(sessions_root)
+        except ValueError:
+            return False
+        current = sessions_root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                return False
+        try:
+            root = lexical.resolve()
+            root.relative_to(sessions_root)
+        except (OSError, ValueError):
             return False
         document = _read_manifest_document(root / ".cambium" / _MANIFEST_NAME)
         if document is None or document.get("schema") != _INTERACTIVE_SCHEMA:
