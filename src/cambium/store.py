@@ -130,6 +130,7 @@ _INSERT_NEXT_SEQ = "INSERT INTO event_store_state(id, next_seq) VALUES(1, ?)"
 _UPDATE_NEXT_SEQ = "UPDATE event_store_state SET next_seq = MAX(next_seq, ?) WHERE id = 1"
 
 _WRITER_BUSY_TIMEOUT_MS = 5000
+_READER_BUSY_TIMEOUT_MS = 5000
 # Checkpoints poll busy readers; a short per-call busy wait keeps the retry
 # loop (and the critical-append deadline) in control of total wait time.
 _CHECKPOINT_BUSY_TIMEOUT_MS = 20
@@ -152,7 +153,12 @@ _SELECT_ALL = (
 _REQUIRED_EVENT_FIELDS = frozenset({"seq", "kind", "payload"})
 
 
-def read_events_file(db_path: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
+def read_events_file(
+    db_path: Path | str,
+    after_seq: int = 0,
+    *,
+    busy_timeout_ms: int = _READER_BUSY_TIMEOUT_MS,
+) -> list[dict[str, Any]]:
     """Read durable events without creating or modifying store state."""
     path = Path(db_path)
     if not path.is_file():
@@ -164,7 +170,7 @@ def read_events_file(db_path: Path | str, after_seq: int = 0) -> list[dict[str, 
         raise StoreError(f"cannot read event store {path}: {exc}") from exc
 
     if header == _SQLITE_HEADER:
-        events = _read_sqlite_events(path)
+        events = _read_sqlite_events(path, busy_timeout_ms)
     else:
         events = _read_jsonl_events(path)
     return [event for event in events if event["seq"] > after_seq]
@@ -303,11 +309,11 @@ def _read_jsonl_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _read_sqlite_events(path: Path) -> list[dict[str, Any]]:
+def _read_sqlite_events(path: Path, busy_timeout_ms: int) -> list[dict[str, Any]]:
     conn = None
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         rows = conn.execute(_SELECT_ALL).fetchall()
     except (OSError, sqlite3.Error) as exc:
         raise _event_store_error(path, str(exc)) from exc
