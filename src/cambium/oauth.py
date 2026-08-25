@@ -787,6 +787,9 @@ def _request(
         method="POST",
         headers={
             "Content-Type": ("application/x-www-form-urlencoded" if form else "application/json"),
+            # The edge rejects requests with urllib's default Python-urllib
+            # user-agent (HTTP 530); identify as cambium instead.
+            "User-Agent": "cambium",
         },
     )
     try:
