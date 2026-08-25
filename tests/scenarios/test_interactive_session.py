@@ -644,6 +644,40 @@ def test_tui_reconnects_to_explicit_durable_interactive_session(tmp_path: Path) 
     assert "tokens=125" in rendered
 
 
+def test_lock_acquisition_refreshes_state_before_contender_can_publish(
+    tmp_path: Path,
+) -> None:
+    root = default_session_root(tmp_path) / "shared"
+    config = OneShotConfig(repo=tmp_path, session_root=root)
+    owner = InteractiveSession(config)
+    first = owner.prepare_turn("first")
+    owner.complete_turn(first, succeeded=False)
+    owner.acquire()
+    try:
+        contender = InteractiveSession(config)
+        assert contender.turn == 1
+
+        second = owner.prepare_turn("second")
+        owner.complete_turn(second, succeeded=False)
+    finally:
+        owner.release()
+
+    contender.acquire()
+    try:
+        assert contender.turn == 2
+        third = contender.prepare_turn("third")
+        contender.observe_event(
+            third,
+            {"kind": "usage_event", "payload": {"provider": "provider-a", "model": "model-a"}},
+        )
+        manifest = json.loads(
+            (root / ".cambium" / "interactive.json").read_text(encoding="utf-8")
+        )
+        assert manifest["turn"] == 2
+    finally:
+        contender.release()
+
+
 def test_stale_interactive_lock_is_detected_and_reclaimed(tmp_path: Path) -> None:
     session = InteractiveSession(
         OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive")

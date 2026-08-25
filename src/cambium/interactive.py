@@ -400,6 +400,7 @@ class InteractiveSession:
         self._model_preference: str | None = None
         self._model_preferences: dict[str, str] = {}
         self._serving_turn: int | None = None
+        self._lock_acquired = False
         self._load_manifest()
         self._load_durable_head()
         self._reconcile_provider_preference()
@@ -531,11 +532,20 @@ class InteractiveSession:
 
     def acquire(self) -> None:
         """Own the interactive root until :meth:`release` is called."""
+        if self._lock_acquired:
+            return
         self._lock.acquire()
+        try:
+            self._reload_durable_state()
+        except BaseException:
+            self._lock.release()
+            raise
+        self._lock_acquired = True
 
     def release(self) -> None:
         """Release the interactive root lock, including after normal exit."""
         self._lock.release()
+        self._lock_acquired = False
 
     @property
     def lock_path(self) -> Path:
@@ -629,6 +639,24 @@ class InteractiveSession:
 
     def _write_manifest(self) -> None:
         _atomic_json(self._manifest_path, self._manifest_document())
+
+    def _reload_durable_state(self) -> None:
+        """Refresh state after taking ownership of the frontend lock."""
+        self._turn = 0
+        self._branch_generation = 1
+        self._branch_start_turn = 0
+        self._seed = None
+        self._pending_seed = None
+        self._last_epoch = 0
+        self._last_checkpoint = None
+        self._provider_preference = None
+        self._model_preference = None
+        self._model_preferences = {}
+        self._serving_turn = None
+        self._reconnected = self._manifest_path.is_file() and self._has_durable_state(self.root)
+        self._load_manifest()
+        self._load_durable_head()
+        self._reconcile_provider_preference()
 
     def _load_manifest(self) -> None:
         if not self._manifest_path.is_file():
