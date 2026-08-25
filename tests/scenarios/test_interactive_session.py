@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -222,6 +224,39 @@ def test_interactive_read_events_merges_turn_stores(tmp_path: Path) -> None:
     ]
     assert [event["seq"] for event in events] == [1, 2, 3]
     assert [event["kind"] for event in read_events(root, after_seq=2)] == ["result"]
+
+
+def test_interactive_read_events_skips_locked_turn_until_next_poll(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    locked_db = root / "turn-0001" / ".cambium" / "events.db"
+    available_db = root / "turn-0002" / ".cambium" / "events.db"
+    for event_db, kind in ((locked_db, "locked-turn"), (available_db, "available-turn")):
+        event_db.parent.mkdir(parents=True)
+        store = EventStore(event_db)
+        try:
+            store.append({"kind": kind, "task_id": "interactive-main", "payload": {}})
+        finally:
+            store.close()
+
+    # BEGIN EXCLUSIVE does not block readers in WAL mode, so use the legacy
+    # rollback journal for this lock scenario.
+    with sqlite3.connect(locked_db) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+
+    blocker = sqlite3.connect(locked_db, isolation_level=None)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        assert [event["kind"] for event in read_events(root)] == ["available-turn"]
+        assert time.monotonic() - started < 1.0
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert [event["kind"] for event in read_events(root)] == [
+        "locked-turn",
+        "available-turn",
+    ]
 
 
 def test_monitor_smoke_reads_interactive_turn_stores(tmp_path: Path) -> None:
