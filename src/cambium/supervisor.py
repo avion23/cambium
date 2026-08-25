@@ -74,6 +74,7 @@ import random
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1468,6 +1469,9 @@ def _interactive_event_timestamp(event: Mapping[str, Any]) -> float | None:
     return timestamp if math.isfinite(timestamp) else None
 
 
+_INTERACTIVE_READ_BUSY_TIMEOUT_MS = 200
+
+
 def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str, Any]]:
     """Replay immutable turn stores as one logical session event stream.
 
@@ -1485,7 +1489,19 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
 
     records: list[tuple[int, int, float | None, int, dict[str, Any]]] = []
     for turn, event_db in turn_stores:
-        for event in read_events_file(event_db):
+        try:
+            events = read_events_file(
+                event_db,
+                busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+            )
+        except StoreError as exc:
+            cause = exc.__cause__
+            if not isinstance(cause, sqlite3.Error) or not any(
+                marker in str(cause).lower() for marker in ("locked", "busy")
+            ):
+                raise
+            continue
+        for event in events:
             records.append(
                 (
                     turn,
