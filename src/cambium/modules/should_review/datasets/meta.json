@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "dataset_version": "1.0.0",
-  "eval_frozen_at": "2026-08-11",
-  "canary_frozen_at": "2026-08-11",
+  "dataset_version": "2.0.0",
+  "eval_frozen_at": "2026-08-25",
+  "canary_frozen_at": "2026-08-25",
   "split_digests": {
-    "train": "49ba6034ce45452b44f60e814c118d6cf3632e25af2bb6141afb4e23c73ce983",
-    "eval": "4bccdabad90becd67cfe105f78c3990a1f27b28c361cfc33f16d170756524991",
-    "canaries": "bbca06e7f8fb04d960ed220d1fbc2114ea1cbe522f86500aa77308c764cd0c5a"
+    "train": "a37ee38cff6b47af8ef92711c61edbf9f738f688db70346f947680e298495127",
+    "eval": "00d9ba400082fd5ff246adec426b58f4fc9bc77397cc94f82d4f69ce72273137",
+    "canaries": "caa5ec8de48bea08647326a067cfe8795aa3402d24f75800783dec955cfe409d"
   },
   "sibling_pins": {}
 }
