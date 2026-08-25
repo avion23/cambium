@@ -69,19 +69,6 @@ EXIT_CODES: dict[str, int] = {
 }
 
 _MISSING = object()
-_FAIL_TOKENS = frozenset(
-    {
-        "error",
-        "failed",
-        "failure",
-        "false",
-        "fail",
-        "rejected",
-        "reject",
-        "timeout",
-        "timed_out",
-    }
-)
 _CANCEL_TOKENS = frozenset(
     {
         "cancel",

@@ -23,8 +23,6 @@ class QualityWeights:
     latency_weight: float = 1.0
     cache_weight: float = 0.1
     stale_after_s: float = 24.0 * 3600.0
-    utilization_weight: float = 0.6
-    shadow_weight: float = 0.1
 
 
 DEFAULT_WEIGHTS = QualityWeights()

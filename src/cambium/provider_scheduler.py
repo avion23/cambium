@@ -23,7 +23,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
@@ -56,10 +56,8 @@ DEFAULT_MINIMUM_BREAKPOINT_TOKENS = 0
 class CacheCapability:
     """Normalized provider prefix-cache capability and tariff metadata.
 
-    Prices are USD per million cache tokens.  A zero value is a valid free
-    tariff; callers should use :meth:`has_pricing` when they need to
-    distinguish a free cache from an undeclared capability.  The constructor
-    accepts the vocabulary used by the architecture documents (for example
+    Prices are USD per million cache tokens.  The constructor accepts the
+    vocabulary used by the architecture documents (for example
     ``minimum_cacheable_tokens``/``cache_ttl_s``) as well as the shorter names
     used in provider files.  The stored fields stay canonical so routing and
     rollover code do not need provider-specific aliases.
@@ -158,66 +156,6 @@ class CacheCapability:
             raise ValueError(f"unknown cache-capability field(s): {unknown}")
         return cls(**dict(value))
 
-    @property
-    def min_cacheable_tokens(self) -> int:
-        """Short spelling for :attr:`minimum_cacheable_tokens`."""
-        return self.minimum_cacheable_tokens
-
-    @property
-    def min_cacheable_block_tokens(self) -> int:
-        """Compatibility spelling used by CAST scheduling notes."""
-        return self.minimum_cacheable_tokens
-
-    @property
-    def ttl_s(self) -> float:
-        """Short spelling for :attr:`cache_ttl_s`."""
-        return self.cache_ttl_s
-
-    @property
-    def ttl_seconds(self) -> float:
-        """Seconds for which an epoch is expected to remain reusable."""
-        return self.cache_ttl_s
-
-    @property
-    def granularity(self) -> int:
-        """Short spelling for :attr:`cache_granularity_tokens`."""
-        return self.cache_granularity_tokens
-
-    @property
-    def granularity_tokens(self) -> int:
-        """Compatibility spelling for cache block granularity."""
-        return self.cache_granularity_tokens
-
-    @property
-    def cache_block_granularity_tokens(self) -> int:
-        """Architecture-document spelling for cache block granularity."""
-        return self.cache_granularity_tokens
-
-    @property
-    def cache_read_price_per_1m(self) -> float:
-        """The read tariff in the unit used by provider configuration."""
-        return self.cache_read_price
-
-    @property
-    def cache_write_price_per_1m(self) -> float:
-        """The write tariff in the unit used by provider configuration."""
-        return self.cache_write_price
-
-    @property
-    def has_pricing(self) -> bool:
-        """Whether either cache tariff was explicitly useful to economics."""
-        return self.cache_read_price > 0 or self.cache_write_price > 0
-
-    @property
-    def declared(self) -> bool:
-        """Whether any non-default cache capability signal is present."""
-        return bool(
-            self.minimum_cacheable_tokens
-            or self.cache_ttl_s
-            or self.cache_granularity_tokens != 1
-            or self.has_pricing
-        )
-
     def cacheable_tokens(self, tokens: int) -> int:
         """Round a prefix up to the provider's cache block granularity."""
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
@@ -259,12 +197,13 @@ def _coalesce_alias(
 
 
 @dataclass(frozen=True, slots=True)
-class CacheHorizonConfig:
-    """Provider-neutral cache-breakpoint batching hints.
+class CastConfig:
+    """CAST rollover and cache-horizon policy for one semantic trunk.
 
-    These values never assert that a provider retained a cache.  They only
-    decide when a completed semantic delta is large/old enough to justify a
-    new immutable breakpoint.
+    ``max_segments`` and ``max_active_trunk_tokens`` are inclusive budgets:
+    rollover is due only once the active trunk exceeds either configured
+    value.  Zero disables that threshold.  Alias fields keep configuration
+    compatible with the terminology used by older architecture drafts.
     """
 
     cache_horizon_s: float = DEFAULT_CACHE_HORIZON_S
@@ -272,6 +211,10 @@ class CacheHorizonConfig:
     # Friendly aliases used by provider capability documents.
     horizon_s: float | None = None
     min_breakpoint_tokens: int | None = None
+    max_segments: int = 0
+    max_active_trunk_tokens: int = 0
+    max_summary_segments: int | None = None
+    max_trunk_tokens: int | None = None
 
     def __post_init__(self) -> None:
         horizon = self.cache_horizon_s
@@ -297,65 +240,6 @@ class CacheHorizonConfig:
         object.__setattr__(self, "minimum_breakpoint_tokens", minimum)
         object.__setattr__(self, "horizon_s", float(horizon))
         object.__setattr__(self, "min_breakpoint_tokens", minimum)
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> CacheHorizonConfig:
-        """Parse a strict JSON/config mapping."""
-        allowed = {
-            "cache_horizon_s",
-            "minimum_breakpoint_tokens",
-            "horizon_s",
-            "min_breakpoint_tokens",
-        }
-        unknown = sorted(set(value) - allowed)
-        if unknown:
-            raise ValueError(f"unknown cache-horizon field(s): {unknown}")
-        return cls(**dict(value))
-
-    def breakpoint_due(
-        self,
-        pending_tokens: int,
-        started_at: float,
-        *,
-        now: float | None = None,
-        force: bool = False,
-    ) -> bool:
-        """Whether a pending delta should create a new breakpoint."""
-        if isinstance(pending_tokens, bool) or not isinstance(pending_tokens, int):
-            raise ValueError("pending_tokens must be a non-negative integer")
-        if pending_tokens < 0:
-            raise ValueError("pending_tokens must be a non-negative integer")
-        if force:
-            return pending_tokens > 0
-        if pending_tokens == 0:
-            return False
-        if self.minimum_breakpoint_tokens == 0:
-            return True
-        if pending_tokens >= self.minimum_breakpoint_tokens:
-            return True
-        timestamp = time.time() if now is None else float(now)
-        if not math.isfinite(timestamp) or not math.isfinite(float(started_at)):
-            raise ValueError("cache breakpoint times must be finite")
-        return timestamp - float(started_at) >= self.cache_horizon_s
-
-
-@dataclass(frozen=True, slots=True)
-class CastConfig(CacheHorizonConfig):
-    """CAST rollover and cache-horizon policy for one semantic trunk.
-
-    ``max_segments`` and ``max_active_trunk_tokens`` are inclusive budgets:
-    rollover is due only once the active trunk exceeds either configured
-    value.  Zero disables that threshold.  Alias fields keep configuration
-    compatible with the terminology used by older architecture drafts.
-    """
-
-    max_segments: int = 0
-    max_active_trunk_tokens: int = 0
-    max_summary_segments: int | None = None
-    max_trunk_tokens: int | None = None
-
-    def __post_init__(self) -> None:
-        CacheHorizonConfig.__post_init__(self)
         segments = self.max_segments
         if self.max_summary_segments is not None:
             if segments != 0 and segments != self.max_summary_segments:
@@ -394,6 +278,32 @@ class CastConfig(CacheHorizonConfig):
         if unknown:
             raise ValueError(f"unknown CAST field(s): {unknown}")
         return cls(**dict(value))
+
+    def breakpoint_due(
+        self,
+        pending_tokens: int,
+        started_at: float,
+        *,
+        now: float | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Whether a pending delta should create a new breakpoint."""
+        if isinstance(pending_tokens, bool) or not isinstance(pending_tokens, int):
+            raise ValueError("pending_tokens must be a non-negative integer")
+        if pending_tokens < 0:
+            raise ValueError("pending_tokens must be a non-negative integer")
+        if force:
+            return pending_tokens > 0
+        if pending_tokens == 0:
+            return False
+        if self.minimum_breakpoint_tokens == 0:
+            return True
+        if pending_tokens >= self.minimum_breakpoint_tokens:
+            return True
+        timestamp = time.time() if now is None else float(now)
+        if not math.isfinite(timestamp) or not math.isfinite(float(started_at)):
+            raise ValueError("cache breakpoint times must be finite")
+        return timestamp - float(started_at) >= self.cache_horizon_s
 
     def rollover_due(self, segment_count: int, active_trunk_tokens: int) -> bool:
         """Return true when either CAST rollover threshold is exceeded."""
@@ -437,13 +347,6 @@ class CastConfig(CacheHorizonConfig):
             cache_capability=cache_capability,
             cache_expired=cache_expired,
         )
-
-
-# Names used by callers and architecture notes.  They intentionally point to
-# one type so policy validation cannot drift between entry points.
-CachePolicy = CastConfig
-CASTConfig = CastConfig
-
 
 @dataclass(frozen=True, slots=True)
 class RolloverDecision:
@@ -595,11 +498,6 @@ def decide_rollover(
     )
 
 
-def decide_k0_rollover(*args: Any, **kwargs: Any) -> RolloverDecision:
-    """Compatibility alias naming the CAST projection explicitly."""
-    return decide_rollover(*args, **kwargs)
-
-
 class BillingMode(StrEnum):
     """How a configured provider consumes scarce capacity."""
 
@@ -669,7 +567,6 @@ class ProviderLease:
     model: str
     root_task_id: str
     cache_identity: str = ""
-    acquired_at: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
         if not self.provider or not self.model or not self.root_task_id:

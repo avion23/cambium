@@ -117,7 +117,6 @@ _PROVIDER_FIELDS = frozenset(
         "throughput_hint_tps",
         "tokens_per_s",
         "interactive_wall_budget_s",
-        "quality_weight",
         "supports_native_tools",
         "supports_python_tool",
         "allow_model_substitution",
@@ -172,7 +171,6 @@ _DEFAULTS: dict[str, object] = {
     "throughput_hint_tps": 0.0,
     "tokens_per_s": None,
     "interactive_wall_budget_s": None,
-    "quality_weight": 1.0,
     "supports_native_tools": True,
     "supports_python_tool": True,
     "allow_model_substitution": False,
@@ -211,7 +209,6 @@ class _ProviderMapping(TypedDict):
     throughput_hint_tps: float
     tokens_per_s: float | None
     interactive_wall_budget_s: float | None
-    quality_weight: float
     supports_native_tools: bool
     supports_python_tool: bool
     allow_model_substitution: bool
@@ -1106,9 +1103,8 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         )
         if interactive_wall_budget_s <= 0:
             raise _error(f"{location}.interactive_wall_budget_s", "must be greater than 0")
-    quality_weight = _require_number(values["quality_weight"], f"{location}.quality_weight")
-    if throughput_hint_tps < 0 or quality_weight < 0:
-        raise _error(location, "throughput_hint_tps and quality_weight must be non-negative")
+    if throughput_hint_tps < 0:
+        raise _error(f"{location}.throughput_hint_tps", "must be non-negative")
     supports_native_tools = _require_bool(
         values["supports_native_tools"], f"{location}.supports_native_tools"
     )
@@ -1194,7 +1190,6 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "throughput_hint_tps": throughput_hint_tps,
         "tokens_per_s": tokens_per_s,
         "interactive_wall_budget_s": interactive_wall_budget_s,
-        "quality_weight": quality_weight,
         "supports_native_tools": supports_native_tools,
         "supports_python_tool": supports_python_tool,
         "allow_model_substitution": allow_model_substitution,
@@ -1326,7 +1321,6 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "throughput_hint_tps": values["throughput_hint_tps"],
         "tokens_per_s": values["tokens_per_s"],
         "interactive_wall_budget_s": values["interactive_wall_budget_s"],
-        "quality_weight": values["quality_weight"],
         "supports_native_tools": values["supports_native_tools"],
         "supports_python_tool": values["supports_python_tool"],
         "allow_model_substitution": values["allow_model_substitution"],

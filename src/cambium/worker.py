@@ -176,10 +176,8 @@ INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
 # Consecutive non-novel actions (valid plans, tool calls, and
-# invalid/unparseable actions) before the agent loop fails fast.  The legacy
-# name is retained as an alias because a few in-process callers import it.
+# invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
-MAX_CONSECUTIVE_PLANS = MAX_NO_PROGRESS_ACTIONS
 DEFAULT_PROGRESS_WINDOW = 3
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB bounded upward diff envelope.
 DEFAULT_MAX_TURNS = 50
@@ -1817,17 +1815,6 @@ def _accumulate_usage(cumulative: dict[str, int], usage: dict[str, Any] | None) 
             previous_total = 0
         cumulative["total_tokens"] = int(previous_total) + total
     return cumulative
-
-
-def _cumulative_total(cumulative: dict[str, int]) -> int:
-    total = cumulative.get("total_tokens")
-    if _valid_usage_count(total):
-        return int(total)
-    inputs = cumulative.get("input_tokens", cumulative.get("prompt_tokens"))
-    outputs = cumulative.get("output_tokens", cumulative.get("completion_tokens"))
-    if _valid_usage_count(inputs) and _valid_usage_count(outputs):
-        return int(inputs) + int(outputs)
-    return 0
 
 
 def _transcript_chars(transcript: list[dict[str, Any]]) -> int:
@@ -5387,21 +5374,6 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
     if isinstance(provider_metadata, dict):
         envelope["provider_metadata"] = provider_metadata
     await send(writer, envelope)
-
-
-async def _emit_result(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
-    """Emit result_envelope + the authoritative exit_message (normal completion)."""
-    await _emit_result_envelope(writer, outcome)
-    await send(
-        writer,
-        {
-            "type": "exit_message",
-            "task_id": outcome["task_id"],
-            "generation": outcome["generation"],
-            "reason": _exit_reason(outcome["status"]),
-            "monotonic_ms": _monotonic_ms(),
-        },
-    )
 
 
 async def _await_on_shutdown(

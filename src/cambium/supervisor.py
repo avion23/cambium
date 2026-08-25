@@ -1444,11 +1444,6 @@ def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, A
     return read_events_file(Path(session_dir) / ".cambium" / "events.db", after_seq)
 
 
-def _open_store(session_dir: Path, *, redactor: Redactor | None = None) -> EventStore:
-    """Open the canonical session event store."""
-    return EventStore(Path(session_dir) / ".cambium" / "events.db", redactor=redactor)
-
-
 @dataclass(frozen=True, slots=True)
 class TaskResult:
     """Outcome of one planned task."""
@@ -2624,7 +2619,7 @@ class _Runtime:
         )
 
     def _run_payload(
-        self, spec: dict[str, Any], run_rid: str, wall_budget: float, generation: int
+        self, spec: dict[str, Any], wall_budget: float, generation: int
     ) -> dict[str, Any]:
         repo = Path(spec["repo"])
         payload = {
@@ -2889,7 +2884,7 @@ class _Runtime:
             }
         )
         try:
-            await self._pin_fork_child(parent_spec, child_spec, parent_task_id, child_task_id, kind)
+            await self._pin_fork_child(child_spec, parent_task_id, child_task_id, kind)
             await self._record_revision_conversation(
                 outcome="admitted",
                 parent_task_id=parent_task_id,
@@ -3062,7 +3057,7 @@ class _Runtime:
         }
 
     async def _await_suspend_children(
-        self, parent_task_id: str, child_ids: list[str], remaining: float
+        self, parent_task_id: str, remaining: float
     ) -> None:
         """Await the suspended parent's children, bounded by the wall budget.
 
@@ -3086,7 +3081,6 @@ class _Runtime:
 
     async def _pin_fork_child(
         self,
-        parent_spec: dict[str, Any],
         child_spec: dict[str, Any],
         parent_task_id: str,
         child_task_id: str,
@@ -4019,7 +4013,7 @@ class _Runtime:
                                 summary=worker_summary,
                             )
                             return
-                        await self._await_suspend_children(task_id, child_ids, remaining)
+                        await self._await_suspend_children(task_id, remaining)
                         if not await self._assert_parent_join_invariant(
                             spec, child_ids, generation
                         ):
@@ -4836,7 +4830,7 @@ class _Runtime:
                     )
                     run_rid = self._next_rid()
                     payload = self._run_payload(
-                        spec, run_rid, max(0.0, wall_deadline - loop.time()), generation
+                        spec, max(0.0, wall_deadline - loop.time()), generation
                     )
                     run_msg = {
                         "type": "run_task",

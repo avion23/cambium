@@ -100,10 +100,7 @@ class RoutingRequest:
     actor.
     """
 
-    task_id: str
     model: str
-    expected_input_tokens: int = 0
-    expected_output_tokens: int = 0
     required_context_tokens: int = 0
     needs_native_tools: bool = True
     needs_python_tool: bool = False
@@ -111,7 +108,6 @@ class RoutingRequest:
     allow_paid: bool = True
     allow_free: bool = True
     quality: str | None = None
-    incumbent_provider: str | None = None
     lease: Any | None = None
 
 
@@ -245,7 +241,7 @@ class ProviderDebt:
         self.last_seen = timestamp
 
 
-def _debt_from_mapping(name: str, entry: Mapping[str, Any]) -> ProviderDebt:
+def _debt_from_mapping(entry: Mapping[str, Any]) -> ProviderDebt:
     """Parse one ledger entry, ignoring malformed fields (tolerate corruption)."""
     debt = ProviderDebt()
     for field_name, converter in (
@@ -368,7 +364,7 @@ class DebtStore:
         ):
             raise ValueError(f"invalid routing ledger schema: {self._path}")
         return {
-            name: _debt_from_mapping(name, entry)
+            name: _debt_from_mapping(entry)
             for name, entry in raw["providers"].items()
             if isinstance(name, str) and isinstance(entry, Mapping)
         }
@@ -1108,7 +1104,6 @@ def score_providers(
     allow_paid = requirements.get("allow_paid", True)
     allow_free = requirements.get("allow_free", True)
     capability_request = RoutingRequest(
-        task_id="routing",
         model="",
         required_context_tokens=min_context_window or 0,
         needs_native_tools=needs_native_tools,

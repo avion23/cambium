@@ -401,7 +401,6 @@ class ProviderConfig:
     # hint during quality ordering.
     tokens_per_s: float | None = None
     interactive_wall_budget_s: float | None = None
-    quality_weight: float = 1.0
     supports_native_tools: bool = True
     supports_python_tool: bool = True
     allow_model_substitution: bool = False
@@ -1943,7 +1942,6 @@ class Diffundo:
         validated = validate_requirements(raw)
         has_native_tools = isinstance(prompt.get("tools"), list) and bool(prompt["tools"])
         return RoutingRequest(
-            task_id=self._task_id,
             model=model or "",
             required_context_tokens=validated.get("min_context_window", 0),
             needs_native_tools=validated.get("needs_native_tools", has_native_tools),

@@ -43,7 +43,7 @@ def test_cache_capability_accepts_aliases_and_rounds_cache_blocks() -> None:
     )
 
     assert capability.minimum_cacheable_tokens == 100
-    assert capability.ttl_s == 60.0
+    assert capability.cache_ttl_s == 60.0
     assert capability.cache_granularity_tokens == 128
     assert capability.cacheable_tokens(129) == 256
     assert capability.cost(129) == pytest.approx(256 / 1_000_000 * 0.02)

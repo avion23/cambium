@@ -266,8 +266,8 @@ def test_wall_budget_uses_one_deadline_across_two_suspensions(
 
     remaining_samples: list[tuple[float, float]] = []
 
-    async def fake_await(parent_task_id: str, child_ids: list[str], remaining: float) -> None:
-        del parent_task_id, child_ids
+    async def fake_await(parent_task_id: str, remaining: float) -> None:
+        del parent_task_id
         remaining_samples.append((remaining, clock.current))
         clock.current += 3.0
 

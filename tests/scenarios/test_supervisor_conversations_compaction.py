@@ -455,6 +455,6 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "fanout_config": {"model": "fake-model", "protocol": "loopback"},
         "authorized_providers": ["fake-provider"],
     }
-    asyncio.run(runtime._pin_fork_child({}, child_spec, "task", "child", "implementation"))
+    asyncio.run(runtime._pin_fork_child(child_spec, "task", "child", "implementation"))
     assert child_spec["context_fork"]["checkpoint_ref"] == valid_advanced["checkpoint_ref"]
     assert child_spec["context_fork"]["suffix_sha256"] == advanced_cache_key["suffix_sha256"]
