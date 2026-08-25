@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -12,7 +13,7 @@ import sys
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -26,7 +27,7 @@ from .interactive import (
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
-from .tui_screen import ActivityState, Cockpit, Transcript
+from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
 
 try:
     import readline as _readline
@@ -51,8 +52,20 @@ class _Cumulative:
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
     latest_output_tokens_per_s: float = 0.0
+    billing_labels: dict[str, str] = field(default_factory=dict)
+    providers_seen: set[str] = field(default_factory=set)
+
+    @staticmethod
+    def _providers(snapshot: Any) -> set[str]:
+        return {
+            provider
+            for agent in getattr(snapshot, "agents", ())
+            if (provider := getattr(agent, "provider", None))
+            and isinstance(provider, str)
+        }
 
     def add(self, snapshot: SessionSnapshot) -> None:
+        self.providers_seen.update(self._providers(snapshot))
         self.calls += snapshot.calls
         self.summary_calls += snapshot.summary_calls
         self.input_tokens += snapshot.input_tokens
@@ -67,7 +80,19 @@ class _Cumulative:
         ]
         self.latest_output_tokens_per_s = sum(rates)
 
-    def line(self) -> str:
+    def line(self, *, snapshot: SessionSnapshot | None = None) -> str:
+        providers = set(self.providers_seen)
+        if snapshot is not None:
+            providers.update(self._providers(snapshot))
+        subscription = any(
+            self.billing_labels.get(provider) == "subscription" for provider in providers
+        )
+        if subscription and self.estimated_cost_usd <= 0:
+            cost = "subscription"
+        elif self.estimated_cost_usd <= 0:
+            cost = "free"
+        else:
+            cost = f"${self.estimated_cost_usd:.6f}"
         return (
             "usage: "
             f"calls={self.calls} summaries={self.summary_calls} "
@@ -75,8 +100,61 @@ class _Cumulative:
             f"(in={self.input_tokens} out={self.output_tokens} "
             f"cached={self.cached_tokens}) "
             f"out/s={self.latest_output_tokens_per_s:.1f} "
-            f"cost=${self.estimated_cost_usd:.6f}"
+            f"cost={cost}"
         )
+
+
+def _provider_billing_labels(config: Any, repo: Path) -> dict[str, str]:
+    """Load non-secret billing labels for providers used by the live TUI.
+
+    Codex OAuth entries from older provider files may omit ``billing_mode``.
+    When their auth mode is ``codex_chatgpt`` and every token tariff is zero,
+    the UI treats that combination as subscription-backed.  This is a
+    presentation-only heuristic; ordinary zero-tariff API-key providers stay
+    ``free`` unless their config explicitly declares ``subscription``.
+    """
+    try:
+        from . import oneshot
+        from .provider_config import AuthMode, BillingMode, load_providers
+
+        provider_path = oneshot._provider_config_path(config, repo)
+        providers = load_providers(provider_path)
+    except (ImportError, OSError, ValueError):
+        return {}
+
+    labels: dict[str, str] = {}
+    for provider in providers:
+        name = getattr(provider, "name", None)
+        if not isinstance(name, str) or not name:
+            continue
+        mode = getattr(getattr(provider, "billing_mode", None), "value", None)
+        if mode == BillingMode.SUBSCRIPTION.value:
+            labels[name] = "subscription"
+            continue
+        if mode == BillingMode.FREE.value:
+            labels[name] = "free"
+            continue
+
+        prices = (
+            getattr(provider, "price_per_1m_in", 0.0),
+            getattr(provider, "price_per_1m_cached_in", 0.0),
+            getattr(provider, "price_per_1m_out", 0.0),
+        )
+        zero_tariffs = all(
+            not isinstance(price, bool)
+            and isinstance(price, int | float)
+            and math.isfinite(float(price))
+            and float(price) == 0.0
+            for price in prices
+        )
+        auth = getattr(getattr(provider, "auth", None), "value", None)
+        if zero_tariffs and auth == AuthMode.CODEX_CHATGPT.value:
+            labels[name] = "subscription"
+        elif zero_tariffs:
+            labels[name] = "free"
+        else:
+            labels[name] = "metered"
+    return labels
 
 
 _HELP = """Commands:
@@ -90,6 +168,7 @@ _HELP = """Commands:
   /model P    select provider P (or P:M) for subsequent turns
   /branches   list durable branch heads with epoch/checkpoint references
   /fork       fork a new branch from the current checkpoint
+  /quota      show provider quota-window state
   /compact    flush semantic context and check for a K0 rollover
   /dashboard  explain the visible live cockpit
   /events     recent durable event summaries
@@ -355,9 +434,10 @@ def _restore_history(
     session: InteractiveSession,
     *,
     transcript: Transcript | None = None,
+    billing_labels: Mapping[str, str] | None = None,
 ) -> tuple[_Cumulative, SessionSnapshot]:
     """Rebuild usage, dashboard state, and optionally the durable transcript tail."""
-    cumulative = _Cumulative()
+    cumulative = _Cumulative(billing_labels=dict(billing_labels or {}))
     latest = ObservabilityState(recent_limit=16).snapshot()
     for turn_dir in session.active_turn_dirs():
         event_db = turn_dir / ".cambium" / "events.db"
@@ -534,13 +614,18 @@ def _command_output(
     if name == "/help" and not argument:
         return _HELP
     if name == "/usage" and not argument:
-        return cumulative.line()
+        return cumulative.line(snapshot=snapshot)
     if name == "/agents" and not argument:
         return "\n".join(render_agent_lines(snapshot))
     if name == "/context" and not argument:
         return _context_line(snapshot)
     if name == "/session" and not argument:
         return session.describe()
+    if name == "/quota" and not argument:
+        rows = render_quota_rows(snapshot)
+        if not rows:
+            return "quota: no provider quota observations"
+        return "\n".join(("quota:", *rows))
     if name == "/model":
         if not argument:
             try:
@@ -600,7 +685,7 @@ def _command_output(
                 session.describe(),
                 _branch_line(session),
                 _context_line(snapshot),
-                cumulative.line(),
+                cumulative.line(snapshot=snapshot),
                 *render_agent_lines(snapshot),
             ]
         )
@@ -633,7 +718,12 @@ async def _run_interactive(
 
     try:
         transcript = Transcript()
-        cumulative, last_snapshot = _restore_history(session, transcript=transcript)
+        billing_labels = _provider_billing_labels(config, session.repo)
+        cumulative, last_snapshot = _restore_history(
+            session,
+            transcript=transcript,
+            billing_labels=billing_labels,
+        )
     except BaseException:
         session.release()
         raise
@@ -720,7 +810,7 @@ async def _run_interactive(
                     transcript,
                     session_description=session.describe(),
                     branch_line=_branch_line(session),
-                    cumulative_line=cumulative.line(),
+                    cumulative_line=cumulative.line(snapshot=last_snapshot),
                 )
                 prompt = await _next_prompt()
                 if prompt is None or _is_quit_prompt(prompt):
@@ -746,7 +836,7 @@ async def _run_interactive(
                     session.reset()
                     state = ObservabilityState(recent_limit=16)
                     last_snapshot = state.snapshot()
-                    cumulative = _Cumulative()
+                    cumulative = _Cumulative(billing_labels=dict(billing_labels))
                     sequence = 0
                     transcript.clear()
                     transcript.system(
@@ -787,7 +877,9 @@ async def _run_interactive(
                     transcript,
                     session_description=session.describe(),
                     branch_line=_branch_line(session),
-                    cumulative_line=cumulative.line(),
+                    cumulative_line=cumulative.line(
+                        snapshot=state.snapshot(session_dir=turn.session_dir)
+                    ),
                     activity_line=activity.render(),
                 )
 
@@ -815,12 +907,13 @@ async def _run_interactive(
                     normalized = dict(record)
                     normalized["seq"] = sequence
                     state.apply(normalized)  # noqa: B023
+                    live_snapshot = state.snapshot(session_dir=turn.session_dir)
                     cockpit.draw(  # noqa: B023  # noqa: B023
-                        state.snapshot(session_dir=turn.session_dir),  # noqa: B023
+                        live_snapshot,  # noqa: B023
                         transcript,
                         session_description=session.describe(),
                         branch_line=_branch_line(session),
-                        cumulative_line=cumulative.line(),  # noqa: B023
+                        cumulative_line=cumulative.line(snapshot=live_snapshot),  # noqa: B023
                         activity_line=_activity.render(),
                     )
 
@@ -869,7 +962,9 @@ async def _run_interactive(
                                         transcript,
                                         session_description=session.describe(),
                                         branch_line=_branch_line(session),
-                                        cumulative_line=cumulative.line(),
+                                        cumulative_line=cumulative.line(
+                                            snapshot=state.snapshot(session_dir=turn.session_dir)
+                                        ),
                                     )
                                 _start_input_read()
 
@@ -937,7 +1032,7 @@ async def _run_interactive(
                     transcript,
                     session_description=session.describe(),
                     branch_line=_branch_line(session),
-                    cumulative_line=cumulative.line(),
+                    cumulative_line=cumulative.line(snapshot=snapshot),
                 )
     except KeyboardInterrupt:
         return ExitCode.INTERRUPTED
