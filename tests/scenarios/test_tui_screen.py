@@ -107,6 +107,49 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     assert "\x1b[31m" not in "\n".join(hostile)
 
 
+def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    summary = (
+        "Detected prior interactive session; resuming durable state: "
+        "turns=1 last_epoch=7 last_checkpoint=interactive-main/epoch-7-"
+        + "c" * 64
+        + ".json. session=/tmp/interactive_session turn=1 branch=1 "
+        "provider=provider-a model=model-a epoch=7"
+    )
+    rendered_summary = "\n".join(render_markdown_lines(summary, 73, color=False))
+    assert "last_epoch=7" in rendered_summary
+    assert "last_checkpoint=interactive-main/epoch-7-" in rendered_summary
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.user("durable prompt")
+    transcript.assistant("durable answer")
+    transcript.system(summary)
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.move_to_input()
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session=/tmp/interactive_session",
+            branch_line="branch: turn=1 provider=provider-a model=model-a epoch=7",
+            cumulative_line="usage: calls=1 tokens=125",
+        )
+        assert "last_epoch=7" not in stream.getvalue()
+        cockpit.hide_cursor(commit=True)
+        cockpit.flush()
+
+    rendered = stream.getvalue()
+    assert "Detected prior interactive session" in rendered
+    assert "last_epoch=7" in rendered
+    assert "last_checkpoint=interactive-main/epoch-7-" in rendered
+
+
 def test_transcript_blocks_are_dense_with_one_separator_and_no_trailing_blank() -> None:
     transcript = Transcript()
     transcript.user("prompt")
