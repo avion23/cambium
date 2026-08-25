@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cambium.tui import _queued_prompt_notice
 from cambium.tui_screen import (
     ActivityState,
     Cockpit,
@@ -821,6 +822,30 @@ def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
     assert "↳ timeout: wall" in failures[0].text
     assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == []
     assert "plan=failed" not in "\n".join(entry.text for entry in transcript.entries)
+    rendered = "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
+    assert "ERROR" in rendered
+    assert "CAMBIUM" not in rendered
+    assert "plan=failed" not in rendered
+
+
+def test_empty_queued_prompt_has_no_dangling_system_label() -> None:
+    transcript = Transcript()
+
+    notice = _queued_prompt_notice(" \n")
+    if notice is not None:
+        transcript.system(notice)
+    assert not any("queued:" in entry.text for entry in transcript.entries)
+    assert "queued:" not in "\n".join(
+        value for _, value in _transcript_lines(transcript, 80, 20)
+    )
+
+    notice = _queued_prompt_notice("follow-up")
+    assert notice == "queued: follow-up"
+    transcript.system(notice)
+    assert "queued: follow-up" in transcript.entries[-1].text
+    assert "queued: follow-up" in "\n".join(
+        value for _, value in _transcript_lines(transcript, 80, 20)
+    )
 
 
 def test_repeated_failure_events_do_not_duplicate_the_block_or_cause() -> None:
