@@ -9,8 +9,10 @@ from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
+    _display_width,
     _side_sections,
     _transcript_lines,
+    _wrap_markdown,
     render_cockpit,
     render_primary,
 )
@@ -93,6 +95,35 @@ def test_compact_cockpit_stays_bounded() -> None:
     assert "conversation · running" in "\n".join(lines)
     assert "agents=1 active" in "\n".join(lines)
     assert lines[-1].startswith("└")
+
+
+def test_long_words_wrap_without_clipping_content_or_frame_borders() -> None:
+    long_word = "neveragainsttherunningliveservi" * 3
+    transcript = Transcript()
+    transcript.assistant(f"before {long_word} after")
+
+    wrapped = _wrap_markdown(long_word, 17)
+    assert "".join(wrapped) == long_word
+    assert all(_display_width(line) <= 17 for line in wrapped)
+
+    lines = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=48,
+        height=28,
+        activity_line="running " + "界" * 80 + "\ud800",
+    )
+    conversation = "".join(
+        value[3:]
+        for role, value in _transcript_lines(transcript, 46, 100)
+        if role == "assistant" and value.startswith("   ")
+    )
+    assert long_word in conversation
+    assert all(_display_width(line) <= 48 for line in lines)
+    assert lines[-1] == "└" + "─" * 46 + "┘"
 
 
 def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:

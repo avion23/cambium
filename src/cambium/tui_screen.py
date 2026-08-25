@@ -22,6 +22,7 @@ import signal
 import sqlite3
 import textwrap
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -195,20 +196,46 @@ def _sanitize(value: Any) -> str:
     return sanitize_terminal_text(value)
 
 
+def _char_width(char: str) -> int:
+    if unicodedata.combining(char) or unicodedata.category(char) == "Cf":
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_width(char) for char in text)
+
+
+def _take_display_width(text: str, width: int) -> tuple[str, str]:
+    """Split text at a terminal column boundary without splitting code points."""
+    if width <= 0:
+        return "", text
+    used = 0
+    for index, char in enumerate(text):
+        char_width = _char_width(char)
+        if used and used + char_width > width:
+            return text[:index], text[index:]
+        if not used and char_width > width:
+            return "", text
+        used += char_width
+    return text, ""
+
+
 def _clip(text: str, width: int) -> str:
     clean = _sanitize(text)
     if width <= 0:
         return ""
-    if len(clean) <= width:
+    if _display_width(clean) <= width:
         return clean
     if width == 1:
         return "…"
-    return clean[: width - 1] + "…"
+    head, _ = _take_display_width(clean, width - 1)
+    return head + "…"
 
 
 def _pad(text: str, width: int) -> str:
     clean = _clip(text, width)
-    return clean + " " * max(0, width - len(clean))
+    return clean + " " * max(0, width - _display_width(clean))
 
 
 def _human_count(value: int) -> str:
@@ -1106,21 +1133,45 @@ class ActivityState:
 
 def _wrap_markdown(text: str, width: int) -> list[str]:
     """Render Markdown structure as safe plain terminal lines before coloring."""
-    width = max(8, width)
+    width = max(1, width)
     output: list[str] = []
     in_fence = False
+
+    def wrap(line: str, line_width: int) -> list[str]:
+        line_width = max(1, line_width)
+        wrapped = textwrap.wrap(
+            line,
+            width=line_width,
+            replace_whitespace=False,
+            drop_whitespace=True,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or [""]
+        output_lines: list[str] = []
+        for chunk in wrapped:
+            while _display_width(chunk) > line_width:
+                head, tail = _take_display_width(chunk, line_width)
+                if not head:
+                    # The framed renderers never pass a one-column body, but
+                    # keep this helper bounded for direct callers too.
+                    head, tail = "?", chunk[1:]
+                output_lines.append(head)
+                chunk = tail
+            output_lines.append(chunk)
+        return output_lines
+
     for raw_line in _sanitize(text).splitlines() or [""]:
         stripped = raw_line.strip()
         if stripped.startswith("```"):
             in_fence = not in_fence
-            output.append(_clip(raw_line, width))
+            output.extend(wrap(raw_line, width))
             continue
         if in_fence:
-            output.append(_clip("  " + raw_line, width))
+            output.extend(wrap("  " + raw_line, width))
             continue
         if stripped.startswith("#"):
             heading = stripped.lstrip("#").strip()
-            output.extend(textwrap.wrap(heading, width=width) or [""])
+            output.extend(wrap(heading, width))
             continue
         prefix = ""
         body = raw_line
@@ -1128,20 +1179,11 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
             prefix, body = "• ", stripped[2:]
         elif stripped.startswith(">"):
             prefix, body = "│ ", stripped[1:].lstrip()
-        continuation = " " * len(prefix)
-        wrapped = textwrap.wrap(
-            body,
-            width=max(4, width - len(prefix)),
-            replace_whitespace=False,
-            drop_whitespace=True,
-            break_long_words=True,
-            break_on_hyphens=False,
-        )
-        if not wrapped:
-            output.append("")
-        else:
-            output.append(prefix + wrapped[0])
-            output.extend(continuation + line for line in wrapped[1:])
+        prefix_width = _display_width(prefix)
+        continuation = " " * prefix_width
+        wrapped = wrap(body, max(1, width - prefix_width))
+        output.append(prefix + wrapped[0])
+        output.extend(continuation + line for line in wrapped[1:])
     return output
 
 
@@ -1159,8 +1201,9 @@ def _entry_lines(
     *,
     detail_limit: int | None = None,
 ) -> list[tuple[str, str]]:
+    width = max(1, width)
     if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
-        return [("dim", " " + _clip(entry.text, max(8, width - 1)))]
+        return [("dim", _clip(" " + entry.text, width))]
     label = "· SYSTEM" if entry.role == "system" else _ROLE_LABELS[entry.role]
     body_prefix = (
         "   │ "
@@ -1169,11 +1212,12 @@ def _entry_lines(
         if entry.role == "user"
         else "   "
     )
-    body_width = max(8, width - 3)
-    rendered = [(entry.role, f" {label}")]
+    body_width = max(1, width - _display_width(body_prefix))
+    rendered = [(entry.role, _clip(f" {label}", width))]
     if entry.tool_name is not None:
         rendered.extend(
-            (entry.role, "   " + line) for line in _wrap_markdown(_tool_line(entry), body_width)
+            (entry.role, _clip("   " + line, width))
+            for line in _wrap_markdown(_tool_line(entry), max(1, width - 3))
         )
         summary = f"{entry.tool_name}: "
         detail = entry.text
@@ -1183,7 +1227,9 @@ def _entry_lines(
             detail_lines = _wrap_markdown(detail, body_width)
             if detail_limit is not None:
                 detail_lines = _bounded_render_lines(detail_lines, detail_limit)
-            rendered.extend((entry.role, body_prefix + line) for line in detail_lines)
+            rendered.extend(
+                (entry.role, _clip(body_prefix + line, width)) for line in detail_lines
+            )
     else:
         lines = _wrap_markdown(entry.text, body_width)
         if detail_limit is not None:
@@ -1194,7 +1240,7 @@ def _entry_lines(
                 if entry.role == "error" and line.lstrip().startswith(_FAILURE_CONTEXT_PREFIX)
                 else entry.role
             )
-            rendered.append((role, body_prefix + line))
+            rendered.append((role, _clip(body_prefix + line, width)))
     if entry.role != "system":
         rendered.append((entry.role, ""))
     return rendered
@@ -1207,9 +1253,9 @@ def _tool_compact_lines(
     count: int = 1,
     last_duration_ms: int | float | None = None,
 ) -> list[tuple[str, str]]:
-    body_width = max(8, width - 3)
+    width = max(1, width)
     line = _tool_line(entry, count=count, last_duration_ms=last_duration_ms)
-    return [("dim", "  " + _clip(line, max(8, body_width - 2)))]
+    return [("dim", _clip("  " + line, width))]
 
 
 def _transcript_blocks(
@@ -1268,14 +1314,18 @@ def _transcript_blocks(
 def _stream_lines(transcript: Transcript, width: int, capacity: int) -> list[tuple[str, str]]:
     if not transcript.streaming_text or transcript.streaming_role is None:
         return []
-    body_width = max(8, width - 3)
+    width = max(1, width)
+    body_width = max(1, width - 3)
     text = transcript.streaming_text
     if len(text) > _STREAM_RENDER_LIMIT:
         text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
     label = _ROLE_LABELS[transcript.streaming_role]
-    rendered = [(transcript.streaming_role, f" {label} · generating")]
+    rendered = [
+        (transcript.streaming_role, _clip(f" {label} · generating", width))
+    ]
     rendered.extend(
-        (transcript.streaming_role, "   " + line) for line in _wrap_markdown(text, body_width)
+        (transcript.streaming_role, _clip("   " + line, width))
+        for line in _wrap_markdown(text, body_width)
     )
     return rendered[-max(1, capacity) :]
 
@@ -1298,7 +1348,7 @@ def _transcript_lines(transcript: Transcript, width: int, capacity: int) -> list
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
-        rendered = [("system", " Waiting for a prompt. Type /help for commands.")]
+        rendered = [("system", _clip(" Waiting for a prompt. Type /help for commands.", width))]
     return rendered[-capacity:]
 
 
@@ -1754,12 +1804,11 @@ def _style_kind(kind: str) -> str:
 def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
     """Return safe, labelled transcript rows for the append-only view."""
     width = max(8, width)
-    body_width = max(8, width - 9)
     # The transcript itself is bounded, but a large Markdown entry may occupy
     # many wrapped rows.  Leave enough capacity to render the complete local
     # view so the Cockpit can append only the suffix it has not emitted yet.
     capacity = max(64, len(transcript.entries) * 16 + 64)
-    rows = _transcript_lines(transcript, body_width, capacity)
+    rows = _transcript_lines(transcript, width, capacity)
     rendered: list[tuple[str, str]] = []
     for role, text in rows:
         rendered.append((role, _clip(_sanitize(text), width)))
@@ -1918,7 +1967,7 @@ _FRAME_OVERHEAD = 2 + _BOTTOM_RESERVED_ROWS
 
 def _status_row(parts: list[str], width: int) -> str:
     text = " · ".join(part for part in parts if part)
-    return _clip(f" {text}", max(8, width))
+    return _clip(f" {text}", max(1, width))
 
 
 def _status_rows(
@@ -1932,7 +1981,7 @@ def _status_rows(
     activity_line: str = "",
 ) -> list[str]:
     """Render the fixed, four-row status pane without repeating source rows."""
-    width = max(8, width)
+    width = max(1, width)
     fields = _status_fields(
         snapshot,
         session_description=session_description,
@@ -2010,7 +2059,7 @@ def _status_rows(
 
 def _frame_inside(text: str, width: int) -> str:
     inner = max(1, width - 2)
-    return "│" + _pad(text, inner) + "│"
+    return "│" + _pad(sanitize_terminal_text(text, single_line=True), inner) + "│"
 
 
 def _cockpit_frame_lines(
