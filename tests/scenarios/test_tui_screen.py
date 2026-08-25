@@ -216,6 +216,63 @@ def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     assert "deferred output" in stream.getvalue()
 
 
+def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
+    class _Tty(io.StringIO):
+        flush_count = 0
+
+        def isatty(self) -> bool:
+            return True
+
+        def flush(self) -> None:
+            self.flush_count += 1
+            super().flush()
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    final_snapshot = _snapshot()
+    final_snapshot.session_status = "done"
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {"kind": "assistant_delta", "payload": {"delta": "partial"}}
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        before = stream.getvalue()
+        flushes_before_completion = stream.flush_count
+
+        transcript.finish_stream("completed response")
+        cockpit.draw(
+            final_snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1 tokens=20000",
+            force=True,
+        )
+
+        after = stream.getvalue()
+        assert "completed response" in after
+        assert after.count("┌ Cambium · conversation") == 2
+        assert "conversation · done" in after
+        assert "tokens=20k" in after
+        assert after != before
+        assert stream.flush_count > flushes_before_completion
+
+
 def test_cockpit_updates_fixed_status_pane_in_place() -> None:
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
