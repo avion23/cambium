@@ -1527,6 +1527,7 @@ def _render_markdown_lines_fallback(
 def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]:
     """Render sanitized Markdown through Rich and return terminal lines."""
     from rich.box import ROUNDED
+    from rich.color import ColorSystem
     from rich.console import Console
     from rich.markdown import BlockQuote, CodeBlock, Heading, Markdown
     from rich.padding import Padding
@@ -1607,6 +1608,7 @@ def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]
         theme=theme,
         width=width,
     )
+    ansi_color_system = ColorSystem.STANDARD if color else None
     rendered: list[str] = []
     for line in console.render_lines(PaneMarkdown(text, hyperlinks=False), pad=False):
         parts: list[str] = []
@@ -1614,11 +1616,11 @@ def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]
             if segment.control:
                 continue
             if color and segment.style:
-                parts.append(segment.style.render(segment.text, color_system=console.color_system))
+                parts.append(segment.style.render(segment.text, color_system=ansi_color_system))
             else:
                 parts.append(segment.text)
         rendered.append("".join(parts))
-    while rendered and not _visible(rendered[-1]):
+    while rendered and not _visible(rendered[-1]).strip():
         rendered.pop()
     return rendered
 
