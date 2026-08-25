@@ -66,12 +66,13 @@ def test_wide_cockpit_has_transcript_agents_context_and_input() -> None:
     assert len(lines) == 32
     assert "YOU" in text
     assert "CAMBIUM" in text
-    assert "AGENTS" in text
-    assert "CONTEXT" in text
-    assert "SESSION USAGE" in text
-    assert "codex/gpt-5.6" in text
-    assert "segments 3" in text
-    assert "│ › " in text
+    assert "↳ Inspect the provider router" in text
+    assert "provider=codex · model=gpt-5.6" in text
+    assert "agents=1 active" in text
+    assert "cost=" in text
+    assert "checkpoint=" in text
+    assert "│ input › " in text
+    assert text.count("├") == 1
     assert lines[-1].startswith("└")
 
 
@@ -89,8 +90,33 @@ def test_compact_cockpit_stays_bounded() -> None:
     )
     assert len(lines) == 22
     assert all(len(line) == 72 for line in lines)
+    assert "conversation · running" in "\n".join(lines)
     assert "agents=1 active" in "\n".join(lines)
     assert lines[-1].startswith("└")
+
+
+def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:
+    snapshot = _snapshot()
+    checkpoint = "task/epoch-001-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb.json"
+    lines = render_primary(
+        snapshot,
+        Transcript(),
+        session_description=(
+            "session=/tmp/run turn=2 branch=1 provider=codex model=gpt-5.6 "
+            f"epoch=4 checkpoint={checkpoint}"
+        ),
+        branch_line="branch: generation=3 turn=2 provider=codex model=gpt-5.6 epoch=4",
+        cumulative_line="usage: calls=3 tokens=12345 out/s=47.5",
+        width=120,
+    )
+    identity, usage, agents, context = lines[-4:]
+
+    assert all(len(line) <= 120 for line in lines[-4:])
+    assert identity.count("provider=codex · model=gpt-5.6") == 1
+    assert "checkpoint=aaaaaaaa" in context
+    assert "aaaaaaaaaaaaaaaa" not in context
+    assert "tokens=" in usage
+    assert "agents=" in agents
 
 
 def test_primary_renderer_ends_with_compact_status_row() -> None:
@@ -109,8 +135,8 @@ def test_primary_renderer_ends_with_compact_status_row() -> None:
 
     assert "YOU" in "\n".join(lines)
     assert "CAMBIUM" in "\n".join(lines)
-    assert lines[-1].startswith("┌ Cambium · status=running")
-    assert "provider=codex model=gpt-5.6" in lines[-1]
+    assert lines[-4].startswith(" provider=codex · model=gpt-5.6")
+    assert "tokens=" in lines[-3]
 
 
 def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
@@ -188,6 +214,49 @@ def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
         cockpit.flush()
 
     assert "deferred output" in stream.getvalue()
+
+
+def test_cockpit_updates_fixed_status_pane_in_place() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    cockpit = Cockpit(stream)
+    transcript = Transcript()
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        cockpit.draw_activity("⠋ running run_shell")
+
+    delta = stream.getvalue()[len(first) :]
+    assert "\x1b[s" in delta
+    assert "\x1b[5A" in delta
+    assert "running run_shell" in delta
+    assert "┌ Cambium · conversation" not in delta
+
+
+def test_short_terminal_falls_back_to_stream_rows() -> None:
+    lines = render_cockpit(
+        _snapshot(),
+        Transcript(),
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=80,
+        height=11,
+    )
+
+    assert lines
+    assert not any(line.startswith("┌") for line in lines)
+    assert not any("─" in line for line in lines)
+    assert any("provider=codex" in line for line in lines)
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:
@@ -374,7 +443,7 @@ def test_expanded_tool_output_is_bounded_without_truncating_entry_state() -> Non
     assert "output-99" in transcript.entries[0].text
 
 
-def test_failed_tool_detail_is_expanded_automatically() -> None:
+def test_failed_tool_event_is_one_compact_notice() -> None:
     transcript = Transcript()
     transcript.observe_event(
         {
@@ -390,9 +459,9 @@ def test_failed_tool_detail_is_expanded_automatically() -> None:
     )
 
     text = "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
-    assert "permission denied" in text
-    assert "stderr: access blocked" in text
-    assert "cat protected.txt" in text
+    assert text == " tool errors: 1 (last: run_shell …)"
+    assert "permission denied" not in text
+    assert "cat protected.txt" not in text
 
 
 def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
@@ -420,12 +489,28 @@ def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
     )
     text = "\n".join(lines)
 
-    # Failed tool events are owned by the consolidated failure block, not the
-    # transcript: successes render as compact lines, the failure does not
-    # duplicate as a transcript entry.
-    assert "✓ run_shell ×2 · last 2395ms" in text
+    assert "✓ run_shell 141ms" in text
+    assert "tool errors: 1 (last: run_shell …)" in text
+    assert "✓ run_shell 2395ms" in text
     assert "✗ run_shell 9273ms" not in text
-    assert len(transcript.entries) == 2
+    assert len(transcript.entries) == 3
+
+
+def test_consecutive_failed_tool_events_collapse_to_one_notice() -> None:
+    transcript = Transcript()
+    for _ in range(5):
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {"tool": "run_shell", "ok": False},
+            }
+        )
+
+    rows = _transcript_lines(transcript, 80, 20)
+    text = "\n".join(value for _, value in rows)
+    assert text == " tool errors: 5 (last: run_shell …)"
+    assert len(transcript.entries) == 1
+    assert transcript.tool_error_count == 5
 
 
 def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:

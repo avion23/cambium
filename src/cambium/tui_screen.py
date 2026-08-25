@@ -138,6 +138,7 @@ _FAILURE_EVENT_KINDS = frozenset(
     }
 )
 _FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
+_TOOL_ERROR_PREFIX = "tool errors:"
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _TOOL_START_KINDS = frozenset(
@@ -233,7 +234,8 @@ def _color_enabled(stream: Any) -> bool:
 
 
 def _paint(text: str, color: str, enabled: bool) -> str:
-    return f"{color}{text}{_RESET}" if enabled else text
+    clean = _sanitize(text)
+    return f"{color}{clean}{_RESET}" if enabled else clean
 
 
 def _event_data(record: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -567,8 +569,9 @@ class Transcript:
         self._failure_context: dict[tuple[str, int | None, int], list[str]] = {}
         self._failure_blocks: dict[tuple[str, int | None, int], _FailureBlock] = {}
         self._failure_order: deque[tuple[str, int | None, int]] = deque()
-        self._failure_previews: dict[tuple[str, int | None, int], _FailureBlock] = {}
-        self._failure_preview_order: deque[tuple[str, int | None, int]] = deque()
+        self._tool_failure_key: tuple[str, int | None, int] | None = None
+        self._tool_failure_count = 0
+        self._tool_failure_entry: TranscriptEntry | None = None
         self._tool_details_expanded = False
 
     @property
@@ -583,8 +586,9 @@ class Transcript:
         self._failure_context.clear()
         self._failure_blocks.clear()
         self._failure_order.clear()
-        self._failure_previews.clear()
-        self._failure_preview_order.clear()
+        self._tool_failure_key = None
+        self._tool_failure_count = 0
+        self._tool_failure_entry = None
 
     @property
     def tool_details_expanded(self) -> bool:
@@ -606,8 +610,9 @@ class Transcript:
     def user(self, text: str) -> None:
         self._turn_serial += 1
         self._turn_by_task.clear()
-        self._failure_previews.clear()
-        self._failure_preview_order.clear()
+        self._tool_failure_key = None
+        self._tool_failure_count = 0
+        self._tool_failure_entry = None
         self.add("user", text)
 
     def assistant(self, text: str) -> None:
@@ -627,6 +632,16 @@ class Transcript:
     @property
     def streaming_role(self) -> str | None:
         return self._stream_role
+
+    @property
+    def tool_error_count(self) -> int:
+        """Return collapsed routine tool failures retained in the transcript."""
+        total = 0
+        for entry in self._entries:
+            match = re.match(rf"{re.escape(_TOOL_ERROR_PREFIX)}\s+(\d+)", entry.text)
+            if match is not None:
+                total += int(match.group(1))
+        return total
 
     def _clear_stream(self) -> None:
         self._stream_role = None
@@ -722,8 +737,6 @@ class Transcript:
     ) -> tuple[tuple[str, int | None, int], _FailureBlock] | None:
         key = self._context_key(task_id, turn)
         block = self._failure_blocks.get(key)
-        if block is None:
-            block = self._failure_previews.get(key)
         if block is not None:
             return key, block
         wanted = task_id or "?"
@@ -735,49 +748,7 @@ class Transcript:
                 and candidate.task_id == wanted
             ):
                 return candidate_key, candidate
-        for candidate_key in reversed(self._failure_preview_order):
-            candidate = self._failure_previews.get(candidate_key)
-            if (
-                candidate is not None
-                and candidate_key[2] == self._turn_serial
-                and candidate.task_id == wanted
-            ):
-                return candidate_key, candidate
         return None
-
-    def _remember_failure_preview(
-        self,
-        task_id: str | None,
-        turn: int | None,
-        cause: str | None,
-    ) -> None:
-        """Retain a failed tool detail until its terminal failure is known."""
-        key = self._context_key(task_id, turn)
-        if key in self._failure_blocks:
-            return
-        block = self._failure_previews.get(key)
-        if block is None:
-            block = _FailureBlock(
-                task_id=key[0],
-                turn=key[1],
-                cause=cause,
-                context=list(self._failure_context.get(key, ())),
-            )
-            self._failure_previews[key] = block
-            self._failure_preview_order.append(key)
-            while len(self._failure_preview_order) > _FAILURE_BLOCK_LIMIT:
-                expired = self._failure_preview_order.popleft()
-                self._failure_previews.pop(expired, None)
-        elif self._prefer_failure_cause(block.cause, cause):
-            block.cause = cause
-        block.context = list(self._failure_context.get(key, block.context))
-
-    def _failure_preview_entries(self) -> tuple[TranscriptEntry, ...]:
-        return tuple(
-            TranscriptEntry(role="error", text=self._failure_text(block))
-            for key in self._failure_preview_order
-            if (block := self._failure_previews.get(key)) is not None
-        )
 
     @staticmethod
     def _selected_failure_context(context: list[str]) -> list[str]:
@@ -798,6 +769,41 @@ class Transcript:
             for line in self._selected_failure_context(block.context)
         )
         return "\n".join(lines)
+
+    def _remember_tool_failure(
+        self,
+        task_id: str | None,
+        turn: int | None,
+        tool: Any,
+    ) -> None:
+        key = self._context_key(task_id, turn)
+        if self._tool_failure_key != key or self._tool_failure_entry not in self._entries:
+            self._tool_failure_key = key
+            self._tool_failure_count = 0
+            self._tool_failure_entry = TranscriptEntry(role="tool", text="")
+            self._entries.append(self._tool_failure_entry)
+
+        self._tool_failure_count += 1
+        name = _sanitize(tool).strip() if isinstance(tool, str) else "tool"
+        previous_entry = self._tool_failure_entry
+        self._tool_failure_entry = TranscriptEntry(
+            role="tool",
+            text=f"{_TOOL_ERROR_PREFIX} {self._tool_failure_count} (last: {name} …)",
+        )
+        for index, current in enumerate(self._entries):
+            if current is previous_entry:
+                self._entries[index] = self._tool_failure_entry
+                return
+
+    def _clear_tool_failure_notice(self, task_id: str | None, turn: int | None) -> None:
+        if self._tool_failure_entry is None:
+            return
+        key = self._context_key(task_id, turn)
+        if self._tool_failure_key != key and task_id is not None:
+            return
+        self._tool_failure_key = None
+        self._tool_failure_count = 0
+        self._tool_failure_entry = None
 
     @staticmethod
     def _prefer_failure_cause(current: str | None, candidate: str | None) -> bool:
@@ -824,6 +830,7 @@ class Transcript:
         turn: int | None,
         cause: str | None,
     ) -> None:
+        self._clear_tool_failure_notice(task_id, turn)
         found = self._failure_block_for(task_id, turn)
         if found is None:
             key = self._context_key(task_id, turn)
@@ -841,18 +848,6 @@ class Transcript:
                 self._failure_context.pop(expired, None)
         else:
             key, block = found
-            if key in self._failure_previews:
-                self._failure_previews.pop(key, None)
-                try:
-                    self._failure_preview_order.remove(key)
-                except ValueError:
-                    pass
-                self._failure_blocks[key] = block
-                self._failure_order.append(key)
-                while len(self._failure_order) > _FAILURE_BLOCK_LIMIT:
-                    expired = self._failure_order.popleft()
-                    self._failure_blocks.pop(expired, None)
-                    self._failure_context.pop(expired, None)
             if self._prefer_failure_cause(block.cause, cause):
                 block.cause = cause
             block.context = list(self._failure_context.get(key, block.context))
@@ -898,13 +893,11 @@ class Transcript:
                 context_line = _failure_context_line(kind, data)
                 if context_line is not None:
                     self._remember_failure_context(task_id, turn, context_line)
-                if any(_tool_detail_value(data.get(key)) for key in _TOOL_DETAIL_KEYS):
-                    self._remember_failure_preview(
-                        task_id,
-                        turn,
-                        _failure_cause(kind, data),
-                    )
+                self._remember_tool_failure(task_id, turn, tool)
                 return
+            self._tool_failure_key = None
+            self._tool_failure_count = 0
+            self._tool_failure_entry = None
             if isinstance(tool, str):
                 text = _sanitize(_tool_entry_text(data, tool, ok, duration)).strip("\n")
                 if text:
@@ -1097,6 +1090,7 @@ class ActivityState:
         )
         if tool is not None:
             tool_name, tool_started_at = tool
+            tool_name = _sanitize(tool_name)
             tool_elapsed = max(0.0, current - tool_started_at)
             label = f"running {tool_name} {tool_elapsed:.1f}s · turn {turn_elapsed:.1f}s"
         elif self._responding:
@@ -1165,7 +1159,16 @@ def _entry_lines(
     *,
     detail_limit: int | None = None,
 ) -> list[tuple[str, str]]:
-    label = _ROLE_LABELS[entry.role]
+    if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
+        return [("dim", " " + _clip(entry.text, max(8, width - 1)))]
+    label = "· SYSTEM" if entry.role == "system" else _ROLE_LABELS[entry.role]
+    body_prefix = (
+        "   │ "
+        if entry.role == "system"
+        else "   ↳ "
+        if entry.role == "user"
+        else "   "
+    )
     body_width = max(8, width - 3)
     rendered = [(entry.role, f" {label}")]
     if entry.tool_name is not None:
@@ -1180,7 +1183,7 @@ def _entry_lines(
             detail_lines = _wrap_markdown(detail, body_width)
             if detail_limit is not None:
                 detail_lines = _bounded_render_lines(detail_lines, detail_limit)
-            rendered.extend((entry.role, "   " + line) for line in detail_lines)
+            rendered.extend((entry.role, body_prefix + line) for line in detail_lines)
     else:
         lines = _wrap_markdown(entry.text, body_width)
         if detail_limit is not None:
@@ -1191,8 +1194,9 @@ def _entry_lines(
                 if entry.role == "error" and line.lstrip().startswith(_FAILURE_CONTEXT_PREFIX)
                 else entry.role
             )
-            rendered.append((role, "   " + line))
-    rendered.append((entry.role, ""))
+            rendered.append((role, body_prefix + line))
+    if entry.role != "system":
+        rendered.append((entry.role, ""))
     return rendered
 
 
@@ -1205,7 +1209,7 @@ def _tool_compact_lines(
 ) -> list[tuple[str, str]]:
     body_width = max(8, width - 3)
     line = _tool_line(entry, count=count, last_duration_ms=last_duration_ms)
-    return [(entry.role, " " + _clip(line, body_width))]
+    return [("dim", "  " + _clip(line, max(8, body_width - 2)))]
 
 
 def _transcript_blocks(
@@ -1291,15 +1295,6 @@ def _transcript_lines(transcript: Transcript, width: int, capacity: int) -> list
             )
             for line in block
         ]
-        history.extend(
-            line
-            for entry in transcript._failure_preview_entries()
-            for line in _entry_lines(
-                entry,
-                width,
-                detail_limit=_TOOL_DETAIL_RENDER_LIMIT,
-            )
-        )
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
@@ -1758,8 +1753,8 @@ def _style_kind(kind: str) -> str:
 
 def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
     """Return safe, labelled transcript rows for the append-only view."""
-    width = max(64, width)
-    body_width = max(20, width - 9)
+    width = max(8, width)
+    body_width = max(8, width - 9)
     # The transcript itself is bounded, but a large Markdown entry may occupy
     # many wrapped rows.  Leave enough capacity to render the complete local
     # view so the Cockpit can append only the suffix it has not emitted yet.
@@ -1771,6 +1766,109 @@ def _primary_rows(transcript: Transcript, width: int) -> list[tuple[str, str]]:
     return rendered
 
 
+_STATUS_KEYS = frozenset(
+    {
+        "session",
+        "turn",
+        "branch",
+        "generation",
+        "provider",
+        "model",
+        "epoch",
+        "checkpoint",
+        "calls",
+        "tokens",
+        "out/s",
+        "cost",
+        "in",
+        "out",
+        "cached",
+    }
+)
+
+
+def _status_fields(
+    snapshot: Any,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+) -> dict[str, str]:
+    """Collect status facts once instead of rendering three verbose source rows."""
+    fields: dict[str, str] = {}
+    for source in (session_description, branch_line, cumulative_line):
+        clean = _sanitize(source).replace("\n", " ")
+        for match in re.finditer(r"(?<![\w/])([\w/]+)=([^\s·]+)", clean):
+            key, value = match.groups()
+            if key in _STATUS_KEYS:
+                fields.setdefault(key, value)
+
+    agents = tuple(getattr(snapshot, "agents", ()))
+    main = next((agent for agent in agents if getattr(agent, "role", "") == "main"), None)
+    provider = getattr(main, "provider", None) if main is not None else None
+    model = getattr(main, "model", None) if main is not None else None
+    if isinstance(provider, str) and provider:
+        fields["provider"] = _sanitize(provider)
+    if isinstance(model, str) and model:
+        fields["model"] = _sanitize(model)
+
+    context = getattr(snapshot, "context", None)
+    if context is not None:
+        fields["epoch"] = str(getattr(context, "epoch", 0))
+        checkpoint = getattr(context, "checkpoint_ref", None)
+        if isinstance(checkpoint, str) and checkpoint:
+            fields.setdefault("checkpoint", _sanitize(checkpoint))
+    fields.setdefault("tokens", _human_count(_usage_int(getattr(snapshot, "total_tokens", 0))))
+    rate = _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0))
+    fields.setdefault("out/s", f"{rate:.1f}")
+    return fields
+
+
+def _compact_checkpoint(value: str) -> str:
+    """Show a checkpoint filename and keep each content hash to eight chars."""
+    clean = _side_clean(value).strip().rstrip("/")
+    if not clean or clean == "none":
+        return "none"
+    filename = clean.rsplit("/", 1)[-1]
+    hashes = re.findall(r"(?i)(?<![a-z0-9])[0-9a-f]{9,}(?![a-z0-9])", filename)
+    return hashes[0][:8] if hashes else filename
+
+
+def _status_parts(fields: Mapping[str, str], previous: Mapping[str, str] | None) -> list[str]:
+    status = fields.get("status", "idle")
+    parts = ["┌ Cambium", f"status={status}"]
+    provider = fields.get("provider")
+    model = fields.get("model")
+    if provider or model:
+        parts.append(f"provider={provider or '?'} model={model or '?'}")
+    if session := fields.get("session"):
+        parts.append(f"session={_clip(session, 28)}")
+    if turn := fields.get("turn"):
+        parts.append(f"t={turn}")
+
+    def changed(key: str) -> bool:
+        return previous is None or fields.get(key) != previous.get(key)
+    if fields.get("branch") and changed("branch"):
+        parts.append(f"b={fields['branch']}")
+    if fields.get("generation") and changed("generation"):
+        parts.append(f"g={fields['generation']}")
+    if fields.get("epoch") and changed("epoch"):
+        parts.append(f"e={fields['epoch']}")
+    if checkpoint := fields.get("checkpoint"):
+        parts.append(f"ckpt={_compact_checkpoint(checkpoint)}")
+
+    usage = []
+    if calls := fields.get("calls"):
+        usage.append(f"calls={calls}")
+    if tokens := fields.get("tokens"):
+        usage.append(f"{tokens} tok")
+    if rate := fields.get("out/s"):
+        usage.append(f"{rate}/s")
+    if usage:
+        parts.append(" ".join(usage))
+    return parts
+
+
 def _primary_status_line(
     snapshot: Any,
     *,
@@ -1778,34 +1876,189 @@ def _primary_status_line(
     branch_line: str,
     cumulative_line: str,
     width: int,
+    previous: Mapping[str, str] | None = None,
 ) -> str:
     """Build the compact status row appended after each changed draw."""
-    status = _sanitize(getattr(snapshot, "session_status", "idle"))
-    agents = getattr(snapshot, "active_agents", 0)
-    tokens = _human_count(getattr(snapshot, "total_tokens", 0))
-    rate = getattr(snapshot, "output_tokens_per_s", 0.0)
-    epoch = getattr(getattr(snapshot, "context", None), "epoch", 0)
-    branch = _sanitize(branch_line)
-    provider_model = ""
-    match = re.search(r"(provider=\S+\s+model=\S+)", branch)
-    if match is not None:
-        provider_model = match.group(1)
-    checkpoint = ""
-    checkpoint_match = re.search(r"(?:last_checkpoint|checkpoint)=(\S+)", session_description)
-    if checkpoint_match is not None:
-        checkpoint = f"last_checkpoint={_clip(checkpoint_match.group(1), 40)}"
-    priority = " · ".join(part for part in (f"status={status}", checkpoint, provider_model) if part)
-    details = (
-        f"{priority} · agents={agents} · tokens={tokens} · out/s={rate:.1f}"
-        f" · epoch={epoch} · {_sanitize(cumulative_line)}"
-        f" · {branch if not provider_model else branch.replace(provider_model, '').strip(' ·')}"
-        f" · {_sanitize(session_description)}"
+    fields = _status_fields(
+        snapshot,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
     )
-    line = f"┌ Cambium · {details}"
-    # A checkpoint reference is content-addressed and can be much longer than
-    # a terminal row.  Keep it intact in native scrollback instead of clipping
-    # the durable identity; the terminal will wrap this one logical status row.
-    return line if checkpoint else _clip(line, max(64, width))
+    fields["status"] = _sanitize(getattr(snapshot, "session_status", "idle"))
+    parts = _status_parts(fields, previous)
+    line = " · ".join(parts)
+    width = max(8, width)
+    if len(line) <= width:
+        return line
+
+    # Usage is useful, but never earns a wrapped status row.  Keep the
+    # identity fields first and retry without the trailing usage group.
+    if len(parts) > 2:
+        compact = " · ".join(parts[:-1])
+        if len(compact) <= width:
+            return compact
+        line = compact
+
+    # Session roots and checkpoint names are the unbounded inputs.  Shorten
+    # those fields before applying the final width guard and ellipsis.
+    for index, part in enumerate(parts):
+        if part.startswith("session="):
+            parts[index] = f"session={_clip(part[8:], 20)}"
+        elif part.startswith("ckpt="):
+            parts[index] = f"ckpt={_clip(part[5:], 16)}"
+    return _clip(" · ".join(parts), width)
+
+
+_FIXED_MIN_HEIGHT = 12
+_STATUS_ROW_COUNT = 4
+_BOTTOM_RESERVED_ROWS = 1 + _STATUS_ROW_COUNT + 1
+_FRAME_OVERHEAD = 2 + _BOTTOM_RESERVED_ROWS
+
+
+def _status_row(parts: list[str], width: int) -> str:
+    text = " · ".join(part for part in parts if part)
+    return _clip(f" {text}", max(8, width))
+
+
+def _status_rows(
+    snapshot: Any,
+    transcript: Transcript,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+    width: int,
+    activity_line: str = "",
+) -> list[str]:
+    """Render the fixed, four-row status pane without repeating source rows."""
+    width = max(8, width)
+    fields = _status_fields(
+        snapshot,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+    )
+    provider = fields.get("provider", "?")
+    model = fields.get("model", "?")
+    turn = fields.get("turn", "?")
+    branch = fields.get("branch", "?")
+    generation = fields.get("generation", "?")
+    epoch = fields.get("epoch", "?")
+
+    identity = [
+        f"provider={provider}",
+        f"model={model}",
+        f"turn={turn}",
+        f"branch={branch}",
+        f"generation={generation}",
+        f"epoch={epoch}",
+    ]
+    if len(" · ".join(identity)) > width:
+        identity = [
+            f"provider={provider} model={model}",
+            f"t={turn}",
+            f"b={branch}/g={generation}",
+            f"e={epoch}",
+        ]
+
+    total_tokens = _human_count(
+        _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
+    )
+    usage = [f"tokens={total_tokens}"]
+    for key in ("in", "out", "cached"):
+        value = fields.get(key)
+        if value is not None:
+            usage.append(f"{key}={_human_count(_usage_int(value))}")
+    rate = fields.get("out/s")
+    if rate:
+        usage.append(f"out/s={rate}")
+    cost = fields.get("cost") or _format_cost(getattr(snapshot, "estimated_cost_usd", 0.0))
+    usage.append(f"cost={_sanitize(cost)}")
+    if len(" · ".join(usage)) > width:
+        usage = [usage[0], *(part for part in usage if part.startswith("out/s=")), usage[-1]]
+
+    agents = tuple(getattr(snapshot, "agents", ()))
+    agent_states = [
+        f"{_clip(_side_clean(getattr(agent, 'task_id', '?')), 16)}:"
+        f"{_side_clean(getattr(agent, 'state', '?'))}"
+        for agent in agents[-4:]
+    ]
+    active = getattr(snapshot, "active_agents", 0)
+    agent_row = [f"agents={active} active"]
+    if agent_states:
+        agent_row.append(" ".join(agent_states))
+    if activity_line:
+        agent_row.append(_side_clean(activity_line))
+
+    checkpoint = fields.get("checkpoint")
+    context_row = []
+    if session := fields.get("session"):
+        context_row.append(f"session={_clip(session, 24)}")
+    if checkpoint:
+        context_row.append(f"checkpoint={_compact_checkpoint(checkpoint)}")
+    tool_errors = transcript.tool_error_count
+    context_row.insert(0, f"tool errors={tool_errors}")
+
+    return [
+        _status_row(identity, width),
+        _status_row(usage, width),
+        _status_row(agent_row, width),
+        _status_row(context_row, width),
+    ]
+
+
+def _frame_inside(text: str, width: int) -> str:
+    inner = max(1, width - 2)
+    return "│" + _pad(text, inner) + "│"
+
+
+def _cockpit_frame_lines(
+    snapshot: Any,
+    transcript: Transcript,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+    width: int,
+    height: int,
+    color: bool,
+    input_label: str,
+    activity_line: str,
+) -> list[str]:
+    width = max(8, width)
+    height = max(_FIXED_MIN_HEIGHT, height)
+    inner = max(1, width - 2)
+    conversation_capacity = max(1, height - _FRAME_OVERHEAD)
+    status = _sanitize(getattr(snapshot, "session_status", "idle"))
+    lines = [_paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)]
+    conversation = _transcript_lines(transcript, inner, conversation_capacity)
+    for role, text in conversation[:conversation_capacity]:
+        lines.append(
+            _paint(
+                _frame_inside(text, width),
+                _ROLE_COLORS.get(role, ""),
+                color,
+            )
+        )
+    while len(lines) < 1 + conversation_capacity:
+        lines.append(_frame_inside("", width))
+
+    lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
+    for text in _status_rows(
+        snapshot,
+        transcript,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+        width=inner,
+        activity_line=activity_line,
+    ):
+        lines.append(_paint(_frame_inside(text, width), _DIM_CYAN, color))
+    label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, inner - 8))
+    lines.append(_paint(_frame_inside(f" input {label} ", width), _BLUE, color))
+    lines.append(_paint("└" + "─" * inner + "┘", _CYAN, color))
+    return lines[:height]
 
 
 def render_primary(
@@ -1818,25 +2071,20 @@ def render_primary(
     width: int,
     color: bool = False,
 ) -> list[str]:
-    """Render an append-only transcript followed by one compact status row."""
-    width = max(64, width)
+    """Render conversation rows followed by the deterministic status pane."""
+    width = max(8, width)
     lines = [
         _paint(text, _ROLE_COLORS.get(role, ""), color)
         for role, text in _primary_rows(transcript, width)
     ]
-    lines.append(
-        _paint(
-            _primary_status_line(
-                snapshot,
-                session_description=session_description,
-                branch_line=branch_line,
-                cumulative_line=cumulative_line,
-                width=width,
-            ),
-            _DIM_CYAN,
-            color,
-        )
-    )
+    lines.extend(_paint(text, _DIM_CYAN, color) for text in _status_rows(
+        snapshot,
+        transcript,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+        width=width,
+    ))
     return lines
 
 
@@ -1858,83 +2106,30 @@ def render_cockpit(
     input_label: str = "›",
     activity_line: str = "",
 ) -> list[str]:
-    """Render one deterministic full-screen frame without cursor controls."""
-    width = max(64, width)
-    height = max(20, height)
-    inner = width - 2
-    lines: list[str] = []
-
-    status = str(getattr(snapshot, "session_status", "idle"))
-    title = f" Cambium · {status} "
-    lines.append(_paint("┌" + _pad(title, inner) + "┐", _CYAN, color))
-    meta = _clip(f" {_sanitize(session_description)}", inner)
-    lines.append("│" + _pad(meta, inner) + "│")
-    branch = _clip(" " + _sanitize(branch_line), inner)
-    lines.append("│" + _pad(branch, inner) + "│")
-    lines.append(_activity_row(activity_line, inner, color))
-
-    body_height = height - 9
-    wide = width >= 104
-    if wide:
-        side_width = min(44, max(34, width // 3))
-        transcript_width = inner - side_width - 1
-        lines.append(
-            _paint(
-                "├" + "─" * transcript_width + "┬" + "─" * side_width + "┤",
-                _DIM_CYAN,
-                color,
-            )
+    """Render one deterministic conversation/status frame without controls."""
+    width = max(8, width)
+    if height < _FIXED_MIN_HEIGHT:
+        return render_primary(
+            snapshot,
+            transcript,
+            session_description=session_description,
+            branch_line=branch_line,
+            cumulative_line=cumulative_line,
+            width=width,
+            color=color,
         )
-        transcript_rows = _transcript_lines(transcript, transcript_width, body_height)
-        side_rows = _side_sections(snapshot, cumulative_line, side_width, body_height)
-        for index in range(body_height):
-            if index < len(transcript_rows):
-                role, left = transcript_rows[index]
-                left_plain = _pad(left, transcript_width)
-                left_text = _paint(left_plain, _ROLE_COLORS.get(role, ""), color)
-            else:
-                left_text = " " * transcript_width
-            if index < len(side_rows):
-                kind, right = side_rows[index]
-                right_plain = _pad(right, side_width)
-                right_text = _paint(right_plain, _style_kind(kind), color)
-            else:
-                right_text = " " * side_width
-            lines.append("│" + left_text + "│" + right_text + "│")
-        lines.append(
-            _paint(
-                "├" + "─" * transcript_width + "┴" + "─" * side_width + "┤",
-                _DIM_CYAN,
-                color,
-            )
-        )
-    else:
-        summary = (
-            f" agents={getattr(snapshot, 'active_agents', 0)} active "
-            f"tokens={_human_count(getattr(snapshot, 'total_tokens', 0))} "
-            f"out/s={getattr(snapshot, 'output_tokens_per_s', 0.0):.1f} "
-            f"epoch={getattr(getattr(snapshot, 'context', None), 'epoch', 0)} "
-            f"segments={getattr(getattr(snapshot, 'context', None), 'summary_segments', 0)}"
-        )
-        lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
-        lines.append("│" + _pad(summary, inner) + "│")
-        transcript_capacity = max(1, body_height - 1)
-        for role, text in _transcript_lines(transcript, inner, transcript_capacity):
-            plain = _pad(text, inner)
-            lines.append("│" + _paint(plain, _ROLE_COLORS.get(role, ""), color) + "│")
-        while len(lines) < height - 4:
-            lines.append("│" + " " * inner + "│")
-        lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
-
-    help_line = (
-        " /help commands · v expand tools · <<< multiline >>> · "
-        "Ctrl-C cancel frontend · /exit close"
+    return _cockpit_frame_lines(
+        snapshot,
+        transcript,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+        width=width,
+        height=height,
+        color=color,
+        input_label=input_label,
+        activity_line=activity_line,
     )
-    lines.append("│" + _pad(help_line, inner) + "│")
-    input_line = f" {input_label} "
-    lines.append("│" + _pad(input_line, inner) + "│")
-    lines.append(_paint("└" + "─" * inner + "┘", _CYAN, color))
-    return lines[:height]
 
 
 class Cockpit:
@@ -1956,9 +2151,15 @@ class Cockpit:
         self._previous_sigterm_handler: Any = None
         self._last_size = os.terminal_size((120, 40))
         self._input_active = False
-        self._pending_draw: tuple[Any, Transcript, str, str, str] | None = None
+        self._pending_draw: tuple[Any, Transcript, str, str, str, str, str] | None = None
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
         self._last_status_line = ""
+        self._last_status_fields: dict[str, str] | None = None
+        self._last_status_rows: tuple[str, ...] = ()
+        self._last_request: tuple[Any, Transcript, str, str, str, str, str] | None = None
+        self._fixed_frame = False
+        self._frame_size: os.terminal_size | None = None
+        self._activity_line = ""
 
     @property
     def size(self) -> os.terminal_size:
@@ -1985,6 +2186,13 @@ class Cockpit:
 
     def close(self) -> None:
         self.flush()
+        if self.enabled and self._fixed_frame:
+            if self._input_active:
+                self.hide_cursor(commit=True)
+            else:
+                self.stream.write("\x1b[1B\r\n")
+                self._fixed_frame = False
+                self.stream.flush()
         if self._entered:
             self._entered = False
         if self._previous_sigterm_handler is not None:
@@ -2005,8 +2213,7 @@ class Cockpit:
         input_label: str = "›",
         activity_line: str = "",
     ) -> None:
-        """Append changed transcript rows and a compact status row."""
-        del input_label
+        """Draw the conversation and reserve a fixed status/input region."""
         if not self.enabled:
             return
         self._last_size = shutil.get_terminal_size((120, 40))
@@ -2016,6 +2223,8 @@ class Cockpit:
             session_description,
             branch_line,
             cumulative_line,
+            _clip(_sanitize(input_label).replace(chr(10), " "), 8),
+            _sanitize(activity_line).replace(chr(10), " "),
         )
         if self._input_active:
             self._pending_draw = request
@@ -2024,17 +2233,98 @@ class Cockpit:
 
     def _draw_now(
         self,
-        request: tuple[Any, Transcript, str, str, str],
+        request: tuple[Any, Transcript, str, str, str, str, str],
     ) -> None:
-        snapshot, transcript, session_description, branch_line, cumulative_line = request
+        (
+            snapshot,
+            transcript,
+            session_description,
+            branch_line,
+            cumulative_line,
+            input_label,
+            activity_line,
+        ) = request
+        self._last_request = request
+        self._activity_line = activity_line
+        if self._last_size.lines < _FIXED_MIN_HEIGHT:
+            if self._fixed_frame:
+                self.stream.write("\x1b[1B\r\n")
+                self._fixed_frame = False
+            self._draw_stream_now(request)
+            return
+
+        if self._fixed_frame and self._frame_size != self._last_size:
+            self.stream.write("\x1b[1B\r\n")
+            self._fixed_frame = False
+
         rows = tuple(_primary_rows(transcript, self._last_size.columns))
+        status_rows = tuple(
+            _status_rows(
+                snapshot,
+                transcript,
+                session_description=session_description,
+                branch_line=branch_line,
+                cumulative_line=cumulative_line,
+                width=self._last_size.columns,
+                activity_line=activity_line,
+            )
+        )
+        if not self._fixed_frame:
+            lines = _cockpit_frame_lines(
+                snapshot,
+                transcript,
+                session_description=session_description,
+                branch_line=branch_line,
+                cumulative_line=cumulative_line,
+                width=self._last_size.columns,
+                height=self._last_size.lines,
+                color=self.color,
+                input_label=input_label,
+                activity_line=activity_line,
+            )
+            self.stream.write("\n".join(lines))
+            self.stream.write("\x1b[1A\r")
+            self.stream.flush()
+            self._fixed_frame = True
+            self._frame_size = self._last_size
+            self._last_primary_rows = rows
+            self._last_status_rows = status_rows
+            return
+
+        if rows != self._last_primary_rows:
+            # Conversation changes are committed as a fresh normal-buffer
+            # frame; status-only changes use the in-place path below.
+            self.stream.write("\x1b[1B\r\n")
+            self._fixed_frame = False
+            self._draw_now(request)
+            return
+        if status_rows != self._last_status_rows:
+            self._redraw_bottom(request, status_rows)
+        self._last_primary_rows = rows
+        self._last_status_rows = status_rows
+
+    def _draw_stream_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+    ) -> None:
+        snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
+        rows = tuple(_primary_rows(transcript, self._last_size.columns))
+        current_status_fields = _status_fields(
+            snapshot,
+            session_description=session_description,
+            branch_line=branch_line,
+            cumulative_line=cumulative_line,
+        )
         status_line = _primary_status_line(
             snapshot,
             session_description=session_description,
             branch_line=branch_line,
             cumulative_line=cumulative_line,
             width=self._last_size.columns,
+            previous=self._last_status_fields,
         )
+        if current_status_fields == self._last_status_fields and self._last_status_line:
+            status_line = self._last_status_line
 
         if rows[: len(self._last_primary_rows)] == self._last_primary_rows:
             new_rows = rows[len(self._last_primary_rows) :]
@@ -2054,6 +2344,35 @@ class Cockpit:
 
         self._last_primary_rows = rows
         self._last_status_line = status_line
+        self._last_status_fields = current_status_fields
+
+    def _redraw_bottom(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+        status_rows: tuple[str, ...],
+    ) -> None:
+        snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
+        inner = max(1, self._last_size.columns - 2)
+        bottom = [
+            "├" + "─" * inner + "┤",
+            *(
+                _paint(_frame_inside(row, self._last_size.columns), _DIM_CYAN, self.color)
+                for row in status_rows
+            ),
+        ]
+        del snapshot, transcript, session_description, branch_line, cumulative_line
+        self.stream.write(f"\x1b[s\x1b[{_BOTTOM_RESERVED_ROWS - 1}A\r")
+        for index, line in enumerate(bottom):
+            changed = index > 0 and (
+                index - 1 >= len(self._last_status_rows)
+                or status_rows[index - 1] != self._last_status_rows[index - 1]
+            )
+            if changed:
+                self.stream.write(f"\r{_CLEAR_LINE}{line}")
+            if index < len(bottom) - 1:
+                self.stream.write("\n")
+        self.stream.write("\x1b[u")
+        self.stream.flush()
 
     def flush(self) -> None:
         """Flush the newest draw once the input line is no longer active."""
@@ -2064,26 +2383,47 @@ class Cockpit:
         self._draw_now(request)
 
     def draw_activity(self, activity_line: str) -> None:
-        """Replace only the reserved activity row in the current cockpit."""
-        if not self.enabled:
+        """Update only the fixed status pane while readline owns the input."""
+        if not self.enabled or not self._fixed_frame or self._last_request is None:
             return
-        width = max(64, self._last_size.columns)
-        row = _activity_row(activity_line, width - 2, self.color)
-        self.stream.write(f"\x1b[4;1H{_CLEAR_LINE}{row}")
-        self.stream.flush()
+        self._activity_line = _sanitize(activity_line).replace(chr(10), " ")
+        request = (*self._last_request[:6], self._activity_line)
+        snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
+        status_rows = tuple(
+            _status_rows(
+                snapshot,
+                transcript,
+                session_description=session_description,
+                branch_line=branch_line,
+                cumulative_line=cumulative_line,
+                width=self._last_size.columns,
+                activity_line=self._activity_line,
+            )
+        )
+        self._redraw_bottom(request, status_rows)
+        self._last_request = request
+        self._last_status_rows = status_rows
 
     def move_to_input(self, *, label: str = "›") -> None:
         if not self.enabled:
             return
         self._input_active = True
-        self.stream.write(f"{label} ")
+        label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
+        if self._fixed_frame:
+            self.stream.write(f"\r{_CLEAR_LINE}{label_text} ")
+        else:
+            self.stream.write(f"{label_text} ")
         self.stream.flush()
 
     def hide_cursor(self, *, commit: bool = False) -> None:
         self._input_active = False
         if self.enabled:
             if commit:
-                self.stream.write("\n")
+                if self._fixed_frame:
+                    self.stream.write("\n\n")
+                    self._fixed_frame = False
+                else:
+                    self.stream.write("\n")
             self.stream.flush()
 
 

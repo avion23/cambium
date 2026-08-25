@@ -389,7 +389,9 @@ def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path)
     assert seen_context_forks[0] is None
     assert seen_context_forks[1] is not None
     assert "tokens=250" in output.getvalue()
-    assert "provider=provider-a model=model-a" in output.getvalue()
+    rendered = output.getvalue()
+    assert "provider=provider-a" in rendered
+    assert "model=model-a" in rendered
 
 
 def test_reset_excludes_prior_turns_from_restored_branch(tmp_path: Path) -> None:
