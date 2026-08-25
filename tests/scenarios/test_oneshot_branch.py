@@ -262,6 +262,38 @@ def test_explicit_provider_requires_usable_credential_and_key_in_plan(
     assert environment["CAMBIUM_PROVIDER_PB_API_KEY"] == "secret-b"
 
 
+def test_pinned_provider_router_keeps_ready_siblings_for_terminal_fallback(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from cambium import worker
+    from cambium.oneshot import _resolve_provider
+
+    repo = _repo(tmp_path / "repo")
+    config_path = _write_providers(tmp_path / "providers.json")
+    store = _stored_auth(tmp_path)
+    store.set_provider("pb", "secret-b")
+    config = oneshot.OneShotConfig(
+        prompt="p",
+        repo=repo,
+        provider="pa",
+        provider_config_path=config_path,
+    )
+
+    resolved, _environment = _resolve_provider(config, repo, auth_store=store)
+    monkeypatch.setattr(worker, "_provider_path", lambda: config_path)
+
+    router, _tier, _model, _identity = worker._provider_router(
+        dict(resolved.fanout_config or {}),
+        assigned_provider=resolved.assigned_provider,
+        authorized_providers=resolved.authorized_providers,
+        authorized_providers_explicit=True,
+        task_id="tui-turn",
+    )
+
+    assert tuple(provider.name for provider in router._providers) == ("pa", "pb")
+    assert router._primary_provider == "pa"
+
+
 def test_resume_requires_existing_session_artifact(tmp_path: Path) -> None:
     config = oneshot.OneShotConfig(
         prompt="resume",
