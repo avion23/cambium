@@ -11,12 +11,16 @@ cambium run PROMPT [--repo PATH] [--provider NAME[:MODEL]]
                    [--session-dir DIR] [--json]
 
 cambium repl [the same routing and budget options]
-cambium tui  [the same routing and budget options] [--quiet]
+cambium tui  [the same routing and budget options]
+             [-c [SESSION]] [--quiet]
 ```
 
 `run` executes one prompt. `repl` and `tui` accept multiple prompts, each as a
 separate durable one-shot session leaf. On a TTY, `tui` displays the live
-operator dashboard while the current run is active.
+operator dashboard while the current run is active. TUI starts a fresh
+interactive session by default; `-c`/`--continue` continues the newest
+reconnectable session, or the named session when a value is supplied. A
+missing continuation target is an error.
 
 ## Monitoring
 

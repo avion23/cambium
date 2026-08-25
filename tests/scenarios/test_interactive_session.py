@@ -7,8 +7,10 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from cambium import tui
-from cambium.interactive import InteractiveSession
+from cambium.interactive import InteractiveSession, InteractiveSessionError
 from cambium.oneshot import OneShotConfig, default_session_root
 from cambium.store import EventStore
 from cambium.supervisor import PlanResult, TaskResult
@@ -80,6 +82,17 @@ def _two_provider_config(path: Path, *, first_enabled: bool = True) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _durable_session(repo: Path, name: str) -> Path:
+    root = default_session_root(repo) / name
+    session = InteractiveSession(OneShotConfig(repo=repo, session_root=root))
+    turn = session.prepare_turn("durable prompt")
+    event_db = turn.session_dir / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    event_db.touch()
+    session.complete_turn(turn, succeeded=False)
+    return root
 
 
 def test_interactive_session_carries_exact_and_semantic_seed(tmp_path: Path) -> None:
@@ -447,7 +460,7 @@ def test_restore_history_folds_completed_current_branch(monkeypatch, tmp_path: P
     assert cumulative.total_tokens == 15
 
 
-def test_tui_reconnects_to_latest_durable_interactive_session(tmp_path: Path) -> None:
+def test_tui_reconnects_to_explicit_durable_interactive_session(tmp_path: Path) -> None:
     root = default_session_root(tmp_path) / "prior"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("durable prompt")
@@ -495,7 +508,7 @@ def test_tui_reconnects_to_latest_durable_interactive_session(tmp_path: Path) ->
     session.acquire()
     session.release()
 
-    reconnected = InteractiveSession(OneShotConfig(repo=tmp_path))
+    reconnected = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     transcript = Transcript()
     cumulative, snapshot = tui._restore_history(reconnected, transcript=transcript)
 
@@ -519,7 +532,7 @@ def test_tui_reconnects_to_latest_durable_interactive_session(tmp_path: Path) ->
     error = io.StringIO()
     code = asyncio.run(
         tui.run_tui(
-            OneShotConfig(repo=tmp_path),
+            OneShotConfig(repo=tmp_path, session_root=root),
             input_stream=source,
             output_stream=output,
             error_stream=error,
@@ -560,3 +573,37 @@ def test_empty_repo_start_does_not_claim_a_prior_interactive_session(tmp_path: P
     assert session.reconnected is False
     assert session.turn == 0
     assert session.root.parent == default_session_root(tmp_path)
+
+
+def test_default_interactive_launch_always_allocates_a_fresh_root(tmp_path: Path) -> None:
+    prior = _durable_session(tmp_path, "prior")
+
+    fresh = InteractiveSession(OneShotConfig(repo=tmp_path))
+
+    assert fresh.root.parent == default_session_root(tmp_path)
+    assert fresh.root != prior.resolve()
+    assert fresh.reconnected is False
+    assert fresh.turn == 0
+
+
+def test_continue_resolves_latest_and_specific_interactive_sessions(tmp_path: Path) -> None:
+    prior = _durable_session(tmp_path, "prior")
+
+    assert InteractiveSession.resolve_continue_session(tmp_path, None) == prior.resolve()
+    assert InteractiveSession.resolve_continue_session(tmp_path, "") == prior.resolve()
+    assert InteractiveSession.resolve_continue_session(tmp_path, "prior") == prior.resolve()
+    assert InteractiveSession.resolve_continue_session(tmp_path, prior) == prior.resolve()
+
+
+def test_continue_missing_interactive_session_fails_clearly(tmp_path: Path) -> None:
+    with pytest.raises(
+        InteractiveSessionError,
+        match="no previous interactive session is available to continue",
+    ):
+        InteractiveSession.resolve_continue_session(tmp_path, None)
+
+    with pytest.raises(
+        InteractiveSessionError,
+        match="no resumable interactive session found",
+    ):
+        InteractiveSession.resolve_continue_session(tmp_path, "missing")

@@ -256,6 +256,25 @@ def test_exit_command_still_exits_without_submitting_a_turn(tmp_path: Path) -> N
     assert not tuple((tmp_path / "interactive").glob("turn-*"))
 
 
+def test_new_command_starts_a_fresh_branch_without_exiting(tmp_path: Path) -> None:
+    output = _Tty()
+    error = io.StringIO()
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=_Tty("/new\n/session\n/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "Started a fresh semantic branch" in output.getvalue()
+    assert "branch=2" in output.getvalue()
+
+
 def test_tui_history_is_private_and_bounded(monkeypatch, tmp_path: Path) -> None:
     history = _History()
     monkeypatch.setattr(tui, "_readline", history)

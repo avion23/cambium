@@ -15,6 +15,7 @@ import pytest
 
 from cambium import cli, oneshot, repl, session, tui
 from cambium.auth import AuthStore, derived_env_name
+from cambium.interactive import InteractiveSession
 from cambium.ipc import MAX_LINE_BYTES
 from cambium.render import render_json_result
 from cambium.results import Result, write_result
@@ -38,6 +39,17 @@ def _repo(path: Path) -> Path:
 
 def _plan_result() -> PlanResult:
     return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+
+def _durable_tui_session(repo: Path, name: str) -> Path:
+    root = repo / ".cambium" / "sessions" / name
+    interactive = InteractiveSession(oneshot.OneShotConfig(repo=repo, session_root=root))
+    turn = interactive.prepare_turn("durable prompt")
+    event_db = turn.session_dir / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    event_db.touch()
+    interactive.complete_turn(turn, succeeded=False)
+    return root
 
 
 def _provider_entry(
@@ -121,6 +133,43 @@ def test_default_runs_allocate_distinct_session_leaves(monkeypatch, tmp_path: Pa
 
     assert sessions[0] != sessions[1]
     assert all(path.parent == repo / ".cambium" / "sessions" for path in sessions)
+
+
+def test_tui_continue_flag_defaults_fresh_and_selects_latest_or_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    prior = _durable_tui_session(tmp_path, "prior")
+    configs: list[oneshot.OneShotConfig] = []
+
+    async def fake_run_tui(config, **_kwargs):
+        configs.append(config)
+        return 0
+
+    monkeypatch.setattr(tui, "run_tui", fake_run_tui)
+
+    assert cli.main(["tui", "--repo", str(tmp_path)]) == 0
+    assert configs[-1].session_root is None
+
+    assert cli.main(["tui", "--repo", str(tmp_path), "-c"]) == 0
+    assert Path(configs[-1].session_root).resolve() == prior.resolve()
+
+    assert cli.main(["tui", "--repo", str(tmp_path), "--continue", "prior"]) == 0
+    assert Path(configs[-1].session_root).resolve() == prior.resolve()
+
+
+def test_tui_continue_missing_session_is_a_clear_error(capsys, tmp_path: Path) -> None:
+    assert cli.main(["tui", "--repo", str(tmp_path), "-c"]) == 2
+
+    captured = capsys.readouterr()
+    assert "cambium tui: no previous interactive session is available to continue" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_tui_continue_flag_has_no_resume_alias() -> None:
+    parser = cli._build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["tui", "--resume"])
 
 
 def test_explicit_session_rejects_second_request_without_changing_artifacts(
