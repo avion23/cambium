@@ -174,6 +174,37 @@ def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin(monkeypat
         other_tier.close()
 
 
+def test_pinned_timeout_falls_back_to_sibling_and_records_origin(monkeypatch) -> None:
+    pinned = FakeServer([(200, _ok_payload("late", model="m-pinned"), 0.1)])
+    sibling = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
+    _set_keys(monkeypatch, "K_TIMEOUT_PIN", "K_TIMEOUT_SIBLING")
+    router = Diffundo(
+        (
+            _config(
+                "p_timeout",
+                pinned,
+                "K_TIMEOUT_PIN",
+                model="m-pinned",
+                timeout_s=0.03,
+            ),
+            _config("p_sibling", sibling, "K_TIMEOUT_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_timeout",
+        call_budget_s=1.0,
+        pause_timeout_s=0.01,
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        assert result.provider == "p_sibling"
+        assert result.fell_back_from == "p_timeout"
+        assert len(pinned.calls) == 1
+        assert len(sibling.calls) == 1
+        assert router.health("p_timeout") is HealthState.COOLDOWN
+    finally:
+        pinned.close()
+        sibling.close()
+
+
 def test_pinned_429_retry_after_does_not_trigger_fallback(monkeypatch) -> None:
     limited = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
