@@ -9,8 +9,10 @@ from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
+    _display_width,
     _side_sections,
     _transcript_lines,
+    _wrap_markdown,
     render_cockpit,
     render_primary,
 )
@@ -93,6 +95,35 @@ def test_compact_cockpit_stays_bounded() -> None:
     assert "conversation · running" in "\n".join(lines)
     assert "agents=1 active" in "\n".join(lines)
     assert lines[-1].startswith("└")
+
+
+def test_long_words_wrap_without_clipping_content_or_frame_borders() -> None:
+    long_word = "neveragainsttherunningliveservi" * 3
+    transcript = Transcript()
+    transcript.assistant(f"before {long_word} after")
+
+    wrapped = _wrap_markdown(long_word, 17)
+    assert "".join(wrapped) == long_word
+    assert all(_display_width(line) <= 17 for line in wrapped)
+
+    lines = render_cockpit(
+        _snapshot(),
+        transcript,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=48,
+        height=28,
+        activity_line="running " + "界" * 80 + "\ud800",
+    )
+    conversation = "".join(
+        value[3:]
+        for role, value in _transcript_lines(transcript, 46, 100)
+        if role == "assistant" and value.startswith("   ")
+    )
+    assert long_word in conversation
+    assert all(_display_width(line) <= 48 for line in lines)
+    assert lines[-1] == "└" + "─" * 46 + "┘"
 
 
 def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:
@@ -568,6 +599,43 @@ def test_consecutive_failed_tool_events_collapse_to_one_notice() -> None:
     assert text == " tool errors: 5 (last: run_shell …)"
     assert len(transcript.entries) == 1
     assert transcript.tool_error_count == 5
+
+
+def test_tool_error_notice_updates_once_across_success_ticks_and_turns() -> None:
+    transcript = Transcript()
+    transcript.user("first turn")
+    events = (
+        ("run_shell", False),
+        ("run_shell", True),
+        ("read_batch", False),
+        ("read_batch", True),
+        ("git_op", False),
+    )
+    for tool, ok in events:
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "task_id": f"{tool}-task",
+                "payload": {"tool": tool, "ok": ok},
+            }
+        )
+
+    notices = [entry for entry in transcript.entries if entry.text.startswith("tool errors:")]
+    assert [entry.text for entry in notices] == ["tool errors: 3 (last: git_op …)"]
+
+    transcript.user("second turn")
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "task_id": "read-task",
+            "payload": {"tool": "read_batch", "ok": False},
+        }
+    )
+    notices = [entry for entry in transcript.entries if entry.text.startswith("tool errors:")]
+    assert [entry.text for entry in notices] == [
+        "tool errors: 3 (last: git_op …)",
+        "tool errors: 1 (last: read_batch …)",
+    ]
 
 
 def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
