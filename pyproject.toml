@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Multi-agent coding-agent harness"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["rich>=13.0"]
+dependencies = []
 
 [project.scripts]
 cambium = "cambium.cli:main"
@@ -16,6 +16,7 @@ cambium-monitor = "cambium.monitor:main"
 
 [project.optional-dependencies]
 dspy = ["dspy>=3.3.0,<3.4"]
+tui = ["rich>=14.3,<16"]
 # ast: focused alias for consumers that need only the optional tree-sitter
 # Python parser; the stdlib ast backend remains the core fallback.
 ast = ["tree-sitter>=0.26", "tree-sitter-python>=0.25"]
