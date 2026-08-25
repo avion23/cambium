@@ -143,8 +143,8 @@ def _provider_billing_labels(config: Any, repo: Path) -> dict[str, str]:
         zero_tariffs = all(
             not isinstance(price, bool)
             and isinstance(price, int | float)
-            and math.isfinite(float(price))
-            and float(price) == 0.0
+            and math.isfinite(price)
+            and price == 0.0
             for price in prices
         )
         auth = getattr(getattr(provider, "auth", None), "value", None)
@@ -297,7 +297,7 @@ def _read_cockpit_prompt(source: TextIO, cockpit: Cockpit, *, native: bool) -> s
     """Read input on the primary-buffer prompt line with native editing."""
 
     def read_one(label: str) -> str | None:
-        cockpit.move_to_input(label=label)
+        cockpit.move_to_input(label=label, native=native)
         try:
             return _input_line(source, cockpit.stream, "", native=native)
         finally:
@@ -749,8 +749,8 @@ async def _run_interactive(
         )
     sequence = 0
     failed = False
-    cockpit = Cockpit(out, enabled=not quiet)
     native_input = source is sys.stdin and out is sys.stdout
+    cockpit = Cockpit(out, enabled=not quiet)
     history_path = _history_path(session)
     if native_input:
         _load_history(history_path)
@@ -896,6 +896,7 @@ async def _run_interactive(
                         snapshot=state.snapshot(session_dir=turn.session_dir)
                     ),
                     activity_line=activity.render(),
+                    turn_active=True,
                 )
 
                 loop = asyncio.get_running_loop()
@@ -936,6 +937,7 @@ async def _run_interactive(
                         branch_line=_branch_line(session),
                         cumulative_line=_cumulative.line(snapshot=live_snapshot),
                         activity_line=_activity.render(),
+                        turn_active=True,
                     )
 
                 _start_input_read()
@@ -988,6 +990,7 @@ async def _run_interactive(
                                             cumulative_line=cumulative.line(
                                                 snapshot=state.snapshot(session_dir=turn.session_dir)
                                             ),
+                                            turn_active=True,
                                         )
                                 _start_input_read()
 
