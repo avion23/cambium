@@ -292,6 +292,7 @@ def test_pinned_provider_router_keeps_ready_siblings_for_terminal_fallback(
 
     assert tuple(provider.name for provider in router._providers) == ("pa", "pb")
     assert router._primary_provider == "pa"
+    assert resolved.model_candidates == ("model-a", "model-b")
 
 
 def test_resume_requires_existing_session_artifact(tmp_path: Path) -> None:
