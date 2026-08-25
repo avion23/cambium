@@ -24,11 +24,11 @@ The current runtime is intentionally small:
 Cambium currently requires Python 3.12 or newer, matching the authoritative
 `project.requires-python = ">=3.12"` declaration in `pyproject.toml`.
 On a real TTY, the `tui` command provides an interactive terminal cockpit: one
-invocation accepts multiple prompts on a durable branch, and a later
-invocation can reconnect to the newest reconnectable branch. It supports
-steering with `!cancel` or Ctrl-C and queued follow-ups, and streams model
-output into the cockpit. Redirected or `--quiet` output uses the line-oriented
-adapter instead.
+invocation accepts multiple prompts on a durable branch, and `-c`/`--continue`
+can reconnect to the newest or a named reconnectable branch. Launches without
+that opt-in start a fresh branch. It supports steering with `!cancel` or
+Ctrl-C and queued follow-ups, and streams model output into the cockpit.
+Redirected or `--quiet` output uses the line-oriented adapter instead.
 
 From a checkout, run commands with `PYTHONPATH=src`. After installation, use
 the `cambium` console script or `python -m cambium` without `PYTHONPATH`.

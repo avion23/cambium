@@ -456,6 +456,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_budget_arguments(tui)
     tui.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_session",
+        nargs="?",
+        const="",
+        metavar="SESSION",
+        help=(
+            "continue the latest interactive session, or SESSION, "
+            "instead of starting a fresh session"
+        ),
+    )
+    tui.add_argument(
         "--quiet",
         action="store_true",
         help="suppress live event updates and print only completed results",
@@ -1118,12 +1130,22 @@ async def _run_tui(args: argparse.Namespace) -> int:
 
     try:
         provider, model = _split_provider_model(args.provider, args.model)
+        session_root = args.session_dir
+        continue_session = getattr(args, "continue_session", None)
+        if continue_session is not None:
+            if session_root is not None:
+                raise ValueError("--continue cannot be combined with --session-dir")
+            from .interactive import InteractiveSession
+
+            session_root = InteractiveSession.resolve_continue_session(
+                args.repo, continue_session
+            )
     except ValueError as exc:
         print(f"cambium tui: {exc}", file=sys.stderr)
         return 2
     config = oneshot.OneShotConfig(
         repo=args.repo,
-        session_root=args.session_dir,
+        session_root=session_root,
         provider=provider,
         model=model,
         auto=args.auto,

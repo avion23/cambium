@@ -40,7 +40,21 @@ hit.
 PYTHONPATH=src python -m cambium tui --repo . --auto
 ```
 
-Use a stable root to reopen the same lineage:
+Each launch without an explicit session target allocates a fresh interactive
+root. Continue the latest durable root explicitly with `-c`:
+
+```bash
+PYTHONPATH=src python -m cambium tui --repo . -c --auto
+```
+
+Continue one session by id (under the repository's session root) or by
+directory path:
+
+```bash
+PYTHONPATH=src python -m cambium tui --repo . -c SESSION_ID --auto
+```
+
+Use a stable root to reopen the same lineage directly:
 
 ```bash
 PYTHONPATH=src python -m cambium tui \
@@ -49,12 +63,13 @@ PYTHONPATH=src python -m cambium tui \
   --auto
 ```
 
-Without `--session-dir`, `InteractiveSession` reconnects to the newest
-reconnectable interactive root for the repository.  On startup it replays the
-durable turn event stores, restores the latest valid checkpoint/branch head, and
-shows the resumed turn, epoch, and checkpoint.  A `session.lock` under the
-interactive `.cambium` directory prevents concurrent owners; a kernel-released
-or stale lock can be reclaimed, but a live owner fails closed.
+`-c` without a value selects the newest reconnectable interactive root. A
+missing or non-reconnectable target is an error; it never silently starts a
+fresh session. On continuation, Cambium replays the durable turn event stores,
+restores the latest valid checkpoint/branch head, and shows the resumed turn,
+epoch, and checkpoint. A `session.lock` under the interactive `.cambium`
+directory prevents concurrent owners; a kernel-released or stale lock can be
+reclaimed, but a live owner fails closed.
 
 The frontend stores content-free lineage metadata at:
 

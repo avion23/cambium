@@ -377,12 +377,7 @@ class InteractiveSession:
         self.repo = oneshot.resolve_repo(config.repo)
         self._reconnected = False
         if config.session_root is None:
-            existing = self.latest_for_repo(self.repo)
-            if existing is None:
-                self.root = oneshot.allocate_session_dir(self.repo)
-            else:
-                self.root = existing
-                self._reconnected = True
+            self.root = oneshot.allocate_session_dir(self.repo)
         else:
             self.root = Path(config.session_root).expanduser().resolve()
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -418,26 +413,63 @@ class InteractiveSession:
         enough to resume: at least one durable event database or checkpoint
         must exist, which avoids reopening an abandoned empty allocation.
         """
+        repo = Path(repo).expanduser().resolve()
         sessions = oneshot.default_session_root(repo)
         if not sessions.is_dir():
             return None
         candidates: list[tuple[tuple[int, int, str], Path]] = []
         for child in sessions.iterdir():
-            if not child.is_dir() or not (child / ".cambium" / _MANIFEST_NAME).is_file():
+            if not cls._is_reconnectable(child, repo):
                 continue
             document = _read_manifest_document(child / ".cambium" / _MANIFEST_NAME)
-            if document is None or document.get("schema") != _INTERACTIVE_SCHEMA:
+            if document is None:
                 continue
-            if document.get("repo") != str(Path(repo).resolve()):
-                continue
-            turn = document.get("turn")
-            if type(turn) is not int or turn < 1 or not cls._has_durable_state(child):
-                continue
+            turn = document["turn"]
             candidates.append(((_durable_mtime(child), turn, child.name), child.resolve()))
         if not candidates:
             return None
         candidates.sort(key=lambda item: item[0])
         return candidates[-1][1]
+
+    @classmethod
+    def resolve_continue_session(cls, repo: str | Path, value: str | Path | None) -> Path:
+        """Resolve an explicit continuation target without allocating a session."""
+        repo_path = oneshot.resolve_repo(repo)
+        if value is None or not str(value).strip():
+            latest = cls.latest_for_repo(repo_path)
+            if latest is None:
+                raise InteractiveSessionError(
+                    "no previous interactive session is available to continue"
+                )
+            return latest
+
+        requested = Path(value).expanduser()
+        value_text = os.fspath(value)
+        if (
+            not requested.is_absolute()
+            and requested.parent == Path(".")
+            and not value_text.startswith(".")
+            and not requested.is_dir()
+        ):
+            requested = oneshot.default_session_root(repo_path) / requested
+        candidate = requested.resolve()
+        if not cls._is_reconnectable(candidate, repo_path):
+            raise InteractiveSessionError(
+                f"no resumable interactive session found at {candidate}"
+            )
+        return candidate
+
+    @classmethod
+    def _is_reconnectable(cls, root: Path, repo: Path) -> bool:
+        if not root.is_dir():
+            return False
+        document = _read_manifest_document(root / ".cambium" / _MANIFEST_NAME)
+        if document is None or document.get("schema") != _INTERACTIVE_SCHEMA:
+            return False
+        if document.get("repo") != str(repo):
+            return False
+        turn = document.get("turn")
+        return type(turn) is int and turn >= 1 and cls._has_durable_state(root)
 
     @staticmethod
     def _has_durable_state(root: Path) -> bool:
