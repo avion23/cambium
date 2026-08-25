@@ -596,7 +596,7 @@ class Transcript:
         self._failure_context: dict[tuple[str, int | None, int], list[str]] = {}
         self._failure_blocks: dict[tuple[str, int | None, int], _FailureBlock] = {}
         self._failure_order: deque[tuple[str, int | None, int]] = deque()
-        self._tool_failure_key: tuple[str, int | None, int] | None = None
+        self._tool_failure_key: int | None = None
         self._tool_failure_count = 0
         self._tool_failure_entry: TranscriptEntry | None = None
         self._tool_details_expanded = False
@@ -803,7 +803,8 @@ class Transcript:
         turn: int | None,
         tool: Any,
     ) -> None:
-        key = self._context_key(task_id, turn)
+        del task_id, turn
+        key = self._turn_serial
         if self._tool_failure_key != key or self._tool_failure_entry not in self._entries:
             self._tool_failure_key = key
             self._tool_failure_count = 0
@@ -823,10 +824,8 @@ class Transcript:
                 return
 
     def _clear_tool_failure_notice(self, task_id: str | None, turn: int | None) -> None:
+        del task_id, turn
         if self._tool_failure_entry is None:
-            return
-        key = self._context_key(task_id, turn)
-        if self._tool_failure_key != key and task_id is not None:
             return
         self._tool_failure_key = None
         self._tool_failure_count = 0
@@ -922,9 +921,6 @@ class Transcript:
                     self._remember_failure_context(task_id, turn, context_line)
                 self._remember_tool_failure(task_id, turn, tool)
                 return
-            self._tool_failure_key = None
-            self._tool_failure_count = 0
-            self._tool_failure_entry = None
             if isinstance(tool, str):
                 text = _sanitize(_tool_entry_text(data, tool, ok, duration)).strip("\n")
                 if text:

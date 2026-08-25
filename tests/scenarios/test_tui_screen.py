@@ -601,6 +601,43 @@ def test_consecutive_failed_tool_events_collapse_to_one_notice() -> None:
     assert transcript.tool_error_count == 5
 
 
+def test_tool_error_notice_updates_once_across_success_ticks_and_turns() -> None:
+    transcript = Transcript()
+    transcript.user("first turn")
+    events = (
+        ("run_shell", False),
+        ("run_shell", True),
+        ("read_batch", False),
+        ("read_batch", True),
+        ("git_op", False),
+    )
+    for tool, ok in events:
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "task_id": f"{tool}-task",
+                "payload": {"tool": tool, "ok": ok},
+            }
+        )
+
+    notices = [entry for entry in transcript.entries if entry.text.startswith("tool errors:")]
+    assert [entry.text for entry in notices] == ["tool errors: 3 (last: git_op …)"]
+
+    transcript.user("second turn")
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "task_id": "read-task",
+            "payload": {"tool": "read_batch", "ok": False},
+        }
+    )
+    notices = [entry for entry in transcript.entries if entry.text.startswith("tool errors:")]
+    assert [entry.text for entry in notices] == [
+        "tool errors: 3 (last: git_op …)",
+        "tool errors: 1 (last: read_batch …)",
+    ]
+
+
 def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     transcript = Transcript()
     for event in (
