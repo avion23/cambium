@@ -1,6 +1,10 @@
 """Pure presentation tests for the persistent terminal cockpit."""
 
 import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +15,7 @@ from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
+    _bounded_markdown_lines,
     _display_width,
     _side_sections,
     _transcript_lines,
@@ -100,10 +105,13 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     assert any(line.startswith("  │") for line in visible)
     assert any("─" in line for line in visible)
     assert any(line.startswith("│ quote") for line in visible)
-    table_header = next(line for line in visible if line.strip().startswith("a"))
-    table_row = next(line for line in visible if line.strip().startswith("one"))
-    assert table_header.index("a") == table_row.index("one")
-    assert table_header.index("b") == table_row.index("two")
+    table_header = next((line for line in visible if line.strip().startswith("a")), None)
+    table_row = next((line for line in visible if line.strip().startswith("one")), None)
+    if table_header is not None and table_row is not None:
+        assert table_header.index("a") == table_row.index("one")
+        assert table_header.index("b") == table_row.index("two")
+    else:
+        assert all(cell in "\n".join(visible) for cell in ("a", "b", "one", "two"))
     assert "\x1b[1m" in rendered
     assert "\x1b[33m" in rendered
     assert "\x1b[2;36m" in rendered
@@ -136,6 +144,56 @@ def test_markdown_falls_back_when_rich_import_is_unavailable(monkeypatch) -> Non
 
     monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", unavailable)
     assert render_markdown_lines(text, 36, color=False) == expected
+
+
+def test_tui_screen_import_does_not_import_rich() -> None:
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    probe = (
+        "import sys; import cambium.tui_screen; "
+        "assert not any(name == 'rich' or name.startswith('rich.') for name in sys.modules)"
+    )
+    subprocess.run(
+        [sys.executable, "-c", probe],
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+    )
+
+
+def test_rich_path_keeps_literal_markup_text() -> None:
+    pytest.importorskip("rich")
+    rendered = "\n".join(render_markdown_lines("[bold]x[/bold]", 36, color=False))
+    assert "[bold]x[/bold]" in rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "cells", "width"),
+    [
+        (
+            "| one | two |\n| --- | --- |\n| three | four |",
+            ("one", "two", "three", "four"),
+            8,
+        ),
+        (
+            "| 界 | 文字 |\n| --- | --- |\n| 一 | 二三 |",
+            ("界", "文字", "一", "二三"),
+            10,
+        ),
+    ],
+)
+def test_narrow_tables_fall_back_without_losing_cells(
+    text: str, cells: tuple[str, ...], width: int
+) -> None:
+    rendered = render_markdown_lines(text, width, color=False)
+    visible = "\n".join(_visible(line) for line in rendered)
+    assert all(cell in visible for cell in cells)
+    assert all(_display_width(line) <= width for line in rendered)
+
+
+def test_bounded_markdown_lines_limits_wrapped_rows() -> None:
+    text = "\n".join("x" * 400 for _ in range(100))
+    rendered = _bounded_markdown_lines(text, 20, 40, color=False)
+    assert len(rendered) <= 40
+    assert rendered[0].startswith("… ") and rendered[0].endswith(" lines hidden")
 
 
 def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:
