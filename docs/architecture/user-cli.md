@@ -15,12 +15,25 @@ cambium tui  [the same routing and budget options]
              [-c [SESSION]] [--quiet]
 ```
 
-`run` executes one prompt. `repl` and `tui` accept multiple prompts, each as a
-separate durable one-shot session leaf. On a TTY, `tui` displays the live
-operator dashboard while the current run is active. TUI starts a fresh
-interactive session by default; `-c`/`--continue` continues the newest
-reconnectable session, or the named session when a value is supplied. A
-missing continuation target is an error.
+`run` executes one prompt. With no explicit `--session-dir`, `repl` starts
+each submitted prompt in a fresh durable one-shot leaf. `tui` accepts multiple
+prompts on one persistent interactive branch, with each turn in its own
+durable leaf; it allocates a fresh interactive root by default. On a TTY, the
+TUI displays the live operator cockpit while the current turn is active.
+`-c [SESSION]` / `--continue [SESSION]` explicitly continues the newest
+reconnectable session when `SESSION` is omitted, or the named session when it
+is supplied. A missing or non-reconnectable target is an error, and the flag
+cannot be combined with `--session-dir`. Inside a running TUI, `/new` remains
+unchanged: it starts a fresh semantic branch while retaining old artifacts.
+
+The TTY cockpit puts the conversation pane above a live status pane showing
+provider/model, turn, tokens, cost, agents, tool-error counters, and the
+checkpoint, followed by an input row. The status activity uses `WAITING`,
+`STREAMING`, and `IDLE` (with terminal `DONE`/`ERROR` results). Conversation
+Markdown renders headings, tables, bold text, and fenced code blocks; routine
+tool failures collapse into per-turn counters. Short terminals use a
+width-bounded, unframed conversation/status fallback instead of the fixed
+two-pane frame.
 
 ## Monitoring
 

@@ -57,6 +57,14 @@ one-task `run_session` adapter remains for compatibility. `EventStore` is
 the current event boundary; there is no current `events.py` or dead-letter
 queue module.
 
+Interactive TUI turns keep those stores isolated under
+`turn-NNNN/.cambium/events.db`. `supervisor.read_events` aggregates the turn
+stores into one session-level timeline with stable sequence numbers for the
+TUI and monitor; it does not rewrite archived turn history. The canonical root
+result keeps its `event_log_ref` as the owning root's
+`sqlite:<root>/.cambium/events.db` URI, with aggregation preserved as a
+read-time supervisor behavior.
+
 The canonical root result written to `.cambium/result.json` is
 `results.Result`. Its JSON record includes the serving `provider` and the
 optional `fell_back_from` origin, so a terminal-death provider substitution is
@@ -65,7 +73,10 @@ visible in the durable result rather than only in the event stream.
 The supervisor gives each worker a bounded decoded-stdout `asyncio.Queue` and
 routes worker and runtime records through `EventStore`'s bounded writer queue.
 Worker stdout remains protocol-only NDJSON; diagnostics use stderr/logging.
-Non-critical store records can be dropped under the store overflow policy.
+When a worker generation fails, the failure envelope/result reason includes
+the latest non-empty worker stderr tail after session redaction, bounded to
+512 characters. Non-critical store records can be dropped under the store
+overflow policy.
 
 ### Worker and providers
 

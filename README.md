@@ -26,9 +26,11 @@ Cambium currently requires Python 3.12 or newer, matching the authoritative
 On a real TTY, the `tui` command provides an interactive terminal cockpit: one
 invocation accepts multiple prompts on a durable branch, and `-c`/`--continue`
 can reconnect to the newest or a named reconnectable branch. Launches without
-that opt-in start a fresh branch. It supports steering with `!cancel` or
-Ctrl-C and queued follow-ups, and streams model output into the cockpit.
-Redirected or `--quiet` output uses the line-oriented adapter instead.
+that opt-in allocate a fresh interactive root. The line-oriented `repl` also
+starts each prompt in a fresh one-shot leaf by default. TUI supports steering
+with `!cancel` or Ctrl-C and queued follow-ups, and streams model output into
+the cockpit. Redirected or `--quiet` output uses the line-oriented adapter
+instead.
 
 From a checkout, run commands with `PYTHONPATH=src`. After installation, use
 the `cambium` console script or `python -m cambium` without `PYTHONPATH`.
@@ -124,6 +126,17 @@ An exit command (`/exit`, `/quit`, or exact `q`), EOF, or an input interrupt
 while waiting for input ends the frontend process; its durable branch and turn
 artifacts remain available to a later invocation.
 
+To continue the newest reconnectable interactive root explicitly:
+
+```bash
+PYTHONPATH=src python -m cambium tui --repo . -c --auto
+```
+
+Pass `-c SESSION` (or `--continue SESSION`) to continue a named session or
+directory. Missing or non-reconnectable continuation targets fail rather than
+silently creating a new root. `/new` still starts a fresh semantic branch
+inside the running TUI and retains the old artifacts.
+
 To reopen the same semantic branch later, give it a stable interactive root:
 
 ```bash
@@ -165,15 +178,21 @@ PYTHONPATH=src python -m cambium supervisor \
   --demo
 ```
 
-Within one invocation, the cockpit appends user prompts, model Markdown,
-important tool/runtime events, and compact status rows to the terminal's normal
-scrollback. It does not enter an alternate screen or maintain fixed
-full-screen panes. Status rows include main and sub-agent state, provider/model,
-per-agent tokens, output tokens/second, CAST trunk size, summary segments,
-raw-tail size, epoch, checkpoint, cumulative usage, and recent durable events.
-Native terminals keep readline editing and private history. Ctrl-C cancels an
-active turn and returns to the cockpit without advancing the last successful
-branch checkpoint; Ctrl-C while waiting for input ends the invocation.
+On a sufficiently tall TTY, the cockpit uses two panes in the terminal's
+normal buffer: the conversation pane is on top and a live status pane is on
+the bottom, followed by the input row. The status pane shows provider/model,
+turn, tokens, cost, agents, tool-error counters, activity, and checkpoint.
+`WAITING`, `STREAMING`, and `IDLE` identify the live activity state; completed
+frames use `DONE` or `ERROR`. Conversation Markdown renders headings, tables,
+bold text, and fenced code blocks, and wraps content within the pane width.
+Routine failed tool events collapse into a per-turn counter while terminal
+task failures keep one consolidated failure block. A short terminal falls
+back to width-bounded conversation rows plus status rows without the fixed
+bordered frame. The final completed frame is forced and flushed even if input
+is pending; native terminals keep readline editing and private history.
+Ctrl-C cancels an active turn and returns to the cockpit without advancing the
+last successful branch checkpoint; Ctrl-C while waiting for input ends the
+invocation.
 
 The TUI carries the newest immutable context checkpoint into the next prompt,
 keeps the provider/model lease when exact cache reuse is compatible, and falls
@@ -206,8 +225,8 @@ Enter these commands in the cockpit prompt:
 | `/exit` / `/quit` | Close this TUI invocation. |
 | `q` | Close the cockpit when the submitted prompt is exactly `q` after trimming whitespace. |
 
-`!cancel` cancels an active turn; `v` toggles full command/output details for
-tool entries. These are input controls rather than slash commands.
+`!cancel` cancels an active turn; `v` toggles available command/output details
+for tool entries. These are input controls rather than slash commands.
 
 Use `<<<` and `>>>` on their own lines for multiline prompts. See
 [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
