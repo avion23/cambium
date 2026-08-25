@@ -15,8 +15,6 @@ template:
   session-wide parallel-worker cap of the same name is the supervisor's job
   at dispatch (architecture §3.7 I2.3: "``max_width`` (per-session parallel
   worker cap, config) are enforced by the supervisor at dispatch").
-- I2.4 info hiding: :func:`subtree_of` gives a node only its own subtree —
-  never a sibling's context.
 - I2.7 information hiding (envelope-only upward results): a node's upward
   envelope carries **exactly** the current arch §3.4 key set — ``parent_task_id``,
   ``unified_diff``, ``diff_truncated``, ``summary``, ``metric_score``,
@@ -404,14 +402,6 @@ def topological_order(tree: TaskTree) -> list[str]:
     return order
 
 
-def leaves(tree: TaskTree) -> list[TaskNode]:
-    """Terminal nodes: no outgoing ``(parent, child)`` edge (no children)."""
-    parents = {edge[0] for edge in tree.edges}
-    result = [node for node in tree.nodes if node.task_id not in parents]
-    result.sort(key=lambda node: (node.depth, node.width_idx, node.task_id))
-    return result
-
-
 def ready_tasks(tree: TaskTree, finished: set[str]) -> list[TaskNode]:
     """Tasks whose dependencies are met and which are not themselves finished.
 
@@ -427,53 +417,6 @@ def ready_tasks(tree: TaskTree, finished: set[str]) -> list[TaskNode]:
     ]
     result.sort(key=lambda node: (node.depth, node.width_idx, node.task_id))
     return result
-
-
-def subtree_of(tree: TaskTree, task_id: str) -> TaskTree:
-    """The subtree rooted at ``task_id`` — the node's own context (I2.4).
-
-    The returned tree is re-based: the subtree root's ``parent_task_id`` is
-    ``None``, depths restart at 0, and sibling ``width_idx`` values are
-    recomputed. A node's subtree never contains a sibling or its descendants.
-    """
-    by_id = {node.task_id: node for node in tree.nodes}
-    if task_id not in by_id:
-        raise TaskTreeError(f"task {task_id!r} is not in the tree")
-
-    children: dict[str, list[str]] = {tid: [] for tid in by_id}
-    for parent, child in tree.edges:
-        children.setdefault(parent, []).append(child)
-
-    subtree_ids: list[str] = []
-    queue = [task_id]
-    head = 0
-    while head < len(queue):
-        tid = queue[head]
-        head += 1
-        subtree_ids.append(tid)
-        queue.extend(sorted(children.get(tid, [])))
-    subtree_set = set(subtree_ids)
-
-    sub_children: dict[str, list[str]] = {tid: [] for tid in subtree_set}
-    for parent, child in tree.edges:
-        if parent in subtree_set:
-            sub_children[parent].append(child)
-
-    depth, width_idx = _assign_layout(sub_children, task_id)
-    nodes = tuple(
-        TaskNode(
-            task_id=node.task_id,
-            kind=node.kind,
-            parent_task_id=None if node.task_id == task_id else node.parent_task_id,
-            spec=copy.deepcopy(node.spec),
-            depth=depth[node.task_id],
-            width_idx=width_idx[node.task_id],
-            status=node.status,
-        )
-        for node in (by_id[tid] for tid in subtree_ids)
-    )
-    edges = tuple(sorted((parent, child) for parent, child in tree.edges if parent in subtree_set))
-    return TaskTree(nodes=nodes, edges=edges)
 
 
 def upward_result(node: TaskNode) -> dict[str, Any]:

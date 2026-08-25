@@ -297,13 +297,6 @@ def _lookup_diffundo(reference: str | None) -> Any | None:
         return _DIFFUNDO_REGISTRY.get(reference)
 
 
-def _resolve_diffundo(reference: str) -> Any:
-    diffundo = _lookup_diffundo(reference)
-    if diffundo is None:
-        raise RuntimeError(f"Diffundo reference {reference!r} is not available in this process")
-    return diffundo
-
-
 def _install_atomic_dspy_save(dspy: Any) -> None:
     """Make DSPy state-file replacement atomic for adapters loaded by Cambium."""
     original_save = dspy.Module.save
