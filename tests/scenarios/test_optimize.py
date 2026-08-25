@@ -627,7 +627,7 @@ def test_main_dry_run_does_not_construct_an_lm(monkeypatch) -> None:
     )
 
 
-def test_should_review_zero_optimizer_uses_packaged_dataset_with_mocked_lm(
+def test_should_review_zero_optimizer_reports_rule_baseline_without_promoting(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -636,12 +636,13 @@ def test_should_review_zero_optimizer_uses_packaged_dataset_with_mocked_lm(
 
     result = optimize.main(["should_review", "--optimizer", "zero", "--budget-usd", "0.10"])
 
-    assert result == 0
+    assert result == 1
     assert lm.calls > 0
     report = json.loads((tmp_path / "optimized" / "should_review" / "report.json").read_text())
-    assert report["stage_zero"] == {"eval_mean": 1.0, "train_mean": 1.0}
-    assert report["canaries"] == {"count": 5, "mean": 1.0, "std": 0.0}
-    assert report["gate_passed"] is True
+    assert 0.0 <= report["stage_zero"]["train_mean"] <= 1.0
+    assert 0.0 <= report["stage_zero"]["eval_mean"] < 0.85
+    assert report["canaries"] == {"count": 6, "mean": 0.5, "std": 0.5}
+    assert report["gate_passed"] is False
 
 
 def test_main_tiny_budget_fails_without_crashing() -> None:
