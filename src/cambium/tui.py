@@ -986,6 +986,7 @@ async def _run_interactive(
                         )
                         continue
 
+                    session.observe_result(turn, response)
                     succeeded = response.exit_code == 0
                     session.complete_turn(turn, succeeded=succeeded)
                     completed = True
