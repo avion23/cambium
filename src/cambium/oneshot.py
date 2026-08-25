@@ -733,6 +733,7 @@ def _resolve_provider(
             for candidate in authorized
             if not _is_codex_oauth_provider(candidate) and candidate.api_key_env
         ),
+        model_candidates=tuple(sorted({candidate.model for candidate in authorized})),
         fanout_config=fanout_config,
     )
     # Interactive budgeting should account for the ready fallback pool too;

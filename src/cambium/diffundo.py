@@ -1742,11 +1742,12 @@ class Diffundo:
                             self._provider_lease = None
                     tried.append(provider.name)
                     last_error = exc
-                    if (
+                    pinned_fallback = (
                         self._pinned_provider is not None
                         and provider.name == self._pinned_provider
-                        and exc.is_real_death
-                    ):
+                        and (exc.is_real_death or exc.outcome is ProviderOutcome.TIMEOUT)
+                    )
+                    if pinned_fallback:
                         existing = {item.name for item in pending}
                         if existing:
                             fallback_triggered = True
