@@ -219,7 +219,8 @@ cause behind a catch-all default.
 ## 9. Test strategy
 
 Tests are colocated in `src/cambium/modules/<name>/tests/`, baselines in
-`tests/baselines/`, and shared runtime scenarios in `tests/scenarios/`. A
+`src/cambium/modules/<name>/tests/baselines/`, and shared runtime scenarios in
+`tests/scenarios/`. A
 module is removable by deleting its complete directory; shared scenarios stay.
 
 DSPy program tests are shared scenarios in `tests/scenarios/`, not tests under

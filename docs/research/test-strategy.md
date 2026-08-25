@@ -9,7 +9,8 @@ and source/tests.
 **Current note (not retroactive):** active `supervisor.run_plan` is flat;
 `task_decomposed` remains unsupported; provider cascade is source-defined and honors
 `Retry-After`; worker stdout/event admission is bounded; no per-worker OS sandbox or
-approval; DLQ and eval cache are absent.
+approval; DLQ and eval cache are absent. The implemented module evaluation surface is
+`python -m cambium optimize eval`.
 
 Tree canaries treat static DAG validation/admission as a harness boundary: no dynamic
 child dispatch before validation, each child gets a fresh bounded context, and only the
@@ -17,27 +18,17 @@ strict upward envelope is visible to its parent. Tests reject implicit single-co
 recursion. Prefix-cache/prompt-prefix behavior is tested by measurement, not assumed
 cheap branching or a fixed discount.
 
-Constraints: scenario/integration tests use real processes, git, SQLite, and a local
+Constraints: scenario tests use real processes, git, SQLite, and a local
 fake provider; no LLM network, pytest plugins, `pytest-asyncio`, timeout plugins,
 `responses`, or `requests-mock`. Sync tests call `asyncio.run()`. Module datasets,
-metrics, and canaries remain the L2 gate; this document does not claim their entry
-points exist.
+metrics, and canaries remain the L2 gate.
 
 ## 1. Pyramid and fake-worker liveness
 
-The useful order is L5 scenarios (public API), L4 real mechanism integration, L3 pure
-replay/contracts, L2 frozen datasets, and L1 one-worker smoke. A behavior change adds a
-scenario/integration or a meaningful pure contract, not a mock copy of internals.
-
-`tests/fakes/worker_liveness.py` speaks NDJSON (`FAKE_MODE`; init/ready/request IDs):
-
-| Mode | Expected evidence |
-|---|---|
-| `healthy` | heartbeat/tool/checkpoint/result/exit; DONE and merge. |
-| `hang` | watchdog timeout, process-group kill, generation bump and bounded restart. |
-| `crash` | SIGKILL/torn result; parse-error, checkpoint recovery, restart. |
-| `garbage` | valid lines survive random bytes/truncated JSON; `parse_error`, then DONE. |
-| `grandchild` | inherited stdout stays open; EOF grace → ping/no pong → group kill (DS-C2). |
+The useful order is public-API scenarios, process-boundary mechanisms, pure
+replay/contracts, and frozen datasets. A behavior change adds a scenario or a
+meaningful pure contract, not a mock copy of internals. Scenario workers live in
+`scripts/fake_worker.py` and `tests/fixtures/` and speak NDJSON.
 
 Supervisor events, not worker self-report, are asserted: `worker_spawned`, ready,
 heartbeat, checkpoint/result, exit/failure, parse errors, and `supervisor_stall`.
@@ -71,8 +62,8 @@ between ref update and event emits `merge_reconciled`.
 
 ## 3. LLM-adjacent tests (offline)
 
-`tests/fakes/fake_provider_server.py` is stdlib `ThreadingHTTPServer` on
-`http://127.0.0.1:<port>`; fixtures pin request/response schema before implementation.
+Offline provider scenarios use stdlib `ThreadingHTTPServer` fixtures on
+`http://127.0.0.1:<port>`; each scenario pins its request/response schema.
 Diffundo cases cover tier fallback (LLM-C2), capability filters/transparency (LLM-C3),
 context-hash cache (LLM-C1), provider outage (`AllProvidersFailed`, DS-M7/IMPL-M5),
 and race disabled/quality-safe (LLM-M6). Decision modules run frozen train/eval splits,
@@ -81,7 +72,7 @@ with sibling pinning for LLM-C4 and canaries for LLM-C5/LLM-M1/LLM-M3.
 ## 4. Named scenario catalog (S01–S15)
 
 | ID | Scenario and invariant |
-|---|---|
+| --- | --- |
 | **S01** | One real worker/merge smoke; readiness, gate, canonical result, no credentials. |
 | **S02** | Crash recovery: checkpoint, locks, quarantine, fresh worktree. |
 | **S03** | Hang/heartbeat watchdog, per-tool heartbeat, bounded kill/restart (DS-C3, IMPL-M10). |
@@ -102,39 +93,28 @@ with sibling pinning for LLM-C4 and canaries for LLM-C5/LLM-M1/LLM-M3.
 
 Every held-out task carries 3–5 canaries: do not delete failing tests, add `assert True`,
 write `.cambium/`, or pad output. `canaries` zero the score on failure; promotion must
-run `python -m cambium.modules.<name>.eval --suite canaries` and reject any metric gain
+run `python -m cambium optimize eval MODULE --dataset PATH` and reject any metric gain
 with canary regression. Dataset loaders reject secret patterns, duplicate IDs, split
 leaks, and schema errors. These controls test the metric, not all backdoors.
 
 ## 6. Layout and command record
 
-Proposed layout keeps thin pure contracts under `tests/unit/`, named scenarios under
-`tests/scenarios/` (marker `scenario`), mechanism tests under `tests/integration/`
-(`integration`), and non-collected workers/providers under `tests/fakes/`. Register
-markers in `pyproject.toml`; unregistered markers raise `PytestUnknownMarkWarning`.
+Current layout keeps scenarios under `tests/scenarios/`, opt-in live-provider checks
+under `tests/acceptance/`, and worker scripts under `scripts/` and `tests/fixtures/`.
+Registered markers in `pyproject.toml` are `slow`, `acceptance`, and `xdist_group`.
 
-Historical commands (repo root, Python 3.14.7) were:
+Current commands (repo root) are:
 
 ```text
-uv run --python 3.14.7 --extra test pytest -q
-uv run --python 3.14.7 --extra test pytest -q -m "not integration"
-uv run --python 3.14.7 --extra test pytest -q -m scenario
-uv run --python 3.14.7 --extra test pytest -q -m integration
-uv run --python 3.14.7 --extra test pytest -q -m "not slow"
-uv run --python 3.14.7 --extra test pytest -q tests/scenarios/test_vertical_slice.py -v
-uv run --python 3.14.7 --extra test pytest --collect-only -q -m scenario
-uv run --python 3.14.7 --extra test pytest -q -p no:cacheprovider
-python -m cambium.tests.smoke
-python -m cambium.modules.<name>.eval --suite canaries
-python -m compileall src/cambium && python -c "import cambium"
+PYTHONPATH=src python -m pytest -q
+PYTHONPATH=src python -m pytest -m slow -q
+PYTHONPATH=src python -m pytest tests/acceptance/ -q
+PYTHONPATH=src python -m ruff check src tests
+PYTHONPATH=src python -m cambium doctor
 ```
 
-The pytest-claim checks were **VERIFIED** against pytest 9.1.1/CPython 3.14.7:
-registered markers select correctly; unknown markers warn; `-m`, `--deselect`, `-k`,
-`--durations`, `-p no:cacheprovider`, `--collect-only`, `tmp_path(_factory)`,
-`pytest.raises`, `pytest.skip`, and parametrization behave as recorded. **UNVERIFIED:**
-the exact Diffundo fake-provider schema, smoke/eval modules (targets at the snapshot),
-and timing margins for writer/fsync assertions.
+The default pytest invocation excludes `slow`; acceptance checks are opt-in and
+require explicit provider credentials and configuration.
 
 ## 7. Finding-to-test map (retained IDs)
 
@@ -192,30 +172,7 @@ canary splits; sibling-pinning prevents an optimizer from changing a helper metr
 hide a regression. Canaries specifically catch deleted tests, `assert True`, `.cambium/`
 writes, no-op patches, and output padding.
 
-## Appendix B — marker and command semantics
-
-The proposed marker registration was:
-
-```toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = [
-  "scenario: named end-to-end scenario through the real public API",
-  "integration: needs real subprocesses, git repos, or a local fake HTTP server",
-  "slow: wall-clock minutes; excluded from default local runs",
-]
-```
-
-The historical command list was deliberately CI-less: full suite; `-m "not integration"`;
-scenario-only; integration-only; `-m "not slow"`; one vertical-slice node ID; a
-`--deselect` slow test; `--durations=5`; `-p no:cacheprovider`; `--markers`; harness
-smoke; module eval plus `--suite canaries`; and compileall/import. The local gate was
-full suite + smoke + touched module eval/canaries. Pytest 9.1.1 checks verified markers,
-selection, deselection, durations, no-cache mode, collection, fixtures, raises/skip,
-and parametrization. Fake-provider wire shape, smoke/eval entry points, and timing
-margins remained UNVERIFIED.
-
-## Appendix C — review-finding matrix
+## Appendix B — review-finding matrix
 
 `IMPL-C1`/`DS-M1` map to S07 merge serialization; `IMPL-C2..C9`, `IMPL-C10`, `IMPL-C11`,
 and `IMPL-N1..N14` map to S01/S15 runtime smoke and protocol assertions. `IMPL-M2` is
@@ -226,7 +183,7 @@ DS-M1/M2/M3/M4/M6/M7 plus DS-N5/N7 map to §§2–4. LLM-C1/C2/C3/C4/C5/C6 and
 LLM-M1/M3/M4/M6 map to §§3–5. The IDs are preserved for audit traceability, not as a
 claim that each scenario currently exists.
 
-## Appendix D — public-boundary and context tests
+## Appendix C — public-boundary and context tests
 
 Tree tests build a plan with a root, two siblings, and a dependency chain. They assert
 that validation completes before any worker process starts, that `max_width` limits
@@ -248,7 +205,7 @@ pinned fake provider. They may report a stable prefix, but they must not assert 
 discount or latency win without provider evidence. A test that changes provider/model,
 dataset, or context layout must record a new baseline instead of reusing a prior claim.
 
-## Appendix E — failure/restart sequencing
+## Appendix D — failure/restart sequencing
 
 The restart suite separates worker crash, provider outage, EOF advisory, and supervisor
 stall. A worker that exits without `exit_message` consumes restart budget; a provider
@@ -265,11 +222,11 @@ cross-split leakage, and malformed fields as hard failures; they never silently 
 bad record. This is the historical reason the test strategy keeps canaries in a separate
 gate from ordinary eval rows.
 
-## Appendix F — harness contract assertions
+## Appendix E — harness contract assertions
 
-The original strategy treated the harness as the system under test. Unit tests covered
-pure tree validation, envelope filtering, retry-budget arithmetic, and event sequence
-allocation. Integration tests then exercised the real process boundary with a fake worker;
+The original strategy treated the harness as the system under test. Pure contract checks
+covered tree validation, envelope filtering, retry-budget arithmetic, and event sequence
+allocation. Scenario tests then exercised the real process boundary with a worker script;
 they did not replace the boundary with an in-process mock. Every scenario recorded the
 worker generation, task ID, worktree path, and event sequence so a failure could be
 replayed from durable data.
@@ -290,7 +247,7 @@ directive, or an attempt to return a trajectory was a hard failure. Prefix-cache
 measured serialized bytes and provider usage metadata under a pinned fake provider;
 they did not turn a measurement into a cost or latency guarantee.
 
-## Appendix G — failure-injection catalogue
+## Appendix F — failure-injection catalogue
 
 The fake worker modes were intentionally orthogonal: clean result, nonzero exit, delayed
 ready, heartbeat silence, stdout flood, malformed JSON, partial final line, grandchild
@@ -306,16 +263,16 @@ redacted values did not appear in SQLite, JSONL, stderr mirrors, or rotated file
 security suite exercised list-form `grep_code` and `git_op`, path traversal, symlinks,
 environment allowlists, prompt-injected repository text, and canary-gaming variants.
 
-## Appendix H — historical verification boundaries
+## Appendix G — historical verification boundaries
 
 The snapshot's command record used system Python and pinned source revisions. Typical
-checks were `python -m pytest -q tests/unit`, targeted scenario selectors, and small
-scripts that inspected raw event rows. A green targeted test was evidence for that
+checks were the full pytest suite, targeted scenario selectors, and small scripts that
+inspected raw event rows. A green targeted test was evidence for that
 scenario only; it was not a claim that the full suite, power-loss path, macOS signals,
 free-threaded Python, or live provider network had passed. These limits explain why
 several IDs remain **UNVERIFIED** even when neighboring canaries were green.
 
-## Appendix I — evidence labels
+## Appendix H — evidence labels
 
 `VERIFIED` meant the named command produced the expected observation on the recorded
 source revision. `UNVERIFIED` meant the document had a design assertion, a missing
