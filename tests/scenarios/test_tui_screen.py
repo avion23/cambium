@@ -12,8 +12,10 @@ from cambium.tui_screen import (
     _display_width,
     _side_sections,
     _transcript_lines,
+    _visible,
     _wrap_markdown,
     render_cockpit,
+    render_markdown_lines,
     render_primary,
 )
 
@@ -76,6 +78,124 @@ def test_wide_cockpit_has_transcript_agents_context_and_input() -> None:
     assert "│ input › " in text
     assert text.count("├") == 1
     assert lines[-1].startswith("└")
+
+
+def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
+    lines = render_markdown_lines(
+        "# Heading\n\n**bold** *italic* `code`\n\n"
+        "- a long list item that hangs on continuation\n\n"
+        "> quote\n\n---\n\n```py\nprint('ok')\n```\n\n"
+        "| a | b |\n|---|---|",
+        36,
+    )
+    visible = [_visible(line) for line in lines]
+    rendered = "\n".join(lines)
+
+    assert visible[0].startswith("Heading")
+    assert "bold" in rendered and "italic" in rendered and "code" in rendered
+    assert "**" not in rendered and "`code`" not in rendered
+    assert any(line.startswith("  ") for line in visible)
+    assert any(line.startswith("  │") for line in visible)
+    assert any("─" in line for line in visible)
+    assert any("| a | b |" in line for line in visible)
+    assert "\x1b[1m" in rendered
+    assert "\x1b[33m" in rendered
+    assert "\x1b[2;36m" in rendered
+
+    hostile = render_markdown_lines("safe\x1b[31m\x1b]2;secret\x07 text", 36)
+    assert "secret" not in "\n".join(hostile)
+    assert "\x1b[31m" not in "\n".join(hostile)
+
+
+def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    summary = (
+        "Detected prior interactive session; resuming durable state: "
+        "turns=1 last_epoch=7 last_checkpoint=interactive-main/epoch-7-"
+        + "c" * 64
+        + ".json. session=/tmp/interactive_session turn=1 branch=1 "
+        "provider=provider-a model=model-a epoch=7"
+    )
+    rendered_summary = "\n".join(render_markdown_lines(summary, 73, color=False))
+    assert "last_epoch=7" in rendered_summary
+    assert "last_checkpoint=interactive-main/epoch-7-" in rendered_summary
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.user("durable prompt")
+    transcript.assistant("durable answer")
+    transcript.system(summary)
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.move_to_input()
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session=/tmp/interactive_session",
+            branch_line="branch: turn=1 provider=provider-a model=model-a epoch=7",
+            cumulative_line="usage: calls=1 tokens=125",
+        )
+        assert "last_epoch=7" not in stream.getvalue()
+        cockpit.hide_cursor(commit=True)
+        cockpit.flush()
+
+    rendered = stream.getvalue()
+    assert "Detected prior interactive session" in rendered
+    assert "last_epoch=7" in rendered
+    assert "last_checkpoint=interactive-main/epoch-7-" in rendered
+
+
+def test_transcript_blocks_are_dense_with_one_separator_and_no_trailing_blank() -> None:
+    transcript = Transcript()
+    transcript.user("prompt")
+    transcript.assistant("first\n\n\nsecond\n\n")
+
+    rows = _transcript_lines(transcript, 60, 100)
+    values = [value for _, value in rows]
+    assert values[-1].strip()
+    assert max(
+        sum(not value.strip() for value in values[index : index + 3])
+        for index in range(max(1, len(values) - 2))
+    ) <= 1
+    assert values.count("") <= 1
+
+
+def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> None:
+    activity = ActivityState()
+    activity.start(now=10.0)
+    assert activity.state == "WAITING"
+    assert "WAITING" in activity.render(now=10.0)
+
+    activity.observe_event(
+        {
+            "kind": "assistant_delta",
+            "payload": {"delta": "first token", "output_tokens_per_s": 12.5},
+        },
+        now=11.0,
+    )
+    assert activity.state == "STREAMING"
+    assert "STREAMING" in activity.render(now=11.0)
+    assert "out/s=12.5" in activity.render(now=11.0)
+
+    activity.observe_event(
+        {"kind": "usage_event", "payload": {"request_rate_status": "cooldown", "retry_after_s": 4}},
+        now=12.0,
+    )
+    assert "COOLDOWN" in activity.render(now=12.0)
+
+    activity.observe_event({"kind": "result", "payload": {"status": "succeeded"}}, now=13.0)
+    assert activity.state == "DONE"
+    assert activity.status_line() == "✓ DONE"
+
+    activity.start(now=20.0)
+    activity.observe_event({"kind": "turn_failed", "payload": {"reason": "provider"}}, now=21.0)
+    assert activity.state == "ERROR"
+    assert activity.status_line() == "✗ ERROR"
 
 
 def test_compact_cockpit_stays_bounded() -> None:
