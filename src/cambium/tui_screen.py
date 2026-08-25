@@ -27,6 +27,7 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -1427,7 +1428,7 @@ def _md_rule(width: int, closing: bool, color: bool) -> str:
     return _md_style("  " + glyph + "─" * max(3, width - 4), _MD_RULE, color)
 
 
-def render_markdown_lines(
+def _render_markdown_lines_fallback(
     text: str,
     width: int = 80,
     *,
@@ -1524,6 +1525,232 @@ def render_markdown_lines(
     return output
 
 
+_MD_TABLE_DELIMITER_RE = re.compile(r"^:?-{3,}:?$")
+
+
+def _markdown_table_cells(line: str) -> tuple[str, ...] | None:
+    stripped = line.strip()
+    if stripped.count("|") < 2 or not (stripped.startswith("|") or stripped.endswith("|")):
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return tuple(cell.strip() for cell in stripped.split("|"))
+
+
+def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
+    """Find tables whose natural Rich width would silently clip cells."""
+    lines = text.splitlines()
+    ranges: list[tuple[int, int]] = []
+    in_fence = False
+    index = 0
+    while index + 1 < len(lines):
+        if _MD_FENCE_RE.match(lines[index]) is not None:
+            in_fence = not in_fence
+            index += 1
+            continue
+        if in_fence:
+            index += 1
+            continue
+        header = _markdown_table_cells(lines[index])
+        delimiter = _markdown_table_cells(lines[index + 1])
+        if (
+            header is None
+            or delimiter is None
+            or len(header) != len(delimiter)
+            or not all(
+                _MD_TABLE_DELIMITER_RE.fullmatch(cell.replace(" ", ""))
+                for cell in delimiter
+            )
+        ):
+            index += 1
+            continue
+
+        end = index + 2
+        rows = [header, delimiter]
+        while end < len(lines):
+            row = _markdown_table_cells(lines[end])
+            if row is None:
+                break
+            rows.append(row)
+            end += 1
+        column_widths = [0] * len(header)
+        for row in rows:
+            for column, cell in enumerate(row):
+                if column < len(column_widths):
+                    column_widths[column] = max(column_widths[column], _display_width(cell))
+        # ponytail: conservative width estimate; use Rich's measure API if its
+        # table layout changes and this starts falling back too early.
+        minimum_width = sum(column_width + 2 for column_width in column_widths)
+        if width < minimum_width:
+            ranges.append((index, end))
+        index = end
+    return ranges
+
+
+@lru_cache(maxsize=1)
+def _rich_markdown_components() -> tuple[Any, Any, Any, Any]:
+    """Load Rich's custom Markdown element classes once, only when needed."""
+    from rich.box import ROUNDED
+    from rich.color import ColorSystem
+    from rich.console import Console
+    from rich.markdown import BlockQuote, CodeBlock, Heading, Markdown
+    from rich.padding import Padding
+    from rich.panel import Panel
+    from rich.segment import Segment
+    from rich.text import Text
+    from rich.theme import Theme
+
+    class PaneHeading(Heading):
+        LEVEL_ALIGN = {level: "left" for level in ("h1", "h2", "h3", "h4", "h5", "h6")}
+
+    class PaneBlockQuote(BlockQuote):
+        def __rich_console__(self, console, options):
+            render_options = options.update(width=max(1, options.max_width - 2))
+            lines = console.render_lines(
+                self.elements,
+                render_options,
+                style=self.style,
+                pad=False,
+            )
+            for line in lines:
+                yield Segment("│ ", self.style)
+                yield from line
+                yield Segment.line()
+
+    class PaneCodeBlock(CodeBlock):
+        def __rich_console__(self, console, options):
+            code = Text(
+                str(self.text).rstrip(),
+                style="markdown.code_block",
+                no_wrap=False,
+                overflow="fold",
+            )
+            panel = Panel(
+                code,
+                box=ROUNDED,
+                border_style="markdown.code_block",
+                expand=True,
+                padding=(0, 1),
+            )
+            yield Padding(panel, (0, 0, 0, 2))
+
+    class PaneMarkdown(Markdown):
+        elements = {
+            **Markdown.elements,
+            "heading_open": PaneHeading,
+            "blockquote_open": PaneBlockQuote,
+            "fence": PaneCodeBlock,
+            "code_block": PaneCodeBlock,
+        }
+
+    theme = Theme(
+        {
+            "markdown.h1": "bold cyan",
+            "markdown.h2": "bold cyan",
+            "markdown.h3": "bold cyan",
+            "markdown.h4": "bold cyan",
+            "markdown.h5": "bold cyan",
+            "markdown.h6": "bold cyan",
+            "markdown.code": "yellow",
+            "markdown.code_block": "dim cyan",
+            "markdown.item.bullet": "bold cyan",
+            "markdown.item.number": "bold cyan",
+            "markdown.block_quote": "dim cyan",
+            "markdown.table.border": "dim cyan",
+            "markdown.table.header": "bold",
+            "markdown.link": "bold cyan",
+            "markdown.link_url": "dim cyan",
+        }
+    )
+    return PaneMarkdown, Console, ColorSystem, theme
+
+
+@lru_cache(maxsize=32)
+def _rich_console(width: int, color: bool) -> tuple[Any, Any]:
+    _, Console, ColorSystem, theme = _rich_markdown_components()
+    console = Console(
+        color_system="standard" if color else None,
+        force_terminal=color,
+        height=None,
+        highlight=False,
+        markup=False,
+        no_color=not color,
+        theme=theme,
+        width=width,
+    )
+    return console, ColorSystem.STANDARD if color else None
+
+
+def _render_markdown_lines_rich_document(text: str, width: int, color: bool) -> list[str]:
+    PaneMarkdown, _, _, _ = _rich_markdown_components()
+    console, ansi_color_system = _rich_console(width, color)
+    rendered: list[str] = []
+    for line in console.render_lines(PaneMarkdown(text, hyperlinks=False), pad=False):
+        parts: list[str] = []
+        for segment in line:
+            if segment.control:
+                continue
+            if color and segment.style:
+                parts.append(segment.style.render(segment.text, color_system=ansi_color_system))
+            else:
+                parts.append(segment.text)
+        rendered.append("".join(parts))
+    while rendered and not _visible(rendered[-1]).strip():
+        rendered.pop()
+    return rendered
+
+
+def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]:
+    """Render sanitized Markdown through Rich, falling back for narrow tables."""
+    table_ranges = _narrow_table_ranges(text, width)
+    if not table_ranges:
+        return _render_markdown_lines_rich_document(text, width, color)
+
+    lines = text.splitlines()
+    rendered: list[str] = []
+    cursor = 0
+    for start, end in table_ranges:
+        prefix = "\n".join(lines[cursor:start])
+        if prefix.strip():
+            rendered.extend(_render_markdown_lines_rich_document(prefix, width, color))
+        rendered.extend(
+            _render_markdown_lines_fallback("\n".join(lines[start:end]), width, color=color)
+        )
+        cursor = end
+    suffix = "\n".join(lines[cursor:])
+    if suffix.strip():
+        rendered.extend(_render_markdown_lines_rich_document(suffix, width, color))
+    while rendered and not _visible(rendered[-1]).strip():
+        rendered.pop()
+    return rendered
+
+
+@lru_cache(maxsize=512)
+def _render_markdown_lines_cached(text: str, width: int, color: bool) -> tuple[str, ...]:
+    """Cache immutable per-entry Markdown rows by source, width, and color."""
+    try:
+        rendered = _render_markdown_lines_rich(text, width, color)
+    except ImportError:
+        rendered = _render_markdown_lines_fallback(text, width, color=color)
+    return tuple(rendered)
+
+
+def render_markdown_lines(
+    text: str,
+    width: int = 80,
+    *,
+    color: bool = True,
+) -> list[str]:
+    """Render sanitized Markdown through Rich, with the old renderer as fallback."""
+    width = max(1, width)
+    clean = _sanitize(text)
+    if not clean:
+        return []
+    return list(_render_markdown_lines_cached(clean, width, color))
+
+
 # Keep the private name convenient for presentation tests and old callers.
 _render_markdown_lines = render_markdown_lines
 
@@ -1592,6 +1819,31 @@ def _bounded_render_lines(lines: list[str], limit: int) -> list[str]:
     return [f"… {hidden} lines hidden", *lines[-max(1, limit - 1) :]]
 
 
+def _bounded_markdown_lines(
+    text: str,
+    width: int,
+    limit: int,
+    *,
+    color: bool,
+) -> list[str]:
+    """Bound source detail and then wrapped rows without changing entry state."""
+    limit = max(1, limit)
+    source_lines = text.splitlines()
+    hidden_source = 0
+    if len(source_lines) > limit:
+        keep = max(1, limit - 1)
+        hidden_source = len(source_lines) - keep
+        text = "\n".join(source_lines[-keep:])
+
+    rendered = render_markdown_lines(text, width, color=color)
+    if hidden_source or len(rendered) > limit:
+        keep = max(1, limit - 1)
+        hidden_rendered = max(0, len(rendered) - keep)
+        hidden = hidden_source + hidden_rendered
+        return [f"… {hidden} lines hidden", *rendered[-keep:]]
+    return rendered
+
+
 def _entry_lines(
     entry: TranscriptEntry,
     width: int,
@@ -1622,16 +1874,20 @@ def _entry_lines(
         if detail.startswith(summary):
             detail = detail.split("\n", 1)[1] if "\n" in detail else ""
         if detail:
-            detail_lines = render_markdown_lines(detail, body_width, color=color)
-            if detail_limit is not None:
-                detail_lines = _bounded_render_lines(detail_lines, detail_limit)
+            detail_lines = (
+                _bounded_markdown_lines(detail, body_width, detail_limit, color=color)
+                if detail_limit is not None
+                else render_markdown_lines(detail, body_width, color=color)
+            )
             rendered.extend(
                 (entry.role, _clip(body_prefix + line, width)) for line in detail_lines
             )
     else:
-        lines = render_markdown_lines(entry.text, body_width, color=color)
-        if detail_limit is not None:
-            lines = _bounded_render_lines(lines, detail_limit)
+        lines = (
+            _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
+            if detail_limit is not None
+            else render_markdown_lines(entry.text, body_width, color=color)
+        )
         for line in lines:
             role = (
                 "dim"
@@ -1756,6 +2012,11 @@ def _transcript_lines(
             if history:
                 history.append(("system", ""))
             history.extend(block)
+        while len(history) > remaining:
+            try:
+                history.remove(next(row for row in history if not row[1]))
+            except StopIteration:
+                break
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
@@ -2493,6 +2754,7 @@ def _cockpit_frame_lines(
     color: bool,
     input_label: str,
     activity_line: str,
+    primary_rows: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
     width = max(8, width)
     height = max(_FIXED_MIN_HEIGHT, height)
@@ -2500,11 +2762,10 @@ def _cockpit_frame_lines(
     conversation_capacity = max(1, height - _FRAME_OVERHEAD)
     status = _sanitize(getattr(snapshot, "session_status", "idle"))
     lines = [_paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)]
-    conversation = _transcript_lines(
-        transcript,
-        inner,
-        conversation_capacity,
-        color=color,
+    conversation = (
+        list(primary_rows[-conversation_capacity:])
+        if primary_rows is not None
+        else _transcript_lines(transcript, inner, conversation_capacity, color=color)
     )
     for role, text in conversation[:conversation_capacity]:
         lines.append(
@@ -2754,6 +3015,19 @@ class Cockpit:
             )
         )
         if not self._fixed_frame:
+            conversation_capacity = max(1, self._last_size.lines - _FRAME_OVERHEAD)
+            hidden_rows = rows[:-conversation_capacity]
+            if self._last_primary_rows:
+                if rows[: len(self._last_primary_rows)] != self._last_primary_rows:
+                    hidden_rows = ()
+                else:
+                    hidden_rows = hidden_rows[len(self._last_primary_rows) :]
+            if hidden_rows:
+                # The fixed frame keeps only the tail; flush newly hidden rows
+                # so restored history and large live entries reach scrollback.
+                for role, text in hidden_rows:
+                    self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
+                    self.stream.write("\n")
             lines = _cockpit_frame_lines(
                 snapshot,
                 transcript,
@@ -2765,6 +3039,7 @@ class Cockpit:
                 color=self.color,
                 input_label=input_label,
                 activity_line=activity_line,
+                primary_rows=rows,
             )
             self.stream.write("\n".join(lines))
             self.stream.write("\x1b[1A\r")

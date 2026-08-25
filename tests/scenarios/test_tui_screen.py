@@ -1,15 +1,21 @@
 """Pure presentation tests for the persistent terminal cockpit."""
 
 import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import cambium.tui_screen as tui_screen
 from cambium.tui import _queued_prompt_notice
 from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
+    _bounded_markdown_lines,
     _display_width,
     _side_sections,
     _transcript_lines,
@@ -86,10 +92,10 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
         "# Heading\n\n**bold** *italic* `code`\n\n"
         "- a long list item that hangs on continuation\n\n"
         "> quote\n\n---\n\n```py\nprint('ok')\n```\n\n"
-        "| a | b |\n|---|---|",
+        "| a | b |\n|---|---|\n| one | two |",
         36,
     )
-    visible = [_visible(line) for line in lines]
+    visible = [_visible(line).rstrip() for line in lines]
     rendered = "\n".join(lines)
 
     assert visible[0].startswith("Heading")
@@ -98,7 +104,14 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     assert any(line.startswith("  ") for line in visible)
     assert any(line.startswith("  │") for line in visible)
     assert any("─" in line for line in visible)
-    assert any("| a | b |" in line for line in visible)
+    assert any(line.startswith("│ quote") for line in visible)
+    table_header = next((line for line in visible if line.strip().startswith("a")), None)
+    table_row = next((line for line in visible if line.strip().startswith("one")), None)
+    if table_header is not None and table_row is not None:
+        assert table_header.index("a") == table_row.index("one")
+        assert table_header.index("b") == table_row.index("two")
+    else:
+        assert all(cell in "\n".join(visible) for cell in ("a", "b", "one", "two"))
     assert "\x1b[1m" in rendered
     assert "\x1b[33m" in rendered
     assert "\x1b[2;36m" in rendered
@@ -106,6 +119,81 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     hostile = render_markdown_lines("safe\x1b[31m\x1b]2;secret\x07 text", 36)
     assert "secret" not in "\n".join(hostile)
     assert "\x1b[31m" not in "\n".join(hostile)
+
+
+def test_rich_markdown_sanitizes_before_the_parser_sees_text(monkeypatch) -> None:
+    seen: list[str] = []
+    rich_renderer = tui_screen._render_markdown_lines_rich
+
+    def capture(text: str, width: int, color: bool) -> list[str]:
+        seen.append(text)
+        return rich_renderer(text, width, color)
+
+    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", capture)
+    render_markdown_lines("safe\x1b[31m injected\x00\x1b]2;secret\x07 text", 36)
+
+    assert seen == ["safe injected text"]
+
+
+def test_markdown_falls_back_when_rich_import_is_unavailable(monkeypatch) -> None:
+    text = "# Heading\n\n**bold** `code`\n\nvalue_with_underscores"
+    expected = tui_screen._render_markdown_lines_fallback(text, 36, color=False)
+
+    def unavailable(*args, **kwargs):
+        raise ImportError("rich unavailable")
+
+    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", unavailable)
+    assert render_markdown_lines(text, 36, color=False) == expected
+
+
+def test_tui_screen_import_does_not_import_rich() -> None:
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    probe = (
+        "import sys; import cambium.tui_screen; "
+        "assert not any(name == 'rich' or name.startswith('rich.') for name in sys.modules)"
+    )
+    subprocess.run(
+        [sys.executable, "-c", probe],
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+    )
+
+
+def test_rich_path_keeps_literal_markup_text() -> None:
+    pytest.importorskip("rich")
+    rendered = "\n".join(render_markdown_lines("[bold]x[/bold]", 36, color=False))
+    assert "[bold]x[/bold]" in rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "cells", "width"),
+    [
+        (
+            "| one | two |\n| --- | --- |\n| three | four |",
+            ("one", "two", "three", "four"),
+            8,
+        ),
+        (
+            "| 界 | 文字 |\n| --- | --- |\n| 一 | 二三 |",
+            ("界", "文字", "一", "二三"),
+            10,
+        ),
+    ],
+)
+def test_narrow_tables_fall_back_without_losing_cells(
+    text: str, cells: tuple[str, ...], width: int
+) -> None:
+    rendered = render_markdown_lines(text, width, color=False)
+    visible = "\n".join(_visible(line) for line in rendered)
+    assert all(cell in visible for cell in cells)
+    assert all(_display_width(line) <= width for line in rendered)
+
+
+def test_bounded_markdown_lines_limits_wrapped_rows() -> None:
+    text = "\n".join("x" * 400 for _ in range(100))
+    rendered = _bounded_markdown_lines(text, 20, 40, color=False)
+    assert len(rendered) <= 40
+    assert rendered[0].startswith("… ") and rendered[0].endswith(" lines hidden")
 
 
 def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:
@@ -336,6 +424,38 @@ def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
     assert "\x1b[2J" not in text
 
 
+def test_cockpit_flushes_overflow_history_once() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    for index in range(20):
+        transcript.system(f"restored-{index}")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        assert all(f"restored-{index}" in first for index in range(20))
+
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        assert stream.getvalue() == first
+
+
 def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
@@ -466,6 +586,34 @@ def test_short_terminal_falls_back_to_stream_rows() -> None:
     assert not any(line.startswith("┌") for line in lines)
     assert not any("─" in line for line in lines)
     assert any("provider=codex" in line for line in lines)
+
+
+def test_live_cockpit_keeps_short_terminal_fallback(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((80, 11)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.system("restored history")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+
+    assert "restored history" in stream.getvalue()
+    assert "conversation ·" not in stream.getvalue()
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:
