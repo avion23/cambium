@@ -38,8 +38,8 @@ dspy import figure recorded in docs/research/worker-coldstart.md, since a
 provider run needs credentials and is out of scope here).
 
 Self-contained: no provider calls, no credentials, no network. Uses the public
-supervisor API (``python -m cambium.supervisor``) the same way
-scripts/e2e-selfcheck.sh does.
+supervisor API (``python -m cambium.supervisor``) with a deterministic marker
+worker.
 """
 
 from __future__ import annotations
@@ -57,8 +57,7 @@ from statistics import median
 
 REAL = Path(__file__).resolve().parents[1]
 DEFAULT_PYTHON = "python3.14"
-# The marker worker needs a tracked target file in the clone. The e2e fixture
-# is the canonical baseline used by scripts/e2e-selfcheck.sh.
+# The marker worker needs a tracked target file in the clone.
 FIXTURE = "tests/fixtures/e2e/cambium-e2e-marker.txt"
 
 # Persistent-pool IPC round-trip floor (ms). From docs/research/worker-coldstart.md:
@@ -116,8 +115,8 @@ def _seed_clone(source: Path, clone: Path) -> None:
             _fail(f"git {' '.join(args)} failed in clone: {r.stderr.strip()[:256]}")
     # The clone inherits the source worktree's checked-out branch (here
     # ``worker-reuse``), but the supervisor resolves base_commit and publishes
-    # onto ``refs/heads/main``. Create and check out a local ``main`` so the
-    # clone matches the repo shape scripts/e2e-selfcheck.sh assumes.
+    # onto ``refs/heads/main``. Create and check out a local ``main`` for that
+    # publication contract.
     rev = subprocess.run(
         ["git", "-C", str(clone), "rev-parse", "--verify", "origin/main"],
         capture_output=True, text=True,
