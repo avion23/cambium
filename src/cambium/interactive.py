@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -45,6 +46,8 @@ except ImportError:  # pragma: no cover - exercised on Windows
 _INTERACTIVE_SCHEMA = 1
 _MANIFEST_NAME = "interactive.json"
 _LOCK_NAME = "session.lock"
+_TURN_DIR_RE = re.compile(r"^turn-(\d+)$")
+_MANIFEST_TURN_MARGIN = 1
 _CONTEXT_KINDS = frozenset({"context_checkpoint", "context_epoch_advanced"})
 _FORK_FIELDS = (
     "provider",
@@ -400,6 +403,7 @@ class InteractiveSession:
         self._model_preference: str | None = None
         self._model_preferences: dict[str, str] = {}
         self._serving_turn: int | None = None
+        self._lock_acquired = False
         self._load_manifest()
         self._load_durable_head()
         self._reconcile_provider_preference()
@@ -452,7 +456,33 @@ class InteractiveSession:
             and not requested.is_dir()
         ):
             requested = oneshot.default_session_root(repo_path) / requested
-        candidate = requested.resolve()
+        sessions_root = oneshot.default_session_root(repo_path)
+        if sessions_root.parent.is_symlink() or sessions_root.is_symlink():
+            raise InteractiveSessionError(
+                "repository session root contains a symlink; refusing continuation"
+            )
+        sessions_root = sessions_root.resolve()
+        lexical = Path(os.path.abspath(os.fspath(requested)))
+        try:
+            relative = lexical.relative_to(sessions_root)
+        except ValueError as exc:
+            raise InteractiveSessionError(
+                "interactive session path must stay under the repository session root"
+            ) from exc
+        current = sessions_root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                raise InteractiveSessionError(
+                    "interactive session path must not contain symlinked components"
+                )
+        candidate = lexical.resolve()
+        try:
+            candidate.relative_to(sessions_root)
+        except ValueError as exc:
+            raise InteractiveSessionError(
+                "interactive session path must stay under the repository session root"
+            ) from exc
         if not cls._is_reconnectable(candidate, repo_path):
             raise InteractiveSessionError(
                 f"no resumable interactive session found at {candidate}"
@@ -463,19 +493,44 @@ class InteractiveSession:
     def _is_reconnectable(cls, root: Path, repo: Path) -> bool:
         if not root.is_dir():
             return False
+        sessions_root = oneshot.default_session_root(repo)
+        if sessions_root.parent.is_symlink() or sessions_root.is_symlink():
+            return False
+        sessions_root = sessions_root.resolve()
+        lexical = Path(os.path.abspath(os.fspath(root)))
+        try:
+            relative = lexical.relative_to(sessions_root)
+        except ValueError:
+            return False
+        current = sessions_root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                return False
+        try:
+            root = lexical.resolve()
+            root.relative_to(sessions_root)
+        except (OSError, ValueError):
+            return False
         document = _read_manifest_document(root / ".cambium" / _MANIFEST_NAME)
         if document is None or document.get("schema") != _INTERACTIVE_SCHEMA:
             return False
         if document.get("repo") != str(repo):
             return False
         turn = document.get("turn")
-        return type(turn) is int and turn >= 1 and cls._has_durable_state(root)
+        max_listed_turn = max(
+            (number for number, _turn_dir in cls._listed_turn_dirs(root)),
+            default=0,
+        )
+        return (
+            type(turn) is int
+            and 1 <= turn <= max_listed_turn + _MANIFEST_TURN_MARGIN
+            and cls._has_durable_state(root)
+        )
 
     @staticmethod
     def _has_durable_state(root: Path) -> bool:
-        for turn_dir in root.glob("turn-*"):
-            if not turn_dir.is_dir():
-                continue
+        for _number, turn_dir in InteractiveSession._listed_turn_dirs(root):
             state_dir = turn_dir / ".cambium"
             if (state_dir / "events.db").is_file():
                 return True
@@ -486,11 +541,20 @@ class InteractiveSession:
 
     def acquire(self) -> None:
         """Own the interactive root until :meth:`release` is called."""
+        if self._lock_acquired:
+            return
         self._lock.acquire()
+        try:
+            self._reload_durable_state()
+        except BaseException:
+            self._lock.release()
+            raise
+        self._lock_acquired = True
 
     def release(self) -> None:
         """Release the interactive root lock, including after normal exit."""
         self._lock.release()
+        self._lock_acquired = False
 
     @property
     def lock_path(self) -> Path:
@@ -542,9 +606,9 @@ class InteractiveSession:
     def active_turn_dirs(self) -> tuple[Path, ...]:
         """Completed turn leaves belonging to the current semantic branch."""
         return tuple(
-            self._turn_dir(number)
-            for number in range(self._branch_start_turn + 1, self._turn + 1)
-            if self._turn_dir(number).is_dir()
+            turn_dir
+            for number, turn_dir in self._listed_turn_dirs(self.root)
+            if self._branch_start_turn < number <= self._turn
         )
 
     @property
@@ -585,6 +649,24 @@ class InteractiveSession:
     def _write_manifest(self) -> None:
         _atomic_json(self._manifest_path, self._manifest_document())
 
+    def _reload_durable_state(self) -> None:
+        """Refresh state after taking ownership of the frontend lock."""
+        self._turn = 0
+        self._branch_generation = 1
+        self._branch_start_turn = 0
+        self._seed = None
+        self._pending_seed = None
+        self._last_epoch = 0
+        self._last_checkpoint = None
+        self._provider_preference = None
+        self._model_preference = None
+        self._model_preferences = {}
+        self._serving_turn = None
+        self._reconnected = self._manifest_path.is_file() and self._has_durable_state(self.root)
+        self._load_manifest()
+        self._load_durable_head()
+        self._reconcile_provider_preference()
+
     def _load_manifest(self) -> None:
         if not self._manifest_path.is_file():
             return
@@ -604,6 +686,14 @@ class InteractiveSession:
         branch_start = document.get("branch_start_turn", 0)
         if type(turn) is not int or turn < 0:
             raise InteractiveSessionError("interactive manifest turn is invalid")
+        max_listed_turn = max(
+            (number for number, _turn_dir in self._listed_turn_dirs(self.root)),
+            default=0,
+        )
+        if turn > max_listed_turn + _MANIFEST_TURN_MARGIN:
+            raise InteractiveSessionError(
+                "interactive manifest turn is implausibly ahead of durable turn directories"
+            )
         if type(generation) is not int or generation < 1:
             raise InteractiveSessionError("interactive manifest generation is invalid")
         if type(branch_start) is not int or not 0 <= branch_start <= turn:
@@ -736,15 +826,7 @@ class InteractiveSession:
     def branch_heads(self) -> tuple[BranchHead, ...]:
         """Replay turn event stores and return their latest checkpoint heads."""
         heads: list[BranchHead] = []
-        turn_dirs = sorted(
-            (
-                path
-                for path in self.root.glob("turn-*")
-                if path.is_dir() and path.name[5:].isdigit()
-            ),
-            key=lambda path: int(path.name[5:]),
-        )
-        for turn_dir in turn_dirs:
+        for turn, turn_dir in self._listed_turn_dirs(self.root):
             event_db = turn_dir / ".cambium" / "events.db"
             if not event_db.is_file():
                 continue
@@ -771,7 +853,6 @@ class InteractiveSession:
                 latest = (epoch, checkpoint_ref)
             if latest is None:
                 continue
-            turn = int(turn_dir.name[5:])
             current = (
                 self._seed is not None
                 and turn == self._turn
@@ -1099,6 +1180,28 @@ class InteractiveSession:
 
     def _turn_dir(self, number: int) -> Path:
         return self.root / f"turn-{number:04d}"
+
+    @staticmethod
+    def _listed_turn_dirs(root: Path) -> tuple[tuple[int, Path], ...]:
+        """List actual, strictly named turn directories without probing gaps."""
+        try:
+            children = tuple(root.iterdir())
+        except OSError:
+            return ()
+        listed: list[tuple[int, Path]] = []
+        for path in children:
+            if path.is_symlink() or not path.is_dir():
+                continue
+            match = _TURN_DIR_RE.fullmatch(path.name)
+            if match is None:
+                continue
+            try:
+                number = int(match.group(1))
+            except ValueError:
+                continue
+            listed.append((number, path))
+        listed.sort(key=lambda item: (item[0], item[1].name))
+        return tuple(listed)
 
     def _copy_seed(self, seed: ContextSeed, session_dir: Path) -> None:
         source = _checkpoint_path(seed.source_session, seed.checkpoint_ref)

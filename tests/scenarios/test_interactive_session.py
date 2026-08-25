@@ -644,6 +644,68 @@ def test_tui_reconnects_to_explicit_durable_interactive_session(tmp_path: Path) 
     assert "tokens=125" in rendered
 
 
+def test_lock_acquisition_refreshes_state_before_contender_can_publish(
+    tmp_path: Path,
+) -> None:
+    root = default_session_root(tmp_path) / "shared"
+    config = OneShotConfig(repo=tmp_path, session_root=root)
+    owner = InteractiveSession(config)
+    first = owner.prepare_turn("first")
+    owner.complete_turn(first, succeeded=False)
+    owner.acquire()
+    try:
+        contender = InteractiveSession(config)
+        assert contender.turn == 1
+
+        second = owner.prepare_turn("second")
+        owner.complete_turn(second, succeeded=False)
+    finally:
+        owner.release()
+
+    contender.acquire()
+    try:
+        assert contender.turn == 2
+        third = contender.prepare_turn("third")
+        contender.observe_event(
+            third,
+            {"kind": "usage_event", "payload": {"provider": "provider-a", "model": "model-a"}},
+        )
+        manifest = json.loads(
+            (root / ".cambium" / "interactive.json").read_text(encoding="utf-8")
+        )
+        assert manifest["turn"] == 2
+    finally:
+        contender.release()
+
+
+def test_hostile_manifest_turn_is_rejected_without_sequential_probe(tmp_path: Path) -> None:
+    root = default_session_root(tmp_path) / "hostile"
+    state = root / ".cambium"
+    state.mkdir(parents=True)
+    (root / "turn-0001" / ".cambium").mkdir(parents=True)
+    (root / "turn-0001" / ".cambium" / "events.db").touch()
+    (state / "interactive.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "repo": str(tmp_path.resolve()),
+                "turn": 200_000,
+                "branch_generation": 1,
+                "branch_start_turn": 0,
+                "seed": None,
+                "provider_preference": None,
+                "model_preference": None,
+                "model_preferences": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InteractiveSessionError, match="implausibly ahead"):
+        InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    assert InteractiveSession.latest_for_repo(tmp_path) is None
+
+
 def test_stale_interactive_lock_is_detected_and_reclaimed(tmp_path: Path) -> None:
     session = InteractiveSession(
         OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive")
@@ -689,6 +751,43 @@ def test_continue_resolves_latest_and_specific_interactive_sessions(tmp_path: Pa
     assert InteractiveSession.resolve_continue_session(tmp_path, "") == prior.resolve()
     assert InteractiveSession.resolve_continue_session(tmp_path, "prior") == prior.resolve()
     assert InteractiveSession.resolve_continue_session(tmp_path, prior) == prior.resolve()
+
+
+def test_continue_rejects_paths_outside_repo_sessions_and_symlink_components(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path.parent / f"cambium-outside-{tmp_path.name}"
+    outside.mkdir()
+    _write_manifest = {
+        "schema": 1,
+        "repo": str(repo.resolve()),
+        "turn": 1,
+        "branch_generation": 1,
+        "branch_start_turn": 0,
+        "seed": None,
+        "provider_preference": None,
+        "model_preference": None,
+        "model_preferences": {},
+    }
+    state = outside / ".cambium"
+    state.mkdir()
+    (state / "interactive.json").write_text(json.dumps(_write_manifest), encoding="utf-8")
+    (outside / "turn-0001" / ".cambium").mkdir(parents=True)
+    (outside / "turn-0001" / ".cambium" / "events.db").touch()
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    with pytest.raises(InteractiveSessionError, match="must stay under"):
+        InteractiveSession.resolve_continue_session(repo, f"../../{outside.name}")
+
+    sessions = default_session_root(repo)
+    sessions.mkdir(parents=True)
+    (sessions / "escape").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(InteractiveSessionError, match="symlinked components"):
+        InteractiveSession.resolve_continue_session(repo, sessions / "escape")
 
 
 def test_continue_missing_interactive_session_fails_clearly(tmp_path: Path) -> None:
