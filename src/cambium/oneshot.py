@@ -706,9 +706,9 @@ def _resolve_provider(
 
     # The selected provider is the pinned primary. Keep every enabled,
     # credential-ready provider in the authorization carrier: Diffundo uses
-    # that bounded set to substitute only after terminal endpoint-death
-    # evidence, with same-tier candidates before other tiers. A sibling
-    # without its credential is never handed to the worker.
+    # that bounded set to substitute after endpoint-death or timeout evidence,
+    # with same-tier candidates before other tiers. A sibling without its
+    # credential is never handed to the worker.
     if len(codex_authorized) > 1:
         raise ValueError(
             "multiple codex_chatgpt providers have stored oauth sessions; "
