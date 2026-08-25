@@ -629,7 +629,7 @@ def test_tracking_diffundo_uses_remaining_budget() -> None:
 
     delegate = Delegate()
     ledger = optimize._CostLedger(1.0)
-    tracked = optimize._TrackingDiffundo(delegate, ledger)
+    tracked = optimize._TrackingDiffundo(cast(optimize.Diffundo, delegate), ledger)
 
     asyncio.run(tracked.call(optimize.ProviderTier.FAST, {}, budget_usd=1.0))
     asyncio.run(tracked.call(optimize.ProviderTier.FAST, {}, budget_usd=1.0))
@@ -660,7 +660,7 @@ def test_tracking_diffundo_reports_usage_when_subscription_cost_is_zero() -> Non
             )
 
     ledger = optimize._CostLedger(1.0)
-    tracked = optimize._TrackingDiffundo(Delegate(), ledger)
+    tracked = optimize._TrackingDiffundo(cast(optimize.Diffundo, Delegate()), ledger)
 
     asyncio.run(tracked.call(optimize.ProviderTier.FAST, {}))
 
@@ -835,7 +835,7 @@ def test_gepa_report_schema_records_stage_and_optimizer() -> None:
     )
     report = optimize._partial_report(
         SimpleNamespace(module_name="should_decompose"),
-        args,
+        cast(Any, args),
         optimize._CostLedger(1.0),
         stage_gepa={"eval_mean": 0.9, "train_mean": 1.0},
     )
