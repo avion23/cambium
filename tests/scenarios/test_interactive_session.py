@@ -11,9 +11,10 @@ import pytest
 
 from cambium import tui
 from cambium.interactive import InteractiveSession, InteractiveSessionError
+from cambium.monitor import monitor_session
 from cambium.oneshot import OneShotConfig, default_session_root
 from cambium.store import EventStore
-from cambium.supervisor import PlanResult, TaskResult
+from cambium.supervisor import PlanResult, TaskResult, read_events
 from cambium.tui_screen import Transcript
 
 
@@ -189,6 +190,66 @@ def test_interactive_branches_replay_event_store_heads(tmp_path: Path) -> None:
     assert len(heads) == 1
     assert heads[0].epoch == 2
     assert heads[0].checkpoint_ref.endswith("epoch-002-ref.json")
+
+
+def test_interactive_read_events_merges_turn_stores(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    (root / ".cambium").mkdir(parents=True)
+    (root / ".cambium" / "events.db").touch()
+    for number, kinds in ((1, ("session_started", "usage_event")), (2, ("result",))):
+        event_db = root / f"turn-{number:04d}" / ".cambium" / "events.db"
+        event_db.parent.mkdir(parents=True)
+        store = EventStore(event_db)
+        try:
+            for kind in kinds:
+                store.append(
+                    {
+                        "kind": kind,
+                        "task_id": "interactive-main",
+                        "generation": 1,
+                        "payload": {"status": "succeeded"} if kind == "result" else {},
+                    }
+                )
+        finally:
+            store.close()
+
+    events = read_events(root)
+
+    assert [event["kind"] for event in events] == [
+        "session_started",
+        "usage_event",
+        "result",
+    ]
+    assert [event["seq"] for event in events] == [1, 2, 3]
+    assert [event["kind"] for event in read_events(root, after_seq=2)] == ["result"]
+
+
+def test_monitor_smoke_reads_interactive_turn_stores(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    event_db = root / "turn-0001" / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    store = EventStore(event_db)
+    try:
+        store.append(
+            {
+                "kind": "usage_event",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {
+                    "provider": "provider-a",
+                    "model": "model-a",
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                },
+            }
+        )
+    finally:
+        store.close()
+
+    output = io.StringIO()
+    assert monitor_session(root, once=True, output_stream=output) == 0
+    rendered = output.getvalue()
+    assert "usage_event" in rendered
+    assert "total=5" in rendered
 
 
 def test_tui_model_preference_is_validated_and_applies_to_next_turn(tmp_path: Path) -> None:

@@ -24,7 +24,8 @@ from .observability import (
     ObservabilityState,
     SessionSnapshot,
 )
-from .store import StoreError, read_events_file
+from .store import StoreError
+from .supervisor import read_events
 from .terminal import sanitize_terminal_text
 
 _ALT_ENTER = "\x1b[?1049h\x1b[?25l"
@@ -363,10 +364,25 @@ class AnsiDashboard:
 
 
 def _latest_session(repo: Path | None) -> Path | None:
+    def has_event_log(path: Path) -> bool:
+        if (path / ".cambium" / "events.db").is_file():
+            return True
+        return any(candidate.is_file() for candidate in path.glob("turn-*/.cambium/events.db"))
+
+    def event_log_mtime(path: Path) -> int:
+        paths = [path / ".cambium" / "events.db"]
+        paths.extend(path.glob("turn-*/.cambium/events.db"))
+        mtimes = []
+        for candidate in paths:
+            try:
+                mtimes.append(candidate.stat().st_mtime_ns)
+            except OSError:
+                pass
+        return max(mtimes, default=0)
+
     candidates: list[Path] = []
     root = Path.cwd() if repo is None else repo
-    direct = root / ".cambium" / "events.db"
-    if direct.is_file():
+    if has_event_log(root):
         candidates.append(root)
     roots = (root / ".cambium" / "sessions",)
     for root in roots:
@@ -375,13 +391,13 @@ def _latest_session(repo: Path | None) -> Path | None:
         candidates.extend(
             path
             for path in root.iterdir()
-            if path.is_dir() and (path / ".cambium" / "events.db").is_file()
+            if path.is_dir() and has_event_log(path)
         )
     if not candidates:
         return None
     return max(
         candidates,
-        key=lambda path: (path / ".cambium" / "events.db").stat().st_mtime_ns,
+        key=lambda path: event_log_mtime(path),
     )
 
 
@@ -398,7 +414,8 @@ def resolve_session(value: str | Path | None, *, repo: str | Path | None = None)
                 raise ValueError("no Cambium session with an event log was found")
             session = latest.resolve()
     event_db = session / ".cambium" / "events.db"
-    if not event_db.is_file():
+    turn_event_dbs = session.glob("turn-*/.cambium/events.db")
+    if not event_db.is_file() and not any(path.is_file() for path in turn_event_dbs):
         raise ValueError(f"session event log is missing: {event_db}")
     return session
 
@@ -418,10 +435,7 @@ async def monitor_session_async(
     try:
         with dashboard:
             while True:
-                events = read_events_file(
-                    session / ".cambium" / "events.db",
-                    after_seq=state.last_seq,
-                )
+                events = read_events(session, after_seq=state.last_seq)
                 state.extend(events)
                 snapshot = state.snapshot(session_dir=session)
                 if json_output:

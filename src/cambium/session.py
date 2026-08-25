@@ -121,7 +121,9 @@ def show_session(path: Path) -> SessionView:
     The session result (``.cambium/result.json``) is the only artifact this
     view surfaces. The durable event log is not part of the result view;
     readers that need the durable log stream it through
-    ``cambium.supervisor.read_events``.
+    ``cambium.supervisor.read_events``. For interactive roots that function
+    merges the immutable ``turn-NNNN`` stores without changing the result's
+    session-root event-log reference.
     """
     session_path = Path(path)
     result_path = session_path / ".cambium" / "result.json"
