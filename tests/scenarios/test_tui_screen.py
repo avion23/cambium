@@ -783,6 +783,28 @@ def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     assert "✓ run_shell 9273ms" in text
     assert "✓ git_op 2395ms" in text
     assert "×" not in text
+
+
+def test_adjacent_tool_ticks_have_no_blank_separator() -> None:
+    transcript = Transcript()
+    for tool in ("run_shell", "read_batch", "git_op"):
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {"tool": tool, "ok": True},
+            }
+        )
+
+    rows = _transcript_lines(transcript, 80, 20)
+    tick_rows = [
+        index for index, (_, value) in enumerate(rows) if value.lstrip().startswith("✓ ")
+    ]
+
+    assert len(tick_rows) == 3
+    assert tick_rows[1] == tick_rows[0] + 1
+    assert tick_rows[2] == tick_rows[1] + 1
+
+
 def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
     transcript = Transcript()
     events = (

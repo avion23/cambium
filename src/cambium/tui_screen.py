@@ -1709,6 +1709,15 @@ def _transcript_blocks(
     return blocks
 
 
+def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
+    if not block:
+        return ""
+    role, text = block[0]
+    if role == "tool" or text.lstrip().startswith(("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)):
+        return "tool"
+    return role
+
+
 def _stream_lines(
     transcript: Transcript,
     width: int,
@@ -1747,15 +1756,18 @@ def _transcript_lines(
     rendered: list[tuple[str, str]] = []
     if remaining:
         history: list[tuple[str, str]] = []
+        previous_kind = ""
         for block in _transcript_blocks(
             transcript.entries,
             width,
             expanded=transcript.tool_details_expanded,
             color=color,
         ):
-            if history:
+            kind = _transcript_block_kind(block)
+            if history and kind != previous_kind:
                 history.append(("system", ""))
             history.extend(block)
+            previous_kind = kind
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
