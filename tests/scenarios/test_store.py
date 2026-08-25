@@ -221,6 +221,24 @@ def test_event_store_read_row_cap_fails_closed(tmp_path, monkeypatch) -> None:
     assert read_events_file(path, after_seq=3) == []
 
 
+def test_large_event_store_cursor_stays_within_read_cap(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "events.db"
+    payload = '{"blob":"' + ("x" * 4096) + '"}'
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE events (seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, "
+            "payload TEXT NOT NULL, ts TEXT, monotonic_ms INTEGER, task_id TEXT, "
+            "worker_id TEXT, generation INTEGER, request_id TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO events(seq, kind, payload) VALUES(?, 'log', ?)",
+            ((seq, payload) for seq in range(1, 8_001)),
+        )
+
+    monkeypatch.setattr(store_module, "MAX_EVENT_ROWS_PER_READ", 32)
+    assert read_events_file(path, after_seq=8_000) == []
+
+
 @pytest.mark.slow
 def test_crash_durability_critical_events_survive(tmp_path) -> None:
     path = tmp_path / "crash" / "events.db"
