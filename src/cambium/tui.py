@@ -802,6 +802,16 @@ async def _run_interactive(
         except BaseException:
             pass
 
+    def _draw_final(snapshot: SessionSnapshot) -> None:
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description=session.describe(),
+            branch_line=_branch_line(session),
+            cumulative_line=cumulative.line(snapshot=snapshot),
+            force=True,
+        )
+
     try:
         with cockpit:
             while True:
@@ -984,6 +994,7 @@ async def _run_interactive(
                             "turn cancelled; the previous successful checkpoint "
                             "remains the branch head."
                         )
+                        _draw_final(snapshot)
                         continue
 
                     session.observe_result(turn, response)
@@ -1007,8 +1018,13 @@ async def _run_interactive(
                         session.complete_turn(turn, succeeded=False)
                     failed = True
                     transcript.error(str(exc))
+                    transcript.finish_stream()
                     err.write(f"cambium tui: {exc}\n")
                     err.flush()
+                    snapshot = state.snapshot(session_dir=turn.session_dir)
+                    last_snapshot = snapshot
+                    cumulative.add(snapshot)
+                    _draw_final(snapshot)
                     continue
                 except BaseException:
                     if not completed:
@@ -1028,13 +1044,7 @@ async def _run_interactive(
                 last_snapshot = snapshot
                 cumulative.add(snapshot)
                 transcript.finish_stream(_response_markdown(render, response))
-                cockpit.draw(
-                    snapshot,
-                    transcript,
-                    session_description=session.describe(),
-                    branch_line=_branch_line(session),
-                    cumulative_line=cumulative.line(snapshot=snapshot),
-                )
+                _draw_final(snapshot)
     except KeyboardInterrupt:
         return ExitCode.INTERRUPTED
     except BrokenPipeError:

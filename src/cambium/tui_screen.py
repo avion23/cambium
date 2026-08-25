@@ -2212,8 +2212,9 @@ class Cockpit:
         cumulative_line: str,
         input_label: str = "›",
         activity_line: str = "",
+        force: bool = False,
     ) -> None:
-        """Draw the conversation and reserve a fixed status/input region."""
+        """Draw the conversation, bypassing input coalescing for final frames."""
         if not self.enabled:
             return
         self._last_size = shutil.get_terminal_size((120, 40))
@@ -2226,14 +2227,20 @@ class Cockpit:
             _clip(_sanitize(input_label).replace(chr(10), " "), 8),
             _sanitize(activity_line).replace(chr(10), " "),
         )
-        if self._input_active:
+        if self._input_active and not force:
             self._pending_draw = request
             return
-        self._draw_now(request)
+        if force:
+            self._pending_draw = None
+        self._draw_now(request, force=force)
+        if force:
+            self.stream.flush()
 
     def _draw_now(
         self,
         request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        force: bool = False,
     ) -> None:
         (
             snapshot,
@@ -2253,7 +2260,8 @@ class Cockpit:
             self._draw_stream_now(request)
             return
 
-        if self._fixed_frame and self._frame_size != self._last_size:
+        if self._fixed_frame and (force or self._frame_size != self._last_size):
+            # Leave the current input/status row before appending a fresh frame.
             self.stream.write("\x1b[1B\r\n")
             self._fixed_frame = False
 

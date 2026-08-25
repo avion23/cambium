@@ -230,6 +230,8 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
     stream = _Tty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
+    final_snapshot = _snapshot()
+    final_snapshot.session_status = "done"
     with cockpit:
         cockpit.draw(
             _snapshot(),
@@ -254,18 +256,19 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
 
         transcript.finish_stream("completed response")
         cockpit.draw(
-            _snapshot(),
+            final_snapshot,
             transcript,
             session_description="session",
             branch_line="branch",
-            cumulative_line="usage: calls=1",
+            cumulative_line="usage: calls=1 tokens=20000",
             force=True,
         )
 
         after = stream.getvalue()
         assert "completed response" in after
         assert after.count("┌ Cambium · conversation") == 2
-        assert "calls=1" in after
+        assert "conversation · done" in after
+        assert "tokens=20k" in after
         assert after != before
         assert stream.flush_count > flushes_before_completion
 
