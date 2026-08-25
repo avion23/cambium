@@ -17,11 +17,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 
-# Import budget guard: the current fresh ``python3 -c "import cambium"``
-# measurement is about 53 ms median (about 89 ms worst in the baseline sample).
-# Keep this at roughly twice the observed worst case, not at an arbitrary
-# machine-dependent limit.  Raise it deliberately if legitimate startup work
-# grows, and update the measured baseline in this comment at the same time.
+# Import budget guard: 30 fresh ``python3 -c "import cambium"`` probes, run in
+# six batches with one-second pauses, measured 60.1 ms median, 104.9 ms p95,
+# and 117.7 ms max on the current host.  Keep this at roughly twice the
+# observed worst case, not at an arbitrary machine-dependent limit.  The
+# baseline p95 is below the 120 ms decision threshold, so retain 0.20 s.
+# Raise it deliberately if legitimate startup work grows, and update the
+# measured baseline in this comment at the same time.
 # The probe takes the BEST of three fresh-interpreter attempts: startup cost
 # is a floor property, and parallel-suite contention only ever adds noise.
 IMPORT_STARTUP_BUDGET_S = 0.20
