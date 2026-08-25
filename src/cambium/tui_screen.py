@@ -170,6 +170,43 @@ _FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
 _TOOL_ERROR_PREFIX = "tool errors:"
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_FIRST_TOKEN_KINDS = frozenset(
+    {
+        "assistant_first_token",
+        "first_token",
+        "first_token_received",
+    }
+)
+_TURN_DONE_KINDS = frozenset(
+    {
+        "complete",
+        "done",
+        "result",
+        "turn_complete",
+        "turn_completed",
+        "turn_finished",
+    }
+)
+_TURN_ERROR_KINDS = frozenset(
+    {
+        "error",
+        "fatal_error",
+        "session_failed",
+        "task_failed",
+        "turn_failed",
+        "turn_failure",
+        "worker_failed",
+    }
+)
+_COOLDOWN_STATUSES = frozenset(
+    {
+        "cooldown",
+        "cooling_down",
+        "rate_limited",
+        "rate-limited",
+        "throttled",
+    }
+)
 _TOOL_START_KINDS = frozenset(
     {
         "tool_begin",
@@ -317,7 +354,7 @@ def _color_enabled(stream: Any) -> bool:
 
 
 def _paint(text: str, color: str, enabled: bool) -> str:
-    clean = _sanitize(text)
+    clean = _safe_rendered(text)
     return f"{color}{clean}{_RESET}" if enabled else clean
 
 
@@ -1029,9 +1066,13 @@ class ActivityState:
     def __init__(self) -> None:
         self._active = False
         self._finished = False
+        self._state = "IDLE"
         self._turn_started_at = 0.0
         self._frame = 0
         self._responding = False
+        self._stream_tokens = 0
+        self._stream_rate = 0.0
+        self._cooldown: tuple[str | None, float | None] | None = None
         self._next_tool_id = 0
         self._tools: dict[str, tuple[str, float]] = {}
 
@@ -1039,13 +1080,22 @@ class ActivityState:
     def active(self) -> bool:
         return self._active
 
+    @property
+    def state(self) -> str:
+        """Return the explicit operator-facing turn state."""
+        return self._state
+
     def start(self, *, now: float | None = None) -> None:
         """Start a fresh turn clock and reset any previous in-flight work."""
         self._active = True
         self._finished = False
+        self._state = "WAITING"
         self._turn_started_at = time.monotonic() if now is None else now
         self._frame = 0
         self._responding = False
+        self._stream_tokens = 0
+        self._stream_rate = 0.0
+        self._cooldown = None
         self._next_tool_id = 0
         self._tools.clear()
 
@@ -1053,8 +1103,36 @@ class ActivityState:
         """Stop the line without leaving stale tool state for a later turn."""
         self._active = False
         self._finished = True
+        if self._state not in {"DONE", "ERROR"}:
+            self._state = "IDLE"
         self._responding = False
         self._tools.clear()
+
+    def complete(self, *, succeeded: bool = True) -> None:
+        """Record a terminal state before the final frame is drawn."""
+        self._state = "DONE" if succeeded else "ERROR"
+        self._active = False
+        self._finished = True
+        self._responding = False
+        self._tools.clear()
+
+    def cancel(self) -> None:
+        """Record a cancelled turn as idle rather than as a provider error."""
+        self._state = "IDLE"
+        self._active = False
+        self._finished = True
+        self._responding = False
+        self._tools.clear()
+
+    def status_line(self) -> str:
+        """Return a final status label suitable for the bottom status pane."""
+        if self._state == "DONE":
+            return "✓ DONE"
+        if self._state == "ERROR":
+            return "✗ ERROR"
+        if self._state == "IDLE":
+            return "IDLE"
+        return self.render()
 
     @staticmethod
     def _tool_name(data: Mapping[str, Any]) -> str:
@@ -1120,6 +1198,8 @@ class ActivityState:
             if key in self._tools:
                 del self._tools[key]
                 self._responding = False
+                if not self._tools:
+                    self._state = "WAITING"
                 return
             return
 
@@ -1130,7 +1210,70 @@ class ActivityState:
             if self._tools[key][0] == tool_name:
                 del self._tools[key]
                 self._responding = False
+                if not self._tools:
+                    self._state = "WAITING"
                 return
+
+    @staticmethod
+    def _number(data: Mapping[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                continue
+            try:
+                number = float(value)
+            except (OverflowError, ValueError):
+                continue
+            if math.isfinite(number) and number >= 0:
+                return number
+        usage = data.get("usage")
+        if isinstance(usage, Mapping):
+            for key in keys:
+                value = usage.get(key)
+                if isinstance(value, bool) or not isinstance(value, int | float):
+                    continue
+                try:
+                    number = float(value)
+                except (OverflowError, ValueError):
+                    continue
+                if math.isfinite(number) and number >= 0:
+                    return number
+        return None
+
+    def _observe_cooldown(self, data: Mapping[str, Any]) -> None:
+        status = data.get("request_rate_status")
+        if not isinstance(status, str):
+            return
+        normalized = status.casefold().replace(" ", "_")
+        if normalized in _COOLDOWN_STATUSES:
+            retry_after = self._number(data, "retry_after_s")
+            provider = data.get("provider") or data.get("assigned_provider")
+            self._cooldown = (
+                provider if isinstance(provider, str) else None,
+                retry_after,
+            )
+        elif normalized not in _COOLDOWN_STATUSES:
+            self._cooldown = None
+
+    def _observe_stream_rate(
+        self,
+        data: Mapping[str, Any],
+        text: str,
+        event_now: float,
+    ) -> None:
+        direct_rate = self._number(
+            data,
+            "output_tokens_per_s",
+            "tokens_per_s",
+            "out_per_s",
+        )
+        if direct_rate is not None:
+            self._stream_rate = direct_rate
+        else:
+            tokens = self._number(data, "output_tokens", "completion_tokens")
+            self._stream_tokens += int(tokens if tokens is not None else max(1, len(text) // 4))
+            elapsed = max(0.001, event_now - self._turn_started_at)
+            self._stream_rate = self._stream_tokens / elapsed
 
     def observe_event(self, record: Mapping[str, Any], *, now: float | None = None) -> None:
         """Fold one synthetic or durable event into the activity view."""
@@ -1143,6 +1286,27 @@ class ActivityState:
             return
         data = _event_data(record)
         event_now = time.monotonic() if now is None else now
+        self._observe_cooldown(data)
+
+        if (
+            kind in _TURN_ERROR_KINDS
+            or kind in _FAILURE_EVENT_KINDS
+            or data.get("status") in _FAILURE_STATUSES
+        ):
+            self._state = "ERROR"
+            self._active = False
+            self._finished = True
+            self._responding = False
+            self._tools.clear()
+            return
+        if kind in _TURN_DONE_KINDS:
+            status = data.get("status")
+            self._state = "ERROR" if status in _FAILURE_STATUSES else "DONE"
+            self._active = False
+            self._finished = True
+            self._responding = False
+            self._tools.clear()
+            return
 
         if self._is_tool_start(kind, data):
             self._start_tool(data, event_now)
@@ -1154,6 +1318,10 @@ class ActivityState:
         update = _stream_update(record)
         if update is not None and update[0] == "assistant" and update[1]:
             self._responding = True
+            self._state = "STREAMING"
+            self._observe_stream_rate(data, update[1], event_now)
+        elif kind in _FIRST_TOKEN_KINDS:
+            self._state = "STREAMING"
 
     def render(self, *, now: float | None = None, advance: bool = False) -> str:
         """Return one bounded status row, or an empty row when the turn is done."""
@@ -1471,8 +1639,6 @@ def _entry_lines(
                 else entry.role
             )
             rendered.append((role, _clip(body_prefix + line, width)))
-    if entry.role != "system":
-        rendered.append((entry.role, ""))
     return rendered
 
 
@@ -2061,7 +2227,7 @@ def _primary_rows(
     rows = _transcript_lines(transcript, width, capacity, color=color)
     rendered: list[tuple[str, str]] = []
     for role, text in rows:
-        rendered.append((role, _clip(_sanitize(text), width)))
+        rendered.append((role, _clip(_safe_rendered(text), width)))
     return rendered
 
 
@@ -2287,8 +2453,8 @@ def _status_rows(
     agent_row = [f"agents={active} active"]
     if agent_states:
         agent_row.append(" ".join(agent_states))
-    if activity_line:
-        agent_row.append(_side_clean(activity_line))
+    if not activity_line:
+        agent_row.append("state=IDLE")
 
     checkpoint = fields.get("checkpoint")
     context_row = []

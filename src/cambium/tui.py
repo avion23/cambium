@@ -802,13 +802,14 @@ async def _run_interactive(
         except BaseException:
             pass
 
-    def _draw_final(snapshot: SessionSnapshot) -> None:
+    def _draw_final(snapshot: SessionSnapshot, *, activity_line: str = "") -> None:
         cockpit.draw(
             snapshot,
             transcript,
             session_description=session.describe(),
             branch_line=_branch_line(session),
             cumulative_line=cumulative.line(snapshot=snapshot),
+            activity_line=activity_line,
             force=True,
         )
 
@@ -908,22 +909,28 @@ async def _run_interactive(
 
                 activity_task = loop.create_task(_activity_ticks())
 
-                def _live_sink(record: dict[str, Any], _activity: ActivityState = activity) -> None:
+                def _live_sink(
+                    record: dict[str, Any],
+                    _activity: ActivityState = activity,
+                    _state: ObservabilityState = state,
+                    _cumulative: _Cumulative = cumulative,
+                    _turn=turn,
+                ) -> None:
                     nonlocal sequence
-                    session.observe_event(turn, record)  # noqa: B023
+                    session.observe_event(_turn, record)
                     transcript.observe_event(record)
                     _activity.observe_event(record)
                     sequence += 1
                     normalized = dict(record)
                     normalized["seq"] = sequence
-                    state.apply(normalized)  # noqa: B023
-                    live_snapshot = state.snapshot(session_dir=turn.session_dir)
-                    cockpit.draw(  # noqa: B023  # noqa: B023
-                        live_snapshot,  # noqa: B023
+                    _state.apply(normalized)
+                    live_snapshot = _state.snapshot(session_dir=_turn.session_dir)
+                    cockpit.draw(
+                        live_snapshot,
                         transcript,
                         session_description=session.describe(),
                         branch_line=_branch_line(session),
-                        cumulative_line=cumulative.line(snapshot=live_snapshot),  # noqa: B023
+                        cumulative_line=_cumulative.line(snapshot=live_snapshot),
                         activity_line=_activity.render(),
                     )
 
@@ -985,6 +992,7 @@ async def _run_interactive(
                         if not cancel_requested:
                             raise
                         session.complete_turn(turn, succeeded=False)
+                        activity.cancel()
                         completed = True
                         snapshot = state.snapshot(session_dir=turn.session_dir)
                         last_snapshot = snapshot
@@ -994,12 +1002,13 @@ async def _run_interactive(
                             "turn cancelled; the previous successful checkpoint "
                             "remains the branch head."
                         )
-                        _draw_final(snapshot)
+                        _draw_final(snapshot, activity_line=activity.status_line())
                         continue
 
                     session.observe_result(turn, response)
                     succeeded = response.exit_code == 0
                     session.complete_turn(turn, succeeded=succeeded)
+                    activity.complete(succeeded=succeeded)
                     completed = True
                     if not succeeded:
                         failed = True
@@ -1016,6 +1025,7 @@ async def _run_interactive(
                 ) as exc:
                     if not completed:
                         session.complete_turn(turn, succeeded=False)
+                    activity.complete(succeeded=False)
                     failed = True
                     transcript.error(str(exc))
                     transcript.finish_stream()
@@ -1024,7 +1034,7 @@ async def _run_interactive(
                     snapshot = state.snapshot(session_dir=turn.session_dir)
                     last_snapshot = snapshot
                     cumulative.add(snapshot)
-                    _draw_final(snapshot)
+                    _draw_final(snapshot, activity_line=activity.status_line())
                     continue
                 except BaseException:
                     if not completed:
@@ -1044,7 +1054,7 @@ async def _run_interactive(
                 last_snapshot = snapshot
                 cumulative.add(snapshot)
                 transcript.finish_stream(_response_markdown(render, response))
-                _draw_final(snapshot)
+                _draw_final(snapshot, activity_line=activity.status_line())
     except KeyboardInterrupt:
         return ExitCode.INTERRUPTED
     except BrokenPipeError:
