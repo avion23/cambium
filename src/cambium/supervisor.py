@@ -1500,9 +1500,12 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
     # retain those records after the turn leaves rather than dropping them.
     root_event_db = session_dir / ".cambium" / "events.db"
     for event in read_events_file(root_event_db):
+        payload = event.get("payload")
+        event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
+        turn = event_turn if type(event_turn) is int and event_turn >= 0 else turn_stores[-1][0] + 1
         records.append(
             (
-                turn_stores[-1][0] + 1,
+                turn,
                 event["seq"],
                 _interactive_event_timestamp(event),
                 1,
