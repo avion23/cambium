@@ -2,14 +2,15 @@
 
 **Status:** implemented operator contract.
 
-`cambium tui` owns one user-visible CAST lineage across many prompts and keeps
-one append-only operator transcript in the terminal's primary buffer for the
-complete terminal session. Each prompt still receives an isolated supervisor
-transaction and worktree, but the newest immutable context checkpoint becomes
-the next prompt's branch head. The frontend is a single writer: a successful
-turn advances that head, while a failed or cancelled leaf remains durable
-without becoming the next seed. The interactive root is also locked, so two
-frontends cannot steer the same branch at once.
+`cambium tui` owns one user-visible CAST lineage across many prompts. Each
+prompt still receives an isolated supervisor transaction and worktree, but the
+newest immutable context checkpoint becomes the next prompt's branch head. The
+frontend is a single writer: a successful turn advances that head, while a
+failed or cancelled leaf remains durable without becoming the next seed. The
+interactive root is also locked, so two frontends cannot steer the same branch
+at once. On a sufficiently tall TTY, the live view is a two-pane cockpit in
+the terminal's normal primary buffer; short terminals use the bounded fallback
+described below.
 
 ```text
 interactive root
@@ -78,51 +79,61 @@ The frontend stores content-free lineage metadata at:
 ```
 
 Raw events, results, worktrees, and checkpoints remain inside the individual
-turn leaves. A corrupt or missing checkpoint fails closed instead of silently
-starting an unrelated context. Reconnect requires durable events or a
-checkpoint, so an abandoned empty allocation is not mistaken for a session.
+turn leaves; `supervisor.read_events` and `monitor` aggregate those event
+stores into one session timeline with stable read sequence numbers. A corrupt
+or missing checkpoint fails closed instead of silently starting an unrelated
+context. Reconnect requires durable events or a checkpoint, so an abandoned
+empty allocation is not mistaken for a session.
 
-## Scrollback design
+## Cockpit layout and scrollback
 
-The live path deliberately chooses **design A: primary-buffer append mode**.
-Each draw appends only transcript rows that have not already been emitted and a
-compact status row:
+For a TTY with at least twelve rows, the fixed frame is arranged top-to-bottom
+as conversation, live status, and input:
 
 ```text
-YOU
-  inspect the routing code
-CAMBIUM
-  ## Findings
-  - ...
-TOOL
-  ✓ read_batch ×3 · last 12ms
-┌ Cambium · status=running · provider=codex model=gpt-5.6 · tokens=42k · ...
-›
+┌ Cambium · conversation · running ┐
+│ YOU / CAMBIUM / TOOL transcript   │  conversation pane
+│ streamed or completed Markdown    │
+├───────────────────────────────────┤
+│ provider=codex · model=gpt-5.6    │
+│ turn=2 · tokens=42k · cost=$...   │  live status pane
+│ agents=1 active · ...             │
+│ STREAMING · tool errors=0 · ckpt  │
+│ input ›                           │  input row
+└───────────────────────────────────┘
 ```
 
-The status row is emitted after changed content rather than painted over a
-fixed viewport. The terminal therefore keeps the complete interaction in its
-normal scrollback; PageUp/PageDown and the terminal's own search work without
-an application-specific history mode. While readline owns the prompt, live
-draws are coalesced and flushed after the read so asynchronous events cannot
-overwrite the line being edited. `/clear` clears Cambium's bounded local
-transcript for future draws; it intentionally cannot erase scrollback already
-owned by the terminal.
+The status pane reports provider/model, turn, tokens (including input/output
+and cached counts when available), throughput, cost, active agents and their
+states, the collapsed tool-error count, session/checkpoint identity, and
+epoch. While a turn runs, activity is `WAITING` while thinking, `STREAMING`
+when assistant output arrives, or `IDLE` between turns; tool/cooldown details
+can replace the live activity text. The final status is `DONE` or `ERROR`, and
+cancelled turns return to `IDLE`.
 
-Design B (retaining the fixed frame and adding an internal PageUp/PageDown or
-Ctrl-B/Ctrl-F history) was rejected for this iteration. It would preserve the
-existing rich two-pane viewport, but would require a second key-reading/input
-state machine alongside readline and would still hide output from the
-terminal's native scrollback. The primary-buffer change removes the
-alternate-screen and full-frame repaint controls, provides the higher-value
-operator behavior, and has a smaller failure surface. The trade-off is that the
-live view is a compact log rather than a continuously updated side panel; the
-immutable snapshots and bounded transcript remain the source of truth.
+The conversation renderer is width-bounded and sanitizes model text. Its safe
+Markdown subset renders headings, lists, quotes, rules, pipe-delimited tables,
+inline **bold**/**italic**/`code`, and fenced code blocks. Long words and wide
+Unicode characters are wrapped by display width rather than allowed to break
+the pane border. Consecutive successful calls to one tool use a compact count;
+routine failed tool events collapse into one per-turn
+`tool errors: N (last: TOOL …)` counter. `v` expands available tool
+command/output details, while a terminal task failure is shown as one
+consolidated failure block with its useful context.
 
-The former framed renderer remains as a pure presentation helper for bounded
-snapshot tests and non-live callers. Both renderers are pure renderings of
-immutable frontend state and the event-sourced `ObservabilityState` projection;
-the TUI never reaches into live workers.
+The fixed frame is written to the normal primary buffer, never an alternate
+screen. Conversation changes append a fresh frame so terminal scrollback keeps
+the interaction; status-only changes repaint the bottom pane in place. While
+readline owns the input row, draws are coalesced so they cannot overwrite
+edited text. Turn completion forces the final frame draw and flush even when
+input is still pending. `/clear` clears Cambium's bounded local transcript for
+future draws; it cannot erase scrollback already owned by the terminal.
+
+If the terminal is shorter than twelve rows, the framed borders are removed and
+the cockpit falls back to width-bounded conversation rows followed by the
+status rows. Input remains a normal prompt rather than a fixed framed row.
+Both renderers are pure views of immutable frontend state and the event-sourced
+`ObservabilityState` projection; the TUI never reaches into live workers.
 
 The cockpit displays:
 
@@ -139,8 +150,8 @@ The cockpit displays:
 - streamed assistant/tool text as bounded Markdown-safe output while a turn is
   in flight, followed by the final Markdown response;
 - successful consecutive calls to the same tool as one compact line with a
-  repeat count and last duration. `v` expands command/output details for all
-  tool entries; failed tools retain their detail instead of collapsing;
+  repeat count and last duration; routine failed tool events use a per-turn
+  collapsed counter, and `v` expands available command/output details;
 - one consolidated failure block per failed task/turn, containing the task,
   cause, and the most useful preceding tool/provider/timeout context.
 

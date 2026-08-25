@@ -51,6 +51,21 @@ unselected.
 
 ### Changed
 
+- **Fresh interactive defaults.** REPL prompts now use fresh one-shot leaves by
+  default, while TUI starts a fresh interactive root unless
+  `-c [SESSION]`/`--continue [SESSION]` explicitly reconnects to the newest or
+  a named root.
+- **Two-pane TUI cockpit.** TTY rendering now places the conversation above a
+  live provider/model, turn, token, cost, agent, tool-error, and checkpoint
+  status pane, with Markdown rendering and `WAITING`/`STREAMING`/`IDLE`
+  activity states.
+- **Completion repaint.** The TUI forces and flushes the final frame when a
+  turn completes, even while input is pending.
+- **Interactive event timeline.** `supervisor.read_events` and `monitor` now
+  aggregate per-turn event stores into one session-level timeline.
+- **Import-budget guard.** Fresh-process import checks now use repeated probes
+  to reject contention noise while retaining the provider-SDK lazy-import
+  guard.
 - **403 classification.** Differentiated HTTP 403 responses into WAF/network,
   credential, quota/billing, model-entitlement, and policy/content-refusal
   outcomes; an unlabelled 403 remains fail-closed as authentication.
@@ -84,6 +99,13 @@ unselected.
 
 ### Fixed
 
+- **Width-safe cockpit wrapping.** TUI conversation and status content now
+  wraps within the terminal pane width, including long words and wide text.
+- **Collapsed tool errors.** Routine failed tool events now render as one
+  per-turn counter instead of repeating full error details.
+- **Pinned-provider sibling fallback.** A terminally dead pinned provider now
+  releases its matching lease before the authorized sibling pool is searched,
+  while retaining fallback provenance.
 - **SQLite resilience.** Hardened SQLite WAL persistence with a single writer,
   bounded busy/checkpoint retries, and explicit disk-full error propagation
   for event append/checkpoint and quota transactions; failed writes are not
@@ -118,6 +140,17 @@ unselected.
 Evidence trail for the unreleased entries (all hashes are commits reachable
 from origin/main):
 
+- Fresh interactive defaults and `-c`/`--continue`: 804ef4f, 0e18743, 09a3e84,
+  43598b6.
+- Two-pane TUI cockpit, Markdown, and activity state: 94ebcad, 7e248c5,
+  f262585, fc941db, 07aac51.
+- Completion repaint: 965dd26, 0ae4364, 083b310.
+- Interactive event aggregation for `read_events` and `monitor`: 7ec6026,
+  2939049, 9eb1492.
+- Fresh-process import-budget guard: 38b8bb3, e1ad641, e33f1d7.
+- Width-safe TUI wrapping: cefb3ac, 74132c8.
+- Per-turn tool-error collapse: cefb3ac, 9c29464.
+- Pinned-provider sibling fallback: 054408d, e3a969e, 37a1a99, ca8cba8.
 - Persistent TUI cockpit: adf937c, 3789458, 3e45659, 16866b4, 545e239.
 - CAST economics and K0 rollover: e63d369, 14a2482, d2c3432.
 - Bounded CAST policy and transactional joins: 1596385, 6f608f7.

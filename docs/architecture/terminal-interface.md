@@ -21,7 +21,11 @@ InteractiveSession single writer
              |
              +--> immutable context checkpoint C2
 
-all leaves --> durable event logs --> ObservabilityState --> TUI / monitor / JSON
+turn-0001/.cambium/events.db ─┐
+turn-0002/.cambium/events.db ─┼─> supervisor.read_events(root)
+root/.cambium/events.db      ─┘       │
+                                     v
+                         stable session timeline -> TUI / monitor / JSON
 ```
 
 One TUI invocation owns one semantic branch. Each prompt still runs through the
@@ -40,10 +44,29 @@ Reopening the same explicit `--session-dir` restores the current checkpoint,
 provider/model lease, branch generation, completed-turn usage, and latest
 operator view.
 
+Each interactive turn writes its own durable
+`<interactive-root>/turn-NNNN/.cambium/events.db`. Those leaves keep their
+local event sequence numbers. `supervisor.read_events(interactive_root)` is
+the read boundary that orders the turn stores (and any root-store records),
+then renumbers the result into one stable session-level timeline. `monitor`
+uses that same function and its `after_seq` cursor, so it observes the whole
+interactive session rather than only the newest leaf. The root result's
+`event_log_ref` remains the owning root's `sqlite:<root>/.cambium/events.db`
+URI; aggregation happens at read time and does not rewrite archived result
+history.
+
 ## Running it
 
 ```bash
 PYTHONPATH=src python -m cambium tui --repo . --auto
+```
+
+No explicit target starts a fresh interactive root. Continue the newest root
+with `-c`/`--continue`, or pass a session id/path:
+
+```bash
+PYTHONPATH=src python -m cambium tui --repo . -c --auto
+PYTHONPATH=src python -m cambium tui --repo . -c SESSION --auto
 ```
 
 Use a stable root to reopen the same branch later:
@@ -55,10 +78,17 @@ PYTHONPATH=src python -m cambium tui \
   --auto
 ```
 
-The normal terminal scrollback contains completed Markdown answers and compact
-usage/context lines. While a turn is active, an alternate-screen dashboard
-shows live workers and subagents. Leaving the dashboard restores the terminal
-before the final answer is printed.
+On a sufficiently tall TTY, the cockpit keeps the conversation pane on top,
+the live status pane at the bottom, and an input row inside a fixed frame in
+the normal terminal buffer. The status pane shows provider/model, turn,
+tokens, cost, agents, tool-error counters, activity, and checkpoint. The
+activity state is `WAITING`, `STREAMING`, or `IDLE` while the turn is live;
+completion reports `DONE` or `ERROR`. Markdown rendering includes tables,
+bold text, and fenced code blocks, with conversation content wrapped within
+the pane width. Routine tool failures collapse into per-turn counters. A
+short terminal falls back to width-bounded conversation rows followed by
+status rows without the bordered frame; completion still forces the final
+frame draw and flush when input is pending.
 
 ## Commands
 
@@ -97,7 +127,8 @@ Each agent row exposes:
 
 The context row exposes exact prompt tokens when reported, plus summary-trunk
 bytes/estimated tokens, segment count, raw-tail size, message count, checkpoint,
-and epoch. Byte-derived token estimates are marked approximate.
+epoch, and the collapsed tool-error count. Byte-derived token estimates are
+marked approximate.
 
 Colors are semantic: main/cyan, subagents/magenta, active/yellow,
 success/green, failure/red, and structural borders/dim cyan. `NO_COLOR`, a dumb
@@ -118,9 +149,10 @@ generation and excludes earlier turn leaves from restored branch totals.
 
 ## Standalone monitoring
 
-`cambium monitor [SESSION]` remains a read-only projection over one supervisor
-leaf. It can render a live frame, a static text frame, or JSON. Closing a
-monitor never mutates or cancels the runtime.
+`cambium monitor [SESSION]` is a read-only projection over a supervisor leaf or
+interactive root. It can render a live frame, a static text frame, or JSON;
+interactive roots use the aggregated session timeline above. Closing a monitor
+never mutates or cancels the runtime.
 
 ## Correctness properties
 

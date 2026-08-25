@@ -391,8 +391,9 @@ Verified in source and the full Python 3.14 test tiers:
 
 Open deltas:
 
-- REPL/TUI prompts still create separate one-shot session leaves instead of
-  continuing one durable interactive branch;
+- The REPL remains one-shot per prompt and does not expose the TUI's durable
+  interactive branch; TUI starts that branch at a fresh root and continues one
+  explicitly with `-c`/`--continue`;
 - provider cache capability, namespace, TTL, granularity, isolation, and
   read/write pricing are not modeled as one typed contract;
 - `prompt_prefix_bytes` is not yet a canonical digest/size of the complete
