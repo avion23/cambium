@@ -449,6 +449,7 @@ class InteractiveSession:
             not requested.is_absolute()
             and requested.parent == Path(".")
             and not value_text.startswith(".")
+            and not requested.is_dir()
         ):
             requested = oneshot.default_session_root(repo_path) / requested
         candidate = requested.resolve()
