@@ -20,11 +20,11 @@ class _Tty(io.StringIO):
         return True
 
 
-def _cache_key() -> dict[str, object]:
+def _cache_key(provider: str = "provider-a", model: str = "model-a") -> dict[str, object]:
     digest = "a" * 64
     return {
-        "provider": "provider-a",
-        "model": "model-a",
+        "provider": provider,
+        "model": model,
         "protocol": "chat_completions",
         "reasoning_effort": None,
         "system_sha256": digest,
@@ -39,7 +39,9 @@ def _cache_key() -> dict[str, object]:
     }
 
 
-def _checkpoint_event(ref: str) -> dict[str, object]:
+def _checkpoint_event(
+    ref: str, provider: str = "provider-a", model: str = "model-a"
+) -> dict[str, object]:
     return {
         "seq": 1,
         "kind": "context_checkpoint",
@@ -47,9 +49,37 @@ def _checkpoint_event(ref: str) -> dict[str, object]:
         "payload": {
             "checkpoint_ref": ref,
             "epoch": 3,
-            "cache_key": _cache_key(),
+            "cache_key": _cache_key(provider, model),
         },
     }
+
+
+def _two_provider_config(path: Path, *, first_enabled: bool = True) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "dead-zen",
+                        "tier": "balanced",
+                        "base_url": "http://127.0.0.1:9999/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY",
+                        "model": "zen-model",
+                        "enabled": first_enabled,
+                    },
+                    {
+                        "name": "healthy-codex",
+                        "tier": "strong",
+                        "base_url": "http://127.0.0.1:9998/v1",
+                        "api_key_env": "CAMBIUM_PROVIDER_HEALTHY_CODEX_API_KEY",
+                        "model": "codex-model",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_interactive_session_carries_exact_and_semantic_seed(tmp_path: Path) -> None:
@@ -182,6 +212,122 @@ def test_tui_model_preference_is_validated_and_applies_to_next_turn(tmp_path: Pa
     assert "preference set" in result
     assert turn.config.provider == "provider-a"
     assert turn.config.model == "model-b"
+
+
+def test_resume_reselects_healthy_provider_and_reconciles_model(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider_config = _two_provider_config(tmp_path / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY", "offline")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_HEALTHY_CODEX_API_KEY", "offline")
+    config = OneShotConfig(
+        repo=tmp_path,
+        session_root=tmp_path / "interactive",
+        provider_config_path=provider_config,
+    )
+    session = InteractiveSession(config)
+    first = session.prepare_turn("first")
+    checkpoint_ref = "interactive-main/epoch-1-" + "d" * 64 + ".json"
+    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("{}", encoding="utf-8")
+    session.observe_event(first, _checkpoint_event(checkpoint_ref, "dead-zen", "zen-model"))
+    session.complete_turn(first, succeeded=True)
+
+    provider_config = _two_provider_config(provider_config, first_enabled=False)
+    monkeypatch.delenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY")
+
+    resumed = InteractiveSession(config)
+    assert resumed.provider == "healthy-codex"
+    assert resumed.model == "codex-model"
+    manifest = json.loads(
+        (config.session_root / ".cambium" / "interactive.json").read_text(encoding="utf-8")
+    )
+    assert manifest["provider_preference"] == "healthy-codex"
+    assert manifest["model_preference"] == "codex-model"
+
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def fake_run(self, turn, *, on_event=None):
+        seen.append((turn.config.provider, turn.config.model))
+        return PlanResult(
+            results=(
+                TaskResult(
+                    task_id="interactive-main",
+                    status="succeeded",
+                    exit_code=0,
+                    provider="healthy-codex",
+                ),
+            )
+        )
+
+    monkeypatch.setattr(InteractiveSession, "run_turn", fake_run)
+    output = _Tty()
+    error = io.StringIO()
+    code = asyncio.run(
+        tui.run_tui(
+            config,
+            input_stream=_Tty("resume\n/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    assert code == 0
+    assert error.getvalue() == ""
+    assert seen == [("healthy-codex", "codex-model")]
+    persisted = json.loads(
+        (config.session_root / ".cambium" / "interactive.json").read_text(encoding="utf-8")
+    )
+    assert persisted["provider_preference"] == "healthy-codex"
+    assert persisted["model_preference"] == "codex-model"
+
+
+def test_serving_reconciliation_preserves_per_provider_model_choices(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider_config = _two_provider_config(tmp_path / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY", "offline")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_HEALTHY_CODEX_API_KEY", "offline")
+    session = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "interactive",
+            provider="dead-zen",
+            model="zen-model",
+            provider_config_path=provider_config,
+        )
+    )
+
+    assert "preference" in session.set_model_preference("dead-zen:zen-model")
+    assert "preference set" in session.set_model_preference("healthy-codex:codex-model")
+    turn = session.prepare_turn("fallback")
+    session.observe_result(
+        turn,
+        PlanResult(
+            results=(
+                TaskResult(
+                    task_id="interactive-main",
+                    status="succeeded",
+                    exit_code=0,
+                    provider="dead-zen",
+                ),
+            )
+        ),
+    )
+
+    manifest = json.loads(
+        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["model_preferences"] == {
+        "dead-zen": "zen-model",
+        "healthy-codex": "codex-model",
+    }
+    assert session.set_model_preference("healthy-codex")
+    assert session.provider == "healthy-codex"
+    assert session.model == "codex-model"
 
 
 def test_tui_multiline_input() -> None:
