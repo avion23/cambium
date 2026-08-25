@@ -404,6 +404,7 @@ class InteractiveSession:
         self._provider_preference: str | None = None
         self._model_preference: str | None = None
         self._model_preferences: dict[str, str] = {}
+        self._serving_turn: int | None = None
         self._load_manifest()
         self._load_durable_head()
         self._reconcile_provider_preference()
@@ -813,6 +814,20 @@ class InteractiveSession:
         if provider is None:
             return
         try:
+            from .provider_config import load_providers
+
+            provider_path = oneshot._provider_config_path(self._base_config, self.repo)
+            configured = load_providers(provider_path)
+            configured_names = {
+                candidate.name
+                for candidate in configured
+                if isinstance(candidate.name, str) and candidate.name
+            }
+            # Checkpoint fixtures and custom callers may carry provider names
+            # that are not in the local provider file.  There is no declared
+            # replacement model for those names, so leave the pair alone.
+            if provider not in configured_names:
+                return
             options = self.eligible_provider_models()
         except (OSError, ValueError):
             return
@@ -825,7 +840,19 @@ class InteractiveSession:
         if selected[0] != provider or selected[1] != self.model:
             self._set_serving_preference(*selected)
 
-    def observe_result(self, _turn: InteractiveTurn, result: Any) -> None:
+    def _record_serving_preference(
+        self, turn: InteractiveTurn, provider: str, model: str | None
+    ) -> None:
+        """Record a provider/model that actually served this turn."""
+        self._serving_turn = turn.number
+        declared_model = self._configured_model(provider)
+        if declared_model is not None:
+            model = declared_model
+        elif not isinstance(model, str) or not model:
+            model = None
+        self._set_serving_preference(provider, model)
+
+    def observe_result(self, turn: InteractiveTurn, result: Any) -> None:
         """Record a terminal serving pair, including router fallback provenance."""
         results = getattr(result, "results", None)
         item = results[0] if isinstance(results, tuple | list) and results else result
@@ -833,10 +860,8 @@ class InteractiveSession:
         if not isinstance(provider, str) or not provider:
             return
         model = getattr(item, "model", None)
-        if not isinstance(model, str) or not model:
-            model = self._configured_model(provider)
-        if model is not None and (provider != self.provider or model != self.model):
-            self._set_serving_preference(provider, model)
+        if provider != self.provider or (isinstance(model, str) and model != self.model):
+            self._record_serving_preference(turn, provider, model)
 
     def set_model_preference(self, value: str) -> str:
         """Validate and persist a provider/model preference for later turns."""
@@ -875,7 +900,12 @@ class InteractiveSession:
                 (provider, model) for provider, model in options if provider == requested_provider
             ]
             if provider_options:
-                requested_model = provider_options[0][1]
+                stored_model = self._model_preferences.get(requested_provider)
+                requested_model = (
+                    stored_model
+                    if (requested_provider, stored_model) in provider_options
+                    else provider_options[0][1]
+                )
             else:
                 current_provider = self.provider
                 if current_provider is None:
@@ -1156,8 +1186,12 @@ class InteractiveSession:
                 serving = payload
             provider = serving.get("provider")
             model = serving.get("model")
-            if isinstance(provider, str) and provider and isinstance(model, str) and model:
-                self._set_serving_preference(provider, model)
+            if isinstance(provider, str) and provider:
+                self._record_serving_preference(
+                    turn,
+                    provider,
+                    model if isinstance(model, str) and model else None,
+                )
             return
         if kind not in _CONTEXT_KINDS:
             return
@@ -1185,7 +1219,19 @@ class InteractiveSession:
             model=model if isinstance(model, str) and model else None,
             epoch=epoch if type(epoch) is int and epoch >= 0 else 0,
         )
-        if isinstance(provider, str) and provider and isinstance(model, str) and model:
+        if self._serving_turn == turn.number:
+            self._pending_seed = replace(
+                self._pending_seed,
+                provider=self.provider,
+                model=self.model,
+            )
+        if (
+            self._serving_turn != turn.number
+            and isinstance(provider, str)
+            and provider
+            and isinstance(model, str)
+            and model
+        ):
             self._set_serving_preference(provider, model)
         if self._pending_seed.epoch >= self._last_epoch:
             self._last_epoch = self._pending_seed.epoch
