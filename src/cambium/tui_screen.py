@@ -1427,7 +1427,7 @@ def _md_rule(width: int, closing: bool, color: bool) -> str:
     return _md_style("  " + glyph + "─" * max(3, width - 4), _MD_RULE, color)
 
 
-def render_markdown_lines(
+def _render_markdown_lines_fallback(
     text: str,
     width: int = 80,
     *,
@@ -1522,6 +1522,122 @@ def render_markdown_lines(
     while output and output[-1] == "":
         output.pop()
     return output
+
+
+def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]:
+    """Render sanitized Markdown through Rich and return terminal lines."""
+    from rich.box import ROUNDED
+    from rich.console import Console
+    from rich.markdown import BlockQuote, CodeBlock, Heading, Markdown
+    from rich.padding import Padding
+    from rich.panel import Panel
+    from rich.segment import Segment
+    from rich.text import Text
+    from rich.theme import Theme
+
+    class PaneHeading(Heading):
+        LEVEL_ALIGN = {level: "left" for level in ("h1", "h2", "h3", "h4", "h5", "h6")}
+
+    class PaneBlockQuote(BlockQuote):
+        def __rich_console__(self, console, options):
+            render_options = options.update(width=max(1, options.max_width - 2))
+            lines = console.render_lines(
+                self.elements,
+                render_options,
+                style=self.style,
+                pad=False,
+            )
+            for line in lines:
+                yield Segment("│ ", self.style)
+                yield from line
+                yield Segment.line()
+
+    class PaneCodeBlock(CodeBlock):
+        def __rich_console__(self, console, options):
+            code = Text(
+                str(self.text).rstrip(),
+                style="markdown.code_block",
+                no_wrap=False,
+                overflow="fold",
+            )
+            panel = Panel(
+                code,
+                box=ROUNDED,
+                border_style="markdown.code_block",
+                expand=True,
+                padding=(0, 1),
+            )
+            yield Padding(panel, (0, 0, 0, 2))
+
+    class PaneMarkdown(Markdown):
+        elements = {
+            **Markdown.elements,
+            "heading_open": PaneHeading,
+            "blockquote_open": PaneBlockQuote,
+            "fence": PaneCodeBlock,
+            "code_block": PaneCodeBlock,
+        }
+
+    theme = Theme(
+        {
+            "markdown.h1": "bold cyan",
+            "markdown.h2": "bold cyan",
+            "markdown.h3": "bold cyan",
+            "markdown.h4": "bold cyan",
+            "markdown.h5": "bold cyan",
+            "markdown.h6": "bold cyan",
+            "markdown.code": "yellow",
+            "markdown.code_block": "dim cyan",
+            "markdown.item.bullet": "bold cyan",
+            "markdown.item.number": "bold cyan",
+            "markdown.block_quote": "dim cyan",
+            "markdown.table.border": "dim cyan",
+            "markdown.table.header": "bold",
+            "markdown.link": "bold cyan",
+            "markdown.link_url": "dim cyan",
+        }
+    )
+    console = Console(
+        color_system="standard" if color else None,
+        force_terminal=color,
+        height=None,
+        highlight=False,
+        markup=False,
+        no_color=not color,
+        theme=theme,
+        width=width,
+    )
+    rendered: list[str] = []
+    for line in console.render_lines(PaneMarkdown(text, hyperlinks=False), pad=False):
+        parts: list[str] = []
+        for segment in line:
+            if segment.control:
+                continue
+            if color and segment.style:
+                parts.append(segment.style.render(segment.text, color_system=console.color_system))
+            else:
+                parts.append(segment.text)
+        rendered.append("".join(parts))
+    while rendered and not _visible(rendered[-1]):
+        rendered.pop()
+    return rendered
+
+
+def render_markdown_lines(
+    text: str,
+    width: int = 80,
+    *,
+    color: bool = True,
+) -> list[str]:
+    """Render sanitized Markdown through Rich, with the old renderer as fallback."""
+    width = max(1, width)
+    clean = _sanitize(text)
+    if not clean:
+        return []
+    try:
+        return _render_markdown_lines_rich(clean, width, color)
+    except ImportError:
+        return _render_markdown_lines_fallback(clean, width, color=color)
 
 
 # Keep the private name convenient for presentation tests and old callers.
