@@ -130,6 +130,16 @@ class OfflineProgram(dspy.Module):
         return should_decompose_metric(example)
 
 
+class ParseFailureProgram(OfflineProgram):
+    async def decide(self, input: TaskInputType) -> DecomposeOutputType:
+        del input
+        return DecomposeOutput(
+            decision=Decision.DO_NOT_DECOMPOSE,
+            reason=optimize.PARSE_FAILURE_REASON,
+            confidence=0.0,
+        )
+
+
 class MemoryLoader:
     def __init__(
         self,
@@ -168,7 +178,11 @@ def _eval_manifest() -> SimpleNamespace:
     )
 
 
-def _patch_eval(monkeypatch, loader: MemoryLoader) -> None:
+def _patch_eval(
+    monkeypatch, loader: MemoryLoader, artifact_root: Path | None = None
+) -> None:
+    if artifact_root is not None:
+        monkeypatch.setattr(optimize, "_ARTIFACT_ROOT", artifact_root)
     monkeypatch.setattr(optimize, "_load_manifest", lambda _name: _eval_manifest())
     monkeypatch.setattr(optimize, "load_program_class", lambda _manifest: OfflineProgram)
     monkeypatch.setattr(
@@ -182,7 +196,7 @@ def _patch_eval(monkeypatch, loader: MemoryLoader) -> None:
 def test_eval_fresh_module_scores_every_split(monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
     loader = MemoryLoader(_examples(2), _examples(1), _examples(3))
-    _patch_eval(monkeypatch, loader)
+    _patch_eval(monkeypatch, loader, tmp_path / "optimized")
 
     assert (
         optimize.main(
@@ -214,7 +228,7 @@ def test_eval_fresh_module_scores_every_split(monkeypatch, tmp_path: Path, capsy
 
 def test_eval_loads_saved_program_state(monkeypatch, tmp_path: Path, capsys) -> None:
     loader = MemoryLoader(_examples(1), _examples(1), _examples(1))
-    _patch_eval(monkeypatch, loader)
+    _patch_eval(monkeypatch, loader, tmp_path / "optimized")
     program_dir = tmp_path / "optimized" / "should_decompose"
     program_dir.mkdir(parents=True)
     program_dir.joinpath("program.json").write_text(
@@ -252,7 +266,11 @@ def test_eval_loads_saved_program_state(monkeypatch, tmp_path: Path, capsys) -> 
 
 def test_eval_json_shape_is_stable(monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.chdir(tmp_path)
-    _patch_eval(monkeypatch, MemoryLoader(_examples(1), _examples(1), _examples(1)))
+    _patch_eval(
+        monkeypatch,
+        MemoryLoader(_examples(1), _examples(1), _examples(1)),
+        tmp_path / "optimized",
+    )
 
     assert (
         optimize.main(
@@ -268,12 +286,23 @@ def test_eval_json_shape_is_stable(monkeypatch, tmp_path: Path, capsys) -> None:
     )
 
     report = json.loads(capsys.readouterr().out)
-    assert set(report) == {"dataset", "module", "program", "splits"}
+    assert set(report) == {"dataset", "module", "parse_failures", "program", "splits"}
     assert all(
-        set(summary) == {"count", "mean", "records", "std"}
+        set(summary) == {
+            "count",
+            "mean",
+            "parse_failures",
+            "records",
+            "scored_count",
+            "std",
+        }
         for summary in report["splits"].values()
     )
-    assert set(report["splits"]["train"]["records"][0]) == {"index", "score"}
+    assert set(report["splits"]["train"]["records"][0]) == {
+        "index",
+        "parse_failure",
+        "score",
+    }
 
 
 def test_load_program_class_rejects_empty_manifest_field() -> None:
@@ -332,7 +361,12 @@ def test_run_stage_zero_completes_offline() -> None:
     returned, report = optimize.run_stage_zero(program, train, val, seed=0)
 
     assert returned is program
-    assert set(report) == {"eval_mean", "train_mean"}
+    assert set(report) == {
+        "eval_mean",
+        "eval_parse_failures",
+        "train_mean",
+        "train_parse_failures",
+    }
     assert report["eval_mean"] == 1.0
     assert report["train_mean"] == 1.0
 
@@ -345,7 +379,12 @@ def test_run_stage_bootstrap_returns_working_compiled_program() -> None:
     compiled, report = optimize.run_stage_bootstrap(program, train, val, seed=0)
 
     assert compiled is not None
-    assert set(report) == {"eval_mean", "train_mean"}
+    assert set(report) == {
+        "eval_mean",
+        "eval_parse_failures",
+        "train_mean",
+        "train_parse_failures",
+    }
     output = asyncio.run(
         cast(OfflineProgram, compiled).decide(TaskInput(task="new task", context=""))
     )
@@ -365,6 +404,7 @@ def _assert_single_artifact_set(artifact: Path) -> None:
 
 def test_write_artifact_writes_single_artifact_set(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(optimize, "_ARTIFACT_ROOT", tmp_path / "optimized")
     program = OfflineProgram(OfflineLM())
     lm = OfflineLM()
 
@@ -375,7 +415,7 @@ def test_write_artifact_writes_single_artifact_set(tmp_path: Path, monkeypatch) 
         {"gate_passed": True, "eval_mean": 1.0},
     )
 
-    assert artifact == Path("optimized/should_decompose")
+    assert artifact == tmp_path / "optimized" / "should_decompose"
     assert (artifact / "program.json").is_file()
     assert (artifact / "report.json").is_file()
     assert json.loads((artifact / "program.json").read_text())
@@ -384,6 +424,7 @@ def test_write_artifact_writes_single_artifact_set(tmp_path: Path, monkeypatch) 
 
 def test_second_write_replaces_artifact_set_in_place(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(optimize, "_ARTIFACT_ROOT", tmp_path / "optimized")
 
     optimize.write_artifact(
         "should_decompose",
@@ -399,7 +440,7 @@ def test_second_write_replaces_artifact_set_in_place(tmp_path: Path, monkeypatch
         {"gate_passed": False, "eval_mean": 0.5},
     )
 
-    assert artifact == Path("optimized/should_decompose")
+    assert artifact == tmp_path / "optimized" / "should_decompose"
     assert json.loads((artifact / "report.json").read_text()) == {
         "gate_passed": False,
         "eval_mean": 0.5,
@@ -411,6 +452,7 @@ def test_main_budget_exhausted_run_writes_report_into_artifact_set(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(optimize, "_ARTIFACT_ROOT", tmp_path / "optimized")
     manifest = SimpleNamespace(module_name="should_decompose")
     loader = object()
 
@@ -586,6 +628,43 @@ def test_tracking_diffundo_uses_remaining_budget() -> None:
     assert ledger.spent_usd == 0.8
 
 
+def test_tracking_diffundo_reports_usage_when_subscription_cost_is_zero() -> None:
+    class Delegate:
+        _providers = (
+            SimpleNamespace(
+                name="subscription",
+                billing_mode=SimpleNamespace(value="subscription"),
+                pricing_known=True,
+            ),
+        )
+
+        async def call(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                provider="subscription",
+                estimated_cost_usd=0.0,
+                usage={
+                    "prompt_tokens": 12,
+                    "completion_tokens": 5,
+                    "cached_tokens": 3,
+                },
+            )
+
+    ledger = optimize._CostLedger(1.0)
+    tracked = optimize._TrackingDiffundo(Delegate(), ledger)
+
+    asyncio.run(tracked.call(optimize.ProviderTier.FAST, {}))
+
+    assert ledger.spent_usd == 0.0
+    assert ledger.usage == {
+        "calls": 1,
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "cached_tokens": 3,
+        "total_tokens": 17,
+    }
+    assert ledger.price_source == "subscription"
+
+
 def test_load_dataset_loader_uses_module_datasets_directory() -> None:
     package_dir = Path(__file__).resolve().parents[2] / "src" / "cambium" / "modules" / "example"
     manifest = optimize.load_module_manifest(package_dir)
@@ -631,6 +710,7 @@ def test_should_review_zero_optimizer_uses_packaged_dataset_with_mocked_lm(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(optimize, "_ARTIFACT_ROOT", tmp_path / "optimized")
     lm = ReviewRuleLM()
     monkeypatch.setattr(optimize, "_construct_lm", lambda *_args: lm)
 
@@ -639,9 +719,32 @@ def test_should_review_zero_optimizer_uses_packaged_dataset_with_mocked_lm(
     assert result == 0
     assert lm.calls > 0
     report = json.loads((tmp_path / "optimized" / "should_review" / "report.json").read_text())
-    assert report["stage_zero"] == {"eval_mean": 1.0, "train_mean": 1.0}
-    assert report["canaries"] == {"count": 5, "mean": 1.0, "std": 0.0}
+    assert report["stage_zero"] == {
+        "eval_mean": 1.0,
+        "eval_parse_failures": 0,
+        "train_mean": 1.0,
+        "train_parse_failures": 0,
+    }
+    assert report["canaries"] == {
+        "count": 5,
+        "mean": 1.0,
+        "parse_failures": 0,
+        "scored_count": 5,
+        "std": 0.0,
+    }
     assert report["gate_passed"] is True
+
+
+def test_parse_failures_are_excluded_from_aggregate_means() -> None:
+    summary = optimize.score_split(ParseFailureProgram(OfflineLM()), _examples(1))
+
+    assert summary == {
+        "count": 1,
+        "mean": 0.0,
+        "parse_failures": 1,
+        "scored_count": 0,
+        "std": 0.0,
+    }
 
 
 def test_main_tiny_budget_fails_without_crashing() -> None:
